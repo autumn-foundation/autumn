@@ -159,14 +159,14 @@ async fn describe_table(
 ) -> Result<Vec<Column>, DataCapsuleError> {
     let rows: Vec<ColumnRow> = diesel::sql_query(
         // `information_schema.columns.is_generated` exists on every version;
-        // `pg_attribute.attgenerated` only from Postgres 12. The base type
-        // follows the domain chain of the column type. When that chain ends
-        // at an array, it follows the chain of the element type too and keeps
-        // `[]`: `amount[]`, and a domain over `amount[]`, are `numeric[]`.
-        // Postgres has one array type per element type, so one level is all.
-        // A domain keeps the modifier of its base type in `typtypmod`: each
-        // step of a chain carries the modifier of the domain before it, so
-        // the base type at the end gets it (`full_base_type`).
+        // `pg_attribute.attgenerated` only from Postgres 12.
+        //
+        // The base type follows the domain chain of the column type. When it ends at an
+        // array, the element type's chain is followed too and `[]` kept: `amount[]` and a
+        // domain over `amount[]` are both `numeric[]`. Postgres has one array type per
+        // element type, so one level suffices. A domain holds its base type's modifier in
+        // `typtypmod`, so each step carries the previous domain's modifier down to the final
+        // base type (`full_base_type`).
         "WITH cols AS ( \
            SELECT a.attnum, a.attname, a.atttypid, a.atttypmod, a.attnotnull, a.atthasdef, \
                   a.attidentity, r.relname, n.nspname, \
@@ -230,10 +230,8 @@ async fn describe_table(
             field.nullable = r.nullable;
             field.generated = r.generated;
             field.has_default = r.has_default;
-            // The manifest keeps the base type of a domain, so import can
-            // treat a domain over `money` as `money`. A domain over a domain
-            // resolves to the last base type.
-            // It keeps the modifier, so a change from `numeric(10,3)` to
+            // The manifest keeps a domain's final base type, so import can treat a domain over
+            // `money` as `money`. The modifier is kept too, so `numeric(10,3)` becoming
             // `numeric(6,2)` under one domain name is a change of type.
             if r.base_type != r.plain_type {
                 field.base_type = Some(r.full_base_type);
@@ -465,9 +463,9 @@ impl CapsuleStore for PgCapsuleStore {
                         .execute(conn)
                         .await
                         .map_err(|e| store_error("check deferred constraints", &e))?;
-                    // Check every move first: one `setval` that fails after
-                    // another one ran would leave a changed sequence.
-                    // Each imported column can own a sequence, not only the key.
+                    // Plan every move before any `setval`: one that fails after another ran
+                    // would leave a changed sequence. Any imported column can own a sequence,
+                    // not only the key.
                     let mut columns = Vec::new();
                     for (_, _, batch) in &statements {
                         for field in batch.model.fields.iter().filter(|f| !f.generated) {
@@ -491,10 +489,9 @@ impl CapsuleStore for PgCapsuleStore {
                             ));
                         }
                     }
-                    // Another import of the same sequence plans from its own
-                    // rows, and its `setval` could move the sequence back
-                    // past ours. Lock each sequence until commit, in one
-                    // order, so two imports cannot hold each other's lock.
+                    // A concurrent import of the same sequence plans from its own rows and its
+                    // `setval` could move the sequence back past ours. Lock each sequence until
+                    // commit, in sorted order so two imports cannot deadlock.
                     owned.sort_unstable();
                     owned.dedup_by(|a, b| a.0 == b.0);
                     for (seq, _, _, _) in &owned {
@@ -753,12 +750,11 @@ async fn plan_sequence(
     if keys.is_empty() {
         return Ok(None);
     }
-    // Read where the sequence is from the sequence itself. After `RESTART
-    // WITH n` or `setval(.., false)` it is not called, and its next value is
-    // `n` itself; `pg_sequence_last_value` gives `NULL` then, as for an
-    // unused sequence, and planning from the start would move it back. That
-    // read needs `SELECT`: without it, a used sequence could look unused,
-    // and `setval` could move it back onto values it already made.
+    // Read the position from the sequence itself. After `RESTART WITH n` or
+    // `setval(.., false)` it is not called and its next value is `n`; `pg_sequence_last_value`
+    // gives `NULL` then, as for an unused sequence, and planning from the start would move it
+    // back. The read needs `SELECT`: without it a used sequence could look unused, and
+    // `setval` could move it back onto values it already handed out.
     let state: SelectGrant =
         diesel::sql_query("SELECT has_sequence_privilege($1::regclass, 'SELECT') AS can_select")
             .bind::<diesel::sql_types::Text, _>(&seq)
@@ -777,19 +773,16 @@ async fn plan_sequence(
             .get_result(conn)
             .await
             .map_err(|e| store_error(&format!("sequence of {target}"), &e))?;
-    // The sequence makes only `start + k * inc`, so only a key on that path
-    // can be a value it makes. The sequence moves to the outermost such key,
-    // in its own direction. A key off the path (500 for `INCREMENT BY 3` from
-    // 1) needs no move: moving to the path value before it would only use up
-    // values that are still free. A key needs a move when it is at or past
-    // the next value of the sequence: `last_value` when it is not called (an
-    // unused or restarted sequence), else the value after it. The arithmetic
-    // is in numeric: `key - start` and `last + inc` can leave the bigint
-    // range. Only the
-    // imported keys count: a row that the target had before, even one outside
-    // the sequence range, is not this import's to check. A key that is not an
-    // integer, or is outside the bigint range, is not a value a sequence
-    // makes.
+    // The sequence makes only `start + k * inc`, so only a key on that path can collide; the
+    // sequence moves to the outermost such key, in its own direction. A key off the path (500
+    // for `INCREMENT BY 3` from 1) needs no move: moving to the path value before it would
+    // only use up free values. A move is needed when the key is at or past the next value:
+    // `last_value` when not called (unused or restarted), else the value after it.
+    //
+    // Only imported keys count: rows the target already had, even outside the sequence range,
+    // are not this import's to check. A key that is not an integer in the bigint range is not
+    // a sequence value. The arithmetic is in numeric because `key - start` and `last + inc`
+    // can leave the bigint range.
     let plan: Option<SequencePlan> = diesel::sql_query(
         "SELECT s.m AS target, s.cache, s.min, s.max, s.cycle, CASE WHEN s.inc > 0 \
            THEN s.m >= s.next ELSE s.m <= s.next END AS needed, \
@@ -829,8 +822,7 @@ async fn plan_sequence(
             plan.cache
         )));
     }
-    // After its last value, a `CYCLE` sequence starts again, at an imported
-    // key.
+    // After its last value a `CYCLE` sequence wraps around onto imported keys.
     if plan.cycle {
         return Err(DataCapsuleError::NotConfigured(format!(
             "the sequence of {target} cycles; import needs NO CYCLE"
@@ -1049,7 +1041,6 @@ mod tests {
         })
         .unwrap();
         assert!(sql.contains("(e.j ->> 'fee')::numeric::money"), "{sql}");
-        // A `money[]` column is rebuilt element by element, in order.
         model.fields[2] = FieldSpec::new("fee", "money[]").nullable();
         let sql = insert_sql(&ImportBatch {
             model: &model,

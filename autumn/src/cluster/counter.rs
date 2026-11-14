@@ -49,8 +49,7 @@
         clippy::arithmetic_side_effects,
     )
 )]
-// `pub` throughout this file is crate-visible only: the enclosing `cluster`
-// submodule is itself `pub(crate)`, so nothing here escapes the crate
+// `pub` here is crate-visible only: the enclosing `cluster` module is `pub(crate)`
 // (clippy::redundant_pub_crate).
 
 use std::collections::BTreeMap;
@@ -88,9 +87,6 @@ impl CounterShards {
     /// Only ever called with the *local* node's current cell key: a node that
     /// writes another cell breaks the semilattice.
     pub fn increment_cell(&mut self, cell: &str, by: u64) {
-        // `entry` rather than `get_mut`/`insert` so a first increment and a
-        // subsequent one take the same path; `saturating_add` because the panic
-        // gate forbids the wrapping alternative.
         let tally = self.cells.entry(cell.to_owned()).or_default();
         *tally = tally.saturating_add(by);
     }

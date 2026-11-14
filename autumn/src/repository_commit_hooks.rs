@@ -9,8 +9,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
-// `AtomicBool`/`Ordering` back the Postgres kick-worker's pending flag, which is
-// `cfg`-gated off under `sqlite` (the durable hook worker is Postgres-only).
+// Only the Postgres kick-worker's pending flag uses these.
 #[cfg(not(feature = "sqlite"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -19,23 +18,19 @@ use diesel::OptionalExtension as _;
 use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::deadpool::Pool;
 use futures::FutureExt as _;
-// `scope_boxed` boxes the `SQLite` claim's transaction closure future for
-// `scoped_immediate_transaction`.
+// `scope_boxed`, for the `SQLite` claim's `scoped_immediate_transaction`.
 #[cfg(feature = "sqlite")]
 use scoped_futures::ScopedFutureExt as _;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::Digest as _;
-// `Notify` backs the Postgres kick-worker's coalesced pending flag, and (under
-// `sqlite`) the single-node poll-loop wake.
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::{AutumnError, AutumnResult};
 
-// The Postgres worker is typed on `PgPool`; the shared enqueue/finalize surface
-// and the `SQLite` worker are typed on the runtime pool alias `RtPool` (on
-// Postgres the two are the SAME type, since `RuntimeConnection = AsyncPgConnection`).
+// The Postgres worker takes `PgPool`; shared code and the `SQLite` worker take `RtPool`.
+// On Postgres they are the same type.
 #[cfg(not(feature = "sqlite"))]
 type PgPool = Pool<diesel_async::AsyncPgConnection>;
 type RtPool = Pool<crate::db::RuntimeConnection>;
@@ -81,16 +76,13 @@ const HOOK_SQLITE_SETTLE_MAX_ATTEMPTS: usize = 10;
 const HOOK_SQLITE_SETTLE_RETRY_SLEEP: Duration = Duration::from_millis(25);
 const HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS: usize = 3;
 
-// ── Backend-forked SQL (#1996 item 5) ────────────────────────────────────────
+// ── Backend-forked SQL ──────────────────────────────────────────────────────
 //
-// Only one backend's arm is ever compiled. The Postgres SQL is byte-identical to
-// the original (numbered `$n` placeholders, `NOW()`, `::JSONB` casts). The `SQLite`
-// SQL uses `?` positional placeholders (bound in the SAME order as the Postgres
-// binds so a single shared function body serves both), `CURRENT_TIMESTAMP` in
-// place of `NOW()`, no `::JSONB` casts (the columns are already `TEXT`), and
-// lowercase `excluded` in the upsert. Structurally-divergent statements (claim,
-// nack retry/dead-letter, stale recovery, and bulk enqueue) are forked at the
-// function level instead — see `*_claim_next` / `*_nack_*` / `*_recover_stale*`.
+// Only one backend's arm is compiled. The `SQLite` SQL binds `?` placeholders in the same
+// order as the Postgres `$n` binds, so one function body serves both. It uses
+// `CURRENT_TIMESTAMP` for `NOW()` and drops the `::JSONB` casts (the columns are `TEXT`).
+// Statements that differ in structure (claim, nack, stale recovery, bulk enqueue) are
+// forked at the function level instead.
 
 #[cfg(not(feature = "sqlite"))]
 const HOOK_SELECT_COLS: &str = "id, handler_key, hook_name, context::TEXT AS context, \
@@ -277,10 +269,8 @@ const HOOK_RECOVER_STALE_PENDING_SQL: &str = "UPDATE autumn_repository_commit_ho
       WHERE status IN ('pending_after_hook', 'after_hook_succeeded') \
         AND claimed_at < NOW() - ($2::BIGINT * INTERVAL '1 millisecond')";
 
-// `SQLite` stale recovery: identical branch semantics, but the `NOW() - INTERVAL`
-// arithmetic is replaced by a Rust-computed cutoff bound (bound SECOND, matching
-// its textual position after the `last_error` message) — `WHERE claimed_at < ?`
-// compares against a UTC `YYYY-MM-DD HH:MM:SS.fff` string. Binds: (last_error, cutoff).
+// `SQLite` has no interval arithmetic, so the cutoff is computed in Rust as a UTC
+// `YYYY-MM-DD HH:MM:SS.fff` string. Binds: (last_error, cutoff).
 #[cfg(feature = "sqlite")]
 const HOOK_RECOVER_STALE_RUNNING_SQL: &str = "UPDATE autumn_repository_commit_hooks \
      SET status = CASE \
@@ -377,10 +367,8 @@ impl RepositoryCommitHookKickState {
     }
 }
 
-// `SQLite` is single-node and single-writer, so it needs no LISTEN/NOTIFY: an
-// in-process `Notify` per pool wakes that pool's poll loop the moment a mutation
-// commits. A missed kick is harmless — the loop also wakes on its idle sleep and
-// drains, so durability never depends on the kick landing.
+// `SQLite` is single-node, so an in-process `Notify` per pool replaces LISTEN/NOTIFY. A
+// missed kick is harmless: the poll loop also wakes on its idle sleep.
 #[cfg(feature = "sqlite")]
 static SQLITE_HOOK_KICKERS: OnceLock<RwLock<HashMap<usize, Arc<Notify>>>> = OnceLock::new();
 
@@ -668,11 +656,9 @@ where
     C: Serialize + Sync + ?Sized,
     R: Serialize + Sync + ?Sized,
 {
-    // Postgres stages every row in one `UNNEST`-driven statement. `SQLite` has no
-    // array binds, so its arm loops the single-row staged insert on the SAME
-    // caller connection (already inside the mutation transaction, so the rows
-    // still commit atomically with the domain write). Both dedupe/restage
-    // identically via `ON CONFLICT (id) DO UPDATE`.
+    // `SQLite` has no array binds, so it loops the single-row insert instead of `UNNEST`.
+    // The caller's connection is inside the mutation transaction, so the rows still commit
+    // atomically with the domain write.
     #[cfg(not(feature = "sqlite"))]
     const SQL: &str = "INSERT INTO autumn_repository_commit_hooks \
          (id, handler_key, hook_name, context, record, status, attempt, \
@@ -784,8 +770,7 @@ where
     C: Serialize + Sync + ?Sized,
     R: Serialize + Sync + ?Sized,
 {
-    // See `enqueue_repository_commit_hooks_pending_bulk_on_conn` for the pg/sqlite
-    // fork rationale (UNNEST batch vs. per-row loop on the same txn connection).
+    // Forked like `enqueue_repository_commit_hooks_pending_bulk_on_conn`.
     #[cfg(not(feature = "sqlite"))]
     const SQL: &str = "INSERT INTO autumn_repository_commit_hooks \
          (id, handler_key, hook_name, context, record, status, attempt, \
@@ -1111,10 +1096,8 @@ fn embed_originating_tenant_in_context(context: String) -> AutumnResult<String> 
         .try_with(std::clone::Clone::clone)
         .ok()
         .flatten();
-    // Fail closed: only embed a genuinely non-blank tenant. A blank or
-    // whitespace-only ambient tenant is never persisted, so the worker runs the
-    // hook with `CURRENT_TENANT` UNSET and a `tenant_scoped` repo fails closed
-    // rather than resolving to `tenant_id = ''` (or whitespace).
+    // Fail closed: a blank tenant is not persisted, so a `tenant_scoped` repo in the hook
+    // fails rather than resolving to `tenant_id = ''`.
     let tenant = tenant.filter(|value| !value.trim().is_empty());
     let Some(tenant) = tenant else {
         return Ok(context);
@@ -1141,19 +1124,15 @@ fn embed_originating_tenant_in_context(context: String) -> AutumnResult<String> 
 /// re-establish (`None` when the hook was enqueued outside any tenant scope).
 #[cfg(feature = "sqlite")]
 fn extract_originating_tenant_from_context(context: &str) -> (Value, Option<String>) {
-    // A context that does not parse is handled downstream when the runner
-    // re-parses it; surface it untouched with no tenant so the hook still runs
-    // (and fails closed if it touches a tenant_scoped repo).
+    // An unparsable context yields `Value::Null` and no tenant: the hook still runs, unscoped,
+    // so a `tenant_scoped` repo in it fails closed.
     serde_json::from_str::<Value>(context).map_or((Value::Null, None), |mut value| {
         let tenant = match &mut value {
             Value::Object(map) => map
                 .remove(TENANT_CONTEXT_KEY)
                 .and_then(|value| match value {
-                    // Fail closed: a blank or whitespace-only persisted tenant is
-                    // NOT an established tenant. Normalize it to `None` so the drain
-                    // loop leaves `CURRENT_TENANT` UNSET rather than scoping a
-                    // `tenant_scoped` repo to `tenant_id = ''` (or whitespace).
-                    // A non-blank tenant is preserved verbatim (never trimmed).
+                    // Fail closed: a blank tenant leaves `CURRENT_TENANT` unset. A non-blank
+                    // tenant is kept verbatim, not trimmed.
                     Value::String(tenant) if tenant.trim().is_empty() => None,
                     Value::String(tenant) => Some(tenant),
                     _ => None,
@@ -1257,16 +1236,11 @@ pub fn start_repository_commit_hook_worker(
     }))
 }
 
-// ── `SQLite` durable worker (#1996 item 5) ─────────────────────────────────────
+// ── `SQLite` durable worker ─────────────────────────────────────────────────────
 //
-// Single-node, single-writer: no `LISTEN/NOTIFY`, no `FOR UPDATE SKIP LOCKED`.
-// The worker polls on the idle sleep AND wakes immediately on an in-process
-// `Notify` kick, then claims one ready row at a time under a `BEGIN IMMEDIATE`
-// write lock (`sqlite_claim_next_repository_commit_hook`). Graceful shutdown is
-// the same `tokio::select!` on the child `CancellationToken` the Postgres worker
-// uses: the loop finishes the in-flight `drain` iteration (claim → run →
-// ack/nack) it is on and settles it before observing `cancelled()` on the next
-// pass, so no leased row is abandoned mid-flight.
+// Single-node, single-writer: no `LISTEN/NOTIFY` and no `FOR UPDATE SKIP LOCKED`. The
+// worker wakes on its idle sleep or an in-process `Notify` kick, and claims one row at a
+// time under a `BEGIN IMMEDIATE` write lock.
 #[cfg(all(feature = "ws", feature = "sqlite"))]
 /// Start the durable commit-hook worker. Returns its handle, or `None` when no
 /// handler is registered. Cancel `shutdown`, then await the handle: the
@@ -1534,9 +1508,8 @@ async fn run_repository_commit_hook_row_value(
 
     match result {
         Ok(Ok(())) => Ok(()),
-        // `message`, not `Display`: both nack paths persist this in
-        // `last_error`, so it must not move when `Display` gains the field
-        // list of a hook that returned a validation error.
+        // `message`, not `Display`: this is persisted in `last_error`, and `Display` adds
+        // the field list of a validation error.
         Ok(Err(error)) => Err(error.message()),
         Err(panic) => Err(format_repository_commit_hook_panic(&*panic)),
     }
@@ -1811,9 +1784,6 @@ async fn recover_stale_repository_commit_hooks(pool: &RtPool, worker_id: &str) {
         return;
     };
 
-    // Postgres computes the stale cutoff inline (`NOW() - INTERVAL`); `SQLite` has
-    // no interval arithmetic, so the cutoff is computed here and bound as a
-    // comparable UTC timestamp string. Same recovery semantics on both.
     let running_result = crate::backend_select! {
         pg => {{
             let stale_after_ms =
@@ -1892,7 +1862,7 @@ fn sqlite_stale_claim_cutoff() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now() - stale_after
 }
 
-// ── `SQLite` claim / drain / nack (#1996 item 5) ───────────────────────────────
+// ── `SQLite` claim / drain / nack ───────────────────────────────────────────────
 
 /// Claim the next ready hook row under a `BEGIN IMMEDIATE` write lock. `SQLite` is
 /// single-writer, so instead of `FOR UPDATE SKIP LOCKED` the worker takes the
@@ -1913,10 +1883,8 @@ async fn sqlite_claim_next_repository_commit_hook(
     // Real time: SQLite stamps `run_at` with its own `CURRENT_TIMESTAMP`, so a
     // virtual clock would never reach it (issue #2967).
     let now = sqlite_timestamp(chrono::Utc::now());
-    // The registered handler keys are internal Rust type-path strings (no
-    // user input); inline them as an escaped `IN (...)` literal list so the raw
-    // `sql_query` needs a fixed bind arity (`run_at <= ?` only). Single quotes
-    // are still doubled defensively.
+    // Handler keys are Rust type paths, not user input. Inlining them keeps the bind arity
+    // fixed; quotes are still doubled defensively.
     let handler_in_list = handler_keys
         .iter()
         .map(|key| format!("'{}'", key.replace('\'', "''")))
@@ -2036,11 +2004,8 @@ pub async fn sqlite_drain_ready_repository_commit_hooks(
         // An aborted worker drops this future: the guard still stops the heartbeat.
         let _heartbeat_guard = heartbeat_shutdown.clone().drop_guard();
 
-        // Tenant isolation (INVIOLABLE): re-establish the SAME tenant the hook was
-        // enqueued under before running it, so a `tenant_scoped` repository the
-        // hook touches resolves to the originating tenant — never another tenant,
-        // and never a default/global scope. A hook enqueued with no tenant runs
-        // with `CURRENT_TENANT` UNSET, so such a repo fails closed.
+        // Run the hook under the tenant it was enqueued under. With no tenant,
+        // `CURRENT_TENANT` stays unset and a `tenant_scoped` repo fails closed.
         let (context_value, tenant) = extract_originating_tenant_from_context(&row.context);
         let result = match tenant {
             Some(tenant) => {
@@ -2443,11 +2408,8 @@ mod tests {
             .build()
             .expect("pool");
 
-        // The first call in a fresh process also pays one-time costs: paging in
-        // the code of the pool, driver and runtime paths it touches. nextest
-        // runs each test in its own process, and on a macOS runner that alone
-        // took the call past 750ms. Warm those paths first, under a bound wide
-        // enough for any runner that still fails a call that hangs.
+        // The first call in a fresh process pays one-time warm-up, which took a macOS
+        // runner past 750ms. Warm up under a wide bound that still catches a hang.
         let warm = tokio::time::timeout(
             Duration::from_secs(30),
             mark_repository_commit_hook_after_hook_failed(&pool, "hook-id", "owner", "boom"),
@@ -2836,9 +2798,8 @@ mod tests {
         );
     }
 
-    // `SQLite` fork of the staged-lifecycle invariants: identical status-machine
-    // wording, but `CURRENT_TIMESTAMP`/`excluded`/bare-`'{}'` in place of the
-    // Postgres `NOW()`/`EXCLUDED`/`::JSONB`.
+    // The `SQLite` SQL has the same status machine, with `CURRENT_TIMESTAMP`, `excluded`
+    // and bare `'{}'` in place of `NOW()`, `EXCLUDED` and `::JSONB`.
     #[cfg(feature = "sqlite")]
     #[test]
     fn staged_hooks_are_not_dispatchable_until_finalized_after_regular_hooks_sqlite() {
@@ -2944,14 +2905,12 @@ mod tests {
 
         assert!(is_missing_hook_table_error(&error));
 
-        // SQLite reports the missing queue table differently.
         let sqlite_error = diesel::result::Error::QueryBuilderError(
             std::io::Error::other("no such table: autumn_repository_commit_hooks").into(),
         );
 
         assert!(is_missing_hook_table_error(&sqlite_error));
 
-        // An unrelated error must not be misclassified as a missing table.
         let unrelated = diesel::result::Error::QueryBuilderError(
             std::io::Error::other("connection reset by peer").into(),
         );

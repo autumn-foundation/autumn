@@ -88,13 +88,10 @@ where
 
         let method = req.method().clone();
         let uri = req.uri().clone();
-        // OTel HTTP server semantic conventions want `{method} {http.route}`
-        // for span names, falling back to the method alone when the matched
-        // route template is unknown. Axum resolves the template inside the
-        // inner service so we can't see it here — using the raw URI path
-        // would explode cardinality (every `/users/123` hits a distinct
-        // span name). Stick to the method and keep the path as a searchable
-        // attribute.
+        // OTel semantic conventions name the span `{method} {http.route}`, or the method alone
+        // when the route template is unknown. Axum resolves the template inside the inner
+        // service, and the raw path would explode span-name cardinality, so the name is the
+        // method and the path goes in an attribute.
         let span = tracing::info_span!(
             "http.server.request",
             otel.name = %method,
@@ -103,15 +100,12 @@ where
             url.path = %uri.path(),
             http.response.status_code = tracing::field::Empty,
         );
-        // Failure only occurs when no `tracing-opentelemetry` subscriber is
-        // installed — which simply means traces aren't being collected.
-        // Nothing to recover from at ingress time.
+        // Fails only when no `tracing-opentelemetry` subscriber is installed, i.e. traces are
+        // not being collected.
         let _ = span.set_parent(parent_cx);
 
-        // Enter the span before building the inner future so any tracing
-        // performed synchronously inside downstream `Service::call`
-        // implementations is parented on the extracted context, not just
-        // the work that runs during `poll`.
+        // Enter the span before calling the inner service so tracing done synchronously in
+        // downstream `Service::call` is parented on the extracted context too, not only `poll`.
         let future = span.in_scope(|| self.inner.call(req));
         TraceContextFuture {
             inner: future.instrument(span.clone()),
@@ -169,9 +163,8 @@ impl Extractor for HeaderMapExtractor<'_> {
 
 struct HeaderMapInjector<'a>(&'a mut HeaderMap);
 
-// The two keys the W3C trace-context propagator injects on every response.
-// Neither is a standard `http` header, so `HeaderName::from_bytes` would copy
-// the name into a fresh allocation each time; these are built at compile time.
+// The two keys the W3C propagator injects on every response. Neither is a standard `http`
+// header, so `HeaderName::from_bytes` would allocate the name on every call.
 const TRACEPARENT_HEADER: http::HeaderName = http::HeaderName::from_static("traceparent");
 const TRACESTATE_HEADER: http::HeaderName = http::HeaderName::from_static("tracestate");
 
@@ -254,8 +247,6 @@ mod tests {
 
     #[test]
     fn precomputed_trace_header_names_match_parsed_names() {
-        // Regression guard: the compile-time names are the same names
-        // `from_bytes` produced for these keys before.
         assert_eq!(
             TRACEPARENT_HEADER,
             http::HeaderName::from_bytes(b"traceparent").unwrap()
@@ -270,8 +261,6 @@ mod tests {
 
     #[test]
     fn traceparent_extracts_expected_span_context() {
-        // Verifies the extractor plumbing end-to-end against the W3C
-        // propagator without needing a global subscriber.
         let mut headers = HeaderMap::new();
         headers.insert("traceparent", TRACEPARENT.parse().unwrap());
         let propagator = TraceContextPropagator::new();
@@ -284,9 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_runs_request_without_propagator_installed() {
-        // When no global propagator is installed (the default in test
-        // processes), the layer should still pass the request through
-        // without panicking or erroring.
+        // No global propagator is installed in test processes.
         let app = Router::new()
             .route("/", get(|| async { "ok" }))
             .layer(TraceContextLayer);
@@ -306,7 +293,6 @@ mod tests {
 
     #[tokio::test]
     async fn service_propagates_inner_error_through_poll() {
-        // Exercises the `Poll::Ready(Err(_))` branch in `TraceContextFuture::poll`.
         use std::convert::Infallible;
         use tower::Service;
 
@@ -329,8 +315,7 @@ mod tests {
             }
         }
 
-        // Infallible placates the compiler that `ErrService::Error` is usable
-        // directly without axum's Router error remapping.
+        // No effect; keeps the `Infallible` import used.
         let _ = std::marker::PhantomData::<Infallible>;
 
         let mut layered = TraceContextLayer.layer(ErrService);
@@ -342,8 +327,6 @@ mod tests {
 
     #[tokio::test]
     async fn call_records_status_code_on_response_span_field() {
-        // Covers the `span.record("http.response.status_code", ...)` line in
-        // `TraceContextFuture::poll` by driving a status through the layer.
         let app = Router::new()
             .route("/", get(|| async { (StatusCode::IM_A_TEAPOT, "teapot") }))
             .layer(TraceContextLayer);

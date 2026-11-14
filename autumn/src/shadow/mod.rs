@@ -36,11 +36,8 @@
 //! assembled into the ingress stack by the framework router; nothing here needs
 //! to be called by hand. See `docs/guide/staged-deploys.md`.
 
-// Private modules behind a curated re-export list, matching
-// `crate::middleware`: the module split is an implementation detail, and
-// everything below is deliberate public surface. `transport` stays public
-// because a third party may want to implement [`ShadowTransport`] against a
-// non-HTTP candidate.
+// The module split is private; the re-exports below are the public surface. `transport` stays
+// public so a third party can implement [`ShadowTransport`] against a non-HTTP candidate.
 pub(crate) mod config;
 pub(crate) mod diff;
 pub(crate) mod layer;

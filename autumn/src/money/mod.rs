@@ -313,9 +313,8 @@ macro_rules! currencies {
                 }
             }
 
-            // Keeps `scale_for`'s closed table total. Spelled as a set rather
-            // than `<= MAX_EXPONENT`, because a comparison between two
-            // constants is folded away and reported as useless.
+            // Keeps `scale_for`'s closed table total. A match, not `<= MAX_EXPONENT`: a
+            // comparison between two constants is linted as useless.
             const _: () = assert!(matches!($exp, 0..=MAX_EXPONENT));
         )*
 
@@ -840,8 +839,7 @@ impl<C: Currency> Money<C> {
             return Err(MoneyError::InvalidWeights);
         }
 
-        // i128 so the numerator cannot overflow: an i64 amount times an i64
-        // weight needs 128 bits.
+        // An i64 amount times an i64 weight needs 128 bits.
         let amount = i128::from(self.minor);
         let divisor = i128::from(total_weight);
 
@@ -860,7 +858,7 @@ impl<C: Currency> Money<C> {
             shares.push((share, remainder));
         }
 
-        // Whatever flooring held back, handed out one minor unit at a time.
+        // Hand out what flooring held back, one minor unit each, largest remainder first.
         let mut leftover = amount
             .checked_sub(floor_total)
             .ok_or(MoneyError::Overflow)?;

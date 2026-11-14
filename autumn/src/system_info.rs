@@ -45,7 +45,6 @@ mod tests {
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), 200);
 
-        // Ensure it returns valid json
         let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
             .await
             .unwrap();

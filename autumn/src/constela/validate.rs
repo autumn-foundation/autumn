@@ -638,11 +638,8 @@ impl<'a> Validator<'a> {
                 &mut scope,
             );
 
-            // A component's children go into its slot, and the AST gives no
-            // way to say *which* children go into *which* named slot. Rather
-            // than pick a rule — duplicate the children into every slot, or
-            // silently fill only the first — a second slot is rejected, so a
-            // document can never be ambiguous about where its children land.
+            // The AST cannot say which children go into which slot, so a second
+            // slot is rejected rather than guessing where the children land.
             let slots = count_slots(&component.view);
             if slots > 1 {
                 self.error(
@@ -871,15 +868,11 @@ impl<'a> Validator<'a> {
         if let Some(name) = element_ref {
             self.check_binding_name(name, path.key("ref"));
         }
-        // Both maps guard the same failure: two props that collapse onto one
-        // emitted name, where HTML keeps whichever came first and the other
-        // binding silently disappears from a *validated* document.
+        // Two props that collapse onto one emitted name (`class` and `className`)
+        // would leave HTML keeping the first and silently dropping the other.
         let mut canonical_seen: BTreeMap<String, &str> = BTreeMap::new();
         let mut event_seen: BTreeMap<String, &str> = BTreeMap::new();
         for (attr, prop) in props {
-            // Two spellings of one attribute (`class` and `className`) would
-            // emit it twice, and HTML would silently keep whichever came
-            // first. Report it rather than pick.
             match prop {
                 Prop::Value(_) => {
                     let canonical = policy::canonical_attr(attr);
@@ -1029,10 +1022,8 @@ impl<'a> Validator<'a> {
         match prop {
             Prop::Handler(handler) => {
                 self.check_action_ref(&handler.action, path.key("action"));
-                // Judged by the same reduction the renderer will apply, so a
-                // name that survives validation is a name that reaches the
-                // page. `"_"` and an emoji are non-empty but reduce to
-                // nothing, and would have vanished silently at render time.
+                // Judged by the renderer's own reduction: `"_"` and an emoji are
+                // non-empty but reduce to nothing, and would vanish at render.
                 if policy::canonical_event(&handler.event).is_empty() {
                     self.error(
                         path.key("event"),
@@ -1300,15 +1291,10 @@ fn count_slots(node: &Node) -> usize {
         | Node::ErrorBoundary { fallback, content } => {
             count_slots(fallback).saturating_add(count_slots(content))
         }
-        // A nested invocation's *children* count against THIS component, not
-        // the one being invoked. They are rendered in the caller's slot scope
-        // (`SlotCtx::outer`), so a `slot` among them fills this component's
-        // slot — two of them would render this component's children twice,
-        // which is exactly what the at-most-one rule exists to prevent. The
-        // invoked component's own `view` is counted separately, when
-        // `check_components` reaches it.
+        // A nested invocation's children render in the caller's slot scope
+        // (`SlotCtx::outer`), so a `slot` among them fills THIS component's slot
+        // and counts against it. The invoked component's `view` is counted separately.
         Node::Component { children, .. } => children.iter().map(count_slots).sum(),
-        // These hold no nodes at all.
         Node::Text { .. } | Node::Markdown { .. } | Node::Code { .. } => 0,
     }
 }

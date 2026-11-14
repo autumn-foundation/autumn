@@ -511,7 +511,6 @@ impl SecurityConfig {
             self.rate_limit.trust_forwarded_headers || !self.rate_limit.trusted_proxies.is_empty();
 
         if new_set && old_set {
-            // Check for value-level conflicts.
             let new_ranges: std::collections::HashSet<&str> = self
                 .trusted_proxies
                 .ranges
@@ -981,10 +980,8 @@ impl SubmitTokenConfig {
         {
             return SubmitTokenMemoryGuard::Ok;
         }
-        // Resolved to the in-memory store in production. `backend == Some(Memory)`
-        // is an explicit opt-in (hard fail); `backend == None` inherited the
-        // memory idempotency backend (warn only). `Some(Redis)` cannot reach here
-        // because it would not resolve to memory.
+        // Memory in production: an explicit `Some(Memory)` is an opt-in and fails; `None` inherited
+        // the memory idempotency backend and only warns.
         match self.backend {
             Some(IdempotencyBackend::Memory) => SubmitTokenMemoryGuard::FailExplicit,
             _ => SubmitTokenMemoryGuard::WarnInherited,
@@ -1632,7 +1629,7 @@ mod tests {
     use super::*;
     use crate::config::IdempotencyBackend;
 
-    // ── submit-token backend resolution (Finding D: inherit idempotency) ─────
+    // ── submit-token backend resolution ─────────────────────────────────────
 
     #[test]
     fn verify_any_matches_one_of_many_candidates_under_any_key() {
@@ -1646,17 +1643,13 @@ mod tests {
 
     #[test]
     fn submit_token_backend_defaults_to_none_and_inherits_idempotency() {
-        // Unset `[security.submit_token].backend` deserializes to `None`.
         let cfg: SubmitTokenConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.backend, None, "unset backend must deserialize to None");
-        // With idempotency on Redis, the resolved submit-token backend follows
-        // it — NOT the old hardcoded Memory default.
         assert_eq!(
             cfg.resolved_backend(IdempotencyBackend::Redis),
             IdempotencyBackend::Redis,
             "an unset submit-token backend must inherit the Redis idempotency backend"
         );
-        // A dev app on the default Memory idempotency backend stays Memory.
         assert_eq!(
             cfg.resolved_backend(IdempotencyBackend::Memory),
             IdempotencyBackend::Memory,
@@ -1666,7 +1659,6 @@ mod tests {
 
     #[test]
     fn submit_token_explicit_backend_overrides_inherited_idempotency() {
-        // An explicit `backend = "memory"` wins even when idempotency is Redis.
         let cfg: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
         assert_eq!(cfg.backend, Some(IdempotencyBackend::Memory));
         assert_eq!(
@@ -1675,7 +1667,6 @@ mod tests {
             "an explicit submit-token backend override must win over the inherited backend"
         );
 
-        // An explicit `backend = "redis"` wins even when idempotency is Memory.
         let cfg: SubmitTokenConfig = toml::from_str("backend = \"redis\"").unwrap();
         assert_eq!(cfg.backend, Some(IdempotencyBackend::Redis));
         assert_eq!(
@@ -1685,13 +1676,12 @@ mod tests {
         );
     }
 
-    // ── submit-token production memory guard (Finding O) ────────────────────
+    // ── submit-token production memory guard ────────────────────────────────
 
     #[test]
     fn submit_token_explicit_memory_in_production_fails_fast() {
-        // EXPLICIT `[security.submit_token].backend = "memory"` in production
-        // is a deliberate unsafe opt-in → hard fail, mirroring idempotency's
-        // explicit enabled+memory prod guard.
+        // An explicit memory backend in production is an unsafe opt-in, so it fails like
+        // idempotency's explicit memory guard.
         let cfg: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
         assert_eq!(cfg.backend, Some(IdempotencyBackend::Memory));
         assert_eq!(
@@ -1706,16 +1696,13 @@ mod tests {
 
     #[test]
     fn submit_token_inherited_memory_in_production_only_warns() {
-        // INHERITED default (`backend = None`) resolving to Memory in production
-        // must NOT fail — upgrading Autumn must not turn into "prod won't boot
-        // without Redis". It only warns.
+        // An inherited memory backend only warns, so an upgrade cannot make production need Redis.
         let cfg: SubmitTokenConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.backend, None);
         assert_eq!(
             cfg.production_memory_guard(IdempotencyBackend::Memory, true),
             SubmitTokenMemoryGuard::WarnInherited,
         );
-        // Inherited Redis resolves to Redis → no warning, no fail.
         assert_eq!(
             cfg.production_memory_guard(IdempotencyBackend::Redis, true),
             SubmitTokenMemoryGuard::Ok,
@@ -1724,8 +1711,6 @@ mod tests {
 
     #[test]
     fn submit_token_memory_outside_production_is_ok() {
-        // Dev / non-production → no warn, no fail, regardless of explicit or
-        // inherited memory.
         let explicit: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
         assert_eq!(
             explicit.production_memory_guard(IdempotencyBackend::Memory, false),
@@ -1740,8 +1725,6 @@ mod tests {
 
     #[test]
     fn submit_token_explicit_redis_backend_never_triggers_guard() {
-        // An explicit Redis override never resolves to memory, so the guard is
-        // a no-op even in production.
         let cfg: SubmitTokenConfig = toml::from_str("backend = \"redis\"").unwrap();
         assert_eq!(
             cfg.production_memory_guard(IdempotencyBackend::Memory, true),
@@ -1749,7 +1732,7 @@ mod tests {
         );
     }
 
-    // ── validate_signing_secret (RED phase) ─────────────────────────────────
+    // ── validate_signing_secret ─────────────────────────────────────────────
 
     #[test]
     fn signing_secret_dev_skips_validation_with_none() {
@@ -1905,9 +1888,8 @@ mod tests {
 
     #[test]
     fn default_csp_does_not_allow_unsafe_eval() {
-        // htmx works without unsafe-eval; only `hx-on` opts into it.
-        // Keep the default tight so that the baseline policy passes
-        // Mozilla Observatory and similar automated scanners.
+        // htmx works without unsafe-eval; only `hx-on` needs it. A tight default passes Mozilla
+        // Observatory and similar scanners.
         let csp = default_content_security_policy();
         assert!(!csp.contains("'unsafe-eval'"), "csp = {csp}");
         assert!(
@@ -2118,9 +2100,8 @@ mod tests {
 
     #[test]
     fn rate_limit_named_key_accepts_short_macro_spellings() {
-        // `#[throttle(key = "principal")]` / `key = "token"` use the SHORT macro
-        // spellings; an operator moving an inline policy into config must be able
-        // to use the same words. Serde aliases bridge macro and config vocabularies.
+        // Serde aliases accept the `#[throttle(key = ...)]` spellings, so an inline policy can move
+        // into config unchanged.
         let toml_str = r#"
             [named.login]
             limit = 5
@@ -2147,7 +2128,6 @@ mod tests {
 
     #[test]
     fn rate_limit_named_key_still_accepts_long_config_spellings() {
-        // The canonical long spellings must keep working unchanged.
         let toml_str = r#"
             [named.login]
             limit = 5
@@ -2175,9 +2155,7 @@ mod tests {
 
     #[test]
     fn global_key_strategy_still_accepts_existing_spellings() {
-        // The aliases live on the shared `KeyStrategy` enum, so the global
-        // `key_strategy` field also accepts them — but its existing canonical
-        // spellings must remain valid.
+        // The aliases live on the shared `KeyStrategy`, so the global `key_strategy` gets them too.
         for (toml_str, expected) in [
             (
                 "key_strategy = \"authenticated_principal\"",
@@ -2185,7 +2163,7 @@ mod tests {
             ),
             ("key_strategy = \"api_token\"", KeyStrategy::ApiToken),
             ("key_strategy = \"ip\"", KeyStrategy::Ip),
-            // Aliases also work here (a beneficial side effect).
+            // Aliases.
             (
                 "key_strategy = \"principal\"",
                 KeyStrategy::AuthenticatedPrincipal,
@@ -2250,7 +2228,7 @@ mod tests {
         assert_eq!(config.upload.allowed_mime_types, vec!["text/plain"]);
     }
 
-    // ── ResolvedSigningKeys + resolve_signing_keys (RED phase) ─────────────
+    // ── ResolvedSigningKeys + resolve_signing_keys ──────────────────────────
 
     #[test]
     fn resolve_signing_keys_dev_generates_non_empty_ephemeral() {
@@ -2324,7 +2302,7 @@ mod tests {
         assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
-    // ── CspNonceConfig (RED phase) ────────────────────────────────────────────
+    // ── CspNonceConfig ────────────────────────────────────────────────────────
 
     #[test]
     fn csp_nonce_config_defaults_to_disabled() {

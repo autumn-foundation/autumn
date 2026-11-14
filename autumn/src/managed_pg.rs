@@ -89,9 +89,8 @@ pub(crate) fn emergency_stop() {
     let Some(provider) = EMERGENCY_PROVIDER.lock().ok().and_then(|g| g.clone()) else {
         return;
     };
-    // These exit paths run on a blocking migration thread (no async runtime
-    // entered), so drive the async stop to completion on a short-lived
-    // current-thread runtime.
+    // Callers run on a blocking thread with no runtime entered, so drive the stop on a
+    // short-lived current-thread runtime.
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -262,8 +261,6 @@ impl ManagedPostgresPoolProvider {
     pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
-            // Use `postgresql_embedded`'s default so a bundled build pins to its
-            // embedded archive version (offline, exact) instead of `*`.
             version: None,
             instance: Arc::new(Mutex::new(None)),
             resolved_url: Arc::new(Mutex::new(None)),
@@ -305,12 +302,9 @@ impl ManagedPostgresPoolProvider {
         match options.open(&path) {
             Ok(mut f) => {
                 use std::io::Write;
-                // `mode(0o600)` only applies on create; an existing (older-build /
-                // manually-created / symlinked) file keeps its old, possibly
-                // permissive mode. The URL embeds the cluster superuser password,
-                // so if we can't enforce owner-only we must NOT write it — skip
-                // publishing (it's only an optimization for task/build attach) and
-                // drop the truncated file rather than expose credentials.
+                // `mode(0o600)` applies only on create; an existing file keeps its old
+                // mode. The URL embeds the superuser password, so if owner-only cannot
+                // be enforced, drop the file and skip publishing (attach is optional).
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -335,20 +329,16 @@ impl ManagedPostgresPoolProvider {
 
     /// Provision (if needed) and start the cluster, returning its connection URL.
     async fn ensure_running(&self) -> Result<String, postgresql_embedded::Error> {
-        // Already started (e.g. a second pool, or repeated calls): reuse the
-        // running instance instead of trying to start a second server on the
-        // same — now locked — data dir.
+        // Already started: reuse the instance rather than start a second server on
+        // the now-locked data dir.
         if let Ok(guard) = self.instance.lock()
             && let Some(pg) = guard.as_ref()
         {
             return Ok(pg.settings().url(MANAGED_DB_NAME));
         }
 
-        // Attach mode: a cluster is already running (started by `autumn serve`)
-        // and `autumn task`/`autumn build` set `AUTUMN_MANAGED_PG_ATTACH_URL` to
-        // its published URL. Connect to it instead of starting a second
-        // postmaster on the daemon's locked data dir — and never `stop()` it,
-        // since its lifecycle belongs to the daemon.
+        // Attach mode: connect to the daemon's running cluster instead of starting a
+        // second postmaster on its locked data dir. `stop()` then leaves it alone.
         if let Some(url) = std::env::var_os(MANAGED_PG_ATTACH_URL_ENV)
             .and_then(|v| v.into_string().ok())
             .filter(|s| !s.trim().is_empty())
@@ -362,38 +352,28 @@ impl ManagedPostgresPoolProvider {
 
         let mut settings = Settings::new();
         settings.data_dir.clone_from(&self.data_dir);
-        // Extract the Postgres binaries under the managed data root rather than
-        // `Settings::new()`'s `$HOME/.theseus` default, which may be unset or
-        // unwritable under launchd/systemd/container supervisors and would fail
-        // before `initdb` even when the CLI-provided data dir is valid.
+        // Not the default `$HOME/.theseus`: `$HOME` may be unset or unwritable under
+        // launchd/systemd/container supervisors.
         settings.installation_dir = self.installation_dir();
-        // Only override the default version when one was explicitly requested;
-        // otherwise keep `Settings::new()`'s default so a `managed-pg-bundled`
-        // build uses its exact embedded archive version (no network resolution).
         if let Some(version) = &self.version {
             settings.version = version.clone();
         }
-        // Persistent cluster tied to the daemon, not a throwaway temp dir.
         settings.temporary = false;
         settings.timeout = Some(STARTUP_TIMEOUT);
-        // Stable superuser credentials: `initdb` bakes the password into the
-        // cluster on first boot only, but `Settings::new()` generates a *fresh*
-        // random password (and a temp password file) every time. Persisting
-        // them next to the data dir keeps later boots able to authenticate.
+        // `initdb` bakes the password in on first boot only, but `Settings::new()`
+        // generates a fresh one each time. Persisted credentials keep later boots
+        // able to authenticate.
         let (password, password_file) = self.stable_credentials();
         settings.password = password;
         settings.password_file = password_file;
 
         let mut pg = PostgreSQL::new(settings);
-        // `setup` is idempotent: it downloads/extracts and runs `initdb` only
-        // when the data dir is not already initialized.
+        // `setup` is idempotent: it runs `initdb` only on an uninitialized data dir.
         pg.setup().await?;
         pg.start().await?;
-        // The post-start database checks can still fail (auth, bootstrap-DB
-        // connection, etc.). The server is already running by now, so stop it
-        // before propagating — `create_pool` turns this error into
-        // `process::exit(1)`, which skips `Drop`/`on_shutdown` and would
-        // otherwise orphan the postmaster on the data dir/port.
+        // The server is running, so stop it before returning: `create_pool` turns the
+        // error into `process::exit(1)`, which skips `Drop`/`on_shutdown` and would
+        // orphan the postmaster.
         if let Err(e) = Self::ensure_app_database(&pg).await {
             let _ = pg.stop().await;
             return Err(e);
@@ -408,14 +388,10 @@ impl ManagedPostgresPoolProvider {
             *g = Some(url.clone());
         }
 
-        // Publish the URL so `autumn task`/`autumn build` can attach to this
-        // running cluster instead of contending for its locked data dir.
         self.publish_url(&url);
 
-        // Register for emergency shutdown so an abnormal boot exit (which
-        // bypasses `on_shutdown`) still stops the supervised child instead of
-        // orphaning it. The clone shares `instance`, so this is idempotent with
-        // a normal `stop()`.
+        // An abnormal boot exit bypasses `on_shutdown`; register so it still stops the
+        // child. The clone shares `instance`, so a normal `stop()` makes this a no-op.
         if let Ok(mut g) = EMERGENCY_PROVIDER.lock() {
             *g = Some(self.clone());
         }
@@ -443,21 +419,16 @@ impl ManagedPostgresPoolProvider {
             .unwrap_or(&self.data_dir)
             .to_path_buf();
         let _ = std::fs::create_dir_all(&parent);
-        // Harden the directory that holds the superuser password file: even with
-        // the file at `0600`, a local user with write access to a permissive
-        // parent could *replace* it and feed us attacker-controlled credentials.
-        // Failing closed here also rejects a parent owned by another user (a
-        // non-owner `chmod` errors, except for root).
+        // Even with the file at `0600`, a local user who can write the parent could
+        // replace it with attacker-controlled credentials.
         harden_credential_dir_or_exit(&parent);
         let password_file = parent.join(".autumn-pg-superuser");
 
         if let Ok(existing) = std::fs::read_to_string(&password_file) {
             let trimmed = existing.trim();
             if !trimmed.is_empty() {
-                // An existing file (older build, manual creation) may have a
-                // permissive mode; the create-time `0600` below never applied to
-                // it. Tighten it before reusing — it holds the cluster superuser
-                // password — and refuse to boot if we can't.
+                // The create-time `0600` below never applied to an existing file, so
+                // tighten it before reusing the password.
                 enforce_password_file_mode_or_exit(&password_file);
                 return (trimmed.to_owned(), password_file);
             }
@@ -474,10 +445,8 @@ impl ManagedPostgresPoolProvider {
         }
         if let Ok(mut f) = options.open(&password_file) {
             use std::io::Write;
-            // `mode(0o600)` only applies when the file is newly created; an
-            // existing empty/permissive file (interrupted first boot, manual
-            // `touch`) keeps its old mode, so tighten it (failing closed) before
-            // writing the superuser password into it.
+            // `mode(0o600)` applies only on create; an existing empty file (interrupted
+            // first boot, manual `touch`) keeps its old mode.
             enforce_password_file_mode_or_exit(&password_file);
             let _ = f.write_all(password.as_bytes());
         }
@@ -487,37 +456,28 @@ impl ManagedPostgresPoolProvider {
     /// Stop the supervised Postgres child. Wire this to the daemon's
     /// `on_shutdown` so the cluster shuts down with the app.
     pub async fn stop(&self) {
-        // Attached to a cluster owned by another process (the daemon): never stop
-        // it or remove its published URL — `autumn task`/`autumn build` only
-        // borrowed the running cluster.
+        // The daemon owns an attached cluster and its published URL.
         if self.attached.load(Ordering::SeqCst) {
             return;
         }
         let taken = self.instance.lock().ok().and_then(|mut guard| guard.take());
         let Some(pg) = taken else {
-            // Nothing running (or already stopped): clear the emergency registration.
             clear_emergency_registration();
             return;
         };
         if let Err(e) = pg.stop().await {
-            // The postmaster is still up. Put the handle back so a later
-            // `stop()`/emergency stop can retry, and leave the emergency
-            // registration in place — dropping both here would strand a running
-            // cluster with no way to reach it (notably for direct/foreground
-            // runs without the CLI's `postmaster.pid` reaper).
+            // The postmaster is still up. Keep the handle and the emergency registration
+            // so a later stop can retry; foreground runs have no `postmaster.pid` reaper.
             tracing::warn!(error = %e, "failed to stop managed Postgres cleanly; will retry on next stop");
             if let Ok(mut guard) = self.instance.lock() {
                 *guard = Some(pg);
             }
             return;
         }
-        // Stopped cleanly: drop the emergency-stop registration so a later app in
-        // the same process (integration tests) doesn't try to stop this now-dead
-        // handle. The resolved URL is carried on the per-app topology, so there is
-        // no process-global URL to clear.
+        // A later app in the same process (integration tests) must not stop this dead
+        // handle.
         clear_emergency_registration();
-        // Remove the published URL file so a later `autumn task`/`autumn build`
-        // doesn't try to attach to a cluster that is now down.
+        // Later `autumn task`/`autumn build` runs must not attach to a stopped cluster.
         let _ = std::fs::remove_file(self.published_url_path());
     }
 }
@@ -527,20 +487,15 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
         &self,
         config: &DatabaseConfig,
     ) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
-        // Reject a sharded config before starting anything. When the provider is
-        // installed only as the *pool* provider (`.with_pool_provider`),
-        // `resolve_shard_set` builds the shards directly from config and never
-        // calls `create_shard_topology`, so its fail-fast is bypassed — without
-        // this check the app would boot with control/migrations on the managed DB
-        // but tenant shards on external URLs.
+        // Reject shards before starting anything. Installed only as the pool provider,
+        // `resolve_shard_set` builds shards from config and never calls
+        // `create_shard_topology`, so its check would be bypassed.
         if config.has_shards() {
             reject_managed_shards();
         }
         let url = match self.ensure_running().await {
             Ok(url) => url,
             Err(e) => {
-                // A failed cluster start is fatal at boot — surface a clear
-                // diagnostic instead of hanging or silently running DB-less.
                 tracing::error!(error = %e, data_dir = %self.data_dir.display(),
                     "managed Postgres failed to provision/start");
                 eprintln!(
@@ -552,7 +507,6 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
             }
         };
 
-        // Build the normal pool from the managed URL; reuses all pool logic.
         let mut managed = config.clone();
         managed.primary_url = Some(url);
         managed.url = None;
@@ -563,17 +517,14 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
         &self,
         config: &DatabaseConfig,
     ) -> Result<Option<crate::db::DatabaseTopology>, PoolError> {
-        // The managed cluster is a single local primary. Ignore any external
-        // `replica_url` from the original config so reads don't silently hit an
-        // unrelated/stale replica while writes and migrations go to the managed
-        // primary; the default impl would build that replica pool.
+        // The managed cluster is a single local primary. Ignore any configured
+        // `replica_url` (the default impl would build it) so reads never hit an
+        // unrelated replica.
         let Some(primary) = self.create_pool(config).await? else {
             return Ok(None);
         };
-        // After `create_pool`, the cluster is running; carry its URL on the
-        // topology so startup migrations target this managed cluster — per-app,
-        // with no process-global. Prefer the resolved URL (set whether we started
-        // the cluster or attached to one), falling back to the retained handle.
+        // Startup migrations target this URL. `resolved_url` is set whether we started
+        // the cluster or attached to one.
         let migration_url =
             self.resolved_url
                 .lock()
@@ -595,9 +546,8 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
         _shard: &crate::config::ShardConfig,
         _defaults: &DatabaseConfig,
     ) -> Result<crate::db::DatabaseTopology, PoolError> {
-        // `setup_database` already started the cluster via `create_topology`;
-        // `process::exit` skips `on_shutdown`, so stop the child first to avoid
-        // orphaning it on the data dir/port, then fail fast.
+        // `create_topology` already started the cluster and `process::exit` skips
+        // `on_shutdown`, so stop the child first.
         self.stop().await;
         reject_managed_shards();
     }
@@ -631,10 +581,8 @@ fn default_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(MANAGED_PG_DATA_DIR_ENV) {
         return PathBuf::from(dir);
     }
-    // Layout is `<base>/<project>/pg`, not `<base>/pg/<project>`: the data dir's
-    // *parent* holds the per-cluster `.autumn-pg-superuser` file (initdb needs an
-    // empty data dir), so the project component must be the parent or every
-    // direct-run project under one user would share a single superuser password.
+    // `<base>/<project>/pg`, not `<base>/pg/<project>`: the data dir's parent holds
+    // the superuser password file, so it must be per project.
     let project = project_data_namespace();
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home)
@@ -642,8 +590,7 @@ fn default_data_dir() -> PathBuf {
             .join(project)
             .join("pg");
     }
-    // Windows (where HOME is usually unset): use a persistent app-data dir
-    // rather than the volatile temp dir, which is cleared on reboot.
+    // Windows usually has no HOME. Prefer app data to the temp dir, which reboots clear.
     if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(local_appdata)
             .join("autumn")
@@ -696,8 +643,8 @@ mod tests {
 
     #[test]
     fn attach_mode_uses_env_url_without_starting() {
-        // With the attach env set, `ensure_running` must return that URL without
-        // touching the (nonexistent) data dir, and `stop` must be a no-op.
+        // `ensure_running` must return the attach URL without touching the
+        // (nonexistent) data dir.
         temp_env::with_var(
             MANAGED_PG_ATTACH_URL_ENV,
             Some("postgresql://u:p@localhost:5499/autumn"),
@@ -711,7 +658,7 @@ mod tests {
                 let url = rt.block_on(provider.ensure_running()).unwrap();
                 assert_eq!(url, "postgresql://u:p@localhost:5499/autumn");
                 assert!(provider.attached.load(Ordering::SeqCst));
-                // No-op in attach mode: must not panic or strand state.
+                // A no-op in attach mode.
                 rt.block_on(provider.stop());
             },
         );

@@ -2183,11 +2183,9 @@ impl FleetLifecycle for FleetReplication {
             self.forget_closed(db.key());
             return;
         }
-        // Every pooled connection is gone. Ship everything they committed
-        // before the replicator's own connection — the last one — closes and
-        // lets SQLite checkpoint.
-        // The cutoff-aware lock: another thread may hold the replica, and
-        // shutdown must not wait for it past the cutoff.
+        // Every pooled connection is gone. Ship what they committed before the replicator's own
+        // connection, the last one, closes and lets SQLite checkpoint. The lock gives up at the
+        // shutdown cutoff: another thread may hold the replica.
         let shipped = lock_replicator(&replica, &|| self.shutdown_cutoff()).map_or_else(
             || {
                 Err((

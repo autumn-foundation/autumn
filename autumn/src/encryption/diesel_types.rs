@@ -34,8 +34,7 @@ macro_rules! encrypted_text_wrapper {
             }
         }
 
-        // Encrypted columns never leak plaintext through `Debug` (composes with
-        // #697 log scrubbing). The development escape hatch may opt back in.
+        // `Debug` hides the plaintext unless the development escape hatch is on.
         impl ::std::fmt::Debug for $name {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 if super::debug_plaintext_enabled() {

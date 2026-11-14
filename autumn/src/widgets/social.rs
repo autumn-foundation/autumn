@@ -362,8 +362,8 @@ pub fn reaction_controls(cfg: &ReactionControls) -> maud::Markup {
     };
     let primary_pressed = if up_pressed { "true" } else { "false" };
     let down_pressed_attr = if down_pressed { "true" } else { "false" };
-    // Stable per-direction button ids: what `hx-preserve` matches on when a
-    // shared/broadcast fragment must not clobber the viewer's pressed state.
+    // `hx-preserve` matches these stable ids, so a broadcast fragment does not clobber the
+    // viewer's pressed state.
     let primary_button_id = if like_mode {
         format!("{}-like", cfg.dom_id)
     } else {
@@ -371,13 +371,10 @@ pub fn reaction_controls(cfg: &ReactionControls) -> maud::Markup {
     };
     let down_button_id = format!("{}-down", cfg.dom_id);
     let preserve = cfg.preserve_pressed_state.then_some("true");
-    // Both forms share one sync scope with the `replace` strategy: a second
-    // click (up then down before the first response lands) aborts the
-    // in-flight request, so only the LAST click's response repaints the
-    // control. Without this the two independent forms race and the older
-    // response can land second, leaving the stale direction pressed even
-    // though the database holds the newer vote — the commits themselves are
-    // already serialized by the target-row lock; this orders the *responses*.
+    // Both forms share one `replace` sync scope: a second click aborts the in-flight request,
+    // so only the last click's response repaints. Otherwise an older response can land second
+    // and leave the stale direction pressed. The row lock orders the commits; this orders the
+    // responses.
     let hx_sync = format!("#{}:replace", cfg.dom_id);
 
     maud::html! {
@@ -983,13 +980,10 @@ fn comment_node(
     focus: bool,
 ) -> maud::Markup {
     let node_id = comment_dom_id(&cfg.dom_id, comment.id);
-    // The write path refuses a reply deeper than `max_depth`, so offering the
-    // form past it would be an invitation to a 422. `depth` is the parent's
-    // level, and the reply lands one below.
+    // The write path rejects a reply deeper than `max_depth` with a 422, so the form is not
+    // offered past it. `depth` is the parent's level; the reply lands one below.
     let can_reply = cfg.can_comment && depth < cfg.max_depth;
-    // Distinct accessible names per node. Without the author, every disclosure
-    // in a forty-comment thread announces the identical "Reply" and a screen
-    // reader user has no way to tell which one they are on.
+    // Name the author, so a screen reader can tell the "Reply" disclosures apart.
     let reply_label = format!("{} to {}", cfg.reply_label, comment.author);
     maud::html! {
         li id=(node_id) class="autumn-comment" tabindex=[focus.then_some("-1")] autofocus[focus] {
@@ -1036,17 +1030,15 @@ fn comment_form(
     } else {
         &cfg.submit_label
     };
-    // Same reason as the disclosure's: one accessible name per form, so the
-    // textarea says which comment it replies to.
+    // One accessible name per form, so the textarea says which comment it replies to.
     let field_label = reply_to_author.map_or_else(
         || cfg.placeholder.clone(),
         |author| format!("{} to {author}", cfg.reply_label),
     );
     let maxlength = cfg.max_body_bytes.map(|bytes| bytes.to_string());
-    // One sync scope for the whole thread, `replace`: two quick replies would
-    // otherwise race, and the older `outerHTML` response landing second would
-    // drop the newer comment from view. The commits are already ordered by the
-    // parent row lock; this orders the *responses*.
+    // One `replace` sync scope for the thread: otherwise an older `outerHTML` response
+    // landing second would drop the newer comment from view. The parent row lock orders the
+    // commits; this orders the responses.
     let hx_sync = format!("#{}:replace", cfg.dom_id);
     maud::html! {
         form class="autumn-comment-form" method="post" action=(cfg.action)
@@ -1064,10 +1056,8 @@ fn comment_form(
             label class="autumn-comment-label" for=(textarea_id) { (field_label) }
             textarea id=(textarea_id) class="autumn-comment-input" name=(cfg.body_field)
                 rows="3" required maxlength=[maxlength] placeholder=(cfg.placeholder) {
-                // Only the form that was actually submitted: `draft_reply_to`
-                // is `None` for the top-level form and `Some(id)` for a reply,
-                // which is exactly how `reply_to` identifies this one. Maud
-                // escapes the text, so a body full of markup is inert.
+                // Only in the form that was submitted: `draft_reply_to` matches `reply_to`
+                // (`None` for the top-level form). Maud escapes the text.
                 @if let Some(draft) = &cfg.draft
                     && reply_to == cfg.draft_reply_to
                 {
@@ -1179,7 +1169,8 @@ impl<'a> FeedConfig<'a> {
 /// passes through unchanged.
 fn encode_query_component(value: &str) -> String {
     use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-    // Everything outside the RFC 3986 unreserved set.
+    // Encodes everything but the RFC 3986 unreserved set and `! $ ' ( ) * , :`, which are
+    // safe inside a query value.
     const QUERY_COMPONENT: &AsciiSet = &CONTROLS
         .add(b' ')
         .add(b'"')
@@ -1211,7 +1202,6 @@ fn encode_query_component(value: &str) -> String {
 /// `#fragment` is preserved after the query (the query must precede it). Maud
 /// additionally HTML-escapes the whole value in the attribute.
 fn feed_next_url(config: &FeedConfig<'_>, cursor: &str) -> String {
-    // The query must go before any `#fragment`.
     let (base, fragment) = match config.url.split_once('#') {
         Some((base, frag)) => (base, Some(frag)),
         None => (config.url, None),
@@ -1289,9 +1279,8 @@ fn feed_sentinel(next_cursor: &str, config: &FeedConfig<'_>) -> maud::Markup {
 /// let last = feed_page(html! { article { "row 3" } }, None, &config).into_string();
 /// assert!(!last.contains("autumn-feed__sentinel"));
 /// ```
-// `items` is taken by value to keep `feed_page(html! { .. }, ..)` ergonomic (no
-// `&` at the call site, matching `alert`); Maud renders it by reference, hence
-// the allow.
+// `items` is taken by value so `feed_page(html! { .. }, ..)` needs no `&`, like `alert`;
+// Maud renders it by reference, hence the allow.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
 pub fn feed_page(
@@ -1399,7 +1388,7 @@ mod tests {
         );
         // A run of blank lines is one break, not several empty paragraphs.
         assert_eq!(comment_paragraphs("first\r\n\r\n\r\n\r\nsecond"), expected);
-        // A single newline stays INSIDE one paragraph, as before.
+        // A single newline stays inside one paragraph.
         assert_eq!(
             comment_paragraphs("one\r\ntwo"),
             vec!["one\ntwo".to_string()]
@@ -1621,8 +1610,7 @@ mod tests {
         )]);
 
         assert_eq!(views[0].author, "ada");
-        // No `author_name` column declared (or a missing author): the id, not
-        // an invented name.
+        // With no `author_name` column or no author, show the id, not an invented name.
         assert_eq!(views[0].replies[0].author, "user #7");
         // Nesting survives to arbitrary depth.
         assert_eq!(views[0].replies[0].replies[0].author, "grace");

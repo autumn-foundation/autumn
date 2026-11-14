@@ -162,9 +162,8 @@ impl RenderSlots {
     /// share of the pool equal to one.
     pub async fn render(&self, slot: &str, context: &[(String, String)]) -> String {
         if !self.declared.iter().any(|declared| declared == slot) {
-            // Not an error, and not silent either: a handler naming a slot the
-            // app never declared is a typo that would otherwise present as a
-            // panel that simply never appears.
+            // A slot the app never declared is a typo. Warn, or it shows up only as a panel
+            // that never appears.
             tracing::warn!(
                 slot,
                 "a handler asked for a render slot this application does not declare"

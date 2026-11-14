@@ -748,11 +748,9 @@ impl FaultState {
             FaultEffect::JobExecution => &self.job_execution_seq,
         };
 
-        // The global ordinal is allocated INSIDE the `recorded` lock, together
-        // with the per-target one. Bumping the atomic before taking the lock
-        // let two passes on a multi-threaded runtime interleave and pair one
-        // pass's global ordinal with another's target ordinal in a single
-        // record. The counters stay atomics; the lock is what orders them.
+        // Allocate the global ordinal inside the `recorded` lock, with the per-target one.
+        // Otherwise two passes on a multi-threaded runtime can interleave and pair one
+        // pass's global ordinal with another's target ordinal.
         let mut recorded = self
             .recorded
             .lock()
@@ -1038,12 +1036,9 @@ impl crate::interceptor::JobInterceptor for FaultJobInterceptor {
                     )))
                 }
                 Decision::Proceed => {
-                    // A panicking handler unwinds straight through `next.await`
-                    // (the job runtime catches it outside this seam), so a bare
-                    // post-await count would drop the pass and leave
-                    // `job_executions != failed + succeeded`. The guard books
-                    // the unwind as a failure; the happy path disarms it and
-                    // records the real result.
+                    // A panicking handler unwinds through `next.await` (the job runtime
+                    // catches it outside this seam). The guard books the unwind as a
+                    // failure so `job_executions == failed + succeeded` still holds.
                     let mut guard = RecordOnUnwind {
                         state: self.state.as_ref(),
                         armed: true,
@@ -1145,9 +1140,8 @@ impl crate::reporting::ErrorReporter for FaultReporter {
         &'a self,
         event: &'a crate::reporting::ErrorEvent,
     ) -> crate::reporting::ReportFuture<'a> {
-        // Recorded as the future is constructed rather than when it is polled:
-        // the reporter chain does both on the same detached task, and doing it
-        // here shortens the window `TestClient::fault_outcome` has to settle.
+        // Record at construction, not on poll: it shortens the window
+        // `TestClient::fault_outcome` has to wait for.
         self.state.record_server_error(ReportedError {
             status: event.status.as_u16(),
             method: event.method.clone(),
@@ -1274,8 +1268,7 @@ mod tests {
             build(SEED + 1),
             "different seeds should (overwhelmingly likely) diverge"
         );
-        // Every pick lands inside the requested range, and there are `count` of
-        // them (distinct, so the set does not collapse).
+        // `count` distinct picks, all inside the range.
         let planned = build(SEED);
         assert_eq!(planned.len(), 3);
         assert!(planned.iter().all(|p| (1..=20).contains(&p.ordinal)));
@@ -1564,11 +1557,8 @@ mod tests {
 
     // ── End-to-end wiring smoke test ────────────────────────────────────────
     //
-    // Proves the whole seam in one cheap, DB-free run: the plan reaches
-    // `TestApp::build`, the fault interceptor is chained innermost of the job
-    // chain (the always-on `JobRecorder` still records the enqueue), the
-    // targeted execution fails, the runtime retries it, and the ledger's
-    // outcome reports exactly that.
+    // DB-free: the plan reaches `TestApp::build`, the targeted execution fails, the
+    // runtime retries it, and the ledger's outcome reports exactly that.
 
     /// Handler attempts the smoke-test job actually reached. Process-global
     /// because a `JobInfo` handler is a plain `fn` pointer with no captures.
@@ -1637,8 +1627,7 @@ mod tests {
             1,
             "the faulted attempt never reached the handler; the retry did"
         );
-        // The always-on enqueue recorder still sees the job: the fault lane
-        // composes with it rather than replacing it.
+        // The always-on enqueue recorder still sees the job.
         assert_eq!(sim.client().enqueued_jobs().len(), 1);
 
         crate::job::clear_global_job_client();

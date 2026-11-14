@@ -158,12 +158,9 @@ where
                 .extensions
                 .insert(crate::agent_authority::AgentActor(actor));
         }
-        // Capture the request's *resolved* actor scope (the auth layer has
-        // published the principal by now) and re-establish it on every streamed
-        // frame, so a lazy/SSE body's writes stay attributed to the request
-        // actor rather than falling back to SYSTEM_ACTOR. Wrapped inside the
-        // log-context body so both scopes are active during frame production,
-        // consistent with the tenant body wrap.
+        // The auth layer has published the principal by now. Re-establish this actor scope on
+        // every streamed frame so a lazy/SSE body's writes are not attributed to SYSTEM_ACTOR.
+        // It sits inside the log-context body so both scopes are active during frame production.
         let actor_body =
             crate::current::CurrentActorBody::new(body, crate::current::current_scope());
         let body_ctx = this
@@ -201,10 +198,8 @@ where
             .get::<crate::agent_authority::AgentInvocation>()
             .is_some();
 
-        // Open an always-on request span carrying the well-known correlation
-        // fields. They are declared up front (Empty) so `set_user_id` /
-        // `set_tenant_id` can record them later and they surface in standard
-        // log output for every event emitted within the request.
+        // Fields are declared up front (Empty) so `set_user_id` / `set_tenant_id` can record
+        // them later; tracing only records fields a span declared at creation.
         let span = tracing::info_span!(
             "request",
             request_id = tracing::field::Empty,
@@ -225,29 +220,21 @@ where
         record_trace_ids(&span, &ctx);
         let body_ctx = Some(ctx.clone());
 
-        // Construct the inner future with the request span entered *and* the log
-        // context installed, so any synchronous work a downstream layer performs
-        // in its own `Service::call` (logging, `with_log_field`) is correlated
-        // too — not just the async polling of the returned future.
+        // Call the inner service with the span entered and the log context installed, so
+        // synchronous work in a downstream `Service::call` is correlated too, not only polling.
         //
-        // Note the deliberate asymmetry with the actor scope below: log context
-        // wraps this synchronous `call` (via `sync_scope`) *and* the async future,
-        // whereas `scope_request` wraps only the async future. No downstream
-        // synchronous `call` touches `Current`, so a future author must not add a
-        // synchronous `Current::set_actor` here expecting it to land.
+        // The actor scope below wraps only the async future, not this synchronous `call`: a
+        // `Current::set_actor` made from a downstream synchronous `call` would not land.
         let inner = span
             .in_scope(|| context::sync_scope(ctx.clone(), || self.inner.call(req)))
             .instrument(span);
 
-        // Wrap the response body so the context is re-established on every frame
-        // poll: a lazy/streaming body (SSE, `Body::from_stream`) is produced
-        // after this future resolves, otherwise dropping the context before any
-        // stream code runs. Mirrors `TenantPropagatingBody`.
+        // `WrapResponse` re-establishes the context on every body frame: a streaming body (SSE,
+        // `Body::from_stream`) is produced after this future resolves. Mirrors
+        // `TenantPropagatingBody`.
         //
-        // Also establish an empty current-actor scope (#1383) for the whole
-        // request so the auth layer can publish the resolved principal via
-        // `Current::set_actor` after the request future has started, and the
-        // generated repository/audit writes read it ambiently.
+        // The empty current-actor scope (#1383) lets the auth layer publish the principal via
+        // `Current::set_actor` mid-request, for generated repository/audit writes to read.
         LogContextFuture {
             inner: crate::current::scope_request(context::scoped(
                 ctx,
@@ -365,9 +352,8 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_body_frames_re_establish_the_context() {
-        // A response body produced lazily is polled after the request future has
-        // resolved (and the task-local scope has ended). LogContextBody must
-        // re-install the context for each frame poll.
+        // A lazy body is polled after the request future and its task-local scope have
+        // ended, so `LogContextBody` must re-install the context on each frame poll.
         struct ProbeBody {
             // The request_id observed during each frame poll (one entry per poll).
             seen: Arc<Mutex<Vec<Option<String>>>>,
@@ -380,7 +366,6 @@ mod tests {
                 mut self: Pin<&mut Self>,
                 _cx: &mut Context<'_>,
             ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-                // Record what the context looks like *during* frame production.
                 self.seen
                     .lock()
                     .unwrap()
@@ -489,8 +474,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(capture.boxed());
 
         with_default(subscriber, || {
-            // Build the same layering the framework uses: RequestId outer,
-            // LogContext inner.
+            // Same layering as the framework: RequestId outer, LogContext inner.
             let app = Router::new()
                 .route(
                     "/",
@@ -504,8 +488,8 @@ mod tests {
                 .layer(LogContextLayer::new(filter()))
                 .layer(RequestIdLayer::default());
 
-            // `with_default` is sync; drive the request to completion on a local
-            // runtime so the captured events are observed under this subscriber.
+            // `with_default` is sync: run the request on a local runtime so its events are
+            // captured by this subscriber.
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -654,9 +638,8 @@ mod tests {
 
     #[test]
     fn user_id_renders_even_when_set_from_a_nested_child_span() {
-        // Regression guard: `set_user_id` must record onto the request span, not
-        // whatever child span is current — otherwise the field is silently
-        // dropped from log output when set from inside e.g. a DB-query span.
+        // `set_user_id` must record onto the request span, not the current child span, or the
+        // field is dropped from log output when set inside e.g. a DB-query span.
         let buf = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
@@ -669,7 +652,6 @@ mod tests {
                 .route(
                     "/",
                     get(|| async {
-                        // Emit from inside a nested child span.
                         let child = tracing::info_span!("child");
                         let _guard = child.enter();
                         context::set_user_id("42");

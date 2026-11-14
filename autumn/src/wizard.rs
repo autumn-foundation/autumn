@@ -67,7 +67,6 @@ pub enum WizardError {
     Serialize(#[from] serde_json::Error),
 }
 
-// Session key prefix for wizard state.
 const WIZARD_KEY_PREFIX: &str = "__autumn_wizard";
 
 /// Context for a multi-step wizard flow.
@@ -589,21 +588,18 @@ mod tests {
         wizard.save_step("shipping", &shipping).await.unwrap();
         wizard.save_step("payment", &payment).await.unwrap();
 
-        // Update shipping
         let shipping2 = ShippingData {
             address: "Second".into(),
             city: "B".into(),
         };
         wizard.save_step("shipping", &shipping2).await.unwrap();
 
-        // Payment is still there
         let loaded_payment: Option<PaymentData> = wizard.step_data("payment").await;
         assert_eq!(
             loaded_payment.as_ref().map(|p| p.card_last4.as_str()),
             Some("4242")
         );
 
-        // Shipping is updated
         let loaded_shipping: Option<ShippingData> = wizard.step_data("shipping").await;
         assert_eq!(
             loaded_shipping.as_ref().map(|s| s.address.as_str()),
@@ -687,7 +683,6 @@ mod tests {
     #[tokio::test]
     async fn guard_step_allows_first_step_unconditionally() {
         let wizard = make_wizard(make_session());
-        // shipping is step 0 — no prior steps, always allowed
         assert!(wizard.guard_step("shipping", "/checkout").await.is_ok());
     }
 
@@ -905,7 +900,6 @@ mod tests {
     #[tokio::test]
     async fn restore_draft_skips_already_complete_steps() {
         let wizard = make_wizard(make_session());
-        // Pre-fill shipping in the session.
         wizard
             .save_step(
                 "shipping",
@@ -917,7 +911,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Draft has different shipping data.
         let draft = serde_json::json!({
             "shipping": { "address": "Stale", "city": "Elsewhere" },
             "payment":  { "card_last4": "1111" }
@@ -937,7 +930,6 @@ mod tests {
     #[tokio::test]
     async fn restore_draft_ignores_unknown_step_names() {
         let wizard = make_wizard(make_session());
-        // Draft contains a step name not in this wizard.
         let draft = serde_json::json!({
             "shipping":    { "address": "A", "city": "B" },
             "nonexistent": { "foo": "bar" }
@@ -972,7 +964,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Export, then restore into a brand new session.
         let draft = wizard.export_draft().await;
         let wizard2 = make_wizard(make_session());
         wizard2.restore_draft(&draft).await;

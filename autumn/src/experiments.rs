@@ -651,8 +651,7 @@ impl PairKey for PairKeyOwned {
     }
 }
 
-// Hashes exactly what `dyn PairKey` hashes, so the owned key and its borrowed
-// form agree by construction (the `Borrow` contract).
+// Hashes exactly what `dyn PairKey` hashes, as the `Borrow` contract requires.
 impl std::hash::Hash for PairKeyOwned {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&self.pair(), state);
@@ -671,8 +670,8 @@ impl<'a> std::borrow::Borrow<dyn PairKey + 'a> for PairKeyOwned {
     }
 }
 
-// `Borrow` requires the borrowed form to hash and compare like the owned key:
-// a `PairKeyOwned` hashes as its two `str`s in order, and so does this.
+// `Borrow` requires this to hash and compare like `PairKeyOwned`: both hash the two `str`s in
+// order.
 impl std::hash::Hash for dyn PairKey + '_ {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::hash::Hash::hash(&self.pair(), state);
@@ -838,29 +837,26 @@ impl ExperimentStore for InMemoryExperimentStore {
     fn record_assignment(&self, assignment: Assignment) -> Result<String, ExperimentStoreError> {
         let mut inner = self.inner.write().unwrap();
 
-        if !assignment.is_override {
-            // Find the exclusion group for this experiment.
-            if let Some(group) = inner
+        if !assignment.is_override
+            && let Some(group) = inner
                 .experiments
                 .get(&assignment.experiment)
                 .and_then(|c| c.exclusion_group.as_ref())
-            {
-                // Check if there is a sibling assignment in the same group.
-                for (exp_name, exp_config) in &inner.experiments {
-                    if exp_name == &assignment.experiment {
-                        continue;
-                    }
-                    if exp_config.exclusion_group.as_ref() == Some(group)
-                        && inner
-                            .assignments
-                            .contains_key(
-                                &(exp_name.as_str(), assignment.actor.as_str()) as &dyn PairKey
-                            )
-                    {
-                        return Err(ExperimentStoreError::Backend(format!(
-                            "ExcludedByGroup:{group}"
-                        )));
-                    }
+        {
+            for (exp_name, exp_config) in &inner.experiments {
+                if exp_name == &assignment.experiment {
+                    continue;
+                }
+                if exp_config.exclusion_group.as_ref() == Some(group)
+                    && inner
+                        .assignments
+                        .contains_key(
+                            &(exp_name.as_str(), assignment.actor.as_str()) as &dyn PairKey
+                        )
+                {
+                    return Err(ExperimentStoreError::Backend(format!(
+                        "ExcludedByGroup:{group}"
+                    )));
                 }
             }
         }
@@ -1207,7 +1203,7 @@ impl ExperimentService {
                 return Err(ExperimentError::Archived(experiment.to_owned()));
             }
             ExperimentState::Concluded => {
-                // Return winner for all actors; no exposure emitted (experiment is done).
+                // Every actor gets the winner, and no exposure is emitted.
                 let winner = config
                     .winner
                     .ok_or_else(|| ExperimentError::NoVariant(experiment.to_owned()))?;
@@ -1222,8 +1218,8 @@ impl ExperimentService {
             ExperimentState::Running => {}
         }
 
-        // Check for staff/QA override (takes precedence over sticky).
-        // Skip stale overrides whose variant was removed from the experiment config.
+        // A staff/QA override beats a sticky assignment. An override naming a removed variant is
+        // ignored.
         if let Some(override_variant) = self.store.get_override(experiment, actor)?
             && config.variants.iter().any(|v| v.name == override_variant)
         {
@@ -1250,7 +1246,7 @@ impl ExperimentService {
             return Ok(override_variant);
         }
 
-        // Return existing sticky assignment (emit exposure each call).
+        // A sticky assignment emits an exposure on every call.
         if let Some(existing) = self.store.get_assignment(experiment, actor)? {
             self.emit_exposure(
                 experiment,
@@ -1262,7 +1258,6 @@ impl ExperimentService {
             return Ok(existing.variant);
         }
 
-        // Mutual exclusion group check.
         if let Some(group) = &config.exclusion_group
             && self
                 .store
@@ -1274,14 +1269,12 @@ impl ExperimentService {
             ));
         }
 
-        // Bucket the actor and pick a variant.
         let bucket = experiment_bucket(experiment, actor);
         let variant_name = select_variant(&config.variants, bucket)
             .ok_or_else(|| ExperimentError::NoVariant(experiment.to_owned()))?
             .to_owned();
 
-        // Store sticky assignment. Use the persisted variant (the winner of any
-        // concurrent first-write race), not the locally-computed one.
+        // Use the persisted variant, which wins any concurrent first-write race.
         let assignment = Assignment::new(experiment, actor, &variant_name, false);
         let persisted_variant = match self.store.record_assignment(assignment) {
             Ok(v) => v,
@@ -1618,17 +1611,13 @@ impl axum::extract::FromRequestParts<crate::AppState> for Experiments {
             })?;
 
         let actor_id = if let Some(session) = parts.extensions.get::<crate::session::Session>() {
-            // Use the configured auth session key (e.g. "user_id"); fall back to
-            // the session ID so each anonymous visitor gets a stable, per-session
-            // bucket rather than all collapsing into a single "anonymous" actor.
+            // An anonymous visitor gets a per-session actor rather than sharing one bucket.
             let session_key = state.auth_session_key();
             if let Some(uid) = session.get(session_key).await {
                 Some(uid)
             } else {
-                // Use or create a stable per-session anonymous actor. We must
-                // insert into the session (marking it dirty) so the framework
-                // sets a cookie and the ID persists across requests; a bare
-                // session.id() call does not mark the session dirty.
+                // Insert into the session to mark it dirty, so the cookie is set and the ID
+                // persists across requests. `session.id()` alone does not mark it dirty.
                 const ANON_KEY: &str = "_autumn_anon_actor";
                 if let Some(existing) = session.get(ANON_KEY).await {
                     Some(existing)
@@ -2402,14 +2391,12 @@ pub mod pg {
 
             let mut conn = self.connect()?;
             let result = conn.transaction::<String, TxError, _>(|conn| {
-                // 1. Acquire advisory lock on actor to serialize concurrent assignments for this actor.
+                // Serializes concurrent assignments for this actor.
                 diesel::sql_query("SELECT pg_advisory_xact_lock(hashtext($1))")
                     .bind::<diesel::sql_types::Text, _>(&assignment.actor)
                     .execute(conn)?;
 
-                // 2. Check exclusion group if this is NOT an override.
                 if !assignment.is_override {
-                    // Fetch the exclusion group for this experiment.
                     let group_row = diesel::sql_query(
                         "SELECT exclusion_group FROM autumn_experiments WHERE name = $1"
                     )
@@ -2418,7 +2405,6 @@ pub mod pg {
                     .optional()?;
 
                     if let Some(ExclusionGroupRow { exclusion_group: Some(group) }) = group_row {
-                        // Check if there are other assignments in the same group.
                         let exists = diesel::sql_query(
                             "SELECT EXISTS ( \
                                  SELECT 1 \
@@ -2441,7 +2427,7 @@ pub mod pg {
                     }
                 }
 
-                // 3. Insert or update on conflict.
+                // An override replaces an existing row; a bucketed one keeps the first write.
                 let variant_name = diesel::sql_query(
                     "INSERT INTO autumn_experiment_assignments \
                          (experiment, actor, variant, is_override) \
@@ -3031,13 +3017,6 @@ mod tests {
         svc.start(name).unwrap();
     }
 
-    // ═══════════════════════════════════ RED PHASE ═══════════════════════════
-    // These tests were written before the full implementation existed and drove
-    // the design of ExperimentService, ExperimentStore, and ExposureSink.
-    // ═════════════════════════════════════════════════════════════════════════
-
-    // ── AC: assign() returns unknown-experiment error ─────────────────────────
-
     #[test]
     fn assign_unknown_experiment_returns_not_found() {
         let svc = make_svc();
@@ -3047,8 +3026,6 @@ mod tests {
             "expected NotFound, got {err}"
         );
     }
-
-    // ── AC: lifecycle — draft rejects assignments ─────────────────────────────
 
     #[test]
     fn assign_draft_experiment_returns_not_running() {
@@ -3060,8 +3037,6 @@ mod tests {
             "expected NotRunning(Draft), got {err}"
         );
     }
-
-    // ── AC: lifecycle — archived rejects assignments ──────────────────────────
 
     #[test]
     fn assign_archived_experiment_returns_archived() {
@@ -3075,14 +3050,11 @@ mod tests {
         );
     }
 
-    // ── AC: lifecycle — concluded returns winner for all actors ───────────────
-
     #[test]
     fn concluded_experiment_returns_winner_for_all_actors() {
         let svc = make_svc();
         running(&svc, "exp");
         svc.conclude("exp", "treatment").unwrap();
-        // Every actor sees the winner — regardless of their bucket.
         for i in 0..100_u32 {
             let actor = format!("user:{i}");
             let v = svc.assign("exp", &actor).unwrap();
@@ -3092,8 +3064,6 @@ mod tests {
             );
         }
     }
-
-    // ── AC: concluded experiment emits no new exposures ───────────────────────
 
     #[test]
     fn concluded_experiment_emits_no_exposures() {
@@ -3115,8 +3085,6 @@ mod tests {
         let _ = svc;
     }
 
-    // ── AC: assign() returns deterministic variant for running experiment ─────
-
     #[test]
     fn assign_running_experiment_returns_valid_variant() {
         let svc = make_svc();
@@ -3128,15 +3096,13 @@ mod tests {
         );
     }
 
-    // ── AC: deterministic bucketing — same actor always gets same variant ─────
-
     #[test]
     fn assign_is_deterministic_for_same_actor() {
         let svc = make_svc();
         running(&svc, "exp");
         let v1 = svc.assign("exp", "user:42").unwrap();
         let v2 = svc.assign("exp", "exp").unwrap(); // different key — just to exercise more
-        // Re-create without sticky to verify pure hash determinism.
+        // A fresh service has no sticky assignment, so this checks the hash alone.
         let svc2 = make_svc();
         running(&svc2, "exp");
         let v3 = svc2.assign("exp", "user:42").unwrap();
@@ -3146,8 +3112,6 @@ mod tests {
         );
         let _ = v2;
     }
-
-    // ── AC: 10 000 stable requests — zero reassignments ───────────────────────
 
     #[test]
     fn zero_reassignments_across_10000_requests() {
@@ -3160,13 +3124,10 @@ mod tests {
         }
     }
 
-    // ── AC: stable hash regression — known fixture inputs ────────────────────
-
     #[test]
     fn stable_hash_regression_known_fixtures() {
-        // Pre-computed: FNV-1a 64-bit of "<experiment>:<actor>" mod 10 000.
-        // MUST NOT change without a documented migration path for existing assignments.
-        // To regenerate: run `experiment_bucket(name, actor)` and record the output.
+        // FNV-1a 64-bit of "<experiment>:<actor>" mod 10 000. A change re-buckets every existing
+        // assignment, so it needs a migration path.
         let b1 = experiment_bucket("checkout_v2", "user:1");
         let b2 = experiment_bucket("checkout_v2", "user:1");
         assert_eq!(
@@ -3174,7 +3135,6 @@ mod tests {
             "hash must be deterministic (same input → same output)"
         );
 
-        // Fixture values established on first run — sentinel against algorithm drift.
         assert_eq!(
             b1, 4_830,
             "checkout_v2:user:1 bucket changed — hash regression"
@@ -3327,6 +3287,59 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_store_refuses_a_sibling_assignment_in_the_same_group() {
+        // The service checks the group before writing; this is the store's own
+        // refusal, which catches two concurrent first assignments.
+        let store = InMemoryExperimentStore::new();
+        for name in ["exp_a", "exp_b"] {
+            store
+                .upsert(
+                    ExperimentConfig::new(name, vec![VariantConfig::new("v1", 1)])
+                        .exclusion_group("group"),
+                )
+                .unwrap();
+        }
+        store
+            .upsert(ExperimentConfig::new(
+                "solo",
+                vec![VariantConfig::new("v1", 1)],
+            ))
+            .unwrap();
+        store
+            .record_assignment(Assignment::new("exp_a", "user:1", "v1", false))
+            .unwrap();
+
+        let refused = store.record_assignment(Assignment::new("exp_b", "user:1", "v1", false));
+        assert!(
+            matches!(&refused, Err(ExperimentStoreError::Backend(msg)) if msg == "ExcludedByGroup:group"),
+            "got {refused:?}"
+        );
+        assert!(store.get_assignment("exp_b", "user:1").unwrap().is_none());
+
+        assert_eq!(
+            store
+                .record_assignment(Assignment::new("exp_b", "user:2", "v1", false))
+                .unwrap(),
+            "v1",
+            "another actor is not excluded"
+        );
+        assert_eq!(
+            store
+                .record_assignment(Assignment::new("exp_b", "user:1", "v1", true))
+                .unwrap(),
+            "v1",
+            "an override bypasses the group"
+        );
+        assert_eq!(
+            store
+                .record_assignment(Assignment::new("solo", "user:1", "v1", false))
+                .unwrap(),
+            "v1",
+            "an experiment outside the group is unaffected"
+        );
+    }
+
+    #[test]
     fn exclusion_group_probe_finds_a_sibling_assignment_by_borrow() {
         // `record_assignment` and `has_assignment_in_group` probe the sibling
         // experiment's `(experiment, actor)` key without building it.
@@ -3367,8 +3380,6 @@ mod tests {
             .unwrap();
     }
 
-    // ── AC: weights — 0% weight variant is never assigned ────────────────────
-
     #[test]
     fn zero_weight_variant_never_assigned() {
         let svc = make_svc();
@@ -3387,8 +3398,6 @@ mod tests {
         }
     }
 
-    // ── AC: weights — single variant at 100% is always assigned ──────────────
-
     #[test]
     fn single_variant_always_assigned() {
         let svc = make_svc();
@@ -3403,8 +3412,6 @@ mod tests {
             assert_eq!(v, "only");
         }
     }
-
-    // ── AC: weights — roughly 50/50 split ────────────────────────────────────
 
     #[test]
     fn fifty_fifty_weights_split_roughly_evenly() {
@@ -3422,8 +3429,6 @@ mod tests {
         );
     }
 
-    // ── AC: all-zero-weight returns NoVariant error ───────────────────────────
-
     #[test]
     fn all_zero_weights_returns_no_variant_error() {
         let svc = make_svc();
@@ -3440,14 +3445,11 @@ mod tests {
         );
     }
 
-    // ── AC: sticky assignment — subsequent calls return same variant ──────────
-
     #[test]
     fn sticky_assignment_returned_on_subsequent_calls() {
         let svc = make_svc();
         running(&svc, "exp");
         let first = svc.assign("exp", "user:1").unwrap();
-        // Subsequent calls must return the same variant even with new service.
         for _ in 0..10 {
             assert_eq!(
                 svc.assign("exp", "user:1").unwrap(),
@@ -3457,15 +3459,13 @@ mod tests {
         }
     }
 
-    // ── AC: sticky assignment not re-bucketed on weight change ────────────────
-
     #[test]
     fn set_weights_does_not_rebucket_existing_assignments() {
         let svc = make_svc();
         running(&svc, "exp");
         let original = svc.assign("exp", "user:1").unwrap();
 
-        // Flip weights completely — existing assignment must remain unchanged.
+        // Move all the weight to the other variant.
         let (new_heavy, new_light) = if original == "control" {
             (0_u32, 100_u32)
         } else {
@@ -3512,8 +3512,6 @@ mod tests {
         );
     }
 
-    // ── AC: exposure emitted exactly once per assign() call ───────────────────
-
     #[test]
     fn exposure_emitted_exactly_once_per_assign_call() {
         let (svc, records) = make_svc_with_sink();
@@ -3537,8 +3535,6 @@ mod tests {
             "different actor → 3 total exposures"
         );
     }
-
-    // ── AC: exposure record contains correct fields ───────────────────────────
 
     #[test]
     fn exposure_record_contains_correct_fields() {
@@ -3567,8 +3563,6 @@ mod tests {
         assert!(!exp_is_override);
     }
 
-    // ── AC: override bypasses weight-based bucketing ──────────────────────────
-
     #[test]
     fn override_bypasses_weights() {
         let svc = make_svc();
@@ -3590,8 +3584,6 @@ mod tests {
         );
     }
 
-    // ── AC: override emits exposure tagged as override ────────────────────────
-
     #[test]
     fn override_emits_exposure_tagged_as_override() {
         let (svc, records) = make_svc_with_sink();
@@ -3610,12 +3602,9 @@ mod tests {
         assert_eq!(exp_variant, "treatment");
     }
 
-    // ── AC: mutual exclusion — second experiment in group is excluded ─────────
-
     #[test]
     fn mutual_exclusion_prevents_sibling_assignment() {
         let svc = make_svc();
-        // Two experiments in the same group.
         svc.create(
             ExperimentConfig::new("exp_a", vec![VariantConfig::new("v1", 1)])
                 .exclusion_group("checkout"),
@@ -3629,18 +3618,14 @@ mod tests {
         .unwrap();
         svc.start("exp_b").unwrap();
 
-        // Assign actor to exp_a first.
         svc.assign("exp_a", "user:1").unwrap();
 
-        // exp_b must exclude the same actor.
         let err = svc.assign("exp_b", "user:1").unwrap_err();
         assert!(
             matches!(err, ExperimentError::ExcludedByGroup(_, _)),
             "expected ExcludedByGroup, got {err}"
         );
     }
-
-    // ── AC: mutual exclusion — different group allows both experiments ─────────
 
     #[test]
     fn different_groups_do_not_exclude_each_other() {
@@ -3666,8 +3651,6 @@ mod tests {
         );
     }
 
-    // ── AC: mutual exclusion — no group means no exclusion ────────────────────
-
     #[test]
     fn no_exclusion_group_allows_both_assignments() {
         let svc = make_svc();
@@ -3681,8 +3664,6 @@ mod tests {
         );
     }
 
-    // ── AC: experiment_bucket is stable and in range ──────────────────────────
-
     #[test]
     fn experiment_bucket_is_stable_and_in_range() {
         for i in 0..100_u32 {
@@ -3693,8 +3674,6 @@ mod tests {
             assert!(b1 < 10_000, "bucket must be in [0, 10000) for {actor}");
         }
     }
-
-    // ── AC: experiment_bucket differs across actors ───────────────────────────
 
     #[test]
     fn experiment_bucket_produces_diverse_values() {
@@ -3707,8 +3686,6 @@ mod tests {
             buckets.len()
         );
     }
-
-    // ── AC: list returns all experiments ─────────────────────────────────────
 
     #[test]
     fn list_returns_all_experiments() {
@@ -3723,8 +3700,6 @@ mod tests {
         assert_eq!(experiments[2].name, "gamma");
     }
 
-    // ── AC: status returns experiment config ─────────────────────────────────
-
     #[test]
     fn status_returns_current_config() {
         let svc = make_svc();
@@ -3734,8 +3709,6 @@ mod tests {
         assert_eq!(cfg.variants.len(), 2);
     }
 
-    // ── AC: history records mutations ─────────────────────────────────────────
-
     #[test]
     fn history_records_create_and_start_mutations() {
         let svc = make_svc();
@@ -3744,8 +3717,6 @@ mod tests {
         let hist = svc.history("exp", 10).unwrap();
         assert!(!hist.is_empty(), "history must record mutations");
     }
-
-    // ── AC: set_weights records mutation in history ───────────────────────────
 
     #[test]
     fn set_weights_recorded_in_history() {
@@ -3765,8 +3736,6 @@ mod tests {
         assert!(has_set_weights, "set_weights must be recorded in history");
     }
 
-    // ── AC: select_variant helper ─────────────────────────────────────────────
-
     #[test]
     fn select_variant_returns_none_for_empty_variants() {
         assert_eq!(select_variant(&[], 0), None);
@@ -3784,18 +3753,13 @@ mod tests {
             VariantConfig::new("control", 50),
             VariantConfig::new("treatment", 50),
         ];
-        // Bucket 0 (threshold = 0 * 100 / 10000 = 0) → cumulative[0]=50 > 0 → control
+        // Total weight 100, so the threshold is `bucket * 100 / 10_000`; the first variant whose
+        // cumulative weight exceeds it wins: 4999 → 49 (control), 5000 → 50 (treatment).
         assert_eq!(select_variant(&vs, 0), Some("control"));
-        // Bucket 4999 (threshold = 4999 * 100 / 10000 = 49) → control
         assert_eq!(select_variant(&vs, 4_999), Some("control"));
-        // Bucket 5000 (threshold = 5000 * 100 / 10000 = 50) → cumulative[0]=50 NOT > 50
-        // → cumulative[1]=100 > 50 → treatment
         assert_eq!(select_variant(&vs, 5_000), Some("treatment"));
-        // Bucket 9999 → treatment
         assert_eq!(select_variant(&vs, 9_999), Some("treatment"));
     }
-
-    // ── AC: InMemoryExperimentStore — Arc delegation ──────────────────────────
 
     #[test]
     fn arc_experiment_store_delegates_all_operations() {
@@ -3829,8 +3793,6 @@ mod tests {
         );
     }
 
-    // ── AC: ExperimentState display ───────────────────────────────────────────
-
     #[test]
     fn experiment_state_display_matches_expected() {
         assert_eq!(ExperimentState::Draft.to_string(), "draft");
@@ -3838,8 +3800,6 @@ mod tests {
         assert_eq!(ExperimentState::Concluded.to_string(), "concluded");
         assert_eq!(ExperimentState::Archived.to_string(), "archived");
     }
-
-    // ── AC: ExperimentError display ───────────────────────────────────────────
 
     #[test]
     fn experiment_error_display() {
@@ -3865,8 +3825,6 @@ mod tests {
         );
     }
 
-    // ── AC: service debug ─────────────────────────────────────────────────────
-
     #[test]
     fn service_debug_does_not_panic() {
         let svc = make_svc();
@@ -3879,7 +3837,6 @@ mod tests {
         let exp = fifty_fifty("exp");
         svc.create(exp.clone()).unwrap();
 
-        // Upsert the same experiment again to trigger update
         svc.create(exp).unwrap();
 
         let hist = svc.history("exp", 10).unwrap();
@@ -3913,7 +3870,6 @@ mod tests {
         };
         store.upsert(config.clone()).unwrap();
 
-        // Assign an actor to "treatment"
         store
             .record_assignment(Assignment {
                 experiment: name.to_string(),
@@ -3924,7 +3880,6 @@ mod tests {
             })
             .unwrap();
 
-        // Attempting to upsert config without "treatment" should fail
         let mut new_config = config;
         new_config.variants = vec![VariantConfig {
             name: "control".to_string(),
@@ -3948,11 +3903,8 @@ mod tests {
 
     // ── Backend screening on the Postgres-only store ──────────────────────
 
-    // `PgExperimentStore` opens a `diesel::PgConnection` and writes `jsonb` and
-    // `pg_advisory_xact_lock` SQL — it cannot serve any other backend. Building one from a
-    // SQLite target used to succeed and fail on first use with a driver-level
-    // connection error naming Postgres, which is not a diagnosis an operator
-    // who configured `sqlite://` can act on.
+    // `PgExperimentStore` speaks only Postgres (`jsonb`, `pg_advisory_xact_lock`), so it refuses
+    // any other target when built rather than failing on first use with a driver error.
     #[cfg(feature = "db")]
     #[test]
     fn pg_experiment_store_refuses_a_non_postgres_target() {

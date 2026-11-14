@@ -95,9 +95,8 @@ impl ReplicationSnapshot {
     #[must_use]
     pub fn lag(&self, now: DateTime<Utc>) -> Option<Duration> {
         let last = self.last_success_at?;
-        // A clock that moved backwards yields a negative span, which is not a
-        // *stale* replica — report zero lag rather than `None`, which the health
-        // indicator would read as "never shipped".
+        // A clock that moved backwards is not a stale replica. Report zero lag, not `None`,
+        // which the health indicator reads as "never shipped".
         Some(
             now.signed_duration_since(last)
                 .to_std()
@@ -307,12 +306,8 @@ impl ReplicationHealthIndicator {
             "pending_bytes".to_owned(),
             serde_json::Value::from(snapshot.pending_bytes),
         );
-        // Named for what it is. This is `lag_alert_after` — the threshold at
-        // which lag turns this check unhealthy, which `replication::build` sets
-        // to a multiple of the RPO. Publishing it as `rpo_seconds` reported 30
-        // for the default 10-second objective, telling operators and their
-        // monitoring the wrong number for the one thing this check exists to
-        // guard. (`autumn db replica status` reports the configured RPO itself.)
+        // The alert threshold, a multiple of the RPO, so not named `rpo_seconds`.
+        // `autumn db replica status` reports the configured RPO.
         details.insert(
             "lag_alert_after_seconds".to_owned(),
             serde_json::Value::from(self.thresholds.lag_alert_after.as_secs()),
@@ -336,8 +331,7 @@ impl ReplicationHealthIndicator {
             );
         }
 
-        // A verification failure means the bytes offsite are not restorable —
-        // the single most important thing this indicator can say.
+        // A failed verification means the replica is not restorable: always `Down`.
         if let Some(detail) = &snapshot.last_verify_error {
             details.insert(
                 "verification_error".to_owned(),

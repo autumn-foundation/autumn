@@ -605,7 +605,6 @@ async fn loopback_concurrent_increments_converge() {
     let b = start_node(&router, &clock, SECRET, "node-b", 2, vec![a.addr.clone()]);
     settle(&clock, 6).await;
 
-    // Interleave writes on both nodes across several push rounds.
     for _ in 0..3 {
         a.handle.counter(COUNTER).increment();
         b.handle.counter(COUNTER).increment();
@@ -699,7 +698,6 @@ async fn loopback_clean_leave_converges_to_one_member_view() {
         view_of(&a)
     );
 
-    // The survivor keeps serving the primitive.
     a.handle.counter(COUNTER).increment();
     assert_eq!(
         a.handle.counter(COUNTER).get(),
@@ -736,7 +734,6 @@ async fn loopback_kill_without_leave_converges_after_suspicion_timeout() {
         view_of(&a)
     );
 
-    // Past the suspicion timeout it drops out.
     advance_time(&clock, SUSPICION).await;
     settle(&clock, 1).await;
     assert_eq!(
@@ -840,8 +837,8 @@ async fn loopback_departure_survives_a_full_peer_queue() {
     // exactly as `try_send` does at PEER_QUEUE_CAPACITY.
     stalled.stall();
 
-    // Written on B and cancelled in the same breath, with the queue already
-    // full: the departure lane is the only way out of this process.
+    // Written and cancelled with the queue already full: only the departure
+    // lane can carry these cells out.
     b.handle.counter(COUNTER).increment_by(7);
     b.token.cancel();
     advance_time(&clock, Duration::from_millis(250)).await;
@@ -975,9 +972,8 @@ async fn loopback_write_storm_is_bounded_by_the_push_cadence_floor() {
     advance_time(&clock, PUSH.checked_div(2).unwrap_or(PUSH)).await;
 
     let before = pushes_sent(&a);
-    // `yield_now` rather than a sleep: the loop gets to run between writes (so
-    // the permits really are consumed one at a time) while the clock stands
-    // still, which is exactly the "increments faster than the interval" shape.
+    // `yield_now`, not a sleep: the loop consumes each permit between writes
+    // while the clock stands still.
     for _ in 0..50 {
         a.handle.counter(COUNTER).increment();
         tokio::task::yield_now().await;
@@ -997,8 +993,6 @@ async fn loopback_write_storm_is_bounded_by_the_push_cadence_floor() {
         view_of(&a)
     );
 
-    // …and the storm is still delivered: bounding the cadence must not lose a
-    // single increment.
     settle(&clock, 4).await;
     assert_eq!(
         b.handle.counter(COUNTER).get(),
@@ -1126,8 +1120,7 @@ fn rejection_counters_are_per_reason_and_fold_framing_into_oversize() {
 
     // A second wrong-secret frame moves only `mac`.
     metrics.record_rejection(RejectReason::Mac);
-    // …and the framing layer's connection-fatal rejections fold into
-    // `oversize`, the series the guide says covers them.
+    // Framing-layer rejections fold into `oversize`.
     metrics.framing_rejected.store(3, Ordering::Relaxed);
 
     let expected: Vec<(&str, u64)> = REJECT_REASONS
@@ -1160,8 +1153,7 @@ async fn forged_frames_are_attributed_to_their_own_reason_series() {
     let router = LoopbackRouter::new();
     let clock = test_clock();
     let a = start_node(&router, &clock, SECRET, "node-a", 1, Vec::new());
-    // An endpoint with no node behind it: purely a return address the router
-    // will accept frames from.
+    // No node behind it: only a return address the router accepts frames from.
     let hostile = router.endpoint();
     let hostile_addr = hostile.local_addr().to_string();
     settle(&clock, 2).await;
@@ -1345,10 +1337,8 @@ async fn loopback_pruned_member_rejoins_at_a_lower_incarnation() {
 
     settle(&clock, 1).await;
 
-    // The contract this test exists for: the frame is ACCEPTED. Holding the
-    // watermark past the tombstone would drop every frame the returning node
-    // sends, with no record left for it to refute — a partition no timeout
-    // ends and only an operator can break.
+    // The frame must be accepted: a watermark kept past the tombstone would drop
+    // every frame the returning node sends, a partition no timeout ends.
     let replay_drops = a
         .handle
         .inner
@@ -1366,11 +1356,9 @@ async fn loopback_pruned_member_rejoins_at_a_lower_incarnation() {
         view_of(&a)
     );
 
-    // What its RECORD then has to wait out is A's local memory of collecting
-    // that id: at an incarnation this node already pruned, a returning node
-    // and a captured pre-departure frame replayed by a stranger are the same
-    // bytes, so the guard withholds both. Bounded, and self-healing — which is
-    // what the rest of this test proves.
+    // The record still waits out A's memory of collecting that id: at a pruned
+    // incarnation, a returning node and a replayed pre-departure frame are the
+    // same bytes, so both are withheld until the memory expires.
     assert_eq!(
         member_ids(&a.handle),
         vec!["node-a".to_owned()],
@@ -1379,9 +1367,7 @@ async fn loopback_pruned_member_rejoins_at_a_lower_incarnation() {
         view_of(&a)
     );
 
-    // Past that memory (twice the tombstone window), the returning node's next
-    // push is learned normally — a real node pushes every interval, so this is
-    // the frame after the ones the guard withheld.
+    // Past that memory (twice the tombstone window), the next push is learned.
     settle(
         &clock,
         window_rounds().saturating_mul(PRUNE_MEMORY_WINDOW_MULTIPLE),

@@ -404,8 +404,7 @@ fn validate_chain_certs(
 ) -> Result<(), TlsError> {
     use x509_parser::prelude::FromDer as _;
 
-    // Skip index 0 (the leaf); its DER and validity window are checked by the
-    // callers via `leaf_validity_unix`.
+    // Skip the leaf: callers check it via `leaf_validity_unix`.
     for (idx, cert) in chain.iter().enumerate().skip(1) {
         // 1-based, matching how operators count "certificate #2" in a bundle.
         let position = idx + 1;
@@ -416,10 +415,8 @@ fn validate_chain_certs(
                 detail: e.to_string(),
             })?;
 
-        // Reject an intermediate outside its validity window, mirroring the
-        // leaf's not-yet-valid / expired handling: `notBefore` in the future is
-        // as fatal as a past `notAfter`, since either makes clients reject the
-        // served chain.
+        // Clients reject a served chain with an intermediate outside its validity window,
+        // whether `notBefore` is in the future or `notAfter` is past.
         let validity = parsed.validity();
         let not_before = validity.not_before.timestamp();
         let not_after = validity.not_after.timestamp();
@@ -464,11 +461,8 @@ pub fn load_certified_key(
     let chain = read_cert_chain(cert_path)?;
     let key = read_private_key(key_path)?;
 
-    // Reject a leaf outside its validity window before we even build the key:
-    // an expired OR not-yet-valid certificate fails every client handshake, so
-    // refuse at startup with a clear message rather than booting into a broken
-    // listener. Symmetric bounds: `notBefore` in the future is as fatal as a
-    // past `notAfter`.
+    // An expired or not-yet-valid leaf fails every client handshake, so refuse at startup
+    // with a clear message rather than boot a broken listener.
     let (not_before, not_after) = leaf_validity_unix(cert_path, &chain[0])?;
     if now_unix < not_before {
         return Err(TlsError::NotYetValid {
@@ -485,15 +479,12 @@ pub fn load_certified_key(
         });
     }
 
-    // Parse and lifetime-check every intermediate before accepting the chain:
-    // rustls validates only the leaf, so a malformed — or expired / not-yet-valid
-    // — intermediate would otherwise boot a listener that serves a chain normal
-    // clients reject during path validation.
+    // rustls validates only the leaf. A malformed, expired or not-yet-valid intermediate
+    // would otherwise boot a listener whose chain clients reject during path validation.
     validate_chain_certs(cert_path, &chain, now_unix)?;
 
-    // `from_der` loads the key with the crypto provider (rejecting an invalid
-    // key) and compares the key's SubjectPublicKeyInfo against the leaf
-    // certificate's, so a cert/key mismatch is caught here.
+    // `from_der` rejects an invalid key and compares its SubjectPublicKeyInfo with the leaf's,
+    // so a cert/key mismatch is caught here.
     let certified = CertifiedKey::from_der(chain, key, provider).map_err(|source| {
         TlsError::InvalidKeyPair {
             cert: cert_path.to_path_buf(),
@@ -619,35 +610,20 @@ pub fn build_server_config_with_client_auth(
             let mut config = builder
                 .with_client_cert_verifier(verifier)
                 .with_cert_resolver(resolver);
-            // Turn OFF session resumption for a client-authenticating listener.
-            //
-            // rustls restores a resumed connection's `peer_certificates` from
-            // the stored session and never calls the verifier again
-            // (`server/tls13.rs`, `server/tls12.rs`). So a client whose CA was
-            // rotated out — or whose certificate was just added to the CRL —
-            // would keep reconnecting on a resumed session until it expired,
-            // and would keep presenting a verified-looking identity to
-            // handlers. That is the one hole a swap-the-verifier design cannot
-            // close by swapping, because the check it swaps is not run.
-            //
-            // The cost is a full handshake per connection, which is the right
-            // trade for a listener whose whole purpose is deciding who may
-            // connect. Server-only TLS keeps resumption untouched.
+            // No session resumption with client auth: rustls restores a resumed connection's
+            // `peer_certificates` from the stored session without calling the verifier again.
+            // A client whose CA was rotated out, or whose certificate was just revoked, would
+            // keep a verified-looking identity until the session expired. The cost is a full
+            // handshake per connection. Server-only TLS keeps resumption.
             config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
             config.send_tls13_tickets = 0;
             config
         }
         None => builder.with_no_client_auth().with_cert_resolver(resolver),
     };
-    // Advertise ALPN (#2321). Without an `alpn_protocols` list rustls
-    // completes the handshake with no protocol selected, so a browser (or
-    // `curl --http2`) never sends the HTTP/2 preface and the serve path's
-    // h2 half — `hyper_util::server::conn::auto` already speaks it — stays
-    // dead code in practice. `h2` first, then `http/1.1`: ALPN-less and
-    // http/1.1-only clients are unaffected, and a client offering only `h2`
-    // negotiates it. Both TLS modes funnel through here (static
-    // `[server.tls]` and the ACME path, #1608), as do both client-auth arms
-    // above, so the advertisement is identical everywhere.
+    // Without ALPN, rustls selects no protocol and clients never send the HTTP/2 preface, so
+    // the serve path's h2 support goes unused (#2321). `h2` first; ALPN-less and
+    // http/1.1-only clients are unaffected. Static TLS and ACME both build their config here.
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
@@ -718,10 +694,8 @@ impl TlsConnectInfo {
         io: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
         peer: std::net::SocketAddr,
     ) -> Self {
-        // rustls exposes the peer chain only after a successful handshake, so
-        // anything here has already passed the configured verifier — the parse
-        // turns a verified certificate into a usable identity, it does not
-        // decide trust.
+        // rustls exposes the peer chain only after a successful handshake, so this parse turns
+        // an already verified certificate into an identity; it does not decide trust.
         let client = io
             .get_ref()
             .1
@@ -730,8 +704,7 @@ impl TlsConnectInfo {
             .and_then(|leaf| match client_auth::ClientIdentity::from_der(leaf) {
                 Ok(identity) => Some(Arc::new(identity)),
                 Err(e) => {
-                    // Verified but unparseable: drop the identity rather than
-                    // fabricate one. Routes that require mTLS then reject.
+                    // Verified but unparseable: drop the identity, so routes requiring mTLS reject.
                     tracing::warn!(peer = %peer, error = %e, "could not parse the verified client certificate");
                     None
                 }
@@ -935,11 +908,8 @@ async fn run_acceptor(
             result = tcp.accept() => match result {
                 Ok(pair) => pair,
                 Err(e) => {
-                    // Never break the loop on a per-connection error — that
-                    // would tear down the whole listener. Retry transient
-                    // per-connection errors immediately; back off briefly on
-                    // anything else so we do not spin (e.g. on the process's
-                    // open-file limit).
+                    // Breaking here would tear down the whole listener. Back off on
+                    // non-transient errors so the loop does not spin (e.g. on `EMFILE`).
                     if is_transient_connection_error(&e) {
                         continue;
                     }
@@ -950,33 +920,26 @@ async fn run_acceptor(
             },
         };
 
-        // Acquire a permit BEFORE spawning so in-flight handshakes are bounded:
-        // once `MAX_CONCURRENT_HANDSHAKES` are running, this parks (applying
-        // backpressure to accept) until one finishes. The only error is a closed
-        // semaphore, which we never close, so the `else` is unreachable in
-        // practice; stop the loop defensively if it ever happens.
+        // Acquire before spawning so in-flight handshakes are bounded and accept gets
+        // backpressure. The semaphore is never closed, so the `else` is defensive.
         let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
             break;
         };
         let acceptor = acceptor.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
-            // The permit is released when this task ends (handshake done,
-            // failed, or timed out), freeing a slot for the next connection.
+            // Held until the task ends (handshake done, failed or timed out), then frees a slot.
             let _permit = permit;
-            // Bound the handshake so a client that connects but never sends a
-            // ClientHello (or stalls mid-handshake) releases its permit instead
-            // of holding it for the process lifetime.
+            // A client that stalls before or during the handshake must not hold its permit
+            // forever.
             match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
                 Ok(Ok(tls)) => {
                     // A closed receiver means the listener is gone; drop.
                     let _ = tx.send((tls, peer, slot)).await;
                 }
                 Ok(Err(e)) => {
-                    // An mTLS client-certificate rejection is an operator-facing
-                    // event: counted by reason and logged at warn, rate-limited
-                    // (#1640). Everything else keeps #1603's quiet debug line.
-                    // The client sees only the standard TLS alert either way.
+                    // mTLS client-certificate rejections are counted and logged at warn (#1640);
+                    // other failures stay at debug. The client sees only the TLS alert.
                     if !client_auth::record_handshake_rejection(&e, peer) {
                         tracing::debug!(
                             peer = %peer,
@@ -1023,12 +986,9 @@ impl axum::serve::Listener for TlsListener {
             }
             return (tls, peer);
         }
-        // The acceptor task has ended and the channel is drained (shutdown, or
-        // an unrecoverable acceptor exit). `Listener::accept` returns no
-        // `Result` and axum loops on it, so we must neither panic nor busy-loop:
-        // park here forever (awaiting the shutdown token, then a never-resolving
-        // future) so axum's own graceful-shutdown path drives teardown instead
-        // of us spinning.
+        // The acceptor has ended and the channel is drained. `Listener::accept` returns no
+        // `Result` and axum loops on it, so park forever instead of panicking or spinning,
+        // and let axum's graceful shutdown drive teardown.
         self.shutdown.cancelled().await;
         std::future::pending().await
     }
@@ -1108,15 +1068,11 @@ pub fn inspect_leaf(
     let key = read_private_key(key_path)?;
     let (not_before, not_after) = leaf_validity_unix(cert_path, &chain[0])?;
 
-    // Parse and lifetime-check every intermediate too, so doctor fails a
-    // malformed — or expired / not-yet-valid — intermediate chain instead of
-    // greenlighting one the runtime would boot but clients reject (rustls
-    // validates only the leaf).
+    // rustls validates only the leaf, so doctor must fail a bad intermediate that the runtime
+    // would boot but clients reject.
     validate_chain_certs(cert_path, &chain, now_unix)?;
 
-    // Validate the key matches the leaf even though we do not need the key
-    // material — a mismatched pair would fail every handshake at runtime, so
-    // doctor should surface it too.
+    // The key material is unused, but a mismatched pair fails every handshake at runtime.
     let provider = crypto_provider();
     CertifiedKey::from_der(chain, key, &provider).map_err(|source| TlsError::InvalidKeyPair {
         cert: cert_path.to_path_buf(),
@@ -1294,26 +1250,20 @@ impl CertReloader {
 
     /// Run the poll loop until `shutdown` is cancelled.
     pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) {
-        // A zero interval would spin the loop (and its two `spawn_blocking`
-        // stats per tick) as fast as the runtime allows. `app.rs` clamps
-        // `reload_interval_secs` before constructing this, but the type is
-        // public, so enforce the invariant where it belongs instead of trusting
-        // every caller to know it.
+        // A zero interval would spin the loop. `app.rs` clamps it, but this type is public.
         let interval = if self.interval.is_zero() {
             std::time::Duration::from_secs(DEFAULT_RELOAD_INTERVAL_SECS)
         } else {
             self.interval
         };
-        // Stat and PEM-read the cert/key on a blocking thread — both touch the
-        // filesystem and must not run on a tokio worker. On a `JoinError` (the
-        // blocking pool shutting down) just skip the tick and retry next time.
+        // Filesystem reads run on the blocking pool. A `JoinError` (pool shutting down) skips
+        // the tick.
         let stat_mtimes = |cert: PathBuf, key: PathBuf| {
             crate::time::spawn_blocking(move || file_mtimes(&cert, &key))
         };
 
-        // The baseline was taken when the served certificate was loaded, so a
-        // renewal between then and the first tick below is a change, not the
-        // status quo.
+        // The baseline dates from when the served certificate was loaded, so a renewal before
+        // the first tick still counts as a change.
         let mut last = self.baseline;
         loop {
             tokio::select! {
@@ -1350,9 +1300,7 @@ impl CertReloader {
             match loaded {
                 Ok(next) => {
                     self.resolver.store(next);
-                    // Only advance the baseline on a successful load, so a
-                    // partial write observed mid-renewal is retried on the
-                    // next tick.
+                    // Advance only on success, so a partial write seen mid-renewal is retried.
                     last = current;
                     tracing::info!(
                         cert = %self.cert_path.display(),
@@ -1376,8 +1324,7 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
-    // Self-signed `CN=localhost`, valid until 2126. Test fixture only — the key
-    // pair is intentionally public (mirrors `tests/integration/pg_tls.rs`).
+    // Self-signed `CN=localhost`, valid until 2126. The key pair is a public test fixture.
     const CERT_PEM: &str = include_str!("../tests/fixtures/tls/localhost.cert.pem");
     const KEY_PEM: &str = include_str!("../tests/fixtures/tls/localhost.key.pem");
     // A second, unrelated self-signed key (does not match `CERT_PEM`).
@@ -1386,10 +1333,8 @@ mod tests {
     const EXPIRED_CERT_PEM: &str = include_str!("../tests/fixtures/tls/expired.cert.pem");
     const EXPIRED_KEY_PEM: &str = include_str!("../tests/fixtures/tls/expired.key.pem");
 
-    // A well-formed PEM CERTIFICATE block whose body is valid base64 but NOT a
-    // parseable X.509 DER (all-zero bytes). PEM-decodes fine, so it survives
-    // `read_cert_chain`, but `X509Certificate::from_der` rejects it — standing in
-    // for a malformed intermediate in a chain.
+    // A valid PEM block whose body is not X.509 DER (all zero bytes): it passes
+    // `read_cert_chain` but `X509Certificate::from_der` rejects it.
     const MALFORMED_CERT_PEM: &str = "\
 -----BEGIN CERTIFICATE-----
 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
@@ -1422,14 +1367,11 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         assert!(!ck.cert.is_empty());
     }
 
-    // Regression (#1603, Codex): rustls validates only the leaf, so a malformed
-    // INTERMEDIATE would boot a listener serving a chain normal clients reject.
-    // `load_certified_key` must parse every cert in the chain and fail fast,
-    // naming the offending 1-based position.
+    // rustls validates only the leaf, so `load_certified_key` must parse every chain cert and
+    // name the bad one's 1-based position (#1603).
     #[test]
     fn malformed_intermediate_in_chain_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        // [valid leaf, malformed intermediate].
         let chain_pem = format!("{CERT_PEM}\n{MALFORMED_CERT_PEM}");
         let cert = write_temp(dir.path(), "chain.pem", &chain_pem);
         let key = write_temp(dir.path(), "k.pem", KEY_PEM);
@@ -1445,15 +1387,11 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         );
     }
 
-    // A chain of [valid leaf, well-formed valid intermediate] still loads.
-    // Chain-cert validation checks DER parseability and the validity window
-    // (not chain-of-trust), so a second currently-valid certificate stands in
-    // for a real intermediate here.
+    // Chain validation checks DER and the validity window, not chain of trust, so a second
+    // copy of the leaf stands in for a real intermediate.
     #[test]
     fn valid_leaf_and_intermediate_chain_loads() {
         let dir = tempfile::tempdir().unwrap();
-        // Both blocks are the far-future `CERT_PEM` fixture, so the intermediate
-        // is within its validity window (an expired intermediate is now rejected).
         let chain_pem = format!("{CERT_PEM}\n{CERT_PEM}");
         let cert = write_temp(dir.path(), "chain.pem", &chain_pem);
         let key = write_temp(dir.path(), "k.pem", KEY_PEM);
@@ -1463,18 +1401,13 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         assert_eq!(ck.cert.len(), 2, "both chain certificates are retained");
     }
 
-    // Regression (#1603, Codex): an EXPIRED intermediate is rejected by clients
-    // during path validation, so `validate_chain_certs` must fail fast at
-    // load/inspection time, naming the 1-based position and that it expired.
+    // Clients reject an expired intermediate during path validation (#1603).
     #[test]
     fn expired_intermediate_in_chain_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        // [valid leaf (far-future), expired intermediate (2021)].
         let chain_pem = format!("{CERT_PEM}\n{EXPIRED_CERT_PEM}");
         let path = write_temp(dir.path(), "chain.pem", &chain_pem);
         let chain = read_cert_chain(&path).unwrap();
-        // "Now" is inside the leaf's window but well past the intermediate's
-        // 2021 notAfter.
         let err = validate_chain_certs(&path, &chain, now()).unwrap_err();
         assert!(
             matches!(err, TlsError::ExpiredChainCert { position: 2, .. }),
@@ -1490,17 +1423,13 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         );
     }
 
-    // Regression (#1603, Codex): a NOT-YET-VALID intermediate is likewise
-    // rejected by clients, so it must fail fast at position 2. `now` is pinned
-    // before the intermediate's notBefore; the leaf (`chain[0]`) is skipped by
-    // `validate_chain_certs`, so only the intermediate is graded.
+    // `validate_chain_certs` skips the leaf, so pinning "now" before the shared notBefore grades
+    // only the intermediate.
     #[test]
     fn not_yet_valid_intermediate_in_chain_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let leaf = write_temp(dir.path(), "leaf.pem", CERT_PEM);
         let leaf_key = write_temp(dir.path(), "leaf.key.pem", KEY_PEM);
-        // The intermediate is a second copy of `CERT_PEM`; pin "now" one hour
-        // before its notBefore so its validity window has not opened yet.
         let not_before = inspect_leaf(&leaf, &leaf_key, now())
             .unwrap()
             .not_before_unix;
@@ -1522,7 +1451,6 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         );
     }
 
-    // A chain whose intermediate is currently within its validity window passes.
     #[test]
     fn valid_intermediate_in_chain_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
@@ -1551,8 +1479,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let key = write_temp(dir.path(), "k.pem", KEY_PEM);
         let provider = crypto_provider();
         let err = load_certified_key(&cert, &key, &provider, now()).unwrap_err();
-        // An input with no PEM blocks yields "no certificates"; a malformed
-        // block yields a parse error. Either is an actionable, path-named error.
+        // No PEM blocks yields `NoCertificates`, a malformed block `ParseCert`; both name the path.
         assert!(matches!(
             err,
             TlsError::NoCertificates { .. } | TlsError::ParseCert { .. }
@@ -1589,15 +1516,10 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let key = write_temp(dir.path(), "k.pem", KEY_PEM);
         let provider = crypto_provider();
 
-        // Pin "now" to one hour BEFORE the fixture's notBefore (equivalent to a
-        // cert whose notBefore is now + 3600): the leaf is not yet valid, so
-        // load must fail fast — symmetric to the expired-leaf rejection.
         let not_before = inspect_leaf(&cert, &key, now()).unwrap().not_before_unix;
         let err = load_certified_key(&cert, &key, &provider, not_before - 3600).unwrap_err();
         assert!(matches!(err, TlsError::NotYetValid { .. }), "got {err:?}");
 
-        // A currently-valid cert is unaffected: one second into the validity
-        // window (and well before notAfter) the same pair loads cleanly.
         load_certified_key(&cert, &key, &provider, not_before + 1)
             .expect("cert loads once notBefore has passed");
     }
@@ -1607,8 +1529,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let dir = tempfile::tempdir().unwrap();
         let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
         let key = write_temp(dir.path(), "k.pem", KEY_PEM);
-        // inspect_leaf tolerates a not-yet-valid leaf (doctor grades it) but
-        // returns notBefore so the caller can see the window has not opened.
+        // `inspect_leaf` tolerates a not-yet-valid leaf; doctor grades it from `not_before_unix`.
         let inspection = inspect_leaf(&cert, &key, now()).expect("pair inspects");
         assert!(inspection.is_not_yet_valid(inspection.not_before_unix - 1));
         assert!(!inspection.is_not_yet_valid(inspection.not_before_unix));
@@ -1632,8 +1553,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let dir = tempfile::tempdir().unwrap();
         let cert = write_temp(dir.path(), "c.pem", EXPIRED_CERT_PEM);
         let key = write_temp(dir.path(), "k.pem", EXPIRED_KEY_PEM);
-        // inspect_leaf tolerates expiry (doctor grades it) but still returns
-        // the notAfter so the caller can see it is in the past.
+        // `inspect_leaf` tolerates expiry; doctor grades it from `not_after_unix`.
         let inspection = inspect_leaf(&cert, &key, now()).expect("expired pair still inspects");
         assert!(inspection.days_until_expiry(now()) < 0);
     }
@@ -1653,12 +1573,6 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         assert!(Arc::ptr_eq(&resolver.current(), &second));
     }
 
-    // Regression (#2321): `build_server_config` never set `alpn_protocols`,
-    // so rustls completed the handshake with no protocol selected and every
-    // browser silently fell back to HTTP/1.1 — even though the serve path's
-    // `hyper_util::server::conn::auto` already speaks h2 once the client
-    // sends the preface. The fix advertises `h2` first, then `http/1.1`:
-    // ALPN-less and http/1.1-only clients are unaffected.
     #[tokio::test(flavor = "multi_thread")]
     async fn no_connection_is_accepted_before_the_cap_is_installed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1686,8 +1600,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         assert_eq!(listener.handshakes_in_flight(), 0, "nothing starts early");
         assert!(listener.limit_connections(1).is_some());
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        // Installing the cap does not start the acceptor: an upgrade successor
-        // installs it before its startup hooks run, and must not take
+        // An upgrade successor installs the cap before its startup hooks run, and must not take
         // connections from its predecessor until the server is polled.
         assert_eq!(
             listener.handshakes_in_flight(),
@@ -1788,6 +1701,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         shutdown.cancel();
     }
 
+    // Without ALPN, browsers fall back to HTTP/1.1 even though the serve path speaks h2 (#2321).
     #[test]
     fn server_config_advertises_h2_then_http11_alpn() {
         let dir = tempfile::tempdir().unwrap();
@@ -1805,9 +1719,8 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         );
     }
 
-    // The ACME path (#1608) funnels through `build_server_config_with_resolver`
-    // and the client-auth path (#1640) takes a different `match` arm, so pin
-    // the ALPN on both entry points rather than assuming the shared funnel.
+    // ACME (#1608) uses `build_server_config_with_resolver` and client auth (#1640) takes another
+    // `match` arm, so pin the ALPN on both.
     #[test]
     fn server_config_with_resolver_and_client_auth_advertise_the_same_alpn() {
         let dir = tempfile::tempdir().unwrap();
@@ -1828,10 +1741,8 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
             "the resolver (ACME) entry point must advertise the same ALPN"
         );
 
-        // rustls refuses to build a client verifier with zero trust anchors
-        // (`NoRootAnchors`) even in `Optional` mode, so load the client CA
-        // fixture instead of an empty store — the anchors are irrelevant to
-        // the ALPN assertion below; only the `Some(verifier)` arm matters.
+        // rustls refuses a verifier with no trust anchors even in `Optional` mode, so load the
+        // client CA fixture. Only the `Some(verifier)` arm matters here.
         let ca = write_temp(
             dir.path(),
             "ca.pem",
@@ -1856,12 +1767,9 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         );
     }
 
-    // Regression (Codex P1 on PR #2780): advertising `h2` in ALPN is only
-    // safe while the serve stack can speak HTTP/2. The serve loop
-    // (`crate::http_server`) runs every connection through
-    // `hyper_util::server::conn::auto::Builder`, whose H2 arm is compiled out
-    // unless hyper-util's `http2` feature is on. `Builder::http2()` exists
-    // only under that feature, so this test does not compile without it.
+    // Advertising `h2` is safe only while the serve loop's `auto::Builder` speaks HTTP/2, which
+    // needs hyper-util's `http2` feature. `Builder::http2()` exists only under that feature, so
+    // this test does not compile without it.
     #[test]
     fn serve_stack_speaks_http2() {
         let mut builder =

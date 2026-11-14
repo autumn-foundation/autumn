@@ -309,9 +309,8 @@ pub(super) async fn ensure_schema(pool: &SqlitePool) -> AutumnResult<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_autumn_jobs_unique_inflight \
          ON autumn_jobs (name, unique_key) \
          WHERE unique_key IS NOT NULL AND status IN ('enqueued', 'running')",
-        // Serves the TTL dedup guard and the TTL eviction, which carry no
-        // status term and so cannot use the partial unique index above. Partial
-        // itself, so an app with no unique jobs carries an empty index.
+        // Serves the TTL dedup guard and TTL eviction, which have no status term and so cannot
+        // use the partial unique index above. Partial, so it stays empty without unique jobs.
         "CREATE INDEX IF NOT EXISTS idx_autumn_jobs_unique_lookup \
          ON autumn_jobs (name, unique_key) WHERE unique_key IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_autumn_jobs_enqueued_dashboard \
@@ -332,12 +331,9 @@ pub(super) async fn ensure_schema(pool: &SqlitePool) -> AutumnResult<()> {
                 ))
             })?;
     }
-    // A table an earlier build of this runtime created has no `unique_ttl_ms`.
-    // SQLite has no `ADD COLUMN IF NOT EXISTS`, so the error is the check — but
-    // only the duplicate-column error means "already migrated". Anything else
-    // (writer contention, for one) must propagate, or the schema cell would be
-    // marked ready with the column still missing and every enqueue would fail
-    // until the process restarted.
+    // Tables from an earlier build lack `unique_ttl_ms`. SQLite has no `ADD COLUMN IF NOT EXISTS`,
+    // so only a duplicate-column error means "already migrated". Any other error (writer
+    // contention) must propagate, or the schema cell would be marked ready without the column.
     if let Err(error) = diesel::sql_query("ALTER TABLE autumn_jobs ADD COLUMN unique_ttl_ms BIGINT")
         .execute(&mut *conn)
         .await
@@ -347,15 +343,11 @@ pub(super) async fn ensure_schema(pool: &SqlitePool) -> AutumnResult<()> {
             "sqlite jobs schema setup failed: {error}"
         )));
     }
-    // A connection the pool opened before this point can hold a cached schema
-    // that predates `idx_autumn_jobs_unique_inflight`. SQLite does not reload
-    // it, so the enqueue upsert cannot resolve its partial-index target and
-    // fails with "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE
-    // constraint" — a real failure on a correct database. The tracking store
-    // opens such a connection: it writes the status record before the first
-    // enqueue. Drop every idle connection once, here, so the pool serves only
-    // connections opened after the queue schema exists. This runs once per
-    // process, behind the schema cell.
+    // A connection opened before this point (the tracking store opens one before the first
+    // enqueue) can cache a schema without `idx_autumn_jobs_unique_inflight`. SQLite does not
+    // reload it, so the enqueue upsert fails with "ON CONFLICT clause does not match any PRIMARY
+    // KEY or UNIQUE constraint". Drop every idle connection so the pool serves only connections
+    // opened after the schema exists.
     drop(conn);
     let _ = pool.retain(|_, _| false);
     Ok(())
@@ -463,25 +455,21 @@ pub(super) async fn enqueue_job_at(
         evict_expired_unique_key(&mut conn, name, key, now.saturating_sub(ttl)).await?;
     }
 
-    // The `WHERE` is the dedup check and the partial unique index is the
-    // backstop, exactly as on Postgres. A TTL window checks only the time
-    // window, so a job that outlives its TTL cannot block a replacement.
+    // The `WHERE` is the dedup check; the partial unique index is the backstop. A TTL window
+    // checks only time, so a job that outlives its TTL cannot block a replacement.
     //
-    // The two windows get separate query text rather than one `CASE`, because a
-    // `CASE` buries the status test where the planner cannot reach the partial
-    // unique index — every unique enqueue would then scan the whole table. Both
-    // texts take the same three guard binds, in the same order, so the bind
-    // chain below stays single.
+    // Separate query text per window, not one `CASE`: a `CASE` hides the status test from the
+    // planner, so every unique enqueue would scan the table. Both texts take the same three
+    // guard binds in the same order.
     let ttl_cutoff = unique_ttl_ms.map(|ttl| now.saturating_sub(ttl));
     let dedup_guard = if unique_ttl_ms.is_some() {
         "NOT EXISTS ( \
            SELECT 1 FROM autumn_jobs dup \
            WHERE dup.name = ? AND dup.unique_key = ? AND dup.enqueued_at > ?)"
     } else {
-        // The trailing `? IS NULL` consumes the unused TTL-cutoff bind; it is
-        // always true here, and a constant term does not stop the planner from
-        // using the `(name, unique_key)` terms above it. A job with no unique
-        // key binds NULL, so `dup.unique_key = ?` matches nothing and the guard
+        // The trailing `? IS NULL` consumes the unused TTL-cutoff bind (always NULL here); a
+        // constant term does not stop the planner using the `(name, unique_key)` terms. A job
+        // with no unique key binds NULL, so `dup.unique_key = ?` matches nothing and the guard
         // passes.
         "NOT EXISTS ( \
            SELECT 1 FROM autumn_jobs dup \
@@ -527,8 +515,7 @@ pub(super) async fn enqueue_job_at(
     })?;
 
     if inserted == 0 {
-        // The conflict target is the dedup index, so a zero row count can only
-        // be a unique job that coalesced — never a silently lost row.
+        // The conflict target is the dedup index, so zero rows means a unique job coalesced.
         if has_unique_key {
             return Ok(EnqueueOutcome::Deduplicated);
         }
@@ -598,10 +585,8 @@ async fn claim_next_job(
     // One JSON array bind: `SQLite` has no array type.
     let deferred = super::deferred_names_json(deferred);
     let mut conn = pool.get().await.ok()?;
-    // Probe with a read first. The claim is an UPDATE, which opens a write
-    // transaction and takes the single writer lock even when it matches
-    // nothing — so an idle worker fleet would otherwise contend with the
-    // application's own writes on every poll.
+    // Probe with a read first: the claim UPDATE takes SQLite's single writer lock even when it
+    // matches nothing, so idle workers would contend with the app's writes on every poll.
     let ready = diesel::sql_query(format!(
         "SELECT COUNT(*) AS count FROM ( \
            SELECT 1 FROM autumn_jobs \
@@ -715,9 +700,8 @@ async fn nack_failure(
     }
 
     let delay_ms = i64::try_from(retry_delay_ms).unwrap_or(i64::MAX);
-    // Restore a pending-window unique key in the same UPDATE that re-enqueues
-    // the row, so there is no window where the row is claimable with no key and
-    // a concurrent enqueue slips past the dedup index.
+    // Restore a pending-window unique key in the same UPDATE that re-enqueues the row, so a
+    // concurrent enqueue cannot slip past the dedup index while the row is claimable keyless.
     diesel::sql_query(format!(
         "UPDATE autumn_jobs \
          SET status = '{STATUS_ENQUEUED}', \
@@ -816,13 +800,9 @@ async fn recover_stale_claims(
     };
     let now = now_ms(state);
     let cutoff = now.saturating_sub(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX));
-    // Restore a pending-window unique key with the status change, so the row is
-    // never claimable with the key missing.
-    //
-    // A row on its final attempt is dead-lettered instead of re-enqueued, so
-    // there is nothing to restore it onto — but it keeps `pending_unique_key`
-    // rather than having it cleared, because that is the only surviving copy
-    // and an operator's retry restores the key from it.
+    // Restore a pending-window unique key with the status change, so the row is never claimable
+    // with the key missing. A dead-lettered row keeps `pending_unique_key`: it is the only
+    // surviving copy, and an operator's retry restores the key from it.
     let sql = format!(
         "UPDATE autumn_jobs \
          SET status = CASE WHEN attempt < max_attempts THEN '{STATUS_ENQUEUED}' \
@@ -858,12 +838,10 @@ async fn recover_stale_claims(
            LIMIT {STALE_RECOVERY_BATCH}) \
          RETURNING id, name, status, payload, attempt"
     );
-    // A per-row jitter, so claims that expire together do not all run again
-    // at once (issue #3054). See `stale_requeue_cap_ms`. The row id mixes one
-    // draw from the app's entropy, not SQLite's `random()`, so a sim replays
-    // the same jitter for a seed (issue #3067). The draw is below 2^31, so the
-    // SQL products cannot overflow. The hash is below 2^31 too, so a jitter
-    // never passes about 24.8 days, whatever the cap.
+    // Per-row jitter so claims that expire together do not all rerun at once (#3054). The seed
+    // comes from the app's entropy, not SQLite's `random()`, so a sim replays it (#3067). Seed
+    // and hash are below 2^31: the SQL products cannot overflow, and a jitter never exceeds
+    // about 24.8 days whatever the cap.
     let cap_ms = super::stale_requeue_cap_ms(state);
     let jitter_seed = i64::try_from(state.entropy().next_u64() & 0x7fff_ffff).unwrap_or(0);
     let recovered = diesel::sql_query(sql)
@@ -905,9 +883,8 @@ async fn recover_stale_claims(
                 &row.id,
                 "visibility timeout expired",
             );
-            // The row will never run again, so settle its tracked record now.
-            // Otherwise the status endpoint reports `running` until the record
-            // expires.
+            // Settle the tracked record now, or the status endpoint reports `running` until the
+            // record expires.
             let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
             crate::job_tracking::settle_tracked_payload_as_failed(
                 state,
@@ -921,9 +898,7 @@ async fn recover_stale_claims(
                 job_id = %row.id,
                 "sqlite job re-enqueued after its visibility timeout expired"
             );
-            // No gauge write here: the row is back in the table and the depth
-            // survey publishes it absolutely on its next pass. Postgres does
-            // the same.
+            // No gauge write: the depth survey publishes the requeued row on its next pass.
             let attempt = u32::try_from(row.attempt).unwrap_or(0);
             super::record_recovered_requeue(&row.name, &row.id, attempt, state, job_admin);
         }
@@ -1193,10 +1168,8 @@ async fn renew_claim(
         Ok(conn) => conn,
         Err(error) => return LeaseRenewal::Failed(format!("sqlite jobs pool error: {error}")),
     };
-    // Read the time after the wait for a connection, so the wait does not
-    // make the new claim time older than it is. `MAX` keeps a late renewal
-    // (one that waited on the write lock, or one of an earlier attempt of
-    // this worker) from moving the claim time back.
+    // Read the time after the connection wait so the wait does not age the claim. `MAX` keeps a
+    // late renewal (stuck on the write lock, or from an earlier attempt) from moving it back.
     let now = clock.now().timestamp_millis();
     match diesel::sql_query(format!(
         "UPDATE autumn_jobs SET claimed_at = MAX(COALESCE(claimed_at, 0), ?) \
@@ -1268,9 +1241,8 @@ async fn execute_job(
         )
         .await;
         let applied = record_pg_cancel_after_ack(ack, &row.name, &row.id, state);
-        // The cancel reuses the ordinary retry-vs-dead-letter decision, so only
-        // settle the tracked record when this really was the terminal attempt.
-        // A rejected ack means another attempt owns the job (issue #2583).
+        // The cancel may still retry, so settle the tracked record only on the terminal attempt.
+        // A rejected ack means another attempt owns the job (#2583).
         if applied && is_final_attempt(&attempt, &max_attempts) {
             crate::job_tracking::settle_tracked_payload_as_failed(
                 state,
@@ -1410,9 +1382,8 @@ async fn settle_outcome(
             let lifecycle = if final_attempt {
                 PgLifecycleRecord::Failure { error: &error }
             } else {
-                // Mirror the `run_at = now + backoff` the retry UPDATE applies,
-                // so the local gauge tracks the retry as scheduled until it is
-                // claimable. A zero backoff is due now.
+                // Mirror the retry UPDATE's `run_at = now + backoff` so the local gauge counts the
+                // retry as scheduled until it is due. A zero backoff is due now.
                 let ready_at_ms = (delay_ms > 0).then(|| {
                     u64::try_from(now_ms(state))
                         .unwrap_or(0)
@@ -1442,8 +1413,7 @@ async fn settle_outcome(
                 pending.apply(&row.name).await;
             }
         }
-        // A panic dead-letters at once whatever the remaining attempts, as on
-        // every other backend.
+        // A panic dead-letters at once, whatever attempts remain.
         JobExecutionOutcome::Panicked(error) => {
             tracing::error!(job = %row.name, error = %error, "sqlite job handler panicked");
             let ack = ack_dead_letter(pool, now_ms(state), &row.id, worker_id, &error).await;
@@ -1483,15 +1453,12 @@ async fn worker_loop(
         if shutdown.is_cancelled() {
             break;
         }
-        // Retry the schema setup on every pass rather than giving up for the
-        // life of the process: a first attempt can lose a `busy_timeout` race
-        // with another process booting against the same file, and a worker that
-        // returned here would drain nothing until someone restarted it.
+        // Retry schema setup every pass: the first attempt can lose a `busy_timeout` race with
+        // another process booting on the same file, and a worker that gave up would drain nothing.
         let Some(pool) = wait_ready(&queue_handle, poll_interval, &shutdown).await else {
             break;
         };
-        // Walk the priority order and reserve a per-queue slot before the claim,
-        // so a queue cap is honored across the claim round-trip.
+        // Reserve a per-queue slot before the claim so a queue cap holds across the round-trip.
         let order = cursor.next_order();
         let mut handled = false;
         for queue in slots.claimable(&order) {
@@ -1499,7 +1466,7 @@ async fn worker_loop(
                 continue;
             };
             let deferred = super::deferred_job_names(&state, &jobs_by_name);
-            // The claim stamps `claimed_at` inside the claim query.
+            // Sampled before the claim query, which stamps `claimed_at` itself.
             let claimed_at = tokio::time::Instant::now();
             match claim_next_job(&pool, &worker_id, &queue, now_ms(&state), &deferred).await {
                 Some(row) => {
@@ -1542,8 +1509,7 @@ async fn maintenance_loop(
     job_admin: JobAdminMemoryBackend,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
-    // Opt-in, and read from the same `retention.job_history` window the
-    // Postgres sweep uses. Unset means history is kept forever, as on Postgres.
+    // Unset keeps job history forever.
     let history_window = state
         .extension::<crate::config::AutumnConfig>()
         .and_then(|config| config.retention.job_history.clone())
@@ -1552,8 +1518,7 @@ async fn maintenance_loop(
     let Some(pool) = wait_ready(&queue_handle, interval_duration, &shutdown).await else {
         return;
     };
-    // Sweep once at start: a row still marked running belongs to a process that
-    // is no longer here.
+    // Sweep once at start to recover claims a dead process left behind.
     recover_stale_claims(&pool, visibility_timeout_ms, &state, &job_admin).await;
     let mut tracking_cleanup = tokio::time::interval(TRACKING_CLEANUP_INTERVAL);
     tracking_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1638,8 +1603,7 @@ fn queue_topology(
         );
     }
     let uncovered = schedule.retain_pinned(&config.pin);
-    // Only worker roles claim queues, so a web replica must not warn about
-    // queues it will never drain.
+    // Only worker roles claim queues; a web replica must not warn about queues it never drains.
     if should_warn_pin_coverage(run_workers, &config.pin) {
         warn_pinned_uncovered_queues(
             &uncovered,
@@ -1708,9 +1672,8 @@ pub(super) fn start_runtime(
 
     install_enqueue_client(state, &queue_handle, &job_admin, per_job_settings, config);
 
-    // Backend-derived actuator gauges: survey the table on an interval. Spawned
-    // for ALL roles — before the web-role return below — so an enqueue-only
-    // replica reports the shared backlog rather than its own local marks.
+    // Spawned for every role, before the web-role return below, so an enqueue-only replica
+    // reports the shared backlog rather than its own local marks.
     {
         let queue_handle = queue_handle.clone();
         let state = state.clone();
@@ -1720,8 +1683,7 @@ pub(super) fn start_runtime(
         });
     }
 
-    // A web replica installs the enqueue client but drains nothing: another
-    // process on the host runs the workers.
+    // A web replica only enqueues; another process on the host runs the workers.
     if !run_workers {
         return Ok(());
     }
@@ -1870,15 +1832,12 @@ impl SqliteJobAdminBackend {
         use diesel::OptionalExtension as _;
         use diesel_async::RunQueryDsl as _;
 
-        // Snapshot the tracking record before the UPDATE makes the retry
-        // visible to workers, so the reset can detect a retry that finishes
-        // faster than this function returns.
+        // Snapshot the tracking record before the UPDATE makes the retry visible, so the reset
+        // can detect a retry that finishes before this function returns.
         //
-        // The read is scoped so its checkout is released before the tracking
-        // call below. The tracking store is backed by this same pool, and that
-        // pool is one slot for a private in-memory target, so holding this
-        // connection across the call would deadlock until
-        // `database.connect_timeout_secs` and then silently skip the reset.
+        // The read is scoped to release its checkout before the tracking call: the tracking
+        // store shares this pool, which is one slot for a private in-memory target, so holding
+        // it would deadlock until `database.connect_timeout_secs` and skip the reset.
         let pre_retry_row = {
             let mut conn = self.queue.ready().await?.get().await.map_err(|error| {
                 AutumnError::internal_server_error_msg(format!("sqlite admin pool error: {error}"))
@@ -1909,9 +1868,8 @@ impl SqliteJobAdminBackend {
         let mut conn = self.queue.ready().await?.get().await.map_err(|error| {
             AutumnError::internal_server_error_msg(format!("sqlite admin pool error: {error}"))
         })?;
-        // The UPDATE also restores a `pending`-window dedup key: claiming moved
-        // it to `pending_unique_key`, and re-enqueueing without it would leave
-        // the retried job undeduplicated while it waits.
+        // Restore a `pending`-window dedup key: claiming moved it to `pending_unique_key`, and
+        // without it the retried job would wait undeduplicated.
         let now = self.clock.now().timestamp_millis();
         let updated = diesel::sql_query(format!(
             "UPDATE autumn_jobs \
@@ -1939,11 +1897,8 @@ impl SqliteJobAdminBackend {
         .await
         .optional()
         .map_err(|error| {
-            // The retried row keeps its unique key, so re-enqueueing while an
-            // equivalent job is in flight trips the partial unique index.
-            // Surface that as an actionable conflict. SQLite names the offending
-            // columns ("UNIQUE constraint failed: autumn_jobs.name, …"), never
-            // the index, so match on that rather than on the index name.
+            // An equivalent in-flight job trips the partial unique index. SQLite's message names
+            // the columns ("UNIQUE constraint failed: autumn_jobs.name, …"), never the index.
             if error.to_string().contains("UNIQUE constraint failed") {
                 AutumnError::bad_request_msg(
                     "an equivalent unique job is already pending or running; \
@@ -2003,9 +1958,8 @@ impl SqliteJobAdminBackend {
             AutumnError::internal_server_error_msg(format!("sqlite admin pool error: {error}"))
         })?;
         let now = self.clock.now().timestamp_millis();
-        // The `status = 'enqueued'` guard means this only ever transitions a
-        // still-unclaimed row, so the gauge decrement below can never
-        // double-count against the cancel a claimed job records at ack time.
+        // The `enqueued` guard touches only unclaimed rows, so the gauge decrement below cannot
+        // double-count the cancel a claimed job records at ack time.
         let cancelled = diesel::sql_query(format!(
             "UPDATE autumn_jobs SET status = '{STATUS_DISCARDED}', finished_at = ? \
              WHERE id = ? AND status = '{STATUS_ENQUEUED}' \
@@ -2024,19 +1978,15 @@ impl SqliteJobAdminBackend {
                 "job '{id}' not found or not in enqueued state"
             )));
         };
-        // Remove the per-queue waiting mark this job pushed at enqueue time, or
-        // a phantom depth lingers on this process. A still-future `run_at` was
-        // a scheduled mark, a ready one a ready mark.
+        // Remove the waiting mark this job pushed at enqueue, or a phantom depth lingers. A
+        // future `run_at` was a scheduled mark.
         if row.run_at > now {
             self.registry.record_cancel_scheduled(&row.name);
         } else {
             self.registry.record_cancel(&row.name);
         }
-        // Release the checkout before the tracking store asks this same pool
-        // for one. That pool is a single slot for a private in-memory target,
-        // so holding it here would stall the cancel until
-        // `database.connect_timeout_secs` and then report success with the
-        // job's public status still pending.
+        // Release the checkout before the tracking store asks this pool for one (see
+        // `retry_failed`), or the cancel stalls and leaves the public status pending.
         drop(conn);
         // An operator can cancel before any worker claims the job, which never
         // reaches the handler — settle the tracked record here too.
@@ -2084,8 +2034,7 @@ async fn admin_page(
     )
     .unwrap_or(0);
     let filter = extra.map_or_else(String::new, |(clause, _)| format!(" AND {clause}"));
-    // A scheduled list reads best soonest-due first; every other list is
-    // newest-first.
+    // Scheduled lists soonest-due first; every other list newest-first.
     let direction = if admin_status == JobAdminStatus::Scheduled {
         "ASC"
     } else {

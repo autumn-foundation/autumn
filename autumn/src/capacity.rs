@@ -1095,7 +1095,7 @@ mod tests {
         assert_ne!(route_graph_digest(&routes), route_graph_digest(&changed));
     }
 
-    // ── runtime admission sourcing (#1733 AC-4) ─────────────────────────
+    // ── runtime admission sourcing (#1733) ──────────────────────────────
 
     use std::io::Write as _;
 
@@ -1123,8 +1123,8 @@ mod tests {
 
     #[test]
     fn an_explicit_zero_disables_shedding_and_never_consults_the_contract() {
-        // `max_concurrent_requests = 0` is today's spelling of "shedding off".
-        // A committed contract must not quietly switch it back on.
+        // `max_concurrent_requests = 0` means "shedding off"; a committed contract must not switch
+        // it back on.
         let mut contract = sample_contract();
         contract.host = HostProfile::detect();
         let (_dir, path) = write_contract(&contract);
@@ -1146,8 +1146,7 @@ mod tests {
 
     #[test]
     fn a_contract_measured_on_another_host_class_is_not_enforced() {
-        // Throttling a 64-core production box to a 2-core laptop's proven
-        // envelope would be a self-inflicted outage.
+        // Throttling a 64-core production box to a 2-core laptop's envelope would cause an outage.
         let mut contract = sample_contract();
         contract.host = HostProfile {
             logical_cpus: HostProfile::detect().logical_cpus.saturating_add(7),

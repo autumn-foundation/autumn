@@ -493,14 +493,10 @@ impl SessionStore for MemoryStore {
 
 // ── Erasure bridge for runtime-installed custom stores ─────────
 //
-// `SessionStore` uses RPIT (`-> impl Future + Send`) and is therefore not
-// dyn-compatible. To let `AppBuilder::with_session_store(impl SessionStore)`
-// erase the concrete type into something `AppBuilder` can store and
-// `build_session_layer` can wrap into a `SessionLayer`, we keep a
-// pub(crate) dyn-compatible `BoxedSessionStore` shadow trait with a blanket
-// impl over any `SessionStore`, plus an `ArcSessionStore` newtype that
-// satisfies `SessionStore` by delegating through the trait object. Users
-// only see `SessionStore`; the bridge stays an implementation detail.
+// `SessionStore` returns `impl Future`, so it is not dyn-compatible. `BoxedSessionStore` is a
+// dyn-compatible shadow with a blanket impl over every `SessionStore`, and `ArcSessionStore`
+// implements `SessionStore` through it, so `AppBuilder::with_session_store` can erase the
+// concrete store. Users only see `SessionStore`.
 
 pub(crate) type BoxedLoadFuture<'a> = Pin<
     Box<
@@ -787,9 +783,7 @@ pub(crate) fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String
             }
 
             if found_token.is_some() {
-                // Multiple cookies with the same name found.
-                // This indicates a potential Cookie Tossing attack!
-                // Reject by returning None.
+                // A repeated cookie name may be cookie tossing: reject it.
                 return None;
             }
 
@@ -1142,11 +1136,9 @@ async fn save_session<St: SessionStore>(
                 new_id: sid.clone(),
                 earlier_ids: inner_guard.prior_ids.clone(),
             });
-        // The tenant `[tenancy] source = "session"` will resolve for a
-        // retry presenting this finalized session — read live from the
-        // data just written rather than reusing the tenant captured
-        // before the handler ran, which a handler like an org switch
-        // may have just changed.
+        // A retry with this session resolves its tenant (`[tenancy] source = "session"`) from
+        // the data just written, which the handler (an org switch, say) may have changed since
+        // the tenant was captured.
         let finalized_tenant = shared
             .tenancy_session_key
             .as_deref()
@@ -1181,7 +1173,6 @@ async fn save_session<St: SessionStore>(
         if let (Some(hooks), Some(rotation)) = (&shared.rotation_hooks, &rotation) {
             hooks.run(rotation).await;
         }
-        // Sign the session ID when signing keys are active
         let cookie_value = shared.signing_keys.as_ref().map_or_else(
             || sid.clone(),
             |keys| format!("{sid}.{}", keys.sign(sid.as_bytes())),
@@ -1217,14 +1208,12 @@ where
 
     fn call(&mut self, mut req: Request) -> Self::Future {
         let shared = Arc::clone(&self.shared);
-        // Verify the HMAC of the cookie if signing is active.
         let Some(existing_id) = session_id_from_headers(
             req.headers(),
             &shared.config.cookie_name,
             shared.signing_keys.as_deref(),
         ) else {
-            // No cookie: a new session, and nothing to load. Call the inner
-            // service at once.
+            // No cookie: a new session with nothing to load, so call the inner service at once.
             let session = Session::for_request(
                 shared.entropy.uuid_v4().to_string(),
                 HashMap::new(),
@@ -1250,7 +1239,6 @@ where
         SessionFuture {
             state: SessionState::Loading {
                 fut: Box::pin(async move {
-                    // 1. Load the session of the cookie.
                     let mut stale_cookie_session_id = None;
                     let (session_id, data, cookie_backed) =
                         match shared.store.load(&existing_id).await {
@@ -1262,7 +1250,6 @@ where
                             Err(error) => return Ok(session_store_unavailable_response(&error)),
                         };
 
-                    // 2. Create session handle and insert into extensions
                     let current_session_scope = cookie_backed.then(|| session_id.clone());
                     let session = Session::for_request(
                         session_id,
@@ -1277,10 +1264,8 @@ where
                         ));
                     req.extensions_mut().insert(session.clone());
 
-                    // 3. Call inner service
                     let response = inner.call(req).await?;
 
-                    // 4. Save or destroy the session.
                     if response_was_deadline_cancelled(&response) {
                         return Ok(response);
                     }
@@ -1476,8 +1461,7 @@ mod tests {
             _id: &str,
         ) -> Result<Option<HashMap<String, String>>, SessionStoreError> {
             *self.load_calls.write().await += 1;
-            // Return a recognisable session payload so the test can prove the
-            // wrapper actually went through this impl.
+            // A recognisable payload proves the wrapper went through this impl.
             let mut data = HashMap::new();
             data.insert("from".to_owned(), "sentinel".to_owned());
             Ok(Some(data))
@@ -1521,7 +1505,6 @@ mod tests {
 
     #[tokio::test]
     async fn boxed_session_store_blanket_impl_works_for_any_session_store() {
-        // Any SessionStore type erases via the BoxedSessionStore blanket impl.
         let store = SentinelStore::default();
         let boxed: Arc<dyn BoxedSessionStore> = Arc::new(store);
         let result = boxed.boxed_load("session-id").await.unwrap();
@@ -1798,7 +1781,6 @@ mod tests {
             .layer(SessionLayer::new(store, config))
             .with_state(state);
 
-        // First request: write to session
         let resp1 = app
             .clone()
             .oneshot(
@@ -1817,10 +1799,8 @@ mod tests {
             .to_str()
             .unwrap()
             .to_owned();
-        // Extract just the cookie value for the next request
         let session_cookie = cookie.split(';').next().unwrap();
 
-        // Second request: read from session
         let resp2 = app
             .oneshot(
                 HttpRequest::builder()
@@ -1877,7 +1857,6 @@ mod tests {
             .unwrap();
         assert!(cookie.contains("Max-Age=0"), "cookie should be expired");
 
-        // Store should no longer have the session
         assert!(store.load("existing-id").await.unwrap().is_none());
     }
 
@@ -1945,15 +1924,13 @@ mod tests {
     async fn deadline_cancelled_response_skips_partial_session_save() {
         let state = test_state();
         let store = MemoryStore::new();
-        // Seed an existing cookie-backed session with no application data.
         store
             .save("existing-id", HashMap::new())
             .await
             .expect("seed save");
 
-        // A handler that mutates the session and then exceeds an inner deadline,
-        // standing in for the real request-timeout layer (which is applied inner
-        // to the session layer and stamps `RequestDeadlineCancelled` on its 503).
+        // Stands in for the request-timeout layer, which sits inside the session layer and marks
+        // its 503 with `RequestDeadlineCancelled`.
         let timeout_layer = axum::middleware::from_fn(
             |req: HttpRequest<Body>, next: axum::middleware::Next| async move {
                 tokio::time::timeout(std::time::Duration::from_millis(50), next.run(req))
@@ -1972,8 +1949,7 @@ mod tests {
                 "/",
                 get(|session: Session| async move {
                     session.insert("user", "alice").await;
-                    // Far exceeds the 50ms inner deadline; the handler future is
-                    // cancelled before it returns.
+                    // Outlasts the 50ms deadline, so the handler is cancelled mid-way.
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     "ok"
                 }),
@@ -1994,8 +1970,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        // The partial mutation must NOT have been persisted: the stored session
-        // is still the seeded empty map, with no `user` key.
         let saved = store
             .load("existing-id")
             .await
@@ -2005,7 +1979,6 @@ mod tests {
             !saved.contains_key("user"),
             "a deadline-cancelled request must not persist partial session changes"
         );
-        // The session layer must also not emit a Set-Cookie for the skipped save.
         assert!(
             response.headers().get(SET_COOKIE).is_none(),
             "no Set-Cookie should be written when the partial save is skipped"
@@ -2057,9 +2030,8 @@ mod tests {
 
     // ── Requests without a cookie (issue #2830) ───────────────────────────
     //
-    // These requests do not load a session, so the layer can call the inner
-    // service at once. These tests make sure that the persistence rules stay
-    // the same on that path.
+    // These requests load no session, so the layer calls the inner service at once. The tests
+    // check that the persistence rules still hold on that path.
 
     #[tokio::test]
     async fn no_cookie_clean_session_sets_no_cookie_and_saves_nothing() {
@@ -2264,7 +2236,7 @@ mod tests {
         assert!(store.sessions.read().await.is_empty(), "nothing saved");
     }
 
-    // ── Signed session cookies (RED phase) ─────────────────────────────────
+    // ── Signed session cookies ─────────────────────────────────────────────
 
     #[tokio::test]
     async fn session_cookie_is_signed_when_signing_keys_set() {

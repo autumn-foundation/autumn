@@ -2627,10 +2627,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let removed = self
             .with_provision_turn(&key, async {
                 let lock = {
-                    // Before the lock: the lock then waits for one write
-                    // only. The connection stays out of the pool while the
-                    // lock is busy (at most the lock timeout). It goes back
-                    // at the end of this block.
+                    // Check out before the path lock, so the lock waits for one
+                    // write only. The connection stays out of the pool while the
+                    // lock is busy (at most the lock timeout).
                     let mut control = record.checkout().await?;
                     // The path lock first: the check, the row and the
                     // removal then see one state. A delete in another

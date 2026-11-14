@@ -286,8 +286,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let (db, mut conn) = seeded(dir.path());
         let _reader = open(&db).expect("second connection");
-        // Whatever the outcome, it must be reported honestly rather than
-        // claiming success while frames remain.
+        // Either outcome is acceptable, as long as it matches the WAL on disk.
         let outcome = checkpoint_truncate(&mut conn, &db).expect("checkpoint");
         let wal_bytes = std::fs::metadata(wal::wal_path(&db)).map_or(0, |m| m.len());
         match outcome {

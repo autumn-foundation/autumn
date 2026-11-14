@@ -167,7 +167,6 @@ pub fn validate(
     served: impl Fn(&str) -> bool,
 ) -> Result<(), Rejection> {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
-    // A request id is a string or an integer.
     let id_ok = id.is_string() || id.is_i64() || id.is_u64();
     let method = msg.get("method").and_then(Value::as_str);
     let (true, Some(method), true) = (
@@ -185,7 +184,6 @@ pub fn validate(
         ));
     };
 
-    // The required `_meta` fields.
     let meta = meta(msg);
     let Some(version) = meta
         .and_then(|m| m.get(META_PROTOCOL_VERSION))

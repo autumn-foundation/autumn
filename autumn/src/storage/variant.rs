@@ -281,7 +281,6 @@ impl VariantHandle {
         store: &dyn BlobStore,
         budget: &VariantBudget,
     ) -> Result<Blob, VariantError> {
-        // Fast path: variant already in store.
         if let Some(meta) = store.head(&self.variant_key).await? {
             return Ok(Blob {
                 provider_id: store.provider_id().to_owned(),
@@ -300,8 +299,7 @@ impl VariantHandle {
         store: &dyn BlobStore,
         budget: &VariantBudget,
     ) -> Result<Blob, VariantError> {
-        // Guard byte size before we even fetch — avoids streaming a huge blob
-        // into memory just to reject it.
+        // Check the recorded size before fetching, so a huge blob is never read.
         if self.source.byte_size > budget.max_source_bytes {
             return Err(VariantError::SourceTooLarge {
                 byte_size: self.source.byte_size,
@@ -309,13 +307,11 @@ impl VariantHandle {
             });
         }
 
-        // Reject non-image MIME types before touching the store.
         check_image_mime_type(&self.source.content_type)?;
 
         let source_bytes = store.get(&self.source.key).await?;
 
-        // Secondary guard on the real byte count — the Blob metadata could be
-        // stale or crafted; check the actual payload length too.
+        // The recorded size can be stale or forged; check the real length too.
         if source_bytes.len() as u64 > budget.max_source_bytes {
             return Err(VariantError::SourceTooLarge {
                 byte_size: source_bytes.len() as u64,
@@ -323,8 +319,7 @@ impl VariantHandle {
             });
         }
 
-        // Offload CPU-bound decode/transform/encode to a blocking thread so
-        // Tokio worker threads are not stalled during image processing.
+        // Image work is CPU-bound: keep it off the async workers.
         let transforms = self.transforms.clone();
         let content_type = self.source.content_type.clone();
         let max_width = budget.max_source_width;
@@ -332,13 +327,12 @@ impl VariantHandle {
 
         let (output_bytes, output_content_type) = crate::time::spawn_blocking(
             move || -> Result<(Vec<u8>, &'static str), VariantError> {
-                // Use decoder limits to guard against image bombs: a compressed
-                // file under `max_source_bytes` can still expand to gigabytes of
-                // pixel data without this guard.
+                // Decoder limits stop image bombs: a small compressed file can expand to
+                // gigabytes of pixels.
                 let mut reader = image::ImageReader::new(Cursor::new(&source_bytes[..]))
                     .with_guessed_format()
                     .map_err(|e| VariantError::DecodeError(e.to_string()))?;
-                // image::Limits is #[non_exhaustive]; build via Default + field mutation.
+                // `image::Limits` is `#[non_exhaustive]`, so no struct literal.
                 let mut limits = image::Limits::default();
                 limits.max_image_width = Some(max_width);
                 limits.max_image_height = Some(max_height);
@@ -353,8 +347,7 @@ impl VariantHandle {
                     _ => VariantError::DecodeError(e.to_string()),
                 })?;
 
-                // Belt-and-suspenders: if the decoder didn't enforce limits,
-                // catch oversized images here where we know the actual size.
+                // Not every decoder enforces the limits.
                 if img.width() > max_width || img.height() > max_height {
                     return Err(VariantError::SourceDimensionsTooLarge {
                         width: img.width(),
@@ -496,7 +489,7 @@ fn apply_transforms(mut img: image::DynamicImage, transforms: &[Transform]) -> i
     for transform in transforms {
         img = match transform {
             Transform::ResizeToLimit { width, height } => {
-                // Never upscale: if the image already fits, return as-is.
+                // `resize` would upscale an image that already fits.
                 if img.width() <= *width && img.height() <= *height {
                     img
                 } else {
@@ -512,8 +505,7 @@ fn apply_transforms(mut img: image::DynamicImage, transforms: &[Transform]) -> i
                 270 => img.rotate270(),
                 _ => img,
             },
-            // Re-encoding through the `image` crate already drops EXIF; this
-            // variant documents intent without additional pixel mutation.
+            // Re-encoding through `image` already drops EXIF.
             Transform::StripMetadata => img,
         };
     }
@@ -530,13 +522,6 @@ fn encode_image(
         .map_err(|e| VariantError::DecodeError(e.to_string()))?;
     Ok(buf.into_inner())
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-//
-// TDD phases:
-//   RED   – test bodies written first; without the implementation above they
-//           would not compile / would panic.
-//   GREEN – the implementation above makes all tests pass.
 
 #[cfg(test)]
 mod tests {
@@ -567,7 +552,7 @@ mod tests {
         buf.into_inner()
     }
 
-    // ── RED: content addressing ──────────────────────────────────────────────
+    // ── content addressing ───────────────────────────────────────────────────
 
     #[test]
     fn transform_serialisation_is_stable() {
@@ -607,9 +592,7 @@ mod tests {
 
     #[test]
     fn same_source_key_different_etag_produces_different_keys() {
-        // Simulates a re-upload to the same key (e.g. avatars/{id}.bin):
-        // the new ETag must produce a different variant key so the old
-        // cached thumbnail is not served for the new content.
+        // A re-upload to the same key gets a new variant key, so the old thumbnail is not served.
         let mut b1 = Blob::new("local", "avatars/1.png", "image/png", 1024);
         b1.etag = Some("sha256-aabbcc".to_owned());
         let mut b2 = Blob::new("local", "avatars/1.png", "image/png", 2048);
@@ -643,7 +626,7 @@ mod tests {
         assert!(key.starts_with("_variants/"), "key: {key}");
     }
 
-    // ── RED: MIME-type enforcement ───────────────────────────────────────────
+    // ── MIME-type enforcement ────────────────────────────────────────────────
 
     #[test]
     fn check_image_mime_type_accepts_jpeg() {
@@ -686,7 +669,7 @@ mod tests {
         assert!(matches!(err, VariantError::UnsupportedMimeType(_)));
     }
 
-    // ── RED: budget enforcement ──────────────────────────────────────────────
+    // ── budget enforcement ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn variant_rejects_non_image_blob() {
@@ -722,12 +705,11 @@ mod tests {
             .put("img.jpg", "image/jpeg", Bytes::from(jpeg))
             .await
             .unwrap();
-        // Budget smaller than the actual stored blob.
         let budget = VariantBudget {
             max_source_bytes: actual_size - 1,
             ..Default::default()
         };
-        // Lie about byte_size in the Blob so the pre-fetch check fires.
+        // The recorded size is over budget, so the check before the fetch fires.
         let blob = Blob::new("test", "img.jpg", "image/jpeg", actual_size);
         let err = blob
             .variant("t", &[Transform::resize_to_limit(2, 2)])
@@ -744,7 +726,6 @@ mod tests {
     async fn variant_rejects_oversized_source_dimensions() {
         let dir = tempfile::tempdir().unwrap();
         let store = test_store(dir.path());
-        // 4×4 image.
         let jpeg = make_test_image(4, 4, image::ImageFormat::Jpeg);
         store
             .put("big.jpg", "image/jpeg", Bytes::from(jpeg.clone()))
@@ -767,7 +748,7 @@ mod tests {
         );
     }
 
-    // ── RED: generation and caching ──────────────────────────────────────────
+    // ── generation and caching ───────────────────────────────────────────────
 
     #[tokio::test]
     async fn variant_generates_on_first_call() {
@@ -809,7 +790,7 @@ mod tests {
         assert_eq!(first.byte_size, second.byte_size);
     }
 
-    // ── RED: transforms ──────────────────────────────────────────────────────
+    // ── transforms ───────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn resize_to_limit_respects_max_dimensions() {
@@ -847,7 +828,6 @@ mod tests {
     async fn resize_to_limit_does_not_upscale() {
         let dir = tempfile::tempdir().unwrap();
         let store = test_store(dir.path());
-        // Source is already smaller than the limit.
         let jpeg = make_test_image(20, 20, image::ImageFormat::Jpeg);
         store
             .put("small.jpg", "image/jpeg", Bytes::from(jpeg.clone()))
@@ -909,7 +889,6 @@ mod tests {
     async fn rotate_90_swaps_dimensions() {
         let dir = tempfile::tempdir().unwrap();
         let store = test_store(dir.path());
-        // 100×50 landscape image.
         let jpeg = make_test_image(100, 50, image::ImageFormat::Jpeg);
         store
             .put("land.jpg", "image/jpeg", Bytes::from(jpeg.clone()))
@@ -988,7 +967,7 @@ mod tests {
         );
     }
 
-    // ── RED: PNG source ──────────────────────────────────────────────────────
+    // ── PNG source ───────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn png_source_is_processed_and_cached() {
@@ -1017,13 +996,12 @@ mod tests {
         );
     }
 
-    // ── RED: WebP source ─────────────────────────────────────────────────────
+    // ── WebP source ──────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn webp_source_is_processed_to_jpeg() {
         let dir = tempfile::tempdir().unwrap();
         let store = test_store(dir.path());
-        // Encode the source as WebP.
         let webp = make_test_image(40, 40, image::ImageFormat::WebP);
         store
             .put("photo.webp", "image/webp", Bytes::from(webp.clone()))
@@ -1035,7 +1013,6 @@ mod tests {
             .ensure_generated(&store, &VariantBudget::default())
             .await
             .unwrap();
-        // WebP sources are transcoded to JPEG.
         assert_eq!(
             variant_blob.content_type, "image/jpeg",
             "WebP source must produce JPEG variant"
@@ -1044,7 +1021,7 @@ mod tests {
         assert!(image::load_from_memory(&out_bytes).is_ok());
     }
 
-    // ── RED: URL helper ──────────────────────────────────────────────────────
+    // ── URL helper ───────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn variant_url_returns_presigned_url() {
@@ -1069,7 +1046,7 @@ mod tests {
         assert!(url.contains("sig="), "URL must contain signature: {url}");
     }
 
-    // ── RED: handle accessors ────────────────────────────────────────────────
+    // ── handle accessors ─────────────────────────────────────────────────────
 
     #[test]
     fn handle_name_accessor() {
@@ -1089,13 +1066,13 @@ mod tests {
         assert_eq!(h.transforms(), &transforms);
     }
 
-    // ── RED: content_addressed_key internals ─────────────────────────────────
+    // ── content_addressed_key internals ──────────────────────────────────────
 
     #[test]
     fn content_addressed_key_hex_is_64_chars() {
         let blob = Blob::new("local", "avatars/1.png", "image/png", 1024);
         let key = content_addressed_key(&blob, &[Transform::resize_to_limit(200, 200)]);
-        // format: _variants/xx/xx/<64-hex-chars>
+        // `_variants/xx/xx/<64 hex chars>`
         let hash_part = key.rsplit('/').next().unwrap();
         assert_eq!(hash_part.len(), 64, "hash part must be 64 hex chars");
     }

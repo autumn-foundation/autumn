@@ -25,9 +25,9 @@
 //! without the `db` feature; [`DivergenceLog`] is a plain shared buffer the
 //! stub server writes into.
 
-// Replay-time module (offline `autumn replay` runs, never the serving path);
-// kept panic-averse with the same deny set, but deliberately outside the
-// request-path panic-gate manifest — see CONTRIBUTING.md.
+// Replay-time code (offline `autumn replay` runs), never the serving path: panic-averse with the
+// same deny set, but deliberately outside the request-path panic-gate manifest.
+// See CONTRIBUTING.md.
 #![cfg_attr(
     not(test),
     deny(
@@ -405,9 +405,7 @@ impl ReplayFixtures {
     /// Build the fixtures a capsule's recording describes.
     #[must_use]
     pub fn from_capsule(capsule: &Capsule) -> Self {
-        // The fallback matters only for a capsule that recorded no readings at
-        // all: `captured_at` is then the closest thing to the failure's own
-        // wall time.
+        // With no recorded readings, `captured_at` is the closest thing to the failure's wall time.
         let fallback = capsule
             .clock
             .first()
@@ -552,17 +550,15 @@ fn judge(
     entropy_warnings(fixtures.entropy.as_ref(), &mut warnings);
     scope_warning(capsule, fixtures, &mut warnings);
 
-    // Statements the run issued that the tape could not answer, then recorded
-    // statements the run never issued at all.
+    // Statements the tape could not answer, then recorded statements the run never issued.
     let mut entries = divergences.entries();
     entries.extend(divergences.unconsumed());
-    // The same two halves for the effect seams: `finish` returns the
-    // divergences logged during the run *plus* every recorded effect the run
-    // never asked for.
+    // The same two halves for the effect seams: `finish` returns the divergences logged during
+    // the run plus every recorded effect the run never asked for.
     let mut effect_entries = fixtures.effects.finish();
-    // A draw of another width is consumed in place, so the counts stay level
-    // and only this check sees it (#2351 item 11). A v3 capsule can hold an
-    // enqueue's job-id draw that replay never takes, so it is not checked.
+    // A draw of another width is consumed in place, so the counts stay level and only this
+    // check sees it (#2351). A v3 capsule can hold an enqueue's job-id draw that replay never
+    // takes, so it is not checked.
     let width_mismatches = if fixtures.effects.legacy_v3() {
         Vec::new()
     } else {
@@ -575,9 +571,8 @@ fn judge(
                 crate::capsule::effects::random_width_divergence(index, recorded, requested)
             }),
     );
-    // A value that stood behind a placeholder in a matched effect is masked in
-    // the recorded outcome. Mask it in the actual outcome too, before the
-    // comparison and before anything prints it (#2351 item 16).
+    // A value that stood behind a placeholder in a matched effect is masked in the recorded
+    // outcome. Mask it in the actual outcome too, before comparing or printing it (#2351).
     let observed = fixtures.effects.observed_redactions();
     let actual = crate::capsule::persist::scrub_outcome(actual, &observed);
     // The divergence report is printed too. Mask the same values in it.
@@ -718,35 +713,31 @@ pub async fn execute_job(
     let run = crate::capsule::effects::with_effect_tape(
         fixtures.effects(),
         crate::capsule::clock::with_replay_request_scope(async move {
-            // The marker that says the recorded clock and entropy were actually
-            // served is otherwise set only by `ReportingLayer`, which a direct
-            // job dispatch never traverses — so without this every faithful job
-            // replay warns that fixtures it *did* serve went unused.
+            // Set the "fixtures were served" marker that `ReportingLayer` sets for requests. A
+            // job dispatch never passes through that layer, so without this every faithful job
+            // replay warns that its clock and entropy went unused.
             let _ = crate::capsule::effects::tape_active();
             dispatch(payload).await
         }),
     );
     let actual = match AssertUnwindSafe(run).catch_unwind().await {
         Ok(Ok(())) => CapsuleOutcome::Status {
-            // A job that now succeeds is the "the bug is gone" shape; code 0
-            // never collides with the 500 a recorded failure carries.
+            // A job that now succeeds means "the bug is gone"; code 0 never collides with the
+            // 500 a recorded failure carries.
             code: 0,
             message: "the job succeeded".to_owned(),
             problem_type: None,
         },
         Ok(Err(error)) => CapsuleOutcome::Status {
             code: 500,
-            // `message`, not `Display`: paired against the recorded
-            // string, which `job::run_job_handler` also records this way.
+            // `message`, not `Display`: `job::run_job_handler` records it the same way.
             message: error.message(),
             problem_type: None,
         },
         Err(payload) => CapsuleOutcome::Panic {
             status: 500,
-            // Byte-identical to what `job::format_job_panic` records, including
-            // its non-string fallback: `outcomes_match` compares payloads
-            // exactly, so a different spelling here would make every
-            // non-string job panic replay as a `Mismatch`.
+            // Byte-identical to what `job::format_job_panic` records, non-string fallback
+            // included: `outcomes_match` compares payloads exactly.
             payload: format_job_panic_payload(payload.as_ref()),
             backtrace: None,
         },
@@ -770,16 +761,11 @@ async fn drive(
     request: Request<Body>,
     effects: Arc<crate::capsule::effects::ReplayEffects>,
 ) -> CapsuleOutcome {
-    // Only the effect tape is installed here. The *consuming* scope for the
-    // clock and the entropy source is established one layer deeper, by
-    // `ReportingLayer`, so that it lines up exactly with the boundary capture
-    // recorded through — see `clock::with_replay_request_scope`.
     let call = crate::capsule::effects::with_effect_tape(effects, router.oneshot(request));
     match AssertUnwindSafe(call).catch_unwind().await {
         Ok(Ok(response)) => outcome_from_response(response).await,
-        // `Router`'s error type is `Infallible`, but the service contract still
-        // has an error arm; treat it as a zero-status failure rather than
-        // unwrapping.
+        // `Router`'s error type is `Infallible`; the arm exists only because the service
+        // contract has one.
         Ok(Err(error)) => CapsuleOutcome::Status {
             code: 0,
             message: format!("the router failed to answer: {error}"),
@@ -799,10 +785,8 @@ async fn drive(
 /// `reporting::report_response` reads them.
 async fn outcome_from_response(response: axum::response::Response) -> CapsuleOutcome {
     let status = response.status();
-    // A panic the reporting layer caught and converted into a sanitized 500
-    // still carries its identity in the extensions; describe it as the panic
-    // it was, so it is compared against a recorded panic by payload rather
-    // than letting any same-status response pass for it.
+    // A panic the reporting layer turned into a sanitized 500 keeps its identity in the
+    // extensions. Describe it as a panic, so it compares by payload, not by status.
     if let Some(caught) = response.extensions().get::<crate::reporting::CaughtPanic>() {
         let payload = caught.payload.clone();
         drain_body(response.into_body()).await;
@@ -827,9 +811,8 @@ async fn outcome_from_response(response: axum::response::Response) -> CapsuleOut
         },
         |info| (info.message.clone(), info.problem_type.map(str::to_owned)),
     );
-    // Draining the body keeps a streaming handler from being judged before it
-    // has actually produced anything — but only up to a deadline, so a body
-    // that never ends cannot hang the verdict.
+    // Drain the body so a streaming handler is not judged before it has produced anything.
+    // `drain_body` has a deadline, so a body that never ends cannot hang the verdict.
     drain_body(response.into_body()).await;
     CapsuleOutcome::Status {
         code: status.as_u16(),
@@ -901,13 +884,9 @@ fn rebuild_request(
         .method(method)
         .uri(uri)
         .version(parse_version(&recorded.http_version));
-    // Restore client identity: the recorded *resolved* identity is
-    // pre-inserted whole, and `TrustedProxiesLayer` honors a pre-existing
-    // `ResolvedClientIdentity` rather than re-resolving — re-running trust
-    // evaluation against a synthetic peer would (correctly) distrust the
-    // recorded forwarded headers and settle on a different host and scheme
-    // than the failing request saw. `ConnectInfo` is anchored too, for
-    // anything reading the peer directly.
+    // Pre-insert the recorded resolved identity: `TrustedProxiesLayer` honors an existing
+    // `ResolvedClientIdentity` instead of re-resolving. Trust evaluation against a synthetic
+    // peer would distrust the recorded forwarded headers and pick a different host and scheme.
     if recorded.client_addr.is_some()
         || recorded.client_host.is_some()
         || recorded.client_scheme.is_some()
@@ -918,10 +897,9 @@ fn rebuild_request(
             scheme: recorded.client_scheme.clone(),
         });
     }
-    // The raw peer socket outranks a synthesized one: middleware and
-    // handlers that inspect the peer directly (address *and* port) see what
-    // the recording server saw. Capsules that predate `peer_addr` fall back
-    // to anchoring the resolved client address with a zero port.
+    // `ConnectInfo`, for code that reads the peer directly: the recorded peer socket (address
+    // and port) if present, else the resolved client address with port 0 (older capsules have
+    // no `peer_addr`).
     if let Some(peer) = recorded.peer_addr {
         builder = builder.extension(axum::extract::ConnectInfo(peer));
     } else if let Some(addr) = recorded.client_addr {
@@ -942,9 +920,8 @@ fn rebuild_request(
         };
         builder = builder.header(name, value);
     }
-    // Non-UTF-8 header values travel base64-encoded so the JSON stays
-    // diffable; restore the exact bytes — a placeholder here would hand the
-    // handler different metadata than production saw.
+    // Non-UTF-8 header values are stored base64-encoded. Restore the exact bytes so the handler
+    // sees the metadata production saw.
     for (name, encoded) in &recorded.binary_headers {
         let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
             warnings.push(format!("dropped unparseable recorded header name {name:?}"));
@@ -1019,12 +996,8 @@ fn outcomes_match(expected: &CapsuleOutcome, actual: &CapsuleOutcome) -> bool {
                 payload: actual, ..
             },
         ) => panic_payloads_match(expected, actual),
-        // A caught panic keeps its identity through the reporting layer (the
-        // `CaughtPanic` response extension), so both sides of a genuinely
-        // reproduced panic present as `Panic` above. A cross-variant pair
-        // therefore means the failure *kind* changed — a fixed panic replaced
-        // by an ordinary error, or the reverse — and a shared status code is
-        // not a reproduction.
+        // A caught panic keeps its identity (`CaughtPanic`), so a cross-variant pair means the
+        // failure kind changed. A shared status code is not a reproduction.
         (CapsuleOutcome::Panic { .. }, CapsuleOutcome::Status { .. })
         | (CapsuleOutcome::Status { .. }, CapsuleOutcome::Panic { .. }) => false,
     }
@@ -1032,12 +1005,9 @@ fn outcomes_match(expected: &CapsuleOutcome, actual: &CapsuleOutcome) -> bool {
 
 /// Whether two panic payloads describe the same panic.
 fn panic_payloads_match(expected: &str, actual: &str) -> bool {
-    // Whole-payload equality, deliberately: persistence never truncates a
-    // panic payload (redaction only substitutes masked secrets, and the
-    // replayed handler panics with the same `[FILTERED]` literals its request
-    // carries), so a substring rule would let `database timeout while writing
-    // the audit log` pass for a recorded `database timeout` — a different
-    // panic wearing the old one's prefix.
+    // Whole-payload equality: persistence never truncates a payload, and the replayed handler
+    // panics with the same `[FILTERED]` literals its request carries. A substring rule would let
+    // `database timeout while writing the audit log` pass for a recorded `database timeout`.
     expected == actual
 }
 
@@ -1151,11 +1121,8 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
         );
     }
     if let CapsuleBody::Skipped { declared_len } = &capsule.request.body {
-        // Replaying with an empty body would drive the handler with input the
-        // failing request never had. The handler then rejects it, the verdict
-        // reads `mismatch` — which the guide tells operators means "the bug is
-        // gone" — and a live bug is quietly marked fixed. Missing input is a
-        // refusal, not a verdict.
+        // An empty body is input the failing request never had. The handler would reject it
+        // and the `mismatch` verdict would read as "the bug is gone".
         let size = declared_len.map_or_else(
             || "its size was never declared".to_owned(),
             |len| format!("it declared {len} byte(s)"),
@@ -1168,15 +1135,8 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
              say which case this was; raise `max_body_bytes` and re-record if it was the cap."
         ));
     }
-    // Effect data the handler *consumes* cannot tolerate a placeholder the way
-    // compared data can. A response body and a cache hit are deserialized and
-    // branched on, so `[FILTERED]` reaches the code as a literal — a number
-    // field that no longer parses, a string that takes the wrong arm — and the
-    // verdict would describe a run that never happened. The masking is not
-    // reversible, so this is a refusal rather than a warning.
-    // Compared effect data that held the placeholder text before redaction
-    // ran. Replay reads that text as a wildcard, so a changed value there
-    // would match anything (#2351 item 5).
+    // Compared effect data that held the placeholder text before redaction ran. Replay reads
+    // that text as a wildcard, so a changed value there would match anything (#2351).
     let literal: Vec<&str> = capsule
         .request
         .redacted_keys
@@ -1203,6 +1163,9 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
             adjacent.join(", ")
         ));
     }
+    // Effect data the handler consumes cannot take a placeholder the way compared data can: a
+    // response body or cache hit is deserialized and branched on, so `[FILTERED]` reaches the
+    // code as a literal. Masking is not reversible, so this is a refusal, not a warning.
     let masked_input: Vec<&str> = capsule
         .request
         .redacted_keys
@@ -1231,14 +1194,9 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
         ));
     }
     if capsule.job.is_some() {
-        // The job payload is the *input* a job capsule replays on, and unlike
-        // an effect it is handed to the handler verbatim: there is no wildcard
-        // reading of `[FILTERED]` at the entry boundary, because the handler
-        // parses the document rather than being compared against it. So a
-        // masked field reaches the code as the literal placeholder — a
-        // `serde` field that no longer deserializes, a branch that takes the
-        // wrong arm — and the verdict describes a run that never happened.
-        // The original bytes are gone by construction, so this is a refusal.
+        // The job payload is input handed to the handler verbatim, not compared, so `[FILTERED]`
+        // has no wildcard reading here: a masked field reaches the code as the literal
+        // placeholder. The original bytes are gone, so this is a refusal.
         let masked: Vec<&str> = capsule
             .request
             .redacted_keys
@@ -1375,8 +1333,6 @@ pub fn print_verdict(outcome: &ReplayOutcome, capsule_path: &Path) -> i32 {
         }
     }
     if !outcome.effect_divergences.is_empty() {
-        // Without this the CLI would print `diverged` and then say nothing at
-        // all about *what* diverged, for every seam outside the database.
         eprintln!(
             "  effect divergences ({}):",
             outcome.effect_divergences.len()
@@ -1626,9 +1582,8 @@ mod tests {
 
     #[test]
     fn a_caught_panic_matches_the_recorded_panic_status() {
-        // A replayed panic keeps its identity through the reporting layer via
-        // the `CaughtPanic` extension, so a genuine reproduction presents as
-        // Panic↔Panic; a bare status — any status — is a different failure.
+        // `CaughtPanic` keeps a replayed panic's identity, so a genuine reproduction is
+        // Panic↔Panic; a bare status, any status, is a different failure.
         assert!(!outcomes_match(&panic_outcome("boom"), &status(500)));
         assert!(!outcomes_match(&panic_outcome("boom"), &status(503)));
         assert!(outcomes_match(

@@ -760,7 +760,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let shipped = self.ship_locked(replication, target).await;
         let now = replication.now();
         if shipped.is_ok() {
-            // The files at the path hold the writes of an earlier record.
+            // The snapshot held the writes of any record kept before `mark`.
             replication.drop_unshipped_generation(&target.key, mark);
         }
         {
@@ -1380,8 +1380,8 @@ impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
         // A ship of a retired database may still upload: wait, so a purge
         // after a delete sees every object it wrote.
         slot.wait_upload();
-        // Kept before the slot goes: a waiter never sees the key in neither.
-        // A retry of a kept generation updates the same slot.
+        // Remember the closed bound before forgetting the slot: a waiter always finds the key in
+        // one of the two maps. A retry of a kept generation updates the same slot.
         self.replication
             .remember_closed(db.key(), ClosedBound::Slot(Arc::clone(&slot)));
         self.replication.forget_generation_slot(db.key(), &slot);

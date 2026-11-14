@@ -458,9 +458,8 @@ pub fn bulk_actions_toolbar(config: &BulkActionsConfig<'_>) -> maud::Markup {
 /// assert!(html.find("rows") < html.find("autumn-bulk-actions"));
 /// assert!(html.trim_end().ends_with("</form>"));
 /// ```
-// `content` is taken by value so `bulk_actions_form(&cfg, .., html! { .. })`
-// reads without a `&` at the call site (matching `alert_with`); Maud renders it
-// by reference, hence the allow.
+// `content` is taken by value so `bulk_actions_form(&cfg, .., html! { .. })` needs no `&`,
+// like `alert_with`; Maud renders it by reference, hence the allow.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
 pub fn bulk_actions_form(
@@ -475,9 +474,8 @@ pub fn bulk_actions_form(
     let submit_field_name = submit_field.unwrap_or("_submit_token");
     maud::html! {
         form method="post" action=(config.action) class="autumn-bulk-form" {
-            // Both hidden fields lead the body: `SubmitTokenLayer` only scans
-            // its first chunk, so a long selection of checkboxes must not be
-            // able to push the token past the scan cap.
+            // Both hidden fields lead the body: `SubmitTokenLayer` scans only its first
+            // chunk, so a long selection must not push the token past the scan cap.
             @if let Some(token) = submit_token {
                 input type="hidden" name=(submit_field_name) value=(token);
             }
@@ -507,7 +505,6 @@ mod tests {
 
     #[test]
     fn transition_controls_only_renders_edges_from_current() {
-        // current = "draft": only the draft -> published edge should appear.
         let html = transition_controls(
             "/orders/42/transitions/status",
             "status",
@@ -519,13 +516,12 @@ mod tests {
         )
         .into_string();
         assert!(html.contains(r#"value="published""#), "{html}");
-        // The published -> archived edge is from a different state: absent.
         assert!(!html.contains(r#"value="archived""#), "{html}");
     }
 
     #[test]
     fn transition_controls_renders_terminal_current_as_empty_group() {
-        // current = "archived" is terminal: no edges match, empty group only.
+        // "archived" is terminal: no edges match, so only the empty group renders.
         let html = transition_controls(
             "/orders/42/transitions/status",
             "status",
@@ -582,8 +578,6 @@ mod tests {
 
     #[test]
     fn transition_controls_guardless_edge_from_current_is_enabled() {
-        // current = "published": the guard-less published -> archived edge shows,
-        // enabled (its guard slot is None, and `can` returns true).
         let html = transition_controls(
             "/orders/42/transitions/status",
             "status",
@@ -618,12 +612,10 @@ mod tests {
             html.contains(r#"<form method="post" action="/orders/42/transitions/status""#),
             "{html}"
         );
-        // Target state carried in the body as a hidden input under the field name.
         assert!(
             html.contains(r#"<input type="hidden" name="status" value="published">"#),
             "{html}"
         );
-        // No JavaScript.
         assert!(!html.contains("onclick"), "{html}");
         assert!(!html.contains("hx-"), "{html}");
         assert!(!html.contains("<script"), "{html}");
@@ -703,8 +695,7 @@ mod tests {
 
     #[test]
     fn transition_controls_with_labels_overrides_a_single_button_by_state() {
-        // current = "pending" has two edges here, so one override leaves the
-        // other edge's button on the default text.
+        // "pending" has two edges, so one override leaves the other on the default text.
         let transitions: &[(&str, &str, Option<&str>)] =
             &[("pending", "approved", None), ("pending", "rejected", None)];
         let html = transition_controls_with_labels(
@@ -722,7 +713,6 @@ mod tests {
             html.contains("<button type=\"submit\">Approve it</button>"),
             "{html}"
         );
-        // "rejected" has no override: it keeps the default "Mark as {state}" text.
         assert!(
             html.contains("<button type=\"submit\">Mark as rejected</button>"),
             "{html}"
@@ -806,10 +796,8 @@ mod tests {
         let html = bulk_actions_form(&cfg, Some("tok-123"), None, None, None, maud::html! {})
             .into_string();
         assert!(html.contains(r#"type="hidden""#), "{html}");
-        // The csrf field name defaults to `_csrf` when none is supplied.
         assert!(html.contains(r#"name="_csrf""#), "{html}");
         assert!(html.contains(r#"value="tok-123""#), "{html}");
-        // A configured field name wins over the default.
         let named = bulk_actions_form(
             &cfg,
             Some("tok-123"),
@@ -829,7 +817,6 @@ mod tests {
         let html = bulk_actions_form(&cfg, None, None, None, None, maud::html! {}).into_string();
         assert!(!html.contains(r#"type="hidden""#), "{html}");
         assert!(!html.contains("_csrf"), "{html}");
-        // The form itself is still rendered.
         assert!(html.contains("<form"), "{html}");
     }
 
@@ -841,11 +828,9 @@ mod tests {
         let cfg = BulkActionsConfig::new("/posts/bulk_delete");
         let html = bulk_actions_form(&cfg, None, None, Some("submit-456"), None, maud::html! {})
             .into_string();
-        // The field name defaults to `_submit_token` when none is supplied.
         assert!(html.contains(r#"name="_submit_token""#), "{html}");
         assert!(html.contains(r#"value="submit-456""#), "{html}");
-        // A configured field name wins over the default, matching whatever
-        // `security.submit_token.field_name` the layer scans for.
+        // A configured name must match the `security.submit_token.field_name` the layer scans.
         let named = bulk_actions_form(
             &cfg,
             None,
@@ -857,7 +842,6 @@ mod tests {
         .into_string();
         assert!(named.contains(r#"name="_once""#), "{named}");
         assert!(!named.contains(r#"name="_submit_token""#), "{named}");
-        // Omitted entirely when the handler has no token.
         let without = bulk_actions_form(&cfg, None, None, None, None, maud::html! {}).into_string();
         assert!(!without.contains("_submit_token"), "{without}");
     }
@@ -891,7 +875,6 @@ mod tests {
         assert!(html.contains(r#"action="/posts/bulk_delete""#), "{html}");
         assert!(html.contains("autumn-bulk-form"), "{html}");
         assert!(html.contains("row-marker"), "{html}");
-        // The toolbar is rendered inside the form, after the content.
         let content_at = html.find("row-marker").expect("content rendered");
         let toolbar_at = html
             .find("autumn-bulk-actions")

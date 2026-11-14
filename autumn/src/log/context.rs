@@ -214,8 +214,6 @@ impl LogContext {
     /// [`ParameterFilter`]) are replaced with `[FILTERED]` before storage.
     pub fn insert_field(&self, key: impl Into<String>, value: impl Into<String>) {
         let key = key.into();
-        // Never let a custom field shadow a built-in correlation id: the core
-        // ids have dedicated setters and are flattened alongside `fields`.
         if RESERVED_FIELD_KEYS.contains(&key.as_str()) {
             return;
         }
@@ -381,9 +379,8 @@ pub fn in_current_context<F: Future>(future: F) -> impl Future<Output = F::Outpu
     async move {
         match ctx {
             Some(ctx) => {
-                // Re-enter the request span too, so ordinary `tracing` output
-                // from the spawned work carries request_id/user_id/tenant_id —
-                // not just consumers that read the task-local snapshot.
+                // Re-enter the request span too, so plain `tracing` output from the spawned
+                // work carries the correlation ids, not only task-local snapshot readers.
                 let span = ctx.span.clone();
                 scope(ctx, future.instrument(span)).await
             }
@@ -437,7 +434,7 @@ mod tests {
             let id = crate::middleware::RequestId::parse_inbound(sent).expect("uuid");
             let ctx = LogContext::for_request(Some(id), Arc::new(ParameterFilter::default()));
             assert_eq!(ctx.snapshot().request_id.as_deref(), Some(sent));
-            // The serialized shape is unchanged: a plain string field.
+            // Serializes as a plain string field.
             let v = serde_json::to_value(ctx.snapshot()).unwrap();
             assert_eq!(v["request_id"], sent);
             scope(ctx, async {
@@ -478,7 +475,6 @@ mod tests {
         let ctx = LogContext::new(Some("req-1".to_owned()));
         scope(ctx, async {
             with_log_field("order_id", "A-1001");
-            // A later read in the same request sees the field.
             let snap = snapshot().unwrap();
             assert_eq!(
                 snap.fields.get("order_id").map(String::as_str),
@@ -509,7 +505,6 @@ mod tests {
         let ctx = LogContext::new(Some("real-req".to_owned()));
         scope(ctx, async {
             set_user_id("real-user");
-            // Attempt to override core ids via the custom-field channel.
             with_log_field("request_id", "spoofed");
             with_log_field("user_id", "spoofed");
             with_log_field("tenant_id", "spoofed");
@@ -526,7 +521,7 @@ mod tests {
                 Some("kept")
             );
 
-            // Serialized form has exactly one request_id, carrying the real value.
+            // The flattened custom fields add no second `request_id`.
             let v = serde_json::to_value(&snap).unwrap();
             assert_eq!(v["request_id"], "real-req");
         })
@@ -535,7 +530,6 @@ mod tests {
 
     #[tokio::test]
     async fn no_context_outside_a_request() {
-        // Outside of any scope, helpers are inert and current() is None.
         assert!(current().is_none());
         assert!(snapshot().is_none());
         with_log_field("k", "v"); // must not panic
@@ -566,11 +560,9 @@ mod tests {
     async fn spawned_task_does_not_inherit_context_unless_propagated() {
         let ctx = LogContext::new(Some("req-1".to_owned()));
         scope(ctx, async {
-            // A bare spawn starts with no context.
             let bare = tokio::spawn(async { current().is_some() }).await.unwrap();
             assert!(!bare, "spawned task silently inherited request context");
 
-            // Explicit propagation carries it across the spawn boundary.
             let propagated = tokio::spawn(in_current_context(async {
                 snapshot().and_then(|s| s.request_id)
             }))

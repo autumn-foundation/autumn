@@ -439,8 +439,7 @@ pub fn active_search(id: &str, label: &str, config: &ActiveSearchConfig<'_>) -> 
          Use active_search_input + active_search_results directly for other selectors.",
         config.target
     );
-    // Derive the results container ID from the configured target selector so the
-    // rendered container always matches what the input's hx-target points at.
+    // The container id must match the input's `hx-target`.
     let results_id = selector_to_id(config.target).to_string();
     let noscript_method = match config.method {
         SearchMethod::Get => "get",
@@ -929,8 +928,8 @@ mod tests {
 
     #[test]
     fn trigger_has_no_filter_expressions() {
-        // No [condition] filters are emitted — min_length is server-side only.
-        // This ensures the trigger works under Autumn's default CSP (no unsafe-eval).
+        // A `[condition]` filter needs `unsafe-eval`, which Autumn's default CSP forbids. The
+        // runtime enforces `min_length` from `data-ac-min-length` instead.
         let t = build_trigger(300, false);
         assert!(!t.contains("this.value.length"), "{t}");
         assert!(!t.contains('['), "{t}");
@@ -1069,7 +1068,7 @@ mod tests {
     fn input_configurable_min_length() {
         let config = ActiveSearchConfig::new("/search", "#results").min_length(3);
         let html = active_search_input("q", "Search", &config).into_string();
-        // min_length is enforced server-side; no filter expression in the trigger
+        // `min_length` is not a trigger filter expression.
         assert!(html.contains("hx-trigger"), "{html}");
         assert!(!html.contains("this.value.length"), "{html}");
     }
@@ -1242,7 +1241,7 @@ mod tests {
         let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"type="search""#), "{html}");
-        // visible input uses query_param (default "q") so htmx sends ?q=...
+        // `query_param` defaults to "q".
         assert!(html.contains(r#"name="q""#), "{html}");
     }
 
@@ -1258,8 +1257,8 @@ mod tests {
         let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(html.contains(r#"type="hidden""#), "{html}");
-        // The hidden input has no name in HTML; name is set by JS on first interaction
-        // so no-JS forms don't see a duplicate field alongside the noscript <select>.
+        // The runtime names the hidden input, so a no-JS form does not submit it next to the
+        // `<noscript>` select.
         assert!(html.contains(r#"id="x-value""#), "{html}");
     }
 
@@ -1282,7 +1281,6 @@ mod tests {
     fn autocomplete_wrapper_has_data_attributes_for_runtime() {
         let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
-        // The external autumn-widgets.js reads these to wire up interactions.
         assert!(html.contains(r#"data-ac-value-id="x-value""#), "{html}");
         assert!(
             html.contains(r#"data-ac-value-name="value_field""#),
@@ -1378,9 +1376,7 @@ mod tests {
 
     #[test]
     fn autocomplete_noscript_select_marks_initial_value_selected() {
-        // ID-mode (default, non-free-text): a prior selection seeded via
-        // `initial_value` must survive a no-JS resubmission too, not just the
-        // JS-driven hidden-input path.
+        // An `initial_value` must also survive a no-JS resubmission.
         let opts: &[(&str, &str)] = &[("1", "Alpha"), ("2", "Beta")];
         let config = AutocompleteConfig::new("/ac", "value_field")
             .fallback_options(opts)
@@ -1422,8 +1418,7 @@ mod tests {
     fn autocomplete_configurable_min_length() {
         let config = AutocompleteConfig::new("/ac", "value_field").min_length(2);
         let html = autocomplete_input("x", "Label", &config).into_string();
-        // min_length is carried as a data attribute for the autumn-widgets.js runtime
-        // to enforce client-side (via htmx:configRequest) and server-side.
+        // The runtime enforces `min_length` from this attribute, not a trigger filter.
         assert!(html.contains(r#"data-ac-min-length="2""#), "{html}");
         assert!(!html.contains("this.value.length"), "{html}");
     }
@@ -1451,7 +1446,7 @@ mod tests {
 
     #[test]
     fn autocomplete_listbox_has_no_inline_handlers() {
-        // All interaction is wired by autumn-widgets.js, not inline hx-on:* attributes.
+        // The runtime wires all interaction, so no inline handlers.
         let config = AutocompleteConfig::new("/ac", "value_field");
         let html = autocomplete_input("x", "Label", &config).into_string();
         assert!(!html.contains("hx-on:keydown"), "{html}");
@@ -1545,7 +1540,6 @@ mod tests {
         assert!(!html.contains("data-ac-chips"), "{html}");
         assert!(!html.contains("<template"), "{html}");
         assert!(!html.contains("multiple"), "{html}");
-        // Single-mode markup is unchanged: no label id, no status region.
         assert!(html.contains(r#"<label for="x-query""#), "{html}");
         assert!(!html.contains("data-ac-status"), "{html}");
         assert!(html.contains("input changed delay:"), "{html}");
@@ -1573,7 +1567,6 @@ mod tests {
             wrapper.contains(r#"data-ac-removed="{label} removed""#),
             "{wrapper}"
         );
-        // The single-value hidden field is not rendered.
         assert!(!wrapper.contains("data-ac-value-id"), "{wrapper}");
         assert!(!html.contains(r#"id="x-value""#), "{html}");
     }
@@ -1707,8 +1700,7 @@ mod tests {
 
     #[test]
     fn multiple_noscript_keeps_a_selected_value_with_no_fallback_option() {
-        // A created tag is not in `fallback_options`. A no-JS resubmit
-        // must keep it.
+        // A created tag is not in `fallback_options`. A no-JS resubmit must keep it.
         let opts: &[(&str, &str)] = &[("rust", "rust")];
         let config = AutocompleteConfig::new("/ac", "tags")
             .multiple()

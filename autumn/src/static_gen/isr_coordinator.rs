@@ -161,7 +161,7 @@ impl IsrCoordinator for PostgresIsrCoordinator {
             };
             match try_pg_advisory_lock(&mut conn, lock_key).await {
                 Ok(true) => {
-                    // Hold the connection so we can unlock on the same session.
+                    // Advisory locks are session-scoped: keep the connection to unlock on it.
                     self.held.lock().unwrap().insert(lock_key, conn);
                     true
                 }
@@ -177,8 +177,7 @@ impl IsrCoordinator for PostgresIsrCoordinator {
     fn release<'a>(&'a self, url_path: &'a str, window_key: &'a str) -> IsrFuture<'a, ()> {
         let lock_key = isr_advisory_lock_key(url_path, window_key);
         Box::pin(async move {
-            // Retrieve the connection that holds the lock.
-            // Extract outside `let...else` so the mutex guard drops immediately.
+            // Bound outside `let...else` so the mutex guard drops immediately.
             let maybe_conn = self.held.lock().unwrap().remove(&lock_key);
             let Some(mut conn) = maybe_conn else {
                 tracing::warn!(
@@ -199,14 +198,11 @@ impl IsrCoordinator for PostgresIsrCoordinator {
                     tracing::warn!(error = %e, "ISR coordinator: pg_advisory_unlock failed");
                 }
             }
-            // conn is dropped here, returning the connection to the pool.
         })
     }
 }
 
-// ---------------------------------------------------------------------------
-// Key derivation utilities (public -- useful in application code and tests)
-// ---------------------------------------------------------------------------
+// --- Key derivation ---
 
 /// Compute the revalidation window key for a route and the current time.
 ///
@@ -271,9 +267,7 @@ pub fn isr_advisory_lock_key(url_path: &str, window_key: &str) -> i64 {
     i64::from_be_bytes(bytes)
 }
 
-// ---------------------------------------------------------------------------
-// Postgres helpers (feature = "postgres")
-// ---------------------------------------------------------------------------
+// --- Postgres helpers ---
 
 #[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
@@ -317,15 +311,9 @@ async fn unlock_pg_advisory_lock(
     Ok(row.released)
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- isr_window_key ---
 
     #[test]
     fn window_key_stable_within_interval() {
@@ -358,8 +346,6 @@ mod tests {
         assert!(!key.is_empty());
     }
 
-    // --- isr_advisory_lock_key ---
-
     #[test]
     fn advisory_key_deterministic() {
         let a = isr_advisory_lock_key("/about", "/about:28333333");
@@ -381,22 +367,17 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    // --- LocalIsrCoordinator ---
-
     #[tokio::test]
     async fn local_coordinator_always_grants() {
-        // LocalIsrCoordinator is a no-op: local dedup is handled by the
-        // AtomicBool in StaticFileLayer, not by this coordinator.
+        // Local dedup is the `AtomicBool` in `StaticFileLayer`, not this coordinator.
         let c = LocalIsrCoordinator::new();
         assert!(c.try_acquire("/a", "w1").await);
-        // Even a second concurrent call returns true (no-op).
         assert!(c.try_acquire("/a", "w1").await);
     }
 
     #[tokio::test]
     async fn local_coordinator_release_is_noop() {
         let c = LocalIsrCoordinator::new();
-        // release should not panic and the coordinator continues to grant.
         c.release("/a", "w1").await;
         assert!(c.try_acquire("/a", "w1").await);
     }

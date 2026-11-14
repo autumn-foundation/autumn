@@ -1854,8 +1854,7 @@ mod tests {
         );
     }
 
-    // Issue 3350: when open databases went first, busy open databases took
-    // every pass.
+    // Issue #3350: busy open databases must not take every pass.
     #[tokio::test]
     async fn a_closed_database_is_visited_when_more_busy_databases_are_open_than_a_pass_visits() {
         let tmp = tempfile::tempdir().unwrap();

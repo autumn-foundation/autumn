@@ -277,13 +277,9 @@ impl AcmeHealthIndicator {
             details.insert("last_failure".to_owned(), serde_json::json!(msg));
         }
 
-        // An already-expired served certificate is Down on its own, INDEPENDENTLY
-        // of whether a renewal failure has been recorded. At boot
-        // `build_acme_tls_listener` records the stored cert's `cert_not_after_unix`
-        // and serves it while renewal runs; if leadership is skipped/degraded or
-        // issuance is merely pending, `last_failure` stays `None` and the
-        // failure-in-danger-window rule below would report `Up` for a TLS cert
-        // that is already invalid. Treat `not_after <= now` as Down and say so.
+        // An expired served cert is Down even with no recorded failure: while leadership is
+        // skipped or issuance is pending, `last_failure` stays `None` and the rule below would
+        // report `Up` for an invalid cert.
         let cert_expired = snap
             .cert_not_after_unix
             .is_some_and(|not_after| not_after <= now_unix);
@@ -291,9 +287,8 @@ impl AcmeHealthIndicator {
             details.insert("cert_expired".to_owned(), serde_json::json!(true));
         }
 
-        // Down ALSO when a failure coincides with real expiry danger: the served
-        // certificate is already inside its renew-before window (or we have no
-        // certificate at all). A failure with plenty of validity left is a blip.
+        // Also Down when a failure coincides with expiry danger: the served cert is inside its
+        // renew-before window, or there is none. A failure with validity to spare is a blip.
         let in_danger = snap
             .cert_not_after_unix
             .is_none_or(|not_after| needs_renewal(not_after, self.renew_before_days, now_unix));
@@ -444,11 +439,6 @@ impl AcmeRenewalTask {
         reporter: ReporterFn,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
-        // Immediate check on boot: order now if we have no real cert yet, or the
-        // stored cert we would serve is already inside its renew-before window
-        // (or expired). Without the latter, a loadable-but-expired stored cert
-        // sets `serving_stored_cert = true` and we would serve a dead cert for
-        // up to `RENEWAL_CHECK_INTERVAL` before the first scheduled renewal.
         let stored_not_after = if self.serving_stored_cert {
             self.stored_not_after().await
         } else {
@@ -473,21 +463,12 @@ impl AcmeRenewalTask {
         coordinator: &Arc<dyn SchedulerCoordinator>,
         reporter: &ReporterFn,
     ) {
-        // Every tick, BEFORE the renewal decision, hot-swap in a newer/healthier
-        // stored certificate if one has appeared. When another replica (or an
-        // out-of-band tool) persists a fresh cert to the shared/local store, a
-        // process that did not issue it must adopt it immediately — otherwise a
-        // follower keeps serving the placeholder or a stale in-memory cert until
-        // its own renew window opens (which, for a freshly-renewed cert, is up to
-        // a full renew-before period away). Adoption never downgrades: it only
-        // swaps to a strictly-newer, fully-loadable pair.
+        // Adopt a newer cert another replica or tool persisted before deciding; otherwise a
+        // follower serves a stale cert until its own renew window opens, up to a full
+        // renew-before period away.
         self.adopt_stored_cert_if_newer().await;
 
-        // Runtime backstop: a previous issuance produced a certificate that STILL
-        // immediately satisfied `needs_renewal` (the renew-before window is >= the
-        // cert's own lifetime). Ordering again would loop and burn the CA's rate
-        // limits, so refuse to order until a restart re-runs config validation.
-        // The failure was already recorded/reported when the flag was set.
+        // See `renew_window_misconfigured`; the failure was reported when the flag was set.
         if self
             .renew_window_misconfigured
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -495,8 +476,7 @@ impl AcmeRenewalTask {
             return;
         }
 
-        // No stored cert (still on the placeholder), or a torn/mismatched pair
-        // that does not load → treated as absent → always due.
+        // No stored cert, or a pair that does not load, is always due.
         let due = self.stored_not_after().await.is_none_or(|not_after| {
             needs_renewal(not_after, self.config.renew_before_days, now_unix())
         });
@@ -511,15 +491,8 @@ impl AcmeRenewalTask {
         coordinator: &Arc<dyn SchedulerCoordinator>,
         reporter: &ReporterFn,
     ) {
-        // A distributed scheduler backend was configured (multi-replica intent)
-        // but this process could not build the distributed coordinator and fell
-        // back to a per-process in-process one. Ordering now would give this
-        // replica its OWN local lease, so every replica would order the SAME
-        // certificate concurrently — racing the per-process HTTP-01 token maps
-        // and local stores and burning the CA's rate limits. Refuse to order:
-        // record the failure and dispatch it through the reporter (same seam as
-        // the coordinator-error path) so health does not stay `Up` while serving
-        // only the placeholder, then keep serving the existing cert this cycle.
+        // See `leadership_degraded`. Report the failure so health does not stay `Up` while
+        // serving only the placeholder.
         if self.leadership_degraded {
             let msg = "ACME renewal: a distributed scheduler backend is configured but its \
                 coordinator is unavailable in this process — refusing to order to avoid racing \
@@ -532,10 +505,8 @@ impl AcmeRenewalTask {
             return;
         }
 
-        // `Fleet` is the single-leader mode: the in-process backend always
-        // grants (correct single-replica behavior), while a distributed backend
-        // grants to exactly one replica a key row for the cert. The key works
-        // as a mutex: hold it through `issue()`, then free it.
+        // `Fleet` is single-leader: the in-process backend always grants, a distributed backend
+        // grants the cert's key to exactly one replica. Hold it through `issue()`, then free it.
         let tick_key = format!("acme:{}", self.cert_id.as_str());
         let lease = match coordinator
             .try_acquire_for_period(
@@ -548,20 +519,13 @@ impl AcmeRenewalTask {
         {
             Ok(Some(lease)) => lease,
             Ok(None) => {
-                // Another replica is the leader for this cert. Try to pick up a
-                // cert it may have already persisted to a shared store.
+                // Another replica leads; pick up a cert it may have persisted to a shared store.
                 self.adopt_stored_cert_if_newer().await;
                 return;
             }
             Err(e) => {
-                // The coordinator itself errored (e.g. the Postgres scheduler
-                // pool is unavailable at first boot). We do NOT know whether we
-                // are the leader, so we must NOT order — but this is a real
-                // failure, not a benign "someone else leads". Record it and
-                // dispatch through the reporter (same as an issuance failure) so
-                // the health indicator does not stay `Up` while serving only the
-                // self-signed placeholder, then skip this cycle and retry next
-                // tick.
+                // Leadership is unknown, so do not order. Unlike "someone else leads" this is a
+                // real failure: report it so health does not stay `Up` on the placeholder.
                 let msg = format!("ACME renewal leader election failed: {e}");
                 tracing::error!("{msg}");
                 self.status.record_failure(now_unix(), msg.clone());
@@ -571,8 +535,6 @@ impl AcmeRenewalTask {
         };
 
         let outcome = self.issue().await;
-        // Always free the key, regardless of outcome, so the next check can
-        // take it.
         if let Err(e) = lease.release_and_free().await {
             tracing::warn!(error = %e, "failed to release ACME renewal lease");
         }
@@ -589,9 +551,8 @@ impl AcmeRenewalTask {
     fn handle_issue_outcome(&self, outcome: Result<i64, String>, reporter: &ReporterFn) {
         match outcome {
             Ok(not_after) => {
-                // Read BEFORE `record_success` clears it: the recovery callback
-                // must fire only for a success that ends an OUTSTANDING failure,
-                // so a steady-state renewal does not re-notify every cycle.
+                // Read before `record_success` clears it: recovery fires only when a success ends
+                // an outstanding failure, so steady-state renewals do not re-notify.
                 let recovered_from_failure = self.status.snapshot().last_failure.is_some();
                 self.status.record_success(now_unix(), not_after);
                 if recovered_from_failure && let Some(recovery) = &self.recovery {
@@ -602,14 +563,8 @@ impl AcmeRenewalTask {
                     "ACME certificate issued/renewed and hot-swapped into the TLS listener"
                 );
 
-                // Backstop (defense in depth): if the freshly-issued certificate
-                // ALREADY satisfies `needs_renewal`, the configured
-                // `renew_before_days` is >= the certificate's own lifetime.
-                // `AcmeConfig::validate()` rejects this for a public CA, but a
-                // custom directory issuing shorter-lived certs can still reach it.
-                // Re-ordering on the next tick would loop and burn the CA's rate
-                // limits, so record a failure, report it, and refuse to order
-                // again until a restart re-runs config validation.
+                // A fresh cert that is already due means `renew_before_days` >= its lifetime.
+                // See `renew_window_misconfigured`.
                 if needs_renewal(not_after, self.config.renew_before_days, now_unix()) {
                     let msg = format!(
                         "ACME renewal: renew_before_days ({}) is >= the issued certificate \
@@ -647,8 +602,7 @@ impl AcmeRenewalTask {
     /// window. `None` here makes the renewal decision proceed instead.
     async fn stored_not_after(&self) -> Option<i64> {
         let stored = self.store.load_cert(&self.cert_id).await.ok().flatten()?;
-        // Validate the FULL pair (same load/validation path the resolver uses) so
-        // a mismatched or malformed pair is detected and counts as absent.
+        // Validate the full pair the way the resolver does, so a mismatched pair counts as absent.
         crate::tls::certified_key_from_pem(
             stored.chain_pem.as_bytes(),
             stored.key_pem.as_bytes(),
@@ -704,21 +658,16 @@ impl AcmeRenewalTask {
             .iter()
             .map(|d| Identifier::Dns(d.clone()))
             .collect();
-        // A wildcard is ordered as the literal `*.myapp.com` identifier (RFC 8555
-        // §7.1.3); the CA answers with an authorization whose identifier is the
-        // BASE domain plus `wildcard: true` (§7.1.4), which is why the
-        // `_acme-challenge` record name is derived from the AUTHORIZATION's
-        // identifier rather than from the configured domain list.
+        // A wildcard is ordered as the literal `*.myapp.com` (RFC 8555 §7.1.3), but its
+        // authorization carries the base domain plus `wildcard: true` (§7.1.4). So the
+        // `_acme-challenge` name comes from the authorization, not the configured domains.
         let mut order = account
             .new_order(&NewOrder::new(&identifiers))
             .await
             .map_err(|e| format!("failed to create ACME order: {e}"))?;
 
-        // Both arms answer their challenges AND wait for the order to settle
-        // before their challenge responses are torn down: `set_ready` only tells
-        // the CA to *queue* validation, so a token or TXT record removed before
-        // the order reaches `ready` is removed while the CA is still looking at
-        // it.
+        // Both arms wait for the order to settle before tearing down their challenge responses:
+        // `set_ready` only queues validation, so the CA may not have looked yet.
         if let Some(dns) = &self.dns {
             self.answer_dns01(&mut order, dns).await?;
         } else {
@@ -761,13 +710,13 @@ impl AcmeRenewalTask {
     ) -> Result<(), String> {
         let wanted = self.collect_dns01_records(order).await?;
         if wanted.is_empty() {
-            // Every authorization is already valid (a re-used order): nothing to
-            // publish, nothing to clean up — but the order still has to settle.
+            // Every authorization is already valid (a re-used order), but the order must still
+            // settle.
             return self.await_order_ready(order).await;
         }
 
-        // Track what actually reached the provider — including a partial publish
-        // interrupted mid-way — so cleanup removes exactly those and no more.
+        // Tracks what reached the provider, including a partial publish, so cleanup removes
+        // exactly those.
         let mut published: Vec<TxtRecord> = Vec::new();
         let outcome = self
             .publish_and_validate_dns01(order, dns, &wanted, &mut published)
@@ -789,12 +738,10 @@ impl AcmeRenewalTask {
         wanted: &[TxtRecord],
         published: &mut Vec<TxtRecord>,
     ) -> Result<(), String> {
-        // Recorded BEFORE the write, not after: a batch that fails partway may
-        // still have written some of these names, and the provider contract
-        // makes deleting a value that was never published a no-op. Publishing
-        // goes through the batch entry point because a set-replacing provider
-        // (Route 53) must apply every value sharing a name in one change —
-        // sequential read-modify-writes race and drop one of them (#1620).
+        // Recorded before the write: a batch that fails partway may have written some names, and
+        // deleting a value never published is a no-op. Batched because a set-replacing provider
+        // (Route 53) must apply every value at one name in one change; sequential
+        // read-modify-writes race and drop one (#1620).
         published.extend(wanted.iter().cloned());
         dns.provider.upsert_txt_batch(wanted).await.map_err(|e| {
             format!(
@@ -803,13 +750,10 @@ impl AcmeRenewalTask {
             )
         })?;
 
-        // Probe the zone's OWN nameservers, not the configured recursive
-        // resolvers. Probing a public recursive immediately after the write
-        // plants a negative-cache entry whose TTL (900s for Route 53, 1800s for
-        // Cloudflare) outlives the propagation budget, so every later probe —
-        // and every later renewal — reads the cached "not there" and the wait
-        // can never succeed. The configured resolvers are how the authoritative
-        // set is discovered, and the fallback when that fails.
+        // Probe the zone's own nameservers, not the configured recursive resolvers. Probing a
+        // recursive right after the write plants a negative-cache entry whose TTL (900s for
+        // Route 53, 1800s for Cloudflare) outlives the propagation budget, so the wait never
+        // succeeds. The configured resolvers discover the authoritative set and are the fallback.
         let probe_targets = Self::dns01_probe_targets(dns, wanted).await;
 
         crate::acme::dns::resolver::wait_for_propagation(
@@ -822,9 +766,8 @@ impl AcmeRenewalTask {
         .await?;
 
         Self::signal_dns01_ready(order).await?;
-        // Inside the cleanup scope on purpose: the CA validates asynchronously
-        // after `set_ready`, so the records must stay published until the order
-        // has actually settled.
+        // The CA validates asynchronously after `set_ready`, so the records stay published until
+        // the order settles.
         self.await_order_ready(order).await
     }
 
@@ -861,8 +804,8 @@ impl AcmeRenewalTask {
             )
             .await;
             if authoritative.is_empty() {
-                // Fall back for THIS name only: one zone with a broken
-                // delegation must not drag the others onto recursive resolvers.
+                // Fall back for this name only: one zone with a broken delegation must not drag
+                // the others onto recursive resolvers.
                 tracing::warn!(
                     fqdn = record.fqdn,
                     "could not discover the authoritative nameservers for the DNS-01 challenge \
@@ -912,13 +855,9 @@ impl AcmeRenewalTask {
                     ));
                 }
             };
-            // The record name comes from the CA's answer, and writing it commits
-            // a DNS change in whatever zone the provider credential can reach.
-            // The CSR is pinned to `config.domains`, so a hostile directory
-            // cannot obtain a certificate for a name it was not asked for — but
-            // it could still steer autumn into writing `_acme-challenge.<x>`
-            // into an unrelated zone (and, under the exec hook, into an argv
-            // entry). Only answer for a name that was actually ordered.
+            // The record name comes from the CA. The CSR is pinned to `config.domains`, but a
+            // hostile directory could still steer a `_acme-challenge.<x>` write into any zone the
+            // provider credential reaches (or into an exec hook's argv). Only answer ordered names.
             if !Self::is_ordered_identifier(&self.config.domains, &domain) {
                 return Err(format!(
                     "the CA returned an authorization for `{domain}`, which is not one of the \
@@ -990,9 +929,8 @@ impl AcmeRenewalTask {
         if published.is_empty() {
             return;
         }
-        // Batched for the same reason publishing is: removing two values at one
-        // name one at a time lets a set-replacing provider's stale read
-        // resurrect the value it just removed (#1620).
+        // Batched for the same reason publishing is: removing two values at one name one at a
+        // time lets a set-replacing provider's stale read resurrect the value just removed (#1620).
         if let Err(e) = dns.provider.delete_txt_batch(published).await {
             tracing::warn!(
                 provider = dns.provider.name(),
@@ -1026,7 +964,6 @@ impl AcmeRenewalTask {
     async fn finalize_and_install(&self, order: &mut instant_acme::Order) -> Result<i64, String> {
         use instant_acme::RetryPolicy;
 
-        // Finalize with a FRESH rcgen keypair + CSR for exactly these domains.
         let (csr_der, key_pem) = self.generate_csr()?;
         order
             .finalize_csr(&csr_der)
@@ -1040,7 +977,7 @@ impl AcmeRenewalTask {
         let stored = StoredCert { chain_pem, key_pem };
         let not_after = crate::tls::leaf_not_after_from_pem(stored.chain_pem.as_bytes())?;
 
-        // Persist BEFORE swapping so a crash mid-swap still has the cert on disk.
+        // Persist before swapping so a crash mid-swap still has the cert on disk.
         self.store
             .save_cert(&self.cert_id, &stored)
             .await
@@ -1096,8 +1033,8 @@ pub(crate) async fn answer_http01<'a>(
             .ok_or_else(|| "authorization offered no http-01 challenge".to_owned())?;
         let token = challenge.token.clone();
         let key_auth = challenge.key_authorization().as_str().to_owned();
-        // Publish BEFORE signalling ready so the CA can fetch it — and track it
-        // in the guard so a failing `set_ready` still cleans up.
+        // Publish before signalling ready so the CA can fetch it; the guard cleans up if
+        // `set_ready` fails.
         published.publish(token, key_auth);
         challenge
             .set_ready()
@@ -1184,18 +1121,10 @@ pub(crate) async fn load_or_register_account(
 ) -> Result<instant_acme::Account, String> {
     use instant_acme::{AccountCredentials, NewAccount};
 
-    // Serialised process-wide. Reading the stored account and registering a new
-    // one is a check-then-act, and since #1635 there are TWO issuers behind it:
-    // the deployment's own renewal task and the tenant custom-domain task, both
-    // spawned at boot and both reaching this on their first order. On a fresh
-    // cache they would each see no account, each register one with the CA, and
-    // race to persist different credentials — so the deployment and its tenants
-    // would not share an account after all, and every fresh start would spend
-    // another of the CA's per-account registration limits.
-    //
-    // The lock spans the load too: releasing it after a miss would put both
-    // callers back in the same race. After the first success every later call
-    // is a file read behind an uncontended lock.
+    // Serialised process-wide: load-or-register is check-then-act, and the deployment's renewal
+    // task and the tenant custom-domain task (#1635) both reach it on their first order. On a
+    // fresh cache each would register its own account, so they would not share one, and every
+    // fresh start would spend another CA registration. The lock spans the load for the same reason.
     static ACCOUNT_INIT: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
     let _init = ACCOUNT_INIT.lock().await;
@@ -1265,8 +1194,7 @@ pub(crate) async fn load_or_register_account(
 /// the panic this prevents.
 pub(crate) fn ensure_default_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
-        // Errors only if another thread won the race to install one, which
-        // satisfies the requirement just as well.
+        // Errors only if another thread installed one first, which is just as good.
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 }
@@ -1413,8 +1341,7 @@ mod tests {
              authoritative for .io and can only ever answer a referral"
         );
 
-        // The shared name is discovered once, not once per value: the apex and
-        // its wildcard challenge the same record.
+        // The apex and its wildcard share one challenge name, so it is discovered once.
         let ns_queries = lookup
             .asked
             .lock()
@@ -1507,8 +1434,7 @@ mod tests {
             rustls::crypto::CryptoProvider::get_default().is_some(),
             "no process-level CryptoProvider installed; every ACME order would panic"
         );
-        // Idempotent: a second call keeps the existing provider rather than
-        // failing or replacing it.
+        // A second call keeps the existing provider rather than failing or replacing it.
         ensure_default_crypto_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
@@ -1538,7 +1464,6 @@ mod tests {
         )
         .expect("placeholder loads as a CertifiedKey");
 
-        // It swaps into a ReloadableCertResolver (the #1603 hot-swap seam).
         let resolver = Arc::new(ReloadableCertResolver::new(Arc::clone(&certified)));
         let next = self_signed_placeholder(&["app.example.com".to_owned()]).unwrap();
         let next_key = crate::tls::certified_key_from_pem(
@@ -1550,7 +1475,7 @@ mod tests {
         resolver.store(Arc::clone(&next_key));
         assert!(Arc::ptr_eq(&resolver.current(), &next_key));
 
-        // And its notAfter is readable for the renewal decision.
+        // The renewal decision reads its notAfter.
         assert!(crate::tls::leaf_not_after_from_pem(placeholder.chain_pem.as_bytes()).is_ok());
     }
 
@@ -1570,8 +1495,6 @@ mod tests {
 
     #[test]
     fn health_up_on_failure_while_cert_still_valid() {
-        // A renewal blip must NOT flip health Down while the served cert has
-        // plenty of validity left.
         let now = 1_000_000_000;
         let status = AcmeStatus::new();
         status.set_cert_not_after(now + 60 * DAY);
@@ -1584,7 +1507,6 @@ mod tests {
 
     #[test]
     fn health_down_on_failure_within_expiry_danger() {
-        // A failure AND the cert is inside its renew-before window → Down.
         let now = 1_000_000_000;
         let status = AcmeStatus::new();
         status.set_cert_not_after(now + 5 * DAY);
@@ -1604,10 +1526,8 @@ mod tests {
 
     #[test]
     fn health_down_when_served_cert_already_expired_without_failure() {
-        // An already-expired stored cert served at boot (not_after <= now) must be
-        // Down even though NO renewal failure has been recorded yet (leadership
-        // skipped/degraded or issuance still pending). Otherwise health hides an
-        // already-invalid TLS certificate.
+        // With leadership skipped or issuance pending no failure is recorded, yet an expired
+        // served cert must still grade Down.
         let now = 1_000_000_000;
         let status = AcmeStatus::new();
         status.set_cert_not_after(now - DAY);
@@ -1626,8 +1546,6 @@ mod tests {
 
     #[test]
     fn health_up_when_cert_has_plenty_of_validity_and_no_failure() {
-        // A healthy served cert with lots of validity left and no failure is Up,
-        // and is NOT flagged as expired.
         let now = 1_000_000_000;
         let status = AcmeStatus::new();
         status.set_cert_not_after(now + 60 * DAY);
@@ -1639,24 +1557,19 @@ mod tests {
 
     #[test]
     fn published_tokens_are_cleared_on_error_path() {
-        // Simulate an order body that publishes N tokens and then returns Err
-        // (e.g. `set_ready` or `poll_ready` failing). The guard must leave the
-        // shared token map empty rather than leaking the published tokens.
         let tokens = Http01Tokens::new();
-        // The inner block scopes the guard: it drops at the closing brace, just
-        // as the guard in `issue` drops when that function returns `Err`.
+        // Stands in for an order that publishes tokens and then fails (e.g. `set_ready`); the
+        // guard drops at the closing brace as it does when `issue` returns `Err`.
         let outcome: Result<(), String> = {
             let mut published = PublishedTokens::new(&tokens);
             published.publish("token-a".to_owned(), "key-a".to_owned());
             published.publish("token-b".to_owned(), "key-b".to_owned());
-            // Both are visible while the order is in flight.
             assert_eq!(tokens.get("token-a").as_deref(), Some("key-a"));
             assert_eq!(tokens.get("token-b").as_deref(), Some("key-b"));
             Err("simulated failure after publishing".to_owned())
         };
 
         assert!(outcome.is_err());
-        // Every published token was removed on the error path.
         assert!(tokens.get("token-a").is_none());
         assert!(tokens.get("token-b").is_none());
     }
@@ -1675,15 +1588,12 @@ mod tests {
     #[test]
     fn due_at_boot_matrix() {
         let now = 1_000_000_000;
-        // No real cert yet (still on the placeholder) → order immediately.
+        // Still on the placeholder → order now.
         assert!(due_at_boot(None, 30, now));
-        // Serving a healthy stored cert (60 days out) → no immediate order.
         assert!(!due_at_boot(Some(now + 60 * DAY), 30, now));
-        // Serving a stored cert already inside its renew-before window (5 days
-        // out, 30-day window) → order immediately.
+        // Inside the 30-day renew-before window → order now.
         assert!(due_at_boot(Some(now + 5 * DAY), 30, now));
-        // Serving a loadable-but-EXPIRED stored cert → order immediately (the
-        // bug: previously this waited a full check interval serving a dead cert).
+        // A loadable but expired stored cert → order now, not after a full check interval.
         assert!(due_at_boot(Some(now - DAY), 30, now));
     }
 
@@ -1715,15 +1625,12 @@ mod tests {
         }
     }
 
-    // Regression (#1608, Codex): when the coordinator itself errors, renewal is
-    // skipped, but the failure MUST be recorded in AcmeStatus AND dispatched to
-    // the reporter — otherwise health can stay `Up` while serving only the
-    // self-signed placeholder and operators lose the error signal.
+    // A coordinator error skips renewal but must still record and report the failure, or health
+    // stays `Up` on the placeholder and operators lose the signal.
     #[tokio::test]
     async fn coordinator_error_records_failure_and_reports() {
         let domains = vec!["app.example.com".to_owned()];
 
-        // A resolver serving the self-signed placeholder (the pre-issuance state).
         let placeholder = self_signed_placeholder(&domains).expect("placeholder builds");
         let provider = crate::tls::crypto_provider();
         let certified = crate::tls::certified_key_from_pem(
@@ -1734,8 +1641,7 @@ mod tests {
         .expect("placeholder loads");
         let resolver = Arc::new(ReloadableCertResolver::new(certified));
 
-        // The store is never touched on the coordinator-error path, but the task
-        // needs one.
+        // Never touched on the coordinator-error path, but the task needs one.
         let store_dir = tempfile::tempdir().unwrap();
         let store: Arc<dyn AcmeStore> = Arc::new(crate::acme::store::FsAcmeStore::new(
             store_dir.path(),
@@ -1769,7 +1675,6 @@ mod tests {
             recovery: None,
         };
 
-        // Capture reporter invocations.
         let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = Arc::clone(&captured);
         let reporter: ReporterFn = Arc::new(move |msg| sink.lock().unwrap().push(msg));
@@ -1777,7 +1682,6 @@ mod tests {
         let coordinator: Arc<dyn SchedulerCoordinator> = Arc::new(FailingCoordinator);
         task.try_renew_once(&coordinator, &reporter).await;
 
-        // The failure is recorded in status...
         let snap = status.snapshot();
         let failure = snap
             .last_failure
@@ -1788,8 +1692,6 @@ mod tests {
             failure.1
         );
 
-        // ...and dispatched through the reporter exactly once. Clone out so the
-        // mutex guard is released immediately.
         let msgs = captured.lock().unwrap().clone();
         assert_eq!(msgs.len(), 1, "reporter must be invoked once");
         assert!(msgs[0].contains("leader election failed"));
@@ -1864,8 +1766,8 @@ mod tests {
         }
     }
 
-    // Issue #3052: the cert key works as a mutex. The leader claim must hold
-    // it for longer than one issuance, or a second replica orders mid-flight.
+    // The cert key works as a mutex: the leader claim must outlast one issuance, or a second
+    // replica orders mid-flight (#3052).
     #[tokio::test]
     async fn renewal_leader_claim_holds_the_key_for_a_whole_issuance() {
         let (task, _store_dir, _status) = degraded_test_task(false);
@@ -1936,12 +1838,9 @@ mod tests {
         (task, store_dir, status)
     }
 
-    // Regression (#1608, Codex P2): a *distributed* scheduler backend was
-    // configured (multi-replica intent) but this process could not build the
-    // distributed coordinator and fell back to a per-process in-process one.
-    // Ordering would let every replica grab its OWN local lease and race the CA.
-    // The renewal task MUST refuse to order — record a failure, dispatch it
-    // through the reporter, and never consult the coordinator this cycle.
+    // With a distributed backend configured but only an in-process fallback coordinator, every
+    // replica would take its own lease and race the CA. The task must refuse to order, report the
+    // failure, and never consult the coordinator.
     #[tokio::test]
     async fn leadership_degraded_refuses_to_order_and_reports() {
         let (task, _store_dir, status) = degraded_test_task(true);
@@ -1950,21 +1849,17 @@ mod tests {
         let sink = Arc::clone(&captured);
         let reporter: ReporterFn = Arc::new(move |msg| sink.lock().unwrap().push(msg));
 
-        // The degraded gate must return before touching the coordinator, so this
-        // flag stays false.
         let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let coordinator: Arc<dyn SchedulerCoordinator> = Arc::new(RecordingCoordinator {
             acquired: Arc::clone(&acquired),
         });
         task.try_renew_once(&coordinator, &reporter).await;
 
-        // No lease was acquired / no order was attempted.
         assert!(
             !acquired.load(std::sync::atomic::Ordering::SeqCst),
             "degraded leadership must NOT acquire a lease or order"
         );
 
-        // The failure is recorded in status...
         let snap = status.snapshot();
         let failure = snap
             .last_failure
@@ -1975,17 +1870,13 @@ mod tests {
             failure.1
         );
 
-        // ...and dispatched through the reporter exactly once.
         let msgs = captured.lock().unwrap().clone();
         assert_eq!(msgs.len(), 1, "reporter must be invoked once");
         assert!(msgs[0].contains("refusing to order"));
     }
 
-    // The genuinely single-replica path (in-process coordinator by design) is
-    // unaffected by the degraded gate: it proceeds to leader election as normal.
-    // A full network order is out of scope for a unit test, so the coordinator
-    // returns `Ok(None)`; the assertion is that the gate did NOT short-circuit
-    // (the coordinator WAS consulted) and no spurious degraded failure surfaced.
+    // A single-replica deployment is unaffected by the degraded gate. The coordinator returns
+    // `Ok(None)` to avoid a network order; the test proves the gate did not short-circuit.
     #[tokio::test]
     async fn single_replica_path_is_unaffected_and_proceeds_to_order() {
         let (task, _store_dir, status) = degraded_test_task(false);
@@ -2000,13 +1891,11 @@ mod tests {
         });
         task.try_renew_once(&coordinator, &reporter).await;
 
-        // The renewal task reached leader election rather than short-circuiting.
         assert!(
             acquired.load(std::sync::atomic::Ordering::SeqCst),
             "single-replica path must proceed to leader election / ordering"
         );
 
-        // No degraded failure was recorded and the reporter was not invoked.
         assert!(
             status.snapshot().last_failure.is_none(),
             "single-replica path must not record a degraded failure"
@@ -2052,15 +1941,12 @@ mod tests {
         }
     }
 
-    // FIX 1 (#1608, Codex P2): a strictly-newer, fully-loadable stored cert is
-    // hot-swapped into the resolver on adoption, independent of whether renewal
-    // is due — so a follower / a process that did not issue picks it up at once.
+    // A follower adopts a strictly newer stored cert at once, whether or not renewal is due.
     #[tokio::test]
     async fn adopt_swaps_in_a_strictly_newer_stored_cert() {
         let (task, _dir, status) = degraded_test_task(false);
         let initial = task.resolver.current();
         let (newer, newer_na) = cert_valid_until_ymd(2200, 1, 1);
-        // The served baseline is OLDER than the stored cert.
         status.set_cert_not_after(newer_na - 100 * DAY);
         task.store.save_cert(&task.cert_id, &newer).await.unwrap();
 
@@ -2073,14 +1959,11 @@ mod tests {
         assert_eq!(status.snapshot().cert_not_after_unix, Some(newer_na));
     }
 
-    // FIX 1: adoption must never DOWNGRADE — an older stored cert than the one we
-    // serve is left in place.
     #[tokio::test]
     async fn adopt_does_not_downgrade_to_an_older_stored_cert() {
         let (task, _dir, status) = degraded_test_task(false);
         let initial = task.resolver.current();
         let (older, older_na) = cert_valid_until_ymd(2100, 1, 1);
-        // The served baseline is NEWER than the stored cert.
         let served = older_na + 100 * DAY;
         status.set_cert_not_after(served);
         task.store.save_cert(&task.cert_id, &older).await.unwrap();
@@ -2098,7 +1981,6 @@ mod tests {
         );
     }
 
-    // FIX 1: no stored cert at all → nothing to adopt, resolver untouched.
     #[tokio::test]
     async fn adopt_no_swap_when_store_is_empty() {
         let (task, _dir, status) = degraded_test_task(false);
@@ -2111,9 +1993,6 @@ mod tests {
         assert_eq!(status.snapshot().cert_not_after_unix, Some(1_000_000_000));
     }
 
-    // FIX 1 (integration): `maybe_renew` adopts a newer stored cert on a tick even
-    // when renewal is NOT due — and, because the adopted cert is far from expiry,
-    // it does NOT proceed to leader election / ordering.
     #[tokio::test]
     async fn maybe_renew_adopts_newer_cert_without_ordering_when_not_due() {
         let (task, _dir, status) = degraded_test_task(false);
@@ -2130,43 +2009,35 @@ mod tests {
 
         task.maybe_renew(&coordinator, &reporter).await;
 
-        // The newer cert was adopted into the resolver...
         assert!(
             !Arc::ptr_eq(&task.resolver.current(), &initial),
             "maybe_renew must adopt a newer stored cert every tick"
         );
         assert_eq!(status.snapshot().cert_not_after_unix, Some(newer_na));
-        // ...and renewal was NOT due, so the coordinator was never consulted.
         assert!(
             !acquired.load(std::sync::atomic::Ordering::SeqCst),
             "adoption must not trigger ordering when renewal is not due"
         );
     }
 
-    // FIX 2 (#1608, Codex P2): a torn/mismatched stored pair (valid future-dated
-    // chain + wrong key) must count as ABSENT for the renewal decision, so a
-    // follower does not treat the unusable future-dated chain as healthy and
-    // stall on the placeholder/old cert.
+    // A torn pair (valid future-dated chain, wrong key) must count as absent, or the renewal
+    // decision trusts the chain's expiry and stalls on the placeholder or old cert.
     #[tokio::test]
     async fn stored_not_after_is_absent_for_a_torn_pair() {
         let (task, _dir, _status) = degraded_test_task(false);
         let torn = torn_cert_future();
-        // The chain alone parses a future notAfter (the trap the old code fell
-        // into)...
         assert!(
             crate::tls::leaf_not_after_from_pem(torn.chain_pem.as_bytes()).is_ok(),
             "precondition: the torn chain is itself a valid, future-dated leaf"
         );
         task.store.save_cert(&task.cert_id, &torn).await.unwrap();
 
-        // ...but the renewal decision treats the unusable PAIR as absent.
         assert!(
             task.stored_not_after().await.is_none(),
             "a torn/mismatched pair must count as absent for the renewal decision"
         );
     }
 
-    // FIX 2: a valid matching pair reports its expiry normally (healthy path).
     #[tokio::test]
     async fn stored_not_after_is_present_for_a_valid_pair() {
         let (task, _dir, _status) = degraded_test_task(false);
@@ -2180,27 +2051,20 @@ mod tests {
         );
     }
 
-    // FIX 1 (#1608, Codex P2): a freshly-issued certificate that STILL immediately
-    // satisfies `needs_renewal` means the renew-before window is >= the cert's own
-    // lifetime. The loop must record a failure, report it, set the backstop flag,
-    // and — critically — NOT re-order on the next tick (no tight loop that burns CA
-    // rate limits).
+    // A fresh cert that already needs renewal means the renew-before window is >= its lifetime.
+    // The loop must report the failure and not re-order on the next tick, or it burns CA rate
+    // limits.
     #[tokio::test]
     async fn backstop_refuses_reorder_when_fresh_cert_still_needs_renewal() {
-        // Default renew window is 30 days; simulate an issued cert that expires in
-        // only 1 day, so `needs_renewal` is immediately true.
         let (task, _dir, status) = degraded_test_task(false);
 
         let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = Arc::clone(&captured);
         let reporter: ReporterFn = Arc::new(move |msg| sink.lock().unwrap().push(msg));
 
-        // Feed the post-issuance handler a "just issued" cert whose notAfter is
-        // inside the renew window — exactly what `issue()` would return for a
-        // misconfigured window.
+        // A "just issued" cert expiring in 1 day, inside the default 30-day renew window.
         task.handle_issue_outcome(Ok(now_unix() + DAY), &reporter);
 
-        // A failure is recorded and dispatched, naming the misconfiguration.
         let snap = status.snapshot();
         let failure = snap
             .last_failure
@@ -2214,15 +2078,13 @@ mod tests {
         assert_eq!(msgs.len(), 1, "reporter must be invoked once");
         assert!(msgs[0].contains("refusing to re-order"));
 
-        // The backstop flag is now set.
         assert!(
             task.renew_window_misconfigured
                 .load(std::sync::atomic::Ordering::SeqCst),
             "the misconfigured-window backstop must be set"
         );
 
-        // A subsequent tick must NOT order, even though the store is empty (which
-        // otherwise counts as due): the coordinator is never consulted.
+        // The next tick must not order, though an empty store otherwise counts as due.
         let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let coordinator: Arc<dyn SchedulerCoordinator> = Arc::new(RecordingCoordinator {
             acquired: Arc::clone(&acquired),
@@ -2234,14 +2096,12 @@ mod tests {
         );
     }
 
-    // FIX 1 companion: a healthy issuance (cert far from expiry) must NOT trip the
-    // backstop — the loop stays free to renew normally when the next window opens.
     #[tokio::test]
     async fn healthy_issuance_does_not_trip_backstop() {
         let (task, _dir, status) = degraded_test_task(false);
         let reporter: ReporterFn = Arc::new(|_| {});
 
-        // Issued cert with 60 days of validity, 30-day window → not immediately due.
+        // 60 days of validity against a 30-day window: not immediately due.
         task.handle_issue_outcome(Ok(now_unix() + 60 * DAY), &reporter);
 
         let snap = status.snapshot();
@@ -2260,8 +2120,7 @@ mod tests {
             "a healthy issuance must not trip the backstop"
         );
 
-        // And the loop is free to order when due (empty store → due) — the
-        // coordinator IS consulted.
+        // The loop still orders when due (an empty store is due).
         let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let coordinator: Arc<dyn SchedulerCoordinator> = Arc::new(RecordingCoordinator {
             acquired: Arc::clone(&acquired),

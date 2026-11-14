@@ -53,8 +53,7 @@
         clippy::arithmetic_side_effects,
     )
 )]
-// `pub` throughout this file is crate-visible only: the enclosing `cluster`
-// submodule is itself `pub(crate)`, so nothing here escapes the crate
+// `pub` here is crate-visible only: the `cluster` module is `pub(crate)`
 // (clippy::redundant_pub_crate).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -387,9 +386,7 @@ struct InboundRegistration {
 impl Drop for InboundRegistration {
     fn drop(&mut self) {
         let mut live = self.connections.lock();
-        // Only if it is still *ours*: an ephemeral port can be reused the
-        // moment this connection closes, and removing by key alone would let a
-        // dying connection retire the successor that took its address.
+        // Only if still ours: a successor may already have reused the ephemeral port.
         if live
             .get(&self.peer)
             .is_some_and(|tracked| tracked.id == self.id)
@@ -587,9 +584,8 @@ impl TcpPeerTransport {
     /// push round on it.
     fn writer_for(&self, to: &str) -> Option<PeerLanes> {
         let mut peers = self.lock_peers();
-        // A closed lane means that writer task exited (cancelled, or its
-        // connection is unrecoverable); both lanes close together, since the
-        // writer owns both receivers. Forget it so the next frame re-dials.
+        // A closed lane means the writer exited (both lanes close together).
+        // Forget it so the next frame re-dials.
         if peers.get(to).is_some_and(|lanes| lanes.pushes.is_closed()) {
             peers.remove(to);
         }
@@ -621,10 +617,8 @@ impl PeerTransport for TcpPeerTransport {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        // `try_send`, never `send().await`: a slow or dead peer must not be able
-        // to stall the push loop, and the next push carries the same (merged)
-        // document anyway. Full and closed are both simply "the packet was
-        // lost", which the protocol is built to tolerate.
+        // `try_send`, never `send().await`: a slow or dead peer must not stall the
+        // push loop, and the next push carries the same document anyway.
         if lanes.pushes.try_send(frame).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
@@ -640,19 +634,14 @@ impl PeerTransport for TcpPeerTransport {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return false;
         };
-        // The departure lane, never the queue: a peer stalled long enough to
-        // fill 64 frames' worth of pushes is precisely the case this exists
-        // for. The writer reads this channel first, so the farewell overtakes
-        // those pushes instead of queueing behind them — and they are stale by
-        // construction, being older copies of the document this frame carries
-        // at a lower sequence, so the peer's replay watermark discards whichever
-        // of them the writer still gets to.
+        // The writer reads the departure lane first, so the farewell overtakes a
+        // stalled peer's queued pushes. Those are older copies at lower sequence
+        // numbers, so the peer's replay watermark discards any still sent.
         if lanes.farewell.try_send(frame).is_ok() {
             return true;
         }
-        // Refused: the writer is gone, or a whole departure is already waiting.
-        // Counted and reported, never swallowed — nothing re-sends this frame,
-        // so a silent drop here is a departure that never happened.
+        // The writer is gone, or a whole departure is already waiting. Nothing
+        // re-sends this frame, so the refusal is reported.
         self.dropped.fetch_add(1, Ordering::Relaxed);
         false
     }
@@ -680,8 +669,7 @@ impl PeerTransport for TcpPeerTransport {
         {
             let mut io = self.lock_io();
             if io.is_some() {
-                // Started already: the accept loop is running and the writers
-                // are keyed off the first `io` we stored.
+                // Already started.
                 return;
             }
             *io = Some(TransportIo {
@@ -703,12 +691,9 @@ impl PeerTransport for TcpPeerTransport {
     }
 
     fn pending_frames(&self) -> usize {
-        // Both lanes: a farewell waiting in the departure lane is the one frame
-        // the flush that reads this number exists to wait for.
         let queued: usize = self.lock_peers().values().map(PeerLanes::queued).sum();
-        // Plus whatever the writer tasks are holding: a tokio permit comes back
-        // the moment `recv()` yields, so queue depth alone reports a frame as
-        // flushed while its writer is still inside a two-second dial.
+        // Plus frames the writers hold: a permit comes back the moment `recv()`
+        // yields, so queue depth alone would report a frame flushed mid-dial.
         queued.saturating_add(self.in_flight.load(Ordering::Relaxed))
     }
 
@@ -725,9 +710,8 @@ impl PeerTransport for TcpPeerTransport {
     }
 
     fn retain_peers(&self, live: &BTreeSet<String>) {
-        // Dropping a peer's lane senders is the retirement: the writer's queue
-        // `recv` then yields `None` once it has drained whatever was queued, so
-        // a frame already handed over is still transmitted.
+        // Dropping the senders retires the writer once it drains its queue, so a
+        // frame already handed over is still transmitted.
         self.lock_peers().retain(|addr, _| live.contains(addr));
     }
 }
@@ -767,9 +751,8 @@ async fn accept_loop(
         match accepted {
             Ok((stream, peer)) => {
                 let Some(slot) = claim_inbound_slot(&limits.live) else {
-                    // Accepted and closed at once rather than parked: the
-                    // socket has already cost a descriptor, and refusing it
-                    // here is what keeps the cost bounded.
+                    // The socket already costs a descriptor; closing it at once
+                    // rather than parking it keeps that cost bounded.
                     drop(stream);
                     tracing::warn!(
                         peer = %peer,
@@ -779,10 +762,8 @@ async fn accept_loop(
                     continue;
                 };
                 let peer = peer.to_string();
-                // A child of the accept loop's token, so this connection can be
-                // closed on its own — by the unauthenticated-frame budget —
-                // without touching the listener or any other connection, while
-                // shutdown still closes all of them at once.
+                // Its own child token, so the unauthenticated-frame budget can close
+                // this connection alone while shutdown still closes them all.
                 let close = shutdown.child_token();
                 let registration = limits.connections.register(&peer, close.clone());
                 let reader = connection_reader(
@@ -844,9 +825,7 @@ async fn connection_reader(
     slot: InboundSlot,
     registration: InboundRegistration,
 ) {
-    // Held for the whole connection: dropping them gives the budget back and
-    // retires the tracking entry on every exit path below, cancellation
-    // included.
+    // Held for the whole connection, so every exit path releases both.
     let _slot = slot;
     let _registration = registration;
     loop {
@@ -860,8 +839,8 @@ async fn connection_reader(
         };
         match read {
             Ok(Ok(_)) => {}
-            // EOF or a reset: the peer re-dials, and a closed connection carries
-            // no liveness meaning at all.
+            // EOF or reset: the peer re-dials; a closed connection means nothing
+            // for liveness.
             Ok(Err(_)) => return,
             Err(_elapsed) => {
                 tracing::debug!(
@@ -874,14 +853,10 @@ async fn connection_reader(
             }
         }
 
-        // Receive-path step 1, and the one place a rejection closes the
-        // connection: after a bad length prefix there is no way to know where
-        // the next frame starts, so the stream is unusable. The cap is checked
-        // on the declared `u32`, before a buffer of that size is reserved.
+        // Receive-path step 1, the one rejection that closes the connection:
+        // after a bad length prefix the next frame's start is unknown.
         let Some(declared) = frame_len(prefix) else {
-            // Counted here, not by the verifier: this frame never reaches it,
-            // and an `oversize` series that stays at zero for exactly the
-            // traffic it documents is worse than no series at all.
+            // Counted here because this frame never reaches the verifier.
             limits.framing_rejections.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 peer = %peer,
@@ -910,7 +885,7 @@ async fn connection_reader(
             () = shutdown.cancelled() => return,
         };
         if handed_up.is_err() {
-            // The node's receive loop is gone; nothing left to read for.
+            // The node's receive loop is gone.
             return;
         }
     }
@@ -993,17 +968,12 @@ async fn peer_writer(
             () = shutdown.cancelled() => None,
         };
         let Some(frame) = queued else { return };
-        // Held for the rest of this iteration, so the frame stays visible to
-        // `pending_frames` for exactly as long as this task owes the OS a write.
+        // Keeps the frame visible to `pending_frames` until this iteration ends.
         let _held = InFlightFrame::claim(&in_flight);
 
         if connection.is_none() {
-            // Bounded: a *refused* connection comes back at once, but a
-            // blackholed one — packets dropped, no RST, the ordinary shape of a
-            // firewall or a machine that vanished — pends for the OS SYN
-            // timeout, which is minutes. The backoff below cannot begin until
-            // this returns, so an unbounded dial makes the configured cap a
-            // fiction and stalls every frame behind it.
+            // Bounded: a blackholed peer (no RST) would otherwise pend for the OS
+            // SYN timeout, minutes, stalling the backoff and every queued frame.
             let dialled = tokio::select! {
                 result = tokio::time::timeout(
                     DIAL_TIMEOUT,
@@ -1015,8 +985,8 @@ async fn peer_writer(
                 backoff = RECONNECT_BACKOFF_MIN;
                 connection = Some(stream);
             } else {
-                // Drop this frame and back off. Losing a push is a non-event:
-                // the next one carries the whole document again.
+                // Drop this frame and back off; the next push carries the whole
+                // document again.
                 tokio::select! {
                     () = tokio::time::sleep(super::jittered(backoff, entropy.as_ref())) => {}
                     () = shutdown.cancelled() => return,
@@ -1027,21 +997,16 @@ async fn peer_writer(
         }
 
         if let Some(stream) = connection.as_mut() {
-            // Bounded and cancellable for the same reason the dial is: a peer
-            // that completed the handshake and then stopped reading fills the
-            // socket buffer, and an unbounded `write_all` would pend there
-            // until the OS TCP timeout — one stalled peer holding the only
-            // writer this node has for it, and holding shutdown too.
+            // Bounded: a peer that stopped reading fills the socket buffer, and an
+            // unbounded `write_all` would pend until the OS TCP timeout.
             let written = tokio::select! {
                 result = tokio::time::timeout(WRITE_TIMEOUT, stream.write_all(&frame)) => result,
                 () = shutdown.cancelled() => return,
             };
             if !matches!(written, Ok(Ok(()))) {
                 // Dropped, not retried: a timed-out write may have left half a
-                // frame on the wire, so the stream's framing can no longer be
-                // trusted and the connection goes with it. Re-dialled on the
-                // next frame — the peer may simply be gone, and the next push
-                // carries the whole document again.
+                // frame on the wire, so the connection is discarded and re-dialled
+                // on the next frame.
                 connection = None;
             }
         }
@@ -1188,8 +1153,7 @@ mod tcp_tests {
             "closing the connection must give its slot back"
         );
 
-        // And the listener itself is untouched: one abuser's socket is closed,
-        // not the port.
+        // The listener itself keeps running.
         let mut fresh = tokio::net::TcpStream::connect(transport.local_addr())
             .await
             .expect("the listener must still accept connections after closing an abuser");
@@ -1236,9 +1200,7 @@ mod tcp_tests {
              proves nothing"
         );
 
-        // At the cap, even a legitimate peer is turned away — which is why
-        // holding the cap indefinitely is a denial of service and not just
-        // untidiness.
+        // At the cap, even a legitimate peer is turned away.
         let mut refused = tokio::net::TcpStream::connect(transport.local_addr())
             .await
             .expect("a connection at the cap is accepted and then closed");
@@ -1250,7 +1212,6 @@ mod tcp_tests {
              observed {at_cap:?}"
         );
 
-        // Every abuser now spends its budget without ever authenticating.
         for abuser in &mut abusers {
             for _ in 0..MAX_UNAUTHENTICATED_FRAMES {
                 abuser
@@ -1268,8 +1229,6 @@ mod tcp_tests {
              that cannot produce a valid MAC keeps the port to itself"
         );
 
-        // …and the freed budget is really usable: a peer connects and its frame
-        // reaches the node.
         let before = reported.load(Ordering::Relaxed);
         let mut peer = tokio::net::TcpStream::connect(transport.local_addr())
             .await
@@ -1389,15 +1348,10 @@ mod tcp_tests {
     /// was still inside a two-second dial or write.
     #[tokio::test(flavor = "multi_thread")]
     async fn pending_frames_counts_the_frame_a_writer_still_holds() {
-        // A blocked *write* cannot be arranged portably — Windows loopback
-        // auto-grows its kernel buffers far enough to swallow tens of
-        // megabytes, completing `write_all` against a peer that never reads —
-        // so this parks the writer in its own bounded *dial* instead:
-        // 192.0.2.1 (RFC 5737 TEST-NET-1) is reserved and unrouted, so the
-        // SYN goes to the void and the dial holds for the full DIAL_TIMEOUT.
-        // The frame leaves the queue microseconds after `send`, which means
-        // the only thing keeping it visible below is the writer's in-flight
-        // claim — exactly the seam the departure flush depends on.
+        // Parks the writer in a dial, since a blocked write cannot be arranged
+        // portably (Windows loopback buffers absorb tens of megabytes).
+        // 192.0.2.1 (RFC 5737 TEST-NET-1) is unrouted, so the dial holds for
+        // DIAL_TIMEOUT and only the in-flight claim keeps the frame visible.
         const BLACKHOLE: &str = "192.0.2.1:9";
 
         let (transport, token) = started(Duration::from_secs(30));
@@ -1408,25 +1362,19 @@ mod tcp_tests {
 
         transport.send(BLACKHOLE, vec![0_u8; 32]);
 
-        // Generous for the process-local queue pickup (microseconds), and
-        // well inside DIAL_TIMEOUT, so on a network that really blackholes
-        // TEST-NET the writer is provably mid-dial with the frame in hand.
+        // Long enough for the writer to take the frame, well inside DIAL_TIMEOUT.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         if transport.pending_frames() == 0 {
-            // A sandboxed or unusually-routed environment fails the TEST-NET
-            // dial fast (ENETUNREACH / immediate RST) instead of letting the
-            // SYN time out; the writer already dropped the frame, so there is
-            // no dial window to observe the claim in. The arithmetic half of
-            // this contract is still pinned unconditionally by
-            // `pending_frames_includes_a_claimed_in_flight_frame` below.
+            // Some networks fail TEST-NET dials fast (ENETUNREACH or RST), leaving
+            // no dial window. `pending_frames_includes_a_claimed_in_flight_frame`
+            // still covers the arithmetic.
             eprintln!("skipping: this network fails TEST-NET dials fast");
             token.cancel();
             return;
         }
-        // Observed mid-dial once; it must still be pending shortly after —
-        // under a writer that never claims, the count would have collapsed to
-        // zero the instant the frame left the queue.
+        // Without the in-flight claim this would read 0 once the frame left the
+        // queue.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             transport.pending_frames(),
@@ -1485,8 +1433,7 @@ mod tcp_tests {
     /// single frame, so the queue is provably full when the farewell is offered.
     #[tokio::test]
     async fn a_departure_is_queued_even_when_the_peer_queue_is_full() {
-        // Nobody is listening, and nothing here awaits, so no writer ever
-        // touches these frames.
+        // Nothing here awaits, so the writer never runs.
         const PEER: &str = "127.0.0.1:9";
 
         let (transport, token) = started(IDLE);
@@ -1528,9 +1475,7 @@ mod tcp_tests {
              the departure flush returns before it has reached the wire"
         );
 
-        // The lane is bounded like everything else here, and a refusal is
-        // REPORTED rather than swallowed: nothing re-sends a farewell, so a
-        // silent drop is a departure that never happened.
+        // The lane is bounded, and a refusal is reported rather than swallowed.
         assert!(
             !transport.send_farewell(PEER, vec![2_u8; 8]),
             "a departure lane holding a whole departure must refuse a third \
@@ -1556,8 +1501,7 @@ mod tcp_tests {
         const FAREWELL: u8 = 0x22;
         const FRAME_BYTES: usize = 8;
 
-        // A real peer, so the ordering is read off an actual connection rather
-        // than inferred from a counter.
+        // A real peer, so the order is read off an actual connection.
         let peer = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("binding an ephemeral loopback port must succeed");
@@ -1567,9 +1511,8 @@ mod tcp_tests {
             .to_string();
         let (transport, token) = started(IDLE);
 
-        // Current-thread runtime, no await in between: the writer task cannot
-        // run until the accept below parks, so it meets both lanes ready at
-        // once — the exact shape a stalled peer plus a shutdown produces.
+        // Current-thread runtime, no await in between: the writer cannot run
+        // until the accept below parks, so it finds both lanes ready at once.
         for _ in 0..8_u8 {
             transport.send(&peer_addr, vec![STALE; FRAME_BYTES]);
         }
@@ -1632,9 +1575,8 @@ mod tcp_tests {
 // ── In-process loopback transport (tests only) ───────────────────────────────
 
 #[cfg(test)]
-// `LoopbackTransport` itself is never named outside its module — a test builds
-// one through `LoopbackRouter::endpoint` and coerces it straight to
-// `Arc<dyn PeerTransport>` — so only the router is re-exported.
+// Tests reach `LoopbackTransport` only through `LoopbackRouter::endpoint`, so only
+// the router is re-exported.
 pub use loopback::LoopbackRouter;
 
 #[cfg(test)]
@@ -1740,11 +1682,8 @@ mod loopback {
         }
 
         fn send_farewell(&self, to: &str, frame: Vec<u8>) -> bool {
-            // No per-peer queue to supersede — the router hands the frame
-            // straight to the destination — so the only question this answers
-            // is whether the endpoint is still plugged in. Reported honestly
-            // rather than defaulted to `true`: an unplugged endpoint (a hard
-            // kill) must not look like a delivered departure.
+            // No queue to supersede, but not the default `true`: an unplugged
+            // endpoint (a hard kill) must not look like a delivered departure.
             self.router.deliver(&self.addr.to_string(), to, frame)
         }
 

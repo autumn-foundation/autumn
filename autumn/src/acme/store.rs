@@ -263,19 +263,12 @@ impl AcmeStore for FsAcmeStore {
         let key = cert.key_pem.clone().into_bytes();
         Box::pin(async move {
             ensure_dir(&dir).await?;
-            // Publish the pair as atomically as two files allow: STAGE both temp
-            // files fully (write + flush) BEFORE renaming EITHER into place, so a
-            // crash can only tear the pair during the two back-to-back rename
-            // syscalls rather than across a full write+flush of the key. Any
-            // residual torn state (a new chain with the old/mismatched key, or
-            // vice-versa) is still caught at load time by the renewal decision's
-            // pair validation, which treats a non-loadable pair as absent.
+            // Stage both files fully before renaming either, so a crash can only tear the pair
+            // between the two renames. A torn pair is caught at load time by the renewal
+            // decision's pair validation, which treats it as absent.
             //
-            // Each staged handle (`crate::fs_atomic::StagedFile`) removes its
-            // own temp file on drop unless `publish_staged` consumes it, so an
-            // early return here — staging the key fails, publishing the chain
-            // fails, or this whole future is cancelled — cannot leak a
-            // partial-secret temp file; no manual cleanup needed.
+            // A staged handle removes its temp file on drop unless `publish_staged` consumes it,
+            // so an early return or cancellation cannot leak a partial-secret temp file.
             let chain_tmp = stage_owner_only(&chain_path, &chain).await?;
             let key_tmp = stage_owner_only(&key_path, &key).await?;
             publish_staged(chain_tmp, &chain_path).await?;
@@ -287,9 +280,8 @@ impl AcmeStore for FsAcmeStore {
         let chain_path = self.chain_path(id);
         let key_path = self.key_path(id);
         Box::pin(async move {
-            // Remove the key first: a crash between the two leaves a chain with
-            // no key, which every loader already treats as absent — the reverse
-            // would leave a usable private key for a domain no longer served.
+            // Remove the key first: a crash between the two leaves a chain with no key, which
+            // loaders treat as absent. The reverse would leave a usable private key behind.
             remove_optional(&key_path).await?;
             remove_optional(&chain_path).await
         })
@@ -413,7 +405,6 @@ mod tests {
         let staging = FsAcmeStore::new(dir.path(), "staging");
         let production = FsAcmeStore::new(dir.path(), "production");
         staging.save_account(b"staging-creds").await.unwrap();
-        // A production store in the same dir must not see the staging account.
         assert!(production.load_account().await.unwrap().is_none());
         assert_eq!(
             staging.load_account().await.unwrap().as_deref(),
@@ -440,7 +431,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FsAcmeStore::new(dir.path(), "staging");
         let id = CertId::from_domains(&["app.example.com".into()]);
-        // Only the chain written (no key) → treated as no stored cert.
         let chain_path = store.chain_path(&id);
         tokio::fs::create_dir_all(chain_path.parent().unwrap())
             .await
@@ -451,10 +441,8 @@ mod tests {
 
     #[tokio::test]
     async fn cert_is_namespaced_per_directory() {
-        // Regression: a staging-issued leaf must NOT be served after promoting
-        // the same cache dir to production. The cert files are keyed only by the
-        // domain-set `CertId`, so before per-directory namespacing a production
-        // store would load the leftover (browser-untrusted) staging cert.
+        // A staging-issued (browser-untrusted) leaf must not be served after the same cache dir is
+        // promoted to production, though both stores key the cert by the same `CertId`.
         let dir = tempfile::tempdir().unwrap();
         let staging = FsAcmeStore::new(dir.path(), "staging");
         let production = FsAcmeStore::new(dir.path(), "production");
@@ -465,16 +453,12 @@ mod tests {
         };
         staging.save_cert(&id, &staging_cert).await.unwrap();
 
-        // Same domain set, but the production store must see nothing.
         assert!(production.load_cert(&id).await.unwrap().is_none());
-        // The staging store still finds its own cert.
         assert_eq!(staging.load_cert(&id).await.unwrap(), Some(staging_cert));
     }
 
     #[tokio::test]
     async fn save_cert_publishes_both_files_without_leftover_temps() {
-        // The staged-then-rename publish must leave BOTH files in place and no
-        // `.tmp` siblings behind (regression for the atomic-pair-publish change).
         let dir = tempfile::tempdir().unwrap();
         let store = FsAcmeStore::new(dir.path(), "staging");
         let id = CertId::from_domains(&["app.example.com".into()]);
@@ -504,16 +488,13 @@ mod tests {
 
     #[tokio::test]
     async fn save_cert_cleans_up_the_key_temp_when_chain_publish_fails() {
-        // Codex review (#1864): once both files stage under unpredictable
-        // per-attempt names, a chain-publish failure must not leak the
-        // already-staged key temp file — unlike the old fixed `.tmp` name,
-        // a fresh name every attempt means nothing overwrites it later.
+        // Temp files get a fresh name per attempt, so nothing overwrites a leaked one later: a
+        // chain-publish failure must remove the already-staged key temp file (#1864).
         let dir = tempfile::tempdir().unwrap();
         let store = FsAcmeStore::new(dir.path(), "staging");
         let id = CertId::from_domains(&["app.example.com".into()]);
 
-        // Make the chain's publish (rename) fail: occupy its target path
-        // with a non-empty directory, which `rename` refuses to replace.
+        // Make the chain's rename fail: `rename` refuses to replace a non-empty directory.
         let chain_path = store.chain_path(&id);
         tokio::fs::create_dir_all(&chain_path).await.unwrap();
         tokio::fs::write(chain_path.join("occupied"), b"x")
@@ -597,12 +578,9 @@ mod tests {
         );
     }
 
-    // Codex review (#1864): a path occupied by a directory (or any other
-    // non-regular node) is a genuinely broken cache, not an absent one — it
-    // must be reported as present (`Some`) so the caller's own read attempt
-    // surfaces the real error, exactly as it always has for a present but
-    // corrupt file. Reporting `None` here would have `autumn doctor` grade a
-    // cache that will fail to load at boot as the benign "not configured yet".
+    // A path occupied by a directory is a broken cache, not an absent one. It must read as present
+    // so the caller's own read surfaces the error; `None` would have `autumn doctor` grade a cache
+    // that fails to load at boot as "not configured yet" (#1864).
     #[tokio::test]
     async fn find_cert_for_domains_reports_an_occupied_directory_as_present() {
         let dir = tempfile::tempdir().unwrap();
@@ -665,7 +643,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // A partial pair alongside the two complete ones must be skipped.
         let partial = CertId::from_domains(&["partial.example.com".into()]);
         tokio::fs::write(store.chain_path(&partial), b"PARTIAL")
             .await
@@ -717,7 +694,6 @@ mod tests {
             );
         }
 
-        // The per-directory subdirectory that holds the secrets is 0700.
         let subdir_mode = std::fs::metadata(store.cert_dir())
             .unwrap()
             .permissions()

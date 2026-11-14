@@ -62,8 +62,7 @@ pub fn resolve_all<'g>(graph: &'g ArchitectureGraph, name: &str) -> Vec<&'g Grap
         graph.nodes.iter().filter(|n| f(n)).collect()
     };
     let tiers: [Vec<&'g GraphNode>; 6] = [
-        // An id with no version names every version of the node: an id can
-        // end in `@<version>` (#2520 item 14).
+        // An id can end in `@<version>` (#2520); one without a version names every version.
         all(&|n: &GraphNode| n.id == name || n.base_id() == name),
         all(&|n: &GraphNode| n.base_id().strip_prefix("model:") == Some(name)),
         all(&|n: &GraphNode| n.kind == NodeKind::Model && n.name == name),
@@ -371,11 +370,8 @@ mod tests {
 
     #[test]
     fn a_name_two_crates_both_answer_to_unions_their_dependents() {
-        // The symbol index deliberately links a name to every node answering to
-        // it, so a route's edge can land on either `Post`. Answering from one
-        // node alone would silently drop every route whose edge landed on the
-        // other — a false negative in the one metric this feature is measured
-        // on.
+        // The symbol index links a name to every node answering to it, so a route's edge can
+        // land on either `Post`. Answering from one node would drop the other's routes.
         const TWO_POSTS: &[ModelGraphDescriptor] = &[
             ModelGraphDescriptor {
                 model: "Post",

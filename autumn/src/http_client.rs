@@ -348,12 +348,8 @@ fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
         return Some(v4);
     }
     let segs = ip.segments();
-    // SIIT IPv4-translated `::ffff:0:0:0/96` (RFC 6052): 64 zero bits, then
-    // 0xffff, then 16 zero bits, then the IPv4 in the last 32 bits. Distinct
-    // from IPv4-mapped `::ffff:0:0/96` (segment[5] == 0xffff) — here
-    // segment[4] == 0xffff and segment[5] == 0 — so `to_ipv4_mapped()` above
-    // does NOT catch it. Decode it so the embedded IPv4 is re-checked by the
-    // IPv4 policy (e.g. `::ffff:0:169.254.169.254` must be blocked).
+    // SIIT IPv4-translated `::ffff:0:0:0/96` (RFC 6052): segment[4] == 0xffff, segment[5] == 0.
+    // `to_ipv4_mapped()` does not catch it, and `::ffff:0:169.254.169.254` must be blocked.
     if segs[0] == 0
         && segs[1] == 0
         && segs[2] == 0
@@ -384,12 +380,8 @@ fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
 }
 
 fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
-    // Block any private / loopback / link-local / metadata IPv4 that is
-    // tunnelled inside this v6 address (IPv4-mapped, IPv4-compatible, NAT64,
-    // 6to4, or SIIT IPv4-translated `::ffff:0:0:0/96`) by re-running the IPv4
-    // policy on the embedded address. A public
-    // embedded IPv4 (e.g. 6to4 `2002:0808:0808::` == 8.8.8.8) is NOT blocked
-    // here — it falls through to the native v6 range checks below.
+    // Re-run the IPv4 policy on any IPv4 tunnelled inside this address. A public embedded IPv4
+    // (6to4 `2002:0808:0808::` == 8.8.8.8) falls through to the v6 range checks below.
     if let Some(v4) = embedded_ipv4(ip)
         && is_blocked_ipv4(v4)
     {
@@ -397,12 +389,9 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
     }
 
     let segs = ip.segments();
-    // RFC 8215 local-use NAT64 prefix `64:ff9b:1::/48`: deny the whole prefix
-    // outright. Unlike the well-known `64:ff9b::/96` (where a public embedded
-    // IPv4 like 8.8.8.8 is legitimately allowed), this is a private/site-local
-    // NAT64 allocation with no legitimate public destination, and the RFC 6052
-    // embedding position varies with prefix length — a blanket deny is both
-    // simpler and strictly safer (e.g. `64:ff9b:1::a9fe:a9fe` == 169.254.169.254).
+    // RFC 8215 local-use NAT64 prefix `64:ff9b:1::/48`: deny it whole. It has no public
+    // destination, and the embedded IPv4's position varies with prefix length
+    // (`64:ff9b:1::a9fe:a9fe` == 169.254.169.254).
     if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
         return true;
     }
@@ -435,21 +424,9 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
         return true;
     }
 
-    // Remaining IANA IPv6 special-purpose prefixes with Globally Reachable =
-    // False. These are reserved / benchmarking / documentation / discard ranges
-    // that must never be dialled, matching the deny-list's reserved policy.
-    // Each check uses explicit masks so it cannot catch an adjacent *public*
-    // address (e.g. benchmarking 2001:2::/48 must not swallow Teredo 2001:0::/32
-    // where s[1] == 0, and documentation 2001:db8::/32 stays its own check).
-    //
-    //   Prefix               RFC        Purpose
-    //   100::/64             RFC 6666   Discard-Only address block
-    //   2001:2::/48          RFC 5180   Benchmarking
-    //   2001:10::/28         RFC 4843   ORCHID (deprecated)
-    //   2001:20::/28         RFC 7343   ORCHIDv2
-    //   3fff::/20            RFC 9637   Documentation
-    //   5f00::/16            RFC 9602   Segment Routing (SRv6) SIDs
-    //   2620:4f:8000::/48    RFC 7534   Direct Delegation AS112 service
+    // Remaining IANA IPv6 special-purpose prefixes that are not globally reachable. The masks
+    // are exact so no check catches an adjacent public address (benchmarking 2001:2::/48 must
+    // not swallow Teredo 2001:0::/32).
     let s = segs;
     // 100::/64 (Discard-Only, RFC 6666)
     if s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0 {
@@ -620,11 +597,7 @@ impl MockRegistry {
         url: &str,
         alias: Option<&str>,
     ) -> Option<MockResponse> {
-        // Extract the URL path component for matching, stripping query and fragment.
-        // For full URLs (https://…) reqwest::Url::parse gives us the clean path.
-        // For relative paths we strip manually so "?query" doesn't break matching.
-        // Extract the path without query/fragment. For full URLs reqwest parses
-        // cleanly; for relative strings we strip manually.
+        // A relative URL does not parse, so its query and fragment are stripped by hand.
         let url_path_owned: String = reqwest::Url::parse(url).map_or_else(
             |_| {
                 let s = url.split_once('?').map_or(url, |(p, _)| p);
@@ -634,15 +607,13 @@ impl MockRegistry {
         );
         let url_path = url_path_owned.as_str();
 
-        // Hold the lock only for the search; release before fetching metadata.
+        // Hold the lock only for the search.
         let found = {
             let entries = self.entries.lock().expect("mock registry lock poisoned");
             entries.iter().find_map(|entry| {
                 let method_ok = entry.method.as_ref().is_none_or(|m| m == method);
-                // Path match: exact equality OR suffix at a segment boundary.
-                // When the mock path starts with '/' the leading slash IS the
-                // segment separator, so a non-empty prefix is also valid
-                // (e.g. mock "/charges" matches URL path "/v1/charges").
+                // Exact match, or a suffix at a segment boundary. A mock path starting with '/'
+                // carries its own boundary: mock "/charges" matches "/v1/charges".
                 let path_ok = url_path == entry.path.as_str()
                     || url_path
                         .strip_suffix(entry.path.as_str())
@@ -807,9 +778,8 @@ fn rebuild_client_error(
                 || ClientError::ReplayedRequestFailure(text.clone()),
                 ClientError::TooManyRedirects,
             ),
-        // `NoMock` carries the method and URL, which the effect already holds;
-        // it is a test-harness error a recorded production run cannot produce,
-        // so it is not worth rebuilding structurally.
+        // `NoMock` is a test-harness error a recorded production run cannot produce, so it is
+        // not rebuilt structurally.
         Some(Kind::Json | Kind::NoMock | Kind::Transport) | None => {
             ClientError::ReplayedRequestFailure(text)
         }
@@ -943,12 +913,8 @@ impl OutboundRecorder {
                     .headers
                     .iter()
                     .map(|(name, value)| {
-                        // A header value is bytes, not text. Replacing an
-                        // opaque non-UTF-8 value with an empty string would
-                        // hand replay a header the peer never sent, and code
-                        // reading it through `as_bytes()` would branch on
-                        // nothing; the lossy form at least preserves its shape
-                        // and length rather than deleting it.
+                        // A non-UTF-8 value is kept lossily rather than emptied, so replay
+                        // still sees a header of the same shape the peer sent.
                         (
                             name.as_str().to_owned(),
                             value.to_str().map_or_else(
@@ -1487,11 +1453,9 @@ impl Client {
             .extension::<crate::config::HttpConfig>()
             .or_else(|| autumn_config.as_ref().map(|c| Arc::new(c.http.clone())));
 
-        // Only reuse the shared inner client when its baked-in timeout still
-        // matches the effective config timeout.  A state_initializer that
-        // replaces AutumnConfig/HttpConfig with a different timeout_secs runs
-        // after build_state, so without this check the stale inner would
-        // silently override the new config's per-request timeout.
+        // Reuse the shared inner client only if its baked-in timeout matches the config. A state
+        // initializer can replace the config after `build_state`, and a stale inner client would
+        // silently override the new timeout.
         let effective_timeout_secs = config.as_ref().map_or_else(
             || crate::config::HttpClientConfig::default().timeout_secs,
             |c| c.client.timeout_secs,
@@ -1520,8 +1484,8 @@ impl Client {
             (None, None) => Self::new(),
         };
 
-        // The extractor builds a new client for each request, so the budgets
-        // live in the app state. Thus all requests of one app share them.
+        // The extractor builds a new client per request, so the budgets live in the app state
+        // and all requests of one app share them.
         client.retry.budgets = shared_retry_budgets(state, &budget_config);
 
         client.resilience_config = autumn_config.map(|c| Arc::new(c.resilience.clone()));
@@ -2233,26 +2197,19 @@ impl RequestBuilder {
     /// Contains an internal `unreachable!()` that guards against a logic error
     /// in the retry loop; it cannot be reached in practice.
     pub async fn send(self) -> Result<Response, ClientError> {
-        // Surface any error captured during builder construction.
         if let Some(err) = self.pending_error {
             return Err(err);
         }
 
-        // Replay serves outbound calls from the capsule's effect tape (#1634) and never
-        // dials the peer. A call the tape cannot answer is a divergence, already logged by
-        // `next_http`, and fails closed here. The unconditional block below stays as the
-        // backstop for a replay process whose current task carries no tape — app boot, a
-        // state initializer, work the handler spawned — because a capsule records no
-        // response for any of those either. The check is here rather than on the client
-        // because a handler can build one any way it likes (`Client::new()`, `from_state`,
-        // a stored one) and every path must be closed.
+        // Replay serves outbound calls from the capsule's effect tape (#1634) and never dials
+        // the peer; a call the tape cannot answer fails closed. The block below is the backstop
+        // for replay work with no tape (boot, state initializers, spawned tasks). The check sits
+        // here, not on the client, because a handler can build a client any way it likes.
         #[cfg(feature = "reporting")]
         if let Some(tape) = crate::capsule::effects::current_tape() {
             let method = self.method.to_string();
-            // Derived exactly as `OutboundRecorder::arm` derives the recorded
-            // half, so the comparison is like with like. No cap on the body:
-            // the capsule's own cap already applied at record time, and a
-            // recording that hit it is refused before it ever reaches replay.
+            // Derived as `OutboundRecorder::arm` derives the recorded half. No body cap: the
+            // capsule's cap applied at record time, and a recording that hit it never replays.
             let headers = caller_headers(&self);
             let body = self
                 .body
@@ -2279,11 +2236,8 @@ impl RequestBuilder {
             ));
         }
 
-        // Capture: the exchange is recorded into the in-flight request's
-        // capsule scope, when there is one. Recording wraps every send path
-        // below (mock, custom, breaker-guarded) so a capsule cannot miss an
-        // exchange because the caller happened to use `no_redirect` or a
-        // pinned address.
+        // Recording wraps every send path (mock, custom, breaker-guarded), so a capsule cannot
+        // miss an exchange made with `no_redirect` or a pinned address.
         let recorder = OutboundRecorder::arm(&self);
         let result = self.send_recorded().await;
         recorder.finish(&result);
@@ -2296,13 +2250,11 @@ impl RequestBuilder {
         crate::fault_injection::inject(crate::fault_injection::FaultTarget::Http)
             .await
             .map_err(|fault| ClientError::FaultInjected(fault.to_string()))?;
-        // After the capture tee armed, so a capsule records only the caller's
-        // own headers and replay compares like with like.
+        // Added after the capture tee armed, so a capsule records only the caller's own headers:
+        // replay compares like with like and needs no random idempotency key.
         if self.forward_request_id {
             add_current_request_id(&mut self.extra_headers);
         }
-        // After the capture tee, so a capsule records the caller's headers
-        // only and replays without a random key.
         self.ensure_idempotency_key();
         self.ensure_criticality_header();
 
@@ -2312,19 +2264,14 @@ impl RequestBuilder {
             return self.send_sim(&net).await;
         }
 
-        // Bypassing circuit breaker if a mock registry is present.
+        // Mocks bypass the circuit breaker.
         if self.mock.is_some() {
             return self.send_inner(false).await;
         }
 
-        // Custom send path: any of no_redirect / follow_redirects / pin_to /
-        // get_ssrf_safe builds one-shot reqwest client(s) with Policy::none()
-        // (+ optional .resolve()) and does manual redirect handling. Like the
-        // mock path it deliberately BYPASSES the process-global circuit breaker
-        // to avoid entangling these one-off, per-URL requests with the shared
-        // per-host breaker registry — unless the caller opted in via
-        // `breaker_scoped()` (repeated calls to a small, durable host set; see
-        // its doc comment).
+        // The custom path (no_redirect / follow_redirects / pin_to / get_ssrf_safe) handles
+        // redirects by hand. It bypasses the per-host breaker registry, since its calls often go
+        // to one-off URLs, unless the caller opted in with `breaker_scoped()`.
         if self.needs_custom_path() {
             if self.breaker_scoped {
                 return self.send_custom_breaker_guarded().await;
@@ -2332,10 +2279,8 @@ impl RequestBuilder {
             return self.send_custom(false).await;
         }
 
-        // ── Resilience / Circuit Breaker ──────────────────────────────────
         let breaker = breaker_for_url(self.resilience_config.as_ref(), &self.url);
 
-        // Check if circuit breaker is open
         let Ok(guard) = breaker.admit() else {
             return Err(ClientError::CircuitBreakerOpen);
         };
@@ -2351,11 +2296,9 @@ impl RequestBuilder {
                     guard.failure();
                 }
             }
-            // Neither says anything about the host. The caller ran out of
-            // time (issue #3058): a cancelled call, which counts only past the
-            // slow-call threshold. A local throttle reject (#3068): dropping
-            // the guard records nothing for a fast call and frees a half-open
-            // slot.
+            // A caller deadline (#3058) or a local throttle reject (#3068) says nothing about the
+            // host. Dropping the guard counts the call only past the slow-call threshold and frees
+            // a half-open slot.
             Err(ClientError::DeadlineExceeded | ClientError::ThrottledLocally { .. }) => {
                 drop(guard);
             }
@@ -2378,13 +2321,10 @@ impl RequestBuilder {
         let Ok(guard) = breaker.admit() else {
             return Err(ClientError::CircuitBreakerOpen);
         };
-        // Like the breaker, the throttle keeps per-host state, so on the
-        // custom path it covers only `breaker_scoped` calls: a small, durable
-        // host set. Unscoped custom calls go to user-supplied URLs, and one
-        // entry per host would grow without bound. The ticket is taken after
-        // the breaker admits, so a fail-fast `CircuitBreakerOpen` call never
-        // reaches the throttle. `send_one` retries inside, so the throttle
-        // counts the call once. A local reject leaves the breaker neutral.
+        // The throttle keeps per-host state, so on the custom path it covers only
+        // `breaker_scoped` calls; unscoped calls go to arbitrary URLs and would grow it without
+        // bound. The ticket is taken after the breaker admits and counts the whole call once,
+        // retries included. A local reject leaves the breaker neutral.
         let ticket = match self.throttle_attempt(None) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -2392,21 +2332,15 @@ impl RequestBuilder {
                 return Err(error);
             }
         };
-        // Mirrors the
-        // plain-path breaker block's own `is_half_open` (passed to
-        // `send_inner` to force a single attempt): a half-open probe is a
-        // budgeted, limited trial (`half_open_trial_count`), and letting
-        // `send_one`'s own retry loop turn one trial into several real
-        // network attempts spends that budget on one logical delivery
-        // instead of testing recovery with independent probes (#2480
-        // review, round 10).
+        // A half-open probe gets a single attempt, as on the plain path: retrying inside one
+        // trial would spend the limited `half_open_trial_count` on one delivery (#2480).
         let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
         let res = self.send_custom(is_half_open).await;
         record_call(ticket, &res);
         match &res {
             Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
-            // The caller ran out of time, not the upstream (issue #3058): a
-            // cancelled call, which counts only past the slow-call threshold.
+            // The caller ran out of time, not the upstream (#3058): counts only past the
+            // slow-call threshold.
             Err(ClientError::DeadlineExceeded) => drop(guard),
             _ => guard.failure(),
         }
@@ -2414,12 +2348,10 @@ impl RequestBuilder {
     }
 
     async fn send_inner(self, suppress_retries: bool) -> Result<Response, ClientError> {
-        // ── Mock short-circuit ──────────────────────────────────────────────
         if let Some(ref mock) = self.mock {
             return self.mock_response(mock);
         }
 
-        // ── Real network request with retries ───────────────────────────────
         let start = crate::time::ambient_instant();
         let max_attempts = self.max_attempts(suppress_retries);
         let mut gate = self.retry_gate(url_host(&self.url).as_deref());
@@ -2502,16 +2434,12 @@ impl RequestBuilder {
                 Err(e) if e.is_timeout() && gate.expired() => {
                     return Err(ClientError::DeadlineExceeded);
                 }
-                // Only retry transient connect/timeout errors; non-transient errors
-                // (e.g. malformed URL) fail immediately.
+                // Only connect and timeout errors are transient; anything else fails at once.
                 Err(e) if (e.is_connect() || e.is_timeout()) && !last => {
                     if let Some(ticket) = ticket {
                         ticket.record(false);
                     }
-                    // The HTTP stack may have followed a redirect: charge the
-                    // host that failed.
-                    // The host that failed: the last redirect target, or the
-                    // request's own host.
+                    // The HTTP stack may have followed a redirect: charge the host that failed.
                     gate.rekey(followed.last().map_or(self.url.as_str(), String::as_str));
                     let wait = self.retry_policy.retry_delay(&*self.entropy, attempt, None);
                     if !gate.allow(RetryKind::Transient, wait) {
@@ -2529,7 +2457,6 @@ impl RequestBuilder {
             }
         }
 
-        // The retry loop always returns inside the last attempt; this is unreachable.
         unreachable!("retry loop exited without returning a result — this is a bug")
     }
 
@@ -2909,14 +2836,8 @@ impl RequestBuilder {
     /// `send_inner(is_half_open)` already does — see
     /// `send_custom_breaker_guarded`'s doc comment.
     async fn send_custom(self, is_half_open: bool) -> Result<Response, ClientError> {
-        // Reject the incompatible `get_ssrf_safe` + `pin_to` combination up
-        // front — deterministically, before any network I/O. `get_ssrf_safe`
-        // routes through `send_ssrf_safe`, which runs its OWN per-hop
-        // resolve→validate→pin and never reads `self.pin_addr`; a caller's
-        // explicit `pin_to(addr)` would therefore be silently ignored. Fail
-        // loudly instead so the mismatch is caught rather than masked. Use
-        // `pin_to` alone for a caller-chosen fixed address, or `get_ssrf_safe`
-        // alone for guarded automatic per-hop pinning.
+        // The combination checks below run before any network I/O, so a misuse fails the same
+        // way every time.
         if self.ssrf_safe && self.pin_addr.is_some() {
             return Err(ClientError::PinNotAllowedWithSsrfSafe(
                 "get_ssrf_safe cannot be combined with pin_to: the SSRF-safe path \
@@ -2927,12 +2848,6 @@ impl RequestBuilder {
             ));
         }
 
-        // Reject the incompatible `pin_to` + `follow_redirects` combination up
-        // front — deterministically, before issuing any request. A single pinned
-        // `SocketAddr` only applies to hop 0 of `follow_loop`; later hops resolve
-        // via normal DNS, so following a cross-host `3xx` would silently escape
-        // the pin and defeat its purpose. `get_ssrf_safe` never sets `pin_addr`,
-        // so its per-hop resolve→validate→pin path is unaffected by this guard.
         if self.pin_addr.is_some() && matches!(self.redirect_mode, RedirectMode::Follow { .. }) {
             return Err(ClientError::IncompatiblePinRedirect(
                 "pin_to cannot be combined with follow_redirects: the pin only \
@@ -2950,14 +2865,8 @@ impl RequestBuilder {
             ));
         }
 
-        // Reject `pin_to` on an IP-literal URL host up front, deterministically, before
-        // any network I/O. reqwest and hyper treat an IP-literal host as already resolved
-        // and do not consult the DNS resolver, so the `resolve_to_addrs` override
-        // `build_oneshot_client` installs — which is what enforces the pin — is skipped
-        // and the socket connects to the literal in the URL rather than the pinned
-        // address, silently violating `pin_to`'s documented guarantee. `get_ssrf_safe`
-        // never sets `pin_addr`, and validates and connects to the same literal, so it
-        // stays safe; this guard targets only the explicit `pin_to` primitive.
+        // reqwest never resolves an IP-literal host, so the `resolve_to_addrs` override that
+        // enforces the pin would be skipped. `get_ssrf_safe` validates the literal itself.
         if self.pin_addr.is_some() && url_host_is_ip_literal(&self.url)? {
             return Err(ClientError::PinRequiresDomainHost(
                 "pin_to cannot be honored for an IP-literal URL host because the \
@@ -2982,7 +2891,7 @@ impl RequestBuilder {
             return self.send_ssrf_safe(timeout, is_half_open, &gate).await;
         }
 
-        // Extract the follow parameters (ending the borrow) before moving `self`.
+        // End the borrow of `self` before `follow_loop` moves it.
         let follow = match &self.redirect_mode {
             RedirectMode::Follow { max, validator } => Some((*max, validator.clone())),
             RedirectMode::None | RedirectMode::Default => None,
@@ -2999,14 +2908,8 @@ impl RequestBuilder {
                 .await;
         }
 
-        // Only `RedirectMode::None` (explicit `no_redirect`) and the pin-only
-        // `RedirectMode::Default` reach here (`Follow` and `ssrf_safe` returned
-        // above). Both use `Policy::none()`: a 3xx is returned to the caller
-        // verbatim rather than being auto-followed. Critically, for the
-        // pin-only path this stops reqwest from silently following a cross-host
-        // redirect and re-resolving the new host via normal DNS — which would
-        // defeat the pin. Callers who want to follow redirects while staying
-        // pinned/rebind-safe use `get_ssrf_safe` (or `follow_redirects`).
+        // Only `no_redirect` and pin-only calls reach here. A 3xx is returned unfollowed: on the
+        // pin-only path, following it would re-resolve the new host via DNS and escape the pin.
         let policy = reqwest::redirect::Policy::none();
         let resolve = self.pin_resolve()?;
         let client = build_oneshot_client(resolve, policy, timeout)?;
@@ -3049,8 +2952,7 @@ impl RequestBuilder {
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
         let mut current = self.url.clone();
-        // Threaded across hops so cross-origin header stripping (Fix A) and
-        // RFC method/body rewriting (Fix B) accumulate correctly.
+        // Threaded across hops so header stripping and method/body rewriting accumulate.
         let mut method = self.method.clone();
         let mut headers = self.extra_headers.clone();
         let mut body = self.body.clone();
@@ -3073,8 +2975,7 @@ impl RequestBuilder {
             } else {
                 None
             };
-            // On any post-origin hop, drop credential-bearing headers if the
-            // current target is cross-origin (stays stripped once stripped).
+            // Drop credential-bearing headers on a cross-origin hop; once stripped they stay so.
             if hop > 0 {
                 strip_sensitive_headers_if_cross_origin(&mut headers, &original, &current)?;
             }
@@ -3208,8 +3109,7 @@ impl RequestBuilder {
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
         let mut current = self.url.clone();
-        // Threaded across hops so cross-origin header stripping (Fix A) and
-        // RFC method/body rewriting (Fix B) accumulate correctly.
+        // Threaded across hops so header stripping and method/body rewriting accumulate.
         let mut method = self.method.clone();
         let mut headers = self.extra_headers.clone();
         let mut body = self.body.clone();
@@ -3219,19 +3119,14 @@ impl RequestBuilder {
         for hop in 0.. {
             let remaining_for_lookup = deadline_remaining_or_timeout(deadline, &current)
                 .map_err(|error| gate.classify(error))?;
-            // Resolve host → ALL validated addresses (rejects if ANY resolved IP
-            // is blocked), then pin the full set so reqwest cannot re-resolve but
-            // can still fall back across the validated addresses in order.
-            // Wrapped in the *remaining* budget, not the full per-request
-            // `timeout`: resolve_and_validate's DNS lookup previously had no
-            // timeout of its own at all.
+            // Rejects the host if any resolved IP is blocked, then pins the full validated set so
+            // reqwest cannot re-resolve but can fall back across it. The lookup gets only what is
+            // left of the deadline.
             let addrs = tokio::time::timeout(remaining_for_lookup, resolve_and_validate(&current))
                 .await
                 .map_err(|_| gate.classify(ssrf_safe_deadline_error(&current)))??;
             let host = host_of(&current)?;
-            // Re-measured after the lookup, so a slow DNS response shrinks
-            // what's left for the connect/response phase below rather than
-            // that phase getting a fresh full `timeout` regardless.
+            // Re-measured after the lookup, so slow DNS shrinks the connect/response budget.
             let remaining_for_connect = deadline_remaining_or_timeout(deadline, &current)
                 .map_err(|error| gate.classify(error))?;
             let client = build_oneshot_client(
@@ -3239,8 +3134,7 @@ impl RequestBuilder {
                 reqwest::redirect::Policy::none(),
                 remaining_for_connect,
             )?;
-            // On any post-origin hop, drop credential-bearing headers if the
-            // current target is cross-origin (stays stripped once stripped).
+            // Drop credential-bearing headers on a cross-origin hop; once stripped they stay so.
             if hop > 0 {
                 strip_sensitive_headers_if_cross_origin(&mut headers, &original, &current)?;
             }
@@ -3270,13 +3164,8 @@ impl RequestBuilder {
             )
             .await?;
 
-            // Honour a chained `no_redirect()`: return the response verbatim
-            // BEFORE parsing the `Location` header. The initial URL was still
-            // resolved / validated / pinned above. Parsing `Location` here (via
-            // `redirect_target`) would let an untrusted server force an
-            // `InvalidUrl` error out of a `no_redirect()` fetch by returning a
-            // followable 3xx with a malformed `Location`, violating the
-            // documented "return the initial 3xx verbatim" contract.
+            // Under `no_redirect()`, return before parsing `Location`: a malformed one from an
+            // untrusted server must not turn the verbatim 3xx into an `InvalidUrl` error.
             if !follow {
                 return Ok(resp);
             }
@@ -3286,15 +3175,12 @@ impl RequestBuilder {
             if hop >= max {
                 return Err(ClientError::TooManyRedirects(max));
             }
-            // Defence-in-depth: reject an https→http downgrade on redirect.
             if scheme_is_https(&current)? && !scheme_is_https(&next)? {
                 return Err(ClientError::RedirectRejected(format!(
                     "https→http scheme downgrade on redirect to {next}"
                 )));
             }
-            // Caller-supplied per-hop validator, present only in the
-            // `follow_redirects` override. It runs in ADDITION to the built-in
-            // resolve/validate/pin already applied at the top of the loop.
+            // The caller's validator runs in addition to the built-in resolve/validate/pin.
             if let RedirectMode::Follow { validator, .. } = &self.redirect_mode
                 && !validator(&next)
             {
@@ -3303,9 +3189,8 @@ impl RequestBuilder {
             // RFC 7231/7538 method+body rewriting before the next hop.
             rewrite_after_redirect(resp.status(), &mut method, &mut body, &mut headers);
             current = next;
-            // The next loop iteration re-resolves + re-validates `current`
-            // before connecting, so a redirect to a blocked address is rejected
-            // there with `SsrfBlocked`.
+            // The next iteration re-resolves and re-validates `current`, so a redirect to a
+            // blocked address fails there with `SsrfBlocked`.
         }
         unreachable!("redirect loop is bounded by the SSRF-safe redirect plan")
     }
@@ -3900,11 +3785,9 @@ fn build_oneshot_client(
     if let Some((host, addrs)) = resolve
         && !addrs.is_empty()
     {
-        // Pin to the FULL validated set: reqwest tries the addresses in order and
-        // falls back on connection failure, so an unreachable first address no
-        // longer dooms the request. Every pinned address was already validated,
-        // so the TOCTOU/SSRF guarantee is preserved. A pinned request must never
-        // route through a re-resolving proxy.
+        // Pin the full validated set: reqwest falls back across it in order, and every address
+        // was validated, so the SSRF guarantee holds. A pinned request never goes through a
+        // re-resolving proxy.
         builder = builder.no_proxy().resolve_to_addrs(&host, &addrs);
     }
     builder.build().map_err(ClientError::Request)
@@ -4107,10 +3990,8 @@ async fn send_one(
     }
     let mut last_transient_err: Option<reqwest::Error> = None;
 
-    // A prior attempt's own connect/timeout error may be why the deadline is
-    // already gone — surface that error (preserving
-    // `ClientError::Request(e).is_timeout()` for callers) instead of masking
-    // it as an unrelated `InvalidUrl`.
+    // A prior attempt's connect/timeout error may be why the deadline is gone. Surface it, so
+    // callers keep `is_timeout()`, rather than an unrelated `InvalidUrl`.
     let deadline_exceeded_err = |last_transient_err: &mut Option<reqwest::Error>| {
         last_transient_err.take().map_or_else(
             || ssrf_safe_deadline_error(url),
@@ -4163,11 +4044,8 @@ async fn send_one(
         };
         gate.check()?;
         let mut req = client.request(method.clone(), url);
-        // Recomputed fresh every attempt (not just retries) rather than
-        // relying solely on `client`'s own timeout, which was fixed when the
-        // caller built it at hop-start: without this override, a retry deep
-        // into a hop's budget would still get the full original per-attempt
-        // timeout rather than what's actually left before `deadline`.
+        // Recomputed every attempt: `client`'s own timeout was fixed at hop start, and a retry
+        // late in the hop must get only what is left before `deadline`.
         let attempt_start = crate::time::ambient_instant();
         let hop_timeout = deadline.map(|d| d.saturating_duration_since(attempt_start));
         // On a chain the client follows itself, the first attempt of a later
@@ -4347,11 +4225,8 @@ fn redirect_location(
     headers: &HeaderMap,
     base: &str,
 ) -> Result<Option<String>, ClientError> {
-    // Only the statuses reqwest itself follows are treated as redirects. A
-    // response like `304 Not Modified` (or 300/305/306) can legitimately carry
-    // a `Location` header without being a followable redirect, so matching the
-    // entire 300–399 range via `is_redirection()` would wrongly issue an extra
-    // request instead of returning the response to the caller.
+    // Only the statuses reqwest itself follows. A 304 (or 300/305/306) can carry `Location`
+    // without being a followable redirect, so `is_redirection()` would be wrong here.
     match status {
         reqwest::StatusCode::MOVED_PERMANENTLY
         | reqwest::StatusCode::FOUND
@@ -4491,10 +4366,7 @@ fn validate_resolved_addrs(addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, Cl
 /// address no longer dooms the request.
 async fn resolve_and_validate(url: &str) -> Result<Vec<SocketAddr>, ClientError> {
     let parsed = url::Url::parse(url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
-    // Explicit scheme allowlist (defence-in-depth): only http/https may be
-    // resolved and connected on the safe path. Reject ftp://, gopher://,
-    // file://, etc. here — before any DNS lookup or connection — rather than
-    // relying on reqwest to reject them after the fact.
+    // Reject other schemes before any DNS lookup, rather than rely on reqwest to.
     let scheme = parsed.scheme();
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return Err(ClientError::InvalidUrl(format!(
@@ -4521,8 +4393,7 @@ async fn resolve_and_validate(url: &str) -> Result<Vec<SocketAddr>, ClientError>
                     "DNS lookup for {name} returned no addresses"
                 )));
             }
-            // Reject if ANY resolved address is blocked (fail closed); otherwise
-            // return the whole validated set (order preserved from the lookup).
+            // Fails closed if any resolved address is blocked; keeps the lookup order.
             validate_resolved_addrs(addrs)
         }
     }
@@ -4530,7 +4401,6 @@ async fn resolve_and_validate(url: &str) -> Result<Vec<SocketAddr>, ClientError>
 
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get("retry-after")?.to_str().ok()?;
-    // Integer seconds (most common form).
     if let Ok(secs) = value.parse::<u64>() {
         return Some(Duration::from_secs(secs));
     }
@@ -4560,7 +4430,6 @@ fn log_request(
     let host = url.host_str().unwrap_or("unknown");
     let path = url.path();
 
-    // Collect non-sensitive header names for the span (values are omitted).
     let sent_headers: Vec<&str> = headers
         .keys()
         .map(HeaderName::as_str)
@@ -5008,7 +4877,6 @@ mod tests {
     }
     use crate::config::HttpClientConfig;
 
-    // RED-PHASE TEST 1: Client can be constructed with defaults.
     #[test]
     fn client_constructs_with_defaults() {
         let client = Client::new();
@@ -5017,7 +4885,6 @@ mod tests {
         assert_eq!(client.retry_policy.max_retries, 3);
     }
 
-    // RED-PHASE TEST 2: Fluent RequestBuilder API compiles.
     #[test]
     fn request_builder_fluent_api_compiles() {
         let client = Client::new();
@@ -5028,7 +4895,6 @@ mod tests {
             .retries(2);
     }
 
-    // RED-PHASE TEST 3: Response accessors work.
     #[test]
     fn response_accessors_work() {
         let payload = serde_json::json!({"id": 42, "name": "Alice"});
@@ -5043,7 +4909,6 @@ mod tests {
         assert!(resp.is_success());
     }
 
-    // RED-PHASE TEST 4: Response::json() deserialises correctly.
     #[test]
     fn response_json_deserialises() {
         #[derive(serde::Deserialize, PartialEq, Debug)]
@@ -5063,7 +4928,6 @@ mod tests {
         assert_eq!(user.name, "Bob");
     }
 
-    // RED-PHASE TEST 5: Response::text() returns UTF-8 string.
     #[test]
     fn response_text_returns_string() {
         let resp = Response {
@@ -5075,7 +4939,6 @@ mod tests {
         assert_eq!(resp.text(), "hello world");
     }
 
-    // RED-PHASE TEST 6: Response::bytes() returns raw bytes.
     #[test]
     fn response_bytes_returns_raw() {
         let resp = Response {
@@ -5087,7 +4950,6 @@ mod tests {
         assert_eq!(resp.bytes(), Bytes::from_static(b"\x00\x01\x02"));
     }
 
-    // RED-PHASE TEST 7: HttpClientConfig deserialises from [http.client] TOML.
     #[test]
     fn config_deserialises_from_toml() {
         // Simulate the [http.client] section as it appears in autumn.toml.
@@ -5113,7 +4975,6 @@ mod tests {
         );
     }
 
-    // RED-PHASE TEST 8: HttpClientConfig has correct defaults.
     #[test]
     fn config_has_correct_defaults() {
         let config = HttpClientConfig::default();
@@ -5122,7 +4983,6 @@ mod tests {
         assert!(config.base_urls.is_empty());
     }
 
-    // RED-PHASE TEST 9: is_idempotent_method returns correct values.
     #[test]
     fn idempotent_method_classification() {
         assert!(is_idempotent_method(&Method::GET));
@@ -5135,7 +4995,6 @@ mod tests {
         assert!(!is_idempotent_method(&Method::PATCH));
     }
 
-    // RED-PHASE TEST 10: is_retryable_status returns correct values.
     #[test]
     fn retryable_status_classification() {
         assert!(is_retryable_status(502));
@@ -5148,7 +5007,6 @@ mod tests {
         assert!(!is_retryable_status(429));
     }
 
-    // RED-PHASE TEST 11: parse_retry_after parses seconds correctly.
     #[test]
     fn retry_after_header_parsing() {
         let mut headers = HeaderMap::new();
@@ -5162,7 +5020,6 @@ mod tests {
         assert_eq!(parse_retry_after(&empty), None);
     }
 
-    // RED-PHASE TEST 12: Sensitive header detection.
     #[test]
     fn sensitive_header_detection() {
         assert!(is_sensitive_header("authorization"));
@@ -5174,7 +5031,6 @@ mod tests {
         assert!(!is_sensitive_header("x-api-key"));
     }
 
-    // RED-PHASE TEST 13: MockRegistry captures and matches calls.
     #[tokio::test]
     async fn mock_registry_captures_calls() {
         let registry = Arc::new(MockRegistry::new());
@@ -5204,7 +5060,6 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
-    // RED-PHASE TEST 14: MockHandle::expect_called passes when count matches.
     #[tokio::test]
     async fn mock_handle_expect_called_passes() {
         let registry = Arc::new(MockRegistry::new());
@@ -5237,7 +5092,6 @@ mod tests {
         assert_eq!(handle.call_count(), 1);
     }
 
-    // RED-PHASE TEST 15: MockRegistry matches by URL path suffix.
     #[tokio::test]
     async fn mock_matches_by_path_suffix() {
         let registry = Arc::new(MockRegistry::new());
@@ -5263,7 +5117,6 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
-    // RED-PHASE TEST 16: NoMock error when mock registry has no match.
     #[tokio::test]
     async fn no_mock_error_when_unmatched() {
         let registry = Arc::new(MockRegistry::new());
@@ -5272,7 +5125,6 @@ mod tests {
         assert!(matches!(result, Err(ClientError::NoMock(_, _))));
     }
 
-    // RED-PHASE TEST 17: MockSetupBuilder registers and returns MockHandle.
     #[tokio::test]
     async fn mock_setup_builder_registers_entry() {
         let registry = Arc::new(MockRegistry::new());
@@ -5297,7 +5149,6 @@ mod tests {
         handle.expect_called(1);
     }
 
-    // RED-PHASE TEST 18: Client::from_config respects timeout and retries.
     #[test]
     fn client_from_config() {
         let config = HttpClientConfig {
@@ -5312,7 +5163,6 @@ mod tests {
         assert_eq!(client.retry_policy.max_retries, 1);
     }
 
-    // RED-PHASE TEST 19: Client.named() preserves mock registry.
     #[test]
     fn named_client_preserves_mock_registry() {
         let registry = Arc::new(MockRegistry::new());
@@ -5322,7 +5172,6 @@ mod tests {
         assert_eq!(named.alias.as_deref(), Some("stripe"));
     }
 
-    // RED-PHASE TEST 20: base_url is prepended to relative paths.
     #[test]
     fn base_url_prepended_to_relative_path() {
         let client = Client::new();
@@ -5331,7 +5180,6 @@ mod tests {
         assert_eq!(builder.url, "https://api.stripe.com/v1/charges");
     }
 
-    // RED-PHASE TEST 21: Absolute URLs bypass base_url.
     #[test]
     fn absolute_url_bypasses_base_url() {
         let client = Client::new().with_base_url("https://ignored.example.com");
@@ -5339,7 +5187,6 @@ mod tests {
         assert_eq!(builder.url, "https://actual.example.com/path");
     }
 
-    // RED-PHASE TEST 22: RetryPolicy can be overridden per-request.
     #[test]
     fn retry_override_per_request() {
         let client = Client::new(); // default: 3 retries
@@ -5350,7 +5197,6 @@ mod tests {
         assert_eq!(no_retry.retry_policy.max_retries, 0);
     }
 
-    // RED-PHASE TEST 23: Client extracts from AppState.
     #[tokio::test]
     async fn client_extracts_from_state() {
         use axum::extract::FromRequestParts;
@@ -5361,12 +5207,10 @@ mod tests {
         let client = Client::from_request_parts(&mut parts, &state)
             .await
             .unwrap();
-        // Default client: no mock, no alias
         assert!(client.mock.is_none());
         assert!(client.alias.is_none());
     }
 
-    // RED-PHASE TEST 24: MockRegistryExt round-trips through AppState extensions.
     #[test]
     fn mock_registry_ext_round_trips_through_state() {
         let registry = Arc::new(MockRegistry::new());
@@ -5377,7 +5221,6 @@ mod tests {
         assert!(retrieved.is_some());
     }
 
-    // TEST 25: named() resolves base URL from base_urls map in config.
     #[test]
     fn named_client_resolves_base_url_from_config() {
         let mut base_urls = std::collections::HashMap::new();
@@ -5400,25 +5243,11 @@ mod tests {
         assert!(other.base_url.is_none());
     }
 
-    // PR #2480 review, round 4 (redesign): `breaker_scoped()` moved breaker accounting for
-    // the custom send path from an external wrapper — `BreakerGuardedCall`, now removed —
-    // to a flag `send_recorded` itself reads. That is what makes the mock bypass, the
-    // capsule-replay bypass, and correct capsule recording of an open-breaker attempt all
-    // free: they were already correctly ordered around `send_recorded` before this flag
-    // existed, for every other caller.
-    //
-    // This test locks in the one thing the external wrapper got wrong (P1, round 1):
-    // keying the breaker by the alias a caller passed to `post`/`get` rather than the
-    // expanded destination. `self.url` is set once, by `Client::build_request`, before any
-    // `breaker_scoped()` or `ssrf_safe()` flag is read, so there is no separate "pass the
-    // right URL" step left to get wrong.
+    // The breaker is keyed by the expanded destination, not the alias passed to `post`/`get`.
     #[test]
     fn breaker_scoped_keys_by_resolved_url_not_alias() {
-        // breaker_for_url really does get_or_create against the shared global
-        // registry, so this needs the same isolation as every other test that
-        // touches it directly — otherwise a concurrently-running test's "no
-        // breaker entry for this host" assertion can observe the entry this
-        // test creates (and never cleans up otherwise).
+        // `breaker_for_url` creates an entry in the global registry, and other tests assert
+        // that a host has none.
         let _lock = crate::circuit_breaker::TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5446,8 +5275,7 @@ mod tests {
         assert_eq!(req.url, "http://mock-receiver/base/hook-service");
         assert!(req.breaker_scoped);
 
-        // The bare alias would neither parse as a URL nor name the real
-        // destination host — exactly the bug the P1 finding caught.
+        // The bare alias would neither parse as a URL nor name the real host.
         assert!(url::Url::parse("hook-service").is_err());
         let breaker = super::breaker_for_url(None, &req.url);
         assert_eq!(breaker.name(), "mock-receiver");
@@ -5455,17 +5283,8 @@ mod tests {
         crate::circuit_breaker::global_registry().clear();
     }
 
-    // PR #2480 review, round 4: `breaker_scoped()` on the custom send path
-    // must trip and fail fast exactly like the plain-path breaker already
-    // does (`test_http_client_circuit_breaker_integration`), and must key on
-    // the same host a non-custom-path request to the same URL would.
-    //
-    // No listener needed: `send_ssrf_safe` refuses a loopback destination
-    // (`SsrfBlocked`) before ever dialing, and that refusal is exactly the
-    // kind of failure the breaker must count — a subscriber pointing
-    // `target_url` at a blocked destination repeatedly must trip the breaker
-    // on those refusals just as it would on real 5xxs, not bypass accounting
-    // entirely.
+    // No listener needed: `send_ssrf_safe` refuses loopback before dialing, and the breaker
+    // must count that refusal as it would a 5xx.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn breaker_scoped_custom_path_trips_and_fails_fast() {
@@ -5493,10 +5312,7 @@ mod tests {
             );
         }
 
-        // The breaker for 127.0.0.1 should now be OPEN — the next attempt
-        // must fail fast with CircuitBreakerOpen rather than SsrfBlocked,
-        // proving it never re-entered send_custom (no re-resolution, no
-        // reqwest client built).
+        // `CircuitBreakerOpen` rather than `SsrfBlocked` proves `send_custom` never ran.
         let res = client.post(url).ssrf_safe().breaker_scoped().send().await;
         assert!(matches!(res, Err(ClientError::CircuitBreakerOpen)));
 
@@ -5559,12 +5375,7 @@ mod tests {
         crate::circuit_breaker::global_registry().clear();
     }
 
-    // PR #2480 review, round 4: a client with a mock registry attached must
-    // never touch the real breaker even with `breaker_scoped()` set —
-    // `send_recorded` checks `self.mock.is_some()` before it ever reads
-    // `breaker_scoped`, so a deliberately-mocked failure in one test cannot
-    // open the shared global breaker for a host name reused by an unrelated
-    // later test.
+    // A mocked failure must not open the global breaker for a host another test reuses.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn breaker_scoped_bypassed_for_mocked_client() {
@@ -5584,9 +5395,7 @@ mod tests {
         .respond_with(500, serde_json::json!({ "error": "down" }));
         let client = Client::new().with_mock(registry);
 
-        // More attempts than minimum_sample_count would need to trip a real
-        // breaker at default thresholds — every one must still reach the
-        // mock rather than short-circuiting on CircuitBreakerOpen.
+        // Enough failures to trip a real breaker at default thresholds.
         for _ in 0..12 {
             let res = client
                 .named("http://mock-receiver/hook")
@@ -5600,7 +5409,6 @@ mod tests {
         }
         mock.expect_called(12);
 
-        // No breaker entry should exist for the mocked host at all.
         assert!(
             crate::circuit_breaker::global_registry()
                 .all_breakers()
@@ -5612,7 +5420,7 @@ mod tests {
         crate::circuit_breaker::global_registry().clear();
     }
 
-    // TEST 26: from_request_parts uses AutumnConfig.http when no HttpConfig extension.
+    // With no `HttpConfig` extension, `AutumnConfig.http` is used.
     #[tokio::test]
     async fn client_extracts_from_autumn_config_in_state() {
         use axum::extract::FromRequestParts;
@@ -5630,7 +5438,7 @@ mod tests {
         assert_eq!(client.retry_policy.max_retries, 7);
     }
 
-    // TEST 27: respond_with_status produces a truly empty body (not JSON null).
+    // An empty body, not JSON `null`.
     #[tokio::test]
     async fn respond_with_status_produces_empty_body() {
         let registry = Arc::new(MockRegistry::new());
@@ -5657,7 +5465,6 @@ mod tests {
         );
     }
 
-    // TEST 28: parse_retry_after handles HTTP-date format.
     #[test]
     fn retry_after_http_date_parsing() {
         let mut headers = HeaderMap::new();
@@ -5674,7 +5481,6 @@ mod tests {
         );
     }
 
-    // TEST 29: non-idempotent POST with retries disabled makes only one attempt.
     #[tokio::test]
     async fn non_idempotent_post_no_retry() {
         let registry = Arc::new(MockRegistry::new());
@@ -5688,7 +5494,7 @@ mod tests {
             call_count: call_count.clone(),
         });
 
-        // With retry_idempotent_only=true (default), POST should NOT retry.
+        // POST is not retried by default.
         let client = Client::new().with_mock(registry);
         let resp = client
             .post("https://example.com/endpoint")
@@ -5697,11 +5503,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status().as_u16(), 503);
-        // Mock was called exactly once — no retry for non-idempotent method.
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
-    // TEST 30: find_match strips query string from relative URLs before comparing.
     #[tokio::test]
     async fn mock_strips_query_from_url_before_matching() {
         let registry = Arc::new(MockRegistry::new());
@@ -5727,12 +5531,10 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
-    // TEST 31: suffix match works when mock path starts with '/' and URL has a prefix.
     #[tokio::test]
     async fn mock_suffix_match_with_leading_slash_path() {
         let registry = Arc::new(MockRegistry::new());
         let call_count = Arc::new(AtomicUsize::new(0));
-        // Register only the leaf segment (with leading slash).
         registry.register(MockEntry {
             method: Some(Method::POST),
             path: "/charges".to_owned(),
@@ -5754,8 +5556,7 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
-    // TEST 32 (issue #3054): retries() sets only the count. POST retries need
-    // retry_non_idempotent().
+    // `retries()` sets only the count; POST retries need `retry_non_idempotent()` (#3054).
     #[test]
     fn retries_does_not_clear_idempotent_only_flag() {
         let client = Client::new();
@@ -5843,7 +5644,6 @@ mod tests {
         assert_eq!(retry_hint(503, &empty), None);
     }
 
-    // TEST 33: log_request covers the sensitive-header redaction path.
     #[test]
     fn log_request_completes_with_sensitive_headers() {
         let url = reqwest::Url::parse("https://api.example.com/v1/resource?q=1").unwrap();
@@ -5856,7 +5656,7 @@ mod tests {
             HeaderName::from_static("authorization"),
             HeaderValue::from_static("Bearer sk_test_xxx"),
         );
-        // Should complete without panicking; authorization is redacted from span.
+        // Only checks that redacting `authorization` completes without panicking.
         log_request("POST", &url, 201, Duration::from_millis(12), &headers);
     }
 
@@ -6030,7 +5830,6 @@ mod tests {
         });
     }
 
-    // TEST 34: the request id is added only inside a request.
     #[test]
     fn no_request_id_outside_a_request() {
         let mut headers = HeaderMap::new();
@@ -6140,8 +5939,6 @@ mod tests {
         crate::circuit_breaker::global_registry().clear();
     }
 
-    // TEST 35: Real GET request exercises inject_trace_context, log_request, and
-    // the success branch of the retry loop.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn real_get_request_covers_network_path() {
@@ -6573,7 +6370,6 @@ mod tests {
         crate::circuit_breaker::global_registry().clear();
     }
 
-    // TEST 36: Real POST with JSON body covers the body-sending code path.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn real_post_with_json_body_covers_body_path() {
@@ -6608,7 +6404,6 @@ mod tests {
         crate::circuit_breaker::global_registry().clear();
     }
 
-    // TEST 37: GET with one 503 then 200 covers the retry-sleep and 5xx-retry paths.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn real_get_retries_on_503_then_succeeds() {
@@ -6729,7 +6524,6 @@ mod tests {
         assert_eq!(RetryPolicy::default().max_backoff, Duration::from_secs(20));
     }
 
-    // TEST 38: text_body sets a plain-text body.
     #[test]
     fn text_body_sets_body() {
         let client = Client::new();
@@ -6737,7 +6531,6 @@ mod tests {
         assert_eq!(builder.body, Some(bytes::Bytes::from_static(b"hello")));
     }
 
-    // TEST 39: ClientError::NoMock displays correctly.
     #[test]
     fn client_error_display() {
         let err = ClientError::NoMock("GET".to_owned(), "/path".to_owned());
@@ -6772,7 +6565,6 @@ mod tests {
         );
     }
 
-    // TEST 40: Outbound circuit breaker integration trips and fails fast.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_http_client_circuit_breaker_integration() {
@@ -6800,14 +6592,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // Build a resilience config with custom thresholds
         let mut rc = crate::config::ResilienceConfig::default();
         rc.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
         rc.circuit_breaker.defaults.minimum_sample_count = Some(3);
         rc.circuit_breaker.defaults.open_duration_secs = Some(10);
 
         let client = Client::new();
-        // Attach the resilience config
         let client = Client {
             resilience_config: Some(Arc::new(rc)),
             ..client
@@ -6815,23 +6605,19 @@ mod tests {
 
         let url = format!("http://127.0.0.1:{}/flaky", addr.port());
 
-        // Send 3 requests (all fail with 500)
         for _ in 0..3 {
             let res = client.get(&url).send().await;
             let res = res.unwrap();
             assert_eq!(res.status().as_u16(), 500);
         }
 
-        // Now the breaker for 127.0.0.1 should be OPEN, and next request should fail fast
         let res = client.get(&url).send().await;
         assert!(matches!(res, Err(ClientError::CircuitBreakerOpen)));
 
-        // Assert that the server was only hit 3 times
         assert_eq!(hit.load(SeqOrdering::SeqCst), 3);
         crate::circuit_breaker::global_registry().clear();
     }
 
-    // RED-PHASE TEST 41: SharedReqwestClient round-trips through AppState extensions.
     #[test]
     fn shared_reqwest_client_ext_round_trips() {
         let ext = SharedReqwestClient {
@@ -6844,18 +6630,14 @@ mod tests {
         assert!(retrieved.is_some());
     }
 
-    // RED-PHASE TEST 42: Client::head() compiles and builds a HEAD RequestBuilder.
     #[test]
     fn client_head_method_builds_request_builder() {
         let client = Client::new();
         let _builder = client.head("https://example.com/resource");
     }
 
-    // RED-PHASE TEST 43: from_state reuses the SharedReqwestClient when registered.
-    // Spins up a local echo server that returns the User-Agent header as the body,
-    // then asserts the extracted Client carries the distinctive user-agent we set
-    // on the shared inner client — proving from_state cloned it rather than
-    // building a fresh default.
+    // The server echoes the User-Agent, so the shared client's distinctive agent proves
+    // `from_state` reused it rather than building a fresh default.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn from_state_reuses_shared_client() {
@@ -6904,9 +6686,8 @@ mod tests {
     #[cfg(feature = "http-client")]
     #[test]
     fn from_state_falls_back_when_timeout_mismatches_shared_client() {
-        // SharedReqwestClient was built with 5s; config says 10s → mismatch
-        // → from_state must not reuse the shared inner (falls through to
-        //   from_config which builds a fresh reqwest::Client).
+        // The shared client's timeout differs from the config's, so `from_state` builds a
+        // fresh one.
         use crate::config::{AutumnConfig, HttpClientConfig};
         use std::sync::Arc;
 
@@ -6923,18 +6704,15 @@ mod tests {
         });
         state.insert_extension(Arc::new(config));
 
-        // Should not panic — falls back to building a fresh client.
         let _client = Client::from_state(&state);
     }
 
     #[cfg(feature = "http-client")]
     #[test]
     fn from_state_reuses_shared_client_when_no_config() {
-        // No HttpConfig/AutumnConfig in state, but SharedReqwestClient is
-        // present → hits the (None, Some(inner)) arm → with_inner.
+        // No config in state, only a shared client: the `(None, Some(inner))` arm.
         let state = crate::AppState::for_test();
-        // Default timeout_secs from HttpClientConfig matches the default used
-        // in effective_timeout_secs, so the shared client is reused.
+        // The default timeout matches, so the shared client is reused.
         let default_timeout = crate::config::HttpClientConfig::default().timeout_secs;
         state.insert_extension(SharedReqwestClient {
             client: reqwest::Client::new(),
@@ -6948,7 +6726,6 @@ mod tests {
 
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    // TEST 44: SSRF address policy — blocked ranges.
     #[test]
     fn ssrf_policy_blocks_private_and_reserved_ipv4() {
         let blocked = [
@@ -6976,7 +6753,6 @@ mod tests {
         }
     }
 
-    // TEST 45: SSRF address policy — public IPv4 is allowed.
     #[test]
     fn ssrf_policy_allows_public_ipv4() {
         for s in ["1.1.1.1", "8.8.8.8", "93.184.216.34"] {
@@ -6986,7 +6762,6 @@ mod tests {
         }
     }
 
-    // TEST 46: SSRF address policy — IPv6 blocked ranges, mapped/compatible forms.
     #[test]
     fn ssrf_policy_ipv6_and_mapped_forms() {
         let blocked = [
@@ -7031,8 +6806,7 @@ mod tests {
             "2606:4700:4700::1111 should be public"
         );
 
-        // Negative tests: real public addresses adjacent to the newly-blocked
-        // special-purpose prefixes must stay allowed (no over-blocking).
+        // Public addresses next to the blocked special-purpose prefixes stay allowed.
         let public_addrs = [
             "2001:4860:4860::8888", // Google DNS
             "2606:4700:4700::1111", // Cloudflare DNS
@@ -7051,9 +6825,7 @@ mod tests {
         }
     }
 
-    // TEST 46b: SSRF policy blocks private / metadata IPv4 tunnelled inside an
-    // IPv6 literal via NAT64 (64:ff9b::/96) and 6to4 (2002::/16), while leaving
-    // a genuinely-public embedded IPv4 (and native public v6) public.
+    // A public IPv4 tunnelled inside IPv6 stays public; a private one is blocked.
     #[test]
     fn ssrf_policy_blocks_tunnelled_ipv4() {
         let blocked = [
@@ -7066,9 +6838,7 @@ mod tests {
             "2002:a9fe:a9fe::",     // 6to4  → 169.254.169.254
             "2002:7f00:1::",        // 6to4  → 127.0.0.1
             "2002:0a00:0001::",     // 6to4  → 10.0.0.1
-            // SIIT IPv4-translated `::ffff:0:0:0/96` (RFC 6052): segment[4] ==
-            // 0xffff, segment[5] == 0, IPv4 in the last 32 bits. Distinct from
-            // IPv4-mapped `::ffff:0:0/96`, so must be decoded and re-checked.
+            // SIIT IPv4-translated `::ffff:0:0:0/96` (RFC 6052), distinct from IPv4-mapped.
             "::ffff:0:169.254.169.254", // SIIT → 169.254.169.254 (cloud metadata)
             "::ffff:0:127.0.0.1",       // SIIT → 127.0.0.1 (loopback)
         ];
@@ -7082,12 +6852,8 @@ mod tests {
         let anycast: IpAddr = "192.88.99.1".parse().unwrap();
         assert!(is_blocked_ip(anycast), "192.88.99.1 should be blocked");
 
-        // A 6to4 address embedding a genuinely-public IPv4 (8.8.8.8) stays
-        // public (the embedded v4 is public, so it falls through to the native
-        // v6 checks, which do not match 2002::/16). So does a native public v6.
-        // A SIIT IPv4-translated address embedding a genuinely-public IPv4
-        // (8.8.8.8) stays public — the decoded v4 is public, so it falls
-        // through to the native v6 checks, which do not match it.
+        // 6to4 and SIIT addresses embedding the public 8.8.8.8 fall through to the native v6
+        // checks and stay public, as does a native public v6.
         for s in ["2002:0808:0808::", "2606:4700::1111", "::ffff:0:8.8.8.8"] {
             let ip: IpAddr = s.parse().unwrap();
             assert!(is_public_ip(ip), "{s} should be public");
@@ -7095,8 +6861,8 @@ mod tests {
         }
     }
 
-    // TEST 47: the `url` crate normalises decimal/hex IP-literal hosts to Ipv4,
-    // so `http://2130706433/` (== 127.0.0.1) is recognised as a blocked IP.
+    // The `url` crate normalises decimal/hex IP-literal hosts, so `http://2130706433/`
+    // (127.0.0.1) is a blocked IP.
     #[test]
     fn ssrf_policy_decimal_encoded_host_is_blocked() {
         for raw in [
@@ -7122,7 +6888,7 @@ mod tests {
         }
     }
 
-    // Small axum helper: spawn `app` on an ephemeral 127.0.0.1 port, return it.
+    // Serves `app` on an ephemeral 127.0.0.1 port.
     async fn spawn(app: axum::Router) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -7146,9 +6912,8 @@ mod tests {
             .unwrap()
     }
 
-    // Build a response with an arbitrary status that carries a `Location`
-    // header — used to prove non-followable 3xx statuses (304/300/…) are NOT
-    // treated as redirects even when they advertise a `Location`.
+    // For proving that non-followable statuses (304, 300, …) with a `Location` are not
+    // redirects.
     fn response_with_location(status: u16, location: String) -> axum::response::Response {
         axum::response::Response::builder()
             .status(status)
@@ -7157,7 +6922,6 @@ mod tests {
             .unwrap()
     }
 
-    // TEST 48: no_redirect returns the 3xx verbatim without following it.
     #[tokio::test]
     async fn no_redirect_returns_3xx_unfollowed() {
         use axum::{Router, routing::get};
@@ -7181,19 +6945,9 @@ mod tests {
         );
     }
 
-    // TEST 48b: the non-ssrf `no_redirect()` path returns the 3xx verbatim even
-    // when `Location` is a MALFORMED URL. That path uses reqwest's
-    // `Policy::none()` and never parses `Location`, so a bad target cannot turn
-    // a `no_redirect()` fetch into an error. This guards the same "don't parse
-    // Location when not following" contract that `send_ssrf_safe` now enforces
-    // by returning the 3xx BEFORE calling `redirect_target`.
-    //
-    // NOTE: the SSRF-safe equivalent — `get_ssrf_safe(url).no_redirect()`
-    // against a listener returning a malformed `Location` — cannot be exercised
-    // end-to-end in-sandbox: the SSRF guard denies loopback (127.0.0.1), so the
-    // request is rejected during resolve→validate before any response is
-    // received. This testable-layer variant documents/guards the shared
-    // contract instead.
+    // `no_redirect()` never parses `Location`, so a malformed one cannot turn the 3xx into an
+    // error. The SSRF-safe path keeps the same contract but cannot be tested here: it refuses
+    // loopback before any response arrives.
     #[tokio::test]
     async fn no_redirect_returns_3xx_with_malformed_location() {
         use axum::{Router, routing::get};
@@ -7219,7 +6973,6 @@ mod tests {
         );
     }
 
-    // TEST 49: follow_redirects follows a valid chain A→B and calls the validator.
     #[tokio::test]
     async fn follow_redirects_valid_chain_calls_validator() {
         use axum::{Router, routing::get};
@@ -7253,9 +7006,8 @@ mod tests {
         );
     }
 
-    // TEST 50: follow_redirects rejects a redirect to a private/blocked target,
-    // and NEVER connects to that private address. Uses the SSRF IP policy as the
-    // validator — structurally the same guard get_ssrf_safe applies per hop.
+    // A redirect to a blocked target is rejected without connecting to it. The validator is
+    // the SSRF IP policy, the guard `get_ssrf_safe` applies per hop.
     #[tokio::test]
     async fn follow_redirects_rejects_private_target() {
         use axum::{Router, routing::get};
@@ -7313,7 +7065,6 @@ mod tests {
         );
     }
 
-    // TEST 51: follow_redirects with a chain longer than `max` → TooManyRedirects.
     #[tokio::test]
     async fn follow_redirects_cap_exceeded() {
         use axum::{Router, routing::get};
@@ -7335,7 +7086,6 @@ mod tests {
         );
     }
 
-    // TEST 52: follow_redirects(0, ..) turns the first 3xx into TooManyRedirects.
     #[tokio::test]
     async fn follow_redirects_zero_max_errors_on_first_3xx() {
         use axum::{Router, routing::get};
@@ -7354,13 +7104,8 @@ mod tests {
         assert!(matches!(result, Err(ClientError::TooManyRedirects(0))));
     }
 
-    // TEST 53: pin_to bypasses DNS and connects to the URL's port.
-    //
-    // The host `pinned.invalid` is guaranteed non-resolvable (.invalid TLD), yet
-    // pinning to 127.0.0.1 reaches the listener — proving DNS was bypassed. The
-    // pinned SocketAddr uses port 1 (which nothing listens on) while the URL uses
-    // the real listener port; reaching the listener proves reqwest IGNORES the
-    // resolve SocketAddr's port and connects to the URL's port instead.
+    // `pinned.invalid` never resolves, so reaching the listener proves DNS was bypassed. The
+    // pin names port 1, so reaching the listener also proves reqwest uses the URL's port.
     #[tokio::test]
     async fn pin_to_bypasses_dns_and_uses_url_port() {
         use axum::{Router, routing::get};
@@ -7415,9 +7160,7 @@ mod tests {
         );
     }
 
-    // TEST 54: get_ssrf_safe rejects a host that resolves to a blocked IP BEFORE
-    // connecting. `localhost` resolves to 127.0.0.1 (and/or ::1), both blocked.
-    // The listener's handler must never fire.
+    // `localhost` resolves to 127.0.0.1 and/or ::1, both blocked.
     #[tokio::test]
     async fn get_ssrf_safe_rejects_loopback_host_before_connecting() {
         use axum::{Router, routing::get};
@@ -7452,8 +7195,6 @@ mod tests {
         );
     }
 
-    // TEST 55: get_ssrf_safe rejects a decimal-encoded loopback IP literal
-    // (http://2130706433/ == 127.0.0.1) with no DNS lookup.
     #[tokio::test]
     async fn get_ssrf_safe_rejects_decimal_encoded_loopback() {
         let result = Client::new()
@@ -7466,16 +7207,10 @@ mod tests {
         );
     }
 
-    // TEST 56: resolve_and_validate — the resolve→validate core of get_ssrf_safe.
-    // A public IP literal validates (returning the URL's port); blocked literals
-    // and decimal-encoded loopback are rejected with SsrfBlocked. Exercising the
-    // actual network connect of the safe path against a public host is NOT
-    // reproducible in-sandbox (no reachable public server); it is covered
-    // structurally by the pin_to and follow_redirects tests. See the report.
+    // The connect to a real public host cannot run in tests; the `pin_to` and
+    // `follow_redirects` tests cover that half.
     #[tokio::test]
     async fn resolve_and_validate_accepts_public_rejects_blocked() {
-        // Public literal with an explicit port → Ok, single-element validated
-        // set, port preserved.
         let ok = resolve_and_validate("http://8.8.8.8:8080/path")
             .await
             .unwrap();
@@ -7489,7 +7224,6 @@ mod tests {
         assert_eq!(ok_https.len(), 1);
         assert_eq!(ok_https[0].port(), 443);
 
-        // Blocked literals and decimal-encoded loopback → SsrfBlocked.
         for raw in [
             "http://127.0.0.1/",
             "http://169.254.169.254/latest/meta-data/",
@@ -7504,21 +7238,14 @@ mod tests {
         }
     }
 
-    // TEST 56b: validate_resolved_addrs — the pure validation core shared by the
-    // resolve→validate step. A set of public addrs returns ALL of them in order;
-    // a set mixing a public and a blocked addr is rejected with SsrfBlocked; an
-    // all-public IPv6+IPv4 mix returns everything in order. This exercises the
-    // multi-record path (pin to ALL validated addresses) without needing real
-    // multi-record DNS.
+    // Covers the multi-record DNS path without real multi-record DNS.
     #[test]
     fn validate_resolved_addrs_returns_all_public_rejects_any_blocked() {
         let v4 = |a, b, c, d, p| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), p);
 
-        // Two public addrs → Ok with BOTH returned, order preserved.
         let two = vec![v4(1, 1, 1, 1, 443), v4(8, 8, 8, 8, 443)];
         assert_eq!(validate_resolved_addrs(two.clone()).unwrap(), two);
 
-        // Public + blocked (10.0.0.1, RFC1918) → Err(SsrfBlocked).
         let mixed = vec![v4(1, 1, 1, 1, 443), v4(10, 0, 0, 1, 443)];
         assert!(
             matches!(
@@ -7528,8 +7255,6 @@ mod tests {
             "a set containing a blocked address must be rejected"
         );
 
-        // All-public IPv6 (2606:4700:4700::1111, Cloudflare) + IPv4 mix → Ok,
-        // all preserved in order.
         let v6 = SocketAddr::new(
             IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
             443,
@@ -7538,10 +7263,7 @@ mod tests {
         assert_eq!(validate_resolved_addrs(mix.clone()).unwrap(), mix);
     }
 
-    // TEST 57: pin_to alone does NOT auto-follow a cross-host redirect. reqwest
-    // would otherwise re-resolve the new host via normal DNS, silently escaping
-    // the pin. The 302 must be returned verbatim and the onward target must
-    // never be connected to.
+    // Following the redirect would re-resolve the new host via DNS and escape the pin.
     #[tokio::test]
     async fn pin_to_does_not_follow_redirect_unpinned() {
         use axum::{Router, routing::get};
@@ -7573,10 +7295,8 @@ mod tests {
             .await;
         let start_port = start.port();
 
-        // Use a DOMAIN host (`pinned.invalid`) so the pin's resolve override is
-        // actually consulted; pinning an IP-literal host is now rejected by the
-        // PinRequiresDomainHost guard. The non-resolvable domain reaches the
-        // loopback listener only via the pin.
+        // A domain host, since `pin_to` refuses an IP literal. It reaches the listener only via
+        // the pin.
         let resp = Client::new()
             .get(format!("http://pinned.invalid:{start_port}/start"))
             .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), start_port))
@@ -7595,8 +7315,6 @@ mod tests {
         );
     }
 
-    // TEST 58: get_ssrf_safe rejects a non-http(s) scheme up front with
-    // InvalidUrl, before any DNS resolution or connection.
     #[tokio::test]
     async fn get_ssrf_safe_rejects_non_http_scheme() {
         for raw in ["ftp://public.example/resource", "gopher://public.example/"] {
@@ -7608,18 +7326,14 @@ mod tests {
         }
     }
 
-    // TEST 59: a cross-origin redirect (different port ⇒ different origin) must
-    // NOT forward credential-bearing request headers to the new origin. This is
-    // the manual-redirect-loop version of reqwest's built-in strip-on-cross-host
-    // behaviour, closing a credential-leak hole (Fix A).
+    // The manual redirect loop strips credentials across origins, as reqwest's own does.
     #[tokio::test]
     async fn follow_redirects_strips_sensitive_headers_cross_origin() {
         use axum::{Router, routing::get};
 
         let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
         let seen2 = seen.clone();
-        // Listener B records the headers it received (different port = different
-        // origin from A).
+        // B records the headers it received. A different port is a different origin.
         let b_addr = spawn(Router::new().route(
             "/dst",
             get(move |headers: HeaderMap| {
@@ -7794,8 +7508,6 @@ mod tests {
         );
     }
 
-    // TEST 60: a SAME-origin redirect (relative `Location`, same host:port) must
-    // keep credential-bearing headers — stripping only applies across origins.
     #[tokio::test]
     async fn follow_redirects_keeps_sensitive_headers_same_origin() {
         use axum::{Router, routing::get};
@@ -7839,8 +7551,7 @@ mod tests {
         );
     }
 
-    // TEST 61: RFC 7231 §6.4.3 — a 302 in response to a POST rewrites the next
-    // hop to a bodyless GET (Fix B).
+    // RFC 7231 §6.4.3: a 302 to a POST makes the next hop a bodyless GET.
     #[tokio::test]
     async fn follow_redirects_302_post_becomes_get() {
         use axum::{
@@ -7870,10 +7581,7 @@ mod tests {
         ))
         .await;
 
-        // `.json(..)` sets a request body AND `Content-Type: application/json`.
-        // On the 302 POST→GET rewrite the body is dropped, and the payload
-        // headers must be dropped with it (Fix B) — otherwise the followed GET
-        // would carry a misleading `Content-Type` for a body it no longer has.
+        // `.json(..)` also sets `Content-Type`, which must go with the dropped body.
         let resp = Client::new()
             .post(format!("http://127.0.0.1:{}/", a_addr.port()))
             .json(&serde_json::json!({"payload": true}))
@@ -7900,9 +7608,7 @@ mod tests {
         );
     }
 
-    // TEST 62: RFC 7231 §6.4.7 — a 307 preserves BOTH the method and the body
-    // across the redirect (the review bot's drop-body-every-hop snippet was
-    // wrong here) (Fix B).
+    // RFC 7231 §6.4.7: a 307 keeps both the method and the body.
     #[tokio::test]
     async fn follow_redirects_307_preserves_method_and_body() {
         use axum::{
@@ -7953,19 +7659,12 @@ mod tests {
         );
     }
 
-    // TEST 63: get_ssrf_safe derives its redirect follow/cap from the chained
-    // builder mode via ssrf_redirect_plan, so `no_redirect()` /
-    // `follow_redirects(max, ..)` override the SSRF-safe default hop cap.
-    //
-    // NOTE: the network-level follow behaviour of get_ssrf_safe cannot be
-    // exercised in-sandbox — the only reachable address here is loopback, which
-    // the SSRF guard blocks before connecting — so this deterministic unit test
-    // on the factored `ssrf_redirect_plan` helper stands in for it.
+    // Tests the plan rather than the network: the only reachable test server is loopback,
+    // which `get_ssrf_safe` refuses.
     #[test]
     fn ssrf_redirect_plan_honours_chained_override() {
         let client = Client::new();
 
-        // Default get_ssrf_safe → follow up to the SSRF-safe hop cap.
         let default = client.get_ssrf_safe("https://example.com/");
         assert_eq!(
             default.ssrf_redirect_plan(),
@@ -7973,7 +7672,6 @@ mod tests {
             "default SSRF-safe path follows up to SSRF_SAFE_MAX_REDIRECTS"
         );
 
-        // no_redirect() → do NOT follow.
         let none = client.get_ssrf_safe("https://example.com/").no_redirect();
         let (follow, _max) = none.ssrf_redirect_plan();
         assert!(
@@ -7981,7 +7679,6 @@ mod tests {
             "no_redirect() must disable following on the safe path"
         );
 
-        // follow_redirects(3, ..) → follow up to the caller's max.
         let follow3 = client
             .get_ssrf_safe("https://example.com/")
             .follow_redirects(3, |_| true);
@@ -7992,10 +7689,6 @@ mod tests {
         );
     }
 
-    // TEST 64: pin_to + follow_redirects is rejected at send time with
-    // IncompatiblePinRedirect — deterministically, without touching the network.
-    // A single pinned SocketAddr only covers hop 0; later redirect hops re-resolve
-    // via normal DNS, so following would silently escape the pin.
     #[tokio::test]
     async fn pin_then_follow_redirects_is_rejected() {
         let result = Client::new()
@@ -8011,8 +7704,7 @@ mod tests {
         );
     }
 
-    // TEST 65: the rejection is order-independent — chaining follow_redirects
-    // before pin_to produces the same IncompatiblePinRedirect error.
+    // Chaining order does not matter.
     #[tokio::test]
     async fn follow_redirects_then_pin_is_rejected() {
         let result = Client::new()
@@ -8028,8 +7720,6 @@ mod tests {
         );
     }
 
-    // TEST 66: pin_to combined with no_redirect is NOT affected by the guard —
-    // the request proceeds and returns the 3xx verbatim (RedirectMode::None).
     #[tokio::test]
     async fn pin_with_no_redirect_is_allowed() {
         use axum::{Router, routing::get};
@@ -8041,8 +7731,7 @@ mod tests {
         .await;
         let port = addr.port();
 
-        // Use a DOMAIN host so the pin's resolve override is consulted; pinning
-        // an IP-literal host is now rejected by the PinRequiresDomainHost guard.
+        // A domain host, since `pin_to` refuses an IP literal.
         let resp = Client::new()
             .get(format!("http://pinned.invalid:{port}/start"))
             .pin_to(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
@@ -8058,12 +7747,8 @@ mod tests {
         );
     }
 
-    // TEST 67: pin_to on an IPv4-literal URL host is rejected at send time with
-    // PinRequiresDomainHost — deterministically, without touching the network.
-    // reqwest/hyper treat an IP-literal host as already-resolved and skip the
-    // resolve override that installs the pin, so the socket would connect to the
-    // literal in the URL (198.51.100.1), NOT the pinned 127.0.0.1 — silently
-    // bypassing the pin. The guard rejects it instead.
+    // Unguarded, the socket would connect to the literal 198.51.100.1, not the pinned
+    // 127.0.0.1.
     #[tokio::test]
     async fn pin_to_ipv4_literal_host_is_rejected() {
         let result = Client::new()
@@ -8078,7 +7763,6 @@ mod tests {
         );
     }
 
-    // TEST 68: the same rejection applies to an IPv6-literal URL host.
     #[tokio::test]
     async fn pin_to_ipv6_literal_host_is_rejected() {
         let result = Client::new()
@@ -8093,11 +7777,6 @@ mod tests {
         );
     }
 
-    // TEST 68b: get_ssrf_safe combined with pin_to is rejected at send time with
-    // PinNotAllowedWithSsrfSafe — deterministically, without touching the
-    // network. The SSRF-safe path runs its own per-hop resolve/validate/pin and
-    // never reads the pin_to address, so an explicit pin would be silently
-    // ignored; the guard fails loudly instead.
     #[tokio::test]
     async fn get_ssrf_safe_with_pin_to_is_rejected() {
         let result = Client::new()
@@ -8112,10 +7791,7 @@ mod tests {
         );
     }
 
-    // TEST 69: a `304 Not Modified` that happens to carry a `Location` header is
-    // NOT a followable redirect. reqwest only follows 301/302/303/307/308, so
-    // `redirect_target` must return the 304 to the caller verbatim rather than
-    // issuing a second request against the `Location` target.
+    // reqwest follows only 301/302/303/307/308, so a 304 with `Location` is returned as is.
     #[tokio::test]
     async fn follow_redirects_does_not_follow_304_with_location() {
         use axum::{Router, routing::get};
@@ -8164,9 +7840,6 @@ mod tests {
         );
     }
 
-    // TEST 70: a `300 Multiple Choices` that carries a `Location` header is
-    // likewise not a followable redirect (only 301/302/303/307/308 are), so the
-    // 300 is returned to the caller and the `Location` target is never hit.
     #[tokio::test]
     async fn follow_redirects_does_not_follow_300_with_location() {
         use axum::{Router, routing::get};

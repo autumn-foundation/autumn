@@ -52,15 +52,13 @@ use serde::{Deserialize, Serialize};
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-// Postgres backend: `Blob` sits on a `JSONB` column.
 #[cfg_attr(
     all(feature = "db", not(feature = "sqlite")),
     derive(diesel::AsExpression, diesel::FromSqlRow),
     diesel(sql_type = diesel::sql_types::Jsonb)
 )]
-// SQLite backend (issue #1924): SQLite has no `JSONB` type, so `Blob` sits on a
-// `TEXT` column storing the same metadata JSON. `Blob` is a local type, so these
-// conversions are orphan-rule-legal (unlike `uuid::Uuid` / `rust_decimal::Decimal`).
+// SQLite has no `JSONB` type (#1924), so the same metadata JSON sits on a `TEXT` column.
+// `Blob` is a local type, so these impls satisfy the orphan rule.
 #[cfg_attr(
     feature = "sqlite",
     derive(diesel::AsExpression, diesel::FromSqlRow),

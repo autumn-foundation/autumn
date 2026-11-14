@@ -150,9 +150,8 @@ pub(crate) fn uuid_v7_from_parts(unix_millis: u64, rand_bytes: [u8; 10]) -> Uuid
 /// from any embedded structure.
 #[must_use]
 pub(crate) fn derive_uuid_from(seed: u64, purpose_tag: &[u8]) -> Uuid {
-    // FNV-1a 64-bit over seed bytes then tag bytes. Chosen for a fully stable,
-    // dependency-free, cross-platform hash (unlike std's DefaultHasher, whose
-    // output is not guaranteed stable across Rust versions).
+    // FNV-1a 64-bit over the seed, then the tag. std's `DefaultHasher` output
+    // may change between Rust versions; this does not.
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
@@ -180,10 +179,8 @@ impl Entropy for std::sync::Arc<dyn Entropy> {
         (**self).fill_bytes(dest);
     }
 
-    // The *provided* methods are forwarded too, not left to the default. A
-    // source that overrides `uuid_v4`/`uuid_v7` would otherwise have its
-    // override silently dropped the moment it was handed through an `Arc`,
-    // which is precisely how this impl is used.
+    // Forward the provided methods too, or a source's own `uuid_v4`/`uuid_v7`
+    // would be lost behind the `Arc`.
     fn uuid_v4(&self) -> Uuid {
         (**self).uuid_v4()
     }
@@ -403,20 +400,15 @@ mod tests {
     #[test]
     fn derive_uuid_is_stable_tag_sensitive_and_stream_independent() {
         let e = SeededEntropy::new(7);
-        // Same tag ⇒ same id.
         assert_eq!(e.derive_uuid("tenant:acme"), e.derive_uuid("tenant:acme"));
-        // Different tags ⇒ different ids.
         assert_ne!(e.derive_uuid("tenant:acme"), e.derive_uuid("tenant:beta"));
-        // Stable regardless of interleaved main-stream draws (order-independent).
+        // Draws from the main stream do not change it.
         let before = e.derive_uuid("tenant:acme");
         let _ = e.uuid_v4();
         let _ = e.next_u64();
         assert_eq!(before, e.derive_uuid("tenant:acme"));
-        // Reproducible from a fresh source with the same seed.
         assert_eq!(before, SeededEntropy::new(7).derive_uuid("tenant:acme"));
-        // Diverges by seed.
         assert_ne!(before, SeededEntropy::new(8).derive_uuid("tenant:acme"));
-        // Shaped as a v4 UUID.
         assert_eq!(before.get_version_num(), 4);
     }
 

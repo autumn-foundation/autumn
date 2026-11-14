@@ -299,10 +299,8 @@ impl fmt::Display for QuotaExceeded {
     }
 }
 
-// `QuotaExceeded` is a `std::error::Error`, so it converts into
-// [`crate::AutumnError`] via the crate's blanket `From<E: Error>` impl, which
-// special-cases it to HTTP 503 Service Unavailable. Handlers that allocate
-// through a cell can therefore propagate a quota breach with `?`.
+// The blanket `From<E: Error>` for `AutumnError` maps this to HTTP 503, so handlers can
+// propagate a quota breach with `?`.
 impl std::error::Error for QuotaExceeded {}
 
 /// The tenant's scratch map plus the high-water mark used to charge per-entry
@@ -353,8 +351,6 @@ impl TenantCellInner {
     /// process-wide gauges. Fails without mutating state if it would exceed the
     /// quota.
     fn reserve(&self, n: usize) -> Result<(), QuotaExceeded> {
-        // Reload the quota on entry (and on each CAS retry below) so a runtime
-        // change via `set_quota_bytes` is honored by the very next reservation.
         if self.quota_bytes.load(Ordering::Relaxed) == 0 {
             self.tracked_bytes.fetch_add(n, Ordering::Relaxed);
             self.global_tracked.fetch_add(n, Ordering::Relaxed);
@@ -362,11 +358,8 @@ impl TenantCellInner {
         }
         let mut current = self.tracked_bytes.load(Ordering::Relaxed);
         loop {
-            // Reload the quota each iteration and re-apply the `0 == unlimited`
-            // rule *before* the over-quota check: a concurrent `set_quota_bytes`
-            // can flip a finite quota to unlimited between the entry check above
-            // and a later CAS retry, and once unlimited every positive `next`
-            // must be accepted rather than compared against `0`.
+            // Re-check `0 == unlimited` on every retry: a concurrent `set_quota_bytes` can switch
+            // to unlimited mid-loop, and `next > 0` would then wrongly reject.
             let quota = self.quota_bytes.load(Ordering::Relaxed);
             if quota == 0 {
                 self.tracked_bytes.fetch_add(n, Ordering::Relaxed);
@@ -421,8 +414,7 @@ impl TenantCellInner {
 
 impl Drop for TenantCellInner {
     fn drop(&mut self) {
-        // Deterministically reclaim any bytes still tracked (e.g. scratch state)
-        // from the process-wide gauge when the last reference to the cell drops.
+        // Return bytes still tracked (e.g. scratch entries) to the process-wide gauge.
         let remaining = *self.tracked_bytes.get_mut();
         if remaining > 0 {
             self.global_tracked.fetch_sub(remaining, Ordering::Relaxed);
@@ -479,11 +471,8 @@ impl TenantCell {
                 tenant_id: tenant_id.into(),
                 quota_bytes: AtomicUsize::new(quota_bytes),
                 tracked_bytes: AtomicUsize::new(0),
-                // The owning registry stamps the real access time immediately
-                // after construction; 0 is a placeholder until then.
+                // Placeholders: the registry `touch`es the cell right after construction.
                 last_access: AtomicU64::new(0),
-                // Likewise a placeholder until the registry's first `touch`
-                // stamps a real, strictly-increasing sequence number.
                 last_access_seq: AtomicU64::new(0),
                 scratch: Mutex::new(ScratchState::default()),
                 global_tracked,
@@ -625,10 +614,8 @@ impl TenantCell {
             .expect("tenant cell scratch lock poisoned");
         let state = &mut *scratch;
         if let Some(old_val_cap) = state.map.get(&key).map(Vec::capacity) {
-            // Key already present: `insert` keeps the stored key and swaps the
-            // value, so only the value-capacity delta is charged. The freshly
-            // built `key` String is dropped. The key, overhead, and peak are all
-            // unaffected.
+            // `insert` keeps the stored key and swaps only the value, so charge just the
+            // value-capacity delta. Key, overhead and peak are unchanged.
             if new_val_cap > old_val_cap {
                 self.inner.reserve(new_val_cap - old_val_cap)?;
             } else if new_val_cap < old_val_cap {
@@ -636,17 +623,13 @@ impl TenantCell {
             }
             state.map.insert(key, value);
         } else {
-            // Genuinely new key: charge the key allocation and the value. Charge
-            // the fixed per-entry overhead only for the portion of the new live
-            // count that exceeds the high-water mark, so re-inserting within the
-            // prior peak (after removals) adds no overhead — the bucket slot it
-            // reuses was already charged and is still resident.
+            // Charge overhead only above the high-water mark: slots below it were already
+            // charged and are still resident.
             let new_len = state.map.len() + 1;
             let overhead_delta = new_len
                 .saturating_sub(state.peak_entries)
                 .saturating_mul(SCRATCH_ENTRY_OVERHEAD);
-            // Reserve before inserting or bumping the peak, so a quota failure
-            // returns without any untracked map growth.
+            // Reserve first so a quota failure leaves the map and peak untouched.
             self.inner
                 .reserve(key.capacity() + new_val_cap + overhead_delta)?;
             state.map.insert(key, value);
@@ -689,10 +672,8 @@ impl TenantCell {
     /// Panics if the tenant cell's scratch lock is poisoned.
     #[must_use = "the removed scratch value is returned; bind it or `let _ =` it"]
     pub fn scratch_remove(&self, key: &str) -> Option<Vec<u8>> {
-        // `remove_entry` recovers the stored key too, so its allocation is
-        // released alongside the value's. The per-entry overhead is retained:
-        // the bucket slot survives the removal, and `peak_entries` is not
-        // lowered.
+        // `remove_entry` returns the stored key so its capacity is released too. The per-entry
+        // overhead stays charged: the bucket slot survives removal.
         let (removed_key, removed_val) = {
             let mut scratch = self
                 .inner
@@ -819,9 +800,8 @@ impl TenantCellRegistry {
     ///
     /// Panics if the registry lock is poisoned.
     #[must_use]
-    // The read guard is deliberately held across the `touch` below: refreshing
-    // the access time under the lock is what closes the eviction race, so we
-    // opt out of the drop-tightening lint that would shrink the guard's scope.
+    // The read guard must stay held across `touch` so a writer cannot evict the cell between
+    // lookup and touch.
     #[allow(clippy::significant_drop_tightening)]
     pub fn get(&self, tenant_id: &str) -> Option<Arc<TenantCell>> {
         let guard = self
@@ -829,13 +809,8 @@ impl TenantCellRegistry {
             .state
             .read()
             .expect("tenant cell registry lock poisoned");
-        // Refresh the access time/sequence WHILE the read guard is still held,
-        // so a concurrent writer cannot evict this cell in the gap between the
-        // lookup and the touch. Capture `now`/`seq` here, under the guard and
-        // immediately before the touch, so a stale timestamp taken before a
-        // lock wait can never stamp the cell. `touch` is relaxed atomic
-        // `fetch_max` stores through the shared `&Arc<TenantCell>`, safe under
-        // the read lock.
+        // Sample `now`/`seq` under the guard so a timestamp taken before a lock wait never
+        // stamps the cell.
         if let Some(cell) = guard.resident.get(tenant_id) {
             cell.touch(self.now_millis(), self.next_seq());
             return Some(Arc::clone(cell));
@@ -862,11 +837,8 @@ impl TenantCellRegistry {
     /// Panics if the registry lock is poisoned.
     #[must_use]
     pub fn get_or_create(&self, tenant_id: &str, quota_bytes: usize) -> Arc<TenantCell> {
-        // Fast path: a resident cell just needs its access time and quota
-        // refreshed under the cheaper read lock. Do the touch/quota-refresh
-        // WHILE the read guard is still held so a concurrent writer cannot evict
-        // this cell in the gap between the lookup and the refresh — `touch` and
-        // `set_quota_bytes` are relaxed atomic stores, safe under the read lock.
+        // Fast path: refresh under the read guard so a writer cannot evict the cell between
+        // lookup and refresh. Sample `now` under the guard too, never before a lock wait.
         {
             let guard = self
                 .inner
@@ -874,9 +846,6 @@ impl TenantCellRegistry {
                 .read()
                 .expect("tenant cell registry lock poisoned");
             if let Some(cell) = guard.resident.get(tenant_id) {
-                // Capture `now` here, under the guard and immediately before the
-                // touch, so a timestamp taken before a lock wait can never stamp
-                // a fresh access time as stale.
                 cell.touch(self.now_millis(), self.next_seq());
                 cell.set_quota_bytes(quota_bytes);
                 return Arc::clone(cell);
@@ -891,20 +860,16 @@ impl TenantCellRegistry {
         // taking the write lock.
         if let Some(cell) = state.resident.get(tenant_id) {
             let cell = Arc::clone(cell);
-            // Fresh `now` under the write guard, right before the touch.
             cell.touch(self.now_millis(), self.next_seq());
             cell.set_quota_bytes(quota_bytes);
             return cell;
         }
-        // An eviction only removes cache residency. If an in-flight request
-        // still owns the former cell, resurrect that exact cell (and therefore
-        // its quota counter and scratch map) rather than minting a second
-        // accounting domain for the tenant.
+        // Eviction only removes residency. If in-flight work still owns the old cell, resurrect
+        // it rather than mint a second accounting domain for the tenant.
         if let Some(inner) = state.lifecycle.get(tenant_id).and_then(Weak::upgrade) {
             let cell = Arc::new(TenantCell { inner });
-            // Use one clock sample for both the touch and TTL enforcement. A
-            // second sample could cross a millisecond boundary and immediately
-            // evict a freshly resurrected cell when the configured TTL is zero.
+            // One clock sample for both touch and TTL: a second could cross a millisecond and
+            // evict the resurrected cell at once when the TTL is zero.
             let now = self.now_millis();
             cell.touch(now, self.next_seq());
             cell.set_quota_bytes(quota_bytes);
@@ -921,13 +886,9 @@ impl TenantCellRegistry {
             quota_bytes,
             Arc::clone(&self.inner.global_tracked),
         ));
-        // Capture `now` under the write guard, immediately before stamping the
-        // new cell and sweeping, so the age comparison in `enforce_limits_locked`
-        // uses a fresh wall-clock reading rather than one taken before the lock
-        // wait.
         let now = self.now_millis();
-        // Stamp the new cell's access sequence BEFORE enforcing limits, so it
-        // holds the greatest sequence and is never chosen as the LRU victim.
+        // Touch before enforcing limits so the new cell holds the newest time and greatest
+        // sequence, and is never the idle or LRU victim.
         cell.touch(now, self.next_seq());
         state
             .lifecycle
@@ -940,9 +901,6 @@ impl TenantCellRegistry {
             .resident
             .insert(tenant_id.to_string(), Arc::clone(&cell));
         self.record_resident_capacity(&state);
-        // Enforce eviction limits while we already hold the write lock. The
-        // just-touched new cell has the newest access time and the greatest
-        // access sequence, so it is never the idle or LRU victim.
         self.enforce_limits_locked(&mut state, now);
         drop(state);
         cell
@@ -973,11 +931,8 @@ impl TenantCellRegistry {
         let max_cells = self.inner.max_cells;
         if max_cells > 0 {
             while state.resident.len() > max_cells {
-                // Evict the least-recently-used cell, chosen by the smallest
-                // access *sequence*. The sequence is globally unique and
-                // monotonic, so there are no ties (unlike millisecond
-                // timestamps) and the just-inserted cell — which drew the
-                // greatest sequence above — is never the victim.
+                // LRU by access sequence, not milliseconds: sequences are unique, so there are
+                // no ties and the just-inserted cell is never chosen.
                 let Some(victim) = state
                     .resident
                     .iter()
@@ -1068,8 +1023,8 @@ impl TenantCellRegistry {
             .state
             .write()
             .expect("tenant cell registry lock poisoned");
-        // Read the clock under the write guard, so a `now` captured before a
-        // lock wait cannot age out a cell another thread just touched.
+        // Read the clock under the write guard so a pre-wait `now` cannot age out a cell
+        // another thread just touched.
         let now = self.now_millis();
         let before = state.resident.len();
         let expired_ids: Vec<_> = state
@@ -1165,17 +1120,14 @@ impl TenantCellRegistry {
     /// Panics if the registry lock is poisoned.
     #[must_use]
     pub fn structural_overhead(&self) -> TenantCellStructuralOverhead {
-        // `ArcInner` contains one strong and one weak reference counter before
-        // its payload. Rust does not expose its private layout; two `usize`s is
-        // the stable structural model used here, not an allocator measurement.
+        // `ArcInner` holds a strong and a weak counter before the payload. Its layout is
+        // private, so two `usize`s is a model, not a measurement.
         const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
         type RegistryEntry = (String, Arc<TenantCell>);
         type LifecycleEntry = (String, Weak<TenantCellInner>);
 
-        // Count every occupied lifecycle record and its owned key: resident
-        // cells', evicted-but-in-flight domains', and tombstones awaiting the
-        // bounded sweep — all are allocated structure. The cleanup queue's
-        // own copies are still excluded, keeping this a lower bound.
+        // Lifecycle records (resident, evicted-but-live and unswept tombstones) are all counted.
+        // The cleanup queue's key copies are not, keeping this a lower bound.
         let state = self
             .inner
             .state
@@ -1197,9 +1149,8 @@ impl TenantCellRegistry {
             .map(|(key, cell)| key.capacity() + cell.inner.tenant_id.capacity())
             .sum::<usize>()
             + index_key_capacity;
-        // Like the resident map, sweeping tombstones can lower the lifecycle
-        // map's `capacity()` without shrinking its allocation, so read the
-        // high-water mark that inserts maintain under the write guard.
+        // Sweeping tombstones lowers `capacity()` without shrinking the allocation, so use the
+        // high-water mark.
         let lifecycle_bucket_count = self
             .inner
             .lifecycle_bucket_high_water
@@ -1209,11 +1160,8 @@ impl TenantCellRegistry {
             + lifecycle_bucket_count;
         let arc_header_bytes = resident_cells * 2 * ARC_HEADER;
         let registry_element_capacity = cells.capacity();
-        // Read allocation history while the map's read guard is still held.
-        // Growth updates the watermark under the corresponding write guard, so
-        // this keeps the resident count, entries, ids, capacity, and watermark
-        // in one coherent registry snapshot. Removals can reduce effective
-        // element capacity via tombstones while retaining the allocation.
+        // High-water mark for the same tombstone reason as above. Read it before dropping the
+        // guard: growth updates it under the write guard, so it stays coherent with the counts.
         let registry_bucket_count = self
             .inner
             .registry_bucket_high_water
@@ -1291,8 +1239,6 @@ pub struct TenantCellHandle {
 
 impl fmt::Debug for TenantCellHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The registry is a process-wide shared handle; summarise it by size
-        // rather than recursing into every resident cell.
         f.debug_struct("TenantCellHandle")
             .field("tenant_id", &self.tenant_id)
             .field("quota_bytes", &self.quota_bytes)

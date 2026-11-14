@@ -1,6 +1,4 @@
-// OpenAPI/JSON/JSON-schema all appear frequently here and are legitimate
-// acronyms, so silence clippy::doc_markdown rather than wrapping every
-// mention in backticks.
+// OpenAPI, JSON and JSON-schema appear throughout the docs; backticking each is noise.
 #![allow(clippy::doc_markdown)]
 
 //! OpenAPI (Swagger) specification auto-generation.
@@ -111,10 +109,7 @@ pub const OPENAPI_UNAVAILABLE_UNCONFIGURED: &str =
 /// [`post`](crate::post), etc.) from the handler's path, signature, and
 /// any [`#[api_doc(...)]`](crate::api_doc) overrides.
 #[derive(Clone, Debug, Default)]
-// A flat, generated metadata descriptor. Each boolean flag (hidden, secured,
-// sunset_opt_out, has_policy, public, mcp_tool, mcp_exclude, mcp_stream,
-// mcp_task, mcp_core, webmcp_tool, webmcp_exclude) models a distinct route property. A sub-struct would
-// obscure them.
+// A flat, macro-generated descriptor: each bool is an independent route property.
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApiDoc {
     /// HTTP method as an uppercase string (e.g. `"GET"`).
@@ -314,12 +309,8 @@ impl SchemaEntry {
     }
 }
 
-// `PartialEq`/`Eq` are implemented by hand rather than derived: deriving them
-// would compare the `identity` field's fn *pointers*, which the
-// `unpredictable_function_pointer_comparisons` lint (rightly) flags as
-// meaningless. Comparing the *resolved* identity strings is both meaningful and
-// what callers actually want (two entries are equal iff they describe the same
-// type the same way).
+// Hand-written: a derive would compare the `identity` fn pointers, which is meaningless
+// (`unpredictable_function_pointer_comparisons`). Compare the resolved identity strings.
 impl PartialEq for SchemaEntry {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
@@ -806,11 +797,8 @@ impl SchemaRegistry {
 // ──────────────────────────────────────────────────────────────────
 // Serializable OpenAPI 3.1 document types.
 //
-// Only the fields Autumn actually populates are modelled — unused
-// OpenAPI keys (callbacks, links, discriminators…) are intentionally
-// omitted so the generated JSON stays clean. Gated behind the
-// `openapi` feature so the runtime spec builder doesn't add code
-// size / dependency pressure to apps that never serve a JSON spec.
+// Only the fields Autumn populates are modelled; callbacks, links, discriminators etc.
+// are omitted.
 // ──────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "openapi")]
@@ -1182,11 +1170,9 @@ fn build_schema_component_index_reserving(
         }
     }
 
-    // A registered component is a response component: the rewrite treats it
-    // as one. Thus a ref in it is a response use. An example is the short
-    // `<Model>` ref of the `<Model>Page` envelope. Without this rule, a type
-    // that only a list route returns is request-only, and its one component
-    // gets the request shape.
+    // The rewrite treats a registered component as a response component, so a ref inside
+    // one is a response use. Otherwise a type only a list route returns (the `<Model>` ref
+    // of a `<Model>Page` envelope) would be request-only and get the request shape.
     let mut registered_refs: Vec<String> = Vec::new();
     for body in registered.values() {
         collect_body_ref_identities(body, &mut registered_refs);
@@ -1398,7 +1384,6 @@ fn assign_request_keys(
 /// never collide with a naturally-produced key (issue #1972).
 #[cfg(feature = "openapi")]
 fn assign_display_keys(refs: &[(String, String)]) -> BTreeMap<String, String> {
-    // Which base display keys are shared by more than one distinct identity?
     let mut by_base: BTreeMap<String, std::collections::BTreeSet<&str>> = BTreeMap::new();
     for (identity, base) in refs {
         by_base
@@ -1410,9 +1395,9 @@ fn assign_display_keys(refs: &[(String, String)]) -> BTreeMap<String, String> {
     let mut by_identity: BTreeMap<String, String> = BTreeMap::new();
     let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    // First pass: assign the plain last-segment key to every identity whose base
-    // is unambiguous, and to legacy short-name identities (no `::` path — the
-    // repository macro's model refs) which cannot be qualified anyway.
+    // First pass: the plain last-segment key for every unambiguous identity, and for
+    // short-name identities with no `::` path (repository macro model refs), which
+    // cannot be qualified.
     for (identity, base) in refs {
         let collides = by_base[base].len() > 1 && identity.contains("::");
         if !collides {
@@ -1423,11 +1408,10 @@ fn assign_display_keys(refs: &[(String, String)]) -> BTreeMap<String, String> {
         }
     }
 
-    // Second pass: qualify each genuinely-colliding real type path with the
-    // fewest trailing module segments that make its key unique. Iterate in a
-    // stable sorted order so the assignment is deterministic regardless of the
-    // order pairs were collected, and guarantee the final key is free even when
-    // the suffix ladder and the full-sanitized fallback are both exhausted.
+    // Second pass: qualify each colliding path with the fewest trailing module segments
+    // that make its key unique. Sorted order keeps the result independent of input
+    // order; the `-N` suffix guarantees a free key once the suffix ladder and the
+    // full-path fallback are both taken.
     let mut pending: Vec<&String> = refs
         .iter()
         .map(|(identity, _)| identity)
@@ -1638,8 +1622,7 @@ fn flatten_ref_entries(entry: &SchemaEntry) -> Vec<&SchemaEntry> {
     if wrapper_is_impostor(entry) {
         return vec![entry];
     }
-    // Arbitrary JSON is described inline, so it must NOT earn a component —
-    // registering one is exactly how it became an opaque placeholder.
+    // Arbitrary JSON is described inline; a component for it would be an opaque placeholder.
     if entry_is_arbitrary_json(entry) {
         return Vec::new();
     }
@@ -1669,10 +1652,8 @@ pub fn generate_spec_at(
 ) -> OpenApiSpec {
     let mut paths: BTreeMap<String, PathItem> = BTreeMap::new();
 
-    // Seed the user and route registrations, then resolve every referenced
-    // schema identity to a collision-free component display key up front, so
-    // both the `$ref` sites (via `operation_for`) and the back-fill below
-    // register/reference the exact same key (issue #1972).
+    // Resolve every schema identity to its display key up front, so the `$ref` sites in
+    // `operation_for` and the back-fill below use the same key (issue #1972).
     let (mut registry, index) = seeded_registry_and_index(config, routes);
 
     let mut any_secured = false;
@@ -1697,20 +1678,15 @@ pub fn generate_spec_at(
             "PUT" => entry.put = Some(operation),
             "DELETE" => entry.delete = Some(operation),
             "PATCH" => entry.patch = Some(operation),
-            // Unknown methods are silently skipped; Autumn's route macros
-            // only emit the five verbs above today.
+            // The route macros only emit the five verbs above.
             _ => {}
         }
     }
 
-    // Back-fill a schema for every referenced identity the user didn't already
-    // register, under its resolved display key. A `#[derive(OpenApiSchema)]`
-    // type advertises a real field-accurate schema through the compile-time
-    // inventory (matched by identity, so two same-named types never shadow each
-    // other — issue #1972); only an identity with no derived schema (and no
-    // explicit `OpenApiConfig::register_schema`) falls back to the minimal
-    // `{"type": "object", "title": "X"}` placeholder. Each component holds the
-    // schema of its direction (issue #2607).
+    // Back-fill every referenced identity the user did not register. A derived schema is
+    // matched by identity, so same-named types never shadow each other (issue #1972);
+    // without one, the component is a bare placeholder. Each component holds the schema
+    // of its direction (issue #2607).
     for (identity, display_key, direction) in index.components() {
         if !registry.schemas().contains_key(display_key) {
             let schema = registered_derived_schema_for(identity, direction).unwrap_or_else(|| {
@@ -1723,7 +1699,6 @@ pub fn generate_spec_at(
         }
     }
 
-    // Register auth security schemes used by secured routes.
     let mut security_schemes: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     if any_secured {
         security_schemes.insert(
@@ -1748,12 +1723,8 @@ pub fn generate_spec_at(
     }
 
     let mut components_map = registry.into_map();
-    // Rewrite every `$ref` that appears *inside* a component body from its raw
-    // schema identity (`type_name`) to its collision-resolved display key, so a
-    // nested derived-schema ref resolves to the same component the top-level
-    // route refs use (issue #1972). Top-level operation refs are already emitted
-    // as display keys by `operation_for`/`schema_value_for`; this closes the
-    // body-internal half of the `$ref` graph.
+    // Refs inside component bodies still name the raw `type_name`; rewrite them to display
+    // keys. Operation-level refs are already display keys (issue #1972).
     rewrite_component_body_refs(&mut components_map, &index);
     let components = if !components_map.is_empty() || !security_schemes.is_empty() {
         Some(Components {
@@ -1808,7 +1779,6 @@ fn operation_for(
     });
     let deprecated = if is_deprecated { Some(true) } else { None };
 
-    // Path parameters — always required.
     let mut parameters: Vec<Parameter> = api_doc
         .path_params
         .iter()
@@ -1823,9 +1793,8 @@ fn operation_for(
         })
         .collect();
 
-    // Query parameters from `Query<T>` extractor — one per struct field when
-    // the field shapes are known (issue #2251), else the old single
-    // struct-level parameter. See `query_parameters_for`.
+    // One parameter per `Query<T>` field when the field shapes are known (issue #2251),
+    // else one struct-level parameter.
     if let Some(query_entry) = &api_doc.query_schema {
         parameters.extend(query_parameters_for(query_entry, index));
     }
@@ -1870,7 +1839,6 @@ fn operation_for(
     );
     insert_problem_responses(&mut responses);
 
-    // If this route version has a sunset schedule and is not opted out, document 410 Gone
     let is_subject_to_sunset = api_doc.api_version.is_some_and(|version| {
         api_versions
             .iter()
@@ -1983,10 +1951,8 @@ fn query_parameters_from_body(
             .iter()
             .map(|(name, field_schema)| {
                 let (style, explode, description) = query_field_style(field_schema);
-                // A field's $ref here still names the raw type_name, not the
-                // display key. The finalize pass fixes that up everywhere it
-                // tracks — but not in this parameter's schema, since it lives
-                // outside components_map. Rewrite it here instead.
+                // A field's $ref still names the raw type_name. The component-body
+                // rewrite never sees parameter schemas, so rewrite it here.
                 let mut schema = field_schema.clone();
                 rewrite_identity_refs(&mut schema, index, SchemaDirection::Request);
                 Parameter {
@@ -2045,9 +2011,8 @@ fn query_field_shape(schema: &serde_json::Value) -> QueryFieldShape {
             QueryFieldShape::Flat
         };
     }
-    // An object schema inlined at the field site, not behind a $ref — a
-    // #[translatable] field is the one case the macro emits today
-    // (autumn-macros/src/schema.rs, emit_json_schema_tokens_for_field).
+    // An object schema inlined at the field site rather than behind a $ref
+    // (the macro emits this for #[translatable] fields).
     if effective.get("type").and_then(serde_json::Value::as_str) == Some("object") {
         return QueryFieldShape::Object;
     }
@@ -2171,17 +2136,10 @@ fn schema_value_for(
             "items": schema_value_for(items, index, direction),
         }),
         SchemaKind::Nullable(inner) => {
-            // OpenAPI 3.1 aligns with JSON Schema 2020-12, which supports
-            // `type: "null"` natively:
-            //   * For a `$ref`, use `oneOf: [{$ref: ...}, {type: "null"}]`
-            //     so the ref can stand alone without `allOf` workarounds.
-            //   * For primitives, use the compact type-array form: `type: ["T", "null"]`.
-            //   * For all other schemas (arrays, nested nullable, etc.), use `oneOf`
-            //     so the full inner schema (e.g. `items`) is preserved.
-            // `Option<serde_json::Value>` must NOT be wrapped: the
-            // unconstrained schema already admits null, and `oneOf` demands that
-            // EXACTLY ONE branch match — so `oneOf [{unconstrained}, {null}]`
-            // would reject the very null it is meant to permit.
+            // OpenAPI 3.1 (JSON Schema 2020-12) has `type: "null"`: primitives use
+            // `type: [T, "null"]`, everything else `oneOf: [inner, {type: "null"}]`.
+            // `Option<serde_json::Value>` is not wrapped: the unconstrained schema already
+            // admits null, and `oneOf` requires exactly one match, so it would reject null.
             if entry_is_arbitrary_json(inner) {
                 return arbitrary_json_schema();
             }
@@ -2503,12 +2461,9 @@ pub fn opaque_component_schemas(spec: &OpenApiSpec) -> Vec<OpaqueSchema> {
         return Vec::new();
     }
 
-    // Pre-compute each component's own outgoing refs, so attribution can follow
-    // the component graph rather than stopping at an operation's direct refs.
-    // An operation usually reaches an opaque type *indirectly* — `POST /orders`
-    // takes a derived `Order` whose `address` field `$ref`s an underived
-    // `Address` — and reporting `Address` with an empty `referenced_by` would
-    // hide the very operation whose contract is degraded.
+    // Each component's outgoing refs. An operation usually reaches an opaque type
+    // indirectly (`POST /orders` takes `Order`, whose `address` refs an underived
+    // `Address`), so attribution must follow the component graph.
     let component_refs: BTreeMap<&str, Vec<String>> = components
         .schemas
         .iter()
@@ -2519,11 +2474,8 @@ pub fn opaque_component_schemas(spec: &OpenApiSpec) -> Vec<OpaqueSchema> {
         })
         .collect();
 
-    // Map each opaque component to the operations that reach it. A reference
-    // can sit anywhere in an operation (body, response, parameter schema, or
-    // nested inside an array/nullable wrapper), so walk the serialized
-    // operation wholesale rather than probing known slots, then close over the
-    // component graph from whatever that turns up.
+    // A ref can sit anywhere in an operation (body, response, parameter, nested
+    // wrappers), so walk the whole serialized operation rather than known slots.
     let mut refs: BTreeMap<&str, std::collections::BTreeSet<String>> = BTreeMap::new();
     for (path, item) in &spec.paths {
         for (method, operation) in path_item_operations(item) {
@@ -2533,8 +2485,7 @@ pub fn opaque_component_schemas(spec: &OpenApiSpec) -> Vec<OpaqueSchema> {
             let mut frontier = Vec::new();
             collect_body_ref_identities(&value, &mut frontier);
 
-            // Breadth-first over components, `seen` guarding the cycles a
-            // self- or mutually-recursive schema creates.
+            // `seen` guards against cycles from recursive schemas.
             let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             while let Some(identity) = frontier.pop() {
                 if !seen.insert(identity.clone()) {
@@ -2835,9 +2786,8 @@ mod tests {
 
     #[test]
     fn generate_spec_back_fills_unregistered_ref_schemas() {
-        // A Json<CreateUser> handler emits a `$ref` with no component
-        // schema registered. The generator must back-fill a placeholder
-        // schema so the resulting OpenAPI document is valid.
+        // A `$ref` with no registered component needs a back-filled placeholder, or the
+        // document is invalid.
         let mut doc = make_doc();
         doc.method = "POST";
         doc.path = "/users";
@@ -2920,7 +2870,7 @@ mod tests {
         assert_eq!(default_tag("/{id}"), None);
     }
 
-    // ── OpenAPI 3.1 compliance tests (RED phase) ───────────────────────────
+    // ── OpenAPI 3.1 compliance ─────────────────────────────────────────────
 
     #[test]
     fn spec_version_is_3_1_0() {
@@ -2935,9 +2885,7 @@ mod tests {
 
     #[test]
     fn nullable_ref_uses_openapi_3_1_one_of() {
-        // OpenAPI 3.1 aligns with JSON Schema 2020-12: nullable refs use
-        // `oneOf: [{$ref: ...}, {type: "null"}]` instead of 3.0's
-        // `nullable: true` + `allOf` workaround.
+        // 3.1 uses `oneOf: [{$ref}, {type: "null"}]`, not 3.0's `nullable` + `allOf`.
         static INNER: SchemaEntry = SchemaEntry {
             name: "User",
             kind: SchemaKind::Ref,
@@ -2977,8 +2925,7 @@ mod tests {
 
     #[test]
     fn nullable_primitive_uses_type_array() {
-        // OpenAPI 3.1 uses `type: ["integer", "null"]` for nullable
-        // primitives instead of the 3.0 `nullable: true` flag.
+        // 3.1 uses `type: ["integer", "null"]`, not 3.0's `nullable: true`.
         static INNER: SchemaEntry = SchemaEntry {
             name: "integer",
             kind: SchemaKind::Primitive("integer"),
@@ -3181,7 +3128,6 @@ mod tests {
         assert!(!op.security[0].contains_key("SessionAuth"));
         // OpenAPI spec: HTTP bearer value array must be empty (not scope names).
         assert!(op.security[0]["BearerAuth"].is_empty());
-        // BearerAuth scheme is registered in components.
         let schemes = &spec.components.as_ref().unwrap().security_schemes;
         assert!(schemes.contains_key("BearerAuth"));
         assert_eq!(schemes["BearerAuth"]["scheme"], "bearer");
@@ -3194,7 +3140,7 @@ mod tests {
         let spec = generate_spec(&config, &[&doc]);
         let op = spec.paths["/secured"].get.as_ref().unwrap();
         assert_eq!(op.security.len(), 1);
-        // Both in the same object = AND semantics.
+        // Both in one object means AND.
         assert!(op.security[0].contains_key("SessionAuth"));
         assert!(op.security[0].contains_key("BearerAuth"));
     }
@@ -3208,15 +3154,9 @@ mod tests {
         assert!(!schemes.contains_key("BearerAuth"));
     }
 
-    // Regression (issue #1972): the fallback display-key assignment must be
-    // collision-proof. This generalizes the reviewer's `app::app::Args` /
-    // `app::Args` example to a pair that still clashes under the deterministic
-    // sorted assignment order: `a::x::Args` sorts first and claims the 2-segment
-    // suffix `x.Args`, then `x::Args` exhausts its suffix ladder (its only
-    // qualified candidate IS `x.Args`) and falls back to
-    // `component_key("x::Args")` == `x.Args` — the exact key `a::x::Args` already
-    // took. Without the disambiguator both identities would map to `x.Args`, so
-    // the second schema would silently overwrite the first.
+    // Issue #1972: `a::x::Args` sorts first and claims `x.Args`; `x::Args` has no other
+    // suffix and its full-path fallback is also `x.Args`. Without the `-N` disambiguator
+    // the second schema would overwrite the first.
     #[test]
     fn colliding_fallback_keys_are_disambiguated() {
         let refs = vec![
@@ -3231,12 +3171,9 @@ mod tests {
             a, b,
             "distinct identities must map to distinct display keys, got {a} == {b}"
         );
-        // `a::x::Args` claims the suffix key; `x::Args` must be pushed onto the
-        // deterministic `-N` disambiguator rather than overwriting it — pinning
-        // this proves the disambiguator branch actually ran.
+        // Pinning `-2` proves the disambiguator branch ran.
         assert_eq!(a, "x.Args");
         assert_eq!(b, "x.Args-2");
-        // Both keys are valid OpenAPI component keys.
         for key in [a, b] {
             assert!(
                 key.chars()
@@ -3246,8 +3183,6 @@ mod tests {
         }
     }
 
-    // Determinism: the same identity set must yield the same keys regardless of
-    // the order the `(identity, base)` pairs are supplied.
     #[test]
     fn assign_display_keys_is_order_independent() {
         let forward = vec![

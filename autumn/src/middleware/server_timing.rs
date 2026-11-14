@@ -89,26 +89,13 @@ type ScopedInner<F> = F;
 /// without `db` it is a no-op passing the future through untouched.
 #[cfg(feature = "db")]
 fn scope_inner<F: Future>(fut: F) -> (DbTimings, ScopedInner<F>) {
-    // Always construct a FRESH per-scope accumulator. Each `ServerTimingLayer`
-    // scope measures only the DB queries that run under its own scope, so
-    // nested Server-Timing scopes stay isolated and never share counts.
+    // A fresh accumulator per scope, never the outer one. With `mcp` on, the scope nests (the
+    // `/mcp` fallback envelope around the dispatch); a shared accumulator would make the
+    // fallback re-emit the `db` metric the MCP path already forwarded.
     //
-    // This isolation is load-bearing. When both `server_timing` and `mcp` are
-    // enabled, `ServerTimingLayer` nests `REQUEST_DB_TIMINGS` twice (the outer
-    // `/mcp` fallback envelope + the inner dispatch). If the inner scope reused
-    // the outer accumulator, the inner dispatch and the outer fallback would
-    // share DB counts and the fallback would re-emit the same `db` metric the
-    // MCP path already forwarded — double-emitting `db` for a DB-backed MCP
-    // tool call. A fresh accumulator per scope keeps each `db` metric correct.
-    //
-    // Request-wide SQL capture (the test harness's `TestResponse` assertions)
-    // rides a SEPARATE task-local lane — `crate::db::REQUEST_QUERY_CAPTURE` —
-    // scoped once around the whole request, so it is entirely unaffected by how
-    // this timing accumulator is scoped or nested here.
+    // Request-wide SQL capture (`crate::db::REQUEST_QUERY_CAPTURE`) is a separate task-local,
+    // scoped once per request, so this nesting does not affect it.
     let timings = Arc::new(RequestDbTimings::default());
-    // Scope the inner future so any DB query instrumentation that runs
-    // during it can record into `timings` via the task-local. We keep a
-    // clone of the Arc outside the scope to read back after poll.
     let scope = REQUEST_DB_TIMINGS.scope(Arc::clone(&timings), fut);
     (timings, scope)
 }
@@ -130,16 +117,14 @@ fn read_db_snapshot(timings: &DbTimings) -> (Option<f64>, usize) {
     let db_ms = if query_count == 0 {
         None
     } else {
-        // Match the `total` formula: microseconds → f64 ms.
         #[allow(clippy::cast_precision_loss)]
         Some((db_micros as f64) / 1000.0)
     };
     (db_ms, query_count)
 }
 
-// Without the `db` feature there is no query instrumentation, so the snapshot
-// is always empty. The `&DbTimings` (a `&()`) parameter keeps the signature
-// identical to the `db` variant so the call site needs no feature gate.
+// `&DbTimings` is `&()` here; the signature matches the `db` variant so the call site needs
+// no feature gate.
 #[cfg(not(feature = "db"))]
 #[allow(clippy::trivially_copy_pass_by_ref)]
 const fn read_db_snapshot(_timings: &DbTimings) -> (Option<f64>, usize) {
@@ -260,10 +245,8 @@ where
             };
         }
         let mut req = req;
-        // Coordinate the primary and fallback layers via the shared sentinel,
-        // mirroring the access-log fallback: the fallback plants it for the
-        // primary to flip; the primary picks it up when present (it is absent
-        // in bare setups that apply only the primary layer).
+        // The fallback plants the sentinel for the primary to flip, as the access-log fallback
+        // does. It is absent when only the primary layer is applied.
         let sentinel = if self.fallback {
             let sentinel = ServerTimingEmitted::default();
             req.extensions_mut().insert(sentinel.clone());
@@ -297,12 +280,10 @@ pin_project! {
             start: Instant,
             timings: DbTimings,
             #[pin] inner: ScopedInner<F>,
-            // `true` for the outermost fallback layer, which must skip
-            // emission when the primary already stamped the header.
+            // `true` for the outermost fallback layer, which skips emission when the primary
+            // already stamped the header.
             fallback: bool,
-            // Shared marker: flipped by the primary on emit, checked by the
-            // fallback to avoid a duplicate `total` metric. `None` in bare
-            // primary-only setups (no fallback planted it).
+            // Flipped by the primary on emit. `None` when no fallback layer planted it.
             sentinel: Option<ServerTimingEmitted>,
         },
     }
@@ -325,11 +306,8 @@ where
                 sentinel,
             } => match inner.poll(cx) {
                 Poll::Ready(Ok(mut response)) => {
-                    // The fallback stays silent when the primary already
-                    // stamped the header, so a request flowing through both
-                    // layers carries a single `total` metric. Short-circuit
-                    // responses never ran the primary, so the marker is unset
-                    // and the fallback emits.
+                    // A request through both layers carries one `total` metric. Short-circuit
+                    // responses never reach the primary, so the fallback emits for them.
                     let already_emitted = *fallback
                         && sentinel
                             .as_ref()
@@ -343,14 +321,10 @@ where
                         let streaming = is_streaming_response(&response);
                         let value = build_header_value(total_ms, db_ms, query_count, streaming);
                         if let Ok(hv) = HeaderValue::from_str(&value) {
-                            // Append rather than insert so any `Server-Timing`
-                            // metrics a handler already emitted are preserved —
-                            // the W3C spec allows multiple comma-joined metrics
-                            // across repeated header lines.
+                            // Append, not insert: keeps `Server-Timing` metrics the handler
+                            // already emitted. The spec allows repeated header lines.
                             response.headers_mut().append(SERVER_TIMING.clone(), hv);
                         }
-                        // Primary flips the sentinel so the outer fallback
-                        // knows not to append a duplicate `total`.
                         if !*fallback && let Some(sentinel) = sentinel.as_ref() {
                             sentinel.mark();
                         }
@@ -398,8 +372,6 @@ pub fn build_header_value(
         && query_count > 0
     {
         let noun = if query_count == 1 { "query" } else { "queries" };
-        // Header format is bounded and small; write! into the buffer to
-        // avoid an intermediate allocation.
         let _ = write!(out, ", db;dur={db:.3};desc=\"{query_count} {noun}\"");
     }
     out

@@ -226,7 +226,7 @@ impl TurnstileProvider {
 impl CaptchaProvider for TurnstileProvider {
     fn verify<'a>(&'a self, token: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            // This client is not the recorded outbound seam (#2351 item 1).
+            // This client bypasses the recorded outbound seam, so it checks egress here (#2351).
             #[cfg(feature = "reporting")]
             if crate::capsule::guard_egress(
                 "captcha",
@@ -301,7 +301,7 @@ impl HCaptchaProvider {
 impl CaptchaProvider for HCaptchaProvider {
     fn verify<'a>(&'a self, token: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
-            // This client is not the recorded outbound seam (#2351 item 1).
+            // This client bypasses the recorded outbound seam, so it checks egress here (#2351).
             #[cfg(feature = "reporting")]
             if crate::capsule::guard_egress(
                 "captcha",
@@ -707,20 +707,14 @@ where
     }
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
-        // Safe methods (GET, HEAD, OPTIONS, TRACE) are always exempt.
         if is_safe_method(req.method()) || crate::security::is_websocket_connect(&req) {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
         }
 
-        // Webhook/API paths that cannot carry a CAPTCHA token are exempt.
-        // Require an exact match or a path-segment boundary (trailing `/`) so
-        // that exempting `/inbound/mailgun` does not accidentally exempt
-        // `/inbound/mailgun-settings` or other adjacent routes. Match against
-        // the normalized path so dot-segment tricks like
-        // `/inbound/mailgun/../other` cannot satisfy an exemption prefix
-        // while targeting another route.
+        // Match the normalized path so `/inbound/mailgun/../other` cannot use an exemption to reach
+        // another route.
         let clean = crate::security::path::clean_path(req.uri().path());
         if crate::security::path::is_exempt_path(clean.as_str(), &self.settings.exempt_paths) {
             let mut inner = self.inner.clone();
@@ -728,15 +722,13 @@ where
             return Box::pin(async move { inner.call(req).await });
         }
 
-        // Dev bypass: skip verification entirely.
         if self.settings.dev_bypass {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
         }
 
-        // Only enforce CAPTCHA on application/x-www-form-urlencoded requests.
-        // JSON APIs, multipart uploads, and external webhooks pass through unchallenged.
+        // Only urlencoded forms are challenged. JSON APIs, multipart uploads and webhooks pass.
         let content_type = req
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
@@ -753,10 +745,8 @@ where
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
-            // Skip body scanning entirely for providers that don't require a token
-            // (e.g. AlwaysPassProvider). Scanning would consume the body and, if
-            // the form exceeds max_scan_bytes, restore an empty body to downstream
-            // handlers — corrupting the request silently.
+            // Do not scan when no token is required: a form over `max_scan_bytes` would be
+            // restored as an empty body downstream.
             let token = if settings.provider.requires_token() {
                 extract_token_from_form(&mut req, &settings.form_field, settings.max_scan_bytes)
                     .await
@@ -766,8 +756,7 @@ where
 
             let token_str = token.as_deref().unwrap_or("");
 
-            // Reject missing/empty tokens locally before any outbound call, unless
-            // the provider explicitly allows missing tokens (e.g. AlwaysPassProvider).
+            // Reject an empty token before any outbound call, unless the provider allows it.
             let valid = if token_str.is_empty() && settings.provider.requires_token() {
                 false
             } else {
@@ -827,7 +816,7 @@ where
 #[must_use]
 pub fn bot_protection_widget(config: &BotProtectionConfig) -> maud::Markup {
     if config.dev_bypass {
-        // Dev mode: render an invisible placeholder so the form submits cleanly.
+        // A hidden placeholder keeps the form submittable in dev.
         return maud::html! {
             input type="hidden" name=(config.effective_form_field()) value="dev-bypass";
         };
@@ -1086,7 +1075,6 @@ mod tests {
 
     #[tokio::test]
     async fn exempt_path_does_not_bleed_to_adjacent_routes() {
-        // Exempting "/webhook/inbound" must not exempt "/webhook/inbound-other".
         let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("required")))
             .with_exempt_paths(vec!["/webhook/inbound".to_string()]);
         let app = Router::new()
@@ -1132,9 +1120,8 @@ mod tests {
 
     #[tokio::test]
     async fn dot_segment_path_does_not_match_exemption() {
-        // `/webhook/../protected` normalizes to `/protected`, which is not
-        // exempt, so the CAPTCHA check must still run (and reject the request
-        // because no token is present). Same for percent-encoded dot-segments.
+        // `/webhook/../protected` normalizes to `/protected`, which is not exempt, so the
+        // tokenless request is rejected. The same holds for percent-encoded dot-segments.
         let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("required")))
             .with_exempt_paths(vec!["/webhook/".to_string()]);
         let app = Router::new()

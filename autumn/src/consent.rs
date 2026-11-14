@@ -266,10 +266,9 @@ pub(crate) fn find_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 
 // ── Cookie value codec ──────────────────────────────────────────
 //
-// Payload format (before percent-encoding): `{policy_version}|{decided_at}|{categories}`
-// where `categories` is a comma-joined list (empty string when none). The
-// whole payload is percent-encoded so `|`, `,`, and RFC 3339's `:`/`+` never
-// reach the raw cookie value (mirrors `crate::i18n`'s locale cookie encoding).
+// Payload before percent-encoding: `{policy_version}|{decided_at}|{categories}`, where
+// `categories` is comma-joined (empty when none). Percent-encoding keeps `|`, `,` and
+// RFC 3339's `:`/`+` out of the raw cookie value, as `crate::i18n`'s locale cookie does.
 
 fn encode_cookie_value(policy_version: u32, decided_at: &str, categories: &[&str]) -> String {
     let payload = format!("{policy_version}|{decided_at}|{}", categories.join(","));
@@ -434,14 +433,8 @@ pub fn redirect_target_from_referer(referer: Option<&str>) -> String {
     let Some(value) = referer else {
         return "/".to_owned();
     };
-    // `split_once` (not `split(...).nth(1)`): a `split` iterates every
-    // occurrence of the delimiter, so a Referer whose path/query legitimately
-    // contains a second `://` (e.g. `?source=https://vendor.example/x`) would
-    // have `.nth(1)` land on the fragment between the FIRST and SECOND
-    // delimiter instead of everything after the first — truncating the
-    // target partway through an embedded URL. `split_once` only ever
-    // recognizes the first `://`, so the rest of the string (including any
-    // further `://` occurrences) survives intact as ordinary path content.
+    // `split_once`, not `split(..).nth(1)`: the query can hold another `://`
+    // (`?source=https://vendor.example/x`), and `nth(1)` would cut the target there.
     let after_scheme = value.split_once("://").map_or(value, |(_, rest)| rest);
     let path = after_scheme.find('/').map_or("/", |i| &after_scheme[i..]);
     safe_redirect_target(path).to_owned()
@@ -589,7 +582,6 @@ mod tests {
 
     #[test]
     fn expiring_a_prior_accept_returns_to_undecided_and_reopens_the_gate() {
-        // A visitor previously accepted analytics...
         let accept = accept_all_cookie(&["analytics"], 1);
         let raw_accept = accept
             .split(';')
@@ -602,8 +594,8 @@ mod tests {
         )));
         assert!(decided.allows("analytics", 1));
 
-        // ...then withdraws via "manage cookie preferences": the browser
-        // drops the expired cookie, so the next request carries none at all.
+        // After withdrawal the browser drops the expired cookie, so the next request
+        // carries none.
         let expired = expire_consent_cookie();
         assert!(
             expired.contains("Max-Age=0"),
@@ -633,7 +625,6 @@ mod tests {
     fn needs_prompt_true_after_policy_version_bump() {
         let headers = decided_headers(&["analytics"], 1);
         let consent = Consent::from_headers(&headers);
-        // The app bumped its policy version from 1 to 2.
         assert!(consent.needs_prompt(2));
     }
 
@@ -642,9 +633,9 @@ mod tests {
         let headers = decided_headers(&["analytics"], 1);
         let consent = Consent::from_headers(&headers);
         assert!(consent.allows("analytics", 1));
-        // Re-prompt is not just cosmetic: the gate itself closes under the new version.
+        // The gate closes under the new version, not only the prompt.
         assert!(!consent.allows("analytics", 2));
-        // ...but necessary is still exempt regardless of version.
+        // `necessary` stays exempt under any version.
         assert!(consent.allows(NECESSARY, 2));
     }
 
@@ -692,10 +683,8 @@ mod tests {
 
     #[test]
     fn session_and_csrf_cookies_survive_alongside_an_undecided_consent() {
-        // Simulates a request that already carries the session + CSRF cookies
-        // (set unconditionally by SessionLayer / CsrfLayer) but has never
-        // recorded a consent choice. This module must not need or touch those
-        // cookies at all — it only ever reads its own cookie name.
+        // SessionLayer and CsrfLayer set these cookies regardless of consent. This
+        // module reads only its own cookie.
         let headers = headers_with_cookie("autumn.sid=session-value; autumn-csrf=csrf-value");
         let consent = Consent::from_headers(&headers);
         assert!(!consent.is_decided());
@@ -757,17 +746,14 @@ mod tests {
 
     #[test]
     fn safe_redirect_target_rejects_tab_based_scheme_relative_bypass() {
-        // The WHATWG URL parser strips ASCII tab/newline bytes from the
-        // whole URL before parsing continues, so `/\t/evil.example` becomes
-        // `//evil.example` (scheme-relative) once a browser strips the tab.
+        // The WHATWG URL parser strips ASCII tab/newline bytes, so `/\t/evil.example`
+        // becomes the scheme-relative `//evil.example`.
         assert_eq!(safe_redirect_target("/\t/evil.example"), "/");
     }
 
     #[test]
     fn safe_redirect_target_rejects_any_ascii_control_byte() {
-        // Rejecting the whole control-byte range (not just the specific
-        // bytes browsers are known to strip today) closes this class of
-        // bypass at once rather than reacting to each one individually.
+        // Every control byte is rejected, not only the ones browsers strip today.
         assert_eq!(safe_redirect_target("/x\0evil"), "/");
         assert_eq!(safe_redirect_target("/x\x0Bevil"), "/");
         assert_eq!(safe_redirect_target("/x\x7Fevil"), "/");
@@ -775,9 +761,8 @@ mod tests {
 
     #[test]
     fn safe_redirect_target_rejects_backslash_based_scheme_relative_bypass() {
-        // Browsers using the WHATWG URL parser treat `\` exactly like `/`
-        // when resolving an HTTP(S) URL, so `/\evil.example` would otherwise
-        // slip past the plain `//` check and still resolve off-site.
+        // The WHATWG URL parser treats `\` like `/` in HTTP(S) URLs, so `/\evil.example`
+        // would otherwise pass the `//` check and resolve off-site.
         assert_eq!(safe_redirect_target("/\\evil.example"), "/");
         assert_eq!(safe_redirect_target("/\\\\evil.example"), "/");
         assert_eq!(safe_redirect_target("/ok/path\\evil.example"), "/");
@@ -798,9 +783,8 @@ mod tests {
 
     #[test]
     fn redirect_target_from_referer_discards_scheme_and_host_entirely() {
-        // Even a maliciously-crafted Referer cannot smuggle an off-site
-        // target through, because the scheme+host are split off and
-        // discarded before any safety check runs.
+        // The host is dropped, and the remaining `//evil.example.com` is rejected as
+        // scheme-relative.
         assert_eq!(
             redirect_target_from_referer(Some("https://good.example.com//evil.example.com")),
             "/"
@@ -817,16 +801,9 @@ mod tests {
 
     #[test]
     fn redirect_target_from_referer_does_not_silently_accept_a_scheme_truncated_target() {
-        // A naive `split("://").nth(1)` would stop at the SECOND `://`
-        // occurrence (the one inside the query value) rather than only the
-        // first, silently truncating the target to `/docs?source=https` —
-        // which, having lost its own embedded `://`, would then sail right
-        // past `safe_redirect_target`'s unrelated "no `://` anywhere" guard
-        // and get silently accepted as a corrupted redirect target.
-        // `split_once` preserves the whole thing instead, so the candidate
-        // downstream still legitimately contains `://` and is correctly
-        // rejected by that guard, falling back to the safe "/" rather than
-        // redirecting to a mangled URL.
+        // `split("://").nth(1)` would truncate to `/docs?source=https`, which has no
+        // `://` left and would pass `safe_redirect_target`. The full path keeps its
+        // `://` and is rejected.
         let result = redirect_target_from_referer(Some(
             "https://app.example.com/docs?source=https://vendor.example.com/x",
         ));

@@ -150,22 +150,16 @@ impl SecurityDump {
         safe_methods.sort();
         safe_methods.dedup();
         let mut exempt_paths = csrf.exempt_paths.clone();
-        // Runtime's `apply_csrf_middleware` exempts every configured webhook
-        // endpoint path via `CsrfLayer::with_exempt_path`, so a webhook POST
-        // route not also listed in `csrf.exempt_paths` still skips CSRF at
-        // runtime. Fold those paths into the exempt set so the manifest matches.
+        // Runtime also exempts webhook endpoints, the one-click unsubscribe endpoint and the
+        // outbox inbox from CSRF. Fold them in, under the same predicates, so the manifest
+        // matches runtime.
         for endpoint in &config.security.webhooks.endpoints {
             exempt_paths.push(endpoint.path.clone());
         }
-        // Runtime also exempts the framework-owned RFC 8058 one-click unsubscribe
-        // endpoint from CSRF (`apply_csrf_middleware`, `router.rs`) under the same
-        // `mail`-feature gate and `should_mount_unsubscribe_endpoint()` predicate,
-        // so fold that path in too when it applies.
         #[cfg(feature = "mail")]
         if config.mail.should_mount_unsubscribe_endpoint() {
             exempt_paths.push(crate::mail::UNSUBSCRIBE_PATH.to_owned());
         }
-        // The outbox inbox endpoint is exempt at runtime too.
         #[cfg(feature = "db")]
         if config.outbox.serves_inbox() {
             exempt_paths.push(crate::outbox::INBOX_PATH.to_owned());
@@ -511,13 +505,9 @@ fn classify(
         );
     }
     let repo_has_policy = repository.is_some_and(|r| r.has_policy);
-    // A repository auto-API declared with `scope = ...` (but no `policy = ...`)
-    // enforces the registered scope on its generated list handler at runtime,
-    // yet leaves both the handler `ApiDoc` and `RepositoryApiMeta::has_policy`
-    // at their defaults. Treat the presence of a scope guard as gated too, so
-    // these scope-protected `GET /<api>` routes are not false-failed as
-    // `Unclassified`. No scope *name* is recorded on the meta (only a
-    // type-erased registry probe), so there is nothing to carry into `scopes`.
+    // A repository auto-API with `scope = ...` enforces it at runtime but sets neither
+    // `ApiDoc` nor `has_policy`, so a scope guard counts as gated. The meta records no
+    // scope name, so nothing goes into `scopes`.
     let repo_has_scope = repository.is_some_and(|r| r.scope_check.is_some());
     if api_doc.secured || api_doc.has_policy || repo_has_policy || repo_has_scope {
         let roles = api_doc
@@ -789,18 +779,13 @@ pub(crate) fn append_probe_and_actuator_routes(
         }
     }
 
-    // Mutating (non-GET) actuator routes are enumerated separately so they
-    // carry their real HTTP method (e.g. `PUT /actuator/loggers/{name}`,
-    // `POST /actuator/webhooks/replay`) rather than a phantom GET.
+    // Mutating actuator routes are listed with their real method, not a phantom GET.
     let mutating_routes = crate::actuator::actuator_mutating_routes(
         &config.actuator.prefix,
         config.actuator.sensitive,
     );
-    // Some entries in `actuator_endpoint_paths` exist only to seed the runtime
-    // startup-barrier allow-list (`StartupBarrierState::from_config`) and are
-    // actually mounted with a mutating method (e.g. `/webhooks/replay` is a
-    // `POST`). Skip any path already covered by a mutating-method entry so the
-    // GET-only listing does not emit a phantom GET for it.
+    // `actuator_endpoint_paths` also seeds the startup-barrier allow-list, so it holds paths
+    // mounted with a mutating method (`/webhooks/replay` is a POST). Skip those here.
     let mutating_paths: std::collections::HashSet<&str> = mutating_routes
         .iter()
         .map(|(_, path)| path.as_str())
@@ -844,6 +829,8 @@ pub(crate) fn append_framework_routes_with_env(
     config: &crate::config::AutumnConfig,
     env: &dyn crate::config::Env,
 ) {
+    // Each route is listed under the same feature gate and config predicate as its router
+    // mount, so the manifest matches what runtime serves.
     append_probe_and_actuator_routes(infos, config);
 
     #[cfg(feature = "htmx")]
@@ -864,7 +851,6 @@ pub(crate) fn append_framework_routes_with_env(
         infos.push(RouteInfo::framework_get(asset.url().to_owned(), handler));
     }
 
-    // Flash and widget stylesheets: mounted whenever their feature is on.
     #[cfg(feature = "flash")]
     infos.push(RouteInfo::framework_get(
         crate::flash::FLASH_CSS_PATH.to_owned(),
@@ -898,12 +884,8 @@ pub(crate) fn append_framework_routes_with_env(
         }
     }
 
-    // Framework-owned RFC 8058 one-click unsubscribe endpoint. Runtime merges
-    // `unsubscribe_router()` — a GET and a POST at `UNSUBSCRIBE_PATH` — under the
-    // same `mail`-feature gate and `should_mount_unsubscribe_endpoint()` predicate
-    // that folds the path into `csrf.exempt_paths`, so list both methods here to
-    // keep the manifest in lockstep. Without the POST listed, `build_csrf_dimension`
-    // would silently under-report the exempt (not-enforced) mutating route.
+    // The RFC 8058 one-click unsubscribe endpoint is mounted as GET and POST. Without the
+    // POST, `build_csrf_dimension` would under-report this CSRF-exempt mutating route.
     #[cfg(feature = "mail")]
     if config.mail.should_mount_unsubscribe_endpoint() {
         for http_method in ["GET", "POST"] {
@@ -915,7 +897,6 @@ pub(crate) fn append_framework_routes_with_env(
         }
     }
 
-    // The outbox inbox endpoint, under the same predicate as the mount.
     #[cfg(feature = "db")]
     if config.outbox.serves_inbox() {
         infos.push(RouteInfo::framework_route(
@@ -925,12 +906,10 @@ pub(crate) fn append_framework_routes_with_env(
         ));
     }
 
-    // Widget story gallery routes (#1526), listed iff the resolved config
-    // enables them (same gating condition as the router mount).
     #[cfg(feature = "maud")]
     if config.stories.enabled {
-        // The demo backends come from the gallery's own list, so this
-        // listing matches the mounted routes (#3408).
+        // The demo backends come from the gallery's own list, so the listing matches the
+        // mount (#3408).
         for (path, handler) in [
             (crate::stories::STORIES_PATH, "story_gallery_index"),
             ("/_stories/{slug}", "story_gallery_story"),
@@ -942,7 +921,6 @@ pub(crate) fn append_framework_routes_with_env(
         }
     }
 
-    // Dev request inspector routes.
     if crate::config::profile_is_dev(config.profile.as_deref()) {
         let inspector_path = &config.dev.inspector_path;
         let inspector_detail_path = format!("{inspector_path}/requests/{{id}}");
@@ -954,10 +932,6 @@ pub(crate) fn append_framework_routes_with_env(
         }
     }
 
-    // Tracked-job status endpoint (#1627): runtime mounts
-    // `GET /_autumn/jobs/{token}` when `jobs.tracking.route_enabled` (default
-    // true), gated identically to the router mount. List it so the manifest
-    // reflects the mounted route.
     #[cfg(feature = "job-tracking")]
     if config.jobs.tracking.route_enabled {
         infos.push(RouteInfo::framework_get(
@@ -966,7 +940,6 @@ pub(crate) fn append_framework_routes_with_env(
         ));
     }
 
-    // Static file serving is unconditionally mounted at /static.
     infos.push(RouteInfo::framework_get(
         "/static/{*path}".to_owned(),
         "static_files",
@@ -1205,8 +1178,6 @@ mod tests {
         let infos = collect_route_infos(&routes, &sources, &[], &[]).unwrap();
         let methods: Vec<&str> = infos.iter().map(|i| i.method.as_str()).collect();
         assert_eq!(methods, vec!["PUT", "PATCH", "DELETE"]);
-        // The transport method browsers actually use must never appear in
-        // the listing for these routes.
         assert!(infos.iter().all(|i| i.method != "POST"), "{infos:?}");
     }
 
@@ -1272,7 +1243,6 @@ mod tests {
     #[test]
     fn collect_route_infos_missing_source_defaults_to_user() {
         let routes = vec![make_route(Method::GET, "/x", "x")];
-        // empty sources slice — should fall back to User
         let infos = collect_route_infos(&routes, &[], &[], &[]).unwrap();
         assert_eq!(infos[0].source, RouteSource::User);
     }
@@ -1696,9 +1666,8 @@ mod tests {
 
     #[test]
     fn collect_leaves_an_ungoverned_route_without_a_grant() {
-        // `None` is the signal the authority manifest keys `ungoverned_tools`
-        // off, so inventing one here would hide the gap the listing exists to
-        // show.
+        // The authority manifest keys `ungoverned_tools` off `None`; a made-up grant would
+        // hide the gap.
         let route = make_route_with(Method::POST, "/api/notes", "write_note", dummy_api_doc());
         let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[]).unwrap();
 
@@ -1707,9 +1676,8 @@ mod tests {
 
     #[test]
     fn route_info_elides_an_absent_agent_grant() {
-        // Same compatibility convention as the fields before it: elided when
-        // absent, so an existing dump entry stays byte-stable for an older
-        // consumer.
+        // Elided when absent, like the other optional fields, so existing dump entries stay
+        // byte-stable for older consumers.
         let info = RouteInfo {
             method: "POST".to_owned(),
             path: "/api/notes".to_owned(),
@@ -2064,8 +2032,6 @@ mod tests {
             "expected PUT {loggers_path} framework route: {infos:?}"
         );
 
-        // The `/webhooks/replay` route is mounted as POST only; it must never
-        // appear as a phantom GET.
         let replay_path = format!("{prefix}/webhooks/replay");
         assert!(
             !infos
@@ -2093,7 +2059,6 @@ mod tests {
                 && i.classification == RouteClassification::Framework),
             "expected POST {replay_path} framework route: {infos:?}"
         );
-        // `/webhooks/dlq` stays a GET listing.
         let dlq_path = format!("{prefix}/webhooks/dlq");
         assert!(
             infos
@@ -2118,7 +2083,6 @@ mod tests {
         let prefix = config.actuator.prefix.clone();
         let replay_path = format!("{prefix}/webhooks/replay");
 
-        // Runtime set (barrier allow-list source) still contains the path.
         let runtime_paths = crate::actuator::actuator_endpoint_paths(
             &prefix,
             config.actuator.sensitive,
@@ -2130,7 +2094,6 @@ mod tests {
              startup barrier bypasses the POST: {runtime_paths:?}"
         );
 
-        // Listing: no phantom GET, but the real POST is present.
         let mut infos = Vec::new();
         append_framework_routes(&mut infos, &config);
         assert!(
@@ -2197,10 +2160,8 @@ mod tests {
             paths.contains(&"/_stories/{slug}"),
             "enabled stories must list the detail route: {paths:?}"
         );
-        // Review follow-up: the Active search / Autocomplete / Infinite feed
-        // stories' live demo backends must be listed too, or route-dump
-        // consumers can't see them and the OpenAPI/MCP collision preflight
-        // (`collect_framework_get_paths` in router.rs) can't reserve them.
+        // The demo backends must be listed too, or route-dump consumers cannot see them and
+        // the OpenAPI/MCP collision preflight cannot reserve them.
         for (demo_path, _) in crate::stories::demo_routes() {
             assert!(
                 paths.contains(&demo_path),
@@ -2256,7 +2217,6 @@ mod tests {
             crate::mail::UNSUBSCRIBE_PATH
         );
 
-        // When the endpoint is NOT mounted, neither route is listed.
         let plain = AutumnConfig::default();
         assert!(!plain.mail.should_mount_unsubscribe_endpoint());
         let mut infos = Vec::new();
@@ -2521,7 +2481,6 @@ mod tests {
             "dump must mirror the runtime CSP resolution verbatim"
         );
 
-        // With the nonce disabled the raw default is reported (no placeholder).
         let mut plain = AutumnConfig::default();
         plain.security.headers.csp_nonce.enabled = false;
         let plain_dump = SecurityDump::from_config(&plain);
@@ -2589,7 +2548,6 @@ mod tests {
             dump.csrf.exempt_paths
         );
 
-        // When the endpoint is NOT mounted, the path must not be folded in.
         let mut plain = AutumnConfig::default();
         plain.mail.mount_unsubscribe_endpoint = false;
         let plain_dump = SecurityDump::from_config(&plain);
@@ -2691,9 +2649,7 @@ mod tests {
 
     #[test]
     fn a_repository_auto_api_route_is_db_bound_without_a_declared_extractor() {
-        // The generated CRUD handlers own their pool checkout internally, so no
-        // extractor appears in a signature the macro could read — but the route
-        // is database-backed by construction.
+        // Generated CRUD handlers check out the pool internally, so no extractor shows it.
         let route = make_repo_route(Method::GET, "/api/posts", "list", Some(repo_meta(true)));
 
         let infos = collect_route_infos(&[route], &[RouteSource::User], &[], &[])

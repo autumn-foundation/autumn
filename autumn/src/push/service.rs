@@ -305,16 +305,12 @@ impl WebPush {
         message: &PushMessage,
     ) -> Result<PushDeliveryReport, PushError> {
         let principal = principal.into();
-        // Fail fast, before touching the store: a missing key, an unusable
-        // `sub`, or an oversize payload fails identically for every device, so
-        // discovering it per-device would just be N copies of the same error.
+        // Fail before touching the store: a missing key, a bad `sub` or an oversize payload fails
+        // identically for every device.
         let vapid = self.vapid.as_ref().ok_or(PushError::NotConfigured)?;
-        // Checked here, not in `new`: the constructor is infallible (and takes
-        // `impl Into<String>`), so a service built by
-        // `AppBuilder::with_web_push` — from a secrets manager, say — never
-        // passes through the boot-time `[push]` validation. Without this an
-        // invalid `sub` would sign every request and every push service would
-        // refuse it, showing up only as `report.failed` with no cause named.
+        // Checked here because `new` is infallible: a service registered through
+        // `AppBuilder::with_web_push` skips the boot-time `[push]` validation, and a bad `sub`
+        // would otherwise show up only as `report.failed` with no cause named.
         self.validate_subject()?;
         let payload = Self::encode(message)?;
 
@@ -324,28 +320,17 @@ impl WebPush {
             .await?;
 
         if subscriptions.is_empty() {
-            // Usually benign (the user never granted permission), but it is
-            // also what a principal-namespace mismatch looks like — the
-            // subscribe route recorded `user:42` while the send asked for
-            // `42`. Naming the id that was looked up is the quickest way to
-            // spot that, and there is no other symptom.
+            // Usually benign, but it is also the only symptom of a principal mismatch (subscribed
+            // as `user:42`, sent to `42`), so name the id that was looked up.
             tracing::debug!(
                 principal = %principal,
                 "no push subscriptions for this principal; nothing dispatched"
             );
         }
 
-        // Dispatched concurrently, with a bound.
-        //
-        // Serially, one device that accepts the connection and then never
-        // answers holds the whole send for the transport's full timeout, and
-        // `send_many` queues every later recipient behind it — a principal at
-        // the subscription cap could stall one notification for minutes.
-        // Since every endpoint is client-chosen, that is reachable on purpose.
-        //
-        // Bounded rather than unbounded: a fan-out is still someone's
-        // connection pool, and `MAX_CONCURRENT_DELIVERIES` at a time is plenty
-        // to keep a stalled device from blocking its live siblings.
+        // Concurrent, so a client-chosen endpoint that never answers cannot hold the whole send
+        // (and every later `send_many` recipient) for the transport's full timeout. Bounded,
+        // because the fan-out shares a connection pool.
         let mut report = PushDeliveryReport::default();
         let mut deliveries = futures::stream::iter(
             subscriptions
@@ -357,8 +342,7 @@ impl WebPush {
             report.merge(outcome?);
         }
         drop(deliveries);
-        // Deterministic order regardless of which device answered first, so a
-        // caller (and a test) can compare reports.
+        // Stable order whichever device answered first, so reports can be compared.
         report.pruned.sort();
         Ok(report)
     }
@@ -381,10 +365,8 @@ impl WebPush {
     where
         P: Into<PushPrincipal> + Send,
     {
-        // Bounded like the per-device fan-out in `send`. The limit is smaller,
-        // so total connections stay at most
-        // `MAX_CONCURRENT_PRINCIPALS * MAX_CONCURRENT_DELIVERIES`. A recipient
-        // whose endpoints all time out must not delay the others.
+        // Concurrent so a recipient whose endpoints all time out does not delay the others.
+        // Connections stay at most `MAX_CONCURRENT_PRINCIPALS * MAX_CONCURRENT_DELIVERIES`.
         let mut report = PushDeliveryReport::default();
         let mut first_error = None;
         let mut sends = futures::stream::iter(
@@ -394,8 +376,7 @@ impl WebPush {
         )
         .buffer_unordered(MAX_CONCURRENT_PRINCIPALS);
         while let Some(outcome) = futures::StreamExt::next(&mut sends).await {
-            // Let every recipient finish. An early `?` would drop the others
-            // mid-send and lose their pruning.
+            // No early `?`: it would drop the other sends mid-flight and lose their pruning.
             match outcome {
                 Ok(outcome) => report.merge(outcome),
                 Err(e) => first_error = first_error.or(Some(e)),
@@ -450,10 +431,8 @@ impl WebPush {
         let request = match self.build_request(vapid, subscription, payload) {
             Ok(request) => request,
             Err(e) => {
-                // A row that no longer encrypts (a key corrupted in storage,
-                // an endpoint that is no longer a valid URL) can never
-                // succeed, but it must not abort delivery to this principal's
-                // other devices either.
+                // A row that cannot be encoded (corrupt key, invalid endpoint URL) never succeeds,
+                // but must not abort delivery to the principal's other devices.
                 tracing::warn!(
                     endpoint.origin = %endpoint_origin(subscription.endpoint()),
                     error = %e,
@@ -481,26 +460,18 @@ impl WebPush {
             }
         };
 
-        // RFC 8030 §7.3: `404 Not Found` and `410 Gone` are the push service
-        // saying this subscription no longer exists. Every OTHER failure —
-        // including a 5xx outage or a 429 rate limit — is transient, and
-        // pruning on those would silently unsubscribe every user during an
-        // incident, unrecoverable without them re-granting permission.
+        // RFC 8030 §7.3: only `404` and `410` mean the subscription is gone. Anything else,
+        // including a 5xx outage or a 429, is transient; pruning on it would unsubscribe every
+        // user during an incident, unrecoverable until they re-grant permission.
         match status {
             200..=299 => Ok(PushDeliveryReport {
                 delivered: 1,
                 ..Default::default()
             }),
             404 | 410 => {
-                // Unscoped: the endpoint is dead for whoever owns it.
-                //
-                // A store failure here is NOT propagated. The message has
-                // already been dispatched and answered; failing the whole send
-                // now would discard the deliveries that already succeeded to
-                // this principal's other devices and abort the ones still to
-                // come — the exact opposite of "a dead device never blocks a
-                // live one". The row simply survives to be pruned on the next
-                // send.
+                // Unscoped: the endpoint is dead for whoever owns it. A store failure is not
+                // propagated: that would discard the other devices' deliveries. The row is pruned
+                // on the next send instead.
                 match self
                     .store
                     .boxed_remove(subscription.endpoint().to_owned(), None)
@@ -582,16 +553,14 @@ impl WebPush {
     /// config block.
     fn default_for(state: &AppState) -> Self {
         let config = state.config();
-        // Already validated at boot by `AppBuilder`, so a key that fails to
-        // load here means the config was replaced at runtime. Treating that as
-        // "unconfigured" is the safe reading: sends then fail loudly with
-        // `NotConfigured` rather than silently signing with a stale key.
+        // Validated at boot, so a failure here means the config changed at runtime. Treat it as
+        // unconfigured: sends fail with `NotConfigured` rather than sign with a stale key.
         let vapid = config.push.load_vapid_key().unwrap_or_else(|e| {
             tracing::error!(error = %e, "the `[push]` VAPID key failed to load; sends will fail");
             None
         });
-        // Validated at boot; if it somehow fails here the configuration was
-        // replaced at runtime, and the documented default is the safe reading.
+        // Validated at boot; a failure here means the config changed at runtime, and the
+        // documented default is the safe fallback.
         let subject = config
             .push
             .validated_subject()
@@ -656,38 +625,25 @@ impl WebPush {
 }
 
 impl axum::extract::FromRequestParts<AppState> for WebPush {
-    // Resolution always succeeds (a store fallback always exists, and a
-    // missing key surfaces from `send`, not extraction) — the same contract
-    // `Notifications` and `Session` have.
+    // Always succeeds: a store fallback always exists, and a missing key surfaces from `send`.
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(
         _parts: &mut axum::http::request::Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Fast path: a service registered by `AppBuilder::with_web_push` /
-        // `with_push_subscription_store`, or resolved by an earlier request.
+        // Registered by `AppBuilder::with_web_push` / `with_push_subscription_store`, or resolved
+        // by an earlier request.
         if let Some(existing) = state.extension::<Self>() {
             return Ok((*existing).clone());
         }
 
-        // Resolve OUTSIDE `extension_or_insert_with`.
-        //
-        // That helper holds the extensions **write** lock while it calls its
-        // closure, and `default_for` reads other extensions off the same state
-        // (the shared outbound HTTP client, and the mock registry under test).
-        // A `std::sync::RwLock` is not reentrant, so resolving inside the
-        // closure takes a read lock on a lock this thread already holds for
-        // writing — and the request hangs forever. `Notifications` can resolve
-        // inline only because its closure touches nothing but the database
-        // pool.
-        //
-        // Building before the lock costs at most a redundant construction when
-        // two requests race; `extension_or_insert_with` re-checks under the
-        // lock, so exactly one is stored and the loser is dropped.
+        // Resolve outside `extension_or_insert_with`: it holds the extensions write lock while
+        // running its closure, and `default_for` reads other extensions (the HTTP client, the
+        // test mock registry). `std::sync::RwLock` is not reentrant, so that would deadlock. A
+        // racing request builds a redundant service; the re-check under the lock keeps one.
         let resolved = Self::default_for(state);
-        // `extension_or_insert_with` keeps the resolved service (and thus the
-        // memory store's contents) stable across requests.
+        // Stored so the service, and a memory store's contents, persist across requests.
         Ok((*state.extension_or_insert_with::<Self>(|| resolved)).clone())
     }
 }
@@ -715,9 +671,8 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use p256::elliptic_curve::sec1::ToSec1Point;
 
-    // The RFC 8291 §5 user agent, whose PRIVATE key lets these tests decrypt
-    // what the framework produced — proving the browser would really be able
-    // to read it, not just that some bytes were sent.
+    // The RFC 8291 §5 user agent. Its private key lets these tests decrypt what was sent, proving
+    // a browser could read it.
     const UA_PRIVATE: &str = "q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94";
     const UA_PUBLIC: &str =
         "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
@@ -941,8 +896,7 @@ mod tests {
             .verify(signing_input.as_bytes(), &signature)
             .expect("the push service must be able to verify the signature");
 
-        // The audience must be this endpoint's origin — a JWT minted for a
-        // different push service is rejected by the real one.
+        // The audience must be this endpoint's origin: other push services reject the JWT.
         let claims = URL_SAFE_NO_PAD
             .decode(signing_input.split('.').nth(1).expect("claims"))
             .expect("claims base64url");
@@ -1081,7 +1035,7 @@ mod tests {
             vec!["https://push.example.com/dead".to_owned()]
         );
 
-        // The whole point of pruning: the next send must not dispatch again.
+        // The next send must not dispatch to the pruned endpoint.
         let second = push
             .send(7_i64, &PushMessage::new("Hi", "again"))
             .await
@@ -1118,9 +1072,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_transient_5xx_is_counted_but_never_prunes() {
-        // Pruning on a 500 would silently unsubscribe every user during a push
-        // service outage — unrecoverable without the user re-granting
-        // permission.
+        // Pruning on a 5xx would unsubscribe every user during a push service outage.
         let transport =
             RecordingPushTransport::new().responding_with("https://push.example.com/a", 503);
         let (push, _) = web_push_with(transport.clone());
@@ -1211,9 +1163,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_stalled_device_does_not_hold_up_its_live_siblings() {
-        // Serially, one endpoint that accepts the connection and never answers
-        // holds the whole send for the transport's full timeout. Every
-        // endpoint is client-chosen, so this is reachable on purpose.
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1230,9 +1179,8 @@ mod tests {
             ) -> crate::push::transport::PushTransportFuture<'a> {
                 Box::pin(async move {
                     if request.endpoint.contains("stall") {
-                        // Resolves only once every other device has been
-                        // dispatched — impossible unless they run
-                        // concurrently with this one.
+                        // Resolves only once the other devices are in flight, which needs
+                        // concurrent dispatch.
                         for _ in 0..1_000 {
                             if self.in_flight.load(Ordering::SeqCst) >= 2 {
                                 break;
@@ -1280,8 +1228,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_delivery_still_prunes_and_reports_deterministically() {
-        // Concurrency must not change what a send reports, only how fast it
-        // gets there — including the order of `pruned`, which callers compare.
+        // Concurrency must not change the report, including the order of `pruned`.
         let transport = RecordingPushTransport::new()
             .responding_with("https://push.example.com/dead-a", 410)
             .responding_with("https://push.example.com/dead-b", 404);
@@ -1309,7 +1256,6 @@ mod tests {
             ],
             "pruned must be stably ordered whichever device answered first"
         );
-        // And the pruning really happened.
         assert_eq!(
             push.send(7_i64, &PushMessage::new("Hi", "again"))
                 .await
@@ -1321,16 +1267,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_invalid_subject_is_refused_before_any_dispatch() {
-        // `WebPush::new` is infallible and takes `impl Into<String>`, so a
-        // service registered through `AppBuilder::with_web_push` never passes
-        // through the boot-time `[push]` validation. Without this check an
-        // invalid `sub` would sign every request and every push service would
-        // refuse it, showing up only as `report.failed` with no cause named.
+        // `WebPush::new` is infallible, so a service built with it skips boot-time `[push]`
+        // validation.
         let transport = RecordingPushTransport::new();
         let push = WebPush::new(
             MemoryPushSubscriptionStore::new(),
             VapidKey::generate(),
-            // A bare address, not a `mailto:` URI — the common mistake.
+            // A bare address, not a `mailto:` URI.
             "ops@example.com",
             transport.clone(),
         );
@@ -1619,9 +1562,8 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_defaults_to_the_documented_value() {
-        // `ttl.parse().is_ok()` would pass for `0`, which means
-        // deliver-now-or-drop — a real behavioural difference for the offline
-        // device this feature exists to reach.
+        // Pinned to the exact value: a TTL of `0` means deliver-now-or-drop, which loses
+        // messages for offline devices.
         let transport = RecordingPushTransport::new();
         let (push, _) = web_push_with(transport.clone());
         push.subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
@@ -1652,10 +1594,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_jwt_exp_is_anchored_to_the_frameworks_clock() {
-        // A broken clock (or the `unwrap_or(0)` in `build_request` firing)
-        // would put `exp` in 1970 and make every real send be rejected by the
-        // push service — with signature verification still passing, so no
-        // other test would notice.
+        // A broken clock (or the `unwrap_or(0)` in `build_request` firing) puts `exp` in 1970,
+        // so push services reject every send while signatures still verify.
         use chrono::{TimeZone as _, Utc};
 
         let issued = Utc.timestamp_opt(1_800_000_000, 0).single().expect("time");
@@ -1754,10 +1694,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_prune_does_not_abort_delivery_to_the_other_devices() {
-        // The prune happens AFTER dispatch. Propagating a store failure there
-        // would discard the deliveries that already succeeded and skip the
-        // ones still to come — the opposite of "a dead device never blocks a
-        // live one".
+        // The prune runs after dispatch; propagating its failure would discard the other
+        // devices' deliveries.
         let transport =
             RecordingPushTransport::new().responding_with("https://push.example.com/dead", 410);
         let push = WebPush::new(
@@ -1799,10 +1737,9 @@ mod tests {
 
     #[tokio::test]
     async fn each_endpoint_gets_a_jwt_audienced_to_its_own_push_service() {
-        // Real deployments mix FCM, Mozilla autopush and WNS. A bug that
-        // computed `aud` once — or reused one Authorization header across
-        // devices — would pass every single-origin test and then be rejected
-        // by every push service but the first.
+        // Real deployments mix push services. Computing `aud` once, or reusing one
+        // Authorization header, would pass single-origin tests and fail on every service but
+        // the first.
         let transport = RecordingPushTransport::new();
         let (push, _) = web_push_with(transport.clone());
         for endpoint in [
@@ -1841,8 +1778,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_device_gets_its_own_encryption_material() {
-        // One ephemeral key or salt reused across two subscriptions in the
-        // same send would be an actual cryptographic break.
+        // Reusing an ephemeral key or salt across subscriptions would be a cryptographic break.
         let transport = RecordingPushTransport::new();
         let (push, _) = web_push_with(transport.clone());
         for endpoint in ["https://push.example.com/a", "https://push.example.com/b"] {

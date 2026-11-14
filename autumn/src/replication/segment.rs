@@ -461,11 +461,8 @@ pub fn decode_segment(payload: &[u8]) -> Result<(SegmentHeader, Vec<u8>), Segmen
             version: header.version,
         });
     }
-    // A segment is one WAL byte range, bounded in practice by the checkpoint
-    // threshold. Refuse a header that claims more than any real segment can hold
-    // BEFORE inflating anything: the periodic verifier runs this inside the app
-    // process, so an unbounded inflate of a crafted object is an OOM of the whole
-    // app, not just a failed restore.
+    // Refuse an oversized claim BEFORE inflating: the periodic verifier runs inside the app
+    // process, so an unbounded inflate of a crafted object would take the whole app down.
     if header.uncompressed_len > MAX_SEGMENT_BYTES {
         return Err(SegmentError::DigestMismatch {
             expected_len: header.uncompressed_len,

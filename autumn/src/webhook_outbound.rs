@@ -297,7 +297,7 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
         let counted = log_delivery_repeats_failure(logs.get(&log.id), &log);
         logs.insert(log.id.clone(), log.clone());
 
-        // Manage subscription consecutive failures and auto-disabling state
+        // Count consecutive failures; 50 in a row fail the subscription.
         let mut subs = self
             .subscriptions
             .write()
@@ -547,10 +547,9 @@ impl WebhookOutboundManager {
                 continue;
             }
 
-            // A relay re-send finds the log of its first send. If a delivery
-            // attempt started, the job exists: skip. If not, the first send
-            // can have stopped before the enqueue: enqueue again. The copy
-            // has the same `webhook-id`, so the receiver can drop it.
+            // A relay re-send finds the log of its first send. If an attempt started, the job
+            // exists: skip. If not, the first send may have stopped before the enqueue: enqueue
+            // again. The copy has the same `webhook-id`, so the receiver can drop it.
             let mut existing = None;
             let log_id = match message_id {
                 Some(message_id) => {
@@ -581,7 +580,6 @@ impl WebhookOutboundManager {
                 timestamp: crate::time::ambient_now(),
             });
 
-            // Register the initial attempt in local storage
             if existing.is_none()
                 && let Err(e) = self.handler.log_delivery(log.clone()).await
             {
@@ -589,14 +587,12 @@ impl WebhookOutboundManager {
                 continue;
             }
 
-            // If a delegate extension is registered, run it (delegates to Harvest workflow)
             if let Some(delegate_ext) = state.extension::<WebhookDelegateExt>() {
                 tracing::info!(subscription_id = %sub.id, "WebhookOutboundManager::dispatch: delegating webhook delivery via runtime hook");
                 if let Err(e) = (delegate_ext.0)(state, sub, log).await {
                     errors.push(e);
                 }
             } else {
-                // Fallback: enqueue a standard background job
                 tracing::debug!(subscription_id = %sub.id, "WebhookOutboundManager::dispatch: enqueuing fallback webhook delivery job");
                 if let Some(job_client) = crate::job::global_job_client() {
                     let job_payload = serde_json::json!({
@@ -731,7 +727,7 @@ pub fn deliver_webhook_job(
             AutumnError::internal_server_error_msg("WebhookOutboundManager not found in extensions")
         })?;
 
-        // Support both self-contained payload structure and legacy log_id lookup (for replays)
+        // The payload carries either the subscription and log, or a `log_id` to look up.
         let (sub, mut log) = if let Some(sub_val) = payload.get("subscription") {
             let _payload_sub: WebhookSubscription = serde_json::from_value(sub_val.clone())
                 .map_err(|e| {
@@ -764,8 +760,8 @@ pub fn deliver_webhook_job(
                 AutumnError::not_found_msg(format!("delivery log {log_id} not found"))
             })?;
 
-            // A second job for a delivered log (an outbox re-send can enqueue
-            // one) must not send again.
+            // A second job for a delivered log (an outbox re-send can enqueue one) must not send
+            // again.
             if !is_replay
                 && log
                     .response_status
@@ -779,7 +775,7 @@ pub fn deliver_webhook_job(
                 return Ok(());
             }
 
-            // Load latest subscription state to respect emergency rotations/disable
+            // Reload the subscription so a rotated secret or a disable applies.
             let sub = load_current_subscription(&manager, &log).await?;
             (sub, log)
         };
@@ -806,9 +802,8 @@ pub fn deliver_webhook_job(
             tracing::info!(subscription_id = %sub.id, "Replaying webhook delivery for failed subscription");
         }
 
-        // Stripe-style payload signing: t=<timestamp>,v1=<signature>
-        // The receiver checks `t=` against its own real clock, so sign with
-        // the ambient clock: real time outside a `Sim` (issue #2967).
+        // Stripe-style `t=<timestamp>,v1=<signature>`. The receiver checks `t=` against its real
+        // clock, so sign with the ambient clock: real time outside a `Sim` (#2967).
         let timestamp = crate::time::ambient_now().timestamp();
         let signing_payload = format!("{timestamp}.{}", log.payload);
         let signature = crate::security::config::hmac_sha256_hex(
@@ -817,10 +812,8 @@ pub fn deliver_webhook_job(
         );
         let signature_header = format!("t={timestamp},v1={signature}");
 
-        // Standard Webhooks headers (issue #3062). `webhook-id` is the log
-        // id. Job retries use the same log, so each attempt sends the same
-        // id. `webhook-signature` signs the id too, so a replay with a new id
-        // fails the check.
+        // Standard Webhooks headers (#3062). `webhook-id` is the log id, so job retries send the
+        // same id. `webhook-signature` signs the id too, so a replay with a new id fails the check.
         let mut request_headers = HashMap::new();
         request_headers.insert("Content-Type".to_owned(), "application/json".to_owned());
         request_headers.insert("Autumn-Signature".to_owned(), signature_header);
@@ -832,19 +825,10 @@ pub fn deliver_webhook_job(
         );
 
         let start = crate::time::ambient_monotonic();
-        // `target_url` is a subscriber-chosen destination, not one the app
-        // itself picked — exactly the case `ssrf_safe()` exists for. Without
-        // it this POST carries none of the private/link-local/loopback/cloud-
-        // metadata deny-list `Client::get_ssrf_safe` documents. `ssrf_safe()`
-        // alone would route through the custom send path, which (like the
-        // mock path) bypasses `send_recorded`'s circuit breaker by default —
-        // right for a one-off fetch of an arbitrary URL, wrong for repeated
-        // deliveries to the same subscriber host. `breaker_scoped()` keeps
-        // the fail-fast-on-a-down-receiver behavior every other outbound call
-        // gets, correctly ordered with the mock bypass, capsule replay, and
-        // capsule *recording* of the attempt — all handled inside
-        // `send_recorded` itself, not layered on here. See
-        // docs/security/2026-09-03-webhook-ssrf/README.md.
+        // The subscriber chooses `target_url`, so `ssrf_safe()` applies the private, loopback and
+        // cloud-metadata deny-list. That path skips the circuit breaker by default, which suits a
+        // one-off fetch but not repeated deliveries to one host, so `breaker_scoped()` restores it.
+        // See docs/security/2026-09-03-webhook-ssrf/README.md.
         let mut req = manager
             .client
             .named(&sub.target_url)
@@ -1011,7 +995,7 @@ async fn handle_delivery_failure(
     error_msg: String,
 ) -> AutumnResult<()> {
     if attempts_remain(manager, &log) {
-        // Return an error to signal the background job runner to retry this job
+        // An error makes the job engine retry.
         Err(AutumnError::internal_server_error_msg(format!(
             "delivery attempt {} failed, scheduled retry: {error_msg}",
             log.attempt
@@ -1019,7 +1003,7 @@ async fn handle_delivery_failure(
     } else {
         log.is_dlq = true;
         manager.store().log_delivery(log).await?;
-        // Return Ok(()) to mark the permanently failed job as complete and send to DLQ
+        // `Ok` ends the job: the log stays in the DLQ.
         tracing::warn!(subscription_id = %sub.id, "Webhook delivery failed permanently; sent to DLQ: {}", error_msg);
         Ok(())
     }
@@ -1718,10 +1702,8 @@ mod tests {
 
         let state = AppState::for_test();
         let store = Arc::new(InMemoryOutboundWebhookHandler::new());
-        // Deliberately NOT registering an `HttpMockRegistryExt` — the mock
-        // path short-circuits before the SSRF check runs (`send_recorded`
-        // checks `self.mock.is_some()` first), so this test needs the real
-        // send path to observe whether the connection was actually blocked.
+        // No `HttpMockRegistryExt`: the mock path returns before the SSRF check, so only the real
+        // send path shows whether the connection was blocked.
         install_outbound_webhook_manager(&state, store.clone(), 1, DEFAULT_WEBHOOK_MAX_ATTEMPTS);
 
         let sub = sample_subscription("sub_ssrf", &target_url, WebhookSubscriptionStatus::Active);

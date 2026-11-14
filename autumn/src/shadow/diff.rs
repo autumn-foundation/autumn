@@ -136,9 +136,8 @@ impl NormalizedBody {
     fn canonical_bytes(&self) -> Vec<u8> {
         match self {
             Self::Empty => Vec::new(),
-            // Canonicalisation already sorted every object's keys, so
-            // `to_string` is stable regardless of whether `serde_json` was
-            // compiled with `preserve_order`.
+            // `canonicalize` sorted every object's keys, so this is stable with or without
+            // serde_json's `preserve_order`.
             Self::Json(value) => serde_json::to_vec(value).unwrap_or_default(),
             Self::Text(text) => text.as_bytes().to_vec(),
             Self::Bytes(bytes) => bytes.to_vec(),
@@ -309,25 +308,14 @@ pub fn normalize_body(facts: &ResponseFacts) -> NormalizedBody {
         return NormalizedBody::Empty;
     }
 
-    // NB: `facts.content_type` is deliberately unread. It is recorded for the
-    // operator's benefit and never consulted here — see the two branches below.
-    // Attempted on every body, with no content-type sniff in front of it. A
-    // sniff for `{`/`[` missed scalar JSON — `null`, `true`, `1`, `"ok"` — so a
-    // body that parsed as JSON on the labelled side fell through to `Text` on
-    // the unlabelled one, and a header-only difference became a body
-    // divergence. Parsing is the only symmetric test. A non-JSON body fails on
-    // its first byte, so this costs nothing on the common path.
+    // `facts.content_type` is never consulted: headers are outside the comparison, so a body must
+    // normalize the same whichever side labelled it. Parsing every body is the only symmetric
+    // test (a `{`/`[` sniff misses scalar JSON), and a non-JSON body fails on its first byte.
     if let Ok(value) = serde_json::from_slice::<Value>(&facts.body) {
         return NormalizedBody::Json(canonicalize(&value));
     }
 
-    // UTF-8 decides this, NOT the content type. Headers are explicitly outside
-    // the comparison contract, so two builds returning the identical bytes
-    // `hello` must not diverge merely because only one of them said
-    // `text/plain` — that would put a header back inside the contract through
-    // the back door, as a difference in normalized *form* rather than in
-    // content. A genuinely binary body is not valid UTF-8 and still lands in
-    // `Bytes`.
+    // UTF-8 decides this, not the content type, for the same reason.
     if let Ok(text) = std::str::from_utf8(&facts.body) {
         return NormalizedBody::Text(normalize_text(text));
     }
@@ -406,11 +394,8 @@ fn sample(body: &NormalizedBody, filter: &ParameterFilter, sample_limit: usize) 
     let NormalizedBody::Json(value) = body else {
         return None;
     };
-    // Parsing as JSON is not on its own a licence to record. `ParameterFilter`
-    // redacts by KEY NAME, so a value only has protection if it sits under one:
-    // a `text/plain` six-digit OTP parses as a JSON number, and a bare scalar —
-    // or a scalar inside an array — offers the filter nothing to match. Those
-    // record a digest and a length like any other unsamplable body.
+    // `ParameterFilter` redacts by key name, so a scalar with no key above it (a `text/plain`
+    // OTP parses as a JSON number) cannot be filtered and is not recorded.
     if !scalars_are_all_keyed(value) {
         return None;
     }
@@ -437,10 +422,7 @@ fn truncate_to_serialized_budget(rendered: &str, sample_limit: usize) -> Option<
     const QUOTES: usize = 2;
 
     let reserved = QUOTES.saturating_add(TRUNCATION_MARKER.len());
-    // Not even the quoted marker fits. Returning it anyway would overshoot the
-    // budget by exactly the amount this function exists to prevent, so the
-    // honest answer is no sample at all — the record still carries the digest,
-    // the length, and how the body was normalized.
+    // Not even the quoted marker fits: record no sample rather than overshoot the budget.
     let budget = sample_limit.checked_sub(reserved)?;
 
     let mut truncated = String::new();
@@ -721,8 +703,6 @@ mod tests {
 
     #[test]
     fn identical_bytes_do_not_diverge_because_only_one_side_named_a_content_type() {
-        // Headers are outside the comparison contract, so a header difference
-        // must not reappear as a difference in normalized *form*.
         let filter = ParameterFilter::default();
         let labelled = ResponseFacts::new(
             200,
@@ -735,7 +715,6 @@ mod tests {
             Comparison::Match
         ));
 
-        // ...and a genuinely different body still diverges.
         let other = ResponseFacts::new(200, None, Bytes::from_static(b"goodbye"));
         assert!(matches!(
             compare(&labelled, &other, &filter, 2048),
@@ -745,9 +724,8 @@ mod tests {
 
     #[test]
     fn scalar_json_is_recognised_without_a_content_type() {
-        // `{`/`[` sniffing missed these, so a labelled side became `Json` while
-        // an unlabelled one became `Text` — a header-only difference surfacing
-        // as a body divergence.
+        // A `{`/`[` sniff misses these, which would turn a header-only difference into a body
+        // divergence.
         let filter = ParameterFilter::default();
         for body in ["null", "true", "1", "\"ok\"", "1.5"] {
             let labelled = ResponseFacts::new(
@@ -768,9 +746,8 @@ mod tests {
 
     #[test]
     fn a_scalar_body_is_never_sampled_however_it_is_labelled() {
-        // A `text/plain` six-digit OTP parses as a JSON number. Comparing it
-        // structurally is right; RECORDING it is not — `ParameterFilter`
-        // redacts by key name, and a bare scalar gives it nothing to match.
+        // A `text/plain` OTP parses as a JSON number. It is compared structurally but never
+        // recorded: a bare scalar has no key for `ParameterFilter` to match.
         let filter = ParameterFilter::default();
         for (content_type, body) in [
             (Some("text/plain".to_owned()), "482913"),
@@ -812,11 +789,8 @@ mod tests {
 
     #[test]
     fn a_list_of_strings_under_a_key_is_still_sampled() {
-        // Regression: an earlier form of this rule demanded that every scalar be
-        // DIRECTLY under a key, which refused `{"items": ["a", "b"]}` — an
-        // extremely ordinary shape whose array IS governed by `items`. Listing
-        // `items` in `filter_parameters` redacts the whole array, so the filter
-        // can be asked about it and the excerpt is safe to record.
+        // The array is governed by `items`: listing that key in `filter_parameters` redacts the
+        // whole array, so the excerpt is safe to record.
         let filter = ParameterFilter::default();
         let body = |raw: &str| {
             ResponseFacts::new(
@@ -863,8 +837,6 @@ mod tests {
 
     #[test]
     fn keyed_bodies_are_still_sampled_including_arrays_of_objects() {
-        // The common shape must keep its excerpt: every scalar here sits under
-        // a key the filter can be asked about.
         let filter = ParameterFilter::default();
         let json_body = |body: &str| {
             ResponseFacts::new(
@@ -962,10 +934,8 @@ mod tests {
 
     #[test]
     fn a_truncated_sample_fits_its_budget_once_serialized() {
-        // The excerpt is stored as a JSON string, so serializing re-adds the
-        // quotes and escapes every quote and backslash in the prefix. Cutting
-        // the source at the budget therefore overshoots the number the operator
-        // configured.
+        // The excerpt is stored as a JSON string, so serializing adds quotes and escapes; cutting
+        // the source at the budget would overshoot it.
         let filter = ParameterFilter::default();
         let quoted = format!(r#"{{"blob":"{}"}}"#, "a\"b\\c".repeat(400));
         for limit in [8usize, 16, 64, 512] {
@@ -985,10 +955,7 @@ mod tests {
 
     #[test]
     fn a_budget_too_small_for_the_marker_records_no_sample_at_all() {
-        // The quoted marker serializes to 5 bytes, so any budget below that
-        // cannot be honoured by emitting it — returning it anyway would
-        // overshoot by exactly what the budget exists to prevent. No sample is
-        // the honest answer; the digest and length still prove the divergence.
+        // The quoted marker serializes to 5 bytes, so a smaller budget records no sample.
         let filter = ParameterFilter::default();
         for limit in 0usize..=4 {
             let Comparison::Diverged(d) =
@@ -1017,8 +984,7 @@ mod tests {
     #[test]
     fn the_sample_budget_is_bytes_not_characters() {
         let filter = ParameterFilter::default();
-        // Each `€` is three UTF-8 bytes. Counting characters would let this
-        // store roughly three times the operator's nominal budget.
+        // Each `€` is three UTF-8 bytes; counting characters would store three times the budget.
         let wide = format!(r#"{{"note":"{}"}}"#, "€".repeat(200));
         let Comparison::Diverged(d) = compare(&json(200, &wide), &json(200, "{}"), &filter, 64)
         else {

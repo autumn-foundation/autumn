@@ -194,8 +194,8 @@ pub(crate) fn with_page_cursor(url: &str, after: Option<i64>) -> String {
     out
 }
 
-// The toast constants need no `maud`, as before the split: an app without
-// `maud` can still target the region in an OOB swap or an `HX-Trigger`.
+// The toast constants need no `maud`: an app without `maud` can still target the
+// region in an OOB swap or an `HX-Trigger`.
 
 /// The default id for the `toast_region` container, and the OOB target
 /// `toast` appends into.

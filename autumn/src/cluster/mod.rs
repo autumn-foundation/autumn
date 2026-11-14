@@ -387,9 +387,7 @@ impl ClusterHandle {
     /// push intervals, they are not instantaneously identical.
     #[must_use]
     pub fn members(&self) -> Vec<ClusterMemberInfo> {
-        // Read the clock before taking either lock: a clock source may lock
-        // internals of its own, and a view is cheap enough not to hold three
-        // locks at once.
+        // Read the clock before taking either lock: a clock source may take a lock of its own.
         let now = self.inner.clock.monotonic();
         let incarnation = self.inner.incarnation.load(Ordering::Relaxed);
 
@@ -397,8 +395,7 @@ impl ClusterHandle {
         let overlay = self.inner.lock_overlay();
 
         let mut view = Vec::with_capacity(state.members.len().saturating_add(1));
-        // This node is always in its own view. A one-member view is healthy, and
-        // a node has no silence to measure against itself.
+        // This node is always in its own view: it has no silence to measure against itself.
         view.push(ClusterMemberInfo {
             id: self.inner.node_id.clone(),
             addr: self.inner.advertise_addr.clone(),
@@ -407,9 +404,8 @@ impl ClusterHandle {
         });
 
         for (id, record) in &state.members {
-            // Replicated `Left` is a tombstone, not a member; the local overlay
-            // then removes whoever has gone silent past the suspicion timeout.
-            // The view is exactly that intersection.
+            // The view is replicated `Alive` members (`Left` is a tombstone) minus those the
+            // local overlay has seen silent past the suspicion timeout.
             if id == &self.inner.node_id || record.status != membership::MemberStatus::Alive {
                 continue;
             }
@@ -517,9 +513,7 @@ impl ClusterHealthIndicator {
 
 impl crate::actuator::HealthIndicator for ClusterHealthIndicator {
     fn check(&self) -> futures::future::BoxFuture<'_, crate::actuator::HealthCheckOutput> {
-        // Reading the view is two uncontended mutex acquisitions and a clone;
-        // there is nothing to await, so the check can never trip the registry's
-        // per-indicator timeout.
+        // Synchronous and cheap, so the check can never trip the per-indicator timeout.
         Box::pin(std::future::ready(self.snapshot()))
     }
 
@@ -648,12 +642,8 @@ pub fn install_from_config(
         return Ok(());
     }
 
-    // One node per app. A second install would bind a second listener, start a
-    // second set of loops, and replace the extension — leaving the actuator
-    // reporting the first node (its health component and metrics source are
-    // registered under a name that is now taken, and those registrations fail)
-    // while application code reads the second. Two nodes in one *process* are
-    // fine and the tests do exactly that; they have one `AppState` each.
+    // One node per app: a second install would replace the extension while the actuator kept
+    // reporting the first node. Two nodes in one process are fine with one `AppState` each.
     if state.extension::<ClusterHandle>().is_some() {
         return Err(AutumnError::internal_server_error_msg(
             "cluster: a ClusterHandle is already installed on this AppState — \
@@ -662,19 +652,13 @@ pub fn install_from_config(
         ));
     }
 
-    // The whole `[cluster]` rule set, re-checked here and before anything is
-    // bound. `AutumnConfig::validate` already runs it at boot, but this
-    // installer is public and reachable with a hand-built section that never
-    // went through the config layer — and every rule it checks (a dialable
-    // advertised address, a suspicion timeout that cannot flap, a `node_id`
-    // free of the cell-key separator) is one this node would otherwise carry
-    // into the cluster.
+    // `AutumnConfig::validate` already runs this at boot, but this installer is public and can be
+    // handed a section that never went through the config layer. Check before anything is bound.
     config.validate().map_err(|error| {
         AutumnError::internal_server_error_msg(format!("cluster: invalid configuration: {error}"))
     })?;
 
-    // Deliberately not `unwrap_or_default()`: an absent secret is a
-    // configuration error, never an empty key.
+    // An absent secret is a configuration error, never an empty key.
     let Some(secret) = config.secret.as_ref() else {
         return Err(AutumnError::internal_server_error_msg(
             "cluster.secret is required when cluster.enabled = true: the cluster transport is \
@@ -684,21 +668,10 @@ pub fn install_from_config(
     };
     let secret = secret.expose_secret().as_bytes().to_vec();
 
-    // Preflight both actuator names before anything is started or registered.
-    //
-    // The two registries are append-only: neither offers an unregister, so
-    // registering the health indicator and only then colliding on the metrics
-    // source would strand an indicator no cluster owns — permanently `UP`,
-    // describing a node this call is about to cancel, and holding the very name
-    // a retry needs. Checking first keeps the failure clean: a refused install
-    // registers nothing at all.
-    //
-    // Check-then-act, so a *concurrent* registration of the same name between
-    // this check and the `register` calls below could still slip through and
-    // fail one of them. Nothing in the framework registers actuator components
-    // off the boot path, which is single-threaded up to here, and the registries
-    // themselves stay the authority: a lost race still fails the boot, it just
-    // fails on the `register` error instead of this one.
+    // Preflight both actuator names before anything is started or registered. The registries
+    // have no unregister, so a collision on the second name would strand a permanently `UP`
+    // indicator holding the name a retry needs. A concurrent registration can still win the
+    // race; the `register` calls below then fail the boot instead.
     let health_registry = state.health_indicator_registry();
     let metrics_registry = state.metrics_source_registry();
     if health_registry.contains(MEMBERSHIP_COMPONENT)
@@ -713,10 +686,9 @@ pub fn install_from_config(
     }
 
     let suspicion_timeout = Duration::from_millis(config.suspicion_timeout_ms);
-    // A peer silent for longer than its suspicion timeout is already out of the
-    // view, so closing its idle socket costs nothing a live peer would miss —
-    // while an unauthenticated socket that never completes a frame stops being
-    // free to hold. The floor keeps a fast cluster from recycling connections.
+    // A peer silent past its suspicion timeout is already out of the view, so closing its idle
+    // socket costs nothing, and a socket that never completes a frame cannot be held for free.
+    // The floor keeps a fast cluster from recycling connections.
     let transport = transport::TcpPeerTransport::bind(&config.bind_addr)?
         .with_inbound_idle_timeout(
             suspicion_timeout
@@ -734,9 +706,7 @@ pub fn install_from_config(
         suspicion_timeout,
     };
 
-    // A short secret is refused inside `ClusterNode::start`, before any frame is
-    // signed — same rule as `ClusterConfig::validate`, enforced at the seam that
-    // actually holds the key.
+    // `ClusterNode::start` refuses a short secret before any frame is signed.
     let node_shutdown = shutdown.child_token();
     let handle = node::ClusterNode::start(
         runtime,
@@ -746,16 +716,9 @@ pub fn install_from_config(
         Arc::new(transport),
     )?;
 
-    // Both names were free a moment ago, so these normally cannot fail; a
-    // registration that fails here lost the check-then-act race described
-    // above. It stays a hard error rather than a warning: the node would bind,
-    // gossip and resolve through the extension while `/actuator/health` and
-    // `/actuator/metrics` described somebody else's component, so an operator
-    // watching the membership view or `autumn_cluster_frames_rejected_total`
-    // would see nothing at all while this node was partitioned or under attack.
-    // Booting is refused instead, and the node that was just started is
-    // cancelled on the way out so a refused install leaves no loops and no
-    // listener behind.
+    // Fails only if the preflight race above was lost. A hard error, not a warning: otherwise the
+    // actuator would describe another component and hide this node's partitions or attacks.
+    // Cancel the started node so a refused install leaves no loops or listener behind.
     let registered = health_registry
         .register(
             MEMBERSHIP_COMPONENT,

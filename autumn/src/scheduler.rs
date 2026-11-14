@@ -632,10 +632,9 @@ impl SchedulerCoordinator for PostgresTickSchedulerCoordinator {
                     ))
                 })?;
 
-            // The statement also takes the advisory key that releases before
-            // #3052 held for the whole tick. While an old replica runs the
-            // tick in a rolling upgrade, this claim fails. The lock is
-            // transaction-scoped, so it frees when the statement commits.
+            // The claim also takes the advisory key that pre-#3052 releases hold for the whole
+            // tick, so it fails while an old replica runs the tick during a rolling upgrade. The
+            // lock is transaction-scoped and frees when the statement commits.
             let claimed = diesel::sql_query(
                 "INSERT INTO autumn_scheduler_ticks \
                  (key_prefix, task_name, tick_key, owner, expires_at) \
@@ -981,11 +980,9 @@ pub fn coordinator_from_config(
                         "scheduler.backend = \"sqlite\" requires a configured database pool",
                     )
                 })?;
-                // The lease table coordinates processes only because they open
-                // the same FILE. On an in-memory target each has its own table,
-                // so every replica would win the same tick and run it — while
-                // `is_fleet_distributed()` reports the opposite. Refuse rather
-                // than promise coordination that cannot happen (issue #1907).
+                // The lease table coordinates processes only because they open the same file.
+                // In memory each process has its own table, so every replica would run every
+                // tick while `is_fleet_distributed()` claims otherwise (#1907).
                 if state
                     .extension::<crate::config::AutumnConfig>()
                     .and_then(|config| {
@@ -1042,12 +1039,8 @@ pub fn coordinator_from_config(
                 ))
             }
 
-            // The Postgres tick-table scheduler coordinator is Postgres-only
-            // (its SQL is Postgres SQL). Under the `sqlite` feature the
-            // runtime pool is a SQLite pool with no such primitive, so refuse
-            // rather than mis-type. SQLite runs one of the two single-host
-            // coordinators instead: `in_process` (the default, one process) or
-            // `sqlite` (a lease table shared by the processes on the host).
+            // The tick-table coordinator runs Postgres SQL, and under `sqlite` the runtime pool is a
+            // SQLite pool, so refuse. SQLite uses `in_process` or the `sqlite` lease table instead.
             #[cfg(all(feature = "db", feature = "sqlite"))]
             {
                 let _ = (state, replica_id);
@@ -1074,8 +1067,7 @@ pub fn coordinator_from_config(
 #[must_use]
 pub fn fixed_delay_tick_key(task_name: &str, delay: Duration, unix_elapsed: Duration) -> String {
     let interval = delay.as_nanos().max(1);
-    // `interval` is `.max(1)`, so the division is always defined; going through
-    // `checked_div` states that rather than relying on the reader to spot it.
+    // `interval >= 1`, so `checked_div` never falls back to 0.
     let bucket = unix_elapsed.as_nanos().checked_div(interval).unwrap_or(0);
     format!("{task_name}:{bucket}")
 }
@@ -1165,9 +1157,7 @@ mod tests {
         assert_eq!(cron_tick_key("digest", 1_700_000_000), "digest:1700000000");
     }
 
-    // Issue #1864: `is_fleet_distributed` is a default trait method derived
-    // from `backend()`, so a plain in-process coordinator needs no override
-    // to report `false`.
+    // `is_fleet_distributed` is a default method derived from `backend()` (#1864).
     #[test]
     fn in_process_coordinator_is_not_fleet_distributed() {
         let coordinator = InProcessSchedulerCoordinator::new("replica-1");
@@ -1175,11 +1165,6 @@ mod tests {
         assert!(!coordinator.is_fleet_distributed());
     }
 
-    // `PostgresTickSchedulerCoordinator` (feature `postgres`) needs a live pool
-    // to construct — covered by the testcontainer-backed
-    // `tests/integration/scheduled_coordination_pg.rs` suite instead. This
-    // exercises the same default-method derivation (`backend() == "postgres"`)
-    // via a minimal double, without a database.
     /// Issue #1907: `scheduler.backend = "sqlite"` is refused on a build with
     /// no `SQLite` backend, and the refusal names the Postgres alternative.
     /// The coordinator of a `[roles.<name>]` preset gets the name as its
@@ -1223,6 +1208,8 @@ mod tests {
         );
     }
 
+    // The real Postgres coordinator needs a live pool and is covered by
+    // `tests/integration/scheduled_coordination_pg.rs`; a double checks the default method.
     #[test]
     fn a_coordinator_reporting_the_postgres_backend_string_is_fleet_distributed() {
         struct FakePostgresCoordinator;
@@ -1245,13 +1232,9 @@ mod tests {
         assert!(FakePostgresCoordinator.is_fleet_distributed());
     }
 
-    // Issue #2585 item 2: `SqliteLeaseSchedulerCoordinator::new` takes the
-    // `Duration` unchecked, and `try_acquire` computes `ttl_ms` from
-    // `as_millis()` — so `Duration::ZERO` (or anything sub-millisecond)
-    // wrote `expires_at == now_ms`, which the reap-first predicate
-    // (`expires_at <= now_ms`) treats as already dead. A second coordinator
-    // then took the identical tick while the first task was still running.
-    // The constructor clamps to the same 1s floor `lock.rs` uses.
+    // `new` clamps the TTL to a 1s floor (#2585). A sub-millisecond TTL writes
+    // `expires_at == now_ms`, which the reap predicate (`expires_at <= now_ms`) treats as dead,
+    // so a second coordinator could take a tick that is still running.
     #[cfg(feature = "sqlite")]
     fn sqlite_test_coordinator(ttl: Duration) -> SqliteLeaseSchedulerCoordinator {
         let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<

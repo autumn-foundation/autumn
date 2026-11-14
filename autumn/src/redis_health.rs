@@ -267,9 +267,8 @@ pub(crate) fn redis_subsystems(config: &AutumnConfig) -> Vec<(&'static str, Stri
             &config.jobs.redis.url,
         ),
         (
-            // Not only the global limiter: `#[throttle]` routes build their
-            // own limiter on this backend, also when `enabled = false`. The
-            // backend is `memory` unless the operator selects Redis.
+            // Not gated on `enabled`: `#[throttle]` routes build their own
+            // limiter on this backend even when `enabled = false`.
             "rate_limit",
             config.security.rate_limit.backend == crate::security::config::RateLimitBackend::Redis,
             &config.security.rate_limit.redis.url,

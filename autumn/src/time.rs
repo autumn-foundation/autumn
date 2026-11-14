@@ -485,12 +485,10 @@ pub fn monotonic_now() -> MonotonicInstant {
 
 // ── Ambient clock ─────────────────────────────────────────────────────────────
 //
-// Framework code with no clock handle in scope used to read the OS clock
-// directly, which a `Sim` cannot control (issue #2967). The ambient clock is
-// the fix: a `Sim` installs its virtual clock for its own thread while it
-// lives, and the `ambient_*` helpers read it. The sim runtime is a
-// current-thread runtime, so every task it polls runs on that thread. Other
-// threads, and code that runs with no `Sim`, see the system clock.
+// For framework code with no clock handle in scope (#2967). A `Sim` installs its virtual clock
+// for its own thread while it lives, and the `ambient_*` helpers read it. The sim runtime is
+// current-thread, so every task it polls sees that clock. Other threads, and code that runs with
+// no `Sim`, see the system clock.
 
 thread_local! {
     /// The clocks installed on this thread, newest last, with a liveness flag.
@@ -801,8 +799,6 @@ pub fn clock_unix_duration(clock: &dyn ClockSource) -> std::time::Duration {
     }
 }
 
-// ── Module-level unit tests ───────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,10 +860,8 @@ mod tests {
 
     #[test]
     fn monotonic_saturates_instead_of_underflowing_on_inversion() {
-        // The one behaviour every caller depends on: subtracting a LATER
-        // instant from an earlier one yields zero rather than panicking or
-        // wrapping. `Duration` has no negative representation, so an unchecked
-        // subtraction here would be an arithmetic panic in production.
+        // Subtracting a later instant yields zero. `Duration` cannot be negative, so an
+        // unchecked subtraction would panic in production.
         let early = MonotonicInstant::from_origin_elapsed(Duration::from_secs(1));
         let late = MonotonicInstant::from_origin_elapsed(Duration::from_secs(5));
         assert_eq!(
@@ -915,8 +909,8 @@ mod tests {
 
     #[test]
     fn ticking_clock_monotonic_is_reproducible_across_instances() {
-        // Two clocks constructed identically and stepped identically must agree
-        // exactly — this is what makes a sim run replay from its seed.
+        // Identical clocks stepped identically must agree exactly, so a sim run replays from
+        // its seed.
         let start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let a = TickingClock::starting_at(start);
         let b = TickingClock::starting_at(start);
@@ -951,11 +945,9 @@ mod tests {
         // And it is the same timeline the free helper reads.
         assert!(monotonic_now() >= second);
 
-        // The default body must read a REAL clock. Without this, a body that
-        // simply returned `ORIGIN` would keep every other test in this file
-        // green while silently making production elapsed-time measurements
-        // always zero. Bounded spin rather than a sleep, so the test stays fast
-        // and never depends on scheduler behaviour.
+        // The default body must read a real clock: one that returned `ORIGIN` would pass every
+        // other test here while zeroing every production elapsed time. A bounded spin, not a
+        // sleep, keeps the test fast and independent of the scheduler.
         let base = clock.monotonic();
         let mut advanced = base;
         for _ in 0..50_000_000u64 {
@@ -972,10 +964,8 @@ mod tests {
 
     #[test]
     fn a_custom_clock_keeps_compiling_and_gets_real_monotonic_by_default() {
-        // Backward-compatibility guard: `monotonic()` ships with a default body,
-        // so a downstream `impl ClockSource` that predates it still compiles and
-        // still reports real process-monotonic time. If someone ever removes the
-        // default body, this test stops compiling — which is the point.
+        // `monotonic()` has a default body, so an `impl ClockSource` without it still compiles
+        // and reports real monotonic time. Removing the default body breaks this test's build.
         #[derive(Debug)]
         struct LegacyClock;
         impl ClockSource for LegacyClock {
@@ -990,10 +980,8 @@ mod tests {
 
     #[test]
     fn a_backwards_wall_clock_cannot_produce_a_negative_elapsed() {
-        // A clock whose `now()` runs backwards (a crude NTP-jump model) must not
-        // be able to corrupt an elapsed measurement taken through the seam.
-        // `TickingClock` derives monotonic from its own start, and its
-        // subtraction saturates, so the worst case is zero — never a panic.
+        // A wall clock that jumps backwards (as after an NTP correction) cannot corrupt an
+        // elapsed measurement: the subtraction saturates, so the worst case is zero.
         let start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let clock = TickingClock::starting_at(start);
         clock.advance(Duration::from_secs(10));
@@ -1019,7 +1007,6 @@ mod tests {
 
     #[test]
     fn clock_unix_duration_exact_epoch_with_nanos() {
-        // Test exact epoch with some nanos to ensure the true branch logic is exercised
         let epoch_with_nanos =
             Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::nanoseconds(100);
         let clock = FixedClock::at(epoch_with_nanos);

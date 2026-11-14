@@ -673,8 +673,6 @@ pub fn admin_redacts_column_name(column: &str) -> bool {
             return true;
         }
     }
-    // Either not an encrypted column, or every registration opted into
-    // admin_visible — in both cases this helper does not force redaction.
     false
 }
 
@@ -767,7 +765,8 @@ pub fn encrypt_versioned_columns_in_value(table: &str, value: &mut serde_json::V
             continue;
         }
         if let Some(field) = obj.get_mut(d.column) {
-            // Non-null, non-string values keep their structure (never plaintext).
+            // Null stays null. A non-string value, or one that fails to
+            // encrypt, becomes the `<encrypted>` marker.
             if field.is_null() {
                 continue;
             }
@@ -862,16 +861,14 @@ pub fn init_attribute_encryption(
     store: &crate::credentials::CredentialsStore,
 ) -> Result<(), String> {
     let columns = registered_encrypted_columns();
-    // No `#[encrypted]` columns anywhere means encryption is not in use: this is a
-    // pure no-op. Return before touching the credentials store, so an app that
-    // never opted into attribute encryption can never fail boot over a partial or
-    // malformed `active_record_encryption` namespace it does not rely on.
+    // Return before reading the credentials store, so an app with no
+    // `#[encrypted]` column never fails boot over a malformed
+    // `active_record_encryption` namespace it does not use.
     if columns.is_empty() {
         return Ok(());
     }
-    // The deterministic key is needed both for deterministic-mode columns and for
-    // `versioned_ciphertext` columns (whose history snapshots are encrypted
-    // deterministically so the version diff stays accurate).
+    // `versioned_ciphertext` columns need the deterministic key too: their
+    // history snapshots are encrypted deterministically so the diff stays accurate.
     let needs_deterministic = columns
         .iter()
         .any(|c| c.deterministic || c.versioned_ciphertext);
@@ -889,7 +886,7 @@ pub fn init_attribute_encryption(
             Ok(())
         }
         Ok(None) => {
-            // `columns` is non-empty here (the empty case returned early above).
+            // `columns` is non-empty: the empty case returned early.
             let first = columns[0];
             Err(format!(
                 "Encrypted column `{}.{}` requires a master key, but `{CREDENTIALS_NAMESPACE}.primary_key` \
@@ -914,8 +911,6 @@ pub use diesel_types::{DeterministicText, RandomizedText};
 mod tests {
     use super::*;
 
-    // A registered `versioned_ciphertext` + `admin_visible` column, used by the
-    // composition tests below.
     inventory::submit! {
         EncryptedColumnDescriptor {
             model: "VcModel",
@@ -936,8 +931,6 @@ mod tests {
             versioned_ciphertext: false,
         }
     }
-    // Columns for the derived-query param-encoding test: a deterministic column
-    // (equality lookups supported) and a randomized one (lookups impossible).
     inventory::submit! {
         EncryptedColumnDescriptor {
             model: "DqModel",
@@ -963,9 +956,8 @@ mod tests {
     const KEY_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const DET: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
-    // Salts are generated at runtime (not hard-coded) so the test fixtures don't
-    // ship a constant cryptographic value; a process-stable salt is shared so
-    // cross-ring determinism/rotation assertions hold.
+    // Generated at runtime so the fixtures ship no constant cryptographic value,
+    // and stable for the process so assertions across rings hold.
     fn salt() -> &'static [u8] {
         static S: OnceLock<[u8; 16]> = OnceLock::new();
         S.get_or_init(|| {
@@ -997,16 +989,12 @@ mod tests {
 
     #[test]
     fn deterministic_key_rotation_reads_old_rows() {
-        // Row written under DET as the deterministic key.
         let old = KeyRing::from_master_hex(KEY_A, &[], Some(DET), salt()).unwrap();
         let written = old.encrypt(Mode::Deterministic, b"pii").unwrap();
 
-        // Rotate the deterministic key to KEY_B; the former DET is retired.
         let rotated =
             KeyRing::from_master_hex(KEY_A, &[DET.to_string()], Some(KEY_B), salt()).unwrap();
-        // Old deterministic row still decrypts via the retired deterministic key.
         assert_eq!(rotated.decrypt(&written).unwrap(), b"pii");
-        // New deterministic writes use the new key.
         let fresh = rotated.encrypt(Mode::Deterministic, b"pii").unwrap();
         assert_ne!(fresh, written, "new det key produces different ciphertext");
         assert_eq!(rotated.decrypt(&fresh).unwrap(), b"pii");
@@ -1071,15 +1059,11 @@ mod tests {
 
     #[test]
     fn rotation_reads_old_writes_with_retired_key() {
-        // Write under A as primary.
         let old = KeyRing::from_master_hex(KEY_A, &[], None, salt()).unwrap();
         let written = old.encrypt(Mode::Randomized, b"legacy-row").unwrap();
 
-        // Rotate: B is now primary, A retired.
         let rotated = KeyRing::from_master_hex(KEY_B, &[KEY_A.to_string()], None, salt()).unwrap();
-        // Old row still decrypts (no rewrite needed).
         assert_eq!(rotated.decrypt(&written).unwrap(), b"legacy-row");
-        // New writes use the new primary key id.
         let fresh = rotated.encrypt(Mode::Randomized, b"new-row").unwrap();
         assert_ne!(rotated.primary_key_id(), old.primary_key_id());
         assert_eq!(rotated.decrypt(&fresh).unwrap(), b"new-row");
@@ -1089,7 +1073,6 @@ mod tests {
     fn fully_retired_key_id_is_named_in_error() {
         let old = KeyRing::from_master_hex(KEY_A, &[], None, salt()).unwrap();
         let written = old.encrypt(Mode::Randomized, b"x").unwrap();
-        // New ring without A at all.
         let other = KeyRing::from_master_hex(KEY_B, &[], None, salt()).unwrap();
         assert!(matches!(
             other.decrypt(&written),
@@ -1102,7 +1085,7 @@ mod tests {
         let a = KeyRing::from_master_hex(KEY_A, &[], None, salt()).unwrap();
         let b = KeyRing::from_master_hex(KEY_A, &[], None, salt2()).unwrap();
         let env = a.encrypt(Mode::Randomized, b"x").unwrap();
-        // Different salt derives a different data key -> different id -> unknown.
+        // A different salt derives a different key id, which is unknown here.
         assert!(b.decrypt(&env).is_err());
     }
 
@@ -1143,8 +1126,8 @@ mod tests {
 
     #[test]
     fn versioned_ciphertext_column_excluded_from_sensitive_marker() {
-        // `versioned_ciphertext` columns store ciphertext, so they must NOT be in
-        // the sensitive list (which would suppress their values entirely).
+        // The sensitive list suppresses values entirely, and these values are
+        // already ciphertext.
         let mut cols: Vec<&'static str> = Vec::new();
         merge_encrypted_columns_for_table("vc_table", &mut cols);
         assert!(
@@ -1165,13 +1148,12 @@ mod tests {
         assert!(!stored.contains("topsecret"), "no plaintext leak: {stored}");
         assert_eq!(v["plain"], "ok", "non-encrypted column untouched");
 
-        // Deterministic: equal plaintext -> equal ciphertext, so the diff stays
-        // accurate (an unchanged value is not reported as changed).
+        // Equal plaintext gives equal ciphertext, so an unchanged value is not
+        // reported as changed.
         let mut v2 = serde_json::json!({ "vc_col": "topsecret" });
         encrypt_versioned_columns_in_value("vc_table", &mut v2);
         assert_eq!(v2["vc_col"], v["vc_col"]);
 
-        // And it is genuinely decryptable back to the plaintext.
         let ring = key_ring().unwrap();
         assert_eq!(
             String::from_utf8(ring.decrypt(stored).unwrap()).unwrap(),
@@ -1183,8 +1165,6 @@ mod tests {
     fn derived_query_param_encoding_matches_column_mode() {
         install_key_ring(KeyRing::from_master_hex(KEY_A, &[], Some(DET), salt()).unwrap());
 
-        // Deterministic column: param is encoded to the same stable ciphertext the
-        // wrapper writes, so the equality predicate matches stored rows.
         let encoded =
             encode_derived_query_param("dq_table", "det_col", "alice@example.com").unwrap();
         assert_ne!(encoded, "alice@example.com", "must be ciphertext");
@@ -1194,8 +1174,6 @@ mod tests {
             "must equal the deterministic ciphertext used on write"
         );
 
-        // Randomized column: equality lookups are impossible by design -> error,
-        // and the message names the offending column and the fix.
         let err = encode_derived_query_param("dq_table", "rnd_col", "x").unwrap_err();
         assert!(matches!(
             err,
@@ -1205,7 +1183,6 @@ mod tests {
         assert!(msg.contains("dq_table.rnd_col"), "names the column: {msg}");
         assert!(msg.contains("deterministic"), "suggests the fix: {msg}");
 
-        // Non-encrypted column: pure passthrough.
         assert_eq!(
             encode_derived_query_param("dq_table", "not_encrypted", "plain").unwrap(),
             "plain"
@@ -1216,8 +1193,6 @@ mod tests {
     fn decrypt_persisted_columns_handles_each_branch() {
         install_key_ring(KeyRing::from_master_hex(KEY_A, &[], Some(DET), salt()).unwrap());
 
-        // A persisted snapshot: a recoverable envelope, a null, and a column that
-        // is not registered as encrypted.
         let envelope = encrypt_text(Mode::Deterministic, "secret@x.com").unwrap();
         let mut v = serde_json::json!({
             "det_col": envelope,
@@ -1235,13 +1210,12 @@ mod tests {
             "unregistered column untouched"
         );
 
-        // A non-recoverable value (e.g. the `<encrypted>` fallback marker or a
-        // legacy plaintext row) is left exactly as-is so reconstruction proceeds.
+        // A value that does not decrypt (the `<encrypted>` marker, a legacy
+        // plaintext row) is left as-is.
         let mut marker = serde_json::json!({ "det_col": "<encrypted>" });
         decrypt_persisted_columns_in_value("dq_table", &mut marker);
         assert_eq!(marker["det_col"], "<encrypted>");
 
-        // A non-object value passes through without panicking.
         let mut arr = serde_json::json!([1, 2, 3]);
         decrypt_persisted_columns_in_value("dq_table", &mut arr);
         assert!(arr.is_array());

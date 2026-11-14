@@ -373,13 +373,9 @@ async fn establish_recording(url: &str, role: &'static str) -> ConnectionResult<
         ));
     }
 
-    // A multi-host URL is a failover list, and tokio-postgres's own connector
-    // walks it in order — so this one must too, or enabling capture would
-    // turn a healthy HA deployment away whenever its first host is down. Each
-    // endpoint gets the *complete* attempt (TCP, startup and authentication,
-    // the writability probe): a host that accepts TCP but cannot finish the
-    // handshake — a half-up standby, a mid-failover primary — rejects that
-    // endpoint, not the pool.
+    // A multi-host URL is a failover list; walk it in order as tokio-postgres does. Each host
+    // gets the complete attempt (TCP, startup, auth, writability probe), so a half-up host
+    // rejects that endpoint, not the pool.
     let mut failures: Vec<String> = Vec::new();
     for (host, port) in &endpoints {
         match establish_recording_at(&config, host, *port, role).await {
@@ -413,8 +409,7 @@ async fn establish_recording_at(
     let stream = TcpStream::connect((host, port))
         .await
         .map_err(|error| error.to_string())?;
-    // Match what tokio-postgres's own connector does: PostgreSQL is a
-    // request/response protocol, so Nagle only adds latency.
+    // As tokio-postgres does: Nagle only adds latency to a request/response protocol.
     let _ = stream.set_nodelay(true);
 
     let (client, connection) = config
@@ -479,10 +474,7 @@ fn tcp_endpoints(config: &tokio_postgres::Config) -> Vec<(String, u16)> {
                     .copied()
                     .unwrap_or(DEFAULT_PG_PORT),
             )),
-            // A Unix-socket host: nothing to tee, and replay has no socket to
-            // stand in for it. The variant itself is `cfg(unix)` in
-            // tokio-postgres, so the arm has to be too — on Windows `Host` has
-            // only `Tcp` and this match is already exhaustive without it.
+            // A Unix socket cannot be teed. tokio-postgres defines this variant only on unix.
             #[cfg(unix)]
             tokio_postgres::config::Host::Unix(_) => None,
         })
@@ -520,9 +512,8 @@ pub fn maybe_capture_pool_provider(
         );
     }
     if let Some(inner) = existing {
-        // The custom provider is left alone, but the topology it returns is
-        // stamped with the gap so *this app's* capsules — and only this
-        // app's — say why they carry no database tape.
+        // Leave the custom provider alone, but stamp its topology so this app's capsules say why
+        // they carry no database tape.
         const REASON: &str =
             "the application installed a custom DatabasePoolProvider, which Autumn does not wrap";
         warn_db_capture_unavailable(REASON);
@@ -812,8 +803,7 @@ impl ConnectionMemo {
             Bucket::Prologue => &mut self.prologue,
             Bucket::Statements => &mut self.statements,
             Bucket::Catalog => &mut self.catalog,
-            // A request's own exchanges belong to one capsule, never to the
-            // connection's history.
+            // A request's exchanges belong to its capsule, not to the connection's history.
             Bucket::Request => return,
         };
         if let Some(existing) = entries
@@ -929,10 +919,8 @@ impl ConnectionRecorder {
         }
         for frame in frames {
             if self.poisoned {
-                // Recording is over for this connection, but attribution
-                // markers still matter: the next request to borrow it must be
-                // told its capsule has no tape (F13's honesty rule), not handed
-                // a capsule that looks complete because nothing was recorded.
+                // Still watch markers, so the next request to borrow this connection is told
+                // its capsule has no tape instead of looking complete.
                 Self::watch_marker_while_poisoned(&frame);
             } else {
                 self.on_frontend_frame(&frame);
@@ -978,9 +966,8 @@ impl ConnectionRecorder {
                 if self.statement_sql.len() >= MAX_STATEMENT_NAMES
                     && !self.statement_sql.contains_key(&name)
                 {
-                    // Recording a `Bind` whose statement we no longer know the
-                    // SQL for would put an empty-SQL exchange on the tape, and
-                    // replay would answer the wrong statement from it.
+                    // An untracked statement name would later record a `Bind` with empty SQL,
+                    // and replay would answer the wrong statement from it.
                     self.give_up(
                         "this connection holds more live prepared statements than \
                                   capture tracks",
@@ -1013,17 +1000,12 @@ impl ConnectionRecorder {
             FrontendMessage::Describe { .. } | FrontendMessage::Execute => {
                 let _ = self.building.get_or_insert_with(Pending::extended);
             }
-            // Dropping a cached prepared statement. It is the client's own
-            // bookkeeping, never part of what the request did, but its
-            // `CloseComplete` + `ReadyForQuery` still cross the wire — so it
-            // gets a slot in the queue that is discarded when it completes,
-            // rather than being ignored here and letting its `ReadyForQuery`
-            // cut short whatever exchange is queued behind it.
+            // A statement close is client bookkeeping, not request work, but its `ReadyForQuery`
+            // still crosses the wire. It gets a housekeeping slot that is discarded on
+            // completion; ignoring it would let that `ReadyForQuery` end the exchange behind it.
             //
-            // Closing a *statement* also retires its name: the SQL behind it
-            // is no longer reachable by any later `Bind`, so keeping the entry
-            // would grow the map for the life of the connection (a long-lived
-            // pooled connection prepares and drops statements indefinitely).
+            // Closing a statement retires its name, so a long-lived pooled connection's map
+            // does not grow without bound.
             FrontendMessage::Close { kind, name } => {
                 if kind == b'S' {
                     self.statement_sql.remove(&name);
@@ -1036,7 +1018,7 @@ impl ConnectionRecorder {
             // answers it with exactly one `ReadyForQuery`.
             FrontendMessage::Sync => self.close_unit(),
             FrontendMessage::Query(sql) => {
-                // A simple `Query` is a complete round trip on its own.
+                // A simple `Query` is its own round trip.
                 self.close_unit();
                 let marker = wire::marker_request_id(&sql);
                 let mut pending = Pending::simple(sql);
@@ -1057,8 +1039,7 @@ impl ConnectionRecorder {
         } else {
             self.building.as_mut()
         }) else {
-            // Handshake frames, and asynchronous notices between round trips:
-            // nothing is in flight, so there is nothing to attach them to.
+            // Handshake frames and asynchronous notices between round trips: nothing is in flight.
             return;
         };
 
@@ -1102,10 +1083,8 @@ impl ConnectionRecorder {
     /// File a completed exchange into the memo and, when the connection is
     /// attributed, into the capsule's tape.
     fn finish(&mut self, pending: Pending) {
-        // Autumn's own attribution statement, or a prepared-statement close.
-        // Recording either would put a connection-management side effect into
-        // a capsule that replay then re-executes; neither is part of what the
-        // request did.
+        // Autumn's attribution marker or a statement close: not request work, and replay would
+        // re-execute it.
         if pending.housekeeping {
             return;
         }
@@ -1118,19 +1097,14 @@ impl ConnectionRecorder {
         } else {
             Bucket::Request
         };
-        // `exchanges` is an ordered script the replay stub walks with a
-        // cursor, so it may hold only statements the request itself will
-        // re-issue. Session housekeeping — `SET TIME ZONE`, `SET
-        // CLIENT_ENCODING`, `SET statement_timeout` — is answered
-        // synthetically at replay, and a recorded copy would leave the cursor
-        // one exchange ahead of the client for the rest of the tape. The
-        // prologue keeps it: that bucket is a keyed lookup, never consumed.
+        // Replay walks `exchanges` with a cursor and answers session housekeeping (`SET TIME
+        // ZONE`, `SET statement_timeout`, ...) synthetically, so a recorded copy would leave the
+        // cursor one exchange ahead. The keyed prologue may keep it.
         if bucket == Bucket::Request && is_session_housekeeping(&pending.sql) {
             return;
         }
-        // The keyed buckets are looked up by SQL, so an exchange with no SQL
-        // to key on is unusable there — and an empty-SQL prologue entry means
-        // something else entirely to replay (a verbatim startup handshake).
+        // Keyed buckets are looked up by SQL, and an empty-SQL prologue entry means a verbatim
+        // startup handshake to replay.
         if bucket != Bucket::Request && pending.sql.is_empty() {
             return;
         }
@@ -1154,10 +1128,8 @@ impl ConnectionRecorder {
 
         let recorded = scope
             .with_db(|db| {
-                // Re-checked under the buffer's own lock: `scope()` tested this
-                // before the lock was taken, and the request can finish in
-                // between. Closing and appending must not interleave, or a late
-                // effect lands in a capsule that is already being written.
+                // Re-checked under the lock: the request can finish after `scope()`, and a late
+                // append would land in a capsule already being written.
                 if scope.is_closed() {
                     return true;
                 }
@@ -1166,16 +1138,14 @@ impl ConnectionRecorder {
                     role.clone_into(&mut tape.role);
                 }
                 let entries = tape_bucket(tape, bucket);
-                // The ordered `exchanges` bucket never deduplicates — a request
-                // may legitimately run the same statement twice — so the scan
-                // is skipped for it entirely rather than run and discarded.
+                // The ordered request bucket never deduplicates: a request may run the same
+                // statement twice.
                 if bucket != Bucket::Request
                     && entries
                         .iter()
                         .any(|entry| entry.sql == exchange.sql && entry.binds == exchange.binds)
                 {
-                    // Already carried over from the memo; the connection's
-                    // history holds one entry per statement, not one per use.
+                    // Already copied from the memo; keyed buckets hold one entry per statement.
                     return true;
                 }
                 if !db.charge(cost, budget) {
@@ -1202,8 +1172,7 @@ impl ConnectionRecorder {
                     self.stopped = false;
                     self.copy_memo();
                 }
-                // The named request has already finished (its scope was
-                // deregistered): nothing to attribute this work to.
+                // The named request already finished.
                 None => self.bound = None,
             },
             MarkerId::Clear => self.bound = None,
@@ -1250,10 +1219,7 @@ impl ConnectionRecorder {
                     return MemoCopy::Copied;
                 }
                 let tape = db.tape_mut(id);
-                // Only buckets this capsule has none of are worth copying, and
-                // the clone is deferred until that is known: the memo can hold
-                // up to a megabyte, and cloning it to discard it was the
-                // dominant cost of every marker on a warm connection.
+                // Decide which buckets to copy before cloning: the memo can hold up to a megabyte.
                 let want_statements = tape.statements.is_empty() && !memo.statements.is_empty();
                 let want_catalog = tape.catalog.is_empty() && !memo.catalog.is_empty();
                 let want_prologue = tape.prologue.is_empty() && !memo.prologue.is_empty();
@@ -1425,8 +1391,7 @@ mod tests {
             .expect("bind");
         let half_up = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
-            // Accept and immediately drop: TCP succeeds, the startup message
-            // meets an EOF.
+            // TCP succeeds; the startup message meets EOF.
             while let Ok((socket, _)) = listener.accept().await {
                 drop(socket);
             }
@@ -1615,8 +1580,7 @@ mod tests {
         let (client, _server) = tokio::io::duplex(1024 * 1024);
         let mut stream = RecordingStream::new(client);
         stream.write_all(&startup()).await.expect("write startup");
-        // Overrun the in-flight queue: the backend answers nothing, so every
-        // query stays pending until the recorder gives up.
+        // The backend answers nothing, so queries pile up until the recorder gives up.
         for index in 0..=MAX_IN_FLIGHT {
             stream
                 .write_all(&query(&format!("SELECT {index}")))
@@ -1628,7 +1592,7 @@ mod tests {
             "an unbounded in-flight queue must stop recording"
         );
 
-        // The next request checks the connection out and binds it.
+        // The next request's attribution marker binds the connection.
         stream
             .write_all(&query("SET autumn.capsule_request = 'later-request'"))
             .await
@@ -1700,7 +1664,7 @@ mod tests {
 
         let mut recorder = ConnectionRecorder::new(7, crate::capsule::schema::TAPE_ROLE_PRIMARY);
         recorder.bound = Some(Arc::downgrade(&scope));
-        // A memo far bigger than the whole budget.
+        // A memo bigger than the whole budget.
         for index in 0..20 {
             recorder.memo.remember(
                 Bucket::Statements,
@@ -1793,10 +1757,8 @@ mod tests {
         );
         assert!(!is_session_housekeeping("SELECT $1::text"));
         assert!(!is_session_housekeeping("SET LOCAL search_path TO app"));
-        // `SET LOCAL` is never the framework's — `Db::checkout` issues a plain
-        // session-level `SET statement_timeout` — so a transaction-scoped
-        // setting is application code and belongs on the ordered tape, where
-        // changing or removing it shows up as a divergence (#2202).
+        // `Db::checkout` issues only session-level `SET`s, so a `SET LOCAL` is application code
+        // and stays on the ordered tape, where changing it shows up as a divergence (#2202).
         assert!(
             !is_session_housekeeping("SET LOCAL statement_timeout = 5000"),
             "an application's transaction-scoped timeout must not be synthesized away"
@@ -1853,10 +1815,7 @@ mod tests {
                 .is_some_and(|reason| reason.contains("TLS")),
             "a TLS URL must be refused with a reason naming TLS"
         );
-        // On Windows tokio-postgres has no `Host::Unix` variant — a socket
-        // path parses as an (unreachable) TCP hostname — so socket detection
-        // is a unix-only behaviour, exactly like the `Host::Unix` match arm
-        // in `tcp_endpoints`.
+        // On Windows tokio-postgres has no `Host::Unix`; a socket path parses as a TCP hostname.
         #[cfg(unix)]
         assert!(
             capture_unavailable_reason("postgres:///db?host=/var/run/postgresql").is_some(),
@@ -1895,11 +1854,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_shard_checkout_outside_a_capture_scope_is_a_no_op() {
-        // Nothing is being captured: the checkout path must not reach for a
-        // scope that is not there.
         note_shard_capture_gap();
 
-        // And a scope untouched by a shard checkout stays complete.
         let scope = scope_for_test("no-shard");
         assert!(scope.notes().is_empty());
         assert!(!scope.is_truncated());

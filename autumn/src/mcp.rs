@@ -133,9 +133,8 @@ const FORWARDED_HEADERS: &[&str] = &[
     "x-forwarded-host",
     "x-forwarded-proto",
     "x-real-ip",
-    // Locale negotiation: the `Locale` extractor falls back to `Accept-Language`
-    // when no locale query/cookie is present, so forward it for the tool result
-    // to match the localized data a direct HTTP call would return.
+    // The `Locale` extractor falls back to `Accept-Language` when no locale
+    // query or cookie is present, so a tool localizes like a direct call.
     "accept-language",
     // x402: the payment for a priced route (`[[aeo.paid_routes]]`). Without it
     // a priced tool could only ever answer `402`.
@@ -397,14 +396,11 @@ fn is_same_origin(origin: &str, host: &str, scheme: Option<&str>) -> bool {
     let Some((origin_scheme, origin_authority)) = origin.split_once("://") else {
         return false;
     };
-    // When the request's own scheme is known, it must match the Origin's.
     if scheme.is_some_and(|s| !s.eq_ignore_ascii_case(origin_scheme)) {
         return false;
     }
-    // Compare host + port with default-port normalization, so e.g.
-    // `Host: app.example:443` (https) is the same origin as
-    // `Origin: https://app.example`. When the request scheme is unknown we
-    // assume the Origin's for the host's default-port resolution.
+    // Default ports are normalized, so `Host: app.example:443` (https) matches
+    // `Origin: https://app.example`. An unknown request scheme takes the Origin's.
     let host_scheme = scheme.unwrap_or(origin_scheme);
     authority_matches(origin_authority, origin_scheme, host, host_scheme)
 }
@@ -469,29 +465,23 @@ pub(crate) fn should_expose(doc: &ApiDoc, expose_all: bool) -> bool {
     if doc.hidden || doc.mcp_exclude {
         return false;
     }
-    // A streaming tool (`#[api_doc(mcp, stream)]`) returns an `Sse` body, so it
-    // has no JSON response schema by nature. It is eligible purely on its
-    // explicit opt-in (or the hatch, for a read-only verb), bypassing the
-    // JSON-out gate below that would otherwise exclude every schema-less route.
+    // A streaming tool returns an `Sse` body and so has no response schema. It
+    // skips the JSON-out gate below and is eligible on opt-in alone (or the
+    // hatch, for a read-only verb).
     if doc.mcp_stream {
         if doc.mcp_tool {
             return true;
         }
         return expose_all && is_read_only(doc.method);
     }
-    // JSON-out only: a response schema is the structural signal that this is a
-    // JSON endpoint rather than an HTML/Maud route.
+    // JSON-out only: a response schema is what separates a JSON endpoint from an
+    // HTML/Maud route. The request side is not checked: the macro infers a body
+    // only from `Json<T>`, so opting in a route that reads `Form<T>`, multipart,
+    // `Bytes` or `String` yields a tool with no body input (see
+    // `AppBuilder::mount_mcp`).
     //
-    // Note this gates on the *response* shape only. The macro infers a request
-    // body solely from `Json<T>`, so a route returning `Json<T>` but reading a
-    // non-JSON body (`Form<T>`/multipart/`Bytes`/`String`) is indistinguishable
-    // here from a legitimately body-less route — both leave `request_body`
-    // unset. Such routes are a documented non-target for MCP exposure (see
-    // `AppBuilder::mount_mcp`): opting one in yields a tool with no body input.
-    // Exception: a status whose body is empty *by contract* (e.g. the
-    // repository macro's generated DELETE returning 204) is structurally
-    // distinct from an HTML route's schema-less 200-with-body. It stays
-    // eligible, and dispatch enforces the empty result (see `call_tool`).
+    // A 204/205 route has no schema by contract (e.g. a generated DELETE). It
+    // stays eligible, and dispatch enforces the empty result.
     if doc.response.is_none() && !has_empty_body_contract(doc.success_status) {
         return false;
     }
@@ -546,7 +536,6 @@ fn annotations_for(
     let mut obj = serde_json::Map::new();
     obj.insert("title".into(), json!(title));
     obj.insert("readOnlyHint".into(), json!(read_only));
-    // DELETE is the destructive verb; flag it so agents/UIs can warn.
     let verb_is_destructive = upper == "DELETE";
     if let Some(authority) = authority {
         let destructive =
@@ -573,17 +562,10 @@ fn build_input_schema(
     let mut required: Vec<Value> = Vec::new();
     let mut defs = serde_json::Map::new();
 
-    // Path params, the `Query<T>` extractor, and the JSON body share one flat
-    // argument object, keyed by the param name for path params and by the
-    // reserved keys `query`/`body` for the other two.
-    //
-    // KNOWN LIMITATION: a path param literally named `query` or `body` collides
-    // with those reserved keys — the inserts below overwrite the path-param
-    // property, and `build_request` then feeds the `query`/`body` value to the
-    // path slot. Such routes (e.g. `/search/{query}` with a `Query<T>`) are
-    // vanishingly rare; the tool they generate is unusable, but the collision is
-    // left undisambiguated rather than reshaping the argument contract for every
-    // path-param tool.
+    // Path params, `query` and `body` share one flat argument object. A path
+    // param named `query` or `body` (e.g. `/search/{query}` with a `Query<T>`)
+    // is overwritten by the reserved key below, and the tool is unusable. That
+    // collision is rare and left as is.
     for param in doc.path_params {
         // axum catch-all params (`{*rest}`) surface with a leading `*`; clients
         // address them by the bare name, so advertise the stripped name.
@@ -769,11 +751,9 @@ pub fn derive_tools(
     expose_all: bool,
     openapi: Option<&crate::openapi::OpenApiConfig>,
 ) -> Vec<McpToolInfo> {
-    // Reuse the OpenAPI generator to resolve component schemas exactly once,
-    // so tool input schemas share the handler's typed contract. Crucially,
-    // reuse the *app's* OpenApiConfig when present so component schemas the
-    // user registered via `OpenApiConfig::register_schema` resolve identically
-    // to the served OpenAPI document, instead of drifting to placeholders.
+    // Use the app's `OpenApiConfig` when present, so schemas registered via
+    // `register_schema` resolve as they do in the served document rather than
+    // to placeholders.
     let refs: Vec<&ApiDoc> = docs.iter().collect();
     let config = openapi.cloned().unwrap_or_else(|| {
         crate::openapi::OpenApiConfig::new("autumn-mcp", env!("CARGO_PKG_VERSION"))
@@ -785,19 +765,15 @@ pub fn derive_tools(
         .map(|c| serde_json::to_value(&c.schemas).unwrap_or(Value::Null))
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    // Resolve `$ref` component keys through the exact same identity→display-key
-    // mapping the OpenAPI generator used, so a tool's inlined `$defs` refs match
-    // the served component names even when two types share a last segment
-    // (issue #1972).
+    // The generator's own identity-to-key mapping, so `$defs` names match the
+    // served components even when two types share a last segment (#1972).
     let index = crate::openapi::schema_component_index_for(&config, &refs);
 
     let mut tools = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for doc in docs {
-        // Surface the "opted in but ineligible" case as a build-time note.
-        // Streaming tools legitimately have no JSON response schema, and an
-        // empty-body status (204/205) makes the missing schema the route's
-        // contract, so both are exempt from this "missing response" warn/skip.
+        // Opted in but ineligible: warn and skip. Streaming and 204/205 routes
+        // have no response schema by design and are exempt.
         if (doc.mcp_tool || (expose_all && is_read_only(doc.method)))
             && doc.response.is_none()
             && !has_empty_body_contract(doc.success_status)
@@ -819,10 +795,8 @@ pub fn derive_tools(
         if !should_expose(doc, expose_all) {
             continue;
         }
-        // Tool names (operation ids) must be unique: the same handler mounted
-        // under two scoped prefixes, or a reused explicit operation_id, would
-        // otherwise advertise a duplicate that dispatch can't disambiguate.
-        // Keep the first registration deterministically and warn on the rest.
+        // Tool names must be unique for dispatch. The same handler under two
+        // scoped prefixes, or a reused operation_id, keeps its first registration.
         if !seen.insert(doc.operation_id) {
             tracing::warn!(
                 operation_id = doc.operation_id,
@@ -1063,12 +1037,10 @@ pub(crate) fn build_mcp_router(
         tools = server.tools.len(),
         "Mounted MCP endpoint"
     );
-    // The JSON-RPC surface (GET probe + POST) carries the optional whole-endpoint
-    // auth gate (`secure_mcp`). `OPTIONS` is deliberately mounted on a *separate*
-    // sub-router so the auth layer never wraps it: a CORS preflight is sent
-    // unauthenticated by the browser, so gating it would 401 the preflight and
-    // the real POST would never fire. Disjoint methods on the same path merge
-    // into one `MethodRouter` without overlap.
+    // `OPTIONS` sits on a separate sub-router so the `secure_mcp` auth layer
+    // never wraps it: browsers send preflight unauthenticated, and a 401 there
+    // would stop the real POST. Disjoint methods on one path merge without
+    // overlap.
     let mut rpc = axum::Router::<crate::state::AppState>::new()
         .route(
             mount_path,
@@ -1078,11 +1050,8 @@ pub(crate) fn build_mcp_router(
     if let Some(layer_fn) = endpoint_layer {
         rpc = layer_fn(rpc);
     }
-    // Host/Origin gate, applied outermost on the JSON-RPC surface so an
-    // untrusted Host or disallowed Origin is rejected before the optional auth
-    // gate runs and before `serve_mcp` buffers the body (see
-    // `mcp_host_origin_guard`). Mounted only on `rpc`, not the `OPTIONS`
-    // preflight below, which a browser sends unauthenticated and host-agnostic.
+    // Outermost on `rpc`, so a bad Host or Origin is rejected before auth runs
+    // and before `serve_mcp` buffers the body. Preflight is not gated.
     let guard_server = Arc::clone(&server);
     rpc = rpc.layer(axum::middleware::from_fn(move |req, next| {
         mcp_host_origin_guard(Arc::clone(&guard_server), req, next)
@@ -1137,7 +1106,6 @@ async fn serve_mcp_options(
 
     let cors = &server.cors;
     let mut out = HeaderMap::new();
-    // `Vary: Origin` since the response depends on the request Origin.
     out.insert(header::VARY, HeaderValue::from_static("origin"));
 
     let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok());
@@ -1158,11 +1126,8 @@ async fn serve_mcp_options(
     if let Ok(v) = HeaderValue::from_str(&cors.allowed_methods.join(", ")) {
         out.insert(header::ACCESS_CONTROL_ALLOW_METHODS, v);
     }
-    // Mirror the app's configured allow-headers, but always include the MCP
-    // Streamable-HTTP transport headers a browser client sends on follow-up
-    // requests (`MCP-Protocol-Version`, and `Mcp-Session-Id` for stateful
-    // clients). The default `allowed_headers` (`Content-Type, Authorization`)
-    // omits them, which would otherwise make the browser block the POST.
+    // Always allow the MCP transport headers: the default `allowed_headers`
+    // omits them, and the browser would then block the POST.
     let mut allow_headers = cors.allowed_headers.clone();
     for extra in MCP_REQUEST_HEADERS {
         if !allow_headers.iter().any(|h| h.eq_ignore_ascii_case(extra)) {
@@ -1213,7 +1178,6 @@ fn apply_cors_headers(
 ) {
     use axum::http::HeaderValue;
     let headers = response.headers_mut();
-    // The response varies by `Origin` whenever an origin is in play.
     headers.insert(header::VARY, HeaderValue::from_static("origin"));
     if let Some(allow_origin) = cors_allow_origin(cors, origin)
         && let Ok(v) = HeaderValue::from_str(&allow_origin)
@@ -1301,10 +1265,8 @@ async fn mcp_host_origin_guard(
                 .and_then(|h| h.to_str().ok())
         });
 
-    // Trusted-Host enforcement. Without it, because the DNS-rebinding `Origin`
-    // check below only fires for browsers, a no-`Origin` agent could call
-    // `initialize`/`tools/list` with an arbitrary `Host` and enumerate the tool
-    // catalog — even though the same request to a direct route would be rejected.
+    // The `Origin` check below only fires for browsers. Without this, an agent
+    // sending no `Origin` could list tools under an arbitrary `Host`.
     let host_trusted = host
         .and_then(crate::router::extract_host_without_port)
         .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
@@ -1336,15 +1298,12 @@ async fn mcp_host_origin_guard(
 async fn serve_mcp(
     axum::extract::Extension(server): axum::extract::Extension<Arc<McpServer>>,
     identity: Option<axum::extract::Extension<crate::security::ResolvedClientIdentity>>,
-    // The connection peer is stored as a `ConnectInfo<SocketAddr>` request
-    // extension by axum's connect-info make-service; read it via `Extension`
-    // (which is optional-friendly) rather than the `ConnectInfo` extractor.
+    // The peer is a `ConnectInfo<SocketAddr>` extension. Reading it through
+    // `Extension` rather than the `ConnectInfo` extractor makes it optional.
     connect_info: Option<
         axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     >,
-    // The verified mTLS client identity of this connection (#1640), stamped by
-    // `ClientIdentityLayer`. Read as an `Extension` for the same
-    // optional-friendly reason `connect_info` is.
+    // The verified mTLS client identity (#1640), set by `ClientIdentityLayer`.
     #[cfg(feature = "tls")] client_cert: Option<
         axum::extract::Extension<std::sync::Arc<crate::tls::client_auth::ClientIdentity>>,
     >,
@@ -1356,19 +1315,13 @@ async fn serve_mcp(
     #[cfg(feature = "tls")]
     let client_cert = client_cert.map(|ext| ext.0);
 
-    // Capture the request `Origin` (if any) so the actual JSON-RPC response can
-    // carry the matching CORS grant, mirroring the `OPTIONS` preflight.
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|o| o.to_str().ok())
         .map(str::to_owned);
 
-    // Trusted-Host enforcement and DNS-rebinding `Origin` validation run in the
-    // `mcp_host_origin_guard` layer (applied in `build_mcp_router`) rather than
-    // here, so an untrusted Host or disallowed Origin is rejected *before* this
-    // handler buffers `body` up to the configured `max_request_size_bytes` —
-    // mirroring how direct routes reject in `TrustedHostService` before
-    // handler extraction.
+    // Host and Origin were already checked by `mcp_host_origin_guard`, before
+    // the body was buffered.
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -1419,19 +1372,12 @@ async fn serve_legacy(server: &Arc<McpServer>, ctx: &ReplayContext<'_>, parsed: 
         Value::Array(batch) if batch.is_empty() => {
             json_response(&error(Value::Null, -32600, "Invalid Request: empty batch"))
         }
-        // A batch carrying a `tools/call` is refused outright. Batching would
-        // let one envelope amplify two budgets a sequence of direct HTTP calls
-        // can't: memory (each replayed call buffers up to
-        // `MAX_TOOL_RESPONSE_BYTES`, and every response object is retained in
-        // `out` until the whole batch serializes) and rate limiting (the
-        // envelope is counted once, so each replayed call below would carry
-        // `RateLimitExempt` and skip the per-route limiter). The newest protocol
-        // revision dropped JSON-RPC batching entirely, so no conformant client
-        // batches calls; rejecting here keeps `tools/call` a single-message
-        // request — where the per-call limiter and the 10 MiB cap both still
-        // apply. Harmless metadata methods (initialize/tools/list/ping) may
-        // still be batched. The server also refuses `tasks/*` in a batch. The
-        // owner check reads the request context. Only a single request has it.
+        // A batched `tools/call` would multiply one envelope's budgets: every
+        // response (up to `MAX_TOOL_RESPONSE_BYTES` each) is held until the batch
+        // serializes, and the envelope is rate-limited once while each replay
+        // carries `RateLimitExempt`. Newer protocol revisions dropped batching.
+        // `tasks/*` is refused too: its owner check needs the single-request
+        // context. Metadata methods may still be batched.
         Value::Array(batch)
             if batch.iter().any(|msg| {
                 msg.get("method")
@@ -1462,10 +1408,8 @@ async fn serve_legacy(server: &Arc<McpServer>, ctx: &ReplayContext<'_>, parsed: 
                 json_response(&Value::Array(out))
             }
         }
-        // A single request object. A `tools/call` is dispatched through a path
-        // that can answer with the Streamable-HTTP SSE channel (a streaming
-        // tool) or buffered JSON; everything else (initialize/tools/list/ping)
-        // is buffered. A notification (no `id`) yields `None` → 202.
+        // A `tools/call` may answer over SSE (a streaming tool). A notification
+        // (no `id`) yields `None`, answered with 202.
         msg @ Value::Object(_) => {
             if let Some((id, params)) = single_request(&msg, "tools/call") {
                 serve_tools_call(server, ctx, id, params).await
@@ -1478,7 +1422,6 @@ async fn serve_legacy(server: &Arc<McpServer>, ctx: &ReplayContext<'_>, parsed: 
                 )
             }
         }
-        // Anything else (scalar, null) is not a valid JSON-RPC message.
         _ => json_response(&error(
             Value::Null,
             -32600,
@@ -1564,16 +1507,13 @@ fn reject_unsupported_protocol_version(headers: &HeaderMap, parsed: &Value) -> O
 fn handle_message(server: &McpServer, msg: &Value) -> Option<Value> {
     let id = msg.get("id").cloned();
 
-    // A JSON-RPC 2.0 `id`, when present, must be a string, number, or null;
-    // an object/array id is invalid and must not reach dispatch.
+    // JSON-RPC 2.0: an `id` must be a string, number or null.
     let id_ok = id
         .as_ref()
         .is_none_or(|v| v.is_string() || v.is_number() || v.is_null());
 
-    // Reject anything that isn't a well-formed JSON-RPC 2.0 request/notification
-    // object (e.g. `5`, `{}`, a message missing `jsonrpc`/`method`, or one with
-    // a structured `id`). A bare notification-shaped-but-invalid item must still
-    // produce an error rather than being silently swallowed.
+    // An invalid message without an `id` still gets an error, not the silence
+    // a notification gets.
     let is_valid = msg.is_object()
         && msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
         && msg.get("method").and_then(Value::as_str).is_some()
@@ -1649,8 +1589,7 @@ fn discover_result(server: &McpServer) -> Value {
 }
 
 fn initialize_result(server: &McpServer, params: &Value) -> Value {
-    // Echo the client's requested version only if we actually implement it;
-    // otherwise advertise our newest supported version (MCP negotiation).
+    // MCP negotiation: echo a supported requested version, else offer ours.
     let protocol = match params.get("protocolVersion").and_then(Value::as_str) {
         Some(requested) if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) => requested,
         _ => DEFAULT_PROTOCOL_VERSION,
@@ -1970,9 +1909,7 @@ impl AgentAudit {
         if let Some(grant) = grant {
             shared.insert("grant".to_owned(), grant.to_owned());
         }
-        // "unknown" rather than a guess: an ungoverned tool's blast radius is
-        // exactly what nobody has established, and calling it `reversible`
-        // would be the one wrong answer.
+        // An ungoverned tool is "unknown", never assumed `reversible`.
         shared.insert(
             "reversibility".to_owned(),
             reversibility.map_or_else(|| "unknown".to_owned(), |r| r.as_str().to_owned()),
@@ -1991,9 +1928,7 @@ impl AgentAudit {
             correlation_id,
             reversibility,
             grant,
-            // The principal the *envelope* resolved, if any. `Current` is set by
-            // the auth layer on the request scope, so a `secure_mcp` app names
-            // its caller and an open one falls back rather than recording "".
+            // The principal the envelope's auth layer resolved, if any.
             actor: crate::current::Current::scoped_actor()
                 .and_then(|actor| clean_actor(&actor))
                 .unwrap_or_else(|| ANONYMOUS_AGENT.to_owned()),
@@ -2096,14 +2031,12 @@ impl AgentAudit {
     async fn record_attempt(&self, state: &crate::state::AppState) -> Result<(), &'static str> {
         let event = self.event(
             format!("agent.tool.{}.attempt", self.tool),
-            // The *write* is what succeeded here; `phase` carries the fact that
-            // nothing has been attempted yet.
+            // The write succeeded; `phase` says nothing has run yet.
             crate::audit::AuditStatus::Success,
             "attempt",
         );
         let Err(error) = Self::write_bounded(state, event).await else {
-            // Mirrored to the trace so an app with no sink installed still sees
-            // both halves of every invocation, not just the outcome.
+            // Traced too, so an app with no sink still sees both halves.
             tracing::info!(
                 target: "autumn.agent",
                 tool = %self.tool,
@@ -2163,10 +2096,8 @@ impl AgentAudit {
     /// itself does not depend on this landing.
     async fn record_refusal(&self, state: &crate::state::AppState, error: &str) {
         let mut event = self.event(
-            // Its own action, not the outcome action with a different `phase`:
-            // a refusal and a completed call are different things, and an
-            // operator filtering for one should not have to parse metadata to
-            // exclude the other.
+            // A distinct action, so filtering on outcomes excludes refusals
+            // without reading metadata.
             format!("agent.tool.{}.refused", self.tool),
             crate::audit::AuditStatus::Failure,
             "refused",
@@ -2188,11 +2119,9 @@ impl AgentAudit {
         request_id: Option<&str>,
         disposition: Disposition,
     ) {
-        // The status line alone is not the verdict: a streaming tool answers
-        // `200` before it has done anything, and a buffered tool can answer
-        // `200` and then fail to hand its body over. `disposition` carries what
-        // actually became of the action.
-        // `None`: the work stopped before the handler gave a status.
+        // A `200` alone is not success: a stream answers it before doing
+        // anything, and a buffered body can still fail. `status` is `None` when
+        // the work stopped before the handler gave one.
         let succeeded = status.is_some_and(|s| s.is_success()) && disposition.is_success();
         let audit_status = if succeeded {
             crate::audit::AuditStatus::Success
@@ -2222,8 +2151,7 @@ impl AgentAudit {
                 .metadata
                 .insert("request_id".to_owned(), request_id.to_owned());
         }
-        // Emitted whether or not a sink is installed, so an app that configured
-        // none still has a trace of every agent action it served.
+        // Traced whether or not a sink is installed.
         tracing::info!(
             target: "autumn.agent",
             tool = %self.tool,
@@ -2242,9 +2170,7 @@ impl AgentAudit {
             request_id = request_id,
             "agent tool call"
         );
-        // Bounded like the attempt write: the handler has already run, so a
-        // hanging sink here cannot change what happened — but it can still hold
-        // the response open, and the caller is owed one.
+        // Bounded so a hanging sink cannot hold the response open.
         if let Err(error) = Self::write_bounded(state, event).await {
             tracing::warn!(
                 target: "autumn.agent",
@@ -2445,9 +2371,8 @@ impl Drop for OutcomeGuard {
             return;
         }
         self.recorded = true;
-        // The work never reached an end: a stream's response body was dropped
-        // while the handler still had output to give, or a task was cancelled,
-        // expired or panicked. The trail has to say so rather than stay silent.
+        // The work never ended: the stream was dropped mid-output, or the task
+        // was cancelled, expired or panicked.
         let disposition = match self.abandoned {
             // A drop during unwinding is a panic, not an abort.
             Disposition::Task(_) if std::thread::panicking() => {
@@ -2459,9 +2384,8 @@ impl Drop for OutcomeGuard {
         let state = self.state.clone();
         let status = self.status;
         let request_id = self.request_id.clone();
-        // `try_current` rather than `spawn`: during runtime shutdown there is
-        // no reactor left to spawn onto, and a panic in `Drop` would be far
-        // worse than a missing row on a process that is already going away.
+        // `try_current`, not `spawn`: during runtime shutdown there is nothing to
+        // spawn onto, and panicking in `Drop` is worse than losing the row.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 audit
@@ -2514,9 +2438,8 @@ fn argument_names(tool: &McpTool, arguments: &Value) -> String {
         return String::new();
     };
 
-    // The keys `build_request` actually reads. Catch-all params (`{*rest}`)
-    // surface from `ApiDoc` with a leading `*` but are addressed by the bare
-    // name, exactly as `build_request` strips it.
+    // The keys `build_request` reads. A catch-all param (`{*rest}`) is
+    // addressed by its bare name.
     let is_known = |name: &str| {
         name == "body"
             || name == "query"
@@ -2553,8 +2476,7 @@ fn argument_names(tool: &McpTool, arguments: &Value) -> String {
         if !out.is_empty() {
             out.push(',');
         }
-        // A count, not the names: the whole point is that these are the ones
-        // nobody vouched for.
+        // A count, never the caller's key names.
         let _ = write!(out, "+{unknown} unknown");
     }
     out
@@ -2574,44 +2496,31 @@ fn apply_replay_extensions(
 ) {
     let extensions = request.extensions_mut();
 
-    // Inserted for EVERY tool — a handler is entitled to know it is being
-    // driven by an agent whether or not anyone declared a grant for it.
+    // Every tool gets it, whether or not a grant was declared.
     extensions.insert(audit.invocation());
 
-    // The caller's resolved identity and connection peer, so the dispatch
-    // pipeline attributes the call like a direct request would — the
-    // proxy-aware tenancy host and the IP-keyed rate limiter both read these.
+    // Tenancy host resolution and the IP-keyed rate limiter read these.
     if let Some(identity) = ctx.identity {
         extensions.insert(identity.clone());
     }
     if let Some(peer) = ctx.peer {
         extensions.insert(axum::extract::ConnectInfo(peer));
     }
-    // The verified client certificate of the envelope's own connection (#1640).
-    // The replay traverses the router's `RequireClientCert` layer, so without
-    // this a legitimately-certified caller would be refused on an mTLS-only
-    // tool — and `ClientCert` would disagree with the `PolicyContext`, which
-    // reads the ambient scope and therefore already sees it.
+    // The replay passes `RequireClientCert`, so without the envelope's verified
+    // certificate (#1640) an mTLS-only tool would refuse a certified caller.
     #[cfg(feature = "tls")]
     if let Some(client_cert) = &ctx.client_cert {
         extensions.insert(std::sync::Arc::clone(client_cert));
     }
-    // When the `/mcp` envelope is itself rate-limited, this call was already
-    // counted there; mark the replay envelope-counted so the framework-default
-    // limiter (which shares the envelope bucket) doesn't charge a second token
-    // for the same tool call. User/per-route limiters (path overrides,
-    // `#[throttle]`) don't share that bucket and still charge the replay.
+    // The envelope already took a token from the default limiter's shared
+    // bucket, so that limiter skips the replay. Per-route limiters (path
+    // overrides, `#[throttle]`) still charge it.
     if server.envelope_rate_limited {
         extensions.insert(crate::security::RateLimitEnvelopeCounted);
     }
-    // Likewise for load shedding: the envelope and the dispatch pipeline share
-    // the SAME `LoadShedLayer` instance (same `Arc` in-flight counter), so
-    // without this a `tools/call` would acquire one slot at the envelope and a
-    // second at this replay for the same logical request — silently halving the
-    // effective ceiling for MCP traffic.
-    //
-    // A task (`detached`) outlives the envelope and its slot, so it takes
-    // its own slot instead.
+    // The envelope and the replay share one `LoadShedLayer`, so a second slot
+    // would halve the ceiling for MCP traffic. A task (`detached`) outlives the
+    // envelope's slot and takes its own.
     if server.envelope_load_shed && !detached {
         extensions.insert(crate::middleware::LoadShedExempt);
         if let Some(admission) = &ctx.envelope_admission {
@@ -2732,8 +2641,8 @@ async fn serve_tools_call(
         Err(message) => return json_response(&error(id, -32602, &message)),
     };
 
-    // Agent-authority envelope (#1691). Resolved before dispatch so the
-    // correlation id exists ahead of anything that can go wrong.
+    // Resolved before dispatch so the correlation id exists before anything can
+    // fail (#1691).
     let mut audit = AgentAudit::new(server, tool, &arguments, ctx, via_call_tool);
 
     if let Err(refusal) = admit_call(server, tool, &audit).await {
@@ -2784,19 +2693,11 @@ async fn serve_tools_call(
         .and_then(|v| v.to_str().ok())
         .is_some_and(accept_includes_event_stream);
 
-    // A streaming tool whose handler streamed (text/event-stream) and whose
-    // client can read SSE: project the stream onto the MCP SSE channel. This is
-    // the only path that escapes buffering; every other case (a buffered tool, a
-    // streaming handler that errored before streaming, or a client that can't
-    // read SSE) falls through to the buffered branch below — so the base #1117
-    // path and non-SSE clients are entirely unaffected.
+    // The only unbuffered path. A streaming handler that failed before
+    // streaming, or a client that cannot read SSE, gets the buffered branch.
     if tool.streams && status.is_success() && is_event_stream && client_accepts_sse {
-        // The outcome is NOT recorded here. A streaming handler answers `200`
-        // before it has produced anything, so recording now would durably claim
-        // success for a stream that then errors or is cut off by a client
-        // disconnect — with no later event to correct it. The guard travels
-        // with the projection and writes exactly one outcome when it reaches a
-        // terminal state, or from its `Drop` if the client hangs up first.
+        // A stream answers `200` before producing anything, so the guard
+        // records the outcome when the stream ends, or on drop.
         let mut stream_audit = OutcomeGuard::new(
             audit,
             server.state.clone(),
@@ -2807,11 +2708,8 @@ async fn serve_tools_call(
         return stream_tool_result(id, &params, response, replayed, stream_audit, server_info);
     }
 
-    // Buffered path: the outcome is recorded only once the body has actually
-    // been read and packaged. A `200` here is not yet proof the agent got
-    // anything — the body can still overflow the tool-result cap or error
-    // mid-read, and the agent would then see a tool error while the audit row
-    // claimed success (issue #1691 review round 2).
+    // Recorded after the body is read: it can still overflow or fail mid-read
+    // after a `200`.
     let (resp, failure) = buffered_tool_response(
         tool,
         id,
@@ -3052,16 +2950,8 @@ async fn buffered_tool_response(
     response: Response,
     server_info: Option<&Value>,
 ) -> (Response, Option<BufferedFailure>) {
-    // Capture the dispatch clone's `Server-Timing` header (#1348) so its
-    // non-`total` metrics can be forwarded onto the rebuilt response. The clone
-    // runs the primary `ServerTimingLayer`, which builds the full metric set —
-    // including `db;dur;desc="N queries"` for a DB-backed tool — but that inner
-    // response is discarded when the JSON-RPC envelope is rebuilt below. Without
-    // forwarding, a DB-backed `tools/call` would lose the query count. Only the
-    // non-`total` metrics are forwarded (see the append below); the inner
-    // `total` measured the dispatch clone alone and is dropped in favour of the
-    // outer fallback's real `/mcp` `total`. Captured before this function
-    // consumes the body, exactly as the caller captured `Set-Cookie`.
+    // The inner `Server-Timing` (#1348) carries metrics such as the DB query
+    // count. Read it before the body is consumed.
     let mut server_timings: Vec<HeaderValue> = Vec::new();
     for value in response.headers().get_all(&SERVER_TIMING) {
         server_timings.push(value.clone());
@@ -3080,17 +2970,9 @@ async fn buffered_tool_response(
     if failure.is_some() {
         return (resp, failure);
     }
-    // Forward only the inner dispatch's non-`total` `Server-Timing` metrics
-    // (e.g. `db;dur=…;desc="N queries"`) onto the rebuilt response, dropping the
-    // inner `total`. That inner `total` measured only the dispatch clone; it was
-    // captured before this endpoint buffered the body (`to_bytes`), collapsed an
-    // SSE body for a non-SSE client, and repackaged the JSON-RPC envelope, so it
-    // under-reports `/mcp` latency. By NOT marking the outer `ServerTimingEmitted`
-    // sentinel, the fallback `ServerTimingLayer` appends the real `/mcp` `total`
-    // (which brackets that buffering/serialization). Net result on a DB-backed
-    // call: the fallback's true `total` plus the inner `db` metric, with exactly
-    // one `total`. A non-DB call forwards nothing and the fallback emits
-    // total-only.
+    // Forward the inner metrics but not the inner `total`, which misses the
+    // buffering and repackaging. `ServerTimingEmitted` stays unset, so the outer
+    // `ServerTimingLayer` appends the real `/mcp` `total`.
     for timing in server_timings {
         if let Ok(value) = timing.to_str()
             && let Some(kept) = strip_total_metric(value)
@@ -3111,15 +2993,10 @@ async fn read_tool_result(
     is_event_stream: bool,
     body: Body,
 ) -> (Value, Option<BufferedFailure>) {
-    // Unlike a normal HTTP response (streamed straight to the socket), the MCP
-    // path buffers the whole body to repackage it as a tool result. Cap that
-    // buffer so a runaway handler can't OOM the process; report an overflow as
-    // an explicit tool error rather than silently truncating to an empty body.
+    // The whole body is buffered, so cap it against a runaway handler.
     let bytes = match axum::body::to_bytes(body, MAX_TOOL_RESPONSE_BYTES).await {
         Ok(bytes) => bytes,
         Err(error) => {
-            // The agent gets a tool error, so the audit row must record one
-            // too: the call did not deliver what the handler produced.
             let failure = BufferedFailure::classify(&error);
             let message = match failure {
                 BufferedFailure::Overflow => format!(
@@ -3132,9 +3009,8 @@ async fn read_tool_result(
             return (tool_error(&message), Some(failure));
         }
     };
-    // A streaming handler buffered for a non-SSE client: collapse the SSE wire
-    // frames into their concatenated data payload so the client still receives a
-    // usable single result instead of raw `data:`-framed text.
+    // A streaming handler buffered for a non-SSE client: return the joined data
+    // payloads, not raw `data:` frames.
     let text = if is_event_stream {
         collapse_sse_body(&bytes)
     } else {
@@ -3201,15 +3077,10 @@ fn buffered_tool_result(tool: &McpTool, status: StatusCode, text: &str) -> Value
 
 // ── Progressive (SSE) tool-result projection ──────────────────────
 //
-// A streaming tool is a normal Autumn route returning `Sse` (issue #1118). Its
-// dispatched response is already SSE wire bytes (`event:`/`data:` frames). The
-// MCP endpoint *re-projects* those frames onto the Streamable-HTTP SSE channel:
-// each handler event becomes a `notifications/progress` message (when the
-// client supplied `_meta.progressToken`), and the stream is terminated by the
-// final id-correlated `tools/call` result. The developer writes a plain Autumn
-// stream — zero hand-written JSON-RPC/SSE framing — and time-to-first-signal is
-// decoupled from total tool duration because frames are forwarded as they
-// arrive rather than buffered.
+// A streaming tool is a route returning `Sse` (#1118). Its SSE frames are
+// re-projected onto the Streamable-HTTP SSE channel as they arrive: each event
+// becomes a `notifications/progress` message (when the client sent
+// `_meta.progressToken`), and the final `tools/call` result ends the stream.
 
 /// Whether an `Accept` header opts the client in to an SSE response. The MCP
 /// Streamable-HTTP transport has a streaming client advertise
@@ -3373,12 +3244,9 @@ async fn project_next(
                     let events = st.parser.push(&bytes);
                     enqueue_projected(&mut st, events);
                 }
-                // The handler's body is finished — cleanly (`None`) or with a
-                // transport error (`Some(Err)`, the only `Some` left here).
-                // Either way this is the action's terminal state, so the
-                // outcome is recorded now rather than left to the drop guard:
-                // whatever the client does with the remaining projection, the
-                // handler has already done everything it was going to do.
+                // The body ended, cleanly (`None`) or with an error (`Some(Err)`).
+                // The handler is done, so record the outcome now rather than
+                // leaving it to the drop guard.
                 terminal => {
                     let outcome = if terminal.is_some() {
                         StreamState::Errored
@@ -3477,7 +3345,7 @@ impl SseWireParser {
         if line.is_empty() {
             return self.dispatch();
         }
-        // A leading colon marks a comment line (SSE keep-alive); ignore it.
+        // A comment line (SSE keep-alive).
         if line.starts_with(':') {
             return None;
         }
@@ -3544,31 +3412,23 @@ fn build_request(
     csrf_header: &str,
     tenant_header: Option<&str>,
 ) -> Result<axum::http::Request<Body>, String> {
-    // Fill the path template from top-level string-ish arguments.
     let mut path = tool.path_template.clone();
     for param in &tool.path_params {
-        // axum catch-all params (`/files/{*rest}`) surface from `ApiDoc` with a
-        // leading `*`. Clients address them by the bare name, and their value is
-        // a multi-segment path whose `/` separators must be preserved (each
-        // segment is still percent-encoded individually).
+        // A catch-all param (`/files/{*rest}`) is addressed by its bare name. Its
+        // `/` separators are kept, and each segment is percent-encoded.
         let is_catch_all = param.starts_with('*');
         let arg_key = param.strip_prefix('*').unwrap_or(param);
         let raw = arguments
             .get(arg_key)
             .ok_or_else(|| format!("missing required path parameter `{arg_key}`"))?;
-        // The tool schema advertises every path param as `{"type":"string"}`.
-        // A string passes through; a number/bool coerces to a single safe
-        // segment. `null`, an object, or an array has no valid single-segment
-        // representation — replaying its literal `null`/JSON text as a path
-        // segment could hit a real (possibly mutating) resource, so reject it
-        // as invalid params (mapped to `-32602`) instead.
+        // Replaying the JSON text of a `null`, object or array as a segment could
+        // hit a real (possibly mutating) resource, so those are rejected.
         let value = match raw {
             Value::String(s) => s.clone(),
             Value::Number(_) | Value::Bool(_) => raw.to_string(),
             _ => return Err(format!("path parameter `{arg_key}` must be a string")),
         };
-        // Use the same full segment encoder the typed path helpers use, so an
-        // MCP call accepts the same values a direct HTTP caller could pass.
+        // The encoder the typed path helpers use.
         let encoded = if is_catch_all {
             crate::paths::encode_catch_all_param(&value)
         } else {
@@ -3577,11 +3437,8 @@ fn build_request(
         path = replace_path_param(&path, param, &encoded);
     }
 
-    // Build the query string from the `query` object, if any. The advertised
-    // `inputSchema` types `query` as an object, so a present-but-non-object
-    // value (`null`, a string, an array) is an invalid-params error rather than
-    // being silently dropped — which would otherwise replay the tool with
-    // defaulted/unfiltered query parameters.
+    // A non-object `query` is an error: dropping it would replay the tool with
+    // unfiltered query parameters.
     if tool.has_query
         && let Some(query) = arguments.get("query")
     {
@@ -3590,10 +3447,8 @@ fn build_request(
         };
         let mut pairs = QueryPairs::new();
         for (key, value) in map {
-            // The tool's own `query` property names get the same rule its
-            // nested object fields do — a dynamic query object can carry an
-            // arbitrary key here, and `filter[x]` would otherwise reach the
-            // decoder as structure rather than as the name the caller sent.
+            // A top-level key such as `filter[x]` would otherwise decode as
+            // structure, not as the name the caller sent.
             if !is_expressible_field_name(key) {
                 return Err(inexpressible_field_name("query"));
             }
@@ -3610,31 +3465,16 @@ fn build_request(
         .method(tool.method.as_str())
         .uri(&path);
 
-    // Replay the caller's headers verbatim so the dispatched request
-    // authenticates and is attributed exactly as a direct HTTP call would:
-    //  * `Authorization` — bearer-token (`RequireApiToken`) auth.
-    //  * `Cookie` — session-based `#[secured]` routes / session tenancy.
-    //  * `Idempotency-Key` — `IdempotencyLayer` dedupe on retried writes.
-    //  * `Host` / `Forwarded` / `X-Forwarded-*` / `X-Real-IP` — subdomain
-    //    tenancy host resolution and the rate limiter's client-IP attribution.
     for name in FORWARDED_HEADERS {
-        // Forward *every* value, not just the first: a header like `Cookie` can
-        // appear multiple times, and `CsrfLayer` inspects all `Cookie` headers
-        // to detect cookie-tossing (duplicate CSRF cookies). Collapsing them to
-        // one value here would let a replayed write slip past that check.
+        // Every value: `CsrfLayer` inspects all `Cookie` headers to detect
+        // cookie-tossing, and collapsing them would slip a replay past it.
         for value in headers.get_all(*name) {
             builder = builder.header(*name, value);
         }
     }
-    // Forward the configured CSRF token header (default `x-csrf-token`) so a
-    // session-authenticated write tool passes `CsrfLayer`, which reads
-    // `CsrfConfig::token_header` — not a hard-coded name.
     if let Some(value) = headers.get(csrf_header) {
         builder = builder.header(csrf_header, value);
     }
-    // Header-based tenancy: forward the configured tenant header (default
-    // `x-tenant-id`) so the `Tenant` extractor on the dispatched request
-    // resolves the same tenant a direct HTTP caller would.
     if let Some(name) = tenant_header
         && let Some(value) = headers.get(name)
     {
@@ -3642,9 +3482,7 @@ fn build_request(
     }
 
     let body = if tool.has_body {
-        // The tool schema marks `body` required; reject a call that omits it
-        // rather than dispatching an empty `{}` that a defaults-only DTO would
-        // silently accept (violating the advertised contract).
+        // `body` is required: an empty `{}` would pass a defaults-only DTO.
         let payload = arguments
             .get("body")
             .ok_or_else(|| "missing required `body` argument".to_owned())?;
@@ -3811,9 +3649,8 @@ fn encode_query_arg(
             "query argument key exceeds {MAX_QUERY_BYTES} bytes"
         ));
     }
-    // Before descending, and so before any child key is formatted: a `null`
-    // leaf emits no pair, so without this it would pay nothing for the parent
-    // key its sibling count forces the encoder to copy.
+    // Charged before any child key is formatted: a `null` leaf emits no pair
+    // but still costs a copy of its parent key.
     out.visit()?;
     let is_container = matches!(value, Value::Array(_) | Value::Object(_));
     let before = out.pairs.len();
@@ -3837,14 +3674,9 @@ fn encode_query_arg(
                 .all(|item| !matches!(item, Value::Array(_) | Value::Object(_)));
             if all_scalar {
                 if let [only] = items.as_slice() {
-                    // Repeated keys carry a sequence only from the *second*
-                    // occurrence on: one `tags=only` pair is indistinguishable
-                    // from a scalar, so `deserialize_any` (an untyped
-                    // `serde_json::Value` target) would yield `"only"` for the
-                    // `["only"]` the caller sent — and the field would turn
-                    // back into an array on gaining a second element. The
-                    // explicit position pins the kind. A typed `Vec` target
-                    // decodes either form identically.
+                    // A single `tags=only` pair reads as a scalar, so an untyped
+                    // `serde_json::Value` target would get `"only"`. The explicit
+                    // position keeps it an array. A typed `Vec` decodes either.
                     out.push(&format!("{key}[0]"), query_scalar(only))?;
                 } else {
                     for item in items {
@@ -3863,21 +3695,12 @@ fn encode_query_arg(
                  empty object — omit the argument, or move the field to a JSON body"
             ));
         }
-        // Every key digit-only means every segment decodes as a *position*
-        // (`query_string::classify_segment`), so the tree comes back a sequence
-        // and an untyped target (`serde_json::Value`, which takes whatever
-        // `deserialize_any` yields) receives an array where the caller sent an
-        // object — with the tell that adding one named key silently flips it
-        // back. A typed map target is unaffected, but the encoder cannot see
-        // the target, so it refuses the shape rather than dispatch a value the
-        // caller did not ask for. Mixed keys are fine: the named one forces the
-        // decoder to promote the whole node to a map.
-        // A `null` field emits no pair, so it cannot disambiguate anything: it
-        // is invisible to the decoder. Judging the shape on *declared* keys let
-        // `{"0": 5, "kind": null}` through, which reaches the wire as the bare
-        // `counts[0]=5` this arm exists to refuse. So the check runs over the
-        // fields that actually emit. An all-null object is left to fall through
-        // to the collapse check below, which describes it better.
+        // All-digit keys decode as positions (`query_string::classify_segment`),
+        // so an untyped target would get an array, not the object sent. The
+        // encoder cannot see the target type, so it refuses. One named key makes
+        // the decoder build a map. Only emitting (non-null) fields count:
+        // `{"0": 5, "kind": null}` reaches the wire as a bare `counts[0]=5`. An
+        // all-null object falls through to the collapse check below.
         Value::Object(fields)
             if {
                 let mut emitting = fields
@@ -3906,12 +3729,9 @@ fn encode_query_arg(
         }
         scalar => out.push(key, query_scalar(scalar))?,
     }
-    // A container every one of whose leaves is `null` emits no pair at all.
-    // Left alone it would vanish — and inside an array the decoder would then
-    // compact the gap, shortening the sequence. That is the same silent
-    // alteration the empty-container and null-element checks above prevent, so
-    // it is refused here rather than dispatched. A `null` **field** is exempt by
-    // construction: it is not a container, so it stays the absent marker.
+    // A container whose leaves are all `null` emits nothing and would vanish;
+    // inside an array the decoder would then shorten the sequence. A `null`
+    // field is not a container, so it stays the absent marker.
     if is_container && out.pairs.len() == before {
         return Err(format!(
             "query argument `{key}` carries no value; a query string cannot express a \
@@ -4027,9 +3847,7 @@ mod tests {
 
     #[test]
     fn strip_total_metric_drops_only_total() {
-        // Inner `total` is dropped; the `db` metric (with a comma-free quoted
-        // desc) is preserved so the outer fallback's real `/mcp` `total` is the
-        // only one on the response.
+        // The outer layer's `total` must be the only one on the response.
         assert_eq!(
             strip_total_metric("total;dur=5.000, db;dur=1.250;desc=\"2 queries\""),
             Some("db;dur=1.250;desc=\"2 queries\"".to_owned())
@@ -4039,12 +3857,9 @@ mod tests {
             strip_total_metric("app;dur=1.500, total;dur=42.000"),
             Some("app;dur=1.500".to_owned())
         );
-        // A total-only header forwards nothing.
         assert_eq!(strip_total_metric("total;dur=9.000"), None);
-        // The metric-name token is matched case-insensitively before `;`/`=`,
-        // so a bare `total` (no params) is also dropped.
+        // Case-insensitive, and a bare `total` with no params is dropped too.
         assert_eq!(strip_total_metric("Total"), None);
-        // Empty / whitespace-only input yields nothing.
         assert_eq!(strip_total_metric("  "), None);
     }
 
@@ -4090,9 +3905,8 @@ mod tests {
 
     #[test]
     fn no_content_delete_with_opt_in_is_eligible() {
-        // A 204 No Content route (e.g. the repository macro's generated
-        // DELETE) has no response schema *by contract*, not because it is an
-        // HTML route. An explicit opt-in must expose it.
+        // A 204 route (e.g. a generated DELETE) has no schema by contract, not
+        // because it is HTML.
         let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
         d.response = None;
         d.success_status = 204;
@@ -4105,8 +3919,7 @@ mod tests {
 
     #[test]
     fn reset_content_205_with_opt_in_is_eligible() {
-        // 205 Reset Content is the other empty-body-by-contract status; the
-        // exemption is a shared predicate, not a hard-coded 204 literal.
+        // 205 is the other empty-body status.
         let mut d = doc("POST", "/api/forms/clear", "clear_form");
         d.response = None;
         d.success_status = 205;
@@ -4118,12 +3931,8 @@ mod tests {
 
     // ── Agent authority carried onto derived tools (#1691) ──────────────────
     //
-    // The authority envelope is what makes a `tools/call` auditable with a
-    // *compile-known* blast radius: the grant name, the effect set, and the
-    // reversibility all come from the const assertions the macro already made
-    // against the handler body. Losing it between `ApiDoc` and `McpToolInfo`
-    // would silently downgrade a governed tool to `reversibility=unknown` in
-    // the audit trail and to `ungoverned_tools` in the manifest.
+    // Losing the authority between `ApiDoc` and `McpToolInfo` would record a
+    // governed tool as `reversibility=unknown` and list it as ungoverned.
 
     /// One construction site for the test grants, so the shape of
     /// [`crate::agent_authority::Grant`] is pinned in exactly one place here.
@@ -4219,9 +4028,7 @@ mod tests {
 
     #[test]
     fn derive_tools_leaves_an_ungoverned_tool_without_an_authority() {
-        // `None` must stay `None`: it is the signal the manifest uses to list a
-        // mutating tool under `ungoverned_tools`, so inventing one here would
-        // hide exactly the gap that check exists to find.
+        // `None` is how the manifest finds `ungoverned_tools`.
         let tools = derive_tools(&[governed_doc("POST", "draft_refund", None)], false, None);
         assert_eq!(tools.len(), 1);
         assert!(
@@ -4258,8 +4065,6 @@ mod tests {
 
     #[test]
     fn destructive_hint_falls_back_to_the_verb_rule_when_ungoverned() {
-        // Nothing changes for the ungoverned majority: POST carries no hint and
-        // DELETE stays flagged, exactly as before #1691.
         let post = derive_tools(&[governed_doc("POST", "draft_refund", None)], false, None);
         assert!(
             post[0].annotations().get("destructiveHint").is_none(),
@@ -4281,13 +4086,9 @@ mod tests {
 
     #[test]
     fn the_delete_verb_is_a_floor_a_reversible_grant_cannot_clear() {
-        // `reversible` means the analyser proved the effect set is bounded
-        // writes only — and `delete_by_id` IS a bounded write, so a hard row
-        // delete reaches this shape. It does not mean the row can be put back;
-        // nothing checks for soft-delete or versioning. Since an MCP client
-        // skips its confirmation prompt on `destructiveHint: false`, the verb
-        // stays a floor: the grant may add the warning, never remove it
-        // (issue #1691 review, P2-1).
+        // `delete_by_id` is a bounded write, so a hard delete can be proved
+        // `reversible` without the row being recoverable. Clients skip their
+        // confirmation on `destructiveHint: false`, so the verb is a floor.
         let tools = derive_tools(
             &[governed_doc(
                 "DELETE",
@@ -4305,7 +4106,7 @@ mod tests {
         );
     }
 
-    // ── Argument names are intersected with the tool's surface (#1691 P2-2) ──
+    // ── Argument names are intersected with the tool's surface (#1691) ──
 
     /// A tool with one path param plus a body, so all three name categories
     /// (path param, reserved key, unknown) are reachable.
@@ -4326,9 +4127,8 @@ mod tests {
 
     #[test]
     fn argument_names_counts_unrecognised_keys_instead_of_quoting_them() {
-        // `build_request` reads only `body`/`query`/the path params and ignores
-        // everything else, and nothing rejects extra properties — so every other
-        // key is caller-authored text that must never reach a durable row.
+        // Nothing rejects extra keys, so they are caller-authored text that must
+        // never reach a durable row.
         let hostile = "\n2026-09-02T00:00:00Z INFO agent tool call actor=admin";
         let mut args = serde_json::Map::new();
         args.insert("body".to_owned(), json!({}));
@@ -4353,9 +4153,7 @@ mod tests {
 
     #[test]
     fn argument_names_addresses_a_catch_all_param_by_its_bare_name() {
-        // `ApiDoc` surfaces `/files/{*rest}` as `*rest`; clients send `rest`,
-        // and `build_request` strips the star to match. The audit view must
-        // strip it the same way or a legitimate param reads as unknown.
+        // `ApiDoc` names `/files/{*rest}` as `*rest`; clients send `rest`.
         let mut t = tool("GET", "/files/{*rest}", false, false);
         t.path_params = vec!["*rest".to_owned()];
         assert_eq!(argument_names(&t, &json!({ "rest": "a/b" })), "rest");
@@ -4378,8 +4176,7 @@ mod tests {
                 provenance: EffectProvenance::Syntactic,
             }
         }
-        // One over the cap, so the elision is exercised rather than the
-        // boundary being silently the whole list.
+        // One over the cap, so the elision is exercised.
         const EFFECTS: [Effect; MAX_AUDITED_EFFECTS + 1] =
             [effect("Refund"); MAX_AUDITED_EFFECTS + 1];
 
@@ -4399,10 +4196,6 @@ mod tests {
 
     #[test]
     fn only_a_completed_stream_and_an_intact_body_count_as_success() {
-        // The disposition is the half of the verdict the status line cannot
-        // supply: a streaming tool answers `200` before it has done anything,
-        // and a buffered one can answer `200` and then fail to hand its body
-        // over (issue #1691 review rounds 1 and 2).
         assert!(Disposition::Settled.is_success());
         assert!(Disposition::Stream(StreamState::Completed).is_success());
         assert!(!Disposition::Stream(StreamState::Aborted).is_success());
@@ -4435,11 +4228,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_length_limit_anywhere_in_the_source_chain_is_an_overflow() {
-        // `to_bytes` collects through `http_body_util::Limited`, which reports
-        // the cap as a `LengthLimitError` *nested* inside the error it hands
-        // back. Classifying on the outer type alone would record every overflow
-        // as a generic `body_error` — so the error under test is produced by the
-        // very call the buffered path makes, not by a hand-built stand-in.
+        // The `LengthLimitError` is nested inside the error `to_bytes` returns,
+        // so the test uses that real error rather than a hand-built one.
         let overflow = axum::body::to_bytes(axum::body::Body::from(vec![0_u8; 32]), 8)
             .await
             .expect_err("a body past the cap must not collect");
@@ -4459,8 +4249,7 @@ mod tests {
 
     #[test]
     fn read_only_hint_is_unaffected_by_the_authority() {
-        // `readOnlyHint` is a statement about the HTTP verb, not about how hard
-        // the effect is to undo — the two hints must not be conflated.
+        // `readOnlyHint` follows the verb alone.
         let tools = derive_tools(
             &[governed_doc(
                 "POST",
@@ -4495,9 +4284,8 @@ mod tests {
 
     #[test]
     fn no_content_under_hatch_pins_behavior() {
-        // A read-only, deliberately body-less endpoint under the whole-API
-        // hatch: 204 is a structural JSON-API signal (unlike an HTML route's
-        // 200-with-body), so the hatch includes it.
+        // Unlike an HTML route's schema-less 200, a 204 GET is included by the
+        // hatch.
         let mut d = doc("GET", "/api/ping", "ping");
         d.response = None;
         d.success_status = 204;
@@ -4507,9 +4295,7 @@ mod tests {
 
     #[test]
     fn derive_tools_keeps_opted_in_no_content_route() {
-        // The "opted in but no JSON response" warn/skip block in
-        // `derive_tools` must not silently drop a 204 route that
-        // `should_expose` accepts.
+        // The warn/skip block in `derive_tools` must agree with `should_expose`.
         let mut d = doc("DELETE", "/api/widgets/{id}", "widget_api_delete");
         d.response = None;
         d.success_status = 204;
@@ -4522,12 +4308,9 @@ mod tests {
 
     #[test]
     fn streaming_tool_is_eligible_without_response_schema() {
-        // A streaming tool returns `Sse` (no JSON response schema); the `stream`
-        // flag exempts it from the JSON-out gate that excludes HTML routes.
         let mut d = doc("GET", "/api/search", "search");
         d.response = None;
         d.mcp_stream = true;
-        // Still requires opt-in: `stream` alone (no `mcp`) is not exposed.
         assert!(
             !should_expose(&d, false),
             "stream without opt-in stays hidden"
@@ -4537,15 +4320,12 @@ mod tests {
             should_expose(&d, false),
             "opted-in streaming tool is exposed"
         );
-        // Exclusion still wins.
         d.mcp_exclude = true;
         assert!(!should_expose(&d, false));
     }
 
     #[test]
     fn streaming_get_is_included_under_the_hatch() {
-        // Under `expose_all`, a read-only streaming GET is auto-included even
-        // without an explicit `mcp` tag (and despite having no response schema).
         let mut d = doc("GET", "/api/search", "search");
         d.response = None;
         d.mcp_stream = true;
@@ -4584,7 +4364,6 @@ mod tests {
 
     #[test]
     fn sse_parser_handles_chunk_boundaries_mid_frame() {
-        // A frame split across chunk boundaries must still parse once complete.
         let mut p = SseWireParser::new();
         assert!(p.push(b"data: hel").is_empty());
         assert!(p.push(b"lo\n").is_empty());
@@ -4700,10 +4479,8 @@ mod tests {
 
     #[test]
     fn detect_degradation_accepts_structured_query_fields() {
-        // Nested objects, arrays of objects, `$ref`s and their nullable
-        // (`oneOf [.., {"type":"null"}]`) forms are all round-trippable now that
-        // `Query<T>` decodes the bracketed dialect `build_request` emits
-        // (issue #1972), so none of them may be reported as a degradation.
+        // `Query<T>` decodes the bracketed dialect `build_request` emits (#1972),
+        // so nested and nullable structure round-trips.
         let schema = json!({
             "type": "object",
             "properties": {
@@ -4779,8 +4556,8 @@ mod tests {
             pairs.pairs
         );
 
-        // The same holds for a null field alongside a carried one — only a
-        // container that collapses ENTIRELY is refused (see the collapse test).
+        // A null field beside a carried one is dropped too. Only a container
+        // that collapses entirely is refused.
         let mut pairs = QueryPairs::new();
         encode_query_arg(
             "filter",
@@ -4797,9 +4574,8 @@ mod tests {
 
     #[test]
     fn encode_query_arg_refuses_values_a_query_string_cannot_carry() {
-        // Each of these would otherwise dispatch something the caller did not
-        // ask for: a vanished field, a shortened sequence, or an invented
-        // nesting level (issue #1972 review follow-ups).
+        // Each would otherwise dispatch a vanished field, a shortened sequence,
+        // or an invented nesting level.
         for (label, value) in [
             ("empty array", json!({ "tags": [] })),
             ("empty object", json!({ "filter": {} })),
@@ -4828,9 +4604,7 @@ mod tests {
 
     #[test]
     fn encode_query_arg_refuses_containers_that_collapse_to_nothing() {
-        // Codex P2: every field of an element being null emits no pair, so the
-        // element would vanish and the decoder would compact the gap — the same
-        // silent shortening a direct null element is already refused for.
+        // An all-null element emits no pair, and the decoder would close the gap.
         let mut pairs = QueryPairs::new();
         assert!(
             encode_query_arg(
@@ -4855,8 +4629,7 @@ mod tests {
 
     #[test]
     fn top_level_query_keys_are_validated_like_nested_field_names() {
-        // Codex P2: a dynamic query object can carry an arbitrary top-level
-        // key, and `filter[x]` would otherwise reach the decoder as structure.
+        // A top-level `filter[x]` would otherwise reach the decoder as structure.
         assert!(!is_expressible_field_name("filter[x]"));
         assert!(!is_expressible_field_name(""));
         assert!(!is_expressible_field_name("a]b"));
@@ -4866,8 +4639,7 @@ mod tests {
 
     #[test]
     fn encode_query_arg_bounds_its_expansion() {
-        // A wide array cannot be turned into an unbounded pair list: expansion
-        // stops at the dispatch limit instead of building a giant URI.
+        // Expansion stops at the dispatch limit.
         let wide: Vec<Value> = (0..(MAX_QUERY_PAIRS * 2)).map(|i| json!(i)).collect();
         let mut pairs = QueryPairs::new();
         assert!(encode_query_arg("tags", &Value::Array(wide), 1, &mut pairs).is_err());
@@ -4880,10 +4652,8 @@ mod tests {
 
     #[test]
     fn encode_query_arg_charges_null_leaves_for_the_traversal_they_cost() {
-        // Codex P2: `null` emits no pair, so a container of them paid nothing
-        // against the pair/byte limits while still forcing one formatted child
-        // key per field — the all-null check only fires after the full walk.
-        // The traversal budget now stops it early.
+        // Nulls emit no pairs, so only the node budget stops this walk early;
+        // the all-null check fires after the full walk.
         let nulls: serde_json::Map<String, Value> = (0..(MAX_QUERY_NODES * 2))
             .map(|i| (format!("f{i}"), Value::Null))
             .collect();
@@ -4910,8 +4680,8 @@ mod tests {
 
     #[test]
     fn encode_query_arg_refuses_an_all_numeric_keyed_object() {
-        // Codex P2: every key digit-only decodes as a sequence, so an untyped
-        // target would receive an array where the caller sent an object.
+        // All-digit keys decode as a sequence, so an untyped target would get an
+        // array where the caller sent an object.
         let mut pairs = QueryPairs::new();
         let err = encode_query_arg("counts", &json!({ "0": 5, "1": 6 }), 1, &mut pairs)
             .expect_err("an all-numeric-keyed object is ambiguous on the wire");
@@ -4936,8 +4706,8 @@ mod tests {
 
     #[test]
     fn a_singleton_scalar_array_keeps_its_container_kind() {
-        // Codex P2: one repeated key is indistinguishable from a scalar, so a
-        // one-element array must use the explicit position instead.
+        // One repeated key reads as a scalar, so a one-element array uses the
+        // explicit position.
         let mut pairs = QueryPairs::new();
         encode_query_arg("tags", &json!(["only"]), 1, &mut pairs).expect("encodes");
         assert_eq!(
@@ -4960,14 +4730,14 @@ mod tests {
 
     #[test]
     fn the_numeric_object_check_ignores_fields_that_emit_nothing() {
-        // Codex P2: a `null` field emits no pair, so it cannot disambiguate —
-        // judging on declared keys let this reach the wire as bare `counts[0]=5`.
+        // A `null` field emits no pair, so this would reach the wire as a bare
+        // `counts[0]=5`.
         let mut pairs = QueryPairs::new();
         let err = encode_query_arg("counts", &json!({ "0": 5, "kind": null }), 1, &mut pairs)
             .expect_err("the null field cannot disambiguate");
         assert!(err.contains("all numeric"), "{err}");
 
-        // A named field that *does* emit still disambiguates, as before.
+        // A named field that emits does disambiguate.
         let mut pairs = QueryPairs::new();
         encode_query_arg("counts", &json!({ "0": 5, "kind": "x" }), 1, &mut pairs)
             .expect("an emitting named key resolves the shape");
@@ -5101,8 +4871,7 @@ mod tests {
 
     #[test]
     fn build_request_preserves_slashes_for_catch_all_param() {
-        // A catch-all route `/files/{*path}`: the argument is addressed by the
-        // bare name `path`, and its `/` separators survive into the replay URI.
+        // A catch-all is addressed by its bare name.
         let mut t = tool("GET", "/files/{*path}", false, false);
         t.path_params = vec!["*path".to_owned()];
         let req = build_request(
@@ -5141,8 +4910,7 @@ mod tests {
     #[test]
     fn build_request_rejects_non_object_query() {
         let t = tool("GET", "/api/search", false, true);
-        // `query` advertised as an object: a non-object value is invalid params,
-        // not silently dropped (which would replay with defaulted parameters).
+        // Dropping a non-object `query` would replay with default parameters.
         for bad in [
             json!({ "query": null }),
             json!({ "query": "all" }),
@@ -5185,8 +4953,7 @@ mod tests {
 
     #[test]
     fn build_request_forwards_accept_language() {
-        // The `Locale` extractor falls back to `Accept-Language`; forwarding it
-        // keeps an MCP tool's localized result matching a direct HTTP call.
+        // The `Locale` extractor falls back to `Accept-Language`.
         let t = tool("GET", "/api/todos", false, false);
         let mut headers = HeaderMap::new();
         headers.insert("accept-language", "fr-CA,fr;q=0.9".parse().unwrap());
@@ -5200,9 +4967,7 @@ mod tests {
 
     #[test]
     fn build_request_preserves_repeated_cookie_headers() {
-        // `CsrfLayer` inspects *all* Cookie headers to detect cookie-tossing
-        // (duplicate CSRF cookies); forwarding only the first would let a
-        // replayed write slip past that check. Every value must be carried.
+        // `CsrfLayer` inspects every `Cookie` header to detect cookie-tossing.
         let t = tool("POST", "/api/todos", true, false);
         let mut headers = HeaderMap::new();
         headers.append("cookie", "session=abc".parse().unwrap());
@@ -5390,9 +5155,8 @@ mod tests {
 
     #[test]
     fn same_origin_allowed_without_cors_allowlist() {
-        // An empty CORS allowlist (the default/production posture) must still
-        // permit a browser MCP client served by this same app — provided the
-        // host is trusted by the trusted-Host policy.
+        // The default empty allowlist still permits a client served by this app
+        // on a trusted host.
         let s = server_with_trusted(Vec::new(), &["app.example"]);
         // Host matches the Origin authority → allowed, scheme unknown.
         assert!(s.origin_allowed("https://app.example", Some("app.example"), None));
@@ -5439,9 +5203,8 @@ mod tests {
 
     #[test]
     fn same_origin_rejected_for_untrusted_host() {
-        // DNS rebinding: Origin and Host both name the attacker's domain. The
-        // authority matches, but the host is not trusted, so the same-origin
-        // shortcut must not fire — and with no CORS allowlist, it is rejected.
+        // DNS rebinding: Origin and Host both name the attacker's domain, which
+        // is not a trusted host, so the same-origin shortcut must not fire.
         let s = server_with_trusted(Vec::new(), &["app.example"]);
         assert!(!s.origin_allowed(
             "http://attacker.example",

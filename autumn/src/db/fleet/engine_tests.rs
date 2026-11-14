@@ -152,7 +152,6 @@ async fn background_open_finds_no_room_over_the_budget() {
     let tmp = tempfile::tempdir().unwrap();
     let fleet = fleet(tmp.path(), 64, 100);
     let (a, b) = (key(&fleet, "a"), key(&fleet, "b"));
-    // Make `b` on disk, then close it.
     drop(fleet.open(&b).await.unwrap());
     fleet.close(&b).await;
     let held = fleet.open(&a).await.unwrap();

@@ -251,9 +251,9 @@ impl ClockSource for ReplayClock {
             }
             return crate::time::MonotonicInstant::from_origin_elapsed(reading);
         }
-        // Over-read: repeat rather than drift to the (stub-fast) real
-        // timeline. Not counted separately — a handler that over-reads the
-        // monotonic clock over-reads it deterministically.
+        // Over-read: repeat the last reading rather than drift to the (stub-fast) real timeline.
+        // Not added to `over_reads`: a handler that over-reads the monotonic clock does so
+        // deterministically.
         last_or_origin()
     }
 }
@@ -326,7 +326,6 @@ mod tests {
         let clock = ReplayClock::new(Vec::new(), at(0))
             .with_monotonic(vec![Duration::from_millis(10), Duration::from_millis(30)]);
 
-        // Outside the scope: origin, non-consuming.
         assert_eq!(
             clock.monotonic(),
             crate::time::MonotonicInstant::ORIGIN,

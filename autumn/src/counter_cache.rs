@@ -1116,10 +1116,9 @@ fn order_tenant_runs<M: 'static>(specs: &[CounterCacheSpec<M>], folded: &mut [Co
             let mut prefix: i128 = 0;
             for slot in run.iter_mut() {
                 let toward_total = prefix < total || (prefix == total && total < 0);
-                // Ties keep their original (child) order, so equal weights go
-                // out as they were captured and the mutation stays
-                // deterministic: `min_by_key` takes the first minimum, and the
-                // reversed scan makes `max_by_key` take the first maximum.
+                // Ties keep child order so the mutation is deterministic:
+                // `min_by_key` takes the first minimum, and the reversed scan
+                // makes `max_by_key` take the first maximum.
                 let pick = if toward_total {
                     (0..remaining.len()).rev().max_by_key(|&i| remaining[i].2)
                 } else {
@@ -1580,10 +1579,9 @@ pub async fn counter_cache_after_update<M: Send + Sync + 'static>(
     for (index, spec) in specs.iter().enumerate() {
         let old = before.get(index).cloned().flatten();
         let new = contribution_of(spec, record);
-        // Collected rather than applied here, and not old-then-new: every delta
-        // this mutation makes goes out in one global lock order (see
-        // `apply_ordered`), so two transactions swapping children between the
-        // same parents cannot take the two row locks in opposite orders.
+        // Collected, not applied: every delta goes out in one global lock order
+        // (see `apply_ordered`), so two transactions swapping children between
+        // the same parents cannot lock them in opposite orders.
         push_diff(index, old, new, (spec.pk_of)(record), &mut moves);
     }
     apply_ordered(conn, specs, moves).await
@@ -1807,18 +1805,14 @@ pub async fn counter_cache_after_update_many<M: Send + Sync + 'static>(
     let pk_of = specs[0].pk_of;
     let mut contributions: Vec<Contribution> = Vec::new();
     for (index, spec) in specs.iter().enumerate() {
-        // Every leg's deltas are collected before any statement runs, then
-        // folded and applied in one global lock order (see `apply_ordered`).
-        // Re-parenting 1000 children from one post to another is then two
-        // `UPDATE`s (`-1000`, `+1000`) rather than 2000, and two concurrent
-        // batches swapping children between the same parents take their row
-        // locks in the same order and cannot deadlock.
+        // Deltas are collected, then folded and applied in one global lock order
+        // (see `apply_ordered`): re-parenting 1000 children is two `UPDATE`s, not
+        // 2000, and concurrent batches over the same parents cannot deadlock.
         for record in records {
             let child_id = pk_of(record);
             let Ok(found) = before.binary_search_by_key(&child_id, |(id, _)| *id) else {
-                // No captured "before" for this row: it appeared between the
-                // capture and the update. Guessing would be worse than leaving
-                // it to `recompute`.
+                // No captured "before": the row appeared between the capture and
+                // the update. Leave it to `recompute` rather than guess.
                 continue;
             };
             let old = before[found].1.get(index).cloned().flatten();
@@ -1873,9 +1867,7 @@ pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
     }
     let pk_of = specs[0].pk_of;
     // A soft-deleted existing row is counted by nobody, so it has no "old
-    // parent". Recording one would make the post-upsert side — which now checks
-    // `live_of` and yields `None` for a row that stays deleted — decrement a
-    // parent that had already dropped it.
+    // parent". Recording one would decrement a parent that already dropped it.
     let before: HashMap<i64, Vec<CapturedContribution>> = existing
         .iter()
         .map(|row| {
@@ -1888,10 +1880,8 @@ pub async fn counter_cache_after_upsert_many<M: Send + Sync + 'static>(
             )
         })
         .collect();
-    // One pass per leg over the whole chunk, inserts and updates together: a row
-    // absent from `before` is an insert (`+1`), a row present in it is an update
-    // (the before/after diff). Folded and ordered by `apply_ordered` like every
-    // other bulk path, for the same two reasons.
+    // One pass per leg over the whole chunk: a row absent from `before` is an
+    // insert (`+1`), a row present in it is an update (the before/after diff).
     let mut contributions: Vec<Contribution> = Vec::new();
     for (index, spec) in specs.iter().enumerate() {
         for record in upserted {
@@ -1965,9 +1955,8 @@ pub fn recompute_update_sql(view: &SqlView, ids: &str) -> String {
     } = quoted(view);
     let ground_truth = ground_truth_sql(view);
     // `IS DISTINCT FROM` so a sweep over a healthy table writes nothing: under
-    // MVCC an unconditional assignment would rewrite every parent row (bloat
-    // proportional to the whole table, for no change), and it would make the
-    // returned count the row count rather than the repair count.
+    // MVCC an unconditional assignment rewrites every parent row, and the
+    // returned count would be the row count rather than the repair count.
     format!(
         "UPDATE {parent_table} SET {counter_column} = {ground_truth} \
          WHERE {parent_table}.{parent_pk} IN ({ids}) \
@@ -2126,11 +2115,10 @@ pub async fn recompute_view(
     if let Some(id) = parent_id {
         return recompute_batch(conn, view, &[id]).await;
     }
-    // A self-referential table (a comment's `reply_count`) has rows that are
-    // children and parents at once: a batch holding several parents in id
-    // order could form a lock cycle with a mutation that holds a child row and
-    // wants its parent. One parent per transaction takes one lock and never a
-    // second, so the repair cannot be one side of that cycle.
+    // In a self-referential table (a comment's `reply_count`) rows are children
+    // and parents at once, so a batch locking several parents could form a lock
+    // cycle with a mutation holding a child and wanting its parent. One parent
+    // per transaction takes a single lock and cannot join that cycle.
     let batch = if view.child_table == view.parent_table {
         1
     } else {
@@ -2386,10 +2374,9 @@ mod tests {
 
     #[test]
     fn a_bulk_decrement_locks_its_children_in_ascending_id_order() {
-        // Deterministic order, and children before parents — the same direction
-        // the single-row and update paths take. Inverting it here would let a
-        // bulk delete deadlock against an `update` that re-parents one of the
-        // same children.
+        // Children before parents, the same direction as the single-row and
+        // update paths; inverting it would let a bulk delete deadlock against an
+        // `update` that re-parents one of the same children.
         let sql = child_lock_sql(&view(&spec(false)), "3,1,2");
         assert!(
             sql.starts_with("SELECT \"id\" AS id FROM \"comments\""),
@@ -2431,10 +2418,9 @@ mod tests {
 
     #[test]
     fn deltas_go_out_in_a_globally_stable_lock_order() {
-        // The order has to come from the schema, not from either model's
-        // declaration order: two child models declaring the same two parents in
-        // opposite orders would otherwise take the two row locks in opposite
-        // orders and deadlock, and the generated transactions do not retry.
+        // The order comes from the schema, not declaration order: two models
+        // declaring the same parents in opposite orders would otherwise deadlock,
+        // and the generated transactions do not retry.
         let specs = two_legs();
         let ordered = fold_and_order(
             &specs,
@@ -2522,9 +2508,8 @@ mod tests {
     #[test]
     fn weights_that_cancel_across_an_overflowing_intermediate_issue_nothing() {
         // `[MAX, MAX, -MAX, -MAX]` nets to zero. Segmenting at the overflow
-        // point would have issued `+MAX` then `-MAX`, and a parent sitting at
-        // `1` would have aborted the whole mutation on the first statement
-        // even though its final value is exactly where it started.
+        // point would issue `+MAX` first, aborting the mutation for a parent at
+        // `1` even though its final value is unchanged.
         let specs = two_legs();
         let ordered = fold_and_order(
             &specs,
@@ -2807,10 +2792,8 @@ mod tests {
 
     #[test]
     fn a_tenant_discriminator_is_matched_null_safely() {
-        // A nullable discriminator with NULL on both sides is the same tenant
-        // (namely none), but `=` yields NULL there, so the maintenance would
-        // silently do nothing — a counter that quietly stops moving is worse
-        // than one that errors.
+        // A nullable discriminator with NULL on both sides is the same tenant,
+        // but `=` yields NULL there and the counter would silently stop moving.
         let mut tenanted = spec(false);
         tenanted.tenant_column = Some("tenant_id");
 
@@ -2836,10 +2819,9 @@ mod tests {
 
     #[test]
     fn a_counter_column_named_after_a_sql_keyword_still_produces_valid_sql() {
-        // `counter_cache = "order"` is a legal identifier and a legal column
-        // name, but `SET order = order + $1` is a syntax error on both backends.
-        // Quoting every interpolated identifier is what keeps the choice of
-        // column name from being able to break the generated statements.
+        // `order` is a legal column name, but `SET order = order + $1` is a
+        // syntax error on both backends, so every interpolated identifier is
+        // quoted.
         let mut keyword = spec(false);
         keyword.counter_column = "order";
         keyword.parent_table = "group";
@@ -2857,8 +2839,8 @@ mod tests {
 
     #[test]
     fn a_plain_counter_cache_keeps_its_pre_derivation_sql() {
-        // The whole design rests on this: derivations reuse the counter-cache
-        // paths, so a counter cache's own SQL must be untouched by them.
+        // Derivations reuse the counter-cache paths, so a counter cache's own SQL
+        // must be untouched by them.
         let plain = view(&spec(false));
         assert!(plain.is_plain());
         assert!(plain.counts_rows());
@@ -2919,10 +2901,9 @@ mod tests {
 
     #[test]
     fn a_filter_may_carry_a_comment_marker_inside_a_quoted_literal() {
-        // The previous substring scan panicked on this in debug builds: `--`
-        // and `;` are inert inside a quoted literal, and the macro escapes the
-        // literal it lowers, so only the identifiers and the contribution are
-        // checked at run time.
+        // `--` and `;` are inert inside a quoted literal, and the macro escapes
+        // the literal it lowers, so only the identifiers and the contribution
+        // are checked at run time.
         let mut filtered = spec(false);
         filtered.filter_sql = " AND ({c}.\"status\" = 'a -- b; c')";
         let filtered = view(&filtered);
@@ -3086,8 +3067,8 @@ mod tests {
 
     #[test]
     fn a_model_without_an_inherent_shadow_resolves_to_the_empty_blanket() {
-        // A `const` block, because the whole point of the flag is that it folds
-        // at compile time — `assert!` on a constant is a clippy error.
+        // A `const` block: the flag must fold at compile time, and `assert!` on a
+        // constant is a clippy error.
         const { assert!(!Dummy::HAS_COUNTER_CACHES) };
         assert!(Dummy::counter_caches().is_empty());
     }

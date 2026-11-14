@@ -347,9 +347,7 @@ impl CommentableSpec {
             live_of: |_| true,
             tenant_column: None,
             tenant_of: None,
-            // Neutral derivation fields: a comment counter is a plain counter
-            // cache, so every live row contributes 1 and nothing is filtered
-            // out — which keeps the generated SQL byte-identical.
+            // A plain counter: every live row contributes 1 and none is filtered.
             contrib_of: |_| 1,
             contrib_sql: "1",
             filter_sql: "",
@@ -510,10 +508,8 @@ inventory::collect!(RepositoryFacts);
 #[cfg(feature = "db")]
 #[must_use]
 pub fn model_has_sharded_repository(model: &str) -> bool {
-    // ANY sharded registration counts. The conservative answer here is the
-    // opposite of tenancy's — refusing to mount a router that would read the
-    // wrong database — but it is the same rule underneath: when registrations
-    // disagree, take the one whose failure mode is a visible refusal.
+    // Any sharded registration counts: when registrations disagree, prefer the visible refusal
+    // over serving from the wrong database.
     repository_facts_for(model).any(|facts| facts.sharded)
 }
 
@@ -703,12 +699,8 @@ pub fn duplicate_commentable_type() -> Option<&'static str> {
 pub fn sharded_commentable_type() -> Option<&'static str> {
     inventory::iter::<CommentableDescriptor>()
         .find(|descriptor| {
-            // Two independent ways to be sharded, and BOTH have to be checked.
-            // `parent_sharded` is the model's own `#[shard_key]`; the registry
-            // is the repository's `#[repository(..., sharded)]`, which routes
-            // through the tenant's shard even when the model carries no shard
-            // key. Checking only the first leaves that shape served from the
-            // control pool — silently the wrong database.
+            // Both checks are needed: `parent_sharded` is the model's `#[shard_key]`, and
+            // `#[repository(..., sharded)]` routes through the tenant's shard even without one.
             descriptor.spec.parent_sharded || model_has_sharded_repository((descriptor.model)())
         })
         .map(|descriptor| descriptor.type_name)
@@ -804,8 +796,6 @@ pub fn duplicate_commentable_storage() -> Option<&'static str> {
 /// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
 /// - Any database error.
 #[allow(clippy::too_many_arguments)] // The polymorphic key is two values.
-// `tenant` and `soft_delete` are two more. A struct hides them at each call
-// site.
 pub async fn add_comment(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -817,7 +807,6 @@ pub async fn add_comment(
     tenant: Option<&str>,
     soft_delete: Option<bool>,
 ) -> AutumnResult<Comment> {
-    // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
     // #2319: the comment insert records no ledger revision.
@@ -837,8 +826,7 @@ pub async fn add_comment(
     // two models register equal specs, only the address finds the model.
     let soft_deletes = resolve_soft_deletes(spec, soft_delete);
 
-    // Owned copies so the transaction closure — which must be `'static`-ish
-    // across the `scope_boxed` boundary — can move them.
+    // Owned copies the transaction closure can move across `scope_boxed`.
     let spec = *spec;
     let parent_type = parent_type.to_owned();
     let body = body.to_owned();
@@ -919,7 +907,6 @@ pub async fn delete_comment(
     tenant: Option<&str>,
     soft_delete: Option<bool>,
 ) -> AutumnResult<usize> {
-    // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
     // #2319: the comment delete records no ledger revision.
@@ -937,10 +924,8 @@ pub async fn delete_comment(
             let type_column = quote_ident(spec.type_column);
             let id_column = quote_ident(spec.id_column);
 
-            // Which parent does this comment hang off? Resolved first so the
-            // parent row can be locked before the subtree is touched, keeping
-            // the lock order (parent, then comments) identical to `add_comment`
-            // — two writers on one thread can therefore never deadlock.
+            // Resolved first so the parent is locked before the subtree: the same lock order
+            // (parent, then comments) as `add_comment`, so two writers cannot deadlock.
             let target: Option<TargetRow> = diesel::sql_query(format!(
                 "SELECT {type_column} AS commentable_type, {id_column} AS commentable_id \
                  FROM {comments} WHERE {pk} = {}",
@@ -951,10 +936,8 @@ pub async fn delete_comment(
             .await
             .optional_row()?;
 
-            // Scoped to the RECORD, not merely to its model. Checking the
-            // discriminator alone would let anyone holding any comment id
-            // delete a comment on someone else's row — the mirror image of the
-            // cross-record `reply_to` graft `comment_depth` refuses.
+            // Scoped to the record, not just the model: otherwise any comment id would be
+            // deletable from any record of the same model.
             let Some(target) = target
                 .filter(|t| t.commentable_type == parent_type && t.commentable_id == parent_id)
             else {
@@ -1025,7 +1008,6 @@ pub async fn recompute_comment_count(
     tenant: Option<&str>,
     soft_delete: Option<bool>,
 ) -> AutumnResult<i64> {
-    // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
     // Before the copy: see `add_comment`.
@@ -1107,17 +1089,15 @@ pub async fn comment_thread(
     tenant: Option<&str>,
     soft_delete: Option<bool>,
 ) -> AutumnResult<Vec<CommentNode>> {
-    // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
     let soft_deletes = resolve_soft_deletes(spec, soft_delete);
     probe_parent(conn, spec, parent_id, tenant, soft_deletes, false).await?;
 
-    // Under read-committed, the probe and the read use different snapshots.
-    // `thread_statement` checks visibility again inside the read. Thus the
-    // read returns no rows if the parent was soft-deleted or moved to another
-    // tenant after the probe (issues #2281, #2287). The result is then an
-    // empty thread, not a `404`. The probe stays because it gives the `404`.
+    // Under read-committed the probe and the read use different snapshots, so
+    // `thread_statement` re-checks visibility inside the read: a parent soft-deleted or
+    // moved to another tenant after the probe yields an empty thread (#2281, #2287). The
+    // probe stays because it gives the `404`.
     let statement = thread_statement(spec, soft_deletes, tenant);
     let query = diesel::sql_query(statement.sql)
         .bind::<Text, _>(parent_type)
@@ -1258,7 +1238,6 @@ pub struct ThreadPage {
 /// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
 /// - Any database error.
 #[allow(clippy::too_many_arguments)] // The thread read's arguments, plus the
-// cursor and the page size.
 pub async fn comment_thread_page(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -1297,7 +1276,6 @@ pub async fn comment_thread_page(
 /// - `404` when `(parent_type, parent_id)` names no live, visible parent row.
 /// - Any database error.
 #[allow(clippy::too_many_arguments)] // The page read's arguments, with the
-// target comment in place of the cursor.
 pub async fn thread_page_containing(
     conn: &mut RuntimeConnection,
     spec: &CommentableSpec,
@@ -1679,17 +1657,10 @@ fn nest(rows: Vec<Comment>) -> Vec<CommentNode> {
     let mut roots: Vec<usize> = Vec::new();
     for (position, comment) in rows.iter().enumerate() {
         match comment.parent_id.and_then(|parent| index.get(&parent)) {
-            // `parent < position` always holds for a well-formed thread (a
-            // parent is inserted before its reply, and the query is ordered by
-            // creation), but a clock skew or a hand-edited row could invert it.
-            //
-            // Keeping only strictly-backward edges is what makes the build
-            // acyclic, and it has to be the real test: rejecting merely
-            // `parent != position` catches a self-parenting row but not a
-            // longer cycle, and a cyclic component has no root — every comment
-            // in it would vanish from the thread rather than show up
-            // misordered. Promoting the forward edge to a root keeps them
-            // visible, which is the whole point of this defensive pass.
+            // `parent < position` holds for a well-formed thread, but clock skew or a
+            // hand-edited row can invert it. Keeping only backward edges makes the build
+            // acyclic; `parent != position` would miss longer cycles, whose rows have no
+            // root and would vanish. A forward edge becomes a root instead.
             Some(&parent) if parent < position => children[parent].push(position),
             _ => roots.push(position),
         }
@@ -1759,10 +1730,8 @@ fn build_nodes(
             let replies = if depth < MAX_NESTING {
                 build_nodes(&children[position], depth + 1, children, comments)
             } else {
-                // At the cap, the rest of the subtree is emitted flat rather
-                // than dropped: a comment nobody can see is worse than one
-                // rendered at the wrong indent, and the caller asked for the
-                // whole thread.
+                // At the cap, emit the rest of the subtree flat rather than drop it: a hidden
+                // comment is worse than a misindented one.
                 flatten_subtree(&children[position], depth, children, comments)
             };
             Some(CommentNode {
@@ -1853,9 +1822,8 @@ fn parent_visibility(
             ),
             Some(tenant.to_owned()),
         ),
-        // Branching on the pair, not the spec alone: binding `NULL` into
-        // `IS NOT DISTINCT FROM` would match only untenanted rows, turning
-        // every call on a tenant-columned model into a 404.
+        // Branch on the pair, not the spec alone: a tenant predicate with no tenant to bind
+        // would match only untenanted rows, so every `across_tenants()` call would 404.
         _ => (String::new(), None),
     };
     let live = if soft_deletes {
@@ -1900,9 +1868,7 @@ async fn probe_parent(
     );
     let query = diesel::sql_query(sql).bind::<BigInt, _>(parent_id);
     let found: Option<ParentRow> = match visibility.tenant {
-        // `tenant` is `Some` exactly when the predicate carries the tenant
-        // placeholder (see `parent_visibility`), so this bind is the one the
-        // predicate names.
+        // `tenant` is `Some` exactly when the predicate carries the tenant placeholder.
         Some(tenant) => query
             .bind::<Text, _>(tenant)
             .get_result::<ParentRow>(conn)
@@ -1974,12 +1940,9 @@ async fn comment_depth(
     let depth = row.depth.ok_or_else(|| {
         AutumnError::unprocessable_msg("Cannot reply to that comment: it is not on this record")
     })?;
-    // The CTE stops recursing at `RECURSION_GUARD`, so a chain longer than that
-    // reports exactly the guard rather than its real depth. Returning the
-    // truncated number would make `max_depth` unenforceable for any thread that
-    // got that deep; refusing is the only honest answer. `#[commentable]`
-    // rejects a `max_depth` at or above the guard, so this is reachable only
-    // through rows written outside the framework.
+    // The CTE stops at `RECURSION_GUARD`, so a longer chain reports the guard, not its real
+    // depth, and `max_depth` could not be enforced. `#[commentable]` caps `max_depth` below
+    // the guard, so only rows written outside the framework reach this.
     if depth >= RECURSION_GUARD {
         return Err(AutumnError::unprocessable_msg(
             "This thread is nested too deeply to reply to",
@@ -2007,16 +1970,10 @@ async fn insert_comment(
     let created_at = quote_ident(spec.created_at_column);
     let type_column = quote_ident(spec.type_column);
     let id_column = quote_ident(spec.id_column);
-    // Resolved in the `RETURNING` list so the caller can render the new comment
-    // without a second round trip; `NULL` when the model declared no
-    // `author_name` column.
-    // The author id is bound a SECOND time here rather than reusing `$4`.
-    // Postgres would happily take the repeat, but `SQLite` numbers its
-    // placeholders by *position of occurrence*, so a reused `$4` would render
-    // as a sixth bare `?` with only five values pushed. Binding it twice is the
-    // one spelling that is correct on both backends. (Naming `author_id`
-    // unqualified inside `RETURNING` is not an option either: it would be
-    // ambiguous against the author table's own columns.)
+    // The author name is resolved in `RETURNING` to save a round trip. The author id is bound
+    // a second time (`ph(6)`) rather than reusing `$4`: `SQLite`'s bare `?` counts occurrences,
+    // so a reused `$4` would become a sixth `?` with five values bound. An unqualified
+    // `author_id` would be ambiguous against the author table's columns.
     let resolves_author_name = spec.author_table.is_some() && spec.author_name_column.is_some();
     let author_name = match (spec.author_table, spec.author_name_column) {
         (Some(table), Some(column)) => format!(
@@ -2042,11 +1999,9 @@ async fn insert_comment(
         ph(4),
         ph(5),
     );
-    // Bind order mirrors placeholder ORDER OF OCCURRENCE in the statement
-    // text, which is what `SQLite`'s bare `?` counts: the five `VALUES` binds,
-    // then the author id again for the `RETURNING` sub-select. When there is no
-    // `author_name` to resolve the sub-select is absent, so the sixth bind
-    // would have no placeholder — hence the fork.
+    // Binds follow placeholder order of occurrence (what `SQLite`'s `?` counts): the five
+    // `VALUES`, then the author id for the `RETURNING` sub-select, which exists only when an
+    // author name resolves.
     let query = diesel::sql_query(sql)
         .bind::<Text, _>(parent_type)
         .bind::<BigInt, _>(parent_id)
@@ -2127,33 +2082,19 @@ async fn delete_subtree(
     .await
     .map_err(AutumnError::from)?;
 
-    // Deduplicate before ANY of it is used as a count. `UNION ALL` does not
-    // deduplicate, and a `parent_id` cycle among imported or hand-edited rows
-    // has no terminating edge, so the walk re-emits the same handful of ids at
-    // every depth until the guard stops it — roughly a thousand rows for a
-    // two-comment cycle. The `UPDATE`/`DELETE` is keyed on `id IN (…)` and so
-    // touches each physical row once, but `ids.len()` is the counter delta, and
-    // an inflated one drives `comment_count` sharply negative with no error
-    // anywhere. Counters are deliberately unclamped, so it stays wrong until
-    // someone runs `recompute_comment_count`.
+    // Deduplicate before counting: `UNION ALL` does not, and a `parent_id` cycle in imported
+    // or hand-edited rows re-emits the same ids at every depth until the guard. `ids.len()` is
+    // the counter delta, so duplicates would drive `comment_count` far negative.
     //
-    // Sorted by depth first so the retained copy of each id is its shallowest,
-    // keeping the truncation check below meaningful.
+    // Sorting by `(id, depth)` keeps each id's shallowest copy for the truncation check below.
     let mut ids = ids;
     ids.sort_by_key(|row| (row.id, row.depth));
     ids.dedup_by_key(|row| row.id);
 
-    // The walk stops at `RECURSION_GUARD`. On the SOFT-delete path that is
-    // survivable: the rows past it stay live, stay counted, and surface as
-    // promoted roots. On the HARD-delete path it is not — the `parent_id`
-    // foreign key cascades, so the database removes every deeper descendant
-    // while `ids.len()` counts only what the walk reached, and the parent's
-    // counter is left permanently too high with no error anywhere.
-    //
-    // Refusing is the honest answer. A chain this deep cannot be produced by
-    // the framework's own write path (`max_depth` is capped below the guard),
-    // so reaching here means imported or hand-edited rows, and quietly
-    // corrupting a counter is a worse service than saying so.
+    // The walk stops at `RECURSION_GUARD`. A soft delete survives that: deeper rows stay live
+    // and counted. A hard delete does not: the `parent_id` cascade removes every deeper row
+    // while `ids.len()` counts only what the walk reached, leaving the counter too high. The
+    // framework cannot write a chain this deep (`max_depth` is capped below the guard).
     if !spec.soft_delete && ids.iter().any(|row| row.depth >= RECURSION_GUARD) {
         return Err(AutumnError::unprocessable_msg(format!(
             "comment {comment_id} has a reply chain deeper than {RECURSION_GUARD}, which this \
@@ -2167,19 +2108,17 @@ async fn delete_subtree(
         return Ok(0);
     }
     let ids: Vec<i64> = ids.into_iter().map(|row| row.id).collect();
-    // Bound the `IN (…)` list: the ids are framework-produced `i64`s, never
-    // caller text, so they are formatted rather than bound — Postgres caps
-    // bind parameters at 65535 and a deep thread could exceed it.
+    // The ids are framework-produced `i64`s, not caller text, so they are formatted rather
+    // than bound: Postgres caps bind parameters at 65535, which a deep thread could exceed.
     let id_list = ids
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Issue #2275. The walk stops at the record, but the `parent_id` cascade
-    // does not. The cascade would remove a reply that is not in `ids`. Then the
-    // returned count is too low, and the counter on that reply's record stays
-    // too high. The framework cannot write such an edge, so refuse the delete.
+    // #2275: the walk stops at the record, but the `parent_id` cascade does not. A reply
+    // outside `ids` would be deleted uncounted, leaving its record's counter too high. The
+    // framework cannot write such an edge, so refuse.
     if !spec.soft_delete {
         let escaped: Option<CommentIdRow> = diesel::sql_query(format!(
             "SELECT {pk} AS id FROM {comments} \
@@ -2491,9 +2430,8 @@ mod tests {
         assert!(v.predicate.contains(r#""posts"."deleted_at" IS NULL"#));
         assert_eq!(v.tenant.as_deref(), Some("acme"));
 
-        // Tenant columned model through `across_tenants()`: no tenant
-        // predicate, no tenant bind — exactly the probe's three-valued
-        // contract, or every such call would 404.
+        // Tenant-columned model through `across_tenants()`: no tenant predicate or bind,
+        // or every such call would 404.
         let v = parent_visibility(&spec, 3, 4, true, None);
         assert!(!v.predicate.contains("tenant_id"));
         assert!(v.tenant.is_none());
@@ -2595,8 +2533,8 @@ mod tests {
         // At the cap the widget offers no form, so a draft must not be pinned
         // to one: `can_reply` is `depth < max_depth`.
         assert!(!reply_form_exists(&thread, 3, 3 - 1));
-        // A target that is simply gone — deleted between render and submit, or
-        // never real — is the case that erased the visitor's body.
+        // A target that is gone (deleted between render and submit, or never real) has no
+        // form, so the draft falls back to the top-level form.
         assert!(!reply_form_exists(&thread, 99, 3));
         assert!(!reply_form_exists(&[], 1, 3));
     }
@@ -2631,9 +2569,8 @@ mod tests {
             "plain first — the answer must not change"
         );
 
-        // Every registration opting out IS positive evidence, and must not be
-        // confused with nothing being registered: the caller falls back to what
-        // the column implies only in the latter case.
+        // All registrations opting out is an answer; no registration is not. Only the
+        // latter falls back to the column.
         assert_eq!(soft_deletes_from([&plain].into_iter()), Some(false));
         assert_eq!(soft_deletes_from(std::iter::empty()), None);
     }
@@ -2992,17 +2929,10 @@ pub fn router<S>(config: CommentsConfig) -> axum::Router<S>
 where
     S: crate::db::DbState + Clone + Send + Sync + 'static,
 {
-    // Two models claiming one discriminator would render each other's threads
-    // and probe each other's tables. The helpers' storage-scoped check runs
-    // here too, for the shared-table case…
     assert_unique_discriminators();
-    // …and the router additionally needs the STRICTER name-only rule. It
-    // dispatches on `{commentable_type}` alone, so two models sharing a
-    // discriminator are ambiguous at the URL even when their comments live in
-    // different tables: `commentable_spec_for` returns whichever registered
-    // first, and the other model is unreachable — or worse, served against the
-    // wrong parent table. Storage isolation makes the helpers safe; it does
-    // nothing for a route.
+    // The router also needs the stricter name-only rule: it dispatches on `{commentable_type}`
+    // alone, so two models sharing a discriminator are ambiguous at the URL even when their
+    // comments live in different tables.
     assert!(
         duplicate_commentable_type().is_none(),
         "two #[commentable] models share the commentable_type {:?}, so the comment router \
@@ -3012,10 +2942,8 @@ where
         duplicate_commentable_type().unwrap_or_default(),
         duplicate_commentable_type().unwrap_or_default(),
     );
-    // A sharded model routes every query through the shard its tenant selects;
-    // this router checks out the control pool. There is no request-time answer
-    // that is not silently wrong, so refuse at wiring time — the repository
-    // helpers still work from the app's own (shard-aware) handlers.
+    // This router checks out the control pool, but a sharded model's queries go to the
+    // tenant's shard. The generated helpers still work from the app's own handlers.
     assert!(
         sharded_commentable_type().is_none(),
         "#[commentable] model {:?} is sharded, and the generic comment router cannot serve it: \
@@ -3149,10 +3077,7 @@ struct CommentSubmission {
 /// something the caller can fix.
 #[cfg(all(feature = "db", feature = "widgets-social"))]
 fn request_tenant(spec: &CommentableSpec) -> AutumnResult<Option<String>> {
-    // A model with no tenant column emits no tenant predicate at all, so
-    // reading the task-local would only ever produce a value nothing uses —
-    // and neither does one whose repository deliberately opted out of
-    // `tenant_scoped` while the model happens to carry a `tenant_id` column.
+    // An unscoped model emits no tenant predicate, so the task-local is not read.
     let model = commentable_model_for_spec(spec).unwrap_or("");
     if !model_requires_tenant(model, spec.parent_tenant_column.is_some()) {
         return Ok(None);
@@ -3243,16 +3168,10 @@ where
             axum::extract::Path::<(String, i64)>::from_request_parts(parts, state).await?;
         let session = crate::session::Session::from_request_parts(parts, state).await?;
 
-        // `CommentAccess` promises the callback that `commentable_type` names a
-        // registered model. Resolve it here, before the callback runs: an
-        // unregistered type is a 404 whatever the app's policy would say, and
-        // letting an arbitrary path string reach application code invites
-        // policy or database work on a name that can never resolve -- and
-        // breaks any callback that dispatches exhaustively over the models it
-        // knows.
+        // `CommentAccess` promises the callback a registered `commentable_type`, so an
+        // unregistered one is a 404 before the callback runs.
         resolve_spec(&commentable_type)?;
 
-        // A write is the method that creates a comment; everything else reads.
         let write = parts.method == axum::http::Method::POST;
         let author_id = session_author(&session, &config).await;
         if write && author_id.is_none() {
@@ -3272,9 +3191,8 @@ async fn show_thread(
     axum::extract::Query(query): axum::extract::Query<ThreadQuery>,
     csrf: Option<crate::security::csrf::CsrfToken>,
     csrf_field: Option<crate::security::csrf::CsrfFormField>,
-    // Declared before `Db` on purpose: authorization runs (and may read the
-    // database) before this request holds a pooled connection. See
-    // `AuthorizedComment`.
+    // Before `Db`: authorization may read the database, so it runs before this request holds a
+    // connection. See `AuthorizedComment`.
     AuthorizedComment { author_id }: AuthorizedComment,
     mut db: crate::db::Db,
 ) -> AutumnResult<maud::Markup> {
@@ -3325,30 +3243,23 @@ struct ThreadQuery {
 /// Post a comment (or a reply), then render the page that shows it.
 #[cfg(all(feature = "db", feature = "widgets-social"))]
 #[allow(clippy::too_many_arguments)] // Every argument is a distinct axum
-// extractor -- config, path, session, CSRF token, CSRF field name, htmx
-// detection, the connection, and the form body. An axum handler's arguments
-// ARE its request-state declaration; bundling them into a struct would only
-// move the same list one level down.
 async fn post_comment(
     axum::Extension(config): axum::Extension<std::sync::Arc<CommentsConfig>>,
     axum::extract::Path((commentable_type, parent_id)): axum::extract::Path<(String, i64)>,
     csrf: Option<crate::security::csrf::CsrfToken>,
     csrf_field: Option<crate::security::csrf::CsrfFormField>,
     htmx: crate::htmx::HxRequest,
-    // Before the checkout, as in `show_thread`: a policy check that reads the
-    // database must not run while this request is already holding a connection.
+    // Before the checkout, as in `show_thread`.
     AuthorizedComment { author_id }: AuthorizedComment,
-    // NOT `Db`. An eager checkout here would be taken before axum runs the
-    // `Form` extractor below, so the connection would be held for as long as
-    // the client takes to send its body — which the client chooses. Enough
-    // slow-body requests would pin the whole pool.
+    // Not `Db`: an eager checkout would hold a connection while the client sends its body,
+    // so slow-body requests could pin the whole pool.
     lazy_db: crate::db::LazyDb,
     axum::extract::Form(submission): axum::extract::Form<CommentSubmission>,
 ) -> AutumnResult<axum::response::Response> {
     use axum::response::IntoResponse as _;
 
     let spec = resolve_spec(&commentable_type)?;
-    // The extractor refuses an unauthenticated write, so this is always `Some`.
+    // Always `Some`: the extractor refuses an unauthenticated write.
     let author_id = author_id.ok_or_else(|| AutumnError::unauthorized_msg("Sign in to comment"))?;
     // An empty hidden input means "top-level", not "malformed": the widget
     // renders `reply_to` only on the per-node forms.
@@ -3360,17 +3271,14 @@ async fn post_comment(
         ),
     };
     let tenant = request_tenant(spec)?;
-    // Only a relative, single-slash path is ever honoured, so a crafted
-    // `return_to` cannot become an open redirect — and the same validated value
-    // is echoed back into the re-rendered forms, so the NEXT no-JS submit still
-    // knows where to come back to.
+    // Only a relative, single-slash path is honoured, so `return_to` cannot become an open
+    // redirect. The validated value is echoed into the re-rendered forms for the next submit.
     let return_to = submission
         .return_to
         .as_deref()
         .filter(|path| is_safe_return_path(path));
 
-    // The body is read and validated, so take the connection now. A malformed
-    // submission is rejected above without ever touching the pool.
+    // Check out only after the body is read and validated.
     let mut db = lazy_db.checkout().await?;
 
     let outcome = add_comment(
@@ -3387,13 +3295,9 @@ async fn post_comment(
     )
     .await;
 
-    // A rejected body is shown, not thrown. htmx does not swap a non-2xx
-    // response by default, so returning the error would make the button look
-    // broken; re-rendering the thread with the message above the form is the
-    // only feedback a no-JS visitor gets either.
-    //
-    // The created comment is carried past this match so the hook can be told
-    // about it *after* this request has let go of its connection -- see below.
+    // A rejected body is re-rendered with the message, not returned as an error: htmx does
+    // not swap a non-2xx response by default, and a no-JS visitor gets no other feedback.
+    // The created comment is carried so the hook runs after the connection is released.
     let (created, error) = match outcome {
         Ok(created) => (Some(created), None),
         Err(err) if err.status() == http::StatusCode::UNPROCESSABLE_ENTITY => {
@@ -3403,19 +3307,12 @@ async fn post_comment(
     };
     let redirecting = error.is_none() && !htmx.is_htmx && return_to.is_some();
 
-    // Read everything this response still needs from the database BEFORE the
-    // hook runs, so the connection can be released first.
+    // Read what the response needs before the hook runs, so the connection can be released
+    // first. The result is held, not `?`-propagated: the comment is committed, and a failed
+    // re-read must not skip its hook.
     //
-    // The result is HELD rather than `?`-propagated: the comment is already
-    // committed by this point, and a transient failure re-reading the thread
-    // must not cost it its notification, live-feed entry or search-index write.
-    // Returning early here would leave a durable comment the rest of the system
-    // never hears about — a silent inconsistency worse than the refresh failure
-    // the caller is about to be told about anyway.
-    //
-    // The response shows the page that holds the new comment. After a
-    // rejection it shows the page of the comment the visitor replied to, so
-    // the draft returns to that form. Else it shows the first page.
+    // The page shown holds the new comment, or after a rejection the comment replied to (so
+    // the draft returns to that form), else the first page.
     let focus = created.as_ref().map(|comment| comment.id).or(reply_to);
     let page = page_after_post(
         &mut db,
@@ -3429,12 +3326,8 @@ async fn post_comment(
     )
     .await;
 
-    // Release the checkout before awaiting the hook. `on_comment` is documented
-    // as the place for a database-backed side effect -- a notification that
-    // resolves a username, a search index write -- and holding this connection
-    // across that await would let `pool_size` concurrent submissions each pin
-    // one while waiting for a second that can never be issued. The row is
-    // already committed, so nothing here needs the connection any more.
+    // Release the connection before awaiting the hook: `on_comment` may need one itself, and
+    // `pool_size` concurrent submissions each holding one would deadlock the pool.
     drop(db);
 
     if let Some(created) = created
@@ -3446,29 +3339,19 @@ async fn post_comment(
             comment_id: created.id,
             reply_to,
             author_id,
-            // The body as *accepted*, not as submitted: `add_comment` trims
-            // before validating and inserting, so the submitted form value can
-            // differ from the stored row -- and padding a short body with
-            // whitespace would otherwise hand the hook a payload larger than
-            // `max_body_bytes` claims to allow.
+            // The trimmed body as stored, not as submitted: whitespace padding could otherwise
+            // exceed `max_body_bytes`.
             body: created.body,
         })
         .await;
     }
 
-    // Now that the hook has run for the committed comment, a failed refresh can
-    // surface.
+    // The hook has run, so a failed refresh can surface now.
     let page = page?;
 
-    // The draft rides with the error, never without it: these two are the same
-    // event — "we refused this, here it is back".
-    //
-    // Pinned to a reply form only if the REFRESHED thread still has one for
-    // that comment. A reply target deleted between render and submit — or one
-    // a client invented — leaves no form for the widget to fill, and the
-    // `outerHTML` swap would erase the body exactly as it did before drafts
-    // were carried at all. Falling back to the top-level form keeps the text on
-    // screen where the visitor can copy it, which is the whole point.
+    // A draft only accompanies an error. It is pinned to a reply form only if the refreshed
+    // thread still renders one; otherwise the `outerHTML` swap would erase it, so it falls
+    // back to the top-level form.
     let draft = error.is_some().then(|| {
         let target = reply_to.filter(|id| reply_form_exists(&page.nodes, *id, spec.max_depth));
         (target, submission.body.clone())
@@ -3496,10 +3379,8 @@ async fn post_comment(
         true,
         return_to,
         error,
-        // Only on rejection: a successful submit renders the new comment and
-        // must leave the textarea empty, or the visitor is invited to post it
-        // twice. `submission.body` is the raw text as typed, not the trimmed
-        // value `add_comment` stored, so nothing the visitor wrote is lost.
+        // Only on rejection, so a successful submit leaves the textarea empty. The draft is the
+        // raw text as typed, not the trimmed value.
         draft,
     )
     .into_response())
@@ -3509,7 +3390,6 @@ async fn post_comment(
 /// the first page. For a no-JS redirect it reads only the cursor.
 #[cfg(all(feature = "db", feature = "widgets-social"))]
 #[allow(clippy::too_many_arguments)] // The post's own request state, passed
-// through from the handler.
 async fn page_after_post(
     db: &mut RuntimeConnection,
     config: &CommentsConfig,
@@ -3628,7 +3508,6 @@ async fn session_author(session: &crate::session::Session, config: &CommentsConf
 /// Build the widget markup for one thread.
 #[cfg(all(feature = "db", feature = "widgets-social"))]
 #[allow(clippy::too_many_arguments)] // Straight-line assembly of the widget's
-// own configuration; every argument is a distinct piece of request state.
 fn render(
     config: &CommentsConfig,
     spec: &CommentableSpec,
@@ -3640,8 +3519,7 @@ fn render(
     can_comment: bool,
     return_to: Option<&str>,
     error: Option<String>,
-    // The rejected body and the form it came from, so a 422 re-render gives the
-    // visitor their draft back instead of an empty textarea.
+    // The rejected body and the reply target it came from, for a 422 re-render.
     draft: Option<(Option<i64>, String)>,
 ) -> maud::Markup {
     let mut widget = crate::widgets::CommentThread::from_spec(
@@ -3654,11 +3532,8 @@ fn render(
     if let Some(csrf) = csrf {
         widget = widget.csrf_token(csrf.token());
     }
-    // `CsrfLayer` scans a URL-encoded body for the CONFIGURED field name only
-    // (unlike the query-string path, which also accepts `_csrf`), so an app
-    // that set `security.csrf.form_field` needs the widget's hidden input
-    // renamed to match. Without this the fragment renders perfectly and every
-    // no-JavaScript submit from it is a 403.
+    // `CsrfLayer` reads only the configured field name from a form body, so the hidden input
+    // must match `security.csrf.form_field` or every no-JS submit is a 403.
     if let Some(field) = csrf_field {
         widget = widget.csrf_field(field.0.clone());
     }

@@ -317,9 +317,8 @@ pub fn build_destination(
         .ok_or_else(|| SetupError::Config {
             errors: vec!["[replication.s3] bucket is unset".to_owned()],
         })?;
-    // Bucket AND endpoint, matching #1619's `destinations_conflict`: the same
-    // bucket name at two different providers is not a collision, and a
-    // path-style vs virtual-hosted spelling of one endpoint is not a difference.
+    // Compare bucket AND endpoint, as `destinations_conflict` does (#1619): one bucket name at two
+    // providers is not a collision, and two spellings of one endpoint are not a difference.
     if !config.allow_shared_bucket
         && storage.is_some_and(|storage| {
             storage.bucket == bucket
@@ -400,14 +399,9 @@ pub fn build(
 
     let destination = build_destination(config, storage)?;
     let status = Arc::new(ReplicationStatus::new(destination.describe()));
-    // Every object this replicator writes hangs off the derived root, and every
-    // destination validates the keys it is handed. A prefix that makes the root
-    // unusable — `../archive`, `archive:sqlite` — therefore passes config
-    // validation and then fails *every* upload at runtime, with the app already
-    // serving and auto-checkpointing already disabled, so the WAL grows without
-    // bound while the operator is told replication is on. Fail closed here
-    // instead: the check is the destination's own, so it cannot drift from what
-    // the uploads will accept.
+    // A prefix that makes the root an invalid key (`../archive`, `archive:sqlite`) passes config
+    // validation but fails every upload at runtime, while auto-checkpointing is off and the WAL
+    // grows without bound. Refuse it here with the destination's own key check.
     let root = segment::root_prefix(config.prefix.as_deref(), profile);
     if let Err(e) = destination::validate_key(&root) {
         return Err(SetupError::Config {
@@ -426,9 +420,8 @@ pub fn build(
         retention: Duration::from_secs(config.retention_hours.max(1).saturating_mul(3600)),
         verify_interval: config.verify_interval(),
     };
-    // The startup grace runs from the injected clock, and so does every
-    // artifact the replicator stamps, so a test that freezes or steps time moves
-    // both together (#1797).
+    // The startup grace and every artifact stamp share the injected clock, so a test that steps
+    // time moves both (#1797).
     let started_at = clock.now();
     let indicator = Arc::new(ReplicationHealthIndicator::new(
         Arc::clone(&status),
@@ -751,8 +744,7 @@ mod tests {
         ));
 
         config.allow_shared_bucket = true;
-        // Still fails, but on the credential env var — proving the bucket guard
-        // is what was tripping before, not a missing credential.
+        // Now it fails on the credential instead, so the bucket guard refused it above.
         assert!(matches!(
             build_destination(&config, same),
             Err(SetupError::MissingCredentialEnv { .. })
@@ -806,9 +798,8 @@ mod tests {
         };
         assert_eq!(tight.sync_interval(), Duration::from_secs(1));
 
-        // An explicit override, within the RPO it has to meet — the pair the
-        // validator accepts. (Longer than the RPO is refused; see
-        // `a_sync_interval_longer_than_the_rpo_is_refused`.)
+        // An explicit override within the RPO. A longer one is refused; see
+        // `a_sync_interval_longer_than_the_rpo_is_refused`.
         let explicit = ReplicationConfig {
             rpo_secs: 60,
             sync_interval_secs: Some(30),

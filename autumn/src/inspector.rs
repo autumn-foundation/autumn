@@ -429,12 +429,8 @@ where
             .path_and_query()
             .map_or_else(|| req.uri().path().to_owned(), |pq| pq.as_str().to_owned());
 
-        // Self-exclusion: don't record requests to the inspector's own subtree.
-        // Use exact match or subtree prefix ("/prefix/") to avoid false-excluding
-        // unrelated routes that share the same string prefix (e.g. "/_autumn/inspector").
-        // `strip_prefix` + a boundary check gets the same semantics as
-        // `format!("{prefix}/")` + `starts_with` without allocating a String
-        // on every request.
+        // Skip the inspector's own subtree. Match exactly or at a `/` boundary so an unrelated
+        // route sharing the string prefix (e.g. "/_autumn/inspector") is still recorded.
         let is_inspector = path
             .strip_prefix(self.inspector_path_prefix.as_str())
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
@@ -447,18 +443,15 @@ where
         let buffer = self.buffer.clone();
         let threshold = self.n_plus_one_threshold;
 
-        // Extract route pattern — available because Axum's Router::layer applies
-        // after route dispatch, so MatchedPath is already set in extensions.
+        // `Router::layer` runs after route dispatch, so `MatchedPath` is already set.
         let route = req
             .extensions()
             .get::<axum::extract::MatchedPath>()
             .map(|mp| mp.as_str().to_owned());
 
-        // Extract session ID from the cookie header before the request is consumed.
         let session_id = extract_session_id(req.headers(), &self.session_cookie_name);
 
-        // Inject per-request query list into extensions so handlers can call
-        // RequestInspector::record_query(...).
+        // The `RequestInspector` extractor records queries into this list.
         let query_list = RequestQueryList::new();
         req.extensions_mut().insert(query_list.clone());
 
@@ -506,8 +499,7 @@ where
             };
             buffer.push(record);
 
-            // Propagate the per-request query list to response extensions so
-            // the dev error overlay (ErrorPageContextLayer) can snapshot it.
+            // The dev error overlay (`ErrorPageContextLayer`) reads the queries from here.
             response.extensions_mut().insert(query_list);
 
             Ok(response)
@@ -527,7 +519,7 @@ fn extract_session_id(headers: &axum::http::HeaderMap, cookie_name: &str) -> Opt
             && name.trim() == cookie_name
         {
             let raw = value.trim();
-            // Strip HMAC signature: `{session_id}.{hmac_hex}` → `{session_id}`
+            // A signed cookie is `{session_id}.{hmac_hex}`; keep only the id.
             let id = raw.split_once('.').map_or(raw, |(id, _)| id);
             if !id.is_empty() {
                 return Some(id.to_owned());
@@ -660,7 +652,6 @@ fn render_detail(rec: &RequestRecord, inspector_path: &str) -> String {
     body.push_str(&escape_html(&rec.path));
     body.push_str("</h1>");
 
-    // Summary bar
     body.push_str("<dl class=\"summary\">");
     body.push_str("<dt>Status</dt><dd>");
     body.push_str(&rec.status.to_string());
@@ -675,7 +666,7 @@ fn render_detail(rec: &RequestRecord, inspector_path: &str) -> String {
     }
     if let Some(sid) = &rec.session_id {
         body.push_str("</dd><dt>Session&nbsp;ID</dt><dd><code>");
-        // Show only first 8 chars to avoid exposing the full token in the UI
+        // Show only the first 8 chars so the UI does not expose the full session token.
         let truncated = if sid.len() > 8 { &sid[..8] } else { sid };
         body.push_str(&escape_html(truncated));
         body.push_str("…</code>");
@@ -691,7 +682,6 @@ fn render_detail(rec: &RequestRecord, inspector_path: &str) -> String {
     }
     body.push_str("</dd></dl>");
 
-    // N+1 warning banner
     if let Some(w) = &rec.n_plus_one {
         body.push_str(
             "<div class=\"n1-banner\"><strong>&#9888; N+1 detected:</strong> query issued ",
@@ -702,7 +692,6 @@ fn render_detail(rec: &RequestRecord, inspector_path: &str) -> String {
         body.push_str("</code></div>");
     }
 
-    // Query list
     if rec.queries.is_empty() {
         body.push_str("<p class=\"muted\">No SQL queries recorded for this request.</p>");
         body.push_str("<p class=\"muted\">Use the <code>RequestInspector</code> extractor in your handler to record queries.</p>");
@@ -729,7 +718,6 @@ fn render_detail(rec: &RequestRecord, inspector_path: &str) -> String {
         body.push_str("</tbody></table>");
     }
 
-    // curl snippet
     body.push_str("<details><summary>Reproduce this request</summary><pre>");
     body.push_str(&escape_html(&rec.curl_snippet()));
     body.push_str("</pre></details>");
@@ -828,8 +816,6 @@ mod tests {
         }
     }
 
-    // Buffer tests
-
     #[test]
     fn buffer_starts_empty() {
         assert_eq!(InspectorBuffer::new(10).snapshot().len(), 0);
@@ -870,7 +856,7 @@ mod tests {
         buf.push(make_record("GET", "/a", 200));
         buf.push(make_record("GET", "/b", 200));
         let snap = buf.snapshot();
-        // newest is snap[0], so its id is higher
+        // The snapshot is newest-first.
         assert!(snap[0].id > snap[1].id);
     }
 
@@ -882,8 +868,6 @@ mod tests {
         let rec = buf.get(id).expect("should find by id");
         assert_eq!(rec.path, "/a");
     }
-
-    // N+1 detection tests
 
     #[test]
     fn detect_empty_returns_none() {
@@ -932,8 +916,6 @@ mod tests {
         assert_eq!(w.count, 7);
     }
 
-    // normalize_sql tests
-
     #[test]
     fn normalize_collapses_whitespace_and_lowercases() {
         assert_eq!(
@@ -942,8 +924,6 @@ mod tests {
         );
     }
 
-    // HTML escaping
-
     #[test]
     fn escape_html_escapes_special_chars() {
         assert_eq!(
@@ -951,8 +931,6 @@ mod tests {
             "&lt;script&gt;&amp;&quot;&#39;"
         );
     }
-
-    // Middleware tests
 
     #[tokio::test]
     async fn middleware_records_request() {

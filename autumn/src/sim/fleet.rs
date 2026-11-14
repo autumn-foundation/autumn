@@ -187,8 +187,7 @@ impl Fleet {
                 sim.mount_replica(spec, app);
             }
             Step::Kill(name) => {
-                // A crash stops the replica's job runs: they no longer count
-                // as running.
+                // A crash stops the replica's job runs: they no longer count as running.
                 note_crash(name);
                 sim.kill_replica(name);
             }

@@ -105,8 +105,8 @@ impl<'de> Deserialize<'de> for TimeZoneConfig {
         #[serde(untagged)]
         enum Repr {
             Scalar(String),
-            // NOTE: keep MANUAL_SCHEMA_SECTIONS in config.rs in sync with these
-            // table fields (schema walker can't see untagged variant fields).
+            // Keep MANUAL_SCHEMA_SECTIONS in config.rs in sync with these fields: the schema
+            // walker cannot see untagged variant fields.
             Table {
                 #[serde(default = "default_time_zone_identifier")]
                 identifier: String,
@@ -548,8 +548,6 @@ pub fn ambient_time_zone() -> Tz {
     AMBIENT_TZ.try_with(|tz| *tz).unwrap_or(Tz::UTC)
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,7 +733,6 @@ mod tests {
 
     #[test]
     fn percent_decode_keeps_trailing_partial_escape_literal() {
-        // A stray '%' with too few hex digits is preserved verbatim.
         assert_eq!(percent_decode("UTC%2"), "UTC%2");
         assert_eq!(percent_decode("UTC%"), "UTC%");
     }
@@ -791,7 +788,6 @@ mod tests {
 
     #[test]
     fn set_time_zone_cookie_encodes_special_chars() {
-        // '+' is safe per our allow-list; space should be encoded
         let header = set_time_zone_cookie("Etc/UTC");
         assert!(header.contains("Etc/UTC"));
     }
@@ -893,7 +889,6 @@ mod tests {
             let utc_html = local_datetime(dt, Tz::UTC).into_string();
             let tokyo_html = local_datetime(dt, Tz::Asia__Tokyo).into_string();
             let ny_html = local_datetime(dt, Tz::America__New_York).into_string();
-            // Each zone yields a different visible time
             assert!(utc_html.contains("12:00"), "UTC: {utc_html}");
             assert!(tokyo_html.contains("21:00"), "Tokyo: {tokyo_html}");
             assert!(ny_html.contains("08:00"), "New York: {ny_html}");
@@ -903,7 +898,6 @@ mod tests {
         fn local_datetime_datetime_attr_is_utc() {
             let dt = utc(2025, 6, 14, 12, 0, 0);
             let html = local_datetime(dt, Tz::Asia__Tokyo).into_string();
-            // The machine-readable datetime attr should include the UTC timestamp
             assert!(
                 html.contains("2025-06-14T12:00:00"),
                 "datetime attr must be UTC: {html}"
@@ -912,7 +906,6 @@ mod tests {
 
         #[test]
         fn local_date_uses_zone() {
-            // Close to midnight UTC — the date differs by zone
             let dt = utc(2025, 6, 14, 23, 30, 0); // Jun 14 23:30 UTC = Jun 15 08:30 Tokyo
             let utc_html = local_date(dt, Tz::UTC).into_string();
             let tokyo_html = local_date(dt, Tz::Asia__Tokyo).into_string();
@@ -985,10 +978,8 @@ mod tests {
 
     #[tokio::test]
     async fn ambient_returns_utc_outside_scope() {
-        // Inside scope
         let inside =
             with_request_time_zone(Tz::America__New_York, async { ambient_time_zone() }).await;
-        // Outside scope
         let outside = ambient_time_zone();
         assert_eq!(inside, Tz::America__New_York);
         assert_eq!(outside, Tz::UTC);

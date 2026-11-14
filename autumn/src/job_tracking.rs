@@ -70,13 +70,9 @@ impl TrackedJobOwner {
         if let Some(user_id) = session.get(state.auth_session_key()).await {
             return Self::User(user_id);
         }
-        // A session with no prior cookie is only persisted (and only gets a
-        // Set-Cookie on the response) if something dirties it during this
-        // request. Reading `session.id()` alone does not — so without
-        // forcing it, the id we bind to here would never actually reach the
-        // browser as a cookie, and the next poll request would present a
-        // different session entirely, getting the same 404 as an
-        // unauthorized caller.
+        // A cookieless session gets a Set-Cookie only if the request dirties it, and reading
+        // `session.id()` does not. Without the touch the bound id never reaches the browser, and
+        // the next poll arrives as a different session and gets a 404.
         if !session.is_cookie_backed().await {
             session.touch().await;
         }
@@ -153,9 +149,8 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // ── Shared record-mutation logic ──────────────────────────────────────────────
 //
-// The status methods of `JobTrackingStore` apply these transitions. Each
-// store implements only `update_record`. Thus all stores apply the same
-// status rules (#3208).
+// `JobTrackingStore`'s status methods apply these transitions; each store implements only
+// `update_record`, so all stores share the same status rules (#3208).
 
 const fn apply_mark_running(record: &mut TrackedJobRecord) {
     if !record.status.is_terminal() {
@@ -763,10 +758,9 @@ impl SqliteJobTrackingStore {
                     ))
                 })?;
         }
-        // A table an earlier build created has no `version`. SQLite has no
-        // `ADD COLUMN IF NOT EXISTS`, so the error is the check — but only the
-        // duplicate-column case means "already migrated"; anything else must
-        // propagate and leave the cell retryable.
+        // Tables from an earlier build lack `version`. SQLite has no `ADD COLUMN IF NOT EXISTS`, so
+        // only a duplicate-column error means "already migrated"; anything else must propagate
+        // and leave the cell retryable.
         if let Err(error) = diesel::sql_query(
             "ALTER TABLE autumn_job_tracking ADD COLUMN version BIGINT NOT NULL DEFAULT 0",
         )
@@ -806,9 +800,8 @@ impl SqliteJobTrackingStore {
                 return Ok(());
             }
         }
-        // Never `Ok(())`: the caller would take a dropped `complete` or `fail`
-        // for a settled job, and the status endpoint would sit at running until
-        // the record expired.
+        // Never `Ok(())`: a dropped `complete` or `fail` would leave the status endpoint at
+        // running until the record expired.
         Err(AutumnError::internal_server_error_msg(format!(
             "job tracking update lost its compare-and-swap {CAS_RETRIES} times"
         )))
@@ -824,10 +817,8 @@ impl SqliteJobTrackingStore {
         use diesel::OptionalExtension as _;
         use diesel_async::RunQueryDsl as _;
 
-        // One clock sample for both the record's `updated_at` and the column.
-        // `reset_for_retry` compares the column against the value it read out
-        // of the record, so two samples that straddle a millisecond make that
-        // compare-and-swap match nothing and leave an admin-retried job stuck.
+        // One clock sample for the record's `updated_at` and the column: `reset_for_retry`
+        // compares the two, so samples straddling a millisecond would break its swap.
         let now = self.clock.now();
         let now_ms = now.timestamp_millis();
         let mut conn = self.conn().await?;
@@ -854,13 +845,10 @@ impl SqliteJobTrackingStore {
                     "job tracking deserialize failed: {error}"
                 ))
             })?;
-        // A settled record is final. `apply_complete` and `apply_fail` replace
-        // the status unconditionally — unlike `apply_set_progress`, which
-        // already checks — so without this a stale attempt of the same job
-        // could flip the authoritative attempt's `failed` to `succeeded`, or
-        // the reverse. Delivery is at-least-once, so that overlap is ordinary.
-        // Only `reset_for_retry` moves a record out of a terminal state, and it
-        // does not come through here.
+        // A settled record is final. `apply_complete` and `apply_fail` replace the status
+        // unconditionally, so without this a stale overlapping attempt (delivery is at-least-once)
+        // could flip `failed` to `succeeded` or back. Only `reset_for_retry` leaves a terminal
+        // state, and not via here.
         if record.status.is_terminal() {
             return Ok(true);
         }
@@ -872,8 +860,8 @@ impl SqliteJobTrackingStore {
             ))
         })?;
 
-        // `version = ?` is the swap, and the write bumps it: it matches only
-        // while no one else has written since the row above was read.
+        // `version = ?` is the swap and the write bumps it, so it matches only if nothing wrote
+        // since the read above.
         let written = diesel::sql_query(
             "UPDATE autumn_job_tracking \
              SET record = ?, updated_at = ?, expires_at = ?, version = version + 1 \
@@ -969,9 +957,7 @@ impl JobTrackingStore for SqliteJobTrackingStore {
             let now_ms = now.timestamp_millis();
             let payload = Self::pending_record(owner, now)?;
             let mut conn = self.conn().await?;
-            // Compare-and-swap: the reset applies only while nothing has
-            // written since `expected` was read, so a retry that settles
-            // faster than this call returns is never clobbered.
+            // Compare-and-swap, so a retry that settles before this call returns is not clobbered.
             diesel::sql_query(
                 "UPDATE autumn_job_tracking \
                  SET record = ?, updated_at = ?, expires_at = ?, version = version + 1 \
@@ -1036,8 +1022,7 @@ fn store_for_config(
     state: &AppState,
     config: &crate::config::JobConfig,
 ) -> Arc<dyn JobTrackingStore> {
-    // Only read when the `db` feature's match arm below exists; without it
-    // (e.g. `redis`-only builds) `state` would otherwise be unused.
+    // `state` is unused in builds with no database arm below (e.g. `redis`-only).
     let _ = state;
     match config.backend.as_str() {
         #[cfg(feature = "redis")]
@@ -1050,9 +1035,8 @@ fn store_for_config(
                  in-memory job tracking store (tracked job status will not survive a restart)"
             );
         }
-        // The durable SQLite queue keeps tracked-job records in the same file,
-        // so a status survives a restart and every process on the host reads
-        // the same record — which a web/worker split needs (issue #1907).
+        // Records live in the queue's SQLite file, so a status survives a restart and is shared
+        // by every process on the host, as a web/worker split needs (#1907).
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             if let Some(pool) = state.pool() {
@@ -1066,11 +1050,8 @@ fn store_for_config(
                  in-memory job tracking store (tracked job status will not survive a restart)"
             );
         }
-        // The Postgres tracking store persists to a Postgres table; under the
-        // `sqlite` feature `state.pool()` is a SQLite pool that cannot satisfy
-        // its Postgres connection type. The Postgres job backend itself is
-        // refused earlier under sqlite (see `start_postgres_runtime`), so this
-        // arm simply does not exist there.
+        // Under `sqlite`, `state.pool()` is a SQLite pool, and the Postgres job backend is refused
+        // earlier (see `start_postgres_runtime`), so this arm is compiled out.
         #[cfg(all(feature = "db", not(feature = "sqlite")))]
         "postgres" => {
             if let Some(pool) = state.pool() {
@@ -1349,15 +1330,11 @@ pub async fn enqueue_tracked_for(
                 .await?;
         }
         Ok(crate::job::EnqueueOutcome::Skipped) => {
-            // A JobInterceptor completed without ever delivering the job to
-            // the backend — the record must not be left at Pending forever
-            // for a job that will never actually run.
+            // An interceptor swallowed the job; settle the record so it is not left pending.
             capped_settle(store.fail(&key, "The job could not be enqueued.".to_owned())).await?;
         }
         Err(error) => {
-            // The job never entered the queue, so the `Pending` record
-            // created above must not be left to linger until TTL expiry —
-            // settle it the same way the `Deduplicated` outcome does.
+            // The job never entered the queue; settle the record rather than leave it pending.
             let _ =
                 capped_settle(store.fail(&key, "The job could not be enqueued.".to_owned())).await;
             return Err(error);
@@ -1459,14 +1436,9 @@ fn wants_html_response(headers: &axum::http::HeaderMap) -> bool {
     if is_htmx {
         return true;
     }
-    // `accept_prefers_html` treats a bare wildcard Accept as "probably a
-    // browser" — a reasonable default for its original use (full-page error
-    // rendering), where a real browser navigation and a bare `*/*` both
-    // reasonably get an HTML page. This status route is JSON-first for API
-    // clients, though, and a bare wildcard is exactly what curl and many
-    // `fetch()`/HTTP-client defaults send with no real preference — so only
-    // defer to it once an explicit `text/html` preference is present; an
-    // actual browser navigation always sends one.
+    // `accept_prefers_html` treats a bare `*/*` as a browser, but curl and most HTTP clients
+    // send that too. This route is JSON-first, so require an explicit `text/html`, which every
+    // real browser navigation sends.
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|value| value.to_str().ok())
@@ -1589,9 +1561,8 @@ impl InMemoryJobTrackingStore {
     pub fn new(ttl_secs: u64) -> Self {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
-            // `TimeDelta::seconds` PANICS above `i64::MAX / 1_000`, so the
-            // obvious `try_from(..).unwrap_or(i64::MAX)` saturation crashed on
-            // exactly the pathological `ttl_secs` it was meant to absorb.
+            // `TimeDelta::seconds` panics above `i64::MAX / 1_000`, so a plain
+            // `try_from(..).unwrap_or(i64::MAX)` would crash on a huge `ttl_secs`.
             ttl: crate::time_math::saturating_time_delta_secs(ttl_secs),
             clock: Arc::new(SystemClock),
             creates_since_sweep: Arc::new(AtomicU64::new(0)),
@@ -2216,11 +2187,7 @@ impl JobTrackingStore for PgJobTrackingStore {
                 ))
             })?;
             let mut conn = self.conn().await?;
-            // The WHERE clause is a compare-and-swap guard: it only takes
-            // effect if nothing has written to this record (e.g. the
-            // retried attempt itself already settling) since `expected`
-            // was read, so a fast retry can never clobber a fresher
-            // terminal write with a stale reset.
+            // Compare-and-swap, so a retry that settles before this call returns is not clobbered.
             diesel::sql_query(
                 "UPDATE autumn_job_tracking SET record = $2::JSONB, updated_at = $3, \
                  expires_at = NOW() + make_interval(secs => $4::FLOAT8), \
@@ -2338,12 +2305,8 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_store_with_extreme_ttl_does_not_panic() {
-        // Regression (issue #1611): `jobs.tracking.ttl_secs` is plain config,
-        // so a pathological value reached two panicking chrono APIs —
-        // `TimeDelta::seconds` panics above `i64::MAX / 1_000`, and
-        // `DateTime<Utc> + TimeDelta` panics when the sum leaves the
-        // representable range. Both must clamp to a far-future (effectively
-        // non-expiring) deadline rather than crash the process.
+        // #1611: a huge `ttl_secs` must clamp to a far-future deadline. Unclamped it panics in
+        // `TimeDelta::seconds` (above `i64::MAX / 1_000`) or in `DateTime<Utc> + TimeDelta`.
         for ttl_secs in [
             u64::MAX,
             u64::try_from(i64::MAX).unwrap_or(u64::MAX),
@@ -2431,10 +2394,8 @@ mod tests {
 
     #[tokio::test]
     async fn reset_for_retry_is_a_no_op_when_a_fresher_write_already_landed() {
-        // Simulates the race Codex flagged: the retried job is re-enqueued,
-        // claimed, and settles to a terminal status before the admin retry
-        // path gets around to calling `reset_for_retry` with the
-        // `updated_at` it read *before* deciding to retry.
+        // The retried job settles before the admin retry path calls `reset_for_retry` with the
+        // token it read before retrying.
         let store = store();
         store
             .create("k1", TrackedJobOwner::Anonymous)
@@ -2450,8 +2411,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The admin retry path's reset, still holding the pre-retry
-        // snapshot, must not clobber the fresher terminal result.
+        // The reset still holds the pre-retry token, so it must not clobber the newer result.
         store
             .reset_for_retry("k1", stale.owner, token)
             .await
@@ -2533,13 +2493,9 @@ mod tests {
 
     #[tokio::test]
     async fn capture_retry_snapshot_before_enqueue_protects_a_fast_retry_from_being_reset() {
-        // A snapshot taken *after* re-enqueueing can itself already observe
-        // the retried job's terminal write (it settled faster than the
-        // admin retry path got around to reading it), which would make the
-        // CAS trivially "unchanged" and reset the fresh terminal record
-        // right back to `pending`. `capture_retry_snapshot` must be called
-        // *before* the retry is made visible so it captures the original
-        // `failed` record instead.
+        // A snapshot taken after re-enqueueing could already see the retry's terminal write, so
+        // the swap would match and reset that record to `pending`. Capturing before the retry is
+        // visible pins the original `failed` record.
         let _guard = crate::job::global_job_runtime_test_lock().lock().await;
         crate::job::clear_global_job_client();
 
@@ -2552,8 +2508,7 @@ mod tests {
         store.fail(key, "boom".to_owned()).await.unwrap();
         let payload = wrap_tracked_payload(key, &serde_json::json!({}));
 
-        // Captured while the record is still the original `failed` one —
-        // i.e. before the retry is re-enqueued/made visible.
+        // Captured before the retry is visible.
         let snapshot = capture_retry_snapshot(&payload).await;
 
         // The retry runs to completion before `apply_retry_reset` is called.
@@ -2875,8 +2830,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Complete at t=8s, before the original 10s TTL expires — this must
-        // push expiry out to t=18s rather than leaving it at t=10s.
+        // Completing at t=8s must push expiry from t=10s to t=18s.
         let store = store.with_clock(std::sync::Arc::new(FixedClock::at(
             start + chrono::TimeDelta::seconds(8),
         )));
@@ -2932,9 +2886,8 @@ mod tests {
             "reads must already treat it as gone"
         );
 
-        // Drive enough creates to cross the amortized sweep threshold. The
-        // clock stays fixed, so every filler entry is still live when the
-        // sweep runs — only the already-expired one should be removed.
+        // Cross the amortized sweep threshold. The clock is fixed, so every filler entry stays
+        // live and only the expired one should be removed.
         for i in 0..IN_MEMORY_SWEEP_INTERVAL {
             store
                 .create(&format!("filler-{i}"), TrackedJobOwner::Anonymous)
@@ -3003,8 +2956,7 @@ mod tests {
     fn reject_reserved_envelope_marker_allows_ordinary_payloads() {
         assert!(reject_reserved_envelope_marker(&serde_json::json!({"account_id": 42})).is_ok());
         assert!(reject_reserved_envelope_marker(&Value::Null).is_ok());
-        // A field merely containing the substring, or not exactly matching
-        // the reserved key, is not a collision.
+        // A key that only starts with the marker is not a collision.
         assert!(
             reject_reserved_envelope_marker(&serde_json::json!({"__autumn_tracked_at": 1})).is_ok()
         );
@@ -3012,10 +2964,8 @@ mod tests {
 
     #[test]
     fn take_and_split_tracked_payload_agree_on_a_malformed_envelope_missing_args() {
-        // The marker is present (so both functions detect a tracked
-        // envelope) but there is no `args` field — a state `wrap_tracked_payload`
-        // itself never produces, but the two unwrap functions must still
-        // agree on how to handle it rather than silently diverging.
+        // A marker with no `args` field, which `wrap_tracked_payload` never produces: both unwrap
+        // functions must still agree on it.
         let malformed = serde_json::json!({"__autumn_tracked": {"k": "abc123"}});
 
         let (split_key, split_inner) = split_tracked_payload(&malformed);
@@ -3241,10 +3191,8 @@ mod tests {
             &crate::config::JobQueuesConfig::default(),
         );
 
-        // "unregistered_job" is never registered on this runtime, so the
-        // enqueue itself fails with an `Err` before the job ever reaches the
-        // queue — the exact scenario that used to leak the `Pending` record
-        // `store.create` had already written moments earlier.
+        // An unregistered name fails the enqueue after `store.create` wrote the `Pending` record,
+        // which must then be settled rather than leaked.
         let err = enqueue_tracked("unregistered_job", serde_json::json!({}))
             .await
             .expect_err("enqueueing an unregistered job name must error");
@@ -3282,20 +3230,15 @@ mod tests {
         ensure_tracking_store_installed(&state);
         assert!(global_tracking_store().is_some(), "sanity: store installed");
 
-        // Simulate a runtime restart that clears global state without ever
-        // constructing a fresh AppState (e.g. an app's own restart helper
-        // that always calls clear_global_job_client() before reinitializing
-        // the runtime on the same, already-built AppState).
+        // A runtime restart that clears global state but reuses the same `AppState`.
         crate::job::clear_global_job_client();
         assert!(
             global_tracking_store().is_none(),
             "sanity: clear really did reset the global"
         );
 
-        // `state` still carries the stale JobTrackingStoreEntry extension
-        // from before the clear; without the fix this call would see that
-        // extension and skip reinstalling, leaving GLOBAL_TRACKING_STORE
-        // stuck at None and enqueue_tracked permanently broken.
+        // `state` still carries the stale `JobTrackingStoreEntry`; the install must not trust it
+        // and skip, or the global store stays `None`.
         ensure_tracking_store_installed(&state);
         assert!(
             global_tracking_store().is_some(),
@@ -3348,10 +3291,8 @@ mod tests {
     #[cfg(feature = "redis")]
     #[tokio::test]
     async fn build_redis_tracking_store_is_some_for_an_unreachable_but_well_formed_url() {
-        // ConnectionManager::new_lazy_with_config never dials eagerly, so
-        // construction succeeds even though nothing is listening on this port
-        // — it just needs a Tokio runtime context to spawn its background
-        // reconnect task onto.
+        // `ConnectionManager::new_lazy_with_config` never dials eagerly, so this succeeds with
+        // nothing listening; it only needs a Tokio runtime for its reconnect task.
         let mut config = crate::config::JobConfig::default();
         config.redis.url = Some("redis://127.0.0.1:19999".to_owned());
         assert!(build_redis_tracking_store(&config).is_some());

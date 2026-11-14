@@ -432,18 +432,13 @@ fn apply_change_row(
             let created_version = match current {
                 // Updating/deleting the live row: the incarnation continues.
                 Some(cur) if !cur.row.deleted => cur.created_version,
-                // A no-op delete over an existing tombstone: no live
-                // incarnation begins, so the marker must NOT move — a
-                // device that pulled the ORIGINAL tombstone recreates from
-                // its version, and bumping the marker here would misroute
-                // that legitimate recreate into the previous-incarnation
-                // server-winning arm. The marker only ever advances on a
-                // transition to LIVE.
+                // A delete over an existing tombstone starts no incarnation, so the marker must
+                // not move: a device that pulled the original tombstone recreates from its
+                // version, and a bumped marker would route that recreate into the
+                // previous-incarnation arm. The marker only advances on a transition to live.
                 Some(cur) if row.deleted => cur.created_version,
-                // A recreate over a seen tombstone, a fresh live insert —
-                // or a tombstone minted from nothing (a base-0 delete of a
-                // pk that never existed, which has no prior marker to
-                // keep): a new incarnation.
+                // A recreate over a seen tombstone, a fresh insert, or a base-0 delete of a pk
+                // that never existed: a new incarnation.
                 _ => version,
             };
             (
@@ -684,9 +679,8 @@ impl SyncBackend for MemorySyncBackend {
         resolver: &dyn ConflictResolver,
     ) -> Result<PushResponse, SyncError> {
         validate_push(request)?;
-        // One lock scope = one atomic batch, mirroring the PG transaction.
+        // One lock scope is one atomic batch, like the Postgres transaction.
         let mut state = self.lock()?;
-        // The REQUESTING SCOPE's horizon (see MemoryState::horizons).
         let horizon = state.horizons.get(scope).copied().unwrap_or(0);
         let mut outcomes = Vec::with_capacity(request.changes.len());
         for change in &request.changes {
@@ -696,9 +690,8 @@ impl SyncBackend for MemorySyncBackend {
                 change.change_id.clone(),
             );
             if let Some(record) = state.applied.get(&dedup_key) {
-                // Replay the ORIGINAL outcome: a Resolved result must come
-                // back as the same Resolved row, not a clean-looking
-                // AlreadyApplied ack (see AppliedRecord).
+                // Replay the original outcome: a Resolved result comes back as the same Resolved
+                // row, not as an AlreadyApplied ack.
                 outcomes.push(record.resolved_row.as_ref().map_or(
                     ChangeOutcome::AlreadyApplied {
                         version: record.version,
@@ -714,8 +707,6 @@ impl SyncBackend for MemorySyncBackend {
             );
             let current = state.rows.get(&row_key).cloned();
             let version = state.allocate_version();
-            // The conflict-arm policy is the shared apply_change_row —
-            // one authoritative copy for both backends.
             let (stored, clean) = apply_change_row(
                 change,
                 &request.device_id,
@@ -757,14 +748,9 @@ impl SyncBackend for MemorySyncBackend {
         limit: i64,
         session_start: Version,
     ) -> Result<PullResponse, SyncError> {
-        // One MutexGuard covers BOTH the horizon read and the row scan, so
-        // they observe a single consistent state — the mutex is this
-        // backend's analogue of the Postgres pull's REPEATABLE READ
-        // snapshot (a GC can only run entirely before or entirely after
-        // this pull, never between its two reads).
+        // One guard covers both the horizon read and the row scan, like the Postgres pull's
+        // REPEATABLE READ snapshot: a GC cannot run between the two reads.
         let state = self.lock()?;
-        // The REQUESTING SCOPE's horizon — both for the staleness check
-        // and the per-page value the client's GC-race guard reads.
         let horizon = state.horizons.get(scope).copied().unwrap_or(0);
         if session_start > 0 && session_start < horizon {
             return Ok(PullResponse::FullResyncRequired {
@@ -790,11 +776,8 @@ impl SyncBackend for MemorySyncBackend {
 
     fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
         let mut state = self.lock()?;
-        // Global sweep, PER-SCOPE horizons: each scope's horizon advances
-        // to the highest tombstone version actually dropped in THAT scope
-        // (see the trait docs) — inherently a committed version under this
-        // mutex, so no clamp is needed, and untouched scopes keep their
-        // horizon.
+        // Global sweep, per-scope horizons: each scope's horizon advances to the highest
+        // tombstone version dropped in that scope. Untouched scopes keep their horizon.
         let mut per_scope: HashMap<String, Version> = HashMap::new();
         let mut removed = 0u64;
         state.rows.retain(|(row_scope, _, _), stored| {
@@ -821,10 +804,8 @@ impl SyncBackend for MemorySyncBackend {
         state
             .applied
             .retain(|_, record| record.applied_at >= older_than);
-        // `retain` only ever removes, so `before >= len()` holds by
-        // construction — but a `usize` underflow here would be a silent
-        // ~1.8e19 "removed" count in release, so saturate and assert the
-        // invariant in debug rather than trusting it silently.
+        // `retain` only removes, so this cannot underflow; saturate anyway so a broken
+        // invariant cannot report ~1.8e19 removed rows in release.
         debug_assert!(
             before >= state.applied.len(),
             "retain must not grow the applied set"
@@ -1265,9 +1246,8 @@ macro_rules! with_sync_pg_connection {
                                 let $conn = &mut conn;
                                 $body
                             };
-                            // The runtime drives the connection's tokio
-                            // driver task: it must outlive every use of
-                            // `conn`.
+                            // The runtime drives the connection's driver task, so it must
+                            // outlive every use of `conn`.
                             drop(conn);
                             drop(runtime);
                             result
@@ -1344,20 +1324,15 @@ impl SyncBackend for PgSyncBackend {
                 if let Some(sql) = &set_local {
                     diesel::connection::SimpleConnection::batch_execute(conn, sql)?;
                 }
-                // Serialize push batches (held until commit). See the doc
-                // comment on PG_PUSH_ADVISORY_LOCK_KEY for why this is
-                // required for correctness, not just politeness.
+                // Serialize push batches until commit; see PG_PUSH_ADVISORY_LOCK_KEY.
                 sql_query("SELECT pg_advisory_xact_lock($1)")
                     .bind::<BigInt, _>(PG_PUSH_ADVISORY_LOCK_KEY)
                     .execute(conn)?;
-                // The REQUESTING SCOPE's horizon, stable for the whole batch:
-                // GC serializes on the same advisory lock, so it cannot move
-                // mid-transaction.
+                // Stable for the whole batch: GC takes the same advisory lock.
                 let horizon = pg_horizon(conn, scope)?;
 
-                // 1. Batch dedup check: every change_id in one round trip.
-                // `validate_push` already rejected repeats within the batch,
-                // so this is a plain equality lookup against EARLIER pushes.
+                // 1. Dedup check against earlier pushes in one round trip. `validate_push`
+                // already rejected repeats within this batch.
                 let change_ids: Vec<&str> = request
                     .changes
                     .iter()
@@ -1379,10 +1354,8 @@ impl SyncBackend for PgSyncBackend {
                     .collect()
                 };
 
-                // 2. Batch current-row fetch (FOR UPDATE): one round trip
-                // for every DISTINCT (collection, pk) among changes that
-                // will actually apply — a dedup hit never touches
-                // autumn_sync_rows, same as before.
+                // 2. Fetch current rows FOR UPDATE in one round trip, for every distinct
+                // (collection, pk) that will apply. Dedup hits are skipped.
                 let mut to_apply_keys: Vec<(&str, &str)> = Vec::new();
                 let mut seen_keys = std::collections::HashSet::new();
                 for change in &request.changes {
@@ -1421,23 +1394,18 @@ impl SyncBackend for PgSyncBackend {
                     .collect()
                 };
 
-                // 3. Batch version allocation: exactly one nextval() per
-                // change that will actually apply — a dedup hit burns no
-                // version, same as before (`pg_next_version` was called
-                // AFTER the dedup `continue`).
+                // 3. Allocate one version per change that will apply; a dedup hit burns none.
                 let to_apply_count = request.changes.len().saturating_sub(applied.len());
                 let mut versions = pg_next_versions(conn, to_apply_count)?.into_iter();
 
-                // 4. Decide every change's outcome in memory (pure — see
-                // above), then batch-write.
+                // 4. Decide every outcome in memory, in request order.
                 let mut outcomes = Vec::with_capacity(request.changes.len());
                 let mut to_record: Vec<(String, Version, Option<serde_json::Value>)> =
                     Vec::with_capacity(to_apply_count);
                 for change in &request.changes {
                     if let Some(record) = applied.get(&change.change_id) {
-                        // Replay the ORIGINAL outcome: a Resolved result must
-                        // come back as the same Resolved row, not a
-                        // clean-looking AlreadyApplied ack (see AppliedRecord).
+                        // Replay the original outcome: a Resolved result comes back as the
+                        // same Resolved row, not as an AlreadyApplied ack.
                         outcomes.push(match &record.resolved_row {
                             Some(value) => ChangeOutcome::Resolved {
                                 row: serde_json::from_value(value.clone()).map_err(|e| {
@@ -1461,11 +1429,7 @@ impl SyncBackend for PgSyncBackend {
                         )));
                     };
                     let key = (change.collection.clone(), change.pk.clone());
-                    // The conflict-arm policy is the shared apply_change_row
-                    // — one authoritative copy for both backends. `current`
-                    // reflects any EARLIER change in this same batch to the
-                    // same key (inserted below), exactly like the old
-                    // re-SELECT would have.
+                    // `current` already holds any earlier change to this key in the same batch.
                     let (stored, clean) = apply_change_row(
                         change,
                         &request.device_id,
@@ -1489,17 +1453,13 @@ impl SyncBackend for PgSyncBackend {
                         _ => None,
                     };
                     to_record.push((change.change_id.clone(), version, resolved_row));
-                    // A pk written twice in this batch keeps only its LAST
-                    // value here — the same end state the old sequential
-                    // per-change UPSERTs left, just decided once instead of
-                    // written twice.
+                    // A pk written twice in this batch keeps only its last value.
                     current.insert(key, stored);
                     outcomes.push(outcome);
                 }
 
-                // 5. Batch-write: one UPSERT for the final state of every
-                // touched row, one INSERT for every applied change's dedup
-                // record.
+                // 5. One UPSERT for the final state of every touched row, one INSERT for the
+                // dedup records.
                 pg_upsert_rows(conn, scope, current.values())?;
                 pg_insert_applied(conn, scope, &request.device_id, &to_record)?;
 
@@ -1516,34 +1476,15 @@ impl SyncBackend for PgSyncBackend {
         limit: i64,
         session_start: Version,
     ) -> Result<PullResponse, SyncError> {
-        // REPEATABLE READ is load-bearing: the horizon read and the row
-        // scan must observe ONE MVCC snapshot. Under the default READ
-        // COMMITTED each statement snapshots independently, so a concurrent
-        // gc_tombstones committing between the two would let this pull pass
-        // the staleness check against the OLD horizon while the row scan
-        // already misses the GC'd tombstones — the client would advance its
-        // cursor past deletions it never received (and never be told to
-        // resync), keeping a stale row visible forever. With one snapshot
-        // the response is internally consistent: the client either sees the
-        // tombstones or (on its next pull, against the advanced horizon)
-        // gets FullResyncRequired.
+        // REPEATABLE READ: the horizon read and the row scan must see one snapshot. Under READ
+        // COMMITTED a GC committing between them would pass the staleness check against the old
+        // horizon while the scan misses the GC'd tombstones, so the client would skip deletions
+        // without being told to resync. A READ ONLY transaction at this level cannot fail with
+        // a serialization error, so no retry loop is needed, and unlike the push advisory lock
+        // it serializes nothing.
         //
-        // Cost: none worth noting. A READ ONLY REPEATABLE READ transaction
-        // in Postgres cannot fail with a serialization error (40001 arises
-        // from write-write conflicts; plain SELECTs have none — only
-        // SERIALIZABLE can abort read-only transactions), so no retry loop
-        // is needed, and unlike taking the GC/push advisory lock this
-        // serializes nothing: pulls, pushes, and GC all keep running
-        // concurrently.
-        //
-        // The posture is set via `SET TRANSACTION ISOLATION LEVEL
-        // REPEATABLE READ, READ ONLY` as the FIRST statement inside
-        // `transaction()` — semantically identical to Postgres's
-        // `BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ` (SET
-        // TRANSACTION applies when it precedes any query in the
-        // transaction), and unlike `build_transaction()` (an inherent
-        // PgConnection method) it works on both connection types the
-        // TLS-aware macro dispatches to.
+        // `SET TRANSACTION` as the first statement is equivalent to `BEGIN ... REPEATABLE READ`
+        // and, unlike `build_transaction()`, works on both connection types the macro yields.
         let set_local = sync_tx_set_local();
         with_sync_pg_connection!(&self.database_url, |conn| {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
@@ -1587,23 +1528,15 @@ impl SyncBackend for PgSyncBackend {
     fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
         with_sync_pg_connection!(&self.database_url, |conn| {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
-                // Serialize with pushes (the SAME advisory lock apply_push
-                // takes): with an in-flight push holding an allocated-but-
-                // uncommitted version below a tombstone this sweep drops, the
-                // persisted horizon could cover that version before its row is
-                // visible — a client pulling in between would jump its cursor
-                // past the row and miss it forever. Holding the push lock, no
-                // push is in flight while we sweep, so every version at or
-                // below anything we drop is committed.
+                // Take the push lock: an in-flight push may hold an uncommitted version below a
+                // tombstone this sweep drops, and a horizon covering it would let a client
+                // advance its cursor past that row before it is visible. Under the lock every
+                // dropped version is committed, so the horizon needs no clamp.
                 sql_query("SELECT pg_advisory_xact_lock($1)")
                     .bind::<BigInt, _>(PG_PUSH_ADVISORY_LOCK_KEY)
                     .execute(conn)?;
-                // Global sweep, PER-SCOPE horizons: each scope's horizon
-                // advances to the highest tombstone version actually dropped
-                // in THAT scope (see the trait docs) — inherently a committed
-                // version, so no explicit clamp is needed, and scopes whose
-                // tombstones were untouched keep their horizon (no forced
-                // resyncs, no suppressed conflict resolution elsewhere).
+                // Global sweep, per-scope horizons: each scope's horizon advances to the highest
+                // tombstone version dropped in that scope. Untouched scopes keep their horizon.
                 let dropped = sql_query(
                     "DELETE FROM autumn_sync_rows WHERE deleted AND version <= $1 \
                  RETURNING scope, version",
@@ -1616,14 +1549,8 @@ impl SyncBackend for PgSyncBackend {
                     let max = per_scope.entry(record.scope).or_insert(0);
                     *max = (*max).max(record.version);
                 }
-                // One statement for every scope touched by this sweep instead
-                // of one per scope: a sweep across a multi-tenant instance
-                // can touch hundreds/thousands of distinct scopes, and each
-                // was previously a separate round trip inside this same
-                // advisory-locked transaction. `UNNEST` fans the arrays back
-                // out into rows server-side, so the ON CONFLICT/GREATEST
-                // semantics are identical to issuing the loop above — this is
-                // a batching change, not a behavior change.
+                // One statement for all touched scopes: a multi-tenant sweep can touch thousands,
+                // and this runs under the push lock.
                 if !per_scope.is_empty() {
                     let (scopes, horizons): (Vec<String>, Vec<Version>) =
                         per_scope.into_iter().unzip();
@@ -1849,9 +1776,8 @@ fn respond<T: serde::Serialize>(
 ) -> axum::response::Response {
     match result {
         Ok(Ok(response)) => Json(response).into_response(),
-        // Protocol violations (e.g. an upsert without a payload) are CLIENT
-        // errors: answer 422 so the pushing device surfaces the bug instead
-        // of retrying a batch the server will never accept.
+        // A protocol violation is a client bug: 422 so the device surfaces it instead of
+        // retrying a batch the server will never accept.
         Ok(Err(err @ SyncError::Protocol(_))) => {
             tracing::warn!(error = %err, "sync request rejected");
             (StatusCode::UNPROCESSABLE_ENTITY, err.to_string()).into_response()
@@ -1925,9 +1851,7 @@ mod tests {
         assert!(!super::constant_time_token_eq("sync-secret", "sync-secreT"));
         assert!(!super::constant_time_token_eq("sync", "sync-secret"));
         assert!(!super::constant_time_token_eq("", "sync-secret"));
-        // Pure equality: an empty expected token DOES equal an empty
-        // presented one — callers must reject empty expected values before
-        // comparing (the routers' documented fail-closed requirement).
+        // Empty equals empty: callers must reject an empty expected token before comparing.
         assert!(super::constant_time_token_eq("", ""));
     }
 }

@@ -371,47 +371,28 @@ impl Multipart {
             return Ok(None);
         };
 
-        // Only file parts carry uploadable content worth validating. Regular
-        // form fields omit a filename entirely and are never sniffed. A file
-        // part always carries a filename (`Some`), so we sniff whenever one is
-        // present AND an allow-list is configured OR strict mismatch-rejection
-        // is enabled — either check needs the actual (magic-byte) content type
-        // rather than the spoofable client header.
+        // Only file parts (those with a filename) are sniffed, and only when a policy needs the
+        // magic-byte content type rather than the spoofable client header.
         let needs_sniff = field.file_name().is_some()
             && (!self.config.allowed_mime_types.is_empty()
                 || self.config.reject_on_content_type_mismatch);
 
-        // An optional/empty file input submits a part with `filename=""` and a
-        // 0-byte body. Only that genuinely-empty case is exempt from
-        // enforcement (see below); a `filename=""` part with a NON-empty body
-        // must still be sniffed and enforced, since callers can consume its
-        // bytes by field name. Capture the empty-filename flag now, before the
-        // body is consumed by the prefix-buffering loop, to avoid borrowing
-        // `field` after it has been read. On the sniff path this flag also
-        // drives the `file_name()` normalization: a genuinely-empty optional
-        // input surfaces as `None`, a non-empty-body empty-filename part as a
-        // file.
+        // Read before the prefix loop consumes the body. An empty optional file input submits
+        // `filename=""` with a 0-byte body; see `is_empty_file_input` below.
         let filename_is_empty = field.file_name().is_some_and(str::is_empty);
 
         if !needs_sniff {
-            // Default path: no MIME policy, so no sniffing and no enforcement.
-            // Hand the field through with ZERO buffering — exactly as before
-            // #1873 — so a handler can reject or stream it without the whole
-            // part being pulled into memory first. `file_name()` normalization
-            // is scoped to the sniff path (below), where body emptiness is
-            // already observed from the bounded sniff prefix; here there is no
-            // classification happening, so the raw inner filename (`Some("")`
-            // for an empty-filename part) is surfaced unchanged. Default config
-            // was explicitly unaffected by #1873.
+            // No MIME policy: hand the field through unbuffered so a handler can reject or stream
+            // it. Body emptiness is unknown here, so `file_name()` stays the raw value
+            // (`Some("")` for an empty filename).
             return Ok(Some(MultipartField::new(
                 field,
                 self.config.max_file_size_bytes,
             )));
         }
 
-        // Buffer a bounded leading prefix (a few chunks at most) for sniffing,
-        // preserving streaming: the rest of the field is still pulled lazily by
-        // the consuming methods, which replay this prefix first.
+        // Buffer a bounded prefix for sniffing. The consuming methods replay it, then stream the
+        // rest lazily.
         let mut prefix: Vec<u8> = Vec::with_capacity(SNIFF_PREFIX_BYTES);
         while prefix.len() < SNIFF_PREFIX_BYTES {
             match field
@@ -421,8 +402,6 @@ impl Multipart {
             {
                 Some(chunk) => {
                     prefix.extend_from_slice(&chunk);
-                    // Reject as soon as the buffered prefix exceeds the per-file
-                    // cap, so an oversized leading chunk bails without reading on.
                     if prefix.len() > self.config.max_file_size_bytes {
                         return Err(file_too_large_error(self.config.max_file_size_bytes));
                     }
@@ -431,25 +410,15 @@ impl Multipart {
             }
         }
 
-        // Borrow the declared header rather than allocating: `declared_essence`
-        // only needs a slice, and the borrow of `field` ends before it is moved
-        // into the returned wrapper below.
-        // Compare on the type ESSENCE (media type without parameters), so a
-        // header like `image/png; charset=binary` matches sniffed `image/png`.
+        // Compare essences, so `image/png; charset=binary` matches sniffed `image/png`.
         let declared_essence = field.content_type().map(content_type_essence);
         let sniffed = sniff_content_type(&prefix);
 
-        // A genuinely-empty optional file input (empty filename AND 0-byte
-        // body) carries no upload: skip enforcement so it passes through as a
-        // non-file/absent field instead of aborting the submit. Every other
-        // part with a filename — including `filename=""` with a non-empty body
-        // — is sniffed and enforced exactly as below, closing the bypass where
-        // a crafted empty filename could smuggle disallowed content.
+        // An empty optional file input (empty filename and 0-byte body) carries no upload, so it
+        // skips enforcement instead of failing the submit. A `filename=""` part with a body is
+        // still enforced, so an empty filename cannot smuggle disallowed content.
         let is_empty_file_input = filename_is_empty && prefix.is_empty();
         if !is_empty_file_input {
-            // Enforce the allow-list (sniffed → markup-guard → declared
-            // fallback) and, when enabled, strict declared-vs-sniffed matching.
-            // See the helpers below for the exact rules.
             if !self.config.allowed_mime_types.is_empty() {
                 enforce_upload_allow_list(
                     &self.config.allowed_mime_types,
@@ -514,7 +483,6 @@ fn truncate_for_error(value: &str) -> String {
 /// means the declared header is spoofed.
 #[cfg(feature = "multipart")]
 fn is_signatureless_text_type(essence: &str) -> bool {
-    // Media types are case-insensitive, so normalize before comparing.
     let lower = essence.to_ascii_lowercase();
     lower.starts_with("text/") || matches!(lower.as_str(), "application/json" | "application/csv")
 }
@@ -772,9 +740,7 @@ impl<'a> MultipartField<'a> {
     /// Returns `413 Payload Too Large` if the field exceeds
     /// `security.upload.max_file_size_bytes`.
     pub async fn bytes_limited(mut self) -> crate::AutumnResult<Vec<u8>> {
-        // Reuse the sniff prefix as the output buffer: it already holds exactly
-        // the leading bytes in order, so appending the inner stream after it
-        // reproduces the original byte sequence with no extra allocation.
+        // The sniff prefix holds the leading bytes, so it doubles as the output buffer.
         let mut out = self.prefix;
         let mut read = out.len();
         if read > self.max_file_size_bytes {
@@ -786,8 +752,7 @@ impl<'a> MultipartField<'a> {
             .await
             .map_err(|err| multipart_error_to_error(&err))?
         {
-            // Saturating: the very next check rejects anything over the cap,
-            // so a saturated total still fails closed instead of overflowing.
+            // A saturated total is still over the cap, so this fails closed.
             read = read.saturating_add(chunk.len());
             if read > self.max_file_size_bytes {
                 return Err(file_too_large_error(self.max_file_size_bytes));
@@ -843,8 +808,7 @@ impl<'a> MultipartField<'a> {
         'a: 'b,
     {
         let key = key.into();
-        // Persist the VERIFIED (sniffed) type when available, falling back to
-        // the client-declared header only when no sniffing occurred.
+        // Prefer the sniffed type; the client header is used only when nothing was sniffed.
         let content_type = self
             .sniffed_content_type
             .map(str::to_owned)
@@ -857,11 +821,8 @@ impl<'a> MultipartField<'a> {
             Some(bytes::Bytes::from(self.prefix))
         };
 
-        // Adapt the multipart chunk iterator into the trait's
-        // `ByteStream`, enforcing the per-file size cap as we go so we
-        // never buffer the whole upload in memory and large files flow
-        // straight through to the store's streaming path. Any sniffed prefix
-        // is replayed as the first chunk so it is not lost.
+        // Stream to the store without buffering the upload, enforcing the per-file cap per
+        // chunk. The sniffed prefix is replayed as the first chunk.
         let state = MultipartFieldStreamState {
             inner: self.inner,
             prefix,
@@ -902,11 +863,8 @@ impl<'a> MultipartField<'a> {
                 }
                 Ok(None) => None,
                 Err(err) => {
-                    // multer/axum already classifies multipart parser
-                    // failures: 400 for malformed bodies, 413 for body
-                    // limit violations, etc. Preserve that — wrapping
-                    // every parser error as `Io` would silently turn
-                    // client errors into 500s on the way out.
+                    // Keep multer's classification (400 malformed, 413 over limit). Wrapping
+                    // every parser error as `Io` would turn client errors into 500s.
                     state.errored = true;
                     let mapped = blob_error_from_multipart(&err);
                     Some((Err(mapped), state))
@@ -939,8 +897,7 @@ impl<'a> MultipartField<'a> {
             .map_err(crate::AutumnError::internal_server_error)?;
 
         let mut written = 0usize;
-        // Write any sniffed prefix bytes first so they are not lost, counting
-        // them toward the per-file cap.
+        // The sniffed prefix comes first and counts toward the per-file cap.
         if !self.prefix.is_empty() {
             written = written.saturating_add(self.prefix.len());
             if written > self.max_file_size_bytes {
@@ -958,8 +915,7 @@ impl<'a> MultipartField<'a> {
             .await
             .map_err(|err| multipart_error_to_error(&err))?
         {
-            // Saturating for the same reason as `bytes_limited`: a saturated
-            // running total is still over the cap, so the file is rejected.
+            // A saturated total is still over the cap, so this fails closed.
             written = written.saturating_add(chunk.len());
             if written > self.max_file_size_bytes {
                 drop(file);
@@ -1079,7 +1035,7 @@ mod tests {
         }
 
         let app = axum::Router::new().route("/csv", axum::routing::post(csv_handler));
-        // Missing name column
+        // No `name` column.
         let body = "id\n1\n";
         let req = Request::builder()
             .method("POST")
@@ -1089,7 +1045,6 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        // CSV parse errors map to AutumnError::bad_request_msg (400)
         assert_eq!(resp.status(), 400);
     }
 
@@ -1254,7 +1209,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
 
-        // Verify that the blob was not created/persisted
         let get_err = store.get("myblob").await.unwrap_err();
         assert_eq!(get_err.status(), http::StatusCode::NOT_FOUND);
     }
@@ -1310,16 +1264,13 @@ mod tests {
 
     #[test]
     fn is_signatureless_text_type_is_case_insensitive() {
-        // Media types are case-insensitive, so mixed-case declarations must be
-        // recognized as signature-less text.
         assert!(is_signatureless_text_type("text/csv"));
         assert!(is_signatureless_text_type("Text/Csv"));
         assert!(is_signatureless_text_type("TEXT/PLAIN"));
         assert!(is_signatureless_text_type("application/json"));
         assert!(is_signatureless_text_type("Application/JSON"));
         assert!(is_signatureless_text_type("application/csv"));
-        // Binary/sniffable types are never treated as signature-less text —
-        // the P1 fix must be preserved regardless of case.
+        // Sniffable binary types never count as signature-less text, in any case.
         assert!(!is_signatureless_text_type("image/png"));
         assert!(!is_signatureless_text_type("Image/PNG"));
         assert!(!is_signatureless_text_type("application/octet-stream"));
@@ -1343,8 +1294,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_field_exposes_sniffed_content_type_for_genuine_png() {
-        // Genuine PNG bytes declared as octet-stream: the extractor must
-        // recognize the real type from magic bytes and expose it.
+        // Real PNG bytes declared as octet-stream.
         let mut body: Vec<u8> = Vec::new();
         body.extend_from_slice(
             b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; \
@@ -1421,11 +1371,9 @@ where
         parts: &mut axum::http::request::Parts,
         state: &S,
     ) -> Result<Self, Self::Rejection> {
-        // Use OriginalUri rather than parts.uri directly: axum's Router::nest
-        // strips the mount prefix from parts.uri inside the nested service,
-        // but nav_link needs the full browser-visible path to compare against
-        // normal absolute hrefs. OriginalUri falls back to parts.uri itself
-        // when the request wasn't dispatched through a nested router.
+        // `Router::nest` strips the mount prefix from `parts.uri`, but nav_link compares against
+        // absolute hrefs. `OriginalUri` keeps the browser-visible path, and equals `parts.uri`
+        // outside a nested router.
         let axum::extract::OriginalUri(uri) =
             axum::extract::OriginalUri::from_request_parts(parts, state)
                 .await
@@ -1772,12 +1720,7 @@ mod trusted_proxy_extractor_tests {
 
     #[tokio::test]
     async fn current_path_preserves_prefix_under_nested_router() {
-        // axum's Router::nest strips the mount prefix from `parts.uri` inside
-        // the nested service, so a request to "/admin/posts" is seen as
-        // "/posts" there. nav_link's documented use compares CurrentPath
-        // against normal absolute hrefs like "/admin/posts", so CurrentPath
-        // must return the browser-visible path (via OriginalUri), not the
-        // nest-relative one.
+        // Inside the nested service `parts.uri` is "/posts"; nav_link needs "/admin/posts".
         async fn handler(CurrentPath(path): CurrentPath) -> String {
             path
         }

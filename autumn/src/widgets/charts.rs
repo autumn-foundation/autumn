@@ -4,8 +4,6 @@
 
 use super::merge_class;
 
-// ── charts: sparkline / bar_chart / line_chart (#1231) ──────────────────────
-
 /// Rendering options shared by [`sparkline_with`], [`bar_chart_with`], and
 /// [`line_chart_with`].
 ///
@@ -230,8 +228,7 @@ fn chart_desc(points: &[(&str, f64)], config: &ChartConfig<'_>) -> String {
     if points.is_empty() {
         return "No data".to_string();
     }
-    // Report the actual data range from the finite point values, independent of
-    // any `config.min`/`config.max` axis override (which controls plotting only).
+    // The actual data range: a `config.min`/`config.max` override affects plotting only.
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
     for (_, v) in points {
@@ -390,11 +387,9 @@ pub fn bar_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud:
     let usable_h = H - 2.0 * PAD;
     let bottom = H - PAD;
     let span = max - min;
-    // Bars diverge from the zero baseline: positive bars grow up from the zero
-    // line, negative bars grow down, and each bar's length is proportional to
-    // its magnitude. A degenerate span (`<= 0`, only reachable as an all-zero
-    // series once automatic bounds are zero-anchored) collapses every bar onto
-    // the baseline with zero height.
+    // Bars grow up or down from the zero line, with length proportional to magnitude. A
+    // span `<= 0` (only an all-zero series, since automatic bounds are zero-anchored)
+    // gives every bar zero height.
     let zero_frac = if span > 0.0 {
         ((0.0 - min) / span).clamp(0.0, 1.0)
     } else {
@@ -517,8 +512,6 @@ pub fn line_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud
 mod tests {
     use super::*;
 
-    // ── charts (#1231) ─────────────────────────────────────────────────
-
     #[test]
     fn sparkline_is_accessible_inline_svg() {
         let html = sparkline(&[("a", 1.0), ("b", 2.0), ("c", 1.5)]).into_string();
@@ -595,7 +588,7 @@ mod tests {
             "single point renders a dot: {html}"
         );
         assert!(!html.contains("NaN"), "{html}");
-        // Centered horizontally, mid-height (span is zero).
+        // Centered horizontally (span is zero).
         assert!(html.contains(r#"cx="50""#), "{html}");
     }
 
@@ -603,21 +596,18 @@ mod tests {
     fn all_equal_positive_values_render_full_height_bars() {
         let html = bar_chart(&[("a", 4.0), ("b", 4.0), ("c", 4.0)]).into_string();
         assert!(!html.contains("NaN"), "{html}");
-        // Degenerate span (all-equal positive): read as full-magnitude bars, so
-        // every bar spans the full usable height (H - 2*PAD = 40 - 4 = 36), not
-        // the 0.5 midline that suits a flat line.
+        // Zero-anchored bounds are [0, 4], so every bar is the max and spans the full
+        // usable height (H - 2*PAD = 36), not the 0.5 midline a flat line uses.
         assert_eq!(html.matches(r#"height="36""#).count(), 3, "{html}");
         assert!(!html.contains(r#"height="18""#), "not half height: {html}");
     }
 
     #[test]
     fn all_zero_bars_render_zero_height() {
-        // All-zero (zero-activity) series: the degenerate-span midline would draw
-        // misleading half-height bars. Instead the bars must have zero height.
+        // The zero-span midline would draw misleading half-height (18) bars.
         let html = bar_chart(&[("a", 0.0), ("b", 0.0)]).into_string();
         assert!(!html.contains("NaN"), "{html}");
         assert_eq!(html.matches(r#"height="0""#).count(), 2, "{html}");
-        // No positive-height bar rect (in particular, no half-height 18).
         assert!(
             !html.contains(r#"height="18""#),
             "no half-height bars: {html}"
@@ -638,27 +628,22 @@ mod tests {
 
     #[test]
     fn bar_auto_baseline_includes_zero_so_min_positive_bar_is_visible() {
-        // All-positive series whose minimum (7) sits well above zero. With the
-        // automatic baseline anchored at zero, the smallest bar must still get a
-        // proportional, POSITIVE height — not collapse to zero because the data
-        // minimum was treated as the axis floor.
+        // The automatic baseline is zero, not the data minimum (7), so the smallest
+        // bar keeps a proportional, positive height.
         let html = bar_chart(&[("Q1", 12.0), ("Q2", 19.0), ("Q3", 7.0)]).into_string();
         assert!(!html.contains("NaN"), "{html}");
         let heights = bar_heights(&html);
         assert_eq!(heights.len(), 3, "{html}");
         let (q1, q2, q3) = (heights[0], heights[1], heights[2]);
-        // Q3 (the smallest bar) is visible: strictly positive height.
         assert!(q3 > 0.0, "smallest bar must be visible, got {q3}: {html}");
         assert!(
             !html.contains(r#"height="0""#),
             "no zero-height bar: {html}"
         );
-        // Bars are ordered by magnitude from a zero baseline.
         assert!(q2 > q3, "tallest (Q2=19) taller than Q3=7: {q2} vs {q3}");
         assert!(q2 > q1 && q1 > q3, "12 between 7 and 19: {q1}");
-        // Q2 is the max, so it fills the usable height (H - 2*PAD = 36).
+        // The max fills the usable height (H - 2*PAD = 36).
         assert!((q2 - 36.0).abs() < 1e-6, "max bar is full height: {q2}");
-        // Q3 = 7/19 of full height (~13.26).
         let expected_q3 = 7.0 / 19.0 * 36.0;
         assert!(
             (q3 - expected_q3).abs() < 1e-3,
@@ -668,9 +653,8 @@ mod tests {
 
     #[test]
     fn explicit_bar_min_override_wins_over_zero_baseline() {
-        // When the caller pins `min`, that override is respected unchanged — no
-        // zero is injected. Pinning min to the data minimum (7) puts the smallest
-        // bar back at zero height, exactly as the caller asked.
+        // A pinned `min` is used as-is, with no zero injected, so the bar at the
+        // pinned minimum (7) has zero height.
         let html = bar_chart_with(
             &[("Q1", 12.0), ("Q2", 19.0), ("Q3", 7.0)],
             &ChartConfig::new().min(7.0),
@@ -679,7 +663,6 @@ mod tests {
         assert!(!html.contains("NaN"), "{html}");
         let heights = bar_heights(&html);
         assert_eq!(heights.len(), 3, "{html}");
-        // Q3 == the pinned min, so it renders at zero height (caller override wins).
         assert!(
             (heights[2] - 0.0).abs() < 1e-9,
             "explicit min pins Q3 to zero: {}",
@@ -690,22 +673,17 @@ mod tests {
 
     #[test]
     fn negative_bars_diverge_downward_largest_magnitude_is_tallest() {
-        // An all-negative series auto-resolves to bounds [-10, 0] (zero-anchored
-        // upper bound). Bars must grow DOWN from the zero line, with length
-        // proportional to |value| — so the largest-magnitude bar (-10) is the
-        // tallest, not collapsed to zero because it sits at the axis floor.
+        // Bounds resolve to [-10, 0], so bars grow down from the zero line and -10,
+        // sitting at the axis floor, is the tallest rather than zero height.
         let html = bar_chart(&[("a", -10.0), ("b", -5.0)]).into_string();
         assert!(!html.contains("NaN"), "{html}");
         let heights = bar_heights(&html);
         assert_eq!(heights.len(), 2, "{html}");
         let (a, b) = (heights[0], heights[1]);
-        // -10 is the largest magnitude: it must be visible and TALLER than -5,
-        // never zero height.
         assert!(a > 0.0, "largest-magnitude bar must be visible: {a}");
         assert!(a > b, "|-10| taller than |-5|: {a} vs {b}");
-        // zero_frac = 1 (zero at the top). -10 -> full usable height (36).
+        // zero_frac = 1 (zero at the top); usable height is 36.
         assert!((a - 36.0).abs() < 1e-6, "-10 fills usable height: {a}");
-        // -5 -> half of full height (18).
         assert!((b - 18.0).abs() < 1e-6, "-5 is half height: {b}");
         assert!(
             !html.contains(r#"height="0""#),
@@ -727,27 +705,24 @@ mod tests {
 
     #[test]
     fn mixed_sign_bars_share_a_zero_baseline() {
-        // A mixed series [+10, -5] resolves to bounds [-5, 10]; the zero line
-        // sits 1/3 up from the bottom. The +10 bar must sit ABOVE the zero line
-        // and the -5 bar BELOW it, both meeting at the shared baseline y.
+        // Bounds resolve to [-5, 10]: the +10 bar sits above the zero line and the
+        // -5 bar below it, both meeting at the same baseline y.
         let html = bar_chart(&[("up", 10.0), ("down", -5.0)]).into_string();
         assert!(!html.contains("NaN"), "{html}");
         let heights = bar_heights(&html);
         let ys = bar_ys(&html);
         assert_eq!(heights.len(), 2, "{html}");
         assert_eq!(ys.len(), 2, "{html}");
-        // Both bars have positive, visible height.
         assert!(heights[0] > 0.0 && heights[1] > 0.0, "both visible: {html}");
-        // Shared zero line: bottom (H-PAD=38) - zero_frac*U. With min=-5, max=10,
-        // span=15, zero_frac = 5/15 = 1/3, U = 36 -> y_zero = 38 - 12 = 26.
+        // y_zero = bottom (H-PAD=38) - zero_frac (5/15) * usable height (36) = 26.
         let y_zero = 26.0;
-        // +10 bar: above the zero line, so its BOTTOM edge (y + height) meets it.
+        // The positive bar's bottom edge (y + height) meets the zero line.
         let up_bottom = ys[0] + heights[0];
         assert!(
             (up_bottom - y_zero).abs() < 1e-6,
             "positive bar's bottom edge on the zero line: {up_bottom} vs {y_zero}"
         );
-        // -5 bar: below the zero line, so its TOP edge (y) meets it.
+        // The negative bar's top edge (y) meets it.
         assert!(
             (ys[1] - y_zero).abs() < 1e-6,
             "negative bar's top edge on the zero line: {} vs {y_zero}",
@@ -774,8 +749,7 @@ mod tests {
             auto, overridden,
             "caller min/max override must move the plotted points"
         );
-        // Under the 0..100 override the points compress toward the baseline
-        // (the auto-scaled chart puts the middle datum at y=15 instead).
+        // Under the 0..100 override the middle datum drops toward the baseline.
         assert!(overridden.contains("50,26.7"), "{overridden}");
         assert!(auto.contains("50,15"), "{auto}");
     }
@@ -783,10 +757,8 @@ mod tests {
     #[test]
     fn non_finite_axis_override_is_ignored_no_nan_in_output() {
         let data = [("a", 1.0), ("b", 2.0), ("c", 3.0)];
-        // A non-finite caller override (e.g. arriving from an upstream
-        // aggregate's `Option<f64>`) must be treated as UNSET: the auto-scaled
-        // bound is used instead, so the emitted SVG can never contain invalid
-        // coordinates like `NaN` / `inf` / `Infinity`.
+        // A non-finite override (e.g. from an aggregate's `Option<f64>`) is treated as
+        // unset, so the SVG never contains `NaN` or `inf` coordinates.
         let bad_configs = [
             ChartConfig::new().max(f64::NAN),
             ChartConfig::new().min(f64::INFINITY),
@@ -803,8 +775,6 @@ mod tests {
                         "{name}: non-finite override leaked `{needle}` into SVG: {overridden}"
                     );
                 }
-                // The non-finite override is ignored, so the geometry is
-                // identical to the un-overridden auto-scaled chart.
                 assert_eq!(
                     auto, overridden,
                     "{name}: non-finite override must be ignored (auto-scale used)"
@@ -824,8 +794,6 @@ mod tests {
 
     #[test]
     fn desc_reports_data_range_not_axis_override() {
-        // Caller pins the axis to 0..100 but leaves `desc` unset. The accessible
-        // `<desc>` must announce the actual data range (0..10), not the override.
         let html = sparkline_with(
             &[("a", 0.0), ("b", 5.0), ("c", 10.0)],
             &ChartConfig::new().max(100.0),

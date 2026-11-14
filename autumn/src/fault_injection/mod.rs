@@ -153,8 +153,8 @@ impl FaultInjection {
     ///
     /// No event is written when the faults are already disarmed.
     pub async fn disarm(&self, actor: &str, reason: &str) {
-        // The sequence is taken under the window lock, as for every toggle,
-        // so the sequence order is the toggle order.
+        // Take the sequence under the window lock, as every toggle does, so sequence order is
+        // toggle order.
         let sequence = {
             let window = self.inner.lock_window();
             let sequence = self.inner.disarm_any().then(|| self.inner.next_sequence());
@@ -300,7 +300,7 @@ impl Deadlines {
         let mut routes = matchit::Router::new();
         for (template, by_method) in overrides.iter() {
             if let Err(error) = routes.insert(template.as_str(), by_method.clone()) {
-                // The route keeps the global timeout for its dependency waits.
+                // On a failed insert the route keeps the global timeout for its dependency waits.
                 tracing::debug!(
                     target: "autumn.fault_injection",
                     template = %template,
@@ -642,9 +642,9 @@ impl RequestScope {
                 }
             }
         }
-        // Check the arm again before the decision counts: an arm change
-        // during the loop drops it. The gap left is from here to the
-        // injection, so a fault of an old arm almost never fires.
+        // Check the arm again before the decision counts: an arm change during the loop drops
+        // it. Only the gap from here to the injection remains, so a stale arm's fault rarely
+        // fires.
         if fired == 0 || !self.armed() {
             return RouteFault::default();
         }
@@ -697,10 +697,9 @@ pub(crate) fn fault_fired() -> bool {
 pub(crate) async fn inject(target: FaultTarget) -> Result<(), InjectedFault> {
     let Ok((mut fault, deadline_at)) = SCOPE.try_with(|scope| {
         let mut fault = scope.roll(target);
-        // A seam can be outside the timeout layer (the Redis session store
-        // is). All waits of a request share the request timeout: a wait gets
-        // at most the time left, then fails as a timeout would, so the stop
-        // condition counts it.
+        // A seam can sit outside the timeout layer (the Redis session store does). All waits of
+        // a request share its timeout: a wait gets at most the time left, then fails as a
+        // timeout would, so the stop condition counts it.
         let left = scope
             .deadline_at
             .map(|at| at.saturating_duration_since(tokio::time::Instant::now()));
@@ -757,8 +756,8 @@ pub(crate) fn build(
         return None;
     }
     let profile = config.profile.as_deref();
-    // Config validation refuses this at boot. Check again here for a path that
-    // does not validate (a test app, a hand-built config).
+    // Boot validation already refuses this; check again for configs that skip it (a test app,
+    // a hand-built config).
     if let Err(error) = section.validate(profile) {
         tracing::error!(
             target: "autumn.fault_injection",
@@ -787,9 +786,8 @@ pub(crate) fn build(
         state: AtomicU64::new(armed_state(0)),
         injected: AtomicU64::new(0),
         window: Mutex::new(Window::default()),
-        // An own stream, seeded once here (outside any request). A request
-        // takes no draw from the app entropy, so the draws that a capsule
-        // records do not depend on the fault config.
+        // Its own stream, seeded once outside any request. Requests draw nothing from the app
+        // entropy, so the draws a capsule records do not depend on the fault config.
         entropy: Arc::new(SeededEntropy::new(state.entropy_arc().next_u64())),
         audit,
         profile: profile.unwrap_or_default().to_owned(),

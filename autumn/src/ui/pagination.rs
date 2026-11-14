@@ -282,7 +282,6 @@ fn filter_query<'a>(query: &'a str, drop_keys: &[&str]) -> String {
 /// only when [`PagerOptions::hx_target`] is set (plain `<a href>` otherwise).
 #[cfg(feature = "maud")]
 fn anchor(href: &str, class: &str, content: &str, opts: &PagerOptions<'_>) -> maud::Markup {
-    // hx-get mirrors the href, but only when htmx is opted in.
     let hx_get = opts.hx_target.map(|_| href);
     let hx_push = if opts.hx_push_url && opts.hx_target.is_some() {
         Some("true")
@@ -314,8 +313,7 @@ fn anchor(href: &str, class: &str, content: &str, opts: &PagerOptions<'_>) -> ma
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn pagination_nav<T>(page: &Page<T>, opts: &PagerOptions<'_>) -> maud::Markup {
-    // Pre-compute the invariant filter prefix once; each page link only appends
-    // the new page number, avoiding O(window) repeated query-string parses.
+    // Parse the query once; each page link only appends its page number.
     let filtered = filter_query(opts.query, &[opts.page_param, opts.size_param]);
     let prefix = if filtered.is_empty() {
         String::new()
@@ -395,12 +393,11 @@ pub fn cursor_pagination_nav<T>(page: &CursorPage<T>, opts: &PagerOptions<'_>) -
             opts.base_path, cursor_prefix, opts.cursor_param
         )
     };
-    // Render the Next link whenever a cursor token is available; no token → disabled.
     let next_token = page.next_cursor.as_deref();
 
     maud::html! {
         nav aria-label=(opts.aria_label) class="autumn-pager autumn-pager--cursor" {
-            // ── Previous (caller-supplied; data model is forward-only) ─
+            // The caller supplies the previous cursor: the page model is forward-only.
             @if let Some(prev) = opts.prev_cursor {
                 (anchor(&cursor_href(prev), "autumn-pager__link autumn-pager__prev", opts.prev_label, opts))
             } @else {
@@ -408,7 +405,6 @@ pub fn cursor_pagination_nav<T>(page: &CursorPage<T>, opts: &PagerOptions<'_>) -
                     (opts.prev_label)
                 }
             }
-            // ── Next ──────────────────────────────────────────────────
             @if let Some(token) = next_token {
                 (anchor(&cursor_href(token), "autumn-pager__link autumn-pager__next", opts.next_label, opts))
             } @else {
@@ -419,8 +415,6 @@ pub fn cursor_pagination_nav<T>(page: &CursorPage<T>, opts: &PagerOptions<'_>) -
         }
     }
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "maud"))]
 mod tests {
@@ -447,7 +441,6 @@ mod tests {
 
     #[test]
     fn window_small_total_has_no_ellipsis() {
-        // 1..=5 all fit; no gaps.
         let items = page_window(3, 5, 2);
         assert_eq!(
             items,
@@ -464,7 +457,6 @@ mod tests {
     #[test]
     fn window_lo_is_two_includes_page_one_without_ellipsis_or_two() {
         let items = page_window(2, 5, 0); // current=2, radius=0 => lo=2, hi=2
-        // It should render: 1 (prefix), 2 (for loop), ..., 5 (suffix)
         let expected = vec![
             PageItem::Page(1),
             PageItem::Page(2),
@@ -477,7 +469,6 @@ mod tests {
     #[test]
     fn window_hi_is_total_minus_one_includes_total_without_ellipsis_or_total_minus_two() {
         let items = page_window(4, 5, 0); // current=4, radius=0 => lo=4, hi=4
-        // It should render: 1, ..., 4, 5
         let expected = vec![
             PageItem::Page(1),
             PageItem::Ellipsis,
@@ -516,9 +507,7 @@ mod tests {
 
     #[test]
     fn window_no_ellipsis_for_single_gap() {
-        // A gap of exactly one page is filled with that page, not an ellipsis.
-        // current 4 of 6, radius 1 => 1 [gap=2] 3 4 5 6 ; gap between 1 and 3
-        // is a single page (2) so it is shown instead of `…`.
+        // current 4 of 6, radius 1: only page 2 lies between 1 and 3, so it shows instead of `…`.
         let items = page_window(4, 6, 1);
         assert!(!items.contains(&PageItem::Ellipsis), "{items:?}");
         assert!(items.contains(&PageItem::Page(2)), "{items:?}");
@@ -527,7 +516,7 @@ mod tests {
     #[test]
     fn window_no_adjacent_duplicate_pages() {
         let items = page_window(2, 20, 2);
-        // page 1 should appear exactly once even though the window starts low.
+        // The window starts at page 1, so the prefix must not add it again.
         let ones = items.iter().filter(|i| **i == PageItem::Page(1)).count();
         assert_eq!(ones, 1, "{items:?}");
     }
@@ -584,14 +573,12 @@ mod tests {
         assert_eq!(items, vec![PageItem::Page(1)]);
     }
 
-    // include_size is opt-in: verify via pagination_nav output.
     #[test]
     fn offset_include_size_appends_size_param_to_links() {
         let page = offset_page(2, 25, 100);
         let opts = PagerOptions::new("/posts").include_size();
         let html = pagination_nav(&page, &opts).into_string();
         assert!(html.contains("size=25"), "size param missing: {html}");
-        // size= should not appear more than once per link (no duplication).
         let hrefs: Vec<&str> = html
             .match_indices("href=\"")
             .map(|(i, _)| &html[i..])
@@ -633,7 +620,6 @@ mod tests {
         // The disabled "Previous" must be a span with aria-disabled and no href,
         // so it cannot receive keyboard focus.
         assert!(html.contains(r#"aria-disabled="true""#), "{html}");
-        // There must be no anchor whose text is the prev label on page 1.
         assert!(
             !html.contains(r#"href="/posts?page=0"#),
             "prev link must not point at page 0: {html}"
@@ -654,8 +640,7 @@ mod tests {
         let page = offset_page(5, 10, 200); // 20 pages
         let opts = PagerOptions::new("/posts").query("q=foo&sort=name");
         let html = pagination_nav(&page, &opts).into_string();
-        // Maud escapes & to &amp; in attributes; assert both filters survive
-        // on each emitted href. Every href must carry q=foo and sort=name.
+        // Maud escapes `&` as `&amp;` in attributes, so check each filter on its own.
         let hrefs: Vec<&str> = html
             .match_indices("href=\"")
             .map(|(i, _)| &html[i..])
@@ -713,7 +698,6 @@ mod tests {
         let opts = PagerOptions::new("/posts");
         let html = pagination_nav(&page, &opts).into_string();
         assert!(html.contains("<nav"), "{html}");
-        // current page 1 is marked current; no other page anchors.
         assert!(html.contains(r#"aria-current="page""#), "{html}");
     }
 

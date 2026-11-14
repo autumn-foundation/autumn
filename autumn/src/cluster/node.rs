@@ -46,8 +46,7 @@
         clippy::arithmetic_side_effects,
     )
 )]
-// `pub` throughout this file is crate-visible only: the enclosing `cluster`
-// submodule is itself `pub(crate)`, so nothing here escapes the crate
+// `pub` here is crate-visible only: the `cluster` module is `pub(crate)`
 // (clippy::redundant_pub_crate).
 
 use std::collections::BTreeSet;
@@ -123,8 +122,7 @@ pub struct ClusterRuntimeConfig {
 
 impl std::fmt::Debug for ClusterRuntimeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Never `secret`, not even its length: a key that reaches a log line is
-        // a key that has to be rotated.
+        // Never `secret`, not even its length: a key in a log has to be rotated.
         f.debug_struct("ClusterRuntimeConfig")
             .field("cluster_name", &self.cluster_name)
             .field("node_id", &self.node_id)
@@ -169,9 +167,8 @@ impl ClusterNode {
         shutdown: CancellationToken,
         transport: Arc<dyn PeerTransport>,
     ) -> AutumnResult<ClusterHandle> {
-        // Captured rather than used through `tokio::spawn`, which panics outside
-        // a runtime — the panic gate forbids that, and a caller deserves an
-        // error it can attribute.
+        // `tokio::spawn` panics outside a runtime; capturing the handle turns
+        // that into an error.
         let runtime = tokio::runtime::Handle::try_current().map_err(|err| {
             boot_error(format!(
                 "ClusterNode::start must be called from within a Tokio runtime: {err}"
@@ -191,17 +188,12 @@ impl ClusterNode {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            // No `advertise_addr`: advertise the address actually bound, so a
-            // `bind_addr` with port 0 publishes its RESOLVED ephemeral port
-            // rather than a port nobody can dial.
+            // Fall back to the bound address, so port 0 publishes the resolved
+            // ephemeral port rather than a port nobody can dial.
             .map_or_else(|| local_addr.to_string(), ToOwned::to_owned);
 
-        // Clock-seeded from Unix MILLISECONDS so a restart with a configured
-        // static node id always comes back with a strictly higher incarnation
-        // than the record peers remember. Second granularity is not enough: two
-        // boots inside one second would mint a byte-identical self-record, and
-        // refutation's exact-echo rule would then read a leftover record from
-        // the dead boot as this boot's own echo.
+        // A restart with a static node id must come back at a strictly higher
+        // incarnation than peers remember; see `seed_incarnation`.
         let incarnation = seed_incarnation(clock.as_ref());
 
         let mut state = ClusterState::default();
@@ -374,9 +366,8 @@ fn push_floor(push_interval: Duration) -> Duration {
 fn push_round(inner: &Arc<ClusterInner>, seq: &mut u64, published: &mut Incarnation) {
     let incarnation = inner.incarnation.load(Ordering::Relaxed);
     if incarnation > *published {
-        // A receiver adopts a higher incarnation and RESETS its sequence
-        // watermark, so restarting the sequence here is what lets a refutation
-        // (or a fresh boot) be heard instead of being replay-dropped.
+        // A receiver resets its sequence watermark on a higher incarnation, so
+        // restarting at 0 keeps a refutation or fresh boot from being replay-dropped.
         *seq = 0;
         *published = incarnation;
     }
@@ -386,18 +377,13 @@ fn push_round(inner: &Arc<ClusterInner>, seq: &mut u64, published: &mut Incarnat
         let mut state = inner.lock_state();
         // Locks are always taken state-then-overlay, never the other way round.
         let mut overlay = inner.lock_overlay();
-        // Housekeeping, in the one order that gives every record an exit:
-        // convert, stamp, prune. A member this node has not heard from for a
-        // whole tombstone window becomes a `Left` record at its current
-        // incarnation — the only way an `Alive` record ever leaves the
-        // document, since pruning collects tombstones alone (see
-        // `ClusterState::convert_down_members`). Converting first means the
-        // record is stamped on this same round and prunes one window later
-        // rather than two.
+        // Order matters: convert, stamp, prune. Converting a member silent for a
+        // whole tombstone window to `Left` is the only way an `Alive` record
+        // leaves the document, since pruning collects tombstones alone. Converting
+        // first stamps it this round, so it prunes one window later, not two.
         let converted = state.convert_down_members(&inner.node_id, &mut overlay, now);
-        // Stamp before pruning: a tombstone learned since the last round ages
-        // from this observation, not from the departed peer's last receipt
-        // (which pruning forgets — see `ClusterState::observe_tombstones`).
+        // Stamp before pruning: a newly learned tombstone ages from this
+        // observation, not from the departed peer's last receipt (which pruning forgets).
         state.observe_tombstones(&mut overlay, now);
         let pruned = state.prune_tombstones(&mut overlay, now);
         drop(overlay);
@@ -412,11 +398,9 @@ fn push_round(inner: &Arc<ClusterInner>, seq: &mut u64, published: &mut Incarnat
                 pruned = pruned.len(),
                 "cluster: pruned expired Left tombstones"
             );
-            // Pruning forgets a node WHOLE. The receive loop owns the replay
-            // watermarks, so it is handed the ids here: leaving a pruned
-            // sender's watermark behind permanently partitions that node if it
-            // comes back at a lower incarnation, because the document no longer
-            // holds a record it could refute.
+            // The receive loop owns the replay watermarks and must drop these
+            // too: a stale watermark permanently partitions a node that returns
+            // at a lower incarnation, as no record is left for it to refute.
             inner.note_pruned_senders(pruned);
         }
         publish_self(&mut state, inner, incarnation);
@@ -426,8 +410,7 @@ fn push_round(inner: &Arc<ClusterInner>, seq: &mut u64, published: &mut Incarnat
         (document, targets)
     };
 
-    // Retire per-peer transport state for addresses that have left the set: a
-    // member that returns at a NEW address must not leave its old address's
+    // A member that returns at a new address must not leave its old address's
     // writer running for the life of the process.
     inner.transport.retain_peers(&targets);
 
@@ -440,8 +423,7 @@ fn push_round(inner: &Arc<ClusterInner>, seq: &mut u64, published: &mut Incarnat
         }
     }
     inner.metrics.pushes_sent.fetch_add(sent, Ordering::Relaxed);
-    // Both are transport-owned monotonic counters, mirrored rather than
-    // incremented: the transport is the only thing that can observe them.
+    // Transport-owned monotonic counters: mirrored, not incremented.
     inner
         .metrics
         .frames_dropped
@@ -463,8 +445,8 @@ fn publish_self(state: &mut ClusterState, inner: &ClusterInner, incarnation: Inc
     let own = MemberRecord::alive(inner.advertise_addr.clone(), incarnation);
     match state.members.get_mut(&inner.node_id) {
         Some(existing) if existing.incarnation <= incarnation => *existing = own,
-        // A record about us at a HIGHER incarnation is refutation's business,
-        // not ours: overwriting it here would lose the argument on the wire.
+        // A record about us at a higher incarnation is left to refutation:
+        // overwriting it would lose that argument on the wire.
         Some(_) => {}
         None => {
             state.members.insert(inner.node_id.clone(), own);
@@ -517,8 +499,7 @@ fn target_addresses(
         targets.insert(record.addr.clone());
     }
 
-    // Never gossip at ourselves: a seed list that contains our own address is a
-    // configuration a node must survive, not diagnose.
+    // Never gossip at ourselves, even when the seed list names this node.
     for own in own_addrs {
         targets.remove(*own);
     }
@@ -608,8 +589,8 @@ fn note_unsendable(inner: &ClusterInner, serialized_bytes: Option<usize>) {
         .pushes_unsendable
         .fetch_add(1, Ordering::Relaxed);
 
-    // Rate limited on the injected clock, so a test can drive it and a
-    // permanent failure costs one line a minute rather than two a second.
+    // Rate limited on the injected clock, so a test can drive it and a permanent
+    // failure costs one line a minute rather than one per push.
     let now_ms = u64::try_from(inner.clock.monotonic().since_origin().as_millis())
         .unwrap_or(u64::MAX)
         // Offset by one so `0` can mean "never warned" without a second field.
@@ -688,10 +669,9 @@ async fn depart(inner: &Arc<ClusterInner>, mut seq: u64) {
     };
 
     let farewell = ClusterMessage::StatePush { state: document };
-    // Peers whose copy of the final document could not even be handed over. The
-    // `leave` alone still converges a peer's view, so it is the *document* that
-    // is worth a line: its loss is the increments accepted since the last round
-    // dying with this process.
+    // Peers that never got the final document. Only that loss is warned about:
+    // the `leave` alone still converges a peer's view, but the document carries
+    // the increments accepted since the last round.
     let mut lost: usize = 0;
     for target in &targets {
         if send_farewell_signed(inner, target, incarnation, seq, &farewell) {
@@ -703,8 +683,7 @@ async fn depart(inner: &Arc<ClusterInner>, mut seq: u64) {
             seq = seq.saturating_add(1);
         }
     }
-    // Mirrored here and not only in the push round: this *is* the last round,
-    // so drops the departure itself made would otherwise never reach the series.
+    // Mirrored here too: there is no later push round to report these drops.
     inner
         .metrics
         .frames_dropped
@@ -721,9 +700,7 @@ async fn depart(inner: &Arc<ClusterInner>, mut seq: u64) {
         );
     }
 
-    // Bounded so a clean departure never extends the app's drain budget. A
-    // transport that delivers synchronously reports nothing pending and this
-    // costs one poll.
+    // Bounded so a clean departure never extends the app's drain budget.
     let flushed = tokio::time::timeout(LEAVE_BUDGET, async {
         while inner.transport.pending_frames() > 0 {
             tokio::time::sleep(LEAVE_FLUSH_POLL).await;
@@ -765,10 +742,8 @@ async fn receive_loop(
             return;
         };
 
-        // A member the push loop pruned is forgotten WHOLE: its replay
-        // watermark goes with its tombstone. Draining here rather than in the
-        // push round is what keeps the verifier unshared — it stays a local of
-        // this loop, and the two loops never hold each other's state.
+        // A pruned member's replay watermark goes with its tombstone. Draining
+        // here keeps the verifier local to this loop.
         for pruned in inner.take_pruned_senders() {
             verifier.forget(&pruned);
         }
@@ -776,19 +751,13 @@ async fn receive_loop(
         match verifier.accept(&frame) {
             Ok((envelope, message)) => apply(&inner, &envelope, &from, &message),
             Err(reason) => {
-                // Counted per reason: `frames_rejected_total{reason="mac"}`
-                // climbing is somebody talking to the port with the wrong
-                // secret, which is a different alert from a replay or a
-                // truncated frame.
+                // Counted per reason: a climbing `mac` count (wrong secret) is a
+                // different alert from a replay or a truncated frame.
                 inner.metrics.record_rejection(reason);
                 if !reason.authenticated() {
-                    // Reported back to the transport, which owns the socket and
-                    // cannot make this judgement itself: the frame never proved
-                    // knowledge of the secret, so the connection it arrived on
-                    // has not earned the inbound slot it is holding. Without
-                    // this the cap is a budget anyone who can reach the port
-                    // can exhaust — one well-framed garbage frame per idle
-                    // window holds a slot for as long as the sender likes, and
+                    // The transport owns the socket but cannot check the MAC, so it
+                    // is told here. Without this, anyone who can reach the port holds
+                    // an inbound slot indefinitely with periodic garbage frames, and
                     // real peers are refused at the cap.
                     inner.transport.note_unauthenticated_frame(&from);
                 }
@@ -818,11 +787,9 @@ fn apply(
             ClusterMessage::StatePush { state: theirs } => {
                 let before = state.clone();
                 {
-                    // Document first, overlay second — the one lock ordering
-                    // rule, same as the push loop's. The merge reads (never
-                    // writes) the overlay's recently-pruned memory, so a
-                    // straggler cannot teach back a tombstone this node has
-                    // already collected: see `ClusterState::merge`.
+                    // Document lock, then overlay. The merge reads the overlay's
+                    // recently-pruned set, so a straggler cannot teach back a
+                    // tombstone this node already collected.
                     let overlay = inner.lock_overlay();
                     state.merge(theirs, &overlay, now);
                 }
@@ -834,19 +801,16 @@ fn apply(
                     .pushes_received
                     .fetch_add(1, Ordering::Relaxed);
 
-                // A peer may be carrying a record about US — a replayed leave,
-                // or a stale Alive from an earlier boot. Refuting it here, at
-                // the merge, is what keeps a live node from being buried.
+                // A peer may carry a stale record about us (a replayed leave, or
+                // an earlier boot's Alive). Refute it so a live node is not buried.
                 let own = MemberRecord::alive(
                     inner.advertise_addr.clone(),
                     inner.incarnation.load(Ordering::Relaxed),
                 );
                 let bumped = state.refute(&inner.node_id, &own);
                 if let Some(bumped) = bumped {
-                    // Adopted while the document lock is still held, so the push
-                    // loop can never read the old incarnation next to the
-                    // already-bumped record and publish a frame that argues
-                    // against itself.
+                    // Stored under the document lock, so the push loop never pairs
+                    // the old incarnation with the bumped record.
                     inner.incarnation.store(bumped, Ordering::Relaxed);
                 }
                 bumped
@@ -856,9 +820,8 @@ fn apply(
                 None
             }
         };
-        // Released before the receipt is recorded, so the overlay lock is held
-        // on its own for the write — and, where the merge above needed both,
-        // only ever in the document-then-overlay order.
+        // Release the document first, so the overlay is never taken after it
+        // except in the merge's document-then-overlay order.
         drop(state);
         inner.lock_overlay().record_receipt(&envelope.sender, now);
         outcome
@@ -870,8 +833,7 @@ fn apply(
             incarnation = bumped,
             "cluster: refuting a stale record about this node at a higher incarnation"
         );
-        // Push immediately: the refutation is worthless until the peer that
-        // holds the stale record hears it.
+        // Push now: the refutation is worthless until the stale holder hears it.
         inner.notify.notify_one();
     }
 }
@@ -880,19 +842,11 @@ fn apply(
 /// authenticated `(sender, incarnation)` in its envelope, so a captured leave
 /// can never be replayed against a newer incarnation of that node.
 fn apply_leave(state: &mut ClusterState, envelope: &Envelope, peer_addr: &str) {
-    // The document's address is authoritative; the source address is only a
-    // fallback for a departure from a node we never met — a `leave` that
-    // arrives before (or instead of) that node's final state push.
-    //
-    // That fallback address is the accepted connection's remote endpoint, which
-    // for a peer that dialled us is its ephemeral source port, not its
-    // listener. Tombstones DO stay push targets until they are pruned (see
-    // `target_addresses`), so this node will dial that dead port for one
-    // tombstone window and gossip it onward. Both costs are bounded and both
-    // are preferred to the alternative: dropping the address would publish a
-    // tombstone nobody can ever push to, and the departed node's own record —
-    // carrying its real advertised address — wins the merge the moment any
-    // state push about it arrives.
+    // The document's address is authoritative. The source address is a fallback
+    // for a node we never met; for a peer that dialled us it is an ephemeral
+    // port, so this node may dial a dead port for one tombstone window. An empty
+    // address would leave a tombstone nobody can push to, and the node's own
+    // record wins the merge as soon as a state push about it arrives.
     let addr = state
         .members
         .get(&envelope.sender)
@@ -1044,7 +998,6 @@ mod tests {
              boots inside one second mint byte-identical self-records"
         );
 
-        // …and one millisecond really is a distinguishable boot.
         let one_ms_later = FixedClock::at(
             chrono::DateTime::<chrono::Utc>::from_timestamp(1_765_430_000, 251_000_000)
                 .unwrap_or_default(),
@@ -1054,9 +1007,8 @@ mod tests {
             "a boot one millisecond later must come back strictly higher"
         );
 
-        // The documented clamp: a pre-epoch clock saturates at 0 rather than
-        // wrapping. Two boots on such a clock DO collide — the caveat named in
-        // `seed_incarnation`'s docs and in the guide, not a property to rely on.
+        // A pre-epoch clock saturates at 0 rather than wrapping. Two boots on such
+        // a clock do collide; see `seed_incarnation`.
         let pre_epoch = FixedClock::at(
             chrono::DateTime::<chrono::Utc>::from_timestamp(-10, 0).unwrap_or_default(),
         );

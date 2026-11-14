@@ -182,9 +182,7 @@ impl MemoryStore {
 
     #[allow(clippy::significant_drop_tightening)]
     fn decide(&self, key: &str, now: DateTime<Utc>, burst: f64, refill_per_sec: f64) -> Decision {
-        // `now` already comes from the injected clock, so derive the Unix
-        // timestamp used in the `x-ratelimit-reset` / `retry-after` headers from
-        // it directly (rather than reaching for `SystemTime::now()` off-seam).
+        // From the injected clock, not `SystemTime::now()`, so a test clock drives the headers.
         let now_unix = u64::try_from(now.timestamp()).unwrap_or(0);
 
         let tokens_after = {
@@ -193,18 +191,13 @@ impl MemoryStore {
                 Err(poisoned) => poisoned.into_inner(),
             };
 
-            // Probe by `&str` and update the bucket in place. A returning
-            // client's key is already cached, so copying it into a fresh
-            // `String` only for `put` to drop it again cost an allocation per
-            // request. Only a first-seen key is copied (and may evict the LRU
-            // tail, as `put` did); a hit moves to the MRU end, as `get` + `put` did.
+            // Probe by `&str` so only a first-seen key is copied into a `String`.
             let bucket = buckets.get_or_insert_mut_ref(key, || Bucket {
                 tokens: burst,
                 last_refill: now,
             });
 
-            // Clamp a negative delta (a backwards wall-clock jump) to zero so it
-            // yields no refill — fail-safe, mirroring the Lua's `math.max(0, …)`.
+            // A backwards wall-clock jump yields no refill, matching the Lua's `math.max(0, …)`.
             let elapsed = (now - bucket.last_refill)
                 .to_std()
                 .unwrap_or(std::time::Duration::ZERO)
@@ -224,9 +217,8 @@ impl MemoryStore {
             Ok(remaining_tokens) => {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let remaining = remaining_tokens.floor() as u32;
-                // When the bucket has fewer than one token left after consuming,
-                // the next request will be denied. Compute the earliest future
-                // time at which a new token will arrive so clients can back off.
+                // Under one token left means the next request is denied: report
+                // when the next token arrives so clients can back off.
                 let reset_at_unix = if remaining_tokens < 1.0 {
                     let secs_to_next = ((1.0 - remaining_tokens) / refill_per_sec).ceil().max(1.0);
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -322,14 +314,9 @@ impl RedisStore {
     }
 
     async fn decide(&self, key: &str, burst: f64, refill_per_sec: f64) -> Option<Decision> {
-        // Timestamps come from the injected clock (not `SystemTime::now()`), so
-        // a deterministic test/sim clock drives the Redis token bucket too. The
-        // Lua script still receives the timestamp as a Rust-computed `ARGV`, so
-        // no change to `rate_limit.lua` is required.
         let now_unix = crate::time::clock_unix_secs(self.clock.as_ref());
 
-        // Sized exactly up front: `format!` would start this at capacity 0 and
-        // grow it. Same `{key_prefix}:{key}` bytes.
+        // `{key_prefix}:{key}`, sized up front instead of growing like `format!`.
         let mut redis_key = String::with_capacity(self.key_prefix.len() + 1 + key.len());
         redis_key.push_str(&self.key_prefix);
         redis_key.push(':');
@@ -349,7 +336,7 @@ impl RedisStore {
 
         match result {
             Ok(values) if values.len() == 3 => {
-                // Redis recovered after an outage — reset the flag so we warn again next time.
+                // Re-arm the outage warning now that Redis answers again.
                 self.outage_logged
                     .store(false, std::sync::atomic::Ordering::Relaxed);
                 let allowed = values[0] == 1;
@@ -533,8 +520,6 @@ impl Limiter {
         let refill_per_sec = config.requests_per_second.max(f64::MIN_POSITIVE);
         let burst_header = HeaderValue::from(config.burst.max(1));
 
-        // Emit deprecation warning when the rate-limit-scoped proxy fields are
-        // in use but the caller didn't supply a top-level resolver.
         if top_level_resolver.is_none()
             && (config.trust_forwarded_headers || !config.trusted_proxies.is_empty())
         {
@@ -546,9 +531,7 @@ impl Limiter {
             );
         }
 
-        // Prefer the top-level resolver when provided; otherwise build one
-        // from the legacy rate-limit-scoped config so existing deployments
-        // continue to work without changes.
+        // Without a top-level resolver, honor the deprecated rate-limit-scoped fields.
         let resolver = top_level_resolver.unwrap_or_else(|| {
             ProxyResolver::from_config(&TrustedProxiesConfig {
                 ranges: config.trusted_proxies.clone(),
@@ -608,8 +591,8 @@ impl Limiter {
                             Err(err) => {
                                 tracing::warn!(
                                     error = %err,
-                                    // Redacted: a managed Redis carries its
-                                    // access key in the URL (#2172).
+                                    // A managed Redis carries its access key in
+                                    // the URL (#2172).
                                     url = %crate::redis_tls::redact_url(url),
                                     "rate-limit Redis backend: failed to create \
                                      connection manager; falling back to memory"
@@ -618,12 +601,9 @@ impl Limiter {
                         }
                     }
                     Err(err) => {
-                        // No `url` field here, redacted or otherwise: this arm
-                        // fires when the URL failed to PARSE, so its shape is
-                        // exactly what a redactor has least purchase on, and
-                        // the `redis` error text names the problem without
-                        // echoing the value. The key is not worth the
-                        // diagnostic (#2172).
+                        // No `url` field: an unparseable URL may defeat the
+                        // redactor, and the error text names the problem
+                        // without echoing the value (#2172).
                         tracing::warn!(
                             error = %err,
                             "rate-limit Redis backend: invalid Redis URL; \
@@ -673,9 +653,8 @@ impl Limiter {
         let mut burst = opt_burst.unwrap_or(self.burst);
         let mut rps = opt_rps.unwrap_or(self.refill_per_sec);
 
-        // Apply tier hook if configured. Pass the raw (un-prefixed) value so
-        // hooks receive e.g. "user-42" rather than "principal:user-42".
-        // Path overrides always take precedence over tier limits when explicitly set.
+        // The hook sees the raw value ("user-42", not "principal:user-42"). A field
+        // set explicitly by a path override beats the tier's.
         if let Some(hook) = &self.tier_hook {
             let value = strip_key_prefix(&raw_key);
             if let Some(tier_name) = hook.call(value)
@@ -690,15 +669,11 @@ impl Limiter {
             }
         }
 
-        // Fold the ambient tenant into the *bucket* key only. The tier hook
-        // above already saw the unqualified `raw_key`, which is consumed here:
-        // moved, not copied, when there is nothing to qualify. See
-        // `tenant_qualify_bucket_key`.
+        // The tenant goes into the bucket key only; the tier hook above saw the
+        // unqualified `raw_key`. See `tenant_qualify_bucket_key`.
         let tenant_qualified_key = tenant_qualify_owned_bucket_key(self.key_strategy, raw_key);
 
-        // Namespace the bucket key by the active path prefix so that different
-        // path overrides get independent token buckets (avoids burst-value
-        // collision when /strict and /normal share the same client IP).
+        // Each path override gets its own bucket per client, apart from the global one.
         let key = if key_ns.is_empty() {
             tenant_qualified_key
         } else {
@@ -1154,16 +1129,9 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        // A `RateLimitExempt` request is a genuine full bypass of every limiter,
-        // framework-default and user path-override alike, matching the marker's documented
-        // contract, so it is honored unconditionally, whatever `honors_mcp_exempt` says.
-        //
-        // A `RateLimitEnvelopeCounted` request is the narrower MCP-replay marker: it was
-        // already counted at the `/mcp` envelope, so only this framework default limiter,
-        // which shares the envelope's bucket with `honors_mcp_exempt` true, skips it to
-        // avoid double-counting. A user-installed limiter, such as a per-path override
-        // added via `AppBuilder::layer`, leaves `honors_mcp_exempt` false, so the replay
-        // still consumes its route-specific bucket exactly as a direct call would.
+        // `RateLimitExempt` bypasses every limiter. `RateLimitEnvelopeCounted` marks an MCP
+        // replay already counted at the `/mcp` envelope: only a limiter sharing that bucket
+        // (`honors_mcp_exempt`) skips it; a user-installed limiter still charges it.
         if req.extensions().get::<RateLimitExempt>().is_some()
             || (self.limiter.honors_mcp_exempt
                 && req.extensions().get::<RateLimitEnvelopeCounted>().is_some())
@@ -1172,12 +1140,11 @@ where
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
         }
-        // Resolve key and effective params synchronously (no I/O).
         let resolved = self.limiter.resolve_key_and_params(&req);
 
         let limiter = Arc::clone(&self.limiter);
         let mut inner = self.inner.clone();
-        // Swap to ensure correct poll_ready semantics.
+        // Call the instance `poll_ready` readied; leave the fresh clone in `self`.
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
@@ -1203,8 +1170,7 @@ where
                     let key_class = resolved
                         .as_ref()
                         .map_or("ip", |(k, _, _)| key_class_label(k));
-                    // `ResBody` is only bounded `From<String>`, so this side
-                    // copies the cached body once rather than re-rendering it.
+                    // `ResBody` is only `From<String>`, so copy the cached body.
                     let body_json = rate_limit_problem_body(key_class).into_owned();
 
                     let mut response = Response::new(ResBody::from(body_json));
@@ -1225,19 +1191,9 @@ where
                     reset_at_unix,
                 }) => {
                     let mut response = inner.call(req).await?;
-                    // The global limiter allowed this request, consuming a token,
-                    // so its informational `x-ratelimit-*` quota headers belong on
-                    // the response. But the inner service may have set its own —
-                    // most notably a per-route `#[throttle]` guard, whose 429
-                    // carries route-specific `x-ratelimit-*` and `retry-after`
-                    // values with remaining 0 and the route's limit. Overwriting
-                    // those with the global bucket's numbers would mislead clients
-                    // into thinking quota remains. So insert each global header only
-                    // when the inner response does not already carry it: a throttle
-                    // 429, which sets all three, keeps its own values, while a plain
-                    // user-handler response — including a user 429 that consumed a
-                    // global token but set no rate-limit headers — still receives the
-                    // global quota metadata.
+                    // Add each global quota header only if the inner service did not
+                    // set it: a `#[throttle]` 429 carries its route's values, and the
+                    // global bucket's numbers would tell the client quota remains.
                     let headers = response.headers_mut();
                     if !headers.contains_key(X_RATELIMIT_LIMIT) {
                         headers.insert(X_RATELIMIT_LIMIT, burst_for_header);
@@ -1381,17 +1337,10 @@ fn build_throttle_limiter(
     key: KeyStrategy,
     clock: Arc<dyn ClockSource>,
 ) -> Arc<Limiter> {
-    // On the Redis backend every per-route limiter shares one connection and,
-    // by default, the single `redis.key_prefix`; the bucket key handed to
-    // `decide()` is only the client-derived value (ip/token/principal). Without
-    // namespacing, inline throttles, named throttles, and the global limiter for
-    // the same client all collide on one Redis bucket, breaking per-route
-    // isolation across replicas. Fold the `registry_key` (route:<id> or
-    // named:<name>) into the prefix so each route/name — and the global limiter,
-    // which keeps the bare prefix — lands in its own keyspace. The in-memory
-    // backend already isolates by allocating a fresh `MemoryStore` per `Limiter`,
-    // so `registry_key` is only consumed on the Redis path (memory keys never
-    // include the prefix).
+    // On Redis every limiter shares `redis.key_prefix` and `decide()` sees only the
+    // client-derived key, so fold `registry_key` into the prefix to keep each route/name
+    // apart from the others and from the global limiter (bare prefix). The memory backend
+    // is already isolated by a fresh `MemoryStore` per `Limiter`.
     #[cfg(not(feature = "redis"))]
     let _ = registry_key;
     #[cfg(feature = "redis")]
@@ -1401,8 +1350,6 @@ fn build_throttle_limiter(
         redis
     };
 
-    // Rebuild a fresh RateLimitConfig with the same backend/failure/redis
-    // settings as the global limiter, then override the rate and burst.
     let cfg = RateLimitConfig {
         enabled: true,
         requests_per_second: throttle_rps(limit, per_secs),
@@ -1419,12 +1366,9 @@ fn build_throttle_limiter(
         on_backend_failure: global.on_backend_failure,
     };
 
-    // Match the client-IP resolution the global tower layer uses (see
-    // `apply_rate_limit_middleware` in router.rs): prefer the shared top-level
-    // `[security.trusted_proxies]` resolver, but only when the legacy
-    // `security.rate_limit.*` proxy fields aren't set, so an operator's explicit
-    // legacy config still wins. Without this, `#[throttle(key = "ip")]` behind an
-    // ALB/CDN would key on the proxy peer instead of the real client.
+    // Resolve client IPs as the global layer does (`apply_rate_limit_middleware` in
+    // router.rs): `[security.trusted_proxies]`, unless the legacy `security.rate_limit.*`
+    // proxy fields are set. Without it, `key = "ip"` behind a proxy keys on the proxy.
     let has_top_level_proxy_config = trusted_proxies.trust_forwarded_headers
         || !trusted_proxies.ranges.is_empty()
         || trusted_proxies.trusted_hops.is_some();
@@ -1476,25 +1420,20 @@ fn throttle_config_fingerprint(
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
-    // Key strategy baked into the limiter (`KeyStrategy` is a fieldless enum but
-    // isn't `Hash`, so hash its discriminant).
+    // The fieldless enums here are not `Hash`, so hash their discriminants.
     (key as u8).hash(&mut hasher);
 
     // Legacy `security.rate_limit.*` proxy resolver inputs.
     global.trust_forwarded_headers.hash(&mut hasher);
     global.trusted_proxies.hash(&mut hasher);
 
-    // Top-level `[security.trusted_proxies]` resolver inputs (the resolver
-    // `build_throttle_limiter` derives from these when legacy fields are unset).
+    // Top-level `[security.trusted_proxies]` resolver inputs.
     trusted_proxies.trust_forwarded_headers.hash(&mut hasher);
     trusted_proxies.ranges.hash(&mut hasher);
     trusted_proxies.trusted_hops.hash(&mut hasher);
 
-    // Backend selection (memory vs Redis); fieldless enum, hash its discriminant.
     (global.backend as u8).hash(&mut hasher);
 
-    // Redis connection, key prefix, and failure posture only exist under the
-    // `redis` feature and only affect construction there.
     #[cfg(feature = "redis")]
     {
         global.redis.url.hash(&mut hasher);
@@ -1549,18 +1488,9 @@ fn resolve_throttle_params<'a>(
             key,
         } => {
             let key = key.unwrap_or(config.key_strategy);
-            // Inline throttles isolate per mounted route path. The compile-time
-            // `route_id` (`module_path!()::fn_name`) is identical for a single handler
-            // mounted at more than one path — the same `routes![…]` reused under two
-            // `AppBuilder::scoped` prefixes, or versioned mounts — so keying on
-            // `route_id` alone would let traffic to one mounted path drain the other's
-            // bucket. Fold the runtime matched path into the registry namespace so each
-            // mount gets its own bucket. With no `MatchedPath` available, for fallbacks
-            // and unnested routes, fall back to the bare `route_id`.
-            //
-            // Named throttles do the opposite (see the `Named` arm below): a named
-            // limiter is a deliberately shared, centrally-named bucket, so it is keyed by
-            // name only and several routes referencing it share it.
+            // A handler mounted at several paths (e.g. under two `AppBuilder::scoped`
+            // prefixes) has one compile-time `route_id`, so the matched path gives each
+            // mount its own bucket. Fallbacks and unnested routes have no `MatchedPath`.
             let registry_key = ThrottleRegistryKey::Route {
                 route_id,
                 matched_path,
@@ -1589,14 +1519,9 @@ fn resolve_throttle_params<'a>(
                 }
                 return None;
             };
-            // A zero `limit` (or a zero-length `per` window) cannot be enforced as
-            // written: the downstream `limit.max(1)` / `per_secs.max(1)` clamps would
-            // silently turn a "0" quota into "1 request per window" and emit a
-            // misleading `x-ratelimit-limit: 0`. The INLINE macro rejects zero limits
-            // at compile time; keep named runtime config consistent by treating a zero
-            // quota as MISCONFIGURED and failing open (allow the request) — the same
-            // policy as the missing-entry / invalid-`per` paths above — rather than
-            // enforcing a bogus budget or hard-failing app startup.
+            // A zero `limit` or `per` cannot be enforced: the `.max(1)` clamps would turn
+            // it into one request per window behind a misleading `x-ratelimit-limit: 0`.
+            // The inline macro rejects zero at compile time; a named entry fails open.
             if entry.limit == 0 || duration.is_zero() {
                 if warn_once(format!("zerolimit:{route_id}:{name}")) {
                     tracing::warn!(
@@ -1612,12 +1537,9 @@ fn resolve_throttle_params<'a>(
             }
             let per_secs = duration.as_secs().max(1);
             let key = entry.key.unwrap_or(config.key_strategy);
-            // NAMED throttles are DELIBERATELY SHARED by name: the matched path is
-            // intentionally NOT folded into the key, so every route pointing at
-            // `#[throttle("<name>")]` shares one centrally-named bucket (e.g.
-            // `POST /login` and `POST /login/2fa` sharing one abuse budget). This
-            // is the deliberate counterpart to the per-path isolation the inline
-            // arm above applies.
+            // Unlike inline throttles, a named one is shared by every route that uses it
+            // (e.g. `POST /login` and `POST /login/2fa` draw on one budget), so the path is
+            // not folded in.
             Some((entry.limit, per_secs, key, ThrottleRegistryKey::Named(name)))
         }
     }
@@ -1696,12 +1618,9 @@ fn build_rate_limited_response(
 /// build their own `RateLimitLayer` instead.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-// `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
-// 128 bytes — that is `axum::response::Response`'s own size, not something this
-// crate chose. Returning a ready-made rejection response IS the idiom here, and
-// boxing it would add an allocation to every rejection path to satisfy a size
-// heuristic. Allowed at the site rather than workspace-wide so the lint stays
-// armed for error types we do control.
+// The large `Err` is `axum::response::Response` itself; boxing it would add an
+// allocation to every rejection. Allowed here, not workspace-wide, so the lint
+// stays on for error types we control.
 #[allow(clippy::result_large_err)]
 pub async fn __check_throttle(
     state: &crate::AppState,
@@ -1714,9 +1633,8 @@ pub async fn __check_throttle(
     session: Option<&crate::session::Session>,
     exempt: bool,
 ) -> Result<(), axum::response::Response> {
-    // `RateLimitExempt` bypasses per-route throttles the same way it bypasses
-    // the framework's global limiter, so an MCP `tools/call` counted once at
-    // the `/mcp` envelope is not re-charged on dispatch replay.
+    // `RateLimitExempt` bypasses per-route throttles too, so an MCP `tools/call` counted at
+    // the `/mcp` envelope is not charged again on replay.
     if exempt {
         return Ok(());
     }
@@ -1728,20 +1646,14 @@ pub async fn __check_throttle(
     let Some((limit, per_secs, key_strategy, registry_key)) =
         resolve_throttle_params(route_id, matched_path, &spec, rl_config)
     else {
-        // Fail-open: named entry missing or unparseable (already logged).
+        // Fail open: named entry missing or misconfigured (already logged).
         return Ok(());
     };
 
-    // Derive the principal from the verified session when this route keys on the
-    // authenticated principal but no `RateLimitPrincipal` extension is present.
-    // The router only installs `populate_rate_limit_principal` when the GLOBAL
-    // limiter's strategy is `AuthenticatedPrincipal`; a `#[throttle(key =
-    // "principal")]` route guarded by `#[secured]` under the default (IP) global
-    // strategy would otherwise never see a principal and silently fall back to IP
-    // keying — collapsing every user behind one NAT into a shared bucket. Mirror
-    // `populate_rate_limit_principal` exactly: read the same auth session key from
-    // the same verified `Session`. An explicit extension (set by `RequireAuth` /
-    // `RequireApiToken`) still wins and is never overwritten.
+    // `populate_rate_limit_principal` runs only when the global strategy is
+    // `AuthenticatedPrincipal`, so derive the principal from the session here as it
+    // does. Otherwise a principal-keyed throttle under the IP default would put every
+    // user behind one NAT in one bucket. An explicit `RateLimitPrincipal` wins.
     let derived_principal = if principal.is_none()
         && key_strategy == KeyStrategy::AuthenticatedPrincipal
     {
@@ -1758,31 +1670,13 @@ pub async fn __check_throttle(
     };
     let principal = principal.or(derived_principal.as_ref());
 
-    // Qualify the registry key with (1) the constructing app's process-unique
-    // id and (2) a fingerprint of every construction-affecting config input.
-    //
-    // The fingerprint alone stops a later `AppState` with a DIFFERENT config
-    // from reusing an earlier app's limiter for the same route/name. But two
-    // INDEPENDENTLY built apps with IDENTICAL rate-limit + trusted-proxy config
-    // (parallel `TestApp`s, or one process hosting two apps with the same
-    // handler) would still fingerprint-collide and share one process-global
-    // `Limiter`/`MemoryStore`, so traffic in one app would drain the other's
-    // per-route bucket. Prefixing the clone-stable `app_id` gives each app its
-    // own buckets, while a cloned `AppState` (what `State` hands the handler)
-    // keeps its origin's id and therefore its origin's bucket.
-    //
-    // The bare `registry_key` (route:<id> / named:<name>) still drives the Redis
-    // keyspace namespacing in `build_throttle_limiter`; only the in-memory cache
-    // lookup carries the app id + fingerprint.
+    // The config fingerprint keeps an app from reusing a limiter built from another
+    // app's config; the clone-stable `app_id` keeps two identically configured apps
+    // from sharing buckets. Redis keyspaces use only the bare `registry_key`.
     let app_id = state.app_id();
     let fingerprint = throttle_config_fingerprint(rl_config, trusted_proxies, key_strategy);
-    // Rendered into a reused per-thread buffer and probed by `&str`: after a
-    // route's first request every lookup is a hit, so an owned key is built
-    // only on the miss that inserts it. Same bytes as the `format!` this
-    // replaced. The closure is synchronous, so neither the buffer borrow nor
-    // the registry lock is ever held across an `.await`.
-    // Probe the registry under the key rendered into `cache_key`, building and
-    // registering the limiter on a miss.
+    // The key is rendered into a reused buffer, so only the miss that inserts
+    // allocates. Synchronous: neither the buffer nor the lock spans an `.await`.
     let lookup = |cache_key: &mut String| {
         use std::fmt::Write as _;
         cache_key.clear();
@@ -1806,10 +1700,8 @@ pub async fn __check_throttle(
             )
         }))
     };
-    // The scratch buffer is out of reach only while this thread's locals are
-    // being torn down (or, defensively, if it is somehow already borrowed). A
-    // fresh `String` then does the same job at the one allocation the key
-    // always used to cost, instead of panicking on the request path.
+    // The buffer is unavailable during thread-local teardown or if already
+    // borrowed; use a fresh `String` then rather than panic.
     let limiter = THROTTLE_CACHE_KEY
         .try_with(|cell| cell.try_borrow_mut().ok().map(|mut buf| lookup(&mut buf)))
         .ok()
@@ -1817,14 +1709,11 @@ pub async fn __check_throttle(
         .unwrap_or_else(|| lookup(&mut String::new()));
 
     let Some(bucket_key) = extract_throttle_key(&limiter, headers, peer, principal) else {
-        // In-process caller with no identifiable peer (SSG, tests without
-        // ConnectInfo). Bypass — matches how the tower layer handles this.
+        // In-process caller with no peer (SSG, tests without ConnectInfo): bypass,
+        // as the tower layer does.
         return Ok(());
     };
-    // Same tenant fold-in the global tower layer applies (see
-    // `tenant_qualify_bucket_key`) — `#[throttle(key = "principal")]` shares
-    // the same `extract_key` derivation and the same cross-tenant collision.
-    // `bucket_key` is moved in, not copied, when there is nothing to qualify.
+    // Same tenant fold-in as the global layer; see `tenant_qualify_bucket_key`.
     let bucket_key = tenant_qualify_owned_bucket_key(key_strategy, bucket_key);
 
     let burst = f64::from(limit.max(1));
@@ -1939,7 +1828,6 @@ mod tests {
     async fn request_over_limit_returns_429_with_retry_after() {
         let app = app(&cfg(true, 1.0, 2));
 
-        // Burn through the burst.
         for _ in 0..2 {
             let response = app
                 .clone()
@@ -1949,7 +1837,6 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
         }
 
-        // Next request is over the limit.
         let response = app
             .clone()
             .oneshot(req_with_ip("2.2.2.2"))
@@ -2027,8 +1914,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_429_body_is_byte_identical_to_a_fresh_render() {
-        // The global layer serves the cached body; the wire bytes must be
-        // exactly what rendering it per denial produced.
+        // The cached body must match a per-denial render byte for byte.
         let app = app(&cfg(true, 1.0, 1));
 
         let _ = app.clone().oneshot(req_with_ip("9.9.9.10")).await.unwrap();
@@ -2056,7 +1942,6 @@ mod tests {
     async fn different_ips_are_independent() {
         let app = app(&cfg(true, 0.1, 1));
 
-        // Exhaust IP A.
         let ok_a = app
             .clone()
             .oneshot(req_with_ip("10.0.0.1"))
@@ -2204,8 +2089,7 @@ mod tests {
         assert_eq!(buckets.len(), 2);
         assert!(buckets.contains("a") && buckets.contains("c") && !buckets.contains("b"));
         drop(buckets);
-        // "a" kept its drained bucket through the eviction: denied, with the
-        // same retry-after the copy-modify-put version computed.
+        // "a" kept its drained bucket through the eviction.
         match store.decide("a", now, 2.0, 0.1) {
             Decision::Denied {
                 retry_after_secs, ..
@@ -2228,7 +2112,6 @@ mod tests {
             |_req: Request<Body>| async { Ok::<_, Infallible>(Response::new(Body::empty())) },
         ));
 
-        // Use a dummy context
         let waker = futures::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
 
@@ -2406,9 +2289,8 @@ mod tests {
 
     #[test]
     fn client_ip_ignores_forwarded_headers_by_default() {
-        // Attacker-supplied forwarding headers must not be trusted when
-        // `trust_forwarded_headers = false`; the limiter keys on the
-        // real peer address instead.
+        // With `trust_forwarded_headers = false`, spoofed forwarding headers are
+        // ignored and the peer address is the key.
         let mut req: Request<()> = Request::builder()
             .header("X-Forwarded-For", "1.2.3.4")
             .header("X-Real-IP", "5.6.7.8")
@@ -2423,10 +2305,8 @@ mod tests {
 
     #[tokio::test]
     async fn forwarded_headers_cannot_bypass_throttling_when_untrusted() {
-        // `trust_forwarded_headers = false` (default). When ConnectInfo is
-        // set (the production configuration), rotating XFF values must
-        // NOT shard the throttle into separate buckets — the peer IP is
-        // the sole key source.
+        // Untrusted headers with ConnectInfo set: rotating XFF values must not
+        // shard the bucket, since the peer IP is the only key source.
         let config = RateLimitConfig {
             enabled: true,
             requests_per_second: 0.1,
@@ -2695,16 +2575,9 @@ mod tests {
 
     #[test]
     fn tenant_qualify_bucket_key_tenant_present_and_absent_families_are_disjoint() {
-        // Regression for Codex's PR #2653 follow-up: round 2's fix left the
-        // tenant-absent case as bare `principal:<id>`, so an attacker able to
-        // choose their own `id` on a tenant-absent request (no `[tenancy]`,
-        // or a `tenancy.public_paths` route) could craft it to reproduce
-        // byte-for-byte whatever a *different* real tenant+id pair's
-        // round-2-encoded key would render — using their own example,
-        // tenant="a" id="bc" rendered as "principal:tenant[1]=abc", exactly
-        // what an id of "tenant[1]=abc" on a tenant-absent request would
-        // also render. The `t`/`n` tag makes the two families disjoint
-        // regardless of what either string contains.
+        // A tenant-absent request whose id mimics a tenant-qualified encoding
+        // must not land in that tenant's bucket: the `t`/`n` tag keeps the two
+        // families disjoint whatever the strings contain.
         let tenant_present = crate::tenancy::CURRENT_TENANT
             .sync_scope(Some("a".to_owned()), || {
                 tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:bc")
@@ -2755,8 +2628,7 @@ mod tests {
 
     #[test]
     fn tenant_qualify_owned_bucket_key_moves_an_unqualified_key() {
-        // Nothing to qualify: the caller's `String` comes back as-is, the
-        // same allocation, rather than a copy of it.
+        // Nothing to qualify: the same allocation comes back, not a copy.
         crate::tenancy::CURRENT_TENANT.sync_scope(Some("tenant-a".to_owned()), || {
             for (strategy, raw) in [
                 (KeyStrategy::Ip, "1.2.3.4"),
@@ -2789,10 +2661,8 @@ mod tests {
 
     #[test]
     fn tenant_qualify_bucket_key_does_not_confuse_tenant_and_id_boundaries_with_colons() {
-        // Regression: a `:`-joined "tenant:id" is not injective — tenant="a:b"
-        // id="c" and tenant="a" id="b:c" both render as "a:b:c". Codex flagged
-        // this on PR #2653; the fix is the length-prefixed encoding in
-        // `tenant_qualify_bucket_key`'s doc comment.
+        // A `:`-joined "tenant:id" is not injective: tenant="a:b" id="c" and
+        // tenant="a" id="b:c" both render as "a:b:c".
         let key_1 = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a:b".to_owned()), || {
             tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:c")
         });
@@ -2808,16 +2678,8 @@ mod tests {
 
     #[test]
     fn tenant_qualify_bucket_key_does_not_confuse_tenant_and_id_boundaries_with_nul() {
-        // A `\0`-joined encoding is only injective if `\0` can never appear in
-        // either component. Header-sourced tenants can't carry one (rejected
-        // at the `HeaderValue` layer), but `tenancy.rs`'s `"session"`/`"jwt"`
-        // arms only reject an empty-after-trim value, so a session- or
-        // JWT-claim-sourced tenant CAN contain `\0` — and so can the
-        // app-supplied `RateLimitPrincipal` id. Codex flagged this as a
-        // follow-up on PR #2653 after the `:` -> `\0` fix; the length-prefix
-        // encoding is injective regardless of what bytes either string
-        // contains, so tenant="a" id="b\0c" must not collide with
-        // tenant="a\0b" id="c".
+        // Session- and JWT-sourced tenants and `RateLimitPrincipal` ids can
+        // contain `\0`, so a `\0` delimiter would not be injective either.
         let key_1 = crate::tenancy::CURRENT_TENANT.sync_scope(Some("a".to_owned()), || {
             tenant_qualify_bucket_key(KeyStrategy::AuthenticatedPrincipal, "principal:b\0c")
         });
@@ -2860,7 +2722,6 @@ mod tests {
             .header("X-Forwarded-For", "5.5.5.5")
             .body(())
             .unwrap();
-        // No Authorization header -> falls back to IP.
         let key = limiter.extract_key(&req).unwrap();
         assert_eq!(key, "5.5.5.5");
     }
@@ -2892,7 +2753,6 @@ mod tests {
             .header("X-Forwarded-For", "5.5.5.5")
             .body(())
             .unwrap();
-        // No RateLimitPrincipal extension → falls back to IP.
         let key = limiter.extract_key(&req).unwrap();
         assert_eq!(key, "5.5.5.5");
     }
@@ -2990,9 +2850,8 @@ mod tests {
     #[cfg(feature = "redis")]
     #[tokio::test]
     async fn throttle_limiter_namespaces_redis_key_prefix_by_route() {
-        // Building a lazy Redis `ConnectionManager` requires a Tokio reactor, so
-        // this runs on `#[tokio::test]` even though no request is issued — the
-        // assertions only inspect the composed `key_prefix`.
+        // A lazy Redis `ConnectionManager` needs a Tokio reactor, though no
+        // request is issued.
         use super::super::config::{
             RateLimitBackend, RateLimitBackendFailure, RateLimitRedisConfig,
         };
@@ -3094,8 +2953,8 @@ mod tests {
 
         // XFF: real client, then one proxy hop; the TCP peer is the load balancer.
         let req = req_with_connect_info("1.1.1.1, 2.2.2.2", "9.9.9.9:4000");
-        // trusted_hops = 1 peels the LB, leaving the real client. Under the bug
-        // (legacy-only resolver) this would key on the peer 9.9.9.9 instead.
+        // trusted_hops = 1 peels the load balancer, leaving the real client
+        // rather than the peer 9.9.9.9.
         assert_eq!(limiter.extract_key(&req).as_deref(), Some("1.1.1.1"));
     }
 
@@ -3277,7 +3136,7 @@ mod tests {
 
         // Distinct instances: App B did NOT inherit App A's cached limiter.
         assert!(!Arc::ptr_eq(&app_a, &app_b));
-        // Each carries its OWN key strategy (the bug: B would key on IP like A).
+        // Each carries its own key strategy.
         assert_eq!(app_a.key_strategy, KeyStrategy::Ip);
         assert_eq!(app_b.key_strategy, KeyStrategy::AuthenticatedPrincipal);
 
@@ -3299,7 +3158,6 @@ mod tests {
         });
 
         let untrusted_ip: IpAddr = "192.168.1.1".parse().unwrap();
-        // Build a request with this peer IP and verify XFF is NOT trusted.
         let peer_addr: std::net::SocketAddr = format!("{untrusted_ip}:1234").parse().unwrap();
         let mut req: axum::http::Request<()> = axum::http::Request::builder()
             .header("x-forwarded-for", "10.0.0.1")
@@ -3409,9 +3267,8 @@ mod tests {
 
     #[tokio::test]
     async fn envelope_counted_marker_ignored_by_user_path_override_limiter() {
-        // A user-installed per-path override limiter does NOT share the envelope's
-        // bucket, so an MCP `tools/call` replay must still consume its
-        // route-specific bucket — the marker is ignored.
+        // A user path-override limiter does not share the envelope's bucket, so an
+        // MCP replay still consumes its route-specific bucket.
         let config = RateLimitConfig {
             enabled: true,
             requests_per_second: 0.1,
@@ -3459,10 +3316,7 @@ mod tests {
 
     #[tokio::test]
     async fn genuine_exempt_marker_bypasses_framework_default_limiter() {
-        // `RateLimitExempt` is the genuine full-bypass marker: it bypasses
-        // *every* limiter, including the framework-default one. So even past the
-        // burst, every request carrying it must pass. (This is broader than the
-        // `RateLimitEnvelopeCounted` envelope-dedup skip.)
+        // `RateLimitExempt` bypasses every limiter, the framework default included.
         let config = RateLimitConfig {
             enabled: true,
             requests_per_second: 0.1,
@@ -3475,8 +3329,7 @@ mod tests {
             .route("/api/strict", get(|| async { "ok" }))
             .layer(layer);
 
-        // Burst is 1, yet every exempt request passes — the full-bypass marker
-        // is honored unconditionally.
+        // Burst is 1, yet every exempt request passes.
         for _ in 0..3 {
             let r = app
                 .clone()
@@ -3489,10 +3342,8 @@ mod tests {
 
     #[tokio::test]
     async fn genuine_exempt_marker_bypasses_user_path_override_limiter() {
-        // `RateLimitExempt` bypasses *every* limiter per its documented
-        // contract, including a user-installed path-override limiter (which does
-        // NOT set `honors_mcp_exempt`). Unlike `RateLimitEnvelopeCounted`, which
-        // such a limiter still charges, a genuine exempt request always passes.
+        // Unlike `RateLimitEnvelopeCounted`, `RateLimitExempt` also bypasses a user
+        // path-override limiter, which does not set `honors_mcp_exempt`.
         let config = RateLimitConfig {
             enabled: true,
             requests_per_second: 0.1,
@@ -3511,8 +3362,7 @@ mod tests {
             .route("/api/strict", get(|| async { "ok" }))
             .layer(layer);
 
-        // Override burst is 1, yet every exempt request passes — the full-bypass
-        // marker is honored even by a user path-override limiter.
+        // Override burst is 1, yet every exempt request passes.
         for _ in 0..3 {
             let r = app
                 .clone()
@@ -3600,7 +3450,7 @@ mod tests {
             per_secs: 60,
             key: None,
         };
-        // No MatchedPath (fallback / unnested route): bare route_id, as before.
+        // No MatchedPath (fallback / unnested route): bare route_id.
         let (limit, per, key, reg_key) =
             resolve_throttle_params("m::h", None, &spec, &global).expect("params");
         assert_eq!(limit, 5);
@@ -3611,9 +3461,7 @@ mod tests {
 
     #[test]
     fn resolve_throttle_params_inline_folds_matched_path_into_registry_key() {
-        // An inline throttle mounted at two paths shares one compile-time
-        // route_id; folding the runtime matched path in gives each mount its
-        // own bucket namespace so their token buckets stay independent.
+        // One handler mounted at two paths gets a bucket namespace per mount.
         let global = RateLimitConfig::default();
         let spec = ThrottleSpec::Inline {
             limit: 5,
@@ -3634,8 +3482,8 @@ mod tests {
 
     #[test]
     fn throttle_registry_key_renders_the_historical_namespace() {
-        // These bytes are the in-memory cache key's middle and the Redis
-        // keyspace suffix, so they must stay exactly what `format!` produced.
+        // These bytes are part of the cache key and the Redis keyspace; changing
+        // them would orphan existing Redis buckets.
         assert_eq!(
             ThrottleRegistryKey::Route {
                 route_id: "m::h",
@@ -3660,9 +3508,7 @@ mod tests {
 
     #[test]
     fn resolve_throttle_params_named_ignores_matched_path() {
-        // A NAMED limiter is a deliberately shared, centrally-named bucket, so
-        // its registry key is keyed by name only — the matched path must NOT be
-        // folded in, letting multiple routes share one bucket on purpose.
+        // A named limiter is shared on purpose, so the matched path is not folded in.
         use super::super::config::RateLimitNamedConfig;
         let mut named = std::collections::HashMap::new();
         named.insert(
@@ -3738,9 +3584,8 @@ mod tests {
     #[test]
     fn resolve_throttle_params_named_zero_limit_fails_open() {
         use super::super::config::RateLimitNamedConfig;
-        // A named entry with `limit = 0` is misconfigured: enforcing it would
-        // clamp to one-request-per-window and emit a misleading
-        // `x-ratelimit-limit: 0`. Treat it like a missing entry → fail open.
+        // Enforcing `limit = 0` would clamp to one request per window behind a
+        // misleading `x-ratelimit-limit: 0`, so it fails open like a missing entry.
         let mut named = std::collections::HashMap::new();
         named.insert(
             "zero".to_owned(),
@@ -3807,9 +3652,8 @@ mod tests {
     #[tokio::test]
     async fn check_throttle_named_zero_limit_allows_requests_fail_open() {
         use super::super::config::RateLimitNamedConfig;
-        // End-to-end: a `limit = 0` named limiter must ALLOW requests
-        // (fail-open), NOT allow one and then 429. Install a config carrying the
-        // misconfigured named entry and drive several requests through the guard.
+        // End to end: a `limit = 0` named limiter allows every request, not one
+        // and then 429.
         let mut named = std::collections::HashMap::new();
         named.insert(
             "zero".to_owned(),
@@ -3849,13 +3693,9 @@ mod tests {
 
     #[tokio::test]
     async fn check_throttle_named_missing_entry_returns_ok_fail_open() {
-        // Fail-open path when a named limiter is referenced but not configured.
-        // Uses AppState::default() (no config installed) so lookup misses.
-        //
-        // Uses a route_id unique to this test so its registry bucket cannot
-        // collide with sibling tests running in parallel; see the module note
-        // on `__throttle_registry_reset` — clearing the shared registry mid-run
-        // races other tests, so we isolate by key instead of resetting.
+        // No config is installed, so the named lookup misses. A unique route_id
+        // isolates the registry entry; resetting the shared registry would race
+        // parallel tests.
         let state = crate::AppState::for_test();
         let headers = axum::http::HeaderMap::new();
         let result = __check_throttle(
@@ -3878,11 +3718,9 @@ mod tests {
 
     #[tokio::test]
     async fn check_throttle_exempt_bypasses_limiter() {
-        // Unique route_id keeps this test's registry bucket isolated from
-        // siblings under parallel `cargo test`; no shared-registry reset.
+        // Unique route_id: no shared-registry reset, which would race parallel tests.
         let state = crate::AppState::for_test();
         let headers = axum::http::HeaderMap::new();
-        // Even with an extremely tight limiter, `exempt = true` returns Ok.
         let result = __check_throttle(
             &state,
             "test::check_throttle_exempt_bypasses_limiter",
@@ -3904,11 +3742,8 @@ mod tests {
 
     #[tokio::test]
     async fn check_throttle_inline_denies_after_burst_and_response_carries_headers() {
-        // This test depends on registry state persisting between r1 and r2, so
-        // it MUST own a route_id no other test touches: a parallel test calling
-        // the shared-registry reset between the two calls would otherwise clear
-        // the bucket and let r2 succeed (the historical flake). Isolate by a
-        // unique key rather than resetting the shared registry.
+        // The bucket must persist between r1 and r2, so this test owns its
+        // route_id: a parallel registry reset in between would let r2 succeed.
         let state = crate::AppState::for_test();
         let headers = axum::http::HeaderMap::new();
         let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
@@ -3918,7 +3753,6 @@ mod tests {
             key: Some(KeyStrategy::Ip),
         };
 
-        // First call consumes the only token.
         let r1 = __check_throttle(
             &state,
             "test::check_throttle_inline_denies_after_burst",
@@ -3933,7 +3767,6 @@ mod tests {
         .await;
         assert!(r1.is_ok(), "first request must succeed");
 
-        // Second call denies.
         let r2 = __check_throttle(
             &state,
             "test::check_throttle_inline_denies_after_burst",
@@ -4088,8 +3921,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_throttle_429_body_is_byte_identical_to_a_fresh_render() {
-        // The `#[throttle]` guard borrows the cached `'static` body; the wire
-        // bytes must be exactly what rendering it per denial produced.
+        // The cached body must match a per-denial render byte for byte.
         let state = crate::AppState::for_test();
         let headers = axum::http::HeaderMap::new();
         let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
@@ -4123,15 +3955,10 @@ mod tests {
 
     #[tokio::test]
     async fn check_throttle_two_apps_same_route_get_independent_buckets() {
-        // Regression for the multi-app throttle bleed: two INDEPENDENTLY built
-        // `AppState`s with IDENTICAL config, hitting the SAME throttled route
-        // from the SAME client, must charge SEPARATE per-route buckets. Before
-        // scoping the registry key by the app's process-unique id, both apps
-        // fingerprint-collided onto one process-global limiter, so exhausting
-        // app A would also deny app B.
+        // Two independently built apps with identical config share a config
+        // fingerprint; only the app id keeps their buckets apart.
         let app_a = crate::AppState::for_test();
         let app_b = crate::AppState::for_test();
-        // Distinct construction => distinct clone-stable identities.
         assert_ne!(
             app_a.app_id(),
             app_b.app_id(),
@@ -4140,7 +3967,6 @@ mod tests {
 
         let headers = axum::http::HeaderMap::new();
         let peer: SocketAddr = "127.0.0.1:1234".parse().unwrap();
-        // Same route id + same single-token inline spec for both apps.
         let route = "test::two_apps_same_route_independent_buckets";
         let spec = ThrottleSpec::Inline {
             limit: 1,
@@ -4148,7 +3974,6 @@ mod tests {
             key: Some(KeyStrategy::Ip),
         };
 
-        // Exhaust app A: first request consumes its only token, second is denied.
         let a1 = __check_throttle(
             &app_a,
             route,
@@ -4180,8 +4005,7 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
         );
 
-        // App B shares config + route + client, yet its own bucket is untouched:
-        // its first request must still succeed (proving buckets are independent).
+        // App B shares config, route and client, yet its bucket is untouched.
         let b1 = __check_throttle(
             &app_b,
             route,
@@ -4202,14 +4026,9 @@ mod tests {
 
     #[tokio::test]
     async fn check_throttle_session_principal_is_isolated_per_app_and_per_principal() {
-        // Deterministic isolation guard for the flaky-throttle class (#1725):
-        // a `#[throttle(key = "principal")]` route deriving its principal from
-        // the verified session must key EACH principal (and each app) on its own
-        // bucket — never silently collapse onto the shared client IP, and never
-        // inherit a neighbouring app's drained bucket. The CI flake was
-        // thread-contention-shaped; this reproduces the SAME invariant
-        // deterministically (no threads) by pre-draining one app's principal
-        // bucket and proving the untouched principal / app is unaffected.
+        // #1725: a principal derived from the session gets its own bucket per
+        // principal and per app, never the shared client IP's. Checked without
+        // threads by draining one bucket and probing the others.
         use std::collections::HashMap;
         let session_for = |user: &str| {
             let mut data = HashMap::new();
@@ -4221,8 +4040,7 @@ mod tests {
         assert_ne!(app_a.app_id(), app_b.app_id());
 
         let headers = axum::http::HeaderMap::new();
-        // A single shared client IP: if the throttle ever fell back to IP keying
-        // (derivation failing), the distinct principals below would collide here.
+        // One client IP for all: a fallback to IP keying would collide the principals.
         let peer: SocketAddr = "203.0.113.7:1234".parse().unwrap();
         let route = "test::check_throttle_session_principal_isolation";
         let spec = || ThrottleSpec::Inline {
@@ -4233,8 +4051,7 @@ mod tests {
         let alice = session_for("alice");
         let bob = session_for("bob");
 
-        // app A, principal "alice" (derived from the session, NO RateLimitPrincipal
-        // extension): first request consumes the token, second is denied.
+        // app A, "alice" from the session (no `RateLimitPrincipal`): drain her bucket.
         let a1 = __check_throttle(
             &app_a,
             route,
@@ -4266,9 +4083,8 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
         );
 
-        // app A, principal "bob": a DISTINCT session principal on the SAME client
-        // IP must get its OWN bucket and still succeed — proving the throttle keyed
-        // on the derived session principal, not the shared peer IP.
+        // app A, "bob" on the same IP: his own bucket proves the key is the
+        // session principal, not the peer IP.
         let bob_req = __check_throttle(
             &app_a,
             route,
@@ -4286,9 +4102,7 @@ mod tests {
             "a distinct session principal must get its own bucket, not fall back to the shared IP",
         );
 
-        // app B, principal "alice": an INDEPENDENTLY built app must not inherit
-        // app A's drained "alice" bucket — this is the per-app isolation that makes
-        // cross-test registry bleed impossible.
+        // app B, "alice": another app does not inherit app A's drained bucket.
         let b1 = __check_throttle(
             &app_b,
             route,
@@ -4310,7 +4124,6 @@ mod tests {
     #[tokio::test]
     async fn check_throttle_no_identifiable_peer_bypasses_limiter() {
         // In-process caller without ConnectInfo (SSG, some tests): bypass.
-        // Unique route_id isolates this test from parallel siblings.
         let state = crate::AppState::for_test();
         let headers = axum::http::HeaderMap::new();
         let result = __check_throttle(

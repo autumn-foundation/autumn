@@ -170,14 +170,9 @@ impl ClientIdentity {
             fingerprint: sha256_fingerprint(der.as_ref()),
             serial: cert.raw_serial_as_string().replace(':', ""),
             not_after_unix: cert.validity().not_after.timestamp(),
-            // From the parsed name, never from the rendered `subject`. The
-            // parser does not escape attribute values, so an enrolment service
-            // that copies `O`/`OU` from a CSR would otherwise let a caller
-            // smuggle `CN=svc-payments` into another attribute and have a
-            // string-splitting reader believe it.
-            //
-            // The LAST `CN`, matching how a CA names the end entity when a
-            // subject carries several.
+            // Read from the parsed name, never the rendered `subject`: attribute values are not
+            // escaped, so `CN=svc-payments` smuggled into an `O`/`OU` from a CSR would fool a
+            // string-splitting reader. The last `CN` names the end entity when there are several.
             common_name: cert
                 .subject()
                 .iter_common_name()
@@ -254,8 +249,7 @@ fn collect_sans(cert: &x509_parser::certificate::X509Certificate<'_>) -> Vec<Str
                         out.push(format!("IP:{ip}"));
                     }
                 }
-                // Directory, registered-ID and othername SANs have no
-                // unambiguous text form worth matching a policy on.
+                // Directory, registered-ID and othername SANs have no unambiguous text form.
                 _ => {}
             }
         }
@@ -421,8 +415,7 @@ fn map_crl_pem_err(path: &Path, source: rustls_pki_types::pem::Error) -> TlsErro
 /// Returns a [`TlsError`] for a missing/unreadable file, unparseable PEM, an
 /// empty bundle or CRL, or a block that is not parseable DER.
 pub fn crl_coverage_gaps(ca_bundle_path: &Path, crl_path: &Path) -> Result<Vec<String>, TlsError> {
-    // Load through the runtime paths first, so the coverage check never
-    // grades a bundle or CRL the server would refuse to boot on.
+    // Load through the runtime paths first, so this never grades files the server would refuse.
     load_client_roots(ca_bundle_path)?;
     let crls = load_crls(crl_path)?;
     let ca_certs = read_ca_cert_ders(ca_bundle_path)?;
@@ -466,12 +459,10 @@ fn crl_coverage_gaps_in(
         parsed_crls.push(parsed);
     }
 
-    // A CRL whose issuer is no CA in the bundle comes from an intermediate:
-    // the bundle holds the root, the client presents the intermediate, and
-    // with end-entity-only revocation checking that intermediate's CRL is
-    // exactly what rustls consults. Which bundle CAs issue client
-    // certificates directly can then not be read off the bundle, so the
-    // bundle-only check would refuse a working PKI at boot; it stands down.
+    // A CRL whose issuer is not in the bundle comes from an intermediate the client presents,
+    // and rustls checks end entities against that CRL. Which bundle CAs issue client
+    // certificates directly is then unknowable, so the check stands down rather than refuse a
+    // working PKI at boot.
     let issued_by_bundle_ca =
         |crl: &x509_parser::revocation_list::CertificateRevocationList<'_>| {
             cas.iter()
@@ -481,16 +472,11 @@ fn crl_coverage_gaps_in(
         return Ok(Vec::new());
     }
 
-    // Covered means a CRL that is cryptographically this CA's, not merely
-    // one naming it: a renewed CA commonly keeps its subject DN under a new
-    // key, and rustls rejects the old key's CRL for it on signature, so a
-    // name match alone would call the renewed CA covered and recreate the
-    // #2706 outage.
+    // Covered means a CRL signed by this CA's key, not just naming it: a renewed CA often keeps
+    // its subject DN under a new key, and rustls rejects the old key's CRL on signature (#2706).
     //
-    // A bundle CA that signed another CA in the bundle is a parent in the
-    // hierarchy: with end-entity-only revocation its clients are checked
-    // against the child's CRL, so demanding one of its own would refuse a
-    // bundle that ships root + intermediate. Only the bottom tier needs cover.
+    // A bundle CA that signed another bundle CA is a parent: end entities are checked against
+    // the child's CRL, so only the bottom tier needs cover.
     let is_parent = |ca: &x509_parser::certificate::X509Certificate<'_>| {
         let parent = ca.subject().as_raw();
         cas.iter().any(|child| {
@@ -610,9 +596,8 @@ impl ReloadableClientVerifier {
 
     /// Swap in a freshly built verifier. Handshakes started after this use it.
     pub fn store(&self, next: Arc<dyn ClientCertVerifier>) {
-        // A poisoned lock means a previous holder panicked while swapping; the
-        // stored value is still a valid verifier, so recover rather than
-        // propagate a panic into every subsequent handshake.
+        // A poisoned lock still holds a valid verifier, so recover rather than panic every
+        // later handshake.
         let mut guard = self
             .inner
             .write()
@@ -640,12 +625,8 @@ impl ReloadableClientVerifier {
 
 impl ClientCertVerifier for ReloadableClientVerifier {
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        // rustls takes this by reference, so it cannot be forwarded from a
-        // temporarily-locked `Arc`. Sending no hint is valid (RFC 8446 §4.4.2.4
-        // makes `certificate_authorities` optional): the client picks from the
-        // certificates it holds. Hinting a rotating store is the wrong trade —
-        // a borrowed snapshot would have to outlive the swap it exists to
-        // describe.
+        // rustls borrows this, so it cannot come from a locked, rotating `Arc`. No hint is valid
+        // (RFC 8446 §4.4.2.4): the client picks from the certificates it holds.
         &[]
     }
 
@@ -655,12 +636,8 @@ impl ClientCertVerifier for ReloadableClientVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        // Deliberately does not count or log a rejection. rustls returns this
-        // error out of the handshake, where `record_handshake_rejection` sees
-        // it WITH the peer address — and also sees the rejections that never
-        // reach a verifier at all (a `required` listener refusing a client that
-        // presented nothing). Counting here too would double every reason but
-        // that one.
+        // Rejections are not counted here: `record_handshake_rejection` sees them with the
+        // peer address, plus those that never reach a verifier. Counting here would double them.
         self.current()
             .verify_client_cert(end_entity, intermediates, now)
     }
@@ -688,9 +665,8 @@ impl ClientCertVerifier for ReloadableClientVerifier {
     }
 
     fn requires_raw_public_keys(&self) -> bool {
-        // Forwarded rather than left at the trait default: `new`/`store` accept
-        // any `ClientCertVerifier`, so a caller wrapping a raw-public-key
-        // verifier must not have it silently reported as X.509.
+        // Forwarded, not defaulted: a wrapped raw-public-key verifier must not be reported as
+        // X.509.
         self.current().requires_raw_public_keys()
     }
 
@@ -763,10 +739,7 @@ impl ClientTrustReloader {
     /// Poll until `shutdown`, swapping the verifier whenever the bundle or CRL
     /// changes on disk.
     pub async fn run(mut self, shutdown: tokio_util::sync::CancellationToken) {
-        // A zero interval would spin the loop as fast as the runtime allows.
-        // `app.rs` clamps before constructing this, but the type is public, so
-        // enforce the invariant where it belongs — and `tokio::time::interval`
-        // panics on a zero period, which is a poor way to learn it.
+        // A zero interval would spin the loop. `app.rs` clamps it, but this type is public.
         let interval = if self.interval.is_zero() {
             std::time::Duration::from_secs(super::DEFAULT_RELOAD_INTERVAL_SECS)
         } else {
@@ -828,8 +801,7 @@ impl ClientTrustReloader {
         match built {
             Ok(next) => {
                 self.verifier.store(next);
-                // Advance the baseline only on success, so a partial write is
-                // retried on the next tick rather than skipped.
+                // Advance only on success, so a partial write is retried next tick.
                 self.baseline = seen;
                 tracing::info!(
                     ca_bundle = %self.ca_bundle_path.display(),
@@ -855,10 +827,8 @@ fn build_from_paths(
     mode: ClientAuthMode,
     provider: &Arc<CryptoProvider>,
 ) -> Result<Arc<dyn ClientCertVerifier>, TlsError> {
-    // Single snapshot: both files are read once into these DERs, and the
-    // coverage check below plus the verifier construction both operate on
-    // them — a rotation landing mid-load can never leave the coverage
-    // decision and the trust store disagreeing about which bytes they saw.
+    // Read each file once: the coverage check and the verifier use the same snapshot, so a
+    // rotation landing mid-load cannot make them disagree.
     let ca_certs = read_ca_cert_ders(ca_bundle_path)?;
     let crls = match crl_path {
         Some(path) => load_crls(path)?,
@@ -875,11 +845,8 @@ fn build_from_paths(
             })?;
     }
     if let Some(path) = crl_path {
-        // Fail fast on the #2706 availability trap: a CRL set that covers
-        // only some of the bundle's CAs makes rustls refuse the clients of
-        // the rest (unknown revocation status is denied once any CRL is
-        // configured). Checked against the same snapshot the verifier is
-        // built from, above.
+        // Once any CRL is configured, rustls denies unknown revocation status, so CRLs covering
+        // only some CAs would refuse the other CAs' clients (#2706).
         let gaps = crl_coverage_gaps_in(&ca_certs, &crls, ca_bundle_path, path)?;
         if !gaps.is_empty() {
             return Err(TlsError::CrlCoverageGap {
@@ -1205,9 +1172,8 @@ where
             .map(|info| info.0.clone());
         let identity = match connect_info {
             Some(info) => {
-                // Re-stamp the plain peer address so everything downstream —
-                // trusted-proxy resolution, `ClientAddr`, rate limiting — sees
-                // exactly what it sees on the plain-TCP path.
+                // Re-stamp the plain peer address so downstream code (proxy resolution,
+                // `ClientAddr`, rate limiting) sees what it sees on plain TCP.
                 req.extensions_mut()
                     .insert(axum::extract::ConnectInfo(info.peer));
                 info.client
@@ -1359,15 +1325,10 @@ where
     fn call(&mut self, req: http::Request<axum::body::Body>) -> Self::Future {
         let required = match &self.scope {
             RequirementScope::AllRoutes => true,
-            // Skip the path normalization for the common no-op case: a
-            // `[server.tls.client_auth]` with no `required_paths` never has to
-            // clean a path. The layer itself is still in the stack.
+            // Skip normalization when no `required_paths` are configured.
             RequirementScope::Paths(paths) if paths.is_empty() => false,
-            // Match the RAW path as well as the normalized one. Normalization
-            // resolves dot segments, so `/internal/%2e%2e` cleans to `/` and
-            // stops matching `/internal` — but axum's router matches the raw
-            // path, so it still dispatches that request to `/internal/{id}`.
-            // A requirement must fail closed: match either spelling.
+            // Match the raw path as well as the normalized one, to fail closed: `/internal/%2e%2e`
+            // cleans to `/`, but axum routes the raw path to `/internal/{id}`.
             RequirementScope::Paths(paths) => {
                 let raw = req.uri().path();
                 path_matches_any(raw, paths)
@@ -1377,10 +1338,8 @@ where
         let verified = req.extensions().get::<Arc<ClientIdentity>>().is_some();
 
         if required && !verified {
-            // The handshake itself succeeded (an `optional` listener, or a
-            // plain-HTTP listener), so this is a route-level refusal, not a
-            // transport one — count it so the rejection is observable next to
-            // the handshake-level ones.
+            // A route-level refusal after a successful handshake; counted alongside the
+            // handshake-level ones.
             crate::metrics::counter(ROUTE_REJECTED_METRIC).increment(1);
             let response = axum::response::IntoResponse::into_response(
                 crate::error::AutumnError::forbidden_msg(REQUIRED_REJECTION_MESSAGE),
@@ -1413,9 +1372,8 @@ pub const ROUTE_REJECTED_METRIC: &str = "tls_client_auth_route_rejected_total";
 /// `required` listener refusing a client that presented no certificate.
 #[must_use]
 pub fn record_handshake_rejection(error: &std::io::Error, peer: std::net::SocketAddr) -> bool {
-    // `tokio_rustls` surfaces a handshake failure as an `io::Error` whose inner
-    // error is the `rustls::Error`; anything else (a dropped socket, a timeout)
-    // is not a certificate rejection.
+    // `tokio_rustls` wraps a handshake failure's `rustls::Error` in an `io::Error`; anything
+    // else (a dropped socket, a timeout) is not a certificate rejection.
     let Some(rustls_error) = error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<rustls::Error>())
@@ -1500,8 +1458,7 @@ impl CrlInspection {
 pub fn inspect_client_ca_bundle(path: &Path) -> Result<Vec<CaInspection>, TlsError> {
     use x509_parser::prelude::FromDer as _;
 
-    // Load through the runtime path first, so doctor rejects exactly what the
-    // server rejects rather than grading a bundle that will not boot.
+    // Load through the runtime path first, so doctor rejects exactly what the server rejects.
     load_client_roots(path)?;
 
     let mut out = Vec::new();
@@ -1622,7 +1579,6 @@ mod tests {
         assert!(id.has_san("DNS:SVC-Orders.Internal"));
         assert!(!id.has_san("URI:SPIFFE://autumn.test/svc/orders"));
 
-        // Fingerprint is the SHA-256 of the DER, hex, prefixed.
         let expected = {
             use std::fmt::Write as _;
 
@@ -1640,11 +1596,8 @@ mod tests {
 
     #[test]
     fn common_name_cannot_be_smuggled_through_another_attribute() {
-        // `X509Name`'s Display does not escape attribute values, so a subject
-        // carrying `O=Acme, CN=svc-payments` renders indistinguishably from two
-        // real attributes. The CN must come from the PARSED name, or an
-        // enrolment service that copies `O` from a CSR lets a caller pick its
-        // own identity.
+        // `X509Name`'s Display does not escape attribute values, so `O=Acme, CN=svc-payments`
+        // renders like two real attributes. The CN must come from the parsed name.
         let id = ClientIdentity::from_der(&first_der(SPOOFED_CN_PEM))
             .expect("parse the spoofed certificate");
         assert!(
@@ -1733,8 +1686,7 @@ mod tests {
 
     #[test]
     fn crl_coverage_names_the_ca_with_no_crl() {
-        // The rotation shape from #2706: old + new CA in one bundle, but the
-        // CRL file names only the old CA.
+        // Old + new CA in one bundle, but the CRL covers only the old CA (#2706).
         let (_bundle_dir, bundle) = write_temp("ca.pem", &format!("{CA_PEM}{OTHER_CA_PEM}"));
         let (_crl_dir, crl) = write_temp("crl.pem", CRL_PEM);
         let gaps = crl_coverage_gaps(&bundle, &crl).expect("coverage check runs");
@@ -1748,8 +1700,7 @@ mod tests {
 
     #[test]
     fn a_crl_from_a_renewed_cas_old_key_does_not_cover_it() {
-        // Same subject DN, new key: the old key's CRL names the renewed CA
-        // but rustls rejects it on signature, so it must not count as cover.
+        // Same subject DN, new key: rustls rejects the old key's CRL on signature.
         const RENEWED_CA_PEM: &str =
             include_str!("../../tests/fixtures/tls/client/renewed-ca.cert.pem");
         let (_bundle_dir, bundle) = write_temp("ca.pem", &format!("{CA_PEM}{RENEWED_CA_PEM}"));
@@ -1765,10 +1716,8 @@ mod tests {
 
     #[test]
     fn an_intermediate_issued_crl_stands_the_bundle_check_down() {
-        // Bundle holds the root, the CRL comes from an intermediate the
-        // client presents: end-entity revocation is checked against the
-        // intermediate's CRL, so demanding a root CRL would refuse a working
-        // PKI at boot.
+        // The bundle holds the root; the CRL comes from an intermediate the client presents.
+        // End entities are checked against that CRL, so no root CRL is needed.
         const INTERMEDIATE_CRL_PEM: &str =
             include_str!("../../tests/fixtures/tls/client/intermediate-crl.pem");
         let (_bundle_dir, bundle) = write_temp("ca.pem", CA_PEM);
@@ -1788,9 +1737,8 @@ mod tests {
 
     #[test]
     fn a_bundled_root_that_signed_a_bundled_intermediate_needs_no_crl() {
-        // Root + its issuing intermediate in one bundle, CRL from the
-        // intermediate: leaves are checked against the intermediate's CRL, so
-        // a missing root CRL must not refuse the boot.
+        // Root + intermediate in one bundle, CRL from the intermediate: leaves are checked
+        // against the intermediate's CRL, so the root needs none.
         const BUNDLED_INTERMEDIATE_PEM: &str =
             include_str!("../../tests/fixtures/tls/client/bundled-intermediate.cert.pem");
         const BUNDLED_INTERMEDIATE_CRL_PEM: &str =
@@ -1802,8 +1750,7 @@ mod tests {
             crl_coverage_gaps(&bundle, &crl).expect("coverage check runs"),
             Vec::<String>::new()
         );
-        // The intermediate itself is still bottom tier: without its CRL it
-        // is named.
+        // The intermediate is bottom tier, so without its CRL it is named.
         let (_old_crl_dir, old_crl) = write_temp("crl.pem", CRL_PEM);
         let gaps = crl_coverage_gaps(&bundle, &old_crl).expect("coverage check runs");
         assert_eq!(gaps.len(), 1, "{gaps:?}");
@@ -1823,8 +1770,7 @@ mod tests {
 
     #[test]
     fn the_startup_path_refuses_a_crl_set_that_covers_only_some_cas() {
-        // `build_from_paths` is the boot path (and the trust-store reload
-        // path): it must fail closed on the #2706 availability trap.
+        // `build_from_paths` serves boot and reload, and must fail closed here (#2706).
         let (_bundle_dir, bundle) = write_temp("ca.pem", &format!("{CA_PEM}{OTHER_CA_PEM}"));
         let (_crl_dir, crl) = write_temp("crl.pem", CRL_PEM);
         let err = build_from_paths(
@@ -1894,8 +1840,7 @@ mod tests {
         assert!(reloadable.offer_client_auth());
         assert!(!reloadable.client_auth_mandatory());
         assert_eq!(reloadable.mode(), ClientAuthMode::Optional);
-        // No hint subjects are advertised: the store rotates, so a borrowed
-        // snapshot could not outlive the swap it describes.
+        // No hint subjects: a borrowed snapshot of a rotating store could not outlive a swap.
         assert!(reloadable.root_hint_subjects().is_empty());
     }
 
@@ -2042,8 +1987,7 @@ mod tests {
     #[test]
     fn a_required_prefix_covers_the_bare_path_but_not_a_sibling() {
         let prefixes = vec!["/internal/".to_owned()];
-        // The regression: an index handler mounted at exactly `/internal` was
-        // left open by a prefix written with a trailing slash.
+        // A prefix written with a trailing slash still covers exactly `/internal`.
         assert!(path_matches_any("/internal", &prefixes));
         assert!(path_matches_any("/internal/", &prefixes));
         assert!(path_matches_any("/internal/keys", &prefixes));
@@ -2060,8 +2004,7 @@ mod tests {
 
     #[test]
     fn a_multi_crl_file_reports_the_earliest_next_update() {
-        // rustls enforces every CRL in the file, so one stale entry makes the
-        // file stale — reporting only the first CRL's window would hide it.
+        // rustls enforces every CRL in the file, so one stale entry makes the file stale.
         let (_dir, path) = write_temp("crl.pem", &format!("{CRL_EMPTY_PEM}{CRL_PEM}"));
         let crl = inspect_crl(&path).expect("multi-CRL file inspects");
         assert_eq!(crl.issuers.len(), 2);
@@ -2119,8 +2062,7 @@ mod tests {
 
     #[test]
     fn leaves_ordinary_handshake_failures_unclassified() {
-        // Server-only TLS keeps #1603's logging: only client-certificate
-        // failures are re-reported as mTLS rejections.
+        // Only client-certificate failures count as mTLS rejections.
         assert_eq!(
             RejectionReason::classify(&rustls::Error::DecryptError),
             None
@@ -2166,7 +2108,6 @@ mod tests {
         );
         assert_eq!(crl.revoked_count, 1);
         assert!(!crl.is_stale(super::super::now_unix()));
-        // A CRL whose nextUpdate has passed is stale.
         assert!(crl.is_stale(crl.next_update_unix.expect("fixture has nextUpdate") + 1));
     }
 

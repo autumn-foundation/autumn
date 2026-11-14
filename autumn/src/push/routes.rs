@@ -124,17 +124,15 @@ async fn vapid_public_key(
             StatusCode::OK,
             [
                 ("content-type", "text/plain; charset=utf-8"),
-                // Per-deployment, not per-user, and stable — but never
-                // worth a shared cache holding it across a key rotation.
-                // The CSRF token below makes it per-visitor besides.
+                // Stable per deployment, but a shared cache must not hold it across a key
+                // rotation, and the CSRF token below makes the response per-visitor.
                 ("cache-control", "no-store"),
             ],
             key,
         )
             .into_response(),
-        // 503, not 200-with-empty-body: the client must be able to tell "push
-        // is not configured here" from "here is your key", and a
-        // `NotConfigured` app is expected to start working once configured.
+        // 503, not an empty 200: the client must tell "not configured" from a key, and the
+        // deployment may be configured later.
         Err(e) => (
             StatusCode::SERVICE_UNAVAILABLE,
             [("cache-control", "no-store")],
@@ -143,14 +141,10 @@ async fn vapid_public_key(
             .into_response(),
     };
 
-    // Attached AFTER the match, so both branches carry it.
-    //
-    // The `503` needs it just as much as the `200`: a deployment that removes
-    // its VAPID key still has browsers holding subscriptions, and the
-    // unsubscribe flow primes its token from exactly this endpoint. Without a
-    // token there, the follow-up `POST /push/unsubscribe` is rejected while
-    // the client still drops its local subscription — stranding the server row
-    // forever, since nothing will ever push to it again to earn a `410`.
+    // The 503 needs the token too: after a deployment drops its VAPID key, browsers still
+    // unsubscribe with a token primed here. Without it `POST /push/unsubscribe` is rejected while
+    // the client drops its local subscription, stranding the server row: nothing will push to it
+    // again to earn a `410`.
     if let Some((token, header_name)) = csrf_headers {
         let headers = response.headers_mut();
         if let (Ok(token), Ok(name)) = (
@@ -172,8 +166,6 @@ async fn subscribe(
     Json(subscription): Json<BrowserSubscription>,
 ) -> AutumnResult<StatusCode> {
     let principal = parts.resolve(&state).await?;
-    // `From<PushError>` carries the status mapping, so this route and an
-    // application's own handler answer a malformed payload identically.
     push.subscribe(principal, &subscription).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -186,10 +178,8 @@ async fn unsubscribe(
     Json(body): Json<UnsubscribeBody>,
 ) -> AutumnResult<StatusCode> {
     let principal = parts.resolve(&state).await?;
-    // The result is deliberately discarded: an endpoint that was already gone
-    // (or belongs to someone else) is still a successful unsubscribe from the
-    // caller's point of view, and reporting the difference would tell one user
-    // whether an endpoint belongs to another.
+    // An endpoint already gone or owned by someone else still answers success: reporting the
+    // difference would tell one user whether an endpoint belongs to another.
     push.unsubscribe(principal, &body.endpoint).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -215,16 +205,10 @@ impl FromRequestParts<AppState> for RequestPrincipal {
 impl RequestPrincipal {
     /// Resolve the calling principal, or `401`.
     async fn resolve(mut self, state: &AppState) -> AutumnResult<String> {
-        // 1. Whatever the framework's auth layers published (bearer tokens and
-        //    `#[secured]` session auth both land here).
-        //
-        //    `scoped_actor`, not `actor`: the latter falls back to the
-        //    PROCESS-WIDE default actor when no request scope is in effect,
-        //    which an app sets for its job runner (`set_default_actor`). This
-        //    router is a mergeable `Router<AppState>` that can be mounted on a
-        //    trimmed stack, and a route whose whole security model is "resolve
-        //    the caller server-side" must never resolve an *unauthenticated*
-        //    request to some ambient global identity.
+        // 1. Whatever the auth layers published (bearer tokens, `#[secured]` session auth).
+        //    `scoped_actor`, not `actor`: `actor` falls back to the process-wide default actor
+        //    (`set_default_actor`, set for job runners), and this router can be mounted on a
+        //    trimmed stack where an unauthenticated request must not resolve to that identity.
         if let Some(actor) = crate::current::Current::scoped_actor() {
             return Ok(actor);
         }
@@ -232,9 +216,8 @@ impl RequestPrincipal {
         // 2. The signed-in user on the session, for an app whose push routes
         //    are not themselves behind an auth layer.
         let session_key = state.config().auth.session_key.clone();
-        // `Session`'s extractor rejection is `Infallible`, so this binding is
-        // irrefutable — leading it with `if let Ok(..)` in a let chain is a
-        // `-D warnings` failure (`irrefutable_let_patterns`).
+        // `Session`'s rejection is `Infallible`, so this pattern is irrefutable; an `if let`
+        // would fail `irrefutable_let_patterns`.
         let Ok(session) = crate::session::Session::from_request_parts(&mut self.0, state).await;
         if let Some(user_id) = session.get(&session_key).await {
             return Ok(user_id);

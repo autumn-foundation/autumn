@@ -232,8 +232,6 @@ where
 mod tests {
     use super::*;
 
-    // ── is_truthy ──────────────────────────────────────────────────────────
-
     #[test]
     fn is_truthy_recognises_common_values() {
         for v in ["1", "true", "TRUE", "yes", "on", "True"] {
@@ -247,8 +245,6 @@ mod tests {
             assert!(!is_truthy(v), "{v} should not be truthy");
         }
     }
-
-    // ── resolve_deploy_version ─────────────────────────────────────────────
 
     #[test]
     fn resolve_defaults_to_stable() {
@@ -277,8 +273,6 @@ mod tests {
         assert_eq!(resolve_deploy_version(Some("  "), Some("true")), CANARY);
         assert_eq!(resolve_deploy_version(Some(""), None), STABLE);
     }
-
-    // ── CanaryState ────────────────────────────────────────────────────────
 
     #[test]
     fn from_env_reads_canary_flag() {
@@ -348,8 +342,6 @@ mod tests {
         assert!(clone.rollback_requested());
     }
 
-    // ── file protocol ──────────────────────────────────────────────────────
-
     #[test]
     fn rollback_flag_absent_by_default() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -380,8 +372,6 @@ mod tests {
         assert!(CanaryState::remove_rollback_flag(&path).unwrap());
         assert!(!CanaryState::remove_rollback_flag(&path).unwrap());
     }
-
-    // ── CanaryRoute extractor ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn canary_route_reads_header() {

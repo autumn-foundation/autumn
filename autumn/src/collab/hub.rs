@@ -613,16 +613,13 @@ impl CollabHub {
         key: &str,
         seed: impl FnOnce() -> CollabText,
     ) -> Result<CollabDoc, CollabError> {
-        // Already live: hand back the shared document and never call the seed.
         if let Some(state) = self.live(key) {
             return Ok(self.handle_for(key, state));
         }
 
-        // Not live: build the seed with the registry UNLOCKED. Under the lock
-        // it would block every other document's joins, a panic in it would
-        // poison the registry for the whole process, and a seed that touched
-        // the hub again would deadlock on a non-reentrant mutex. A race builds
-        // the value twice and discards the loser, which nothing observes.
+        // Build the seed with the registry unlocked. Under the lock it would block every other
+        // document's joins, a panic would poison the registry, and a seed that touched the hub
+        // would deadlock. A race builds the value twice and discards the loser.
         let seeded = seed();
 
         let mut docs = self
@@ -635,8 +632,7 @@ impl CollabHub {
             drop(docs);
             return Ok(self.handle_for(key, state));
         }
-        // Drop entries whose document is gone before counting: a dead weak
-        // reference costs a map slot, not a document.
+        // Drop dead weak entries before counting: they cost a map slot, not a document.
         docs.retain(|_, weak| weak.strong_count() > 0);
         if docs.len() >= self.inner.limits.max_documents {
             let open = docs.len();
@@ -653,13 +649,10 @@ impl CollabHub {
                 limit: self.inner.limits.max_documents,
             });
         }
-        // The seed is measured like anything else the document holds, against
-        // both bounds. A row can be over either without anyone having typed a
-        // character into this hub: a limit lowered since it was written, or a
-        // document that is wire-valid at 10 000 elements *plus* 1 000 buffered
-        // operations, because `Deserialize` bounds those two separately.
-        // Installing it would put the authority over its own advertised bound
-        // and leave it refusing edits to a document it served.
+        // A stored row can be over the bound without anyone typing here: the limit may have
+        // been lowered, and `Deserialize` bounds elements and buffered operations separately,
+        // so 10 000 elements plus 1 000 pending is wire-valid. Installing it would leave the
+        // hub refusing edits to a document it served.
         let held = seeded.element_count() + seeded.pending_len();
         if held > self.inner.limits.max_document_chars {
             drop(docs);
@@ -674,15 +667,10 @@ impl CollabHub {
                 limit: self.inner.limits.max_document_chars,
             });
         }
-        // And the buffer on its own, which the total above does not cover: a
-        // thousand-odd unresolved operations are far below
-        // `max_document_chars` while being past what the decoder accepts. The
-        // merge paths have refused this since they learned to; the seed is the
-        // third door into the same document and was still open. A caller can
-        // reach it without a hub at all — build the value through `apply` and
-        // `encode_column`, store it, and seed from the row later — and the hub
-        // would then serve and persist a document that offline sync and every
-        // other serde consumer refuse to read.
+        // The buffer on its own: a thousand-odd unresolved operations are far below
+        // `max_document_chars` but past what the decoder accepts. A seed built through `apply`
+        // and `encode_column` can carry that, and serving it would persist a document every
+        // serde consumer refuses to read.
         if seeded.pending_len() > MAX_WIRE_PENDING {
             drop(docs);
             tracing::warn!(
@@ -750,19 +738,14 @@ impl CollabHub {
             .expect("collab registry lock poisoned");
         let state = docs.get(key).and_then(Weak::upgrade)?;
         let mut guard = state.lock().expect("collab document lock poisoned");
-        // Refuse while an editor is still here. Evicting would not stop them:
-        // they hold the same `Arc` and keep editing a document nobody can
-        // find, while the next joiner re-seeds from the row and starts a
-        // second, divergent copy. The last editor to leave evicts it.
+        // Refuse while an editor is still here: they hold the same `Arc` and would keep editing
+        // a document nobody can find, while the next joiner re-seeds a divergent copy.
         if guard.sessions > 0 {
             return None;
         }
-        // One close at a time. Two persistence paths racing here — an idle
-        // sweep against a disconnect hook — would each get a guard over the
-        // same state and each start a write. The first to finalize releases
-        // the document; an editor reopens and edits a fresh authority; the
-        // second write then lands on top of it with the older text, and its
-        // `finalize` sees a different `Arc` and says nothing.
+        // One close at a time. Two racing persistence paths (an idle sweep and a disconnect
+        // hook) would both write; after the first releases and an editor reopens, the second
+        // write overwrites the fresh document with older text.
         if guard.close_claim.upgrade().is_some() {
             return None;
         }
@@ -909,10 +892,9 @@ impl CollabClose {
         if state.sessions > 0 {
             return None;
         }
-        // Moved on since the state that was just written was taken. Hand the
-        // caller what the document actually holds now. Releasing here would
-        // drop it: this guard is the last thing keeping it alive, so the
-        // difference would exist in no row and no memory.
+        // Edited since the persisted state was taken: hand back the current state instead.
+        // This guard is the last thing keeping the document alive, so releasing would lose the
+        // difference.
         if state.revision != self.revision {
             let text = state.doc.clone();
             let revision = state.revision;
@@ -928,8 +910,8 @@ impl CollabClose {
                 claim: self.claim,
             });
         }
-        // Under the same lock as the removal, so no edit can slip between
-        // "still registered" and "released".
+        // Under the same lock as the removal, so no edit slips between "registered" and
+        // "released".
         state.released = true;
         drop(state);
         docs.remove(&self.key);
@@ -1109,10 +1091,7 @@ impl CollabDoc {
     /// Panics if the internal document mutex is poisoned.
     #[must_use]
     pub fn participants(&self) -> Vec<CollabParticipant> {
-        // Membership first, then each caret read in place under the document
-        // lock: the two locks are still never held together, and the whole
-        // caret map is no longer copied out (one actor string per editor, on
-        // every cursor move) to read one `usize` per editor.
+        // Presence first, then the document lock: the two are never held together.
         let entries = self.presence.list(self.topic_name());
         let state = self
             .state
@@ -1169,11 +1148,9 @@ impl CollabDoc {
                 }
                 let ops = {
                     let mut state = self.editable()?;
-                    // The hub minted every id in this document, so an anchor
-                    // it has never seen is a client fault. Refusing it here
-                    // stops two things at once: an anchor from the future
-                    // would drag the Lamport clock up with it, and an
-                    // unintegrable insert would sit in the buffer forever.
+                    // The hub minted every id, so an unknown anchor is a client fault. Accepting
+                    // it would drag the Lamport clock forward and leave the insert buffered
+                    // forever.
                     if let Some(anchor) = after.as_ref()
                         && !state.doc.knows(anchor)
                     {
@@ -1181,8 +1158,7 @@ impl CollabDoc {
                             id: anchor.to_string(),
                         });
                     }
-                    // Tombstones and buffered operations count too: they are
-                    // what the document costs, not what it shows.
+                    // Tombstones and buffered operations count: they are what the document costs.
                     let held = state.doc.element_count() + state.doc.pending_len();
                     if held + added > self.limits.max_document_chars {
                         return Err(CollabError::DocumentFull {
@@ -1204,11 +1180,8 @@ impl CollabDoc {
                 }
                 let ops = {
                     let mut state = self.editable()?;
-                    // `remove_known`, not `remove_ids`: a delete for a
-                    // character the hub has never seen must be dropped, not
-                    // buffered. Buffered, it would tombstone that character
-                    // the moment somebody typed it — one message could
-                    // pre-delete another editor's next thousand keystrokes.
+                    // `remove_known`, not `remove_ids`: a buffered delete for an unseen id would
+                    // tombstone that character the moment somebody typed it.
                     state.edit(|doc| doc.remove_known(&ids))
                 };
                 self.broadcast_ops(&ops);
@@ -1237,14 +1210,9 @@ impl CollabDoc {
                             id: anchor.to_string(),
                         });
                     }
-                    // Every refusal before the first mutation. That is the
-                    // whole reason this is one message: the delete cannot be
-                    // the part that lands while the insert is turned away.
-                    //
-                    // The insert is charged in full, with no credit for what
-                    // the delete removes — a tombstone costs what a character
-                    // costs. So a document at the limit refuses this too, and
-                    // refuses it whole, which is the difference that matters.
+                    // Every refusal comes before the first mutation, so the delete never lands
+                    // without the insert. The insert gets no credit for the delete: a tombstone
+                    // costs what a character costs.
                     let held = state.doc.element_count() + state.doc.pending_len();
                     if held + added > self.limits.max_document_chars {
                         return Err(CollabError::DocumentFull {
@@ -1297,9 +1265,7 @@ impl CollabDoc {
         let (accepted, waiting) = {
             let mut state = self.editable()?;
             let held = state.doc.element_count() + state.doc.pending_len();
-            // Charge only what the batch would actually add. A reconnecting
-            // peer replays its whole history, so counting the batch length
-            // would refuse an idempotent replay that adds nothing.
+            // Charge only what the batch adds: a reconnecting peer replays its whole history.
             let novel = state.doc.novel_count(ops.iter());
             if held + novel > self.limits.max_document_chars {
                 return Err(CollabError::DocumentFull {
@@ -1308,29 +1274,14 @@ impl CollabDoc {
                 });
             }
             Self::check_pending(&state.doc, ops, novel)?;
-            // Keep only what the authority took, and only the first time it
-            // takes it. `apply` refuses an id past `MAX_COUNTER` outright, and
-            // a browser replica has no such check — broadcasting a refused
-            // operation would put a character in every client that the
-            // document does not have, and every later edit anchored to it
-            // would then come back as unknown.
-            //
-            // `holds_pending` alone cannot tell "newly buffered" from "was
-            // already buffered", so asking it after the fact re-broadcast
-            // every idempotent replay. A reconnecting peer replays its whole
-            // history, so an operation whose cause never arrives would go out
-            // again on every reconnect and sit in every client's causal buffer
-            // once more.
+            // Broadcast only what the authority took, and only the first time. `apply` refuses
+            // ids at or past `MAX_COUNTER` and a browser replica does not, so broadcasting a
+            // refused op would give clients a character the document lacks.
             let accepted: Vec<CollabOp> = ops
                 .iter()
                 .filter(|op| {
-                    // Nothing new: already integrated, or already waiting.
-                    // `apply` answers `true` for an idempotent replay of an
-                    // integrated operation just as it does for a first
-                    // arrival, so asking it alone re-broadcast a reconnecting
-                    // peer's entire history to every socket — and bumped the
-                    // revision each time, which is what tells a close guard
-                    // the document moved on.
+                    // Skip replays before `apply`: it returns `true` for those too, which would
+                    // re-broadcast them and bump the revision a close guard watches.
                     if state.doc.already_applied(op) || state.doc.holds_pending(op) {
                         return false;
                     }
@@ -1371,8 +1322,7 @@ impl CollabDoc {
         let mut state = self.editable()?;
         let held = state.doc.element_count() + state.doc.pending_len();
         let novel = state.doc.novel_count(ops.iter());
-        // The same bound `handle` and `apply_remote` enforce. Without it a
-        // delivered batch is a way around the limit entirely.
+        // The same bound `handle` and `apply_remote` enforce.
         if held + novel > self.limits.max_document_chars {
             return Err(CollabError::DocumentFull {
                 got: held,
@@ -1380,9 +1330,7 @@ impl CollabDoc {
             });
         }
         Self::check_pending(&state.doc, ops, novel)?;
-        // Borrowed: on the authority these are its own operations coming back
-        // to every editor's socket loop, and they integrate as no-ops, so a
-        // copy of each was made only to be dropped.
+        // Borrowed: on the authority these are usually its own ops echoing back as no-ops.
         state.edit(|doc| {
             for op in ops {
                 doc.apply_ref(op);
@@ -1464,11 +1412,8 @@ impl CollabDoc {
         };
         let topic = self.topic_name();
         if let Err(error) = self.channels.publish(topic, json) {
-            // Encoded again rather than cloned up front: the publish took
-            // the first copy, and only a full or closed Redis queue (or an
-            // interceptor's refusal) lands here, so a clone kept for it
-            // charged every keystroke for a path almost none take. The
-            // encoding is deterministic: the same bytes go out.
+            // Re-encoded rather than cloned up front: this path is rare, and the encoding is
+            // deterministic.
             let delivered = serde_json::to_string(message).map_or(0, |json| {
                 self.channels
                     .backend()
@@ -1580,11 +1525,9 @@ impl Drop for CollabSession {
         drop(self.presence.take());
         self.doc.broadcast_presence();
 
-        // Nothing is evicted here on purpose. The registry points at the
-        // document weakly, so it goes when the last `CollabDoc` handle does —
-        // which is *after* the handler has persisted it. Removing it here
-        // instead would let a reconnect in that window re-seed from the stale
-        // row and then lose the departing editor's work to the late save.
+        // No eviction here: the registry is weak, so the document goes with the last
+        // `CollabDoc` handle, after the handler persists it. Evicting now would let a
+        // reconnect re-seed from the stale row and lose this editor's work to the late save.
     }
 }
 
@@ -1657,14 +1600,11 @@ pub async fn serve_socket(
         return;
     }
 
-    // Presence entries expire on a TTL (30 s by default) and a background
-    // sweep evicts them. Without a heartbeat every editor would vanish from
-    // the participant list while still connected and typing.
+    // Presence entries expire on a TTL (30 s by default); renew them while connected.
     let mut heartbeat = tokio::time::interval(PRESENCE_REFRESH);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // A client that keeps falling behind the broadcast buffer costs a full
-    // document resend each time. Give it a few chances, then let it reconnect.
+    // Each lag costs a full resend. Give a slow client a few, then let it reconnect.
     let mut lags = 0u32;
 
     loop {
@@ -1705,15 +1645,9 @@ pub async fn serve_socket(
                 match update {
                     Ok(update) => {
                         let text = update.into_string();
-                        // With a multi-replica backend (Redis), this is how
-                        // another replica's operations reach us. Merge them
-                        // into the local authority before forwarding: a
-                        // client that saw a character here would otherwise
-                        // anchor its next edit to one this replica has never
-                        // heard of, and `handle` would refuse it as unknown.
-                        // Locally-produced operations arrive here too and
-                        // re-apply as no-ops, which is what idempotence is
-                        // for.
+                        // With a multi-replica backend, another replica's ops arrive here. Merge
+                        // them before forwarding, or the client's next edit anchors to an id
+                        // `handle` refuses as unknown. Local ops re-apply as no-ops.
                         let refused = if may_be_ops_frame(&text)
                             && let Ok(CollabServerMessage::Ops { ops }) =
                                 serde_json::from_str::<CollabServerMessage>(&text)
@@ -1732,12 +1666,8 @@ pub async fn serve_socket(
                             false
                         };
                         if refused {
-                            // Forwarding anyway would put characters in this
-                            // editor that the replica it is talking to does
-                            // not have. Its next edit would anchor to one of
-                            // them and come back refused as unknown — the
-                            // editor punished for the replica's shortfall.
-                            // Hand it what this replica actually holds.
+                            // Forwarding would give the editor characters this replica lacks.
+                            // Send what this replica holds instead.
                             if send_json(&mut socket, &session.snapshot()).await.is_err() {
                                 break;
                             }
@@ -1747,13 +1677,9 @@ pub async fn serve_socket(
                             break;
                         }
                     }
-                    // Lagged: this editor fell behind the broadcast buffer,
-                    // so it has missed operations. Resend the whole document
-                    // rather than let it drift — but a resend is larger than
-                    // the backlog it replaces, so a client that cannot keep
-                    // up would lag again on every pass, taking the shared
-                    // document lock each time. After a few tries, close and
-                    // let it reconnect on a fresh subscription.
+                    // Missed operations: resend the whole document. A resend is larger than
+                    // the backlog, so a client that cannot keep up lags again each pass; after
+                    // a few tries, close and let it reconnect.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         lags += 1;
                         if lags > MAX_LAG_RESENDS {

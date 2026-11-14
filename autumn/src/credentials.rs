@@ -724,7 +724,7 @@ mod tests {
     fn load_credentials_returns_file_truncated_for_non_utf8_plaintext() {
         let tmp = TempDir::new().unwrap();
         let key = MasterKey::generate();
-        // Encrypt bytes that are valid AES-GCM output but not valid UTF-8 TOML
+        // Decrypts fine, but the plaintext is not valid UTF-8.
         let non_utf8 = vec![0xC0u8, 0x80u8, 0xFF, 0xFE]; // invalid UTF-8 sequence
         let ct = encrypt(&key, &non_utf8);
         std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
@@ -778,7 +778,7 @@ mod tests {
         let ct = encrypt(&key, b"x = \"y\"\n");
         std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
         std::fs::write(tmp.path().join("config/credentials/dev.toml.enc"), &ct).unwrap();
-        // No override and no env var → NoKeyFound
+        // No override, and the env fallback has no key either.
         let err = load_credentials_with_key_override("dev", tmp.path(), None).unwrap_err();
         assert!(matches!(err, CredentialsError::NoKeyFound));
     }

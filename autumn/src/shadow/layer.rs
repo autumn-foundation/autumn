@@ -212,9 +212,7 @@ pub struct ShadowMirrorService<S> {
 impl<S, ReqBody> Service<Request<ReqBody>> for ShadowMirrorService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<Body>>,
-    // The body gate in `decide` needs the body's own end-of-stream signal to
-    // catch *undeclared* bodies (issue #2332): the request type must be an
-    // `http_body::Body`, which every real server body is.
+    // `decide` reads the body's end-of-stream signal to catch undeclared bodies (#2332).
     ReqBody: http_body::Body,
 {
     type Response = Response<Body>;
@@ -232,10 +230,7 @@ where
             req.method(),
             &target,
             req.headers(),
-            // The body's own end-of-stream signal: the undeclared-body half
-            // of the #2332 gate. A body that is already at end-of-stream (a
-            // normal bodiless GET, which the transport knows from framing)
-            // mirrors as before; anything else sits out.
+            // Only a body already at end-of-stream (a normal bodiless GET) may mirror (#2332).
             http_body::Body::is_end_stream(req.body()),
             || roll_from(ctx.entropy.as_ref()),
         );
@@ -243,19 +238,14 @@ where
         let pending = match decision {
             MirrorDecision::Mirror => Some(PendingMirror {
                 method: req.method().clone(),
-                // The trusted-proxy layer runs at the `axum::serve` boundary,
-                // outside this one, so its verdict is already stamped here.
+                // The trusted-proxy layer runs outside this one, so its verdict is already here.
                 headers: forwarded_headers(
                     req.headers(),
                     req.extensions()
                         .get::<crate::security::ResolvedClientIdentity>(),
                 ),
-                // Prefer axum's matched route template over the configured
-                // pattern: this layer is applied with `Router::layer`, which
-                // wraps each route's service, so routing — and the
-                // `MatchedPath` insertion — has already happened. It is a
-                // bounded, genuinely informative dimension; the raw path never
-                // is, which is why it is not the fallback.
+                // `Router::layer` wraps each route, so `MatchedPath` is already set. It is a
+                // bounded label; the raw path is not, so it is never the fallback.
                 route: req
                     .extensions()
                     .get::<axum::extract::MatchedPath>()
@@ -265,15 +255,9 @@ where
                     ),
                 target,
             }),
-            // Not mirrored: the request is forwarded with no wrapper at all, so
-            // the overwhelmingly common path costs one decision and nothing
-            // else — no body wrapper, no allocation. The one exception is the
-            // conditional skip, which the mirror layer counts: unlike the
-            // other skip reasons (configuration facts), conditional traffic is
-            // the coverage the mirror is silently giving up on cache-heavy
-            // routes, and the operator needs to see how much (issue #2335).
-            // The increment fires only on this rare path, never on the
-            // request path at large.
+            // Not mirrored: no wrapper, no allocation. Conditional skips are counted because they
+            // are coverage the mirror silently gives up on cache-heavy routes (#2335); the other
+            // skip reasons are configuration facts.
             MirrorDecision::Skip(reason) => {
                 if reason == SkipReason::Conditional {
                     self.ctx.registry.record_skipped_conditional();
@@ -325,11 +309,10 @@ impl MirrorContext {
         self: &Arc<Self>,
         pending: PendingMirror,
     ) -> Option<oneshot::Sender<Option<ResponseFacts>>> {
-        // A mirror is not a handler effect, and its client is not the recorded
-        // outbound seam: a replay starts none (#2351 item 1).
+        // A mirror is not a handler effect or a recorded outbound call: a replay starts none
+        // (#2351).
         #[cfg(feature = "reporting")]
-        // `current_tape`, not `tape_active`: only the reporting layer marks
-        // the replay scope as entered.
+        // `current_tape`, not `tape_active`: only the reporting layer marks the replay scope.
         if crate::capsule::effects::current_tape().is_some() {
             return None;
         }
@@ -340,10 +323,8 @@ impl MirrorContext {
         let Some(permit) =
             InFlightPermit::try_acquire(&self.in_flight, self.settings.max_in_flight)
         else {
-            // The candidate is not keeping up. Drop the mirror rather than
-            // queueing it: a queue would turn a slow shadow into unbounded
-            // memory growth on the *primary*, which is the one thing this
-            // feature must never do.
+            // Drop rather than queue: a queue would turn a slow shadow into unbounded memory
+            // growth on the primary.
             self.registry.record_dropped_at_capacity();
             record_outcome(&self.registry, &pending.route, "dropped");
             return None;
@@ -360,11 +341,8 @@ impl MirrorContext {
             route: pending.route,
         };
 
-        // Mirroring needs somewhere to run the detached task. There always is
-        // one on a served request, but a caller driving the router from a
-        // non-tokio executor would otherwise make `tokio::spawn` panic on the
-        // request path — which is precisely what this module's panic gate
-        // exists to prevent. No runtime means no mirror, not a broken request.
+        // A caller driving the router from a non-tokio executor would make `tokio::spawn` panic
+        // on the request path. No runtime means no mirror.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             tracing::debug!(
                 target: "autumn::shadow",
@@ -392,17 +370,13 @@ async fn run_mirror(
     request: ShadowRequest,
     primary_rx: oneshot::Receiver<Option<ResponseFacts>>,
 ) {
-    // The permit is released when this task ends, whatever the outcome.
     let _permit = permit;
 
-    // ONE deadline, stamped at dispatch, covers every stage: the shadow
-    // request, the wait for the primary body, and the comparison. Independent
+    // One deadline covers every stage (shadow request, primary body, comparison). Independent
     // timeouts would let a mirror hold a slot for a multiple of `timeout_ms`.
     let now = tokio::time::Instant::now();
-    // `checked_add`, not `+`: this module's panic gate denies arithmetic that
-    // can panic, and `Instant + Duration` does on overflow. An absurd
-    // `timeout_ms` therefore degrades to an immediate deadline — the mirror
-    // gives up rather than the request path panicking.
+    // `Instant + Duration` panics on overflow; an absurd `timeout_ms` becomes an immediate
+    // deadline instead.
     let deadline = now.checked_add(ctx.settings.timeout).unwrap_or(now);
 
     let shadow = match tokio::time::timeout_at(deadline, ctx.transport.send(request)).await {
@@ -425,36 +399,28 @@ async fn run_mirror(
         Ok(Ok(facts)) => facts,
     };
 
-    // The primary's teed body is bounded by the same deadline as the shadow
-    // request. It resolves when the CLIENT finishes reading the response, which
-    // is not something this process controls: a client reading a byte a minute,
-    // or a long-lived `text/event-stream`, would otherwise pin this permit for
-    // the life of that connection. `max_in_flight` of those and mirroring is
-    // silently off for the rest of the process's life. `Err` on the channel
-    // means the same thing arrived sooner — the client disconnected, or the
-    // response was aborted mid-stream.
+    // The primary body resolves when the client finishes reading it, so a slow reader or a
+    // long-lived `text/event-stream` would otherwise pin this permit. `Err` on the channel means
+    // the client disconnected or the response was aborted mid-stream.
     let Ok(Ok(primary)) = tokio::time::timeout_at(deadline, primary_rx).await else {
         ctx.registry.record_primary_incomplete();
         record_outcome(&ctx.registry, &context.route, "incomplete");
         return;
     };
 
-    // `None` means the primary body blew the capture budget; a shadow body may
-    // do the same.
+    // `None` means the primary body exceeded the capture budget; check the shadow body too.
     let (Some(primary), true) = (primary, shadow.body.len() <= ctx.settings.max_body_bytes) else {
         ctx.registry.record_skipped_oversize();
         record_outcome(&ctx.registry, &context.route, "skipped");
         return;
     };
 
-    // Decode, compare and record on the blocking pool, under the SAME deadline.
-    // Those steps are CPU work with no await point, so only a join under
-    // `timeout_at` can bound them (issue #2333). At the deadline the mirror is
-    // counted as `abandoned` and the slot is freed; `state` makes the work stop
-    // at its next step and record nothing.
+    // Decode, compare and record on the blocking pool under the same deadline: CPU work with no
+    // await point can only be bounded by a join under `timeout_at` (#2333). At the deadline the
+    // mirror counts as `abandoned` and `state` makes the work stop at its next step.
     //
-    // An abandoned job keeps its blocking thread until its step ends, so a
-    // second counter, held until the job returns, caps that pile-up.
+    // An abandoned job keeps its blocking thread until its step ends, so a second counter, held
+    // until the job returns, caps that pile-up.
     let Some(blocking) =
         InFlightPermit::try_acquire(&ctx.blocking, ctx.settings.max_in_flight.saturating_mul(2))
     else {
@@ -490,8 +456,7 @@ async fn run_mirror(
                 ctx.registry.record_comparison_abandoned();
                 record_outcome(&ctx.registry, &context.route, "abandoned");
             }
-            // Else the work already began recording. Do not wait for it: the
-            // slot must free at the deadline, and the job ends on its own.
+            // Else the work already began recording. Do not wait: the slot frees at the deadline.
         }
     }
 }
@@ -525,11 +490,8 @@ fn compare_and_record(
     if state.load(Ordering::Acquire) != RUNNING {
         return;
     }
-    // Decode BOTH sides. A handler can serve a precompressed representation, so
-    // the primary tee captures encoded bytes just as the candidate's response
-    // can arrive encoded; decoding only one side would report two identical
-    // builds as divergent. The failures are told apart: a body that expands past
-    // the budget is a *size* skip, a body that does not decode is an *error*.
+    // Decode both sides: a precompressed handler makes the primary tee capture encoded bytes too.
+    // A body that expands past the budget is a size skip; one that does not decode is an error.
     let primary_body = match decode_side(ctx, primary) {
         Ok(body) => body,
         Err(error) => {
@@ -594,10 +556,8 @@ fn compare_and_record(
         .registry
         .record_comparison(context, comparison, observed_at_ms);
 
-    // One WARN per distinct divergence, not per occurrence: a systematic
-    // regression diverges on EVERY mirrored request. The registry already
-    // collapses repeats by fingerprint. The recurrence count is in the actuator
-    // payload and in `autumn_shadow_divergences_total`.
+    // One WARN per distinct divergence, not per occurrence: a systematic regression diverges on
+    // every mirrored request. Repeats are counted in the actuator payload and the metric.
     if let Recorded::NewDivergence(divergence) = recorded {
         tracing::warn!(
             target: "autumn::shadow",
@@ -640,9 +600,8 @@ fn record_decode_failure(
         record_outcome(&ctx.registry, &context.route, "skipped");
         return;
     }
-    // Attributed to the side that produced it. `shadow_errors` is documented as
-    // candidate failures, so counting the live build's own malformed response
-    // there would send an operator hunting candidate connectivity.
+    // `shadow_errors` counts candidate failures only; the live build's own malformed response is
+    // a primary error.
     if side == PRIMARY {
         ctx.registry.record_primary_error();
         record_outcome(&ctx.registry, &context.route, "primary_error");
@@ -766,13 +725,9 @@ where
             return Poll::Ready(Ok(response));
         }
 
-        // A `HEAD` response carries no body on the wire, so the tee would never
-        // be polled and the facts would never be delivered — the mirror would
-        // burn a slot and record nothing. Worse, an upstream layer that *does*
-        // drain the body would hand the differ the `GET` body while the
-        // candidate's `HEAD` returns none, manufacturing a divergence on every
-        // request. Deliver empty facts now and leave the body alone: for a
-        // `HEAD`, status class is the only thing there is to compare.
+        // A `HEAD` response sends no body, so the tee might never be polled; and an upstream layer
+        // that drains it would diff the `GET` body against the candidate's empty `HEAD`. Deliver
+        // empty facts now: for a `HEAD`, status class is all there is to compare.
         let head = pending.method == Method::HEAD;
         let Some(tx) = this.ctx.begin_mirror(pending) else {
             return Poll::Ready(Ok(response));
@@ -823,9 +778,7 @@ fn tee_response(
 
     let (parts, body) = response.into_parts();
 
-    // A body that is already at end-of-stream (a `HEAD`, a `204`) may never be
-    // polled at all, so there would be no poll on which to deliver the facts.
-    // Deliver them now and leave the body untouched.
+    // A body already at end-of-stream (a `204`) may never be polled, so deliver the facts now.
     if http_body::Body::is_end_stream(&body) {
         let _ = tx.send(Some(ResponseFacts::encoded(
             status,
@@ -869,19 +822,14 @@ impl MirrorTeeBody {
         if self.overflowed {
             return;
         }
-        // Nobody is waiting any more — the mirror task gave up (its deadline,
-        // a transport failure) or finished. Without this check the buffer keeps
-        // growing to `max_body_bytes` for a receiver that no longer exists, so
-        // the memory the tee holds would be bounded by *inbound concurrency*
-        // rather than by `max_in_flight` — the ceiling would stop meaning what
-        // the module docs say it means.
+        // The mirror task gave up or finished. Stop buffering, or tee memory would be bounded by
+        // inbound concurrency instead of `max_in_flight`.
         if self.tx.as_ref().is_some_and(oneshot::Sender::is_closed) {
             self.tx = None;
             return;
         }
         if self.captured.len().saturating_add(data.len()) > self.max_body_bytes {
-            // Abandon rather than truncate: half a body would diff against
-            // half another body and manufacture divergences that are not real.
+            // Abandon rather than truncate: half a body would manufacture false divergences.
             self.overflowed = true;
             self.captured = BytesMut::new();
             return;
@@ -923,16 +871,15 @@ impl http_body::Body for MirrorTeeBody {
                     let data = data.clone();
                     this.capture(&data);
                 }
-                // A body that announces its end alongside its last frame is
-                // finished here; the consumer is entitled not to poll again.
+                // A body that announces its end with its last frame is finished: the consumer need
+                // not poll again.
                 if http_body::Body::is_end_stream(&this.inner) {
                     this.finish();
                 }
             }
             Poll::Ready(None) => this.finish(),
-            // A body that errored mid-stream never reached the client whole,
-            // so there is nothing comparable. Dropping the sender cancels the
-            // waiting mirror task.
+            // A body that errored mid-stream never reached the client whole. Dropping the sender
+            // cancels the waiting mirror task.
             Poll::Ready(Some(Err(_))) => {
                 this.tx = None;
             }
@@ -1203,9 +1150,7 @@ mod tests {
         let response = service.oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 
-        // The skip happens synchronously in `decide`: no detached mirror task
-        // is ever spawned, so asserting immediately is sound — there is
-        // nothing to settle.
+        // The skip happens synchronously in `decide`, so there is nothing to settle.
         assert!(
             transport.seen().is_empty(),
             "a conditional request must never reach the candidate"
@@ -1262,12 +1207,8 @@ mod tests {
         let registry = ShadowRegistry::new(10);
         let service = layer(transport.clone(), &registry, settings()).layer(echo_primary());
 
-        // A GET carrying a request body is legal (RFC 9110 does not forbid
-        // it) and search APIs do use it. The primary consumes the body and
-        // answers from it, but nothing is mirrored: the mirror replays
-        // method, target, and headers but no body, so mirroring it would ask
-        // the candidate a different request and record the manufactured
-        // difference as a divergence (issue #2332).
+        // A GET with a body is legal (search APIs use it). The mirror replays no body, so it
+        // would ask the candidate a different request (#2332).
         let body = r#"{"query":"shoes"}"#;
         let request = Request::builder()
             .uri("/api/orders")
@@ -1276,12 +1217,9 @@ mod tests {
             .expect("request");
         let response = service.oneshot(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        // The live request passes through untouched: the primary saw the
-        // whole body.
+        // The primary saw the whole body.
         assert_eq!(read_body(response).await, body);
 
-        // And the candidate never saw it: zero mirrored, zero compared,
-        // zero divergences.
         assert!(transport.seen().is_empty());
         let stats = registry.stats();
         assert_eq!(stats.mirrored, 0);
@@ -1298,10 +1236,8 @@ mod tests {
         let registry = ShadowRegistry::new(10);
         let service = layer(transport.clone(), &registry, settings()).layer(echo_primary());
 
-        // No `Content-Length`, no `Transfer-Encoding`: on HTTP/2 a client can
-        // legally send DATA frames on a GET stream without declaring them.
-        // The headers alone would wave this through — the body's own
-        // end-of-stream signal is what sits it out (issue #2332, option 1).
+        // No framing headers: on HTTP/2 a client can send DATA frames on a GET stream undeclared.
+        // Only the body's end-of-stream signal catches it (#2332).
         let body = r#"{"query":"shoes"}"#;
         let request = Request::builder()
             .uri("/api/orders")
@@ -1428,11 +1364,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert_eq!(body, r#"{"ok":true}"#);
-        // The shadow stalls for 30 s against a 50 ms deadline. A client that
-        // waited on the mirror at all would show at least that deadline here;
-        // one that waited on the stall would show 30 s. A looser bound would
-        // pass even if the mirror were awaited inline, which is the whole
-        // property under test.
+        // The shadow stalls for 30 s against a 50 ms deadline; the client must wait on neither.
         assert!(
             elapsed < Duration::from_millis(100),
             "the client waited {elapsed:?} on a stalled shadow"
@@ -1447,10 +1379,8 @@ mod tests {
 
     #[tokio::test]
     async fn one_deadline_covers_both_mirror_waits() {
-        // A shadow that answers just under the deadline must not then start a
-        // fresh full deadline on the primary wait: that would hold the permit
-        // for up to 2x the configured timeout, and at capacity would keep every
-        // later mirror dropped for twice as long as the operator asked for.
+        // A shadow that answers just under the deadline must not start a fresh deadline on the
+        // primary wait, which would hold the permit for up to twice the timeout.
         let transport = FakeTransport::new(Behaviour::Stall(Duration::from_millis(120)));
         let registry = ShadowRegistry::new(10);
         let mut settings = settings();
@@ -1459,8 +1389,7 @@ mod tests {
         let service =
             layer(transport.clone(), &registry, settings).layer(primary(r#"{"ok":true}"#));
 
-        // Drop the response unread, so the primary wait never resolves on its
-        // own and only the shared deadline can end the mirror.
+        // Drop the response unread so only the shared deadline can end the mirror.
         let request = Request::builder()
             .uri("/api/orders")
             .body(Body::empty())
@@ -1657,8 +1586,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_transport_reported_oversize_body_is_skipped_not_errored() {
-        // The real transport stops reading a candidate body once it passes the
-        // budget, so the caller never sees its length — it sees this error.
+        // The real transport stops reading a candidate body past the budget and returns this error.
         let transport = FakeTransport::new(Behaviour::Oversize);
         let registry = ShadowRegistry::new(10);
         let service =
@@ -1716,10 +1644,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_precompressed_body_is_decoded_on_both_sides_before_comparing() {
-        // A handler may serve a precompressed representation, so the primary
-        // tee captures ENCODED bytes — exactly as the candidate's response can
-        // arrive encoded. Decoding only one side would report two identical
-        // builds as divergent on every such route.
         let transport = FakeTransport::new(Behaviour::ReplyGzipped {
             body: r#"{"ok":true}"#,
         });
@@ -1757,9 +1681,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_precompressed_primary_matches_a_plain_candidate_with_the_same_content() {
-        // Only one side encoded: after decoding, the content is identical, so
-        // this is a match. An encoding difference is a header difference, and
-        // headers are outside the comparison contract.
+        // An encoding difference is a header difference, and headers are not compared.
         let transport = FakeTransport::new(Behaviour::Reply {
             status: 200,
             body: r#"{"ok":true}"#,
@@ -1794,11 +1716,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_head_on_a_precompressed_route_still_compares() {
-        // A `HEAD` sends no body while keeping its representation headers, so
-        // both sides arrive as zero bytes still declaring `Content-Encoding:
-        // gzip`. Handing that to a decoder fails with an unexpected EOF — which
-        // would have two identical builds counted as `shadow_errors` and never
-        // compared, on every precompressed route answering `HEAD`.
+        // Both sides arrive as zero bytes still declaring `Content-Encoding: gzip`, which a
+        // decoder rejects with an unexpected EOF.
         let transport = FakeTransport::new(Behaviour::Reply {
             status: 200,
             body: "",
@@ -1839,9 +1758,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_primary_body_is_not_blamed_on_the_candidate() {
-        // `shadow_errors` is documented as CANDIDATE failures. Counting the
-        // live build's own undecodable response there sends an operator hunting
-        // candidate connectivity for a body their own handler emitted.
+        // `shadow_errors` counts candidate failures only.
         let transport = FakeTransport::new(Behaviour::Reply {
             status: 200,
             body: r#"{"ok":true}"#,
@@ -1882,10 +1799,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_encoding_is_an_error_not_a_size_skip() {
-        // An operator seeing `skipped_oversize` would go looking for a body
-        // over `max_body_bytes`, when the real problem is a response whose
-        // declared encoding does not decode. Distinct counters, distinct
-        // outcome labels.
+        // `skipped_oversize` would send an operator looking for a body over `max_body_bytes`.
         let transport = FakeTransport::new(Behaviour::ReplyMisencoded);
         let registry = ShadowRegistry::new(10);
         let service =
@@ -1913,10 +1827,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_permit_is_released_so_mirroring_survives_the_first_batch() {
-        // The ceiling test only ever fills slots; nothing proved they come
-        // back. If `InFlightPermit::drop` were a no-op the whole suite would
-        // still pass, and production mirroring would silently stop after
-        // `max_in_flight` requests.
+        // If `InFlightPermit::drop` were a no-op, mirroring would stop after `max_in_flight`
+        // requests.
         let transport = FakeTransport::new(Behaviour::Reply {
             status: 200,
             body: r#"{"ok":true}"#,
@@ -1947,10 +1859,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_the_live_build_refused_is_not_mirrored() {
-        // This layer sits outside load shedding, maintenance mode and the rate
-        // limiter, so without this the candidate — under none of those
-        // pressures — answers 200 and every request through a maintenance
-        // window becomes a status-class divergence.
+        // This layer sits outside load shedding, maintenance mode and the rate limiter. The
+        // candidate, under none of those pressures, would answer 200: a false divergence.
         for status in [
             StatusCode::TOO_MANY_REQUESTS,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1992,9 +1902,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_head_request_compares_on_status_class_alone() {
-        // A `HEAD` response carries no body on the wire, so a tee would never
-        // be polled: the mirror would burn a slot and record nothing. The
-        // facts are delivered up front instead, and both sides compare empty.
+        // A `HEAD` response has no body to tee, so both sides compare empty.
         let transport = FakeTransport::new(Behaviour::Reply {
             status: 200,
             body: "",
@@ -2027,11 +1935,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_primary_body_the_client_never_finishes_is_counted_not_leaked() {
-        // Dropping the response without reading it stands in for a client that
-        // disconnects. Without the deadline on the primary wait this would
-        // hold its slot until the process ended; without the counter the
-        // operator would see `mirrored` exceed every other counter with
-        // nothing explaining the gap.
+        // Dropping the response unread stands in for a client that disconnects. The counter
+        // accounts for the gap between `mirrored` and every other outcome.
         let transport = FakeTransport::new(Behaviour::Reply {
             status: 200,
             body: r#"{"ok":true}"#,
@@ -2066,8 +1971,7 @@ mod tests {
             body: "{}",
         });
         let registry = ShadowRegistry::new(10);
-        // Route the request through a real axum Router so `MatchedPath` is set,
-        // exactly as it is for the framework's own ingress stack.
+        // A real axum Router sets `MatchedPath`, as the framework's ingress stack does.
         let router: axum::Router = axum::Router::new()
             .route(
                 "/api/orders/{id}",

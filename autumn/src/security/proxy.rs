@@ -360,8 +360,8 @@ mod tests {
         req.headers_mut()
             .insert("x-forwarded-for", "1.2.3.4, 10.0.0.1".parse().unwrap());
 
-        // If trusted proxies are not explicitly configured, we only trust the peer IP
-        // to have appended its own address, so we take the second to last.
+        // With no trusted proxies configured, only the peer is trusted to have appended its own
+        // address, so the client is the second-to-last entry.
         let ip = extract_client_ip(&req, true, &[], false);
         assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
     }

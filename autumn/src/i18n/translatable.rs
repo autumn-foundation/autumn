@@ -772,10 +772,9 @@ mod db {
     {
         fn from_sql(bytes: DB::RawValue<'_>) -> deserialize::Result<Self> {
             let raw = String::from_sql(bytes)?;
-            // Request-scoped when a scope is in effect, so a row decoded during
-            // a request never depends on which app in the process booted last;
-            // the process-wide install is the out-of-request fallback. Borrowed
-            // from the shared `Arc` rather than copied: this runs per value.
+            // Prefer the request scope's default, so a row decoded in a request does not
+            // depend on which app in the process booted last. Borrowed from the shared
+            // `Arc`, not copied: this runs per value.
             Ok(Self::decode_column(
                 &raw,
                 &scoped_or_global_default_locale_shared(),
@@ -846,7 +845,7 @@ mod tests {
         f()
     }
 
-    // ── AC1: independent value per locale tag ────────────────────────────────
+    // ── Independent value per locale tag ─────────────────────────────────────
 
     #[test]
     fn set_stores_an_independent_value_per_locale() {
@@ -858,7 +857,7 @@ mod tests {
         assert_eq!(t.get("fr"), None);
     }
 
-    // ── AC4: writing one locale never clobbers another ───────────────────────
+    // ── Writing one locale never clobbers another ────────────────────────────
 
     #[test]
     fn updating_one_locale_leaves_the_others_untouched() {
@@ -870,7 +869,7 @@ mod tests {
         assert_eq!(t.get("es"), Some("Hola"));
     }
 
-    // ── AC2: resolution against the ambient locale, no argument passed ────────
+    // ── Resolution against the ambient locale, no argument passed ─────────────
 
     #[test]
     fn resolve_uses_the_ambient_locale() {
@@ -890,7 +889,7 @@ mod tests {
         assert_eq!(got.as_deref(), Some("Bonjour"));
     }
 
-    // ── AC3: fallback chain walk, then a single documented sentinel ───────────
+    // ── Fallback chain walk, then a single documented sentinel ────────────────
 
     #[test]
     fn resolve_walks_the_fallback_chain_when_the_active_locale_is_missing() {
@@ -946,7 +945,7 @@ mod tests {
         assert_eq!(got.as_deref(), Some("Hello"));
     }
 
-    // ── AC5: observing which locales a record carries ────────────────────────
+    // ── Observing which locales a record carries ─────────────────────────────
 
     #[test]
     fn available_locales_are_reported_in_a_stable_order() {
@@ -1112,7 +1111,6 @@ mod tests {
 
     #[test]
     fn publishing_outside_a_scope_is_inert() {
-        // Must never panic; there is simply nothing to refine.
         super::super::publish_ambient_locale("es");
     }
 
@@ -1158,7 +1156,6 @@ mod tests {
     #[test]
     fn resolve_tolerates_a_poisoned_tag_lock() {
         let scope = super::LocaleScope::with_default_locale("es", chain(&["en"]), "en");
-        // Poison the tag lock by panicking while holding it.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = scope.tag.write().unwrap();
             panic!("poison the scope's tag lock");

@@ -12,12 +12,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-// 1. Task-local storage for CURRENT_TENANT
 tokio::task_local! {
     pub static CURRENT_TENANT: Option<String>;
 }
 
-// 2. Extractor structure
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tenant(pub String);
 
@@ -28,9 +26,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
         parts: &mut axum::http::request::Parts,
         state: &crate::AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Fast path: when the tenancy middleware has already resolved and scoped
-        // the tenant for this request, read it from the task-local rather than
-        // performing a second extraction from headers/session/cookies.
+        // If the tenancy middleware already scoped the tenant, read it instead of extracting again.
         if let Ok(Some(tenant_id)) = CURRENT_TENANT.try_with(Clone::clone) {
             return Ok(Self(tenant_id));
         }
@@ -67,7 +63,7 @@ pub(crate) fn current_tenant_id() -> String {
         .unwrap_or_default()
 }
 
-// Helper to run in-test tenancy contexts
+// Scopes `tenant_id` as the current tenant outside the tenancy middleware, e.g. in tests.
 pub async fn with_tenant<F, R>(tenant_id: String, future: F) -> R
 where
     F: Future<Output = R>,
@@ -151,11 +147,9 @@ async fn extract_tenant_impl(
             ));
         }
     }
-    // Only under `source = "subdomain"`, where the `Host` header is ALREADY the
-    // tenant signal. Under `header`/`session`/`jwt` the tenant comes from a
-    // credential the client cannot forge, and letting a connected `Host`
-    // outrank it would let any authenticated user reach another tenant's data
-    // by setting one header.
+    // Only under `source = "subdomain"`, where `Host` is already the tenant signal. Other sources
+    // take the tenant from a credential the client cannot forge; letting `Host` outrank it would
+    // let any authenticated user reach another tenant by setting one header.
     #[cfg(feature = "custom-domains")]
     if config.tenancy.enabled
         && config.tenancy.source == "subdomain"
@@ -279,7 +273,6 @@ fn request_host(parts: &axum::http::request::Parts) -> Option<String> {
         })
 }
 
-// Tenant extraction logic based on configuration
 #[allow(
     clippy::too_many_lines,
     clippy::needless_pass_by_ref_mut,
@@ -351,8 +344,7 @@ async fn extract_tenant_from_parts_inner(
                 ));
             }
 
-            // DNS hostnames are case-insensitive; normalise to lowercase
-            // before any matching so that e.g. `Tenant1.Example.COM` works.
+            // DNS hostnames are case-insensitive.
             let host_lower = host_only.to_lowercase();
 
             if let Some(ref base_domain) = config.tenancy.base_domain {
@@ -490,11 +482,8 @@ async fn extract_tenant_from_parts_inner(
                 crate::AutumnError::unauthorized_msg(format!("JWT validation failed: {e}"))
             })?;
 
-            // `jsonwebtoken`'s `set_audience` validates the `aud` value when
-            // the claim is *present*, but silently accepts tokens that omit the
-            // `aud` field entirely. Explicitly reject those when audience
-            // validation is enabled so legacy tokens without an `aud` claim
-            // cannot bypass the check.
+            // `set_audience` checks `aud` only when the claim is present and accepts tokens that
+            // omit it, so reject a missing `aud` here.
             if let Some(ref expected_aud) = config.tenancy.jwt_audience {
                 let aud_ok = token_data.claims.get("aud").is_some_and(|v| match v {
                     serde_json::Value::String(s) => s == expected_aud,
@@ -559,27 +548,17 @@ async fn extract_tenant_from_parts_inner(
 /// framework (CSRF, CAPTCHA): `/login` matches `/login` and `/login/sso` but not
 /// `/login-admin`.
 fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
-    // When locale-prefix routing (issue #1251) is on, a public route like
-    // `/login` is actually reachable at `/en/login`, but every exemption
-    // below (`public_paths`, `login_redirect`, health probes, actuator) is
-    // configured as an unprefixed path. Strip a leading `/{locale}` segment
-    // first so tenancy sees the same logical path regardless of which locale
-    // prefix carried the request — otherwise the locale-prefixed request for
-    // an exempt page is never exempt, and its tenant-resolution failure
-    // redirects back to a bare `login_redirect` that immediately
-    // locale-redirects right back into the same failure (Codex review).
+    // With locale-prefix routing (#1251), `/login` is served at `/en/login`, but every exemption
+    // below is configured unprefixed. Without the strip, an exempt page under a locale prefix
+    // would fail tenant resolution and redirect-loop through `login_redirect`.
     let path = strip_locale_prefix_for_tenancy(path, config);
 
-    // Guard against empty prefixes: `path_matches_route_prefix(path, "")` is true
-    // for every absolute path, so an empty entry — whether a stray `public_paths`
-    // item or a misconfigured built-in like `health.path = ""` — would otherwise
-    // exempt the entire application from tenancy.
+    // `path_matches_route_prefix(path, "")` is true for every path, so an empty entry (a stray
+    // `public_paths` item, `health.path = ""`) would exempt the whole app.
     let matches =
         |prefix: &str| !prefix.is_empty() && crate::router::path_matches_route_prefix(path, prefix);
 
-    // User-configured public paths — normalize trailing slashes so `/static/`
-    // behaves the same as `/static`, but preserve a bare `"/"` (a common landing
-    // page) rather than trimming it away to an empty, never-matching string.
+    // `/static/` matches like `/static`, but a bare `"/"` is kept rather than trimmed to "".
     let user_paths_match = config.tenancy.public_paths.iter().any(|p| {
         let p = if p.len() > 1 {
             p.trim_end_matches('/')
@@ -589,16 +568,10 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
         matches(p)
     });
 
-    // The login_redirect target must always be reachable to prevent an infinite
-    // redirect loop when a user forgets to add it to public_paths. Only auto-exempt
-    // *relative* targets (no authority): those land back on this app, so a loop is
-    // possible and the exemption is warranted. An absolute target — whether an
-    // external IdP (`https://idp.example.com/login`) or even a same-origin URL —
-    // is not auto-exempted: the external case causes no local loop, and we can't
-    // reliably tell same-origin from external here (server.host is the bind
-    // address, not the public host). A same-origin absolute target that must be
-    // public should be listed in `public_paths`. Parse as a URI so a relative
-    // target with a query (`/login?next=/dashboard`) still matches by path.
+    // A relative `login_redirect` target is exempt, or a missing `public_paths` entry would loop
+    // the redirect. An absolute target is not: `server.host` is the bind address, so same-origin
+    // cannot be told from an external IdP here; list it in `public_paths`. Parsing as a URI
+    // matches `/login?next=/dashboard` by path.
     let redirect_match = config
         .tenancy
         .login_redirect
@@ -607,16 +580,11 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
         .filter(|uri| uri.authority().is_none())
         .is_some_and(|uri| uri.path() == path);
 
-    // Match the actuator prefix against its *normalized* form — the same
-    // transformation the actuator router applies before mounting (trim, drop
-    // trailing slashes, ensure a leading slash). Otherwise a non-canonical config
-    // value like `ops/` or `/ops/` would mount endpoints at `/ops/...` yet never
-    // match the raw string here, breaking the probe/scrape bypass.
+    // Normalize the prefix as the actuator router does before mounting, so `ops/` or `/ops/`
+    // still match the endpoints mounted at `/ops/...`.
     let actuator_prefix = crate::actuator::normalize_actuator_prefix(&config.actuator.prefix);
     let actuator_match = if actuator_prefix.is_empty() {
-        // A prefix that normalizes to empty (`/` or blank) is a root mount: the
-        // ops endpoints sit at `/health`, `/prometheus`, … directly. We can't
-        // exempt the whole root, so exempt the actual mounted endpoint paths.
+        // A root mount: exempt each endpoint path, not the whole root.
         crate::actuator::actuator_endpoint_paths(
             &actuator_prefix,
             config.actuator.sensitive,
@@ -628,10 +596,8 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
         matches(&actuator_prefix)
     };
 
-    // Built-in probe endpoints mount at their *exact* configured path
-    // (`mount_probe_endpoints` installs `router.route(&health.path, …)`, not a
-    // subtree), so match them exactly. Prefix matching here would wrongly exempt
-    // an app's own `/health/history` while the probe only serves `/health`.
+    // Probes mount at their exact path, not a subtree, so a prefix match would wrongly exempt an
+    // app's own `/health/history`.
     let probe_match = path == config.health.path
         || path == config.health.live_path
         || path == config.health.ready_path
@@ -707,7 +673,6 @@ const fn strip_locale_prefix_for_tenancy<'a>(
     path
 }
 
-// Tenancy middleware for Axum requests
 pub async fn tenancy_middleware(
     State(state): State<crate::AppState>,
     request: Request<axum::body::Body>,
@@ -724,9 +689,7 @@ pub async fn tenancy_middleware(
 
     let (mut parts, body) = request.into_parts();
 
-    // Public paths (login/signup pages, static assets, health probes) stay
-    // reachable without a tenant so unauthenticated visitors can reach them —
-    // otherwise a session/jwt-sourced SaaS could never show a login screen.
+    // Public paths need no tenant, or a session/jwt-sourced app could never show a login page.
     if is_public_path(parts.uri.path(), &config) {
         return next.run(Request::from_parts(parts, body)).await;
     }
@@ -743,13 +706,8 @@ pub async fn tenancy_middleware(
     {
         Ok(t) => t,
         Err(e) => {
-            // For browser logins, bounce a missing/unauthenticated tenant to the
-            // configured login page instead of returning a raw 401. Only do this
-            // for clients that accept HTML (navigating browsers): API clients
-            // (e.g. `Accept: application/json`) expect the 401 so their error
-            // handling isn't broken by a 303 to a login page. Other error classes
-            // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
-            // are not masked as login redirects.
+            // Redirect a 401 to the login page only for clients that accept HTML; API clients
+            // expect the 401. Other errors pass through so real bugs are not masked as redirects.
             if e.status() == axum::http::StatusCode::UNAUTHORIZED
                 && let Some(target) = &config.tenancy.login_redirect
                 && parts
@@ -764,8 +722,7 @@ pub async fn tenancy_middleware(
         }
     };
 
-    // Tag the request-scoped log context (#1169) so every subsequent event
-    // automatically carries the resolved tenant id.
+    // Every later log event in this request carries the tenant id (#1169).
     crate::log::context::set_tenant_id(&tenant_id);
 
     // Per-tenant bulkheads (#3072). The request permit lives until the
@@ -786,13 +743,9 @@ pub async fn tenancy_middleware(
     let request = Request::from_parts(parts, body);
     let tenant_id_clone = tenant_id.clone();
 
-    // Bind a lazily-materializing handle to the tenant's memory cell for the
-    // request lifecycle. The registry itself is lazily registered in the app
-    // state's extension map on first use, but building a handle does NOT create
-    // a cell: the cell is materialized only when a handler (or a streaming body)
-    // first accesses it via `current_tenant_cell()`. Requests to routes that
-    // never touch tenant memory therefore leave the registry untouched, even
-    // with request-controlled tenant ids.
+    // Building a handle does not create a cell; `current_tenant_cell()` does, on first use.
+    // Routes that never touch tenant memory leave the registry untouched, even with
+    // request-controlled ids.
     let registry = state.extension_or_insert_with(|| {
         crate::tenant_cell::TenantCellRegistry::with_limits(
             config.tenancy.max_cells,
@@ -800,8 +753,7 @@ pub async fn tenancy_middleware(
                 .then(|| std::time::Duration::from_secs(config.tenancy.idle_ttl_secs)),
         )
     });
-    // The id goes in as an `Arc<str>`, so the clone for the body below, and
-    // the body's clone on every frame, copy no id.
+    // The id is an `Arc<str>`, so cloning the handle here and on every body frame copies no id.
     let handle = crate::tenant_cell::TenantCellHandle::from_shared(
         (*registry).clone(),
         std::sync::Arc::from(tenant_id.as_str()),
@@ -883,8 +835,8 @@ pin_project! {
         pub inner: B,
         pub tenant_id: String,
         pub handle: Option<crate::tenant_cell::TenantCellHandle>,
-        // The `tenancy.max_db_connections` bulkhead (#3072). A checkout
-        // while the body is polled counts against it.
+        // The `tenancy.max_db_connections` bulkhead (#3072): a checkout while the body is polled
+        // counts against it.
         pub db_bulkhead: Option<std::sync::Arc<crate::bulkhead::TenantBulkhead>>,
     }
 }
@@ -1500,7 +1452,6 @@ mod tests {
     fn login_redirect_target_is_always_public() {
         let mut c = crate::config::AutumnConfig::default();
         c.tenancy.login_redirect = Some("/auth/login".to_string());
-        // Not in public_paths — should still be reachable.
         assert!(is_public_path("/auth/login", &c));
         // Only the exact target, not adjacent paths.
         assert!(!is_public_path("/auth/login/sso", &c));
@@ -1542,8 +1493,7 @@ mod tests {
     fn root_public_path_is_preserved() {
         let c = public_paths_config(&["/"]);
         assert!(is_public_path("/", &c));
-        // The slash-boundary semantics mean `/` matches only the root, not every
-        // path, so protected routes still require a tenant.
+        // `/` matches only the root, not every path.
         assert!(!is_public_path("/dashboard", &c));
     }
 

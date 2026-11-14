@@ -230,9 +230,8 @@ where
             })
         };
 
-        // The fallback plants the sentinel for the primary to flip; the
-        // primary picks it up when present (it is absent in bare setups
-        // that apply only the primary layer).
+        // The fallback plants the sentinel for the primary to flip. Bare setups with only the
+        // primary layer have none.
         let sentinel = if self.fallback {
             let sentinel = AccessLogEmitted::default();
             req.extensions_mut().insert(sentinel.clone());
@@ -296,18 +295,14 @@ where
                         .saturating_duration_since(*this.start)
                         .as_secs_f64()
                         * 1000.0;
-                    // The primary layer reads the id from the request
-                    // extension; the fallback covers short-circuits that may
-                    // never have run RequestIdLayer, so it falls back to the
-                    // `x-request-id` response header and omits the field when
-                    // neither is present.
+                    // A short-circuit seen only by the fallback may never have run
+                    // RequestIdLayer, so fall back to the `x-request-id` response header.
                     let header_id = response
                         .headers()
                         .get(&X_REQUEST_ID)
                         .and_then(|value| value.to_str().ok());
-                    // Rendered on the stack, as `RequestIdLayer` renders the
-                    // header. The field stays a `&str`, so it is recorded with
-                    // `record_str` (quoted in text output) exactly as before.
+                    // Rendered on the stack, as `RequestIdLayer` renders the header. The field
+                    // stays a `&str`, so text output quotes it.
                     let mut id_buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
                     let request_id = meta
                         .request_id

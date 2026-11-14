@@ -57,8 +57,7 @@
         clippy::arithmetic_side_effects,
     )
 )]
-// `pub` throughout this file is crate-visible only: the enclosing `cluster`
-// submodule is itself `pub(crate)`, so nothing here escapes the crate
+// `pub` here is crate-visible only: the `cluster` module is `pub(crate)`
 // (clippy::redundant_pub_crate).
 
 use std::collections::BTreeMap;
@@ -274,8 +273,6 @@ pub fn sign_envelope(
 /// cap rather than emitting something the peer must reject.
 pub fn encode_frame(envelope: &Envelope) -> Option<Vec<u8>> {
     let body = serde_json::to_vec(envelope).ok()?;
-    // The sender applies the receiver's cap rather than emitting a frame the
-    // peer is obliged to refuse (and to close the connection over).
     if body.is_empty() || body.len() > MAX_FRAME_BYTES {
         return None;
     }
@@ -310,8 +307,6 @@ pub fn framed(prefix: [u8; LENGTH_PREFIX_BYTES], body: &[u8]) -> Vec<u8> {
 /// Read a length prefix, refusing `0` and anything over [`MAX_FRAME_BYTES`]
 /// **before** a buffer of that size is reserved.
 pub const fn frame_len(prefix: [u8; LENGTH_PREFIX_BYTES]) -> Option<usize> {
-    // The comparison happens on the declared `u32`, so nothing of that size is
-    // ever reserved: an attacker's 4 GiB prefix costs four bytes and a branch.
     match u32::from_be_bytes(prefix) {
         0 => None,
         declared if declared as usize > MAX_FRAME_BYTES => None,
@@ -389,9 +384,6 @@ impl FrameVerifier {
         match self.verify(frame) {
             Ok(accepted) => Ok(accepted),
             Err(reason) => {
-                // Every refusal is counted, whatever the reason: a silent drop
-                // is not observable, and `frames_rejected_total{reason=…}` is
-                // how an operator sees somebody talking to the port.
                 self.rejected = self.rejected.saturating_add(1);
                 Err(reason)
             }
@@ -401,11 +393,11 @@ impl FrameVerifier {
     /// The receive path proper. [`Self::accept`] owns the counter so that no
     /// early return here can forget to increment it.
     fn verify(&mut self, frame: &[u8]) -> Result<(Envelope, ClusterMessage), RejectReason> {
-        // 1. Length prefix — refused before anything of that size is reserved.
+        // 1. Length prefix.
         let body = frame_body(frame)?;
 
-        // 2. Envelope parse. Only the fixed envelope is parsed here; the
-        //    payload stays an opaque string until the MAC verifies.
+        // 2. Envelope parse. The payload stays an opaque string until the MAC
+        //    verifies.
         let envelope: Envelope =
             serde_json::from_slice(body).map_err(|_| RejectReason::Malformed)?;
 
@@ -437,14 +429,12 @@ impl FrameVerifier {
             return Err(RejectReason::Mac);
         }
 
-        // 5. Self-origin, decided on the authenticated sender and never on the
-        //    peer address.
+        // 5. Self-origin, by authenticated sender, never by peer address.
         if envelope.sender == self.local_id {
             return Err(RejectReason::SelfOrigin);
         }
 
-        // 6. Replay watermark: lower incarnation, or the same incarnation
-        //    without a strictly higher seq, is a replay.
+        // 6. Replay watermark.
         if let Some(&(incarnation, seq)) = self.watermarks.get(&envelope.sender)
             && (envelope.incarnation < incarnation
                 || (envelope.incarnation == incarnation && envelope.seq <= seq))
@@ -452,12 +442,11 @@ impl FrameVerifier {
             return Err(RejectReason::Replay);
         }
 
-        // 7. Payload parse — only now.
+        // 7. Payload parse.
         let message: ClusterMessage =
             serde_json::from_str(&envelope.payload).map_err(|_| RejectReason::Payload)?;
 
-        // Accepted: adopt the incarnation (resetting the sequence watermark
-        // when it rose) and remember the sequence at it.
+        // A higher incarnation replaces the watermark, resetting its sequence.
         self.watermarks.insert(
             envelope.sender.clone(),
             (envelope.incarnation, envelope.seq),
@@ -924,8 +913,7 @@ mod tests {
         );
         assert_eq!(verifier.rejected_total(), 1, "the replay must be counted");
 
-        // A HIGHER incarnation adopts and resets the sequence watermark — this
-        // is what lets a restarted node rejoin instead of being replay-locked.
+        // A higher incarnation resets the sequence, so a restarted node can rejoin.
         let rejoined = frame_for(SECRET, CLUSTER, REMOTE, 2, 0, &ClusterMessage::Leave);
         assert!(
             verifier.accept(&rejoined).is_ok(),
@@ -937,7 +925,6 @@ mod tests {
             "a higher incarnation must adopt and reset the sequence watermark"
         );
 
-        // …and the dead incarnation can no longer speak.
         let stale_incarnation = frame_for(SECRET, CLUSTER, REMOTE, 1, 6, &ClusterMessage::Leave);
         assert_eq!(
             verifier.accept(&stale_incarnation).err(),
@@ -948,8 +935,7 @@ mod tests {
 
     #[test]
     fn self_origin_frame_dropped() {
-        // Correctly signed, but the authenticated sender is us: a reflected
-        // frame. It must be dropped by sender id, not by source address.
+        // Correctly signed, but the authenticated sender is us: a reflected frame.
         let frame = frame_for(SECRET, CLUSTER, LOCAL, 1, 1, &ClusterMessage::Leave);
         let mut verifier = verifier();
         let result = verifier.accept(&frame);
@@ -1049,12 +1035,8 @@ mod tests {
         let mut truncated = 64u32.to_be_bytes().to_vec();
         truncated.extend_from_slice(b"only-a-few-bytes");
 
-        // A LEGAL length prefix over a body that is not an envelope — the
-        // "malformed body" case this test is about. The bytes must be framed:
-        // fed raw, `not-` reads as a declared length of 1,852,797,997, which is
-        // over the cap and therefore the connection-fatal `Oversize` verdict
-        // that `frame_len_refuses_zero_and_oversize` pins, not a malformed body
-        // at all (issue #1762 red-phase input bug).
+        // A legal length prefix over a non-envelope body. Fed raw, `not-` would
+        // read as a declared length over the cap: `Oversize`, not a malformed body.
         let mut junk = 18u32.to_be_bytes().to_vec();
         junk.extend_from_slice(b"not-a-frame-at-all");
 
@@ -1077,8 +1059,6 @@ mod tests {
             "the length prefix width is part of the wire contract"
         );
 
-        // Positive control: the receive path survives garbage and still accepts
-        // a valid frame afterwards (totality means "continue", not "give up").
         let good = frame_for(SECRET, CLUSTER, REMOTE, 1, 1, &ClusterMessage::Leave);
         assert!(
             verifier.accept(&good).is_ok(),

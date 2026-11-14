@@ -218,19 +218,14 @@ impl PushError {
     #[must_use]
     pub const fn status(&self) -> http::StatusCode {
         match self {
-            // The caller sent something unusable.
             Self::InvalidEndpoint(_)
             | Self::InvalidSubscriptionKey(_)
             | Self::PayloadTooLarge { .. } => http::StatusCode::BAD_REQUEST,
-            // Well-formed, but it conflicts with existing state…
             Self::EndpointClaimed => http::StatusCode::CONFLICT,
-            // …or exceeds the caller's quota.
             Self::TooManySubscriptions { .. } => http::StatusCode::UNPROCESSABLE_ENTITY,
-            // Push is not set up on this deployment: the request was fine, the
-            // capability is absent. `503` invites a retry once it is
-            // configured, where `500` would not.
+            // The request was fine but push is not configured: `503` invites a retry once it is,
+            // where `500` would not.
             Self::NotConfigured => http::StatusCode::SERVICE_UNAVAILABLE,
-            // Genuinely ours.
             Self::InvalidVapidKey(_)
             | Self::InvalidConfig(_)
             | Self::Serialization(_)

@@ -645,9 +645,8 @@ pub enum FillLockStatus {
 /// For cross-replica backends (Redis) use [`get_cached`] instead, which
 /// also handles JSON deserialization of [`RawCacheBytes`].
 pub fn get<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str) -> Option<V> {
-    // Failure-capsule seam (#2351 item 2). The value is not serializable, so
-    // a replay serves only a recorded miss, and capture can record only a
-    // miss.
+    // Failure-capsule seam (#2351). The value is not serializable, so a replay serves only a
+    // recorded miss, and capture can record only a miss.
     if replayed_untyped_get(key) {
         return None;
     }
@@ -707,7 +706,7 @@ const DIRECT_READ_NOTE: &str = "the run read the cache with `Cache::get_value` d
 /// For cross-replica backends (Redis) use [`insert_cached`] instead,
 /// which also serializes the value for storage across process boundaries.
 pub fn insert<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str, value: V) {
-    // Failure-capsule seam (#2351 item 2): a replay never writes, and capture
+    // Failure-capsule seam (#2351): a replay never writes, and capture
     // cannot record the value.
     if record_or_replay_untyped_insert(key) {
         return;
@@ -738,21 +737,17 @@ where
     }
     let arc = helper_read(cache, key);
     let value = arc.and_then(|arc| {
-        // Fast path: in-memory backend stored the concrete type directly.
+        // In-memory backends (Moka) store the concrete type.
         if let Some(value) = arc.downcast_ref::<V>() {
             return Some(value.clone());
         }
-        // Slow path: serializing backend (e.g. Redis) stored RawCacheBytes.
+        // Serializing backends (Redis) store `RawCacheBytes`.
         arc.downcast_ref::<RawCacheBytes>()
             .and_then(|raw| serde_json::from_slice::<V>(&raw.0).ok())
     });
-    // Recorded from the *typed* value rather than from the stored `Arc<dyn
-    // Any>`: the in-process backend (Moka) stores `Arc<V>` and never
-    // `RawCacheBytes`, so reading the erased value would record every hit from
-    // the default backend as valueless — and replay would then take the miss
-    // branch of a handler whose bug is on the hit branch. The `Serialize`
-    // bound is what makes the recording possible at all; every caller already
-    // pairs this with `insert_cached`, which requires it too.
+    // Recorded from the typed value, not the stored `Arc<dyn Any>`: Moka stores `Arc<V>`, never
+    // `RawCacheBytes`, so the erased value would record every Moka hit as valueless and replay
+    // would take the miss branch. This is why `V` must be `Serialize`.
     record_cache_get(key, value.as_ref());
     value
 }
@@ -781,9 +776,9 @@ where
     }
     #[cfg(feature = "reporting")]
     let _helper = HelperCall::enter();
-    // In-memory path (MokaCache, CountingCache in tests, …)
+    // In-process backends (Moka) store this.
     cache.insert_value(key, Arc::new(value));
-    // Serialized path (RedisCache, any cross-replica backend)
+    // Cross-replica backends (Redis) store these bytes.
     if let Some(bytes) = bytes {
         cache.insert_raw_bytes(key, bytes, ttl);
     }
@@ -915,10 +910,9 @@ pub fn insert_cached_fenced<V>(
 where
     V: Clone + serde::Serialize + Send + Sync + 'static,
 {
-    // A replay has no fence: `insert_cached` sends the write to the tape, or
-    // drops it during `autumn replay` with no tape. Only a sampled epoch
-    // reaches the backend, so only it is bypassed, and only after the value
-    // is encoded, as the fenced path does.
+    // A replay has no fence: `insert_cached` sends the write to the tape, or drops it under
+    // `autumn replay` with no tape. Only a sampled epoch would reach the backend, so only it is
+    // redirected, and only once the value encodes, as on the fenced path.
     let epoch = match epoch {
         FillEpoch::Sampled(_) if replaying() => {
             if serde_json::to_vec(&value).is_err() {
@@ -946,8 +940,7 @@ where
         cache.insert_raw_bytes_if_epoch(key, bytes.clone(), ttl, namespace, sampled)
     };
     if stored {
-        // Capture records the write after it happened. A replay never gets
-        // here.
+        // Capture records the write once it landed. A replay never gets here.
         let _ = record_or_replay_cache_insert(key, Some(&bytes), ttl);
     }
     stored
@@ -985,9 +978,8 @@ const fn replaying() -> bool {
 
 // ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
 //
-// The `capsule` module is behind the `reporting` feature, so each helper here
-// has a no-op twin for builds without it — the seam stays one line at each
-// call site whatever the feature set.
+// The `capsule` module is behind the `reporting` feature, so each helper here has a no-op twin
+// for builds without it, keeping each call site to one line.
 
 /// What a replay has to say about a cache read.
 ///
@@ -1120,10 +1112,8 @@ fn record_or_replay_cache_insert(
                 ttl_secs: ttl.map(|ttl| ttl.as_secs()),
             });
         } else {
-            // The live backend accepted this write; the capsule cannot hold it.
-            // Recording nothing would let replay suppress a real cache mutation
-            // and still grade the run clean, which is the same falsification the
-            // unserializable *read* refuses — caught here a function later.
+            // The backend took this write but the capsule cannot hold it. Recording nothing would
+            // let replay skip a real cache mutation and still grade the run clean.
             scope.note(UNRECORDABLE_CACHE_WRITE_NOTE);
             scope.mark_truncated();
         }
@@ -1205,7 +1195,7 @@ const fn record_or_replay_untyped_insert(_key: &str) -> bool {
     false
 }
 
-// ── Capsule seam for the removal methods (#2351 item 2) ──────────────────
+// ── Capsule seam for the removal methods (#2351) ─────────────────────────
 
 /// Wrap `cache` so a capsule records its removals and a replay never reaches
 /// it. Idempotent: a wrapped backend is returned as it is, so `Arc` identity
@@ -1596,10 +1586,9 @@ impl Cache for CapsuleSeamCache {
         if replay_blocked() {
             return Box::pin(async { Ok(()) });
         }
-        // The scope is read now; the tape position is taken when the future
-        // first runs, which is when replay consumes its entry. It is filled
-        // when the removal ends, so a cancelled removal leaves an unfilled
-        // slot that marks the capsule incomplete.
+        // The scope is read now. The slot is reserved when the future first runs, where replay
+        // consumes its entry, and filled when the removal ends, so a cancelled removal leaves an
+        // unfilled slot that marks the capsule incomplete.
         let scope = crate::capsule::current_scope();
         Box::pin(async move {
             let slot = scope.and_then(|scope| scope.reserve_cache().map(|index| (scope, index)));
@@ -2137,8 +2126,7 @@ mod tests {
     #[cfg(feature = "cache-moka")]
     #[test]
     fn get_cached_raw_bytes_slow_path() {
-        // Simulate a cross-replica backend: store RawCacheBytes directly, then
-        // verify get_cached deserializes it back to the concrete type.
+        // Stands in for a cross-replica backend, which stores `RawCacheBytes`.
         let cache = MokaCache::new(10, None);
         let bytes = serde_json::to_vec(&42_i32).unwrap();
         cache.insert_value("k", Arc::new(RawCacheBytes(bytes)));
@@ -2559,8 +2547,8 @@ mod tests {
             assert_eq!(cache.fill_epoch("ns"), FillEpoch::Unsupported);
         }));
         assert!(spy.calls().is_empty(), "{:?}", spy.calls());
-        // Codex review on #3222: only the reporting layer enters the replay
-        // scope. A cache call must not, or the missing-layer warning is lost.
+        // Only the reporting layer enters the replay scope. A cache call must not, or the
+        // missing-layer warning is lost.
         assert!(!tape.scope_entered());
     }
 

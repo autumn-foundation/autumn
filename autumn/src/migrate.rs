@@ -711,11 +711,8 @@ macro_rules! with_migration_connection {
             scope
                 .spawn(|| {
                     match crate::db::establish_migration_connection($url)
-                        // Redacted: this is the RUNTIME's startup-migration
-                        // path (the `--wait` loop is the other one), and the
-                        // driver quotes the target it was handed straight back
-                        // into its message. It is logged with
-                        // `tracing::error!` at boot.
+                        // The driver echoes the target URL into its message,
+                        // and the startup path logs this error at boot.
                         .map_err(|e| {
                             MigrationError::Connection(crate::db_url::redact_driver_error(
                                 &e.to_string(),
@@ -1041,9 +1038,8 @@ where
     if !crate::db::sqlite_target_is_any_in_memory(database_url) {
         return None;
     }
-    // Only reject when there is actually a migration to apply. If the set can't
-    // be enumerated, treat it as non-empty (the apply would fail anyway) so the
-    // doomed configuration is still surfaced rather than silently proceeding.
+    // A set that cannot be enumerated counts as non-empty: the apply would fail
+    // anyway, so the bad configuration is still reported.
     let has_registered = migrations.migrations().map_or(true, |m| !m.is_empty());
     if !has_registered {
         return None;
@@ -1081,12 +1077,9 @@ pub fn run_pending_sqlite(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
 ) -> Result<MigrationResult, MigrationError> {
-    // Reject ANY in-memory target (private OR shared-cache) with registered
-    // migrations before opening the (transient) migration connection: the
-    // migrated schema is lost before the runtime pool anchors it — a private
-    // in-memory connection is its own empty database, and a shared in-memory
-    // database is destroyed when its last connection closes (issue #1614
-    // follow-up). Only a file-backed target is unaffected.
+    // An in-memory target loses the migrated schema before the runtime pool
+    // opens: a private connection is its own empty database, and a shared-cache
+    // database is dropped with its last connection.
     if let Some(err) = reject_in_memory_migrations(database_url, &migrations) {
         return Err(err);
     }
@@ -1464,10 +1457,8 @@ where
 /// Skip this guard when running against those backends.
 #[cfg(feature = "postgres")]
 pub struct MigrationLockGuard {
-    // TLS-aware (issue #1585 review): `autumn migrate` acquires this lock
-    // BEFORE spawning the external diesel CLI, so the lock connection itself
-    // must honor the URL's sslmode — the bundled libpq cannot reach
-    // TLS-only servers at all.
+    // Honors the URL's sslmode: `autumn migrate` takes this lock before it
+    // spawns the diesel CLI, and the bundled libpq cannot reach TLS-only servers.
     conn: crate::db::MigrationConnection,
 }
 
@@ -1795,11 +1786,8 @@ pub(crate) fn compute_migration_disambiguation(
 pub(crate) fn compute_migration_disambiguation_from_names(
     sets: impl IntoIterator<Item = Vec<(String, String)>>,
 ) -> HashMap<String, String> {
-    // version -> distinct full names claiming it. Only the DISTINCT full
-    // names matter for collision detection: the same migration folded into
-    // two bundles under different source names (the intentional, harmless
-    // case) contributes one entry, not two, regardless of how many sources
-    // register it or in what order.
+    // version -> distinct full names. The same migration registered by two
+    // sources is one entry, not a collision.
     let mut by_version: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
     for pairs in sets {
@@ -1812,35 +1800,23 @@ pub(crate) fn compute_migration_disambiguation_from_names(
     }
 
     let mut disambiguated = HashMap::new();
-    // Seed with every RAW version already claimed by some registered
-    // migration, not just substitutes handed out so far — otherwise a
-    // generated substitute could coincide with an unrelated migration's own
-    // plain version and the two would still share one Diesel tracking key.
+    // Seed with every raw version, so a substitute never equals another
+    // migration's plain version and shares its Diesel tracking key.
     let mut substitutes_in_use: std::collections::HashSet<String> =
         by_version.keys().cloned().collect();
     for (version, mut entries) in by_version {
         if entries.len() <= 1 {
             continue; // 0 or 1 distinct migration claims this version -- no collision.
         }
-        // Deterministic, CONTENT-based order -- a pure function of the
-        // colliding migrations' own full names, independent of which
-        // `.migrations()`/`.plugin_migrations()` call happened to run
-        // first. This matters because registration order is NOT stable
-        // across builds: reordering those calls in source, or adding a new
-        // plugin, must not change which migration keeps the plain version.
-        // The lexicographically-first full name wins it; every other
-        // colliding migration is mapped to a substitute below.
+        // Order by full name, not registration order: reordering the
+        // `.migrations()`/`.plugin_migrations()` calls or adding a plugin must not
+        // change which migration keeps the plain version. The first name keeps it.
         entries.sort();
         let kept_name = entries[0].clone();
         for full_name in entries.into_iter().skip(1) {
-            // The substitute hash derives from the losing migration's own full
-            // name, not from which sources currently register it. A migration's
-            // full name is fixed by its own directory naming and never changes
-            // across releases, whereas the set of sources registering a duplicate
-            // can grow or shrink — the same bundle folded into an additional
-            // plugin, say. Hashing on that set would silently reassign an
-            // already-applied migration's tracked substitute the moment its
-            // registration footprint changed, though the migration itself did not.
+            // Hash only the migration's own full name, which never changes. The
+            // set of sources registering it can change across releases, and
+            // hashing that would move an applied migration to a new substitute.
             let mut tie_breaker = 1u32;
             let mut substitute = bounded_substitute_version(&version, &full_name, tie_breaker);
             while substitutes_in_use.contains(&substitute) {
@@ -1884,8 +1860,7 @@ fn bounded_substitute_version(version: &str, salt: &str, tie_breaker: u32) -> St
     } else {
         format!("+{short_hash}-{tie_breaker}")
     };
-    // Reserve room for the suffix; truncate an unusually long version rather
-    // than risk overflowing the VARCHAR(50) column.
+    // Truncate the version to leave room for the suffix in VARCHAR(50).
     let max_version_len = 50usize.saturating_sub(suffix.len());
     let truncated_version: String = version.chars().take(max_version_len).collect();
     format!("{truncated_version}{suffix}")
@@ -2030,11 +2005,8 @@ pub fn migration_checksum(up_sql: &str) -> String {
 /// path to feed this function at startup.
 #[must_use]
 pub fn migration_checksum_bytes(up_sql: &[u8]) -> String {
-    // Lossy decode: mirror the CLI's on-disk read (`fs::read_to_string`),
-    // which itself rejects non-UTF-8 — the lossy path is only exercised
-    // when the embedded macro somehow ships non-UTF-8, which Diesel does
-    // not. Keeping the API infallible avoids a fallible checksum in the
-    // apply loop.
+    // Lossy, to keep this infallible: Diesel only ships UTF-8 SQL, and the CLI's
+    // `fs::read_to_string` rejects anything else.
     let s = String::from_utf8_lossy(up_sql);
     migration_checksum(&s)
 }
@@ -2131,19 +2103,13 @@ where
                         }
                     }
                 }
-                // Recorded as applied but the on-disk up.sql is gone: the
-                // migration was deleted or renamed after being applied. The
-                // recorded checksum proves it once belonged to THIS dir (a
-                // checksum is only recorded for a file present at record
-                // time), so this is genuine drift — not the legacy case.
-                // Framework/embedded migrations never get a recorded checksum
-                // against the user dir, so they can never reach this arm.
+                // A checksum is only recorded for a file in this dir, so a
+                // recorded version with no up.sql was deleted or renamed after
+                // it was applied: drift. Framework migrations never reach here.
                 (None, Some(recorded_hash)) => ChecksumState::Missing {
                     recorded: recorded_hash.clone(),
                 },
-                // No recorded checksum (with or without on-disk up.sql):
-                // legacy migration applied before checksum tracking, or an
-                // unresolvable up.sql that was never recorded. Never an error.
+                // Applied before checksum tracking, or never in this dir.
                 (Some(_) | None, None) => ChecksumState::Unrecorded,
             };
             (version.clone(), state)
@@ -2609,12 +2575,9 @@ fn load_applied_versions_lenient<C>(conn: &mut C) -> Result<Vec<String>, Migrati
 where
     C: diesel::connection::LoadConnection<Backend = Pg>,
 {
-    // We do NOT own `__diesel_schema_migrations` (Diesel creates it on its
-    // first apply), so it may be absent on a totally fresh DB. Probe for it
-    // with `to_regclass`, which returns NULL for an unknown relation — an
-    // existence test that never errors, and never depends on localized
-    // "does not exist" error text (which breaks under a non-English
-    // `lc_messages`). Only SELECT from the table once we know it's present.
+    // Diesel creates the table on its first apply, so a fresh DB lacks it.
+    // `to_regclass` returns NULL instead of erroring, so the probe does not
+    // depend on localized "does not exist" text.
     let present = diesel::sql_query(
         "SELECT to_regclass('__diesel_schema_migrations') IS NOT NULL AS present",
     )
@@ -2732,9 +2695,8 @@ pub fn record_checksums_from_dir_locked(
     with_migration_connection!(database_url, |conn| {
         acquire_migration_lock_on(conn, timeout)?;
 
-        // The applied-versions READ and the checksum WRITE both run here, under
-        // the advisory lock on THIS session, so a concurrent `down` cannot
-        // revert a version between them. Always release the lock afterwards.
+        // Read and write under the advisory lock on this session, so a
+        // concurrent `down` cannot revert a version between them.
         let result: Result<usize, MigrationError> = (|| {
             let applied = load_applied_versions_lenient(conn)?;
             record_checksums(conn, &applied, &up_by_version)
@@ -2781,9 +2743,7 @@ pub fn rebaseline_checksum_from_dir_locked(
     with_migration_connection!(database_url, |conn| {
         acquire_migration_lock_on(conn, timeout)?;
 
-        // The "is `version` currently applied?" READ and the overwrite WRITE
-        // both run here, under the advisory lock on THIS session. Always
-        // release the lock afterwards.
+        // Check and overwrite under the advisory lock on this session.
         let result: Result<(), MigrationError> = (|| {
             let is_applied = !diesel::sql_query(
                 "SELECT version FROM __diesel_schema_migrations WHERE version = $1",
@@ -2824,10 +2784,8 @@ pub fn checksum_status(
     with_migration_connection!(database_url, |conn| {
         let recorded = recorded_checksums(conn)?;
         let applied = load_applied_versions_lenient(conn)?;
-        // Framework-owned versions never record a checksum against the user dir
-        // and their up.sql is not in `migrations_dir`, so classifying them would
-        // report `Unrecorded` and prompt `baseline` — which cannot record them.
-        // Exclude them exactly as rollback does before classifying the rest.
+        // A framework version would classify as `Unrecorded` and prompt
+        // `baseline`, which cannot record it: its up.sql is not in this dir.
         let user_applied = user_applied_versions(&applied, &up_by_version, &framework);
         Ok(classify(&user_applied, &up_by_version, &recorded))
     })
@@ -2916,11 +2874,8 @@ fn classify_applied_user_migrations(
 ) -> Vec<AppliedUserMigration> {
     let mut user: Vec<AppliedUserMigration> = applied
         .iter()
-        // Local presence wins: a version present in `migrations_dir` is a user
-        // migration even if it collides with a framework shim version (e.g. the
-        // placeholder `00000000000000` shared by `create_api_tokens` and some
-        // apps' first migration). Only framework-owned versions that are absent
-        // locally are excluded.
+        // A local version is a user migration even when a framework migration
+        // shares it (the placeholder `00000000000000` of `create_api_tokens`).
         .filter(|v| by_version.contains_key(*v) || !framework.contains(*v))
         .map(|version| {
             by_version.get(version).map_or_else(
@@ -2966,8 +2921,6 @@ pub fn applied_user_migrations(
     database_url: &str,
     migrations_dir: &Path,
 ) -> Result<Vec<AppliedUserMigration>, MigrationError> {
-    // TLS-aware: honors the URL's sslmode (`autumn migrate status` rollback
-    // availability must work against TLS-only servers too).
     with_migration_connection!(database_url, |conn| {
         let source = FileBasedMigrations::from_path(migrations_dir).map_err(|e| {
             MigrationError::Migration(format!("failed to read migrations dir: {e}"))
@@ -3017,8 +2970,6 @@ where
 {
     let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
 
-    // TLS-aware: honors the URL's sslmode (`autumn migrate down` must work
-    // against TLS-only servers too).
     with_migration_connection!(database_url, |conn| {
         let source = FileBasedMigrations::from_path(migrations_dir).map_err(|e| {
             MigrationError::Migration(format!("failed to read migrations dir: {e}"))
@@ -3036,8 +2987,6 @@ where
 
             let mut count = 0;
             for version in &versions {
-                // Build a borrowed `MigrationVersion` once per version (no heap
-                // allocation) instead of allocating a `String` for every migration.
                 let target = diesel::migration::MigrationVersion::from(version.as_str());
                 let migration = all_migrations
                     .iter()
@@ -3055,15 +3004,9 @@ where
                     .map_err(|e| MigrationError::Migration(e.to_string()))?;
                 let duration = crate::time::ambient_instant().saturating_duration_since(started);
 
-                // This version is no longer applied, so its recorded checksum row
-                // must go: reverting exactly this migration removes it from
-                // `__diesel_schema_migrations`, and `version` is the key the row
-                // was recorded under. Deleting it restores the "row exists iff
-                // version applied with matching bytes" invariant, so a later
-                // re-apply of an edited `up.sql` records the new hash instead of
-                // leaving the stale one (#1203 review). Best-effort: the schema
-                // revert has already committed, so a failed delete only warns, and
-                // a later `autumn migrate baseline` or re-apply reconciles it.
+                // A checksum row exists only for an applied version, so a re-apply
+                // of an edited up.sql records the new hash. Best-effort: the revert
+                // has committed, and a later baseline or re-apply reconciles it.
                 if let Err(e) = delete_checksum(&mut *conn, version) {
                     tracing::warn!(
                         version = %version,
@@ -3119,18 +3062,13 @@ where
         .map(|m| (m.name().version().to_string(), m.name().to_string()))
         .collect();
 
-    // The framework version strings are backend-independent; enumerate them via
-    // the `Sqlite` source so a framework version that somehow landed in
-    // `__diesel_schema_migrations` is still excluded from user rollback planning.
     // Through the same identity map: a framework migration tracked under a
     // substitute is excluded under it, and its plain version, which then
     // belongs to the app migration, is not.
     let framework = sqlite_framework_tracked_versions(identity)?;
 
-    // A record the apply path would move to its substitute (a database that
-    // ran an app migration before the framework migration sharing its version
-    // existed, and has not applied since) is read as already moved, so the
-    // listing sees the app migration under the identity it is planned under.
+    // A record the apply path would move to its substitute is read as already
+    // moved, so the app migration is listed under the identity it is planned under.
     let applied: Vec<String> = conn
         .applied_migrations()
         .map_err(|e| MigrationError::Migration(e.to_string()))?
@@ -3306,9 +3244,8 @@ where
             .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
     with_sqlite_migration_lock(&mut conn, |conn| {
-        // A rollback is a write, so a legacy record is moved for real here,
-        // exactly as the apply path would have, before the plan is made; the
-        // revert then finds the migration under the version its record carries.
+        // A rollback writes, so move legacy records for real before planning, as
+        // the apply path does; the revert then finds each under its record's version.
         let moves = sqlite_collision_history_moves(conn, &sets, &identity)?;
         apply_sqlite_collision_moves(conn, &moves)?;
         let applied_user = resolve_applied_user_migrations_sqlite(
@@ -3382,14 +3319,11 @@ pub(crate) fn is_retryable_connection_error(msg: &str) -> bool {
         || lower.contains("host is unreachable")
         || lower.contains("network is unreachable")
         || lower.contains("timed out")
-        // libpq reports a connect_timeout expiry as "timeout expired" (not
-        // "timed out"), so firewalled hosts that silently drop packets are
-        // also retryable rather than being mis-classified as fatal.
+        // libpq's connect_timeout expiry, e.g. a firewall dropping packets.
         || lower.contains("timeout expired")
         || lower.contains("connection closed")
-        // DNS resolution failures — common in Docker Compose / Kubernetes
-        // cold-start where the 'db' hostname resolves only after the DNS
-        // service is ready (Linux/glibc, macOS, and generic forms).
+        // DNS failures: in Docker Compose or Kubernetes the 'db' hostname
+        // resolves only once DNS is ready (glibc, macOS and generic forms).
         || lower.contains("name or service not known")
         || lower.contains("nodename nor servname provided")
         || lower.contains("failed to lookup")
@@ -3442,7 +3376,6 @@ pub(crate) fn wait_for_database_inner(
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        // Extract the transient error message or return immediately for Ok/Fatal.
         let retryable_msg = match try_connect() {
             Ok(()) => return Ok(()),
             Err(AttemptError::Fatal(msg)) => {
@@ -3463,9 +3396,8 @@ pub(crate) fn wait_for_database_inner(
         let delay = backoff_delay(attempt).min(max_wait.saturating_sub(elapsed_now));
         on_retry(attempt, delay);
         sleep(delay);
-        // Guard against sleep overshoot: if the deadline has now passed, don't
-        // start another connection attempt (which could block for a full
-        // per-attempt connect_timeout before detecting the expiry).
+        // A sleep can overshoot the deadline; another attempt could then block
+        // for a full connect_timeout.
         if elapsed() >= max_wait {
             return Err(MigrationError::Connection(format!(
                 "database did not become reachable within {}s after {} attempt(s); \
@@ -3481,11 +3413,9 @@ pub(crate) fn wait_for_database_inner(
 #[cfg(feature = "postgres")]
 fn with_connect_timeout(url: &str, timeout_secs: u64) -> String {
     if crate::pg_conn_str::is_url(url) {
-        // Splice `connect_timeout` directly into the raw percent-encoded query
-        // string so existing parameters (e.g. `options=-c%20search_path%3Dapp`)
-        // are preserved byte-for-byte.  Using query_pairs() / append_pair() would
-        // decode and re-encode them via form encoding (spaces → `+`), which libpq
-        // does not accept.
+        // Splice into the raw query so existing parameters such as
+        // `options=-c%20search_path%3Dapp` stay byte-for-byte. `append_pair` would
+        // form-encode spaces as `+`, which libpq does not accept.
         return url::Url::parse(url).map_or_else(
             |_| url.to_owned(),
             |mut parsed| {
@@ -3503,17 +3433,13 @@ fn with_connect_timeout(url: &str, timeout_secs: u64) -> String {
             },
         );
     }
-    // Keyword/value form (accepted by config validation since the keyword
-    // parser landed): without this, a `--wait` attempt against a blackholed
-    // host gets no per-attempt connect_timeout and a single hung connect can
-    // outlive the whole wait budget. Append the parameter — unless the user
-    // already set their own connect_timeout, which is respected as-is.
+    // Keyword/value form, so a blackholed host cannot hang one attempt past the wait budget.
     match crate::pg_conn_str::keyword_value_pairs(url) {
         Some(pairs) if !pairs.iter().any(|(key, _)| key == "connect_timeout") => {
             format!("{url} connect_timeout={timeout_secs}")
         }
-        // User-provided timeout, or a string tokio-postgres itself would
-        // reject: pass through untouched so connect reports its own error.
+        // A user-set connect_timeout is kept; an unparseable string passes through so
+        // connect reports its own error.
         _ => url.to_owned(),
     }
 }
@@ -3550,17 +3476,12 @@ pub fn wait_for_database(
     wait_for_database_inner(
         max_wait,
         || {
-            // Cap the per-attempt connect_timeout to the remaining budget so
-            // a single hung establish() call cannot extend the total wait beyond
-            // max_wait (e.g. a DROP-firewalled host that accepts the SYN but
-            // never completes the handshake).  libpq's connect_timeout is in
-            // whole seconds; clamp to at least 1.
+            // Cap each attempt to the remaining budget so one hung connect cannot
+            // outlast max_wait. connect_timeout is whole seconds, at least 1.
             let remaining = max_wait.saturating_sub(start.elapsed());
             let connect_timeout_secs = remaining.as_secs().max(1);
             let timed_url = with_connect_timeout(database_url, connect_timeout_secs);
-            // TLS-aware: honors the URL's sslmode (the bundled libpq has no
-            // SSL support, so waiting on a TLS-only server through the
-            // native path would never succeed).
+            // Not the native path: the bundled libpq cannot reach TLS-only servers.
             crate::db::establish_migration_connection(&timed_url)
                 .map(|_conn| ())
                 .map_err(|e| {
@@ -3607,10 +3528,6 @@ pub fn hold_migration_lock(
     database_url: &str,
     wait_timeout: std::time::Duration,
 ) -> Result<MigrationLockGuard, MigrationError> {
-    // TLS-aware: honors the URL's sslmode, exactly like `run_pending_locked`
-    // (see `crate::db::establish_migration_connection`) — this lock is taken
-    // before spawning the external diesel CLI, so it must reach TLS-only
-    // servers too.
     let mut conn = crate::db::establish_migration_connection(database_url).map_err(|e| {
         MigrationError::Connection(crate::db_url::redact_driver_error(
             &e.to_string(),
@@ -3741,47 +3658,22 @@ fn run_pending_locked_inner(
     with_migration_connection!(database_url, |conn| {
         acquire_migration_lock_on(conn, timeout)?;
 
-        // Everything from here runs under the advisory lock on THIS session, so
-        // no concurrent runner can interleave between the validate, apply,
-        // record, and re-validate steps. Compute the outcome, then always
-        // release the lock (the immediately-invoked closure drops its borrow of
-        // `conn` before the release below).
+        // The closure ends its borrow of `conn`, so the lock is released below
+        // on every path.
         let outcome: Result<MigrationResult, MigrationError> = (|| {
-            // (2) Authoritative pre-apply validation: every already-applied
-            //     version's recorded checksum vs its current on-disk up.sql.
-            //     The reads run under the policy `lock_timeout` and retry, so
-            //     a lock on either table fails fast instead of blocking boot.
+            // (2) Validate. The reads run under the policy `lock_timeout` and
+            //     retry, so a lock on either table fails fast instead of blocking boot.
             if let Some(up) = up_sql_by_version {
                 validate_checksums_under_policy(&mut *conn, up, policy)?;
             }
 
-            // (3) Apply pending migrations, with `lock_timeout` and a jittered
-            //     retry (#3057). Collect names eagerly so the harness borrow on
-            //     `conn` is dropped before the checksum steps reuse it.
+            // (3) Apply, with `lock_timeout` and a jittered retry (#3057).
             let applied: Vec<String> = apply_pending_with_policy(&mut *conn, migrations, policy)?;
 
-            // (5) Post-apply re-validation — still under the lock, on the same
-            //     session. It deliberately does not record checksums for the
-            //     freshly-applied versions.
-            //
-            //     This path applies the embedded migration set compiled into the
-            //     binary, but `up_sql_by_version` is read from the on-disk
-            //     `./migrations/` dir. When the dir is not byte-identical to the
-            //     embedded set — files edited or mounted after the binary was built
-            //     — recording the disk bytes would store a hash for content that
-            //     was never applied, since the DB holds the embedded schema,
-            //     silently making the edited file canonical and defeating later
-            //     drift checks. Diesel's `Migration` API does not expose each
-            //     embedded migration's raw `up.sql` bytes, so we cannot hash what
-            //     was applied. Validate only, and defer authoritative recording to
-            //     the CLI and baseline paths (`autumn migrate run`, `autumn migrate
-            //     baseline`), where the applied bytes are the on-disk bytes (#1203).
-            //
-            //     Re-validating catches the interleaving where a sibling replica
-            //     applied and recorded this version's original content between our
-            //     step 2 and our apply: that now-recorded hash is compared against
-            //     our edited on-disk `up.sql`, so the mismatch still fails fast
-            //     before boot.
+            // (4) Re-validate, and record nothing. The embedded set was applied,
+            //     but the map holds the on-disk bytes, which may differ; Diesel does
+            //     not expose the embedded `up.sql`, so the applied bytes cannot be
+            //     hashed here. `autumn migrate run` and `baseline` record instead.
             if let Some(up) = up_sql_by_version {
                 validate_checksums_under_policy(&mut *conn, up, policy)?;
             }
@@ -4226,14 +4118,10 @@ fn sqlite_collision_history_moves(
         .flatten()
         .map(|(version, name)| (name.as_str(), version.as_str()))
         .collect();
-    // Every `FRAMEWORK_MIGRATIONS` full name new to `SQLite` as of this fork
-    // (issue #2699) — every one except the five [`SQLITE_FRAMEWORK_MIGRATION_TABLES`]
-    // already lists. Derived from `FRAMEWORK_MIGRATIONS` itself, never from
-    // `sets`'s shape: a caller's `sets` can hold plugin-registered sources at
-    // any position (`AppBuilder::plugin_migrations`), and a plugin migration
-    // is not unambiguous the way a migration new to `SQLite` is — it may
-    // have applied in an earlier release, so guessing "not the app's own
-    // single set" as "never ran" would silently drop its history.
+    // Framework migrations new to `SQLite` in #2699: all but the shim and the five
+    // in [`SQLITE_FRAMEWORK_MIGRATION_TABLES`]. Derived from `FRAMEWORK_MIGRATIONS`,
+    // not from the position in `sets`: `sets` can hold plugin sets anywhere, and a
+    // plugin migration may have run in an earlier release.
     let new_framework_names: std::collections::HashSet<String> =
         migration_versions_and_names::<diesel::sqlite::Sqlite, _>(&FRAMEWORK_MIGRATIONS)
             .map(|pairs| {
@@ -4264,8 +4152,8 @@ fn sqlite_collision_history_moves(
         if !applied.contains(*version) || applied.contains(substitute) {
             continue;
         }
-        // The pre-#2699 framework migration in this collision, and its
-        // table, if this version is one of the five ambiguous ones.
+        // The pre-#2699 framework migration in this collision and its table, if
+        // any; whether that table exists tells which side ran.
         let framework = sets
             .iter()
             .flatten()
@@ -4284,18 +4172,15 @@ fn sqlite_collision_history_moves(
                 !framework_ran
             }
         } else if new_framework_names.contains(full_name.as_str()) {
-            // `full_name` itself is a framework migration new to `SQLite`. It
-            // never ran, so the plain version still belongs to whichever
-            // other side won the collision.
+            // A framework migration new to `SQLite` never ran, so the plain
+            // version belongs to the other side.
             false
         } else {
             match sqlite_non_framework_collision_owner(sets, version, &new_framework_names)? {
                 Some(ran) => ran,
-                // No `FRAMEWORK_MIGRATIONS` name shares this version at all —
-                // an ordinary collision between two other registered sources
-                // (e.g. the app's own migrations and a plugin's). Which side
-                // ran is genuinely ambiguous from names alone; leave it for
-                // an operator, exactly as before this fork existed.
+                // No framework migration shares this version: which of the
+                // other sources ran is ambiguous from names, so leave it to an
+                // operator.
                 None => continue,
             }
         };
@@ -4494,11 +4379,8 @@ pub(crate) fn auto_migrate(
         if is_dev {
             tracing::info!(target = %target, "Development profile: running pending database migrations...");
         } else {
-            // Non-dev auto-apply is always an explicit opt-in (issue #1903):
-            // either `database.auto_migrate = true` or the
-            // `auto_migrate_in_production` alias. Name the profile and the key
-            // that enabled it so a custom-profile operator (`fly`, `staging`, …)
-            // sees clearly that their opt-in was honored.
+            // Non-dev auto-apply is an explicit opt-in (#1903). Name the key that
+            // enabled it, so an operator on a custom profile sees it was honored.
             let key = if auto_migrate.is_some() {
                 "database.auto_migrate"
             } else {
@@ -4512,26 +4394,10 @@ pub(crate) fn auto_migrate(
             );
         }
 
-        // Content-checksum drift guard (#1203). When the local `./migrations/` directory
-        // is present, read every migration's on-disk `up.sql`, so the locked apply path
-        // can validate already-applied versions against their recorded checksums under
-        // the advisory lock and on the same Postgres session, fail fast on drift, then
-        // re-validate after applying. Running the compare inside the lock, rather than in
-        // a pre-lock check, is what makes the guard race-free under a concurrent rolling
-        // deploy (see [`run_pending_locked_inner`]).
-        //
-        // This startup path validates only; it records no new checksums. It applies the
-        // embedded migration set, which may not be byte-identical to the on-disk `up.sql`
-        // read here, so recording the disk bytes would store a hash for content that was
-        // never applied. Authoritative recording happens on the CLI and baseline paths
-        // (`autumn migrate run`, `autumn migrate baseline`), where applied bytes are the
-        // on-disk bytes.
-        //
-        // Best-effort read: production binaries typically ship without the source tree, so
-        // an absent `./migrations/` is not an error — the map is `None`, the checksum steps
-        // are skipped, and `autumn migrate` is the canonical strict apply path in prod. A
-        // present-but-unreadable dir likewise degrades to `None` with a warning rather than
-        // blocking boot; genuine drift on a readable dir still hard-fails, under the lock.
+        // The on-disk `up.sql` feeds the checksum drift guard (#1203), which runs under
+        // the advisory lock (see [`run_pending_locked_inner`]). Best-effort: production
+        // binaries usually ship without `./migrations/`, so a missing or unreadable dir
+        // skips the guard instead of blocking boot.
         let migrations_dir = std::path::Path::new("migrations");
         let up_by_version = if migrations_dir.is_dir() {
             match read_up_sql_by_version(migrations_dir) {
@@ -4565,12 +4431,8 @@ pub(crate) fn auto_migrate(
                     "All pending migrations applied"
                 );
             }
-            // Hard-fail on genuine drift: an applied migration was either edited
-            // ("checksum mismatch") or deleted/renamed ("up.sql is missing from
-            // the source tree") after being applied. Both mean the deployed
-            // schema silently forks from a fresh build. The validation now runs
-            // under the advisory lock, so this is caught even in the rolling
-            // deploy race a pre-lock check would miss.
+            // An applied migration was edited or deleted since: the deployed schema
+            // no longer matches a fresh build.
             Err(MigrationError::Migration(msg))
                 if msg.contains("checksum mismatch")
                     || msg.contains("up.sql is missing from the source tree") =>
@@ -4582,27 +4444,21 @@ pub(crate) fn auto_migrate(
             }
             Err(e) => {
                 tracing::error!(error = %e, target = %target, "Failed to run migrations");
-                // Aborting boot via `process::exit` skips `on_shutdown`; stop any
-                // managed Postgres first so a bad migration doesn't orphan the
-                // supervised child holding the data dir and port.
+                // `process::exit` skips `on_shutdown`; stop managed Postgres first
+                // so the child does not keep holding the data dir and port.
                 #[cfg(feature = "managed-pg")]
                 crate::managed_pg::emergency_stop();
                 std::process::exit(1);
             }
         }
     } else {
-        // In non-dev modes, just report status
         match pending_migrations(database_url, migrations) {
             Ok(pending) if pending.is_empty() => {
                 tracing::info!(target = %target, "Database migrations are up to date");
             }
             Ok(pending) => {
                 if !is_dev {
-                    // Any non-dev profile (prod/production AND custom names like
-                    // `fly`/`staging`) is opt-in (issue #1903). Name the profile
-                    // and the key an operator would set so a custom-profile
-                    // deploy is not left with only the generic "Run `autumn
-                    // migrate`" line as its signal.
+                    // Every non-dev profile, custom names included, is opt-in (#1903).
                     tracing::warn!(
                         profile = profile_name,
                         target = %target,
@@ -4662,13 +4518,8 @@ pub(crate) fn auto_migrate_sqlite(
     migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite> + Send,
     target: &str,
 ) {
-    // An in-memory target (private OR shared-cache) with registered migrations
-    // cannot work: the migrated schema is lost before the runtime pool anchors
-    // it — a private connection is its own empty database, and a shared in-memory
-    // database is destroyed when its last connection closes. Fail startup fast
-    // with an actionable message — in both the auto-apply and report-pending
-    // profiles — rather than booting into a schema-less pool whose every
-    // DB-backed request 500s (issue #1614 follow-up).
+    // Checked in both modes: an in-memory target loses the migrated schema, and
+    // booting anyway gives a pool where every DB-backed request fails.
     if let Some(err) = reject_in_memory_migrations(database_url, &migrations) {
         tracing::error!(
             target = %target,
@@ -5224,7 +5075,6 @@ mod tests {
         .expect("up.sql");
         std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
         let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
-        // The older release: the app set alone, under its plain version.
         let before = run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
             .expect("the older release applies the app set");
         assert_eq!(before.applied, vec!["20260907101530".to_owned()]);
@@ -5296,8 +5146,7 @@ mod tests {
         .expect("up.sql");
         std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
         let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
-        // A release predating this fork: the app set alone, under its plain
-        // version. `create_api_tokens` did not exist on `SQLite` yet.
+        // Before #2699, `create_api_tokens` did not exist on `SQLite`.
         let before = run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
             .expect("the older release applies the app set");
         assert_eq!(before.applied, vec!["20260512000000".to_owned()]);
@@ -5361,8 +5210,6 @@ mod tests {
         .expect("up.sql");
         std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
         let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
-        // An older release applied the app's migration alone, under its
-        // plain version — no plugin collided with it yet.
         run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
             .expect("the older release applies the app's migration");
 
@@ -5370,16 +5217,9 @@ mod tests {
             crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
         let app_pairs =
             migration_versions_and_names::<diesel::sqlite::Sqlite, _>(&app).expect("enumerate");
-        // A newer release adds a plugin migration that collides with the
-        // app's version; the plugin's name sorts first, so the APP's own
-        // migration is remapped to a substitute — mirroring how
-        // `migration_sets_for_disambiguation` and `sqlite_collision_pairs`
-        // build `sets` at app boot: the app's own migrations (`sets[0]`)
-        // plus every plugin set, in registration order, with no framework
-        // set folded in at all. A heuristic that reads "not `sets[0]`" as
-        // "framework, never ran" gets this backwards: here it is the app's
-        // own migration — not the plugin's — that is remapped, and it did
-        // run.
+        // A newer release adds a plugin migration at the same version. The
+        // plugin's name sorts first, so the app's migration, which did run, is
+        // remapped. `sets` is shaped as at boot: the app set, then plugin sets.
         let sets: Vec<Vec<(String, String)>> = vec![
             app_pairs,
             vec![(
@@ -5427,10 +5267,8 @@ mod tests {
         .expect("up.sql");
         std::fs::write(older.join("down.sql"), "DROP TABLE zzz;\n").expect("down.sql");
         let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
-        // A record under "00000000000000" from before this fork existed —
-        // either the app's own migration, or a prior partial attempt at the
-        // old, unforked FRAMEWORK_MIGRATIONS. Nothing here can tell them
-        // apart.
+        // A pre-#2699 record under "00000000000000" may be the app's migration
+        // or the shim from the old, shared FRAMEWORK_MIGRATIONS.
         run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
             .expect("the older release applies the app's migration");
 
@@ -5484,8 +5322,6 @@ mod tests {
         .expect("up.sql");
         std::fs::write(older.join("down.sql"), "DROP TABLE aaa;\n").expect("down.sql");
         let app = FileBasedMigrations::from_path(&migrations_dir).expect("app set");
-        // An older release, before either the plugin or this fork existed:
-        // only the app's migration applied, under its plain version.
         run_pending_sqlite(&url, DisambiguatedMigrations::new(&app, &HashMap::new()))
             .expect("the older release applies the app's migration");
 
@@ -5493,11 +5329,9 @@ mod tests {
             crate::db::establish_sqlite_migration_connection(&url).expect("open the file");
         let app_pairs =
             migration_versions_and_names::<diesel::sqlite::Sqlite, _>(&app).expect("enumerate");
-        // A newer release adds both a plugin and this fork's framework
-        // migration at the same version. The app's name sorts first (wins,
-        // keeps the plain version); the plugin's name sorts between the
-        // app's and the framework's (per the review finding) and is
-        // remapped, same as the framework migration.
+        // A newer release adds a plugin and a framework migration at the same
+        // version. The app's name sorts first and keeps the plain version; both
+        // others are remapped.
         let sets: Vec<Vec<(String, String)>> = vec![
             app_pairs,
             vec![(
@@ -5622,10 +5456,7 @@ mod tests {
 
     #[test]
     fn no_disambiguation_when_same_set_registered_twice() {
-        // The intentional, harmless case: the exact same migration set
-        // registered from two different call sites (e.g. two plugins that
-        // both depend on a shared migrations bundle) reuses the same
-        // versions AND full names.
+        // Two plugins depending on one shared bundle: same versions and names.
         const A: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
         let disambiguated = compute_migration_disambiguation(&[("plugin-a", &A), ("plugin-b", &A)]);
@@ -5637,10 +5468,8 @@ mod tests {
 
     #[test]
     fn disambiguates_a_real_version_collision() {
-        // Real-world shape: a framework migration and an app's own first
-        // migration both picking the all-zero placeholder version — exactly
-        // what `examples/todo-app` hits against the framework's legacy
-        // `create_api_tokens` migration.
+        // Both sides use the all-zero placeholder version, as `examples/todo-app`
+        // does.
         const APP: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
         const COLLIDING: EmbeddedMigrations =
@@ -5649,10 +5478,8 @@ mod tests {
         let disambiguated =
             compute_migration_disambiguation(&[("app", &APP), ("test-plugin", &COLLIDING)]);
 
-        // Deterministic, content-based order (lexicographic full name):
-        // "00000000000000_create_gadgets" < "00000000000000_create_todos",
-        // so the plugin's migration keeps the plain version regardless of
-        // registration order.
+        // "..._create_gadgets" < "..._create_todos", so the plugin's migration
+        // keeps the plain version.
         assert!(
             !disambiguated.contains_key("00000000000000_create_gadgets"),
             "the lexicographically-first migration must keep its original version: {disambiguated:?}"
@@ -5672,14 +5499,9 @@ mod tests {
 
     #[test]
     fn duplicate_migrations_substitute_hash_is_independent_of_registration_order() {
-        // A migration folded into two bundles under different source names — the
-        // intentional, harmless "same set registered twice" case — that also collides at
-        // its version with a third, differently-named migration: the duplicate is the one
-        // that must be substituted, since "20260101000000_a_third_migration" sorts before
-        // "20260101000000_create_gizmos". The substitute hash derives from the duplicate's
-        // own full name, not from which sources register it, so it must be identical
-        // whatever the registration order — and whether or not it is ever registered under
-        // a second name at all (see the next test).
+        // A migration registered under two source names also collides with a third
+        // migration that sorts first, so the duplicate is substituted. Its substitute
+        // must not depend on registration order.
         const DUP: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
         const OTHER: EmbeddedMigrations =
@@ -5716,14 +5538,8 @@ mod tests {
 
     #[test]
     fn duplicate_migrations_substitute_hash_is_stable_as_registrations_change() {
-        // The stronger guarantee `duplicate_migrations_substitute_hash_is_independent_of_registration_order`
-        // only hints at: an ALREADY-APPLIED migration's substitute must not
-        // change merely because the set of sources registering it grows or
-        // shrinks across releases (e.g. the same bundle later folded into an
-        // additional plugin too) -- only the migration's own, permanently
-        // fixed full name may drive the hash. Registered once vs. registered
-        // twice (under an entirely different second name) must produce the
-        // SAME substitute for the losing migration.
+        // An applied migration's substitute must not change when a later release
+        // registers it from one more source.
         const DUP: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("tests/fixtures/plugin_migrations_ok");
         const OTHER: EmbeddedMigrations =
@@ -5747,11 +5563,8 @@ mod tests {
 
     #[test]
     fn substitute_never_collides_with_an_unrelated_raw_version() {
-        // If a generated substitute happened to equal some OTHER, unrelated
-        // migration's own plain version, the two would share one Diesel
-        // tracking key -- exactly the bug this guard exists to prevent.
-        // Regression-guard the underlying invariant directly: no output
-        // substitute may equal any INPUT raw version.
+        // A substitute equal to another migration's plain version would share its
+        // Diesel tracking key.
         const APP: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
         const COLLIDING: EmbeddedMigrations =
@@ -5781,13 +5594,9 @@ mod tests {
 
     #[test]
     fn disambiguates_a_collision_against_the_standalone_shard_control_migrations() {
-        // `SHARD_DIRECTORY_MIGRATIONS`/`SHARD_MAP_MIGRATIONS` are applied
-        // straight from their own `const`s (not through the app's
-        // `migrations`), so callers must pass them into
-        // `compute_migration_disambiguation` explicitly alongside the
-        // registered set -- this fixture's version
-        // ("20260612000000") matches the real shard-directory migration's,
-        // under a different name, exactly the scenario a plugin could hit.
+        // The shard control sets are applied from their own `const`s, so callers
+        // pass them in explicitly. The fixture shares the shard-directory
+        // migration's version under another name.
         const PLUGIN: EmbeddedMigrations = diesel_migrations::embed_migrations!(
             "tests/fixtures/plugin_migrations_collision_shard_directory"
         );
@@ -5798,9 +5607,8 @@ mod tests {
                 &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
             ),
         ]);
-        // "20260612000000_a_plugin_thing" < "20260612000000_create_shard_directory"
-        // lexicographically, so the PLUGIN keeps the plain version and the
-        // framework's own shard-directory migration is the one substituted.
+        // "..._a_plugin_thing" < "..._create_shard_directory", so the framework
+        // migration is the one substituted.
         assert!(
             !disambiguated.contains_key("20260612000000_a_plugin_thing"),
             "the lexicographically-first migration must keep its original version: {disambiguated:?}"
@@ -5813,10 +5621,7 @@ mod tests {
 
     #[test]
     fn bounded_substitute_version_fits_varchar_50_even_with_a_long_source_name() {
-        // `plugin_migrations` accepts an arbitrary `&'static str` name --
-        // an unbounded "{version}+{name}" would overflow
-        // __diesel_schema_migrations.version (VARCHAR(50)) and fail the
-        // INSERT at migration time.
+        // A plugin name is arbitrary; "{version}+{name}" would overflow VARCHAR(50).
         let long_name = "a-plugin-with-a-very-long-descriptive-crate-name-that-keeps-going";
         let substitute = bounded_substitute_version("20260101000000", long_name, 1);
         assert!(
@@ -5851,9 +5656,6 @@ mod tests {
 
     #[test]
     fn with_connect_timeout_appends_to_keyword_strings() {
-        // Keyword/value strings pass config validation, so the wait loop
-        // must bound their connect attempts too — a blackholed host must
-        // not hang one attempt past the whole wait budget.
         assert_eq!(
             with_connect_timeout("host=db user=app sslmode=require", 7),
             "host=db user=app sslmode=require connect_timeout=7"
@@ -5893,7 +5695,7 @@ mod tests {
         assert_eq!(with_connect_timeout("host=", 7), "host=");
     }
 
-    // ── Red-phase tests for advisory-lock API (fail until implemented) ─────
+    // ── Advisory-lock API ──────────────────────────────────────────────────
 
     #[test]
     fn lock_timeout_error_display() {
@@ -6720,10 +6522,8 @@ mod tests {
 
     #[test]
     fn run_pending_locked_inner_with_checksum_map_still_errors_on_bad_url() {
-        // The checksum-carrying locked path (the one `auto_migrate` uses) must
-        // reach the connection stage and surface a Connection error on an
-        // unreachable host — the under-lock validation never runs before the
-        // session exists, so the map does not change the failure mode.
+        // The under-lock validation needs a session, so the map does not change
+        // the failure mode.
         const MIGRATIONS: EmbeddedMigrations =
             diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
         let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db";
@@ -6776,7 +6576,6 @@ mod tests {
             results.push(handle.await.expect("task panicked"));
         }
 
-        // (c) No runner should produce an error.
         for result in &results {
             assert!(
                 result.is_ok(),
@@ -6784,7 +6583,6 @@ mod tests {
             );
         }
 
-        // (a) Exactly one runner applied migrations.
         let applied_count = results
             .iter()
             .filter(|r| r.as_ref().is_ok_and(|m| !m.applied.is_empty()))
@@ -6794,8 +6592,7 @@ mod tests {
             "exactly one runner should apply migrations; results={results:?}"
         );
 
-        // (b) The final schema must include all expected tables.
-        // We verify by checking that a subsequent run finds no pending migrations.
+        // A later run finds nothing pending, so the schema is complete.
         let final_check =
             run_pending_locked(&url, TEST_MIGRATIONS, None).expect("post-run check failed");
         assert!(
@@ -6830,8 +6627,7 @@ mod tests {
         let port = container.get_host_port_ipv4(5432).await.unwrap();
         let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
-        // Diesel's sync API is blocking; run it off the runtime thread. The
-        // container handle stays owned here so it outlives the blocking work.
+        // The container handle stays here so it outlives the blocking work.
         crate::time::spawn_blocking(move || checksum_loop_body(&url))
             .await
             .expect("checksum loop task panicked");
@@ -6865,13 +6661,9 @@ mod tests {
         let mut conn =
             diesel::PgConnection::establish(url).expect("failed to connect to Postgres container");
 
-        // ── Step 7: fresh-DB behaviour (read-only contract) ─────────────────
-        // Before any framework migration runs, `autumn_migration_checksums`
-        // does not exist. `recorded_checksums` is READ-ONLY: it must return an
-        // empty map — never an error — WITHOUT creating the table and WITHOUT
-        // poisoning the session (issue #1203 review, P2-A). Read paths
-        // (`autumn migrate status`, pre-apply validation) must not require DDL
-        // privileges or mutate the DB just to display / check state.
+        // ── Step 0: fresh DB, read-only ─────────────────────────────────────
+        // `recorded_checksums` returns an empty map without creating the table or
+        // poisoning the session: read paths must not need DDL privileges.
         assert!(
             !checksum_table_exists(&mut conn),
             "checksum table must be absent before the first checksum call"
@@ -6882,24 +6674,16 @@ mod tests {
             empty.is_empty(),
             "fresh DB must report no recorded checksums"
         );
-        // The table must STILL be absent — `recorded_checksums` is read-only and
-        // must NOT create it (that is the write helpers' job on apply/record).
         assert!(
             !checksum_table_exists(&mut conn),
             "recorded_checksums must NOT create the checksum table (read-only)"
         );
-        // The connection must remain usable after the fresh-DB path — this is
-        // the highest-risk untested path.
         let row = diesel::sql_query("SELECT 1 AS one")
             .get_result::<One>(&mut conn)
             .expect("connection must remain usable after the fresh-DB path");
         assert_eq!(row.one, 1, "post-fresh-DB query must succeed");
 
         // ── Step 1: run framework migrations, which create the checksum table ─
-        // The table is still absent (read-only reads above never created it);
-        // the framework migration set includes the managed
-        // `create_migration_checksums` DDL, so after applying it the table
-        // exists and starts empty.
         run_pending(url, FRAMEWORK_MIGRATIONS).expect("framework migrations must apply");
         assert!(
             checksum_table_exists(&mut conn),
@@ -6995,7 +6779,6 @@ mod tests {
         );
         validate_checksums(&applied_with_legacy, &up_by_version, &recorded)
             .expect("an Unrecorded legacy migration must NOT fail validation");
-        // Baseline: record checksums for versions that lack them.
         let newly = record_checksums(&mut conn, &applied_with_legacy, &up_by_version)
             .expect("record_checksums baseline");
         assert_eq!(
@@ -7013,7 +6796,6 @@ mod tests {
         );
 
         // ── Step 6: escape hatch — rebaseline overwrites, then validates ────
-        // Declare the EDITED content canonical for `version`.
         rebaseline_checksum(&mut conn, &version, &actual_hash).expect("rebaseline_checksum");
         let recorded = recorded_checksums(&mut conn).expect("read recorded checksums");
         assert_eq!(
@@ -7024,15 +6806,10 @@ mod tests {
         validate_checksums(&applied, &edited_by_version, &recorded)
             .expect("edited content must validate Ok after re-baseline");
 
-        // Step 8: the drift guard runs under the advisory lock. Prove
-        // `run_pending_locked_inner` performs the checksum comparison inside its locked
-        // critical section, not only in the pre-lock caller. At this point `version` is
-        // recorded as `actual_hash` from step 6's re-baseline, but
-        // `up_by_version[version]` still holds the original `up_sql`, which hashes to
-        // `recorded_hash`, so the on-disk content and the recorded checksum disagree.
-        // Feeding that map to the locked apply path must fail fast with a "checksum
-        // mismatch" before any migration is applied. The framework migrations passed here
-        // are already applied, so the only way this errors is the under-lock validation.
+        // ── Step 7: the drift guard runs under the advisory lock ────────────
+        // `version` is recorded as `actual_hash` since step 6, but `up_by_version`
+        // still holds the original `up_sql`. The framework migrations are already
+        // applied, so only the under-lock validation can fail here.
         assert_ne!(
             migration_checksum(up_sql),
             actual_hash,
@@ -7051,14 +6828,9 @@ mod tests {
             "run_pending_locked_inner must validate checksums inside the locked section: {drift:?}"
         );
 
-        // ── Step 9: rollback clears the checksum, re-apply records fresh ────
-        // Reproduces the PR review's P2: down + edit up.sql + re-apply must NOT
-        // leave a stale hash. Simulate `autumn migrate down` for `version` the
-        // same way the wired revert path does — remove it from
-        // `__diesel_schema_migrations` and call `delete_checksums` — then prove
-        // its checksum row is gone (so the version is neither applied nor
-        // recorded → no drift), that re-applying an EDITED up.sql records the
-        // NEW hash (not the stale one), and that a subsequent validate passes.
+        // ── Step 8: rollback clears the checksum, re-apply records fresh ────
+        // Simulates `autumn migrate down`: down, edit up.sql, re-apply must not
+        // leave the stale hash.
         diesel::sql_query("DELETE FROM __diesel_schema_migrations WHERE version = $1")
             .bind::<diesel::sql_types::Text, _>(&version)
             .execute(&mut conn)
@@ -7075,10 +6847,6 @@ mod tests {
             "after rollback the reverted version must have NO recorded checksum"
         );
 
-        // Re-apply the EDITED up.sql: re-record the applied version and record
-        // checksums from the edited content. The additive `record_checksums`
-        // now writes a fresh row (the stale one was deleted on rollback) whose
-        // hash matches the edited bytes.
         diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ($1)")
             .bind::<diesel::sql_types::Text, _>(&version)
             .execute(&mut conn)
@@ -7098,18 +6866,9 @@ mod tests {
         validate_checksums(&applied, &edited_by_version, &recorded)
             .expect("edited content validates Ok after rollback + fresh re-apply");
 
-        // ── Step 10: the startup path VALIDATES but does NOT record ─────────
-        // The startup auto-migrate path (`run_pending_locked_inner` with a disk
-        // map) applies the EMBEDDED migration set, which may differ from the
-        // on-disk `up.sql` read into the map, so it must never record disk bytes
-        // for versions it "applies" (issue #1203 review). Authoritative
-        // recording is deferred to the CLI/baseline paths where applied == disk.
-        //
-        // Simulate a freshly-applied-but-unrecorded version exactly as the
-        // startup path would see it: present in `__diesel_schema_migrations` and
-        // in the disk map, but with NO recorded checksum. Running the locked path
-        // must leave it Unrecorded — it must NOT write a checksum row from the
-        // disk bytes.
+        // ── Step 9: the startup path validates but does not record ──────────
+        // It applies the embedded set, which may differ from the disk bytes in the
+        // map, so an applied, unrecorded version must stay unrecorded.
         let startup_version = "20990103000000".to_string();
         let startup_sql = "CREATE TABLE checksum_startup (id BIGINT PRIMARY KEY);";
         diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES ($1)")
@@ -7124,8 +6883,7 @@ mod tests {
                 .contains_key(&startup_version),
             "precondition: the startup version must have no recorded checksum yet"
         );
-        // FRAMEWORK_MIGRATIONS are all applied, so nothing pending; the map is
-        // used for validation only. Unrecorded → Ok, so this must succeed.
+        // Nothing is pending; Unrecorded validates Ok.
         run_pending_locked_inner(
             url,
             FRAMEWORK_MIGRATIONS,
@@ -7143,13 +6901,10 @@ mod tests {
         );
     }
 
-    // ── Existing tests ─────────────────────────────────────────────────────
-
     // ── applied_user_migrations / revert_user_migrations ─────────────────────
 
     #[test]
     fn applied_user_migrations_fails_with_connection_error_on_bad_url() {
-        // Red-phase: function exists and returns Connection error on unreachable host.
         let dir = std::path::Path::new("../examples/todo-app/migrations");
         let result =
             applied_user_migrations("postgres://invalid:invalid@0.0.0.0:1/invalid_db", dir);
@@ -7162,8 +6917,7 @@ mod tests {
 
     #[test]
     fn revert_user_migrations_locked_fails_with_connection_error_on_bad_url() {
-        // The connection is established before the lock/plan, so an unreachable
-        // host produces a Connection error and the plan closure never runs.
+        // The connection comes before the lock and the plan.
         let dir = std::path::Path::new("../examples/todo-app/migrations");
         let mut planned = false;
         let result = revert_user_migrations_locked(
@@ -7189,10 +6943,6 @@ mod tests {
 
     #[test]
     fn record_checksums_from_dir_locked_fails_with_connection_error_on_bad_url() {
-        // `autumn migrate baseline` primitive: it reads the migrations dir first,
-        // then establishes a connection to take the advisory lock before the
-        // read+write. An unreachable host must surface as a Connection error
-        // (never a panic or a silently-held lock).
         let dir = std::path::Path::new("../examples/todo-app/migrations");
         let result = record_checksums_from_dir_locked(
             "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
@@ -7207,10 +6957,7 @@ mod tests {
 
     #[test]
     fn rebaseline_checksum_from_dir_locked_fails_with_connection_error_on_bad_url() {
-        // `autumn migrate baseline --force <version>` primitive. `00000000000000`
-        // exists on disk, so the up.sql lookup succeeds and the code proceeds to
-        // connect for the advisory lock — an unreachable host must produce a
-        // Connection error.
+        // `00000000000000` exists on disk, so the lookup passes and it connects.
         let dir = std::path::Path::new("../examples/todo-app/migrations");
         let result = rebaseline_checksum_from_dir_locked(
             "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
@@ -7226,9 +6973,7 @@ mod tests {
 
     #[test]
     fn rebaseline_checksum_from_dir_locked_errors_before_connecting_on_unknown_version() {
-        // The up.sql lookup is a pure disk read that runs BEFORE any connection
-        // or lock acquisition, so an unknown version fails fast with a Migration
-        // error and never opens a session (nothing to serialize).
+        // The up.sql lookup runs before the connection.
         let dir = std::path::Path::new("../examples/todo-app/migrations");
         let result = rebaseline_checksum_from_dir_locked(
             "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
@@ -7280,7 +7025,6 @@ mod tests {
             Path::new("migrations"),
         );
 
-        // The framework version (absent locally) is dropped; the user migration remains.
         assert_eq!(user.len(), 1);
         assert_eq!(user[0].version, "20260101000000");
         assert_eq!(
@@ -7291,8 +7035,6 @@ mod tests {
 
     #[test]
     fn classify_keeps_user_migration_colliding_with_framework_version() {
-        // A local user migration whose version equals a framework shim version
-        // (the placeholder `00000000000000`) must be kept — local presence wins.
         let applied = vec!["00000000000000".to_string()];
         let by_version = version_map(&[("00000000000000", "00000000000000_create_todos")]);
         let framework = version_set(&["00000000000000"]);
@@ -7315,8 +7057,7 @@ mod tests {
 
     #[test]
     fn classify_surfaces_applied_migration_missing_locally() {
-        // Applied, not framework-owned, but absent from the local dir: keep it
-        // with dir = None so callers can refuse rather than silently drop it.
+        // Kept with `dir: None`, so callers can refuse instead of dropping it.
         let applied = vec!["20260101000000".to_string()];
         let by_version = version_map(&[]);
         let framework = version_set(&["00000000000000"]);
@@ -7355,10 +7096,8 @@ mod tests {
         );
 
         assert_eq!(user.len(), 2);
-        // Ascending by version regardless of input order.
         assert_eq!(user[0].version, "20260101000000");
         assert_eq!(user[1].version, "20260102000000");
-        // Hyphenated dir resolved via the normalised version key.
         assert_eq!(
             user[0].dir,
             Some(Path::new("migrations").join("2026-01-01-000000_create_posts"))
@@ -7420,7 +7159,7 @@ mod tests {
 
     #[test]
     fn profile_aliases_are_recognized() {
-        // `auto_migrate` unset (None) — decision falls to convention + alias.
+        // `auto_migrate` unset: the profile and the alias decide.
         assert!(should_auto_apply(Some("dev"), None, false));
         assert!(should_auto_apply(Some("development"), None, false));
         assert!(!should_auto_apply(Some("prod"), None, false));
@@ -7435,10 +7174,10 @@ mod tests {
     /// (the reported bug). And a custom profile with nothing set stays off.
     #[test]
     fn should_auto_apply_is_profile_agnostic_for_the_alias() {
-        // THE bug: custom profile + alias opt-in => auto-apply.
+        // Custom profile with the alias: apply.
         assert!(should_auto_apply(Some("fly"), None, true));
         assert!(should_auto_apply(Some("staging"), None, true));
-        // Custom profile, nothing set => opt-in only, stays off.
+        // Custom profile, nothing set: off.
         assert!(!should_auto_apply(Some("fly"), None, false));
         assert!(!should_auto_apply(Some("staging"), None, false));
     }
@@ -7448,13 +7187,13 @@ mod tests {
     /// even on dev.
     #[test]
     fn explicit_auto_migrate_overrides_convention_on_any_profile() {
-        // dev/development => auto-apply by default (alias irrelevant).
+        // dev applies by default.
         assert!(should_auto_apply(Some("dev"), None, false));
         assert!(should_auto_apply(Some("development"), None, false));
-        // Explicit false on dev => report-only (override beats convention).
+        // Explicit false on dev: report only.
         assert!(!should_auto_apply(Some("dev"), Some(false), false));
         assert!(!should_auto_apply(Some("development"), Some(false), true));
-        // Explicit true forces apply on a custom/prod profile with no alias.
+        // Explicit true applies on any profile.
         assert!(should_auto_apply(Some("fly"), Some(true), false));
         assert!(should_auto_apply(Some("prod"), Some(true), false));
         // Explicit `auto_migrate` wins even when the alias disagrees.
@@ -7535,15 +7274,14 @@ mod tests {
 
     #[test]
     fn should_auto_apply_returns_false_for_none_profile() {
-        // No profile is treated as a non-dev, opt-in profile: off unless an
-        // explicit override or the alias enables it.
+        // No profile is a non-dev, opt-in profile.
         assert!(!should_auto_apply(None, None, false));
         assert!(should_auto_apply(None, None, true));
         assert!(should_auto_apply(None, Some(true), false));
         assert!(!should_auto_apply(None, Some(false), true));
     }
 
-    // ── startup wait-for-DB (red phase) ───────────────────────────────────────
+    // ── startup wait-for-DB ───────────────────────────────────────────────────
 
     #[test]
     fn is_retryable_connection_refused() {
@@ -7679,8 +7417,7 @@ mod tests {
 
     #[test]
     fn redact_masks_whole_token_on_parse_failure() {
-        // A URL with a bare @ in the password fails url::Url::parse; the whole
-        // token must be replaced with **** rather than passed through unredacted.
+        // A bare @ in the password fails `Url::parse`; the whole token is masked.
         let msg = "error: postgres://user:p@ss@host/db";
         let out = redact_db_url_credentials(msg);
         assert!(
@@ -7757,7 +7494,6 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(attempts.get(), 3);
         assert_eq!(sleep_delays.len(), 2);
-        // Delays grow with capped exponential backoff
         assert_eq!(sleep_delays[0], std::time::Duration::from_millis(500));
         assert_eq!(sleep_delays[1], std::time::Duration::from_secs(1));
     }
@@ -7791,9 +7527,7 @@ mod tests {
 
     #[test]
     fn migration_checksum_lf_and_crlf_hash_equally() {
-        // Line-ending normalization: CRLF, CR, and LF variants of the same
-        // logical source must produce the same checksum so a Windows checkout
-        // does not spuriously trip the mismatch guard.
+        // A Windows checkout must not trip the mismatch guard.
         let lf = "CREATE TABLE t (id INT);\nCREATE INDEX i ON t (id);\n";
         let crlf = "CREATE TABLE t (id INT);\r\nCREATE INDEX i ON t (id);\r\n";
         let cr = "CREATE TABLE t (id INT);\rCREATE INDEX i ON t (id);\r";
@@ -7803,8 +7537,7 @@ mod tests {
 
     #[test]
     fn migration_checksum_ignores_trailing_whitespace() {
-        // trim_end strips trailing whitespace so an editor that appends /
-        // strips a final newline does not spuriously trip the mismatch guard.
+        // An editor adding or removing a final newline must not trip the guard.
         let a = "SELECT 1;\n";
         let b = "SELECT 1;";
         let c = "SELECT 1;\n\n\n   \n";
@@ -7814,7 +7547,6 @@ mod tests {
 
     #[test]
     fn migration_checksum_differs_on_semantic_edit() {
-        // A real content change must change the checksum.
         let orig = "CREATE TABLE t (id INT);\n";
         let edited = "CREATE TABLE t (id BIGINT);\n";
         assert_ne!(migration_checksum(orig), migration_checksum(edited));
@@ -7822,18 +7554,14 @@ mod tests {
 
     #[test]
     fn migration_checksum_is_hex_sha256() {
-        // Known SHA-256 vector: sha256("abc") is the standard test vector.
-        // Our normaliser leaves "abc" unchanged (no CRLF, no trailing ws),
-        // so the checksum equals the canonical sha256("abc") hex.
+        // The standard sha256("abc") vector; normalising leaves "abc" unchanged.
         let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         assert_eq!(migration_checksum("abc"), expected);
     }
 
     #[test]
     fn migration_checksum_bytes_matches_string_form() {
-        // The bytes and string forms must agree for valid UTF-8 so the
-        // startup (embedded bytes) and CLI (on-disk string) paths hash
-        // identically.
+        // Startup hashes embedded bytes and the CLI hashes on-disk strings.
         let sql = "CREATE TABLE t (id INT);\r\n";
         assert_eq!(
             migration_checksum(sql),
@@ -7881,8 +7609,7 @@ mod tests {
 
     #[test]
     fn classify_marks_unrecorded_when_missing_from_recorded_map() {
-        // Legacy migrations applied before the checksum table existed have no
-        // recorded hash; they must show up as Unrecorded (never Changed).
+        // Applied before the checksum table existed: Unrecorded, never Changed.
         let up = "SELECT 1;\n";
         let applied = vec!["20260101000000".to_string()];
         let up_map = checksum_map(&[("20260101000000", up)]);
@@ -7895,8 +7622,7 @@ mod tests {
 
     #[test]
     fn classify_marks_unrecorded_when_up_sql_unresolvable() {
-        // Applied migration whose local up.sql isn't available: treat as
-        // Unrecorded rather than a hard error so status/validation still runs.
+        // Not an error, so status and validation still run.
         let applied = vec!["20260101000000".to_string()];
         let up_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let recorded = std::collections::HashMap::new();
@@ -7944,9 +7670,7 @@ mod tests {
 
     #[test]
     fn classify_marks_missing_when_recorded_but_up_sql_gone() {
-        // A migration that WAS recorded (so it once belonged to this dir) but
-        // whose on-disk up.sql is now gone (deleted or renamed) must classify
-        // as Missing — genuine drift, NOT the tolerated Unrecorded legacy case.
+        // A recorded checksum means it once belonged to this dir, so this is drift.
         let original = "SELECT 1;\n";
         let applied = vec!["20260101000000".to_string()];
         let up_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -7964,8 +7688,6 @@ mod tests {
 
     #[test]
     fn validate_checksums_fails_on_missing() {
-        // The Missing state must hard-fail validation (drift), with a message
-        // that names the version, the recorded hex, and the remedy.
         let original = "SELECT 1;\n";
         let version = "20260101000000";
         let applied = vec![version.to_string()];
@@ -7983,12 +7705,11 @@ mod tests {
             msg.contains(&migration_checksum(original)),
             "message must include the recorded hex: {msg}"
         );
+        // The auto_migrate startup guard matches this substring to hard-exit.
         assert!(
             msg.contains("up.sql is missing from the source tree"),
             "message must name the failure mode: {msg}"
         );
-        // The auto_migrate startup guard matches on this exact substring to
-        // decide to hard-exit; keep them in lockstep.
         assert!(
             msg.contains("must never be deleted or renamed"),
             "message must state the remedy: {msg}"
@@ -7997,19 +7718,12 @@ mod tests {
 
     #[test]
     fn validate_checksums_tolerates_absent_up_sql_without_recorded_checksum() {
-        // NEGATIVE / no-false-positive test: a version that is applied but has
-        // NO recorded checksum and NO on-disk up.sql — e.g. an embedded or
-        // framework migration whose SQL never lived in the validated dir, or a
-        // truly legacy migration — must classify Unrecorded and NOT hard-fail,
-        // even alongside a normal recorded+present migration. This proves the
-        // `recorded.is_some()` scoping keeps `Missing` from firing on
-        // migrations that never belonged to this dir.
+        // With no recorded checksum, an absent up.sql (a framework migration, or a
+        // legacy one) is Unrecorded, not Missing.
         let ok_up = "SELECT 1;\n";
         let framework_version = "00000000000000".to_string();
         let user_version = "20260101000000".to_string();
         let applied = vec![framework_version.clone(), user_version];
-        // Only the user migration is present on disk / recorded; the framework
-        // version is applied but has neither a file nor a recorded checksum.
         let up_map = checksum_map(&[("20260101000000", ok_up)]);
         let recorded = checksum_map(&[("20260101000000", &migration_checksum(ok_up))]);
 
@@ -8028,12 +7742,9 @@ mod tests {
 
     #[test]
     fn checksum_status_excludes_framework_but_keeps_user_unrecorded() {
-        // Reproduces the status bug: an applied FRAMEWORK version (no local
-        // up.sql, no recorded checksum) must NOT be classified Unrecorded and
-        // prompt `baseline` (which cannot record it — its up.sql isn't in the
-        // user dir). A genuinely user-owned applied-but-unrecorded version must
-        // STILL classify Unrecorded. The status path filters framework versions
-        // via `user_applied_versions` BEFORE `classify`, so exercise that first.
+        // An applied framework version must not show as Unrecorded and prompt
+        // `baseline`, which cannot record it. `checksum_status` filters with
+        // `user_applied_versions` before `classify`.
         let framework_version = "00000000000000".to_string();
         let user_recorded_version = "20260101000000".to_string();
         let user_unrecorded_version = "20260102000000".to_string();
@@ -8046,28 +7757,21 @@ mod tests {
 
         let ok_up = "SELECT 1;\n";
         let pending_up = "SELECT 2;\n";
-        // The framework version has no on-disk up.sql; both user versions do.
         let up_map = checksum_map(&[("20260101000000", ok_up), ("20260102000000", pending_up)]);
-        // Only the first user migration has a recorded checksum. The framework
-        // version is (correctly) never recorded against the user dir.
         let recorded = checksum_map(&[("20260101000000", &migration_checksum(ok_up))]);
         let framework = version_set(&["00000000000000"]);
 
         let user_applied = user_applied_versions(&applied, &up_map, &framework);
-        // The framework version is filtered out entirely before classification.
         assert!(
             !user_applied.contains(&framework_version),
             "applied framework version must be excluded from checksum status"
         );
 
         let states = classify(&user_applied, &up_map, &recorded);
-        // The framework version produces no status entry, so it can never
-        // recommend `baseline`.
         assert!(
             states.iter().all(|(v, _)| v != &framework_version),
             "framework version must not appear in checksum status output"
         );
-        // The recorded user migration is Ok.
         assert_eq!(
             states
                 .iter()
@@ -8075,8 +7779,6 @@ mod tests {
                 .map(|(_, s)| s),
             Some(&ChecksumState::Ok),
         );
-        // The user-owned applied-but-unrecorded migration STILL surfaces as
-        // Unrecorded — the filter must not over-reach.
         assert_eq!(
             states
                 .iter()
@@ -8089,14 +7791,10 @@ mod tests {
 
     #[test]
     fn user_applied_versions_keeps_disk_missing_user_migration() {
-        // A user-owned applied version absent from disk AND not framework-owned
-        // must still be kept (it is a real problem to surface), while a
-        // framework version absent from disk is dropped. The filter keys on
-        // framework-set membership, never on "absent from the user dir".
+        // The filter keys on framework-set membership, not on absence from disk.
         let framework_version = "00000000000000".to_string();
         let missing_user_version = "20260101000000".to_string();
         let applied = vec![framework_version.clone(), missing_user_version.clone()];
-        // Neither version is present on disk.
         let up_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let framework = version_set(&["00000000000000"]);
 

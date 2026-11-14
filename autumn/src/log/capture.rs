@@ -33,8 +33,6 @@ use tracing_subscriber::registry::LookupSpan;
 
 use crate::log::filter::{FILTERED_PLACEHOLDER, ParameterFilter};
 
-// ── Config ─────────────────────────────────────────────────────
-
 /// Configuration for the in-memory log capture buffer.
 ///
 /// Nested under `[log.capture]` in `autumn.toml` or via
@@ -79,8 +77,6 @@ impl Default for LogCaptureConfig {
     }
 }
 
-// ── CapturedLogEntry ──────────────────────────────────────────
-
 /// A single captured tracing event stored in the [`LogBuffer`].
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CapturedLogEntry {
@@ -102,8 +98,6 @@ pub struct CapturedLogEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
 }
-
-// ── LogBuffer ─────────────────────────────────────────────────
 
 struct LogBufferInner {
     capacity: usize,
@@ -177,7 +171,6 @@ impl LogBuffer {
         });
 
         if let Some(n) = limit {
-            // Take the last N matching entries (newest-last in the original order).
             let mut result: Vec<_> = iter.rev().take(n).cloned().collect();
             drop(guard);
             result.reverse();
@@ -211,8 +204,6 @@ impl LogBuffer {
     }
 }
 
-// ── Level helpers ──────────────────────────────────────────────
-
 /// Parse a level string (case-insensitive) into a `tracing::Level`.
 ///
 /// Returns `None` for unrecognised strings so callers can handle gracefully.
@@ -241,8 +232,6 @@ pub fn level_from_str(s: &str) -> Option<Level> {
         }
     }
 }
-
-// ── LogCaptureLayer ───────────────────────────────────────────
 
 /// `tracing_subscriber` layer that captures events into a [`LogBuffer`].
 ///
@@ -281,7 +270,6 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LogCaptureLayer {
         let target = event.metadata().target().to_owned();
         let timestamp = crate::time::ambient_now().to_rfc3339_opts(SecondsFormat::Millis, true);
 
-        // Scrub sensitive field values in-place to avoid re-allocating the map.
         let filter = self.buffer.filter();
         let mut fields = visitor.fields;
         for (k, v) in &mut fields {
@@ -290,10 +278,7 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LogCaptureLayer {
             }
         }
 
-        // Pull full request context (request_id, user_id, tenant_id, custom fields)
-        // from the task-local log context.  Event-level fields take priority;
-        // context fields are only inserted when the key does not already exist.
-        // All values are run through the same sensitive-key filter.
+        // Merge in the request context. An event field wins over a context field with the same key.
         let request_id;
         if let Some(ctx) = crate::log::context::snapshot() {
             request_id = ctx.request_id;
@@ -337,8 +322,6 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LogCaptureLayer {
         self.buffer.push(entry);
     }
 }
-
-// ── Field visitor ─────────────────────────────────────────────
 
 struct FieldVisitor {
     message: Option<String>,
@@ -394,8 +377,6 @@ impl Visit for FieldVisitor {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,8 +391,6 @@ mod tests {
             request_id: None,
         }
     }
-
-    // ── RED: LogBuffer bounded capacity ──────────────────────
 
     #[test]
     fn red_buffer_evicts_oldest_at_capacity() {
@@ -443,7 +422,6 @@ mod tests {
         }
         let snap = buf.snapshot(None, Some(3));
         assert_eq!(snap.len(), 3);
-        // limit takes the most recent N entries in chronological order
         assert_eq!(snap[0].message, "msg-7");
         assert_eq!(snap[2].message, "msg-9");
     }
@@ -481,11 +459,8 @@ mod tests {
         assert_eq!(snap.len(), 2);
     }
 
-    // ── RED: LogBuffer sensitive field scrubbing ──────────────
-
     #[test]
     fn red_buffer_push_does_not_scrub_fields_directly() {
-        // Scrubbing happens in LogCaptureLayer, not in push; push is raw.
         let buf = LogBuffer::new(10, ParameterFilter::default());
         let mut entry = make_entry("INFO", "login");
         entry.fields.insert(
@@ -494,11 +469,9 @@ mod tests {
         );
         buf.push(entry.clone());
         let snap = buf.snapshot(None, None);
-        // push stores whatever it's given (scrubbing is the layer's job)
+        // `push` stores fields raw: scrubbing is the layer's job.
         assert_eq!(snap[0].fields["password"], "hunter2");
     }
-
-    // ── RED: LogBuffer clone shares storage ────────────────────
 
     #[test]
     fn red_buffer_clone_shares_storage() {
@@ -507,8 +480,6 @@ mod tests {
         buf.push(make_entry("INFO", "shared"));
         assert_eq!(clone.len(), 1);
     }
-
-    // ── RED: level_from_str ────────────────────────────────────
 
     #[test]
     fn red_level_from_str_parses_case_insensitive() {
@@ -520,16 +491,12 @@ mod tests {
         assert_eq!(level_from_str("bogus"), None);
     }
 
-    // ── RED: LogCaptureConfig defaults ────────────────────────
-
     #[test]
     fn red_capture_config_default_is_disabled_with_1000_capacity() {
         let cfg = LogCaptureConfig::default();
         assert!(!cfg.enabled);
         assert_eq!(cfg.capacity, 1000);
     }
-
-    // ── RED: LogBuffer snapshot newest-last ordering ──────────
 
     #[test]
     fn red_snapshot_returns_entries_in_insertion_order() {
@@ -544,8 +511,6 @@ mod tests {
         assert_eq!(snap[2].message, "c");
     }
 
-    // ── GREEN: LogCaptureLayer via tracing subscriber ─────────
-
     #[tokio::test]
     async fn green_layer_captures_event_with_structured_fields_and_scrubs_sensitive_keys() {
         use tracing_subscriber::layer::SubscriberExt;
@@ -553,8 +518,7 @@ mod tests {
         let buf = LogBuffer::new(10, ParameterFilter::default());
         let layer = LogCaptureLayer::new(buf.clone());
 
-        // Install into a *dispatch* (not global) so the test doesn't fight
-        // with other tests for the global subscriber slot.
+        // A scoped dispatch, not the global subscriber, so tests do not contend for it.
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
 
@@ -566,7 +530,6 @@ mod tests {
         assert_eq!(entry.message, "order placed");
         assert_eq!(entry.level, "INFO");
         assert_eq!(entry.fields["order_id"].as_str().unwrap(), "A-1001");
-        // sensitive key scrubbed
         assert_eq!(
             entry.fields["password"].as_str().unwrap(),
             crate::log::filter::FILTERED_PLACEHOLDER
@@ -593,14 +556,12 @@ mod tests {
 
     #[tokio::test]
     async fn green_layer_is_additive_does_not_affect_other_layers() {
-        // This test verifies the layer is truly additive by ensuring the
-        // buffer receives events even when multiple layers are stacked.
         use tracing_subscriber::layer::SubscriberExt;
 
         let buf = LogBuffer::new(10, ParameterFilter::default());
         let capture = LogCaptureLayer::new(buf.clone());
 
-        // Stack capture + a no-op fmt layer (simulating the existing pipeline).
+        // A fmt layer writing to a sink stands in for the stdout pipeline.
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
             .with(capture);
@@ -608,12 +569,9 @@ mod tests {
 
         tracing::info!("additive test");
 
-        // Both the fmt layer and the capture layer ran; capture has the entry.
         assert_eq!(buf.len(), 1);
         assert_eq!(buf.snapshot(None, None)[0].message, "additive test");
     }
-
-    // ── GREEN: LogContext fields captured in on_event ─────────
 
     #[tokio::test]
     async fn green_layer_captures_request_context_user_tenant_and_custom_fields() {
@@ -658,7 +616,6 @@ mod tests {
         ctx.set_user_id("context-user");
 
         scope(ctx, async {
-            // Event-level field takes priority over the context field.
             tracing::info!(user_id = "event-user", "priority test");
         })
         .await;
@@ -670,7 +627,6 @@ mod tests {
 
     #[tokio::test]
     async fn green_layer_no_context_sets_request_id_to_none() {
-        // When no LogContext is active, request_id must be None.
         use tracing_subscriber::layer::SubscriberExt;
 
         let buf = LogBuffer::new(10, ParameterFilter::default());
@@ -684,8 +640,6 @@ mod tests {
         assert_eq!(snap.len(), 1);
         assert!(snap[0].request_id.is_none());
     }
-
-    // ── GREEN: FieldVisitor numeric and bool types ─────────────
 
     #[tokio::test]
     async fn green_layer_field_visitor_records_numeric_and_bool_types() {
@@ -713,19 +667,14 @@ mod tests {
         assert!(entry.fields["active"].as_bool().unwrap());
     }
 
-    // ── GREEN: level_from_str mixed-case fallback paths ────────
-
     #[test]
     fn green_level_from_str_mixed_case_hits_fallback_branches() {
-        // "Error", "Warn", "Debug", "Trace" are not in the fast-path arms;
-        // they fall through to the eq_ignore_ascii_case branches.
+        // Mixed case misses the exact-match arms and takes the `eq_ignore_ascii_case` branches.
         assert_eq!(level_from_str("Error"), Some(Level::ERROR));
         assert_eq!(level_from_str("Warn"), Some(Level::WARN));
         assert_eq!(level_from_str("Debug"), Some(Level::DEBUG));
         assert_eq!(level_from_str("Trace"), Some(Level::TRACE));
     }
-
-    // ── GREEN: LogBuffer Debug impl and is_empty ───────────────
 
     #[test]
     fn green_buffer_debug_format_shows_len() {
@@ -743,14 +692,11 @@ mod tests {
         assert!(!buf.is_empty());
     }
 
-    // ── GREEN: context field scrubbing (filter matches) ────────
-
     #[tokio::test]
     async fn green_layer_scrubs_sensitive_context_user_id_and_tenant_id() {
         use crate::log::context::{LogContext, scope};
         use tracing_subscriber::layer::SubscriberExt;
 
-        // Build a filter that considers user_id and tenant_id sensitive.
         let filter = ParameterFilter::new(
             &[
                 "user_id".to_owned(),

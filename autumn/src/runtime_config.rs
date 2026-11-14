@@ -367,8 +367,6 @@ impl ConfigValidator {
                 let s = value
                     .as_text()
                     .ok_or_else(|| "Regex validator applied to non-text value".to_owned())?;
-                // Simple deterministic regex check using the built-in approach
-                // (no regex dep) — validate by trying to construct and match.
                 if regex_matches(pattern, s) {
                     Ok(())
                 } else {
@@ -386,9 +384,8 @@ impl ConfigValidator {
 /// NFA sufficient for config-validation patterns (email-like, digits, enums).
 fn regex_matches(pattern: &str, text: &str) -> bool {
     let bytes = pattern.as_bytes();
-    // Strip optional anchors — we always do a full-string match.
-    // Guard against stripping an escaped `\$` (literal dollar sign): only
-    // treat a trailing `$` as an anchor when the preceding backslash count is even.
+    // Anchors are optional: the match is always full-string. A trailing `$` is an anchor
+    // only after an even number of backslashes; otherwise it is an escaped literal.
     let start = usize::from(bytes.first() == Some(&b'^'));
     let trailing_dollar_is_anchor = if bytes.last() == Some(&b'$') {
         let mut backslashes = 0;
@@ -420,11 +417,9 @@ fn re_match(pat: &[u8], text: &[u8]) -> bool {
         return text.is_empty();
     }
 
-    // Extract the next atom (single char, `.`, or `[...]`).
     let (atom_len, atom) = re_next_atom(pat);
     let rest_pat = &pat[atom_len..];
 
-    // Peek for a quantifier after the atom.
     let quantifier = rest_pat.first().copied();
     let (min, max, after_quant) = match quantifier {
         Some(b'*') => (0usize, usize::MAX, &rest_pat[1..]),
@@ -467,7 +462,6 @@ fn re_next_atom(pat: &[u8]) -> (usize, &[u8]) {
         let mut idx = 1;
         while idx < pat.len() {
             if pat[idx] == b']' {
-                // Count consecutive backslashes preceding this ']'
                 let mut backslashes = 0;
                 let mut b_idx = idx;
                 while b_idx > 1 && pat[b_idx - 1] == b'\\' {
@@ -475,14 +469,12 @@ fn re_next_atom(pat: &[u8]) -> (usize, &[u8]) {
                     b_idx -= 1;
                 }
                 if backslashes % 2 == 0 {
-                    // Valid unescaped closing bracket!
                     return (idx + 1, &pat[..=idx]);
                 }
             }
             idx += 1;
         }
     }
-    // Escaped character or single character.
     if pat[0] == b'\\' && pat.len() > 1 {
         return (2, &pat[..2]);
     }
@@ -495,7 +487,6 @@ fn re_atom_matches(atom: &[u8], ch: u8) -> bool {
         return false;
     }
     if atom[0] == b'[' {
-        // Character class: strip brackets.
         let inner = if atom.len() >= 2 && atom[atom.len() - 1] == b']' {
             &atom[1..atom.len() - 1]
         } else {
@@ -504,7 +495,6 @@ fn re_atom_matches(atom: &[u8], ch: u8) -> bool {
         return re_class_matches(inner, ch);
     }
     if atom[0] == b'\\' && atom.len() > 1 {
-        // Escaped literal: treat the second byte as a literal character.
         return atom[1] == ch;
     }
     match atom[0] {
@@ -524,7 +514,6 @@ fn re_class_matches(inner: &[u8], ch: u8) -> bool {
     let mut i = 0usize;
     let mut matched = false;
     while i < body.len() {
-        // Handle escape inside class.
         let (c, advance) = if body[i] == b'\\' && i + 1 < body.len() {
             (body[i + 1], 2)
         } else {
@@ -2032,7 +2021,6 @@ mod tests {
 
     #[test]
     fn regex_validator_accepts_matching_value() {
-        // Simple email-like pattern: user@host
         let v = ConfigValidator::Regex("[a-z0-9]+@[a-z0-9.]+".to_owned());
         v.validate(&ConfigValue::Text("ops@example.com".to_owned()))
             .unwrap();
@@ -2049,8 +2037,7 @@ mod tests {
 
     #[test]
     fn regex_anchor_stripping_ignores_escaped_dollar() {
-        // Pattern `[a-z]+\$` means: one-or-more lowercase letters followed by
-        // a literal `$`.  The trailing `\$` must NOT be stripped as an anchor.
+        // The trailing `\$` is a literal `$`, not an anchor.
         let v = ConfigValidator::Regex(r"[a-z]+\$".to_owned());
         v.validate(&ConfigValue::Text("price$".to_owned())).unwrap();
         let err = v
@@ -2082,7 +2069,7 @@ mod tests {
 
     #[test]
     fn regex_character_class_handles_escaped_brackets() {
-        // Class with escaped bracket and closing bracket.
+        // `\]` inside the class is a literal `]`, not the closing bracket.
         let v = ConfigValidator::Regex(r"[a-z\]]+".to_owned());
         v.validate(&ConfigValue::Text("abc]def".to_owned()))
             .unwrap();
@@ -2593,7 +2580,7 @@ mod tests {
             RuntimeConfigService::new(Arc::new(registry), Arc::new(InMemoryConfigStore::new()));
         svc.set("retries", "5", None).unwrap();
         assert_eq!(svc.get("retries").unwrap(), ConfigValue::Int(5));
-        // Failing write should not change the stored value.
+        // A rejected write leaves the stored value unchanged.
         svc.set("retries", "999", None).unwrap_err();
         assert_eq!(
             svc.get("retries").unwrap(),
@@ -2632,11 +2619,9 @@ mod tests {
 
     // ── Backend screening on the Postgres-only store ──────────────────────
 
-    // `PgConfigStore` opens a `diesel::PgConnection` and takes
-    // `pg_advisory_xact_lock(1, hashtext($1))` — it cannot serve any other backend. Building one from a
-    // SQLite target used to succeed and fail on first use with a driver-level
-    // connection error naming Postgres, which is not a diagnosis an operator
-    // who configured `sqlite://` can act on.
+    // `PgConfigStore` needs a `PgConnection` and `pg_advisory_xact_lock`, so it cannot serve any
+    // other backend. Building one from another target must fail with a message that names the
+    // cause, not a Postgres driver error at first use.
     #[cfg(feature = "db")]
     #[test]
     fn pg_config_store_refuses_a_non_postgres_target() {

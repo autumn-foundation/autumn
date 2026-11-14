@@ -308,9 +308,8 @@ impl EffectBuffer {
         weight: usize,
         budget: usize,
     ) {
-        // Answered either way: a slot the budget refuses is already covered by
-        // `overflowed`, and counting it as unfinished as well would report one
-        // incomplete recording as two separate faults.
+        // No longer outstanding either way: a slot the budget refuses is already counted in
+        // `overflowed`, and counting it as unfinished too would report one fault twice.
         self.outstanding = self.outstanding.saturating_sub(1);
         let charged = self.bytes.saturating_add(weight);
         if charged > budget {
@@ -343,8 +342,7 @@ impl EffectBuffer {
             self.overflowed = true;
             return;
         }
-        // Charged only for an entry that is actually kept, so `charged_bytes`
-        // means what it says.
+        // Charged only for an entry that is kept.
         let charged = self.bytes.saturating_add(weight);
         if charged > budget {
             self.overflowed = true;
@@ -628,9 +626,8 @@ impl CaptureScope {
     #[must_use]
     pub fn captured_body(&self) -> CapturedBody {
         let Ok(tap) = self.body.lock() else {
-            // A poisoned lock means a body copy was interrupted mid-write.
-            // Reporting "no body" as though the request had none would be a
-            // falsification, so the capsule is marked incomplete instead.
+            // A poisoned lock means a body copy was interrupted mid-write. "No body" would be
+            // false, so the capsule is marked incomplete instead.
             self.mark_truncated();
             return CapturedBody::Absent;
         };
@@ -660,12 +657,9 @@ impl CaptureScope {
             BodyTap::Teeing {
                 overflowed: true, ..
             } => Some(BODY_OVERFLOW_NOTE),
-            // A handler that read exactly `Content-Length` bytes and stopped
-            // has the whole body — it simply never polled once more for the
-            // `None` that sets `end_stream`. The captured length settles it,
-            // and treating that as partial would refuse a capsule whose body
-            // is complete (replay refuses partial bodies, so a false positive
-            // here costs a perfectly good reproduction).
+            // A handler that read exactly `Content-Length` bytes and stopped has the whole body;
+            // it never polled again for the `None` that sets `end_stream`. Calling it partial
+            // would make replay refuse a complete capsule.
             BodyTap::Teeing {
                 declared_len: Some(declared),
                 buf,
@@ -824,11 +818,9 @@ impl CaptureScope {
     /// empty body the recording never gave it.
     pub fn fill_http(&self, index: usize, mut effect: HttpEffect) {
         let cap = self.settings.max_body_bytes;
-        // An already-`Skipped` body counts. `http_client::encode_body` drops an
-        // oversized body *before* it reaches here — deliberately, so a 50 MB
-        // download is never copied just to be thrown away — and
-        // `body_weight(Skipped)` is zero, so a weight comparison alone would
-        // never see the one case this check exists for.
+        // An already-`Skipped` body counts: `http_client::encode_body` drops an oversized body
+        // before it gets here (so a large download is never copied), and `body_weight(Skipped)`
+        // is zero, so a weight check alone would miss it.
         let skipped = |body: &CapsuleBody| {
             matches!(body, CapsuleBody::Skipped { .. }) || body_weight(body) > cap
         };
@@ -840,10 +832,8 @@ impl CaptureScope {
             self.note(HTTP_BODY_SKIPPED_NOTE);
             self.mark_truncated();
         }
-        // Every field the effect *retains*, not just the obvious two: a handler
-        // sending or receiving large headers would otherwise grow the buffer
-        // and the persisted capsule past `max_capsule_bytes` without ever
-        // tripping the bound that exists to stop exactly that.
+        // Charge every field the effect retains, headers included, or large headers would grow
+        // the capsule past `max_capsule_bytes` unchecked.
         let weight = effect
             .url
             .len()
@@ -872,7 +862,7 @@ impl CaptureScope {
     /// Complete a reserved job-enqueue slot with the backend's outcome.
     pub fn fill_job_enqueue(&self, index: usize, effect: JobEffect) {
         // Every retained field is charged, the error text included: replay
-        // hands it back verbatim, so it is kept whole (#2351 item 19).
+        // hands it back verbatim, so it is kept whole (#2351).
         let weight = effect
             .name
             .len()
@@ -897,16 +887,12 @@ impl CaptureScope {
     /// Complete a reserved mail slot.
     pub fn fill_mail(&self, index: usize, mut effect: MailEffect) {
         let cap = self.settings.max_body_bytes;
-        // Both halves of a multipart message have the same cap (#2351 item
-        // 10).
+        // Both halves of a multipart message share the cap (#2351).
         let over = body_weight(&effect.body) > cap || body_weight(&effect.alternate_body) > cap;
         effect.body = clamp_body(effect.body, cap);
         effect.alternate_body = clamp_body(effect.alternate_body, cap);
-        // A skipped body is a wildcard to the replay comparison — it has to be,
-        // there being nothing recorded to compare against — so a capsule
-        // holding one must not present as complete. Otherwise the message
-        // contents could change freely and still replay `reproduced`, which is
-        // the outcome comparing the body at all was meant to prevent.
+        // A skipped body is a wildcard to the replay comparison, so the capsule must not present
+        // as complete: the message could change freely and still replay as `reproduced`.
         if over {
             self.note(MAIL_BODY_SKIPPED_NOTE);
             self.mark_truncated();
@@ -1160,10 +1146,9 @@ pub async fn capture_job<T>(
         name: name.to_owned(),
         payload: payload.clone(),
     });
-    // A synthetic head, so the capsule's `request` describes the entry point
-    // the way a request capsule's does. `JOB` is deliberately not a real HTTP
-    // method: a reader (and `autumn replay`) must not mistake this for a
-    // request that can be driven through the router.
+    // A synthetic head, so the capsule's `request` names the entry point as a request capsule's
+    // does. `JOB` is not a real HTTP method, so neither a reader nor `autumn replay` mistakes it
+    // for a request the router can serve.
     scope.set_request(RawRequest {
         method: "JOB".to_owned(),
         uri: format!("/jobs/{name}")
@@ -1171,7 +1156,6 @@ pub async fn capture_job<T>(
             .unwrap_or_else(|_| axum::http::Uri::from_static("/jobs")),
         version: axum::http::Version::HTTP_11,
         headers: axum::http::HeaderMap::new(),
-        // Braces are the route-template syntax, not a format placeholder.
         #[allow(
             clippy::literal_string_with_formatting_args,
             reason = "`{name}` is Autumn's route-template syntax, not an interpolation"
@@ -1202,8 +1186,7 @@ pub async fn capture_job<T>(
 /// into the database attribution marker exactly as a request id is.
 #[cfg(feature = "reporting")]
 fn job_scope_id() -> String {
-    // Drawn through the framework's entropy seam rather than `Uuid::new_v4`,
-    // so a simulation with a seeded source gets reproducible capsule ids too.
+    // Through the entropy seam, not `Uuid::new_v4`, so a seeded simulation gets reproducible ids.
     use crate::entropy::Entropy as _;
     format!("job-{}", crate::entropy::OsEntropy.uuid_v4().simple())
 }
@@ -1242,9 +1225,8 @@ struct RegistryGuard(Arc<CaptureScope>);
 
 impl Drop for RegistryGuard {
     fn drop(&mut self) {
-        // Order matters: closing first means a connection recorder that is
-        // mid-append when the request ends cannot slip an effect in between
-        // the two steps.
+        // Close before deregistering, so a connection recorder mid-append cannot slip an effect
+        // in between.
         self.0.close();
         deregister(self.0.id());
     }
@@ -1358,10 +1340,8 @@ where
             if let Some(probe) = state_cache {
                 scope.note_state_cache(probe());
             }
-            // The raw peer socket, before any trusted-proxy resolution: a
-            // replay restores it verbatim so middleware and handlers that
-            // inspect the peer directly (address *and* port) see what the
-            // failing request's server saw.
+            // The raw peer socket, before trusted-proxy resolution. Replay restores it verbatim,
+            // so code that inspects the peer (address and port) sees what the failing request saw.
             if let Some(peer) = req
                 .extensions()
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
@@ -1375,25 +1355,20 @@ where
                 headers: req.headers().clone(),
                 route,
             });
-            // Note the body is *teed*, never pre-read: see `arm_body_capture`.
+            // The body is teed, never pre-read: see `arm_body_capture`.
             let mut req = arm_body_capture(req, &scope);
             register(&scope);
             let _guard = RegistryGuard(Arc::clone(&scope));
             req.extensions_mut()
                 .insert(CaptureHandle(Arc::clone(&scope)));
 
-            // The scope ends when the response future resolves, so effects a
-            // streaming body produces afterwards are not captured. The
-            // reporting layer marks a failing response whose body is still
-            // streaming at that point as truncated (with a note), so such a
-            // capsule is refused by replay rather than presented as complete.
+            // The scope ends when the response future resolves, so effects a streaming body
+            // produces afterwards are not captured. The reporting layer marks a failing response
+            // still streaming then as truncated, so replay refuses it.
             //
-            // `inner.call(req)` is deliberately made *inside* the scoped
-            // future rather than passed to `scope` as an argument: arguments
-            // are evaluated first, so an inner service that does its work in
-            // `call` itself — as a hand-written Tower middleware does, and as
-            // `TrustedProxiesService` does when it stamps the client identity
-            // — would run before the task-local existed and find no scope.
+            // `inner.call(req)` runs inside the scoped future, not as an argument to `scope`:
+            // arguments are evaluated first, so a service that works in `call` itself (a
+            // hand-written Tower middleware, `TrustedProxiesService`) would find no scope.
             CAPSULE_SCOPE
                 .scope(scope, async move { inner.call(req).await })
                 .await
@@ -1488,13 +1463,9 @@ impl http_body::Body for TeeBody {
                 if let Some(data) = frame.data_ref() {
                     this.scope.tee_body_chunk(data);
                 }
-                // A body that announces its end *with* its last frame is
-                // finished here, and a handler is entitled to stop rather than
-                // poll once more for `Ready(None)`. Waiting for that extra
-                // poll called such a body partial and had replay refuse a
-                // capsule that was in fact complete — the failure mode that
-                // throws away faithful recordings rather than the one that
-                // over-trusts them, but a failure mode either way.
+                // A body that announces its end with its last frame is finished here, and a
+                // handler may stop rather than poll again for `Ready(None)`. Waiting for that poll
+                // would call a complete body partial.
                 if http_body::Body::is_end_stream(&this.inner) {
                     this.scope.mark_body_end();
                 }
@@ -1701,17 +1672,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_inner_service_sees_the_scope_from_call_not_only_from_its_future() {
-        // `CAPSULE_SCOPE.scope(scope, inner.call(req))` evaluates its argument
-        // *first*, so an inner service that records during `call` — which is
-        // what a hand-written Tower middleware does, and what
-        // `TrustedProxiesService` does when it stamps the client identity —
-        // ran outside the task-local and found no scope at all. Every layer
-        // inner to this one is affected, so the fix belongs here rather than
-        // in each of them.
+        // `CAPSULE_SCOPE.scope(scope, inner.call(req))` would evaluate `call` before the
+        // task-local exists, so a service that records during `call` (a hand-written Tower
+        // middleware, `TrustedProxiesService`) would find no scope.
         //
-        // `service_fn` hides this: its closure body is the returned future, so
-        // it always runs inside the scope. Only a service that works in `call`
-        // itself can catch the regression.
+        // A `service_fn` probe cannot catch this: its closure body is the returned future, which
+        // always runs inside the scope.
         let saw_scope = Arc::new(Mutex::new(None));
         let probe = SyncProbe {
             saw_scope: Arc::clone(&saw_scope),
@@ -1736,10 +1702,9 @@ mod tests {
 
     #[tokio::test]
     async fn call_does_not_read_the_body_before_the_inner_service_runs() {
-        // The capture layer sits *outside* the request-timeout layer, so any
-        // byte it reads off the socket itself is read before the deadline
-        // starts. A slow client dripping a small body would otherwise hold a
-        // worker open forever. Bytes must only be read by the handler.
+        // The capture layer sits outside the request-timeout layer, so a byte it read itself would
+        // be read before the deadline starts, and a slow client could hold a worker open forever.
+        // Only the handler reads the body.
         let trace = Trace::default();
         let request = Request::post("/x")
             .header(axum::http::header::CONTENT_LENGTH, "7")
@@ -1813,11 +1778,9 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_body_with_no_length_and_no_transfer_encoding_is_still_teed() {
-        // HTTP/2 (and /3) have no `Transfer-Encoding`: a streamed h2 request
-        // arrives with no `Content-Length`, no exact size hint and no header to
-        // hint at one. Deciding "does this request have a body" from the
-        // HTTP/1.1 header alone classifies it as having none, and the capsule
-        // then replays a request whose body has silently vanished.
+        // HTTP/2 and /3 have no `Transfer-Encoding`: a streamed request arrives with no
+        // `Content-Length` and no size hint. Judging "has a body" from HTTP/1.1 headers alone would
+        // drop the body from the capsule.
         let trace = Trace::default();
         let request = Request::post("/x")
             .version(axum::http::Version::HTTP_2)
@@ -1922,10 +1885,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_scope_closes_when_the_request_ends() {
-        // The scope outlives the request — the reporting layer writes the
-        // capsule from a detached task — so "closed" is what stops a pooled
-        // connection's next liveness ping from being recorded as something
-        // this request did.
+        // The scope outlives the request (the reporting layer writes the capsule from a detached
+        // task), so closing it is what stops a pooled connection's next liveness ping from being
+        // recorded against this request.
         let request = Request::get("/x")
             .body(Body::empty())
             .expect("request builds");
@@ -2297,12 +2259,9 @@ mod tests {
 
     #[test]
     fn a_body_that_ends_with_its_last_frame_is_not_partial() {
-        // A streaming body with no `Content-Length` can announce its end
-        // alongside the final frame, and a handler is entitled to stop there
-        // rather than poll again for `Ready(None)`. There is no declared
-        // length to compare against, so the end-of-stream flag is the only
-        // evidence — and waiting for the extra poll to set it had replay
-        // refuse a capsule whose body was complete.
+        // A streaming body with no `Content-Length` can announce its end with its final frame, and
+        // a handler may stop there. With no declared length, the end-of-stream flag is the only
+        // evidence, so it must be set on that frame.
         let scope = Arc::new(CaptureScope::new(
             "body".to_owned(),
             Arc::new(CaptureSettings::default()),
@@ -2395,12 +2354,9 @@ mod tests {
 
     #[test]
     fn db_buffer_snapshots_tapes_in_first_use_order() {
-        // Connection ids are process-wide birth order, which says nothing about
-        // the order *this* request reached for them: a long-lived pooled
-        // connection 2 can easily be checked out after a freshly minted 7.
-        // Replay hands tape *i* to the *i*-th connection its pool opens, so the
-        // capsule must list them in the order the request first used them or
-        // the tapes get swapped and both connections diverge.
+        // Connection ids are process-wide birth order, not the order this request used them: pooled
+        // connection 2 can be checked out after a fresh 7. Replay hands tape i to the i-th
+        // connection its pool opens, so tapes must be in first-use order or they get swapped.
         let mut buffer = DbBuffer::default();
         buffer.tape_mut(7);
         buffer.tape_mut(2);

@@ -38,9 +38,9 @@
 //! `DataRow` field is **binary**-encoded. A capsule's frames are written back
 //! verbatim, so this only matters when hand-building a fixture.
 
-// Replay-time module (offline `autumn replay` runs, never the serving path);
-// kept panic-averse with the same deny set, but deliberately outside the
-// request-path panic-gate manifest — see CONTRIBUTING.md.
+// Replay-time code (offline `autumn replay` runs), never the serving path: panic-averse with the
+// same deny set, but deliberately outside the request-path panic-gate manifest.
+// See CONTRIBUTING.md.
 #![cfg_attr(
     not(test),
     deny(
@@ -290,10 +290,8 @@ impl StubServer {
     /// answered as one blob up to `ReadyForQuery` (F8).
     fn simple_query(&self, sql: &str) -> Vec<u8> {
         if split_statements(sql).is_empty() {
-            // A blank simple `Query` is not housekeeping and not on any tape:
-            // a real backend answers it with `EmptyQueryResponse`, and that is
-            // what the driver is waiting for. Acknowledging it as a `SET`
-            // would put a `CommandComplete` on the wire that never happened.
+            // A real backend answers a blank `Query` with `EmptyQueryResponse`, which the driver
+            // waits for. Acknowledging it as a `SET` would send a fake `CommandComplete`.
             let mut reply = build::empty_query_response();
             reply.extend_from_slice(&build::ready_for_query(b'I'));
             return reply;
@@ -332,13 +330,8 @@ impl StubServer {
                     statement,
                     params,
                 } => {
-                    // A `Bind` naming a statement this connection never
-                    // `Parse`d is not something the tape can answer. Treating
-                    // the missing SQL as the empty string used to make the
-                    // batch look like housekeeping (`is_housekeeping("")` was
-                    // true) and it was acknowledged as a `SET` — the client
-                    // then decoded whatever came next against a statement the
-                    // stub had never resolved.
+                    // A `Bind` naming a statement this connection never `Parse`d cannot be
+                    // answered from the tape: report it rather than guess at its SQL.
                     let Some(sql) = self.statements.get(statement).cloned() else {
                         unknown_statement = Some(statement.clone());
                         continue;
@@ -484,10 +477,8 @@ impl StubServer {
         }
 
         let Some(expected) = expected else {
-            // A driver catalog probe is never an *ordering* problem: it is a
-            // type-info lookup the recorded connection's cache already had, so
-            // it is reported as unrecorded with the F4 hint rather than as a
-            // tape that ran out.
+            // A driver catalog probe is a type-info lookup the recorded connection had cached,
+            // not an ordering problem: report it as unrecorded, not as an exhausted tape.
             if is_catalog_sql(sql) {
                 return Resolution::Diverged(self.divergence(
                     DivergenceKind::UnrecordedQuery,
@@ -761,11 +752,8 @@ pub fn replica_pool_from_capsule(
                 .collect()
         })
         .unwrap_or_default();
-    // A configured replica that this request never read from still has to
-    // *exist* during replay: code that checks replica availability before
-    // querying must see the shape production had. An empty stub answers no
-    // query — which is right, because the recording issued none, so any query
-    // the replay sends is a divergence rather than a silent success.
+    // A configured replica the request never read from must still exist during replay, so code
+    // that checks replica availability sees production's shape. Any query it gets diverges.
     let replica_configured = capsule
         .db_roles
         .iter()
@@ -782,8 +770,8 @@ fn pool_from_tapes(
     divergences: Arc<DivergenceLog>,
 ) -> Result<Pool<AsyncPgConnection>, PoolError> {
     let tapes: Arc<Vec<ConnectionTape>> = Arc::new(tapes);
-    // One spare slot beyond the recording: see the note above on why replay
-    // must never be able to block on its own pool.
+    // One spare slot beyond the recording, so replay never blocks on its own pool (see
+    // `pool_from_capsule`).
     let max_size = tapes.len().saturating_add(1);
     let next_tape = Arc::new(AtomicUsize::new(0));
     let progress: Arc<Vec<Arc<TapeProgress>>> = Arc::new(
@@ -826,10 +814,9 @@ fn pool_from_tapes(
                         "the replay stub server refused the handshake: {error}"
                     ))
                 })?;
-            // We own the connection future because `try_from_client_and_connection`
-            // is hard-wired to `tokio_postgres::Socket` and cannot take a duplex
-            // half. The cost is no notification stream on replay pools, which
-            // replay does not use.
+            // Drive the connection future here: `try_from_client_and_connection` only takes a
+            // `tokio_postgres::Socket`, not a duplex half. Replay pools lose the notification
+            // stream, which replay does not use.
             tokio::spawn(async move {
                 let _ = connection.await;
             });
@@ -1148,8 +1135,8 @@ mod tests {
             "a configured replica must exist during replay even with nothing recorded on it"
         );
 
-        // A capsule that recorded no roles at all (written before the field
-        // existed, or an app with no database) keeps the old behaviour.
+        // A capsule with no recorded roles (an older capsule, or an app with no database)
+        // gets no replica pool.
         capsule.db_roles.clear();
         let none =
             replica_pool_from_capsule(&capsule, Arc::new(DivergenceLog::new())).expect("builds");
@@ -1218,8 +1205,8 @@ mod tests {
     #[test]
     fn a_catalog_probe_diverges_with_a_type_hint() {
         let server = StubServer::new(ConnectionTape::default(), Arc::new(DivergenceLog::new()));
-        // The driver's real enum type-info probe, verbatim — hand-written
-        // catalog reads are application work and no longer classify.
+        // The driver's real enum type-info probe, verbatim. A hand-written catalog read is
+        // application work and does not classify as a probe.
         let probe = "SELECT enumlabel\nFROM pg_catalog.pg_enum\nWHERE enumtypid = $1\nORDER BY enumsortorder\n";
         match server.resolve_execute(probe, &[]) {
             Resolution::Diverged(divergence) => {

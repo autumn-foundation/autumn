@@ -1190,8 +1190,7 @@ mod tests {
                 .unwrap()
                 .starts_with("text/html")
         );
-        // Codex review (P1): a declared `Content-Length` does not make a
-        // stream safe to wait for.
+        // A declared `Content-Length` does not make a stream safe to wait for.
         let declared = html()
             .header(CONTENT_LENGTH, "11")
             .body(Body::from_stream(futures::stream::pending::<
@@ -1247,8 +1246,8 @@ mod tests {
         }
     }
 
-    // Codex review (P1): an exact size hint is not a buffered body. The wait
-    // is bounded, and the page goes out as HTML with the bytes already read.
+    // An exact size hint is not a buffered body. The wait is bounded, and the
+    // page goes out as HTML with the bytes already read.
     #[tokio::test(start_paused = true)]
     async fn an_exact_but_lazy_body_stays_html_after_the_deadline() {
         let config = NegotiateConfig {
