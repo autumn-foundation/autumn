@@ -1,0 +1,37 @@
+# Bolt profile: autumn-web/metrics_per_call
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+           1,378   18.8%  autumn_web::metrics::insert_label
+             810   11.1%  _int_free
+             642    8.8%  malloc
+             609    8.3%  <[(alloc::string::String, alloc::string::String)] as core::hash::Hash>::hash
+             465    6.4%  free
+             447    6.1%  <autumn_web::metrics::Instrument>::series_for
+             436    6.0%  autumn_web::metrics::instrument
+             392    5.4%  __memcmp_avx2_movbe
+             252    3.4%  <autumn_web::metrics::Counter>::with_label
+             250    3.4%  core::ptr::drop_glue
+             224    3.1%  __memcpy_avx_unaligned_erms
+             188    2.6%  <autumn_web::metrics::Counter>::increment
+             160    2.2%  metrics_per_call::round
+             147    2.0%  <std::sys::sync::once::futex::Once>::call
+             138    1.9%  <autumn_web::metrics::Timer>::record
+             135    1.8%  __rustc::__rdl_alloc
+             126    1.7%  <autumn_web::metrics::Histogram>::with_label
+             120    1.6%  <alloc::raw_vec::RawVecInner>::finish_grow
+             104    1.4%  foldhash::hash_bytes_long
+              72    1.0%  <alloc::raw_vec::RawVec>::grow_one
+              57    0.8%  <std::sync::once_lock::OnceLock>::initialize
+              42    0.6%  autumn_web::metrics::counter
+              42    0.6%  <std::sync::once::Once>::call_once_force::{closure#0}
+              15    0.2%  __rustc::__rust_alloc
+              15    0.2%  __rustc::__rdl_dealloc
+              15    0.2%  __rustc::__rust_no_alloc_shim_is_unstable_v2
+              15    0.2%  __rustc::__rust_dealloc
+              14    0.2%  autumn_web::metrics::timer
+               5    0.1%  metrics_per_call::main
+
+           7,315  100.0%  TOTAL
