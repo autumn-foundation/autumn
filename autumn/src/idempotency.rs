@@ -255,28 +255,19 @@ fn build_storage_key(
     format!("v2:{}", hex::encode(hasher.finalize()))
 }
 
+/// The session id the request's storage key is scoped by. The session layer
+/// records it on the [`Session`](crate::session::Session) it builds, so a
+/// request that never reaches this layer pays nothing for it.
 async fn storage_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {
-    let session_scope = parts
-        .extensions
-        .get::<IdempotencySessionScope>()
-        .and_then(|scope| scope.session_id.as_deref().map(str::to_owned));
-    let session = parts.extensions.get::<crate::session::Session>().cloned();
-    if session_scope.is_some() {
-        session_scope
-    } else if let Some(session) = session
-        && session.is_cookie_backed().await
-    {
-        Some(session.id().await)
-    } else {
-        None
-    }
+    let session = parts.extensions.get::<crate::session::Session>()?;
+    session.idempotency_session_id().await
 }
 
-fn stale_cookie_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {
-    parts
-        .extensions
-        .get::<IdempotencySessionScope>()
-        .and_then(|scope| scope.stale_cookie_session_id.as_deref().map(str::to_owned))
+/// The id of a request cookie that named no stored session, read from the
+/// same [`Session`](crate::session::Session).
+async fn stale_cookie_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {
+    let session = parts.extensions.get::<crate::session::Session>()?;
+    session.idempotency_stale_cookie_id().await
 }
 
 fn extract_replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
@@ -345,25 +336,6 @@ fn finalized_session_record(
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct IdempotencyCacheCommittedErrorResponse;
-
-#[derive(Clone, Debug)]
-pub(crate) struct IdempotencySessionScope {
-    session_id: Option<String>,
-    stale_cookie_session_id: Option<String>,
-}
-
-impl IdempotencySessionScope {
-    #[must_use]
-    pub(crate) const fn new(
-        session_id: Option<String>,
-        stale_cookie_session_id: Option<String>,
-    ) -> Self {
-        Self {
-            session_id,
-            stale_cookie_session_id,
-        }
-    }
-}
 
 #[doc(hidden)]
 #[derive(Clone, Debug, Default)]
@@ -1771,10 +1743,12 @@ async fn prepare_idempotency_request(
     let key_context = StorageKeyContext::from_parts(idempotency_key.clone(), &parts);
     let session_id = storage_session_id_for_parts(&parts).await;
     let storage_key = key_context.storage_key(session_id.as_deref(), None);
-    let stale_cookie_storage_key = stale_cookie_session_id_for_parts(&parts).and_then(|id| {
-        let key = key_context.storage_key(Some(&id), None);
-        (key != storage_key).then_some(key)
-    });
+    let stale_cookie_storage_key = stale_cookie_session_id_for_parts(&parts)
+        .await
+        .and_then(|id| {
+            let key = key_context.storage_key(Some(&id), None);
+            (key != storage_key).then_some(key)
+        });
     parts.extensions.insert(IdempotencyContext::new(
         idempotency_key.clone(),
         storage_key.clone(),
@@ -3213,6 +3187,192 @@ mod tests {
             .await
             .expect("bob body should collect");
         assert_eq!(bob_body, Bytes::from_static(b"bob"));
+    }
+
+    /// The two session-scope readers, on a request that came through the
+    /// session layer: a cookie that names a stored session, one that names
+    /// none, and no cookie.
+    #[tokio::test]
+    async fn session_scope_readers_follow_the_session_layer_cookie_lookup() {
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore as _};
+
+        let store = MemoryStore::new();
+        store
+            .save("live", HashMap::new())
+            .await
+            .expect("memory store should save");
+        let service = SessionLayer::new(store, SessionConfig::default()).layer(tower::service_fn(
+            |req: Request<Body>| async move {
+                let (parts, _body) = req.into_parts();
+                let scope = format!(
+                    "{:?} {:?}",
+                    storage_session_id_for_parts(&parts).await,
+                    stale_cookie_session_id_for_parts(&parts).await,
+                );
+                Ok::<_, Infallible>(Response::new(Body::from(scope)))
+            },
+        ));
+
+        for (cookie, expected) in [
+            (Some("autumn.sid=live"), r#"Some("live") None"#),
+            (Some("autumn.sid=gone"), r#"None Some("gone")"#),
+            (None, "None None"),
+        ] {
+            let mut request = Request::builder().method(Method::POST).uri("/orders");
+            if let Some(cookie) = cookie {
+                request = request.header(axum::http::header::COOKIE, cookie);
+            }
+            let response = service
+                .clone()
+                .oneshot(request.body(Body::empty()).expect("request should build"))
+                .await
+                .expect("request should complete");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should collect");
+            assert_eq!(body, Bytes::from(expected), "cookie: {cookie:?}");
+        }
+    }
+
+    /// Without the session layer, the readers scope by a cookie-backed
+    /// session's id and by nothing else.
+    #[tokio::test]
+    async fn session_scope_readers_use_a_hand_built_session_as_it_is() {
+        let parts_with = |session: Option<crate::session::Session>| {
+            let mut request = idempotent_post("/orders", "key", "body");
+            if let Some(session) = session {
+                request.extensions_mut().insert(session);
+            }
+            request.into_parts().0
+        };
+
+        let cookie_backed = parts_with(Some(session_with_user("session-alice", "alice")));
+        assert_eq!(
+            storage_session_id_for_parts(&cookie_backed).await,
+            Some("session-alice".to_owned())
+        );
+        assert_eq!(
+            stale_cookie_session_id_for_parts(&cookie_backed).await,
+            None
+        );
+
+        let fresh = parts_with(Some(crate::session::Session::new_for_test_without_cookie(
+            "fresh".to_owned(),
+            HashMap::new(),
+        )));
+        assert_eq!(storage_session_id_for_parts(&fresh).await, None);
+        assert_eq!(stale_cookie_session_id_for_parts(&fresh).await, None);
+
+        let no_session = parts_with(None);
+        assert_eq!(storage_session_id_for_parts(&no_session).await, None);
+        assert_eq!(stale_cookie_session_id_for_parts(&no_session).await, None);
+    }
+
+    /// One key through the session and idempotency layers, in every scope a
+    /// login that rotates the session id passes through: no cookie, the
+    /// cookie of a stored session, that cookie once the rotation has made it
+    /// stale, and the cookie the rotation issued.
+    #[tokio::test]
+    async fn a_rotating_login_replays_for_the_stale_and_the_new_cookie() {
+        use crate::session::{
+            MemoryStore, Session, SessionConfig, SessionLayer, SessionStore as _,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let session_store = MemoryStore::new();
+        let mut existing = HashMap::new();
+        existing.insert("marker".to_owned(), "old-session".to_owned());
+        session_store
+            .save("old-session-id", existing)
+            .await
+            .expect("memory store should save");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let app = axum::Router::new()
+            .route(
+                "/login",
+                axum::routing::post(move |session: Session| {
+                    let handler_calls = Arc::clone(&handler_calls);
+                    async move {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        let marker = session
+                            .get("marker")
+                            .await
+                            .unwrap_or_else(|| "anonymous".to_owned());
+                        session.insert("user_id", "42").await;
+                        session.rotate_id().await;
+                        marker
+                    }
+                }),
+            )
+            .layer(IdempotencyLayer::new(Arc::new(
+                MemoryIdempotencyStore::new(Duration::from_secs(30)),
+            )))
+            .layer(SessionLayer::new(session_store, SessionConfig::default()));
+        let send = |cookie: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder()
+                    .method(Method::POST)
+                    .uri("/login")
+                    .header(IDEMPOTENCY_KEY_HEADER, "login-key");
+                if let Some(cookie) = cookie {
+                    request = request.header(axum::http::header::COOKIE, cookie);
+                }
+                let response = app
+                    .oneshot(request.body(Body::empty()).expect("request should build"))
+                    .await
+                    .expect("request should complete");
+                let replayed = response.headers().contains_key(X_IDEMPOTENT_REPLAYED);
+                let new_cookie = response
+                    .headers()
+                    .get(axum::http::header::SET_COOKIE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.split(';').next())
+                    .map(str::to_owned);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body should collect");
+                (
+                    String::from_utf8(body.to_vec()).expect("body should be text"),
+                    replayed,
+                    new_cookie,
+                )
+            }
+        };
+        let old_cookie = || Some("autumn.sid=old-session-id".to_owned());
+
+        let (body, replayed, _) = send(None).await;
+        assert_eq!((body.as_str(), replayed), ("anonymous", false));
+
+        let (body, replayed, new_cookie) = send(old_cookie()).await;
+        assert_eq!(
+            (body.as_str(), replayed),
+            ("old-session", false),
+            "a stored session is a scope of its own, apart from the anonymous one"
+        );
+        let new_cookie = new_cookie.expect("the rotation should issue a cookie");
+        assert_ne!(new_cookie, "autumn.sid=old-session-id");
+
+        let (body, replayed, _) = send(old_cookie()).await;
+        assert_eq!(
+            (body.as_str(), replayed),
+            ("old-session", true),
+            "the cookie the rotation made stale still finds the record it wrote"
+        );
+
+        let (body, replayed, _) = send(Some(new_cookie)).await;
+        assert_eq!(
+            (body.as_str(), replayed),
+            ("old-session", true),
+            "the cookie the rotation issued finds the same record"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "neither retry runs the handler again"
+        );
     }
 
     #[tokio::test]

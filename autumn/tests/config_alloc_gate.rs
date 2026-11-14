@@ -259,9 +259,16 @@ fn measure_per_request(
 /// named futures. A restored `from_fn` now costs 4 blocks (see the control
 /// test below). Thus the headroom is 3 blocks, so one restored `from_fn` still
 /// fails this gate.
+///
+/// Re-derived again: **88** blocks under the 8 default features and under the
+/// full `cargo test --workspace` set. The error-page layer no longer copies the
+/// request headers outside dev, the reporting layer keeps its context typed,
+/// the submit token is drawn on first read, and a session id minted for a
+/// request with no cookie stays a `Uuid` until something reads it. The headroom
+/// is 3 blocks, as before.
 #[test]
 fn per_request_allocations_stay_under_the_ceiling() {
-    const CEILING: u64 = 101;
+    const CEILING: u64 = 91;
 
     let measured = measure_per_request(|app| app);
     println!(

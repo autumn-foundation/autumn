@@ -17,15 +17,16 @@
 //! | service                         | request         | before | after |
 //! |---------------------------------|-----------------|--------|-------|
 //! | `LogContextService`             | any             |      3 |     2 |
-//! | `SessionService`                | no cookie       |      7 |     3 |
+//! | `SessionService`                | no cookie       |      7 |     2 |
 //! | `MethodOverrideService`         | GET, JSON POST  |      1 |     0 |
 //! | `IdempotencyReplayService`      | no replay       |      1 |     0 |
 //! | `SubmitTokenLayer` service      | GET             |      5 |     3 |
 //! | `SubmitTokenLayer` service      | JSON POST       |      6 |     3 |
 //!
 //! The 2 blocks of `LogContextService` are its two scopes: the log context
-//! and the actor scope. The 3 blocks of `SessionService` are the session id,
-//! the session state, and the session extension. The 3 blocks of the
+//! and the actor scope. The 2 blocks of `SessionService` are the session
+//! state and the session extension: a minted id stays a `Uuid` until something
+//! reads it as text. The 3 blocks of the
 //! submit-token service are a copy of the field name and the two request
 //! extensions. The token's value is drawn when a handler reads it, so a
 //! request that renders no form allocates none. Before, a JSON POST also had
@@ -121,9 +122,9 @@ fn session_future_without_a_cookie_is_not_boxed() {
     let per_call = allocations_per_call(&mut svc, &get);
     println!("session, no cookie: {per_call} allocations per call");
     assert_eq!(
-        per_call, 3,
-        "a request without a session cookie must allocate only the session id, \
-         the session state and its request extension"
+        per_call, 2,
+        "a request without a session cookie must allocate only the session state \
+         and its request extension: a minted id is not rendered until it is read"
     );
 }
 

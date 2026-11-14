@@ -101,8 +101,8 @@ use http::request::Parts;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tower::{Layer, Service};
-#[cfg(test)]
 use uuid::Uuid;
+use uuid::fmt::Hyphenated;
 
 // ── Session data ────────────────────────────────────────────────
 
@@ -122,16 +122,107 @@ pub struct Session {
     entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
-#[derive(Debug)]
 struct SessionInner {
-    id: String,
+    id: SessionId,
     old_id: Option<String>,
     /// Every id the session held before the current one, oldest first.
     prior_ids: Vec<String>,
     data: HashMap<String, String>,
     cookie_backed: bool,
+    scope_source: ScopeSource,
     dirty: bool,
     destroyed: bool,
+}
+
+/// A session id.
+///
+/// The layer mints an id for every request that has no stored session, and
+/// most of those requests never read it: the session stays clean, so nothing
+/// is saved and no cookie is sent. A minted id therefore stays a [`Uuid`]
+/// until something asks for its text.
+enum SessionId {
+    /// An id the layer drew from its entropy source for this request.
+    Minted(Uuid),
+    /// An id that arrived as text: from the request cookie, from a caller, or
+    /// from a rotation.
+    Text(String),
+}
+
+impl SessionId {
+    /// Length of a minted id's text.
+    const MINTED_LEN: usize = Hyphenated::LENGTH;
+
+    /// The id as text. A minted id is written to `buffer` in the form
+    /// [`Uuid`]'s `Display` gives: lowercase and hyphenated.
+    fn as_str<'a>(&'a self, buffer: &'a mut [u8; Self::MINTED_LEN]) -> &'a str {
+        match self {
+            Self::Minted(uuid) => uuid.as_hyphenated().encode_lower(buffer),
+            Self::Text(text) => text,
+        }
+    }
+
+    /// The id as an owned string.
+    fn to_text(&self) -> String {
+        self.as_str(&mut [0; Self::MINTED_LEN]).to_owned()
+    }
+
+    /// The id as an owned string, without a copy when it is already text.
+    fn into_text(self) -> String {
+        match self {
+            Self::Minted(_) => self.to_text(),
+            Self::Text(text) => text,
+        }
+    }
+}
+
+/// Prints the id as the string it renders to, whichever form it is held in.
+impl std::fmt::Debug for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(&mut [0; Self::MINTED_LEN]), f)
+    }
+}
+
+/// Prints the session's id and state. The idempotency scope source is left
+/// out: it is bookkeeping for the idempotency layer, not session state.
+#[allow(
+    clippy::missing_fields_in_debug,
+    reason = "the scope source is left out so the debug text shows session state only"
+)]
+impl std::fmt::Debug for SessionInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionInner")
+            .field("id", &self.id)
+            .field("old_id", &self.old_id)
+            .field("prior_ids", &self.prior_ids)
+            .field("data", &self.data)
+            .field("cookie_backed", &self.cookie_backed)
+            .field("dirty", &self.dirty)
+            .field("destroyed", &self.destroyed)
+            .finish()
+    }
+}
+
+/// Where the session ids that scope an idempotency storage key come from.
+///
+/// The session layer decides this once, when it builds the session, and the
+/// idempotency layer reads it only for a mutation that carries an
+/// `Idempotency-Key`. No other request pays for it.
+// The payloads are read only by the idempotency layer.
+#[cfg_attr(not(feature = "idempotency"), allow(dead_code))]
+enum ScopeSource {
+    /// The session itself: its current id when it is cookie-backed. This is a
+    /// request with no session cookie, and a session built by hand.
+    Own,
+    /// The request cookie named a stored session. The scope is the id the
+    /// session was loaded with, whatever it is rotated to later.
+    LoadedCookie,
+    /// The request cookie named no stored session. There is no session id to
+    /// scope by, and the id the cookie carried is the stale id.
+    StaleCookie(String),
+    /// This layer saw no cookie, and the request already carried the session
+    /// of an outer session layer. The scope is what that layer's cookie
+    /// resolved to.
+    OuterLayer(Session),
 }
 
 impl Session {
@@ -160,15 +251,22 @@ impl Session {
     }
 
     fn with_cookie_state(id: String, data: HashMap<String, String>, cookie_backed: bool) -> Self {
-        Self::for_request(id, data, cookie_backed, Arc::new(crate::entropy::OsEntropy))
+        Self::for_request(
+            SessionId::Text(id),
+            data,
+            cookie_backed,
+            ScopeSource::Own,
+            Arc::new(crate::entropy::OsEntropy),
+        )
     }
 
     /// A session for a request. `entropy` is the source of the session
     /// layer, so a simulation replays session-id rotation deterministically.
     fn for_request(
-        id: String,
+        id: SessionId,
         data: HashMap<String, String>,
         cookie_backed: bool,
+        scope_source: ScopeSource,
         entropy: Arc<dyn crate::entropy::Entropy>,
     ) -> Self {
         Self {
@@ -178,6 +276,7 @@ impl Session {
                 prior_ids: Vec::new(),
                 data,
                 cookie_backed,
+                scope_source,
                 dirty: false,
                 destroyed: false,
             })),
@@ -203,7 +302,58 @@ impl Session {
 
     /// Returns the session ID.
     pub async fn id(&self) -> String {
-        self.inner.read().await.id.clone()
+        self.inner.read().await.id.to_text()
+    }
+
+    /// Run `read` on the session that decides the idempotency scope: this
+    /// one, or the session of the outer layer it defers to. The flag is
+    /// `true` for an outer layer's session.
+    #[cfg_attr(not(feature = "idempotency"), allow(dead_code))]
+    async fn with_scope_source<T>(&self, read: impl Fn(&SessionInner, bool) -> T) -> T {
+        let mut outer: Option<Self> = None;
+        loop {
+            let next = {
+                let inner = outer.as_ref().unwrap_or(self).inner.read().await;
+                match &inner.scope_source {
+                    ScopeSource::OuterLayer(next) => next.clone(),
+                    ScopeSource::Own | ScopeSource::LoadedCookie | ScopeSource::StaleCookie(_) => {
+                        return read(&inner, outer.is_some());
+                    }
+                }
+            };
+            outer = Some(next);
+        }
+    }
+
+    /// The session id an idempotency storage key is scoped by, or `None` for
+    /// a request that presented no stored session.
+    ///
+    /// For a session the layer loaded from the request cookie, this is the id
+    /// the cookie carried, also after [`Session::rotate_id`]: a retry of the
+    /// same request presents the same cookie. A cookie-backed session built by
+    /// hand reports the id it has now.
+    #[cfg_attr(not(feature = "idempotency"), allow(dead_code))]
+    pub(crate) async fn idempotency_session_id(&self) -> Option<String> {
+        self.with_scope_source(|inner, outer| match &inner.scope_source {
+            ScopeSource::LoadedCookie => {
+                Some(inner.old_id.clone().unwrap_or_else(|| inner.id.to_text()))
+            }
+            ScopeSource::Own if !outer && inner.cookie_backed => Some(inner.id.to_text()),
+            ScopeSource::Own | ScopeSource::StaleCookie(_) | ScopeSource::OuterLayer(_) => None,
+        })
+        .await
+    }
+
+    /// The id of a request cookie that named no stored session, if the
+    /// request carried one. An idempotency record written while that session
+    /// still existed is stored under it.
+    #[cfg_attr(not(feature = "idempotency"), allow(dead_code))]
+    pub(crate) async fn idempotency_stale_cookie_id(&self) -> Option<String> {
+        self.with_scope_source(|inner, _| match &inner.scope_source {
+            ScopeSource::StaleCookie(id) => Some(id.clone()),
+            ScopeSource::Own | ScopeSource::LoadedCookie | ScopeSource::OuterLayer(_) => None,
+        })
+        .await
     }
 
     /// Returns whether this session ID came from a valid request cookie rather
@@ -272,10 +422,10 @@ impl Session {
         let new_id = self.entropy.uuid_v4().to_string();
         let mut inner = self.inner.write().await;
         if inner.old_id.is_none() {
-            inner.old_id = Some(inner.id.clone());
+            inner.old_id = Some(inner.id.to_text());
         }
-        let previous = std::mem::replace(&mut inner.id, new_id);
-        inner.prior_ids.push(previous);
+        let previous = std::mem::replace(&mut inner.id, SessionId::Text(new_id));
+        inner.prior_ids.push(previous.into_text());
         inner.dirty = true;
     }
 
@@ -765,6 +915,14 @@ fn is_production_profile(profile: Option<&str>) -> bool {
 
 /// Extract a named cookie value from the Cookie header.
 pub(crate) fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    cookie_value(headers, name).map(str::to_owned)
+}
+
+/// The value of the cookie `name`, borrowed from the Cookie header.
+///
+/// `None` when no header carries the cookie, and when more than one does. A
+/// header that is not visible ASCII is skipped.
+fn cookie_value<'h>(headers: &'h http::HeaderMap, name: &str) -> Option<&'h str> {
     let mut found_token = None;
 
     for cookie_header in headers.get_all(COOKIE) {
@@ -787,7 +945,7 @@ pub(crate) fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String
                 return None;
             }
 
-            found_token = Some(v.trim().to_owned());
+            found_token = Some(v.trim());
         }
     }
     found_token
@@ -801,7 +959,8 @@ pub(crate) fn verified_session_id(
     cookie_name: &str,
     signing_keys: &crate::security::config::ResolvedSigningKeys,
 ) -> Option<String> {
-    let raw = get_cookie(headers, cookie_name)?;
+    // Borrow the cookie: only a verified id is copied out of the header.
+    let raw = cookie_value(headers, cookie_name)?;
     let (id, signature) = raw.split_once('.')?;
     signing_keys
         .verify(id.as_bytes(), signature)
@@ -1103,11 +1262,13 @@ async fn save_session<St: SessionStore>(
 ) -> Response {
     let inner_guard = session.inner.read().await;
     if inner_guard.destroyed {
-        if let Err(error) = shared
-            .store
-            .destroy(inner_guard.old_id.as_deref().unwrap_or(&inner_guard.id))
-            .await
-        {
+        // The store holds the session under the id it was loaded with.
+        let mut minted = [0; SessionId::MINTED_LEN];
+        let stored_id = inner_guard
+            .old_id
+            .as_deref()
+            .unwrap_or_else(|| inner_guard.id.as_str(&mut minted));
+        if let Err(error) = shared.store.destroy(stored_id).await {
             crate::idempotency::keep_deferred_session_commit_locked(&mut response);
             return session_store_unavailable_response(&error);
         }
@@ -1123,7 +1284,7 @@ async fn save_session<St: SessionStore>(
         );
     } else if inner_guard.dirty {
         let data = inner_guard.data.clone();
-        let sid = inner_guard.id.clone();
+        let sid = inner_guard.id.to_text();
         let primary_replay_after_guard_denial =
             inner_guard.cookie_backed && inner_guard.old_id.is_some();
         // A session with no stored row has nothing keyed to its old id.
@@ -1214,15 +1375,28 @@ where
             shared.signing_keys.as_deref(),
         ) else {
             // No cookie: a new session with nothing to load, so call the inner service at once.
-            let session = Session::for_request(
-                shared.entropy.uuid_v4().to_string(),
+            let id = shared.entropy.uuid_v4();
+            let mut session = Session::for_request(
+                SessionId::Minted(id),
                 HashMap::new(),
                 false,
+                ScopeSource::Own,
                 shared.entropy.clone(),
             );
-            // No idempotency scope: with no cookie, the scope has no session
-            // id, and idempotency reads the same from the new session.
-            req.extensions_mut().insert(session.clone());
+            // With no cookie, the idempotency scope has no session id, and
+            // idempotency reads the same from the new session. The exception
+            // is a session layer inside another one: the request then keeps
+            // the scope the outer layer's cookie resolved to.
+            if let Some(outer) = req.extensions_mut().insert(session.clone()) {
+                session = Session::for_request(
+                    SessionId::Minted(id),
+                    HashMap::new(),
+                    false,
+                    ScopeSource::OuterLayer(outer),
+                    shared.entropy.clone(),
+                );
+                req.extensions_mut().insert(session.clone());
+            }
             return SessionFuture {
                 state: SessionState::Serving {
                     inner: self.inner.call(req),
@@ -1239,29 +1413,32 @@ where
         SessionFuture {
             state: SessionState::Loading {
                 fut: Box::pin(async move {
-                    let mut stale_cookie_session_id = None;
-                    let (session_id, data, cookie_backed) =
+                    // The session carries what the cookie resolved to, for
+                    // the idempotency layer to read when it needs a scope.
+                    let (session_id, data, cookie_backed, scope_source) =
                         match shared.store.load(&existing_id).await {
-                            Ok(Some(data)) => (existing_id, data, true),
-                            Ok(None) => {
-                                stale_cookie_session_id = Some(existing_id);
-                                (shared.entropy.uuid_v4().to_string(), HashMap::new(), false)
-                            }
+                            Ok(Some(data)) => (
+                                SessionId::Text(existing_id),
+                                data,
+                                true,
+                                ScopeSource::LoadedCookie,
+                            ),
+                            Ok(None) => (
+                                SessionId::Minted(shared.entropy.uuid_v4()),
+                                HashMap::new(),
+                                false,
+                                ScopeSource::StaleCookie(existing_id),
+                            ),
                             Err(error) => return Ok(session_store_unavailable_response(&error)),
                         };
 
-                    let current_session_scope = cookie_backed.then(|| session_id.clone());
                     let session = Session::for_request(
                         session_id,
                         data,
                         cookie_backed,
+                        scope_source,
                         shared.entropy.clone(),
                     );
-                    req.extensions_mut()
-                        .insert(crate::idempotency::IdempotencySessionScope::new(
-                            current_session_scope,
-                            stale_cookie_session_id,
-                        ));
                     req.extensions_mut().insert(session.clone());
 
                     let response = inner.call(req).await?;
@@ -2568,5 +2745,633 @@ mod tests {
             ran_after.load(std::sync::atomic::Ordering::SeqCst),
             "a later hook still runs after an earlier one fails"
         );
+    }
+
+    // ── Cookie parsing without a copy ──
+
+    /// The parser as it was when it copied every match: the reference the
+    /// borrowing parser must agree with.
+    fn get_cookie_copying_reference(headers: &http::HeaderMap, name: &str) -> Option<String> {
+        let mut found_token = None;
+        for cookie_header in headers.get_all(COOKIE) {
+            let Ok(cookie_str) = cookie_header.to_str() else {
+                continue;
+            };
+            for pair in cookie_str.split(';') {
+                let pair = pair.trim();
+                let Some((k, v)) = pair.split_once('=') else {
+                    continue;
+                };
+                if k.trim() != name {
+                    continue;
+                }
+                if found_token.is_some() {
+                    return None;
+                }
+                found_token = Some(v.trim().to_owned());
+            }
+        }
+        found_token
+    }
+
+    /// Signed-cookie verification on top of the copying parser.
+    fn verified_session_id_copying_reference(
+        headers: &http::HeaderMap,
+        cookie_name: &str,
+        signing_keys: &crate::security::config::ResolvedSigningKeys,
+    ) -> Option<String> {
+        let raw = get_cookie_copying_reference(headers, cookie_name)?;
+        let (id, signature) = raw.split_once('.')?;
+        signing_keys
+            .verify(id.as_bytes(), signature)
+            .then(|| id.to_owned())
+    }
+
+    fn cookie_test_keys() -> crate::security::config::ResolvedSigningKeys {
+        crate::security::config::ResolvedSigningKeys::new(
+            b"current-signing-key-current-signing-key".to_vec(),
+            vec![b"previous-signing-key-previous-signing-key".to_vec()],
+        )
+    }
+
+    /// Pieces of a `Cookie` header. Joined at random they give matching and
+    /// near-matching names, repeated names, empty values, stray separators,
+    /// padding, validly and invalidly signed values, and bytes outside
+    /// visible ASCII (which make the whole header unreadable as a string).
+    fn cookie_header_piece() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        let keys = cookie_test_keys();
+        let signed_current = format!("abc.{}", keys.sign(b"abc"));
+        let signed_previous = {
+            let previous = crate::security::config::ResolvedSigningKeys::new(
+                b"previous-signing-key-previous-signing-key".to_vec(),
+                Vec::new(),
+            );
+            format!("abc.{}", previous.sign(b"abc"))
+        };
+        prop_oneof![
+            Just("autumn.sid".to_owned()),
+            Just("autumn.sidx".to_owned()),
+            Just("other".to_owned()),
+            Just(";".to_owned()),
+            Just("=".to_owned()),
+            Just(".".to_owned()),
+            Just(" ".to_owned()),
+            Just("\t".to_owned()),
+            Just("\u{e9}".to_owned()),
+            Just(signed_current),
+            Just(signed_previous),
+            "[a-f0-9-]{1,12}",
+        ]
+    }
+
+    fn cookie_headers() -> impl proptest::strategy::Strategy<Value = http::HeaderMap> {
+        use proptest::prelude::*;
+        proptest::collection::vec(
+            proptest::collection::vec(cookie_header_piece(), 0..10),
+            0..3,
+        )
+        .prop_map(|header_values| {
+            let mut headers = http::HeaderMap::new();
+            for pieces in header_values {
+                if let Ok(value) = http::HeaderValue::from_bytes(pieces.concat().as_bytes()) {
+                    headers.append(COOKIE, value);
+                }
+            }
+            headers
+        })
+    }
+
+    proptest::proptest! {
+        /// The borrowing parser finds the same value as the copying one, for
+        /// every name the layer could be configured with.
+        #[test]
+        fn cookie_value_matches_the_copying_parser(headers in cookie_headers()) {
+            for name in ["autumn.sid", "other", "missing", ""] {
+                let expected = get_cookie_copying_reference(&headers, name);
+                proptest::prop_assert_eq!(
+                    cookie_value(&headers, name).map(str::to_owned),
+                    expected.clone()
+                );
+                proptest::prop_assert_eq!(get_cookie(&headers, name), expected);
+            }
+        }
+
+        /// Verifying a borrowed cookie accepts and rejects exactly what
+        /// verifying a copy of it does, with and without signing keys.
+        #[test]
+        fn session_id_from_headers_matches_the_copying_parser(headers in cookie_headers()) {
+            let keys = cookie_test_keys();
+            proptest::prop_assert_eq!(
+                verified_session_id(&headers, "autumn.sid", &keys),
+                verified_session_id_copying_reference(&headers, "autumn.sid", &keys)
+            );
+            proptest::prop_assert_eq!(
+                session_id_from_headers(&headers, "autumn.sid", Some(&keys)),
+                verified_session_id_copying_reference(&headers, "autumn.sid", &keys)
+            );
+            proptest::prop_assert_eq!(
+                session_id_from_headers(&headers, "autumn.sid", None),
+                get_cookie_copying_reference(&headers, "autumn.sid")
+            );
+        }
+    }
+
+    #[test]
+    fn verified_session_id_accepts_current_and_previous_keys_only() {
+        let keys = cookie_test_keys();
+        let previous = crate::security::config::ResolvedSigningKeys::new(
+            b"previous-signing-key-previous-signing-key".to_vec(),
+            Vec::new(),
+        );
+        let cookie = |value: String| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                COOKIE,
+                format!("a=b;  autumn.sid = {value} ").parse().unwrap(),
+            );
+            headers
+        };
+
+        for signature in [keys.sign(b"sid-1"), previous.sign(b"sid-1")] {
+            assert_eq!(
+                verified_session_id(&cookie(format!("sid-1.{signature}")), "autumn.sid", &keys),
+                Some("sid-1".to_owned())
+            );
+        }
+        let tampered = format!("sid-2.{}", keys.sign(b"sid-1"));
+        assert_eq!(
+            verified_session_id(&cookie(tampered), "autumn.sid", &keys),
+            None
+        );
+        assert_eq!(
+            verified_session_id(&cookie("sid-1".to_owned()), "autumn.sid", &keys),
+            None,
+            "an unsigned value has no signature to verify"
+        );
+    }
+
+    #[test]
+    fn cookie_value_borrows_from_the_header() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(COOKIE, "other=xyz;  autumn.sid = abc123 ".parse().unwrap());
+
+        let value = cookie_value(&headers, "autumn.sid").expect("cookie present");
+
+        assert_eq!(value, "abc123");
+        let header = headers.get(COOKIE).unwrap().as_bytes().as_ptr_range();
+        let found = value.as_bytes().as_ptr_range();
+        assert!(
+            header.start <= found.start && found.end <= header.end,
+            "the value is a slice of the header, not a copy of it"
+        );
+    }
+
+    // ── Session ids rendered on demand ──
+
+    proptest::proptest! {
+        /// A minted id renders to the text `Uuid`'s `Display` gives, by every
+        /// route the layer reads it.
+        #[test]
+        fn minted_session_id_renders_as_uuid_display(bits in proptest::prelude::any::<u128>()) {
+            let uuid = Uuid::from_u128(bits);
+            let expected = uuid.to_string();
+            let id = SessionId::Minted(uuid);
+            let mut buffer = [0; SessionId::MINTED_LEN];
+            proptest::prop_assert_eq!(id.as_str(&mut buffer), expected.as_str());
+            proptest::prop_assert_eq!(&id.to_text(), &expected);
+            proptest::prop_assert_eq!(format!("{id:?}"), format!("{expected:?}"));
+            proptest::prop_assert_eq!(&id.into_text(), &expected);
+        }
+
+        /// An id that arrived as text is handed back unchanged.
+        #[test]
+        fn text_session_id_is_handed_back_unchanged(text in proptest::prelude::any::<String>()) {
+            let id = SessionId::Text(text.clone());
+            let mut buffer = [0; SessionId::MINTED_LEN];
+            proptest::prop_assert_eq!(id.as_str(&mut buffer), text.as_str());
+            proptest::prop_assert_eq!(&id.to_text(), &text);
+            proptest::prop_assert_eq!(format!("{id:?}"), format!("{text:?}"));
+            proptest::prop_assert_eq!(&id.into_text(), &text);
+        }
+    }
+
+    type SeenSession = Arc<std::sync::Mutex<Option<Session>>>;
+
+    /// A service that keeps the request's session. `/id` answers with the
+    /// session id, `/insert` writes a value, `/destroy` destroys the session.
+    fn session_keeper() -> (
+        tower::util::BoxCloneService<Request, Response, std::convert::Infallible>,
+        SeenSession,
+    ) {
+        let seen = SeenSession::default();
+        let slot = Arc::clone(&seen);
+        let service = tower::service_fn(move |req: Request| {
+            let slot = Arc::clone(&slot);
+            async move {
+                let session = req
+                    .extensions()
+                    .get::<Session>()
+                    .cloned()
+                    .expect("session layer installed");
+                *slot.lock().unwrap() = Some(session.clone());
+                let mut body = String::new();
+                match req.uri().path() {
+                    "/id" => body = session.id().await,
+                    "/insert" => session.insert("k", "v").await,
+                    "/destroy" => session.destroy().await,
+                    _ => {}
+                }
+                Ok(Response::new(Body::from(body)))
+            }
+        });
+        (tower::util::BoxCloneService::new(service), seen)
+    }
+
+    fn request(uri: &str, cookie: Option<&str>) -> Request {
+        let mut request = HttpRequest::builder().uri(uri);
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        request.body(Body::empty()).unwrap()
+    }
+
+    async fn body_text(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_minted_id_stays_a_uuid_until_it_is_read() {
+        let (keeper, seen) = session_keeper();
+        let service = SessionLayer::new(MemoryStore::new(), SessionConfig::default()).layer(keeper);
+
+        for cookie in [None, Some("autumn.sid=no-such-session")] {
+            service.clone().oneshot(request("/", cookie)).await.unwrap();
+            let session = seen.lock().unwrap().take().expect("handler ran");
+            assert!(
+                matches!(session.inner.read().await.id, SessionId::Minted(_)),
+                "no text is rendered for an id nothing read (cookie: {cookie:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_loaded_session_keeps_the_cookie_id_as_text() {
+        let store = MemoryStore::new();
+        store.save("sid-1", HashMap::new()).await.unwrap();
+        let (keeper, seen) = session_keeper();
+        let service = SessionLayer::new(store, SessionConfig::default()).layer(keeper);
+
+        let response = service
+            .oneshot(request("/id", Some("autumn.sid=sid-1")))
+            .await
+            .unwrap();
+
+        assert_eq!(body_text(response).await, "sid-1");
+        let session = seen.lock().unwrap().take().expect("handler ran");
+        assert!(matches!(
+            &session.inner.read().await.id,
+            SessionId::Text(id) if id == "sid-1"
+        ));
+    }
+
+    /// One id is drawn for each request without a stored session, read or
+    /// not, and a read gives that draw as `Uuid`'s `Display` renders it. A
+    /// seeded run therefore sees the same ids in the same order.
+    #[tokio::test]
+    async fn each_request_without_a_stored_session_draws_one_id() {
+        let seed = 0x5e55_1017;
+        let expected = crate::entropy::SeededEntropy::shared(seed);
+        let (keeper, _seen) = session_keeper();
+        let service = SessionLayer::new(MemoryStore::new(), SessionConfig::default())
+            .with_entropy(crate::entropy::SeededEntropy::shared(seed))
+            .layer(keeper);
+
+        for (uri, cookie) in [
+            ("/", None),
+            ("/id", None),
+            ("/", Some("autumn.sid=no-such-session")),
+            ("/id", Some("autumn.sid=no-such-session")),
+            ("/id", None),
+        ] {
+            let drawn = expected.uuid_v4().to_string();
+            let response = service.clone().oneshot(request(uri, cookie)).await.unwrap();
+            if uri == "/id" {
+                assert_eq!(body_text(response).await, drawn);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_minted_id_is_saved_and_sent_as_its_uuid_text() {
+        let seed = 7;
+        let expected = crate::entropy::SeededEntropy::shared(seed)
+            .uuid_v4()
+            .to_string();
+        let store = MemoryStore::new();
+        let (keeper, _seen) = session_keeper();
+        let service = SessionLayer::new(store.clone(), SessionConfig::default())
+            .with_entropy(crate::entropy::SeededEntropy::shared(seed))
+            .layer(keeper);
+
+        let response = service.oneshot(request("/insert", None)).await.unwrap();
+
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            cookie.starts_with(&format!("autumn.sid={expected};")),
+            "cookie carries the drawn id: {cookie}"
+        );
+        let saved = store.load(&expected).await.unwrap().expect("saved");
+        assert_eq!(saved.get("k").map(String::as_str), Some("v"));
+        assert_eq!(store.sessions.read().await.len(), 1);
+    }
+
+    /// Records the ids the layer asks the store to destroy.
+    #[derive(Clone, Default)]
+    struct DestroyLog {
+        destroyed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SessionStore for DestroyLog {
+        async fn load(
+            &self,
+            _id: &str,
+        ) -> Result<Option<HashMap<String, String>>, SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn save(
+            &self,
+            _id: &str,
+            _data: HashMap<String, String>,
+        ) -> Result<(), SessionStoreError> {
+            Ok(())
+        }
+
+        async fn destroy(&self, id: &str) -> Result<(), SessionStoreError> {
+            self.destroyed.lock().unwrap().push(id.to_owned());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_destroyed_minted_session_is_destroyed_under_its_uuid_text() {
+        let seed = 11;
+        let expected = crate::entropy::SeededEntropy::shared(seed)
+            .uuid_v4()
+            .to_string();
+        let store = DestroyLog::default();
+        let (keeper, _seen) = session_keeper();
+        let service = SessionLayer::new(store.clone(), SessionConfig::default())
+            .with_entropy(crate::entropy::SeededEntropy::shared(seed))
+            .layer(keeper);
+
+        service.oneshot(request("/destroy", None)).await.unwrap();
+
+        assert_eq!(*store.destroyed.lock().unwrap(), vec![expected]);
+    }
+
+    #[tokio::test]
+    async fn rotating_a_minted_id_records_its_uuid_text() {
+        let seed = 13;
+        let minted = Uuid::from_u128(0x0123_4567_89ab_4def_8123_4567_89ab_cdef);
+        let rotated = crate::entropy::SeededEntropy::shared(seed)
+            .uuid_v4()
+            .to_string();
+        let session = Session::for_request(
+            SessionId::Minted(minted),
+            HashMap::new(),
+            false,
+            ScopeSource::Own,
+            crate::entropy::SeededEntropy::shared(seed),
+        );
+
+        session.rotate_id().await;
+
+        assert_eq!(session.id().await, rotated);
+        assert_eq!(session.previous_id().await, Some(minted.to_string()));
+        let inner = session.inner.read().await;
+        assert_eq!(inner.old_id, Some(minted.to_string()));
+        assert_eq!(inner.prior_ids, vec![minted.to_string()]);
+        drop(inner);
+    }
+
+    /// The session's debug text is what it was when the id was a `String`
+    /// and the session carried no idempotency scope.
+    #[tokio::test]
+    async fn session_debug_text_shows_the_id_text_and_no_scope_source() {
+        let session = Session::for_request(
+            SessionId::Minted(Uuid::from_u128(1)),
+            HashMap::new(),
+            false,
+            ScopeSource::StaleCookie("gone".to_owned()),
+            Arc::new(crate::entropy::OsEntropy),
+        );
+        let inner = session.inner.read().await;
+        assert_eq!(
+            format!("{:?}", *inner),
+            "SessionInner { id: \"00000000-0000-0000-0000-000000000001\", old_id: None, \
+             prior_ids: [], data: {}, cookie_backed: false, dirty: false, destroyed: false }"
+        );
+        drop(inner);
+    }
+
+    // ── Idempotency scope carried by the session ──
+
+    /// Answers with what the idempotency layer reads for the request: the
+    /// session id of the scope, the stale cookie id, and how many extensions
+    /// the request carries. `/rotate` rotates the session id first.
+    async fn report_scope(req: Request) -> Result<Response, std::convert::Infallible> {
+        let extensions = req.extensions().len();
+        let session = req
+            .extensions()
+            .get::<Session>()
+            .cloned()
+            .expect("session layer installed");
+        if req.uri().path() == "/rotate" {
+            session.rotate_id().await;
+        }
+        let body = format!(
+            "{:?} {:?} {extensions}",
+            session.idempotency_session_id().await,
+            session.idempotency_stale_cookie_id().await,
+        );
+        Ok(Response::new(Body::from(body)))
+    }
+
+    async fn store_with(ids: &[&str]) -> MemoryStore {
+        let store = MemoryStore::new();
+        for id in ids {
+            store.save(id, HashMap::new()).await.unwrap();
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn the_scope_follows_what_the_request_cookie_resolved_to() {
+        let service = SessionLayer::new(store_with(&["sid-1"]).await, SessionConfig::default())
+            .layer(tower::service_fn(report_scope));
+
+        for (uri, cookie, expected) in [
+            ("/", Some("autumn.sid=sid-1"), r#"Some("sid-1") None 1"#),
+            // A rotation keeps the scope of the cookie the request presented.
+            (
+                "/rotate",
+                Some("autumn.sid=sid-1"),
+                r#"Some("sid-1") None 1"#,
+            ),
+            ("/", Some("autumn.sid=gone"), r#"None Some("gone") 1"#),
+            ("/rotate", Some("autumn.sid=gone"), r#"None Some("gone") 1"#),
+            ("/", None, "None None 1"),
+            ("/rotate", None, "None None 1"),
+        ] {
+            let response = service.clone().oneshot(request(uri, cookie)).await.unwrap();
+            assert_eq!(body_text(response).await, expected, "{uri} {cookie:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signed_cookie_scopes_by_the_verified_id() {
+        let keys = Arc::new(cookie_test_keys());
+        let signed = format!("autumn.sid=sid-1.{}", keys.sign(b"sid-1"));
+        let stale = format!("autumn.sid=gone.{}", keys.sign(b"gone"));
+        let service = SessionLayer::new(store_with(&["sid-1"]).await, SessionConfig::default())
+            .with_signing_keys(keys)
+            .layer(tower::service_fn(report_scope));
+
+        for (cookie, expected) in [
+            (signed.as_str(), r#"Some("sid-1") None 1"#),
+            (stale.as_str(), r#"None Some("gone") 1"#),
+            // An unsigned cookie is no cookie.
+            ("autumn.sid=sid-1", "None None 1"),
+        ] {
+            let response = service
+                .clone()
+                .oneshot(request("/", Some(cookie)))
+                .await
+                .unwrap();
+            assert_eq!(body_text(response).await, expected, "{cookie}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hand_built_session_scopes_by_the_id_it_has_now() {
+        let cookie_backed = Session::new_for_test("hand".to_owned(), HashMap::new());
+        assert_eq!(
+            cookie_backed.idempotency_session_id().await,
+            Some("hand".to_owned())
+        );
+        cookie_backed.rotate_id().await;
+        assert_eq!(
+            cookie_backed.idempotency_session_id().await,
+            Some(cookie_backed.id().await),
+            "no cookie lookup fixed the scope, so it is the current id"
+        );
+        assert_eq!(cookie_backed.idempotency_stale_cookie_id().await, None);
+
+        let fresh = Session::new_for_test_without_cookie("fresh".to_owned(), HashMap::new());
+        assert_eq!(fresh.idempotency_session_id().await, None);
+        fresh.rotate_id().await;
+        assert_eq!(fresh.idempotency_session_id().await, None);
+        assert_eq!(fresh.idempotency_stale_cookie_id().await, None);
+    }
+
+    /// One layer's cookie on a request through nested session layers.
+    #[derive(Clone, Copy, Debug)]
+    enum LayerCookie {
+        Absent,
+        Live,
+        Gone,
+    }
+
+    /// What a request with the given cookie on each of three nested session
+    /// layers (outermost first) reports, next to what it must report: the
+    /// scope of the innermost layer that found its cookie on the request.
+    /// The stores are new for each call, so a rotation in one call does not
+    /// reach the next.
+    async fn nested_scope(cookies: [LayerCookie; 3], uri: &str) -> (String, String) {
+        let layer = |index: usize, store: MemoryStore| {
+            SessionLayer::new(
+                store,
+                SessionConfig {
+                    cookie_name: format!("l{index}.sid"),
+                    ..SessionConfig::default()
+                },
+            )
+        };
+        let service = layer(0, store_with(&["live-0"]).await).layer(
+            layer(1, store_with(&["live-1"]).await).layer(
+                layer(2, store_with(&["live-2"]).await).layer(tower::service_fn(report_scope)),
+            ),
+        );
+
+        let mut header = Vec::new();
+        let mut expected = (None, None);
+        for (index, cookie) in cookies.into_iter().enumerate() {
+            match cookie {
+                LayerCookie::Absent => {}
+                LayerCookie::Live => {
+                    header.push(format!("l{index}.sid=live-{index}"));
+                    expected = (Some(format!("live-{index}")), None);
+                }
+                LayerCookie::Gone => {
+                    header.push(format!("l{index}.sid=gone-{index}"));
+                    expected = (None, Some(format!("gone-{index}")));
+                }
+            }
+        }
+        let header = (!header.is_empty()).then(|| header.join("; "));
+
+        let response = service
+            .oneshot(request(uri, header.as_deref()))
+            .await
+            .unwrap();
+        (
+            body_text(response).await,
+            format!("{:?} {:?} 1", expected.0, expected.1),
+        )
+    }
+
+    /// With session layers nested, the scope is the one of the innermost
+    /// layer that found its cookie on the request, whatever the layers inside
+    /// it did, and a rotation by the handler does not move it. Every
+    /// combination over three layers is checked.
+    #[tokio::test]
+    async fn nested_session_layers_keep_the_innermost_cookie_scope() {
+        let states = [LayerCookie::Absent, LayerCookie::Live, LayerCookie::Gone];
+        for outer in states {
+            for middle in states {
+                for inner in states {
+                    for uri in ["/", "/rotate"] {
+                        let (seen, expected) = nested_scope([outer, middle, inner], uri).await;
+                        assert_eq!(
+                            seen, expected,
+                            "{uri} outer={outer:?} middle={middle:?} inner={inner:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_layer_with_no_cookie_takes_no_scope_from_a_hand_built_session() {
+        let service = SessionLayer::new(MemoryStore::new(), SessionConfig::default())
+            .layer(tower::service_fn(report_scope));
+        let mut req = request("/", None);
+        req.extensions_mut()
+            .insert(Session::new_for_test("hand".to_owned(), HashMap::new()));
+
+        let response = service.oneshot(req).await.unwrap();
+
+        assert_eq!(body_text(response).await, "None None 1");
     }
 }
