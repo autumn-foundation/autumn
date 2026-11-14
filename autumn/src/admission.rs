@@ -371,11 +371,27 @@ const fn f64_to_usize(value: f64) -> usize {
 /// RTT in nanoseconds as `f64`, at least 1 ns, so a ratio never divides by
 /// zero.
 const fn rtt_nanos(rtt: Duration) -> f64 {
+    // A `u64` holds 584 years of nanoseconds and converts in one instruction.
+    // The 128-bit conversion of `as_nanos` is a library call. Both round to
+    // nearest, so the result is the same. The sum is built from the two
+    // parts: a narrowed `as_nanos` compiles back to the 128-bit conversion.
+    let whole = rtt.as_secs().checked_mul(1_000_000_000);
+    #[allow(
+        clippy::cast_lossless,
+        reason = "`u64::from` is not callable in a `const fn`"
+    )]
+    let narrow = match whole {
+        Some(whole) => whole.checked_add(rtt.subsec_nanos() as u64),
+        None => None,
+    };
     #[allow(
         clippy::cast_precision_loss,
         reason = "nanosecond RTTs fit an f64 mantissa for ~104 days"
     )]
-    let nanos = rtt.as_nanos() as f64;
+    let nanos = match narrow {
+        Some(nanos) => nanos as f64,
+        None => rtt.as_nanos() as f64,
+    };
     nanos.max(1.0)
 }
 
@@ -545,6 +561,9 @@ pub struct Vegas {
     rtt_noload: f64,
     probe_count: u64,
     probe_multiplier: u64,
+    /// The last limit a step was computed for, and that step. A limit at
+    /// its bound stays the same for many samples.
+    step_of: (f64, f64),
 }
 
 impl Vegas {
@@ -559,12 +578,48 @@ impl Vegas {
             rtt_noload: 0.0,
             probe_count: 0,
             probe_multiplier: 30,
+            // No limit is NaN, so the first sample computes its step.
+            step_of: (f64::NAN, 1.0),
         }
     }
 
+    /// [`Self::log10_root`] of the current limit. The step of a limit that
+    /// did not change since the last sample is not computed again.
+    fn step(&mut self) -> f64 {
+        let limit = self.estimated;
+        if self.step_of.0.to_bits() != limit.to_bits() {
+            self.step_of = (limit, Self::log10_root(limit));
+        }
+        self.step_of.1
+    }
+
     /// `max(1, floor(log10(limit)))`, as Netflix `Log10RootFunction`.
+    ///
+    /// Every sample asks for this. A limit below 100 000 is answered by
+    /// comparison, with no libm call. Each range stops short of the powers
+    /// of ten at its ends: next to one, `log10` can round to the integer on
+    /// the other side. Those limits, and the larger ones, still ask libm, so
+    /// the result is libm's for every limit.
     fn log10_root(limit: f64) -> f64 {
-        limit.log10().floor().max(1.0)
+        /// How far, as a fraction, a compared range stays from a power of
+        /// ten. A libm `log10` is off by a few units in the last place,
+        /// which is a fraction near `1e-16`.
+        const MARGIN: f64 = 1e-6;
+        const BELOW: f64 = 1.0 - MARGIN;
+        const ABOVE: f64 = 1.0 + MARGIN;
+        // A limit below 100 has the step 1, and so has a limit that is zero
+        // or negative: `max` takes 1 over `-inf` and over NaN.
+        if limit < 100.0 * BELOW {
+            1.0
+        } else if limit > 100.0 * ABOVE && limit < 1_000.0 * BELOW {
+            2.0
+        } else if limit > 1_000.0 * ABOVE && limit < 10_000.0 * BELOW {
+            3.0
+        } else if limit > 10_000.0 * ABOVE && limit < 100_000.0 * BELOW {
+            4.0
+        } else {
+            limit.log10().floor().max(1.0)
+        }
     }
 
     fn update(&mut self, sample: Sample) -> usize {
@@ -572,7 +627,8 @@ impl Vegas {
         // is never a base RTT.
         if sample.dropped {
             let limit = self.estimated;
-            let next = self.bounds.clamp_f64(limit - Self::log10_root(limit));
+            let step = self.step();
+            let next = self.bounds.clamp_f64(limit - step);
             if next < limit {
                 self.probe_count = 0;
             }
@@ -595,7 +651,7 @@ impl Vegas {
             return self.limit();
         }
         let limit = self.estimated;
-        let step = Self::log10_root(limit);
+        let step = self.step();
         let next = if usize_to_f64(sample.in_flight) * 2.0 < limit {
             return self.limit();
         } else {
@@ -1086,6 +1142,123 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Sample arithmetic ─────────────────────────────────────────────────
+
+    #[test]
+    fn rtt_nanos_is_the_128_bit_conversion() {
+        #[allow(clippy::cast_precision_loss)]
+        let wide = |rtt: Duration| (rtt.as_nanos() as f64).max(1.0);
+        let mut cases = vec![
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_nanos(999),
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+            // 2^53 ns and its neighbours: the first values an `f64` rounds.
+            Duration::from_nanos((1 << 53) - 1),
+            Duration::from_nanos(1 << 53),
+            Duration::from_nanos((1 << 53) + 1),
+            Duration::from_nanos((1 << 53) + 3),
+            // The last value that fits a `u64`, and the first that does not.
+            Duration::from_nanos(u64::MAX),
+            Duration::from_nanos(u64::MAX) + Duration::from_nanos(1),
+            Duration::from_secs(u64::MAX / 1_000_000_000 + 1),
+            Duration::MAX,
+        ];
+        // Bit patterns across the whole `u64` range.
+        let mut bits: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..4096 {
+            bits ^= bits << 13;
+            bits ^= bits >> 7;
+            bits ^= bits << 17;
+            cases.push(Duration::from_nanos(bits));
+            cases.push(Duration::from_nanos(bits >> (bits % 64)));
+        }
+        for rtt in cases {
+            assert_eq!(
+                rtt_nanos(rtt).to_bits(),
+                wide(rtt).to_bits(),
+                "rtt_nanos differs from the u128 conversion for {rtt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn log10_root_is_the_libm_formula_for_every_limit() {
+        let libm = |limit: f64| limit.log10().floor().max(1.0);
+        let same = |limit: f64| {
+            assert_eq!(
+                Vegas::log10_root(limit).to_bits(),
+                libm(limit).to_bits(),
+                "log10_root differs from libm for {limit:?}"
+            );
+        };
+        // Every whole limit an app is likely to set, and the halves between.
+        for whole in 0_u32..=250_000 {
+            same(f64::from(whole));
+            same(f64::from(whole) + 0.5);
+        }
+        // The floats on both sides of each power of ten: where a comparison
+        // and a rounded `log10` could disagree.
+        for exponent in 0..=19 {
+            let power: f64 = format!("1e{exponent}").parse().expect("a power of ten");
+            let (mut below, mut above) = (power, power);
+            same(power);
+            for _ in 0..512 {
+                below = below.next_down();
+                above = above.next_up();
+                same(below);
+                same(above);
+            }
+            // The edges of the compared ranges.
+            for scale in [1.0 - 1e-6, 1.0 + 1e-6, 1.0 - 2e-6, 1.0 + 2e-6] {
+                let edge = power * scale;
+                same(edge);
+                same(edge.next_down());
+                same(edge.next_up());
+            }
+        }
+        for odd in [
+            0.0,
+            -0.0,
+            -1.0,
+            -1e9,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+        ] {
+            same(odd);
+        }
+    }
+
+    #[test]
+    fn vegas_step_is_the_step_of_the_current_limit() {
+        // Small bounds pin the limit at each end for many samples, and the
+        // stream moves it between them: drops, queues, and quiet samples.
+        for (min, max, initial) in [
+            (1, 1000, 20),
+            (10, 100, 100),
+            (1, 10, 1),
+            (5, 100_000, 99_990),
+        ] {
+            let mut v = Vegas::new(bounds(min, max, initial));
+            let mut bits: u64 = 0x2545_F491_4F6C_DD1D;
+            let mut limit = initial;
+            for _ in 0..20_000 {
+                bits ^= bits << 13;
+                bits ^= bits >> 7;
+                bits ^= bits << 17;
+                let mut s = sample(1 + bits % 60, limit);
+                s.dropped = bits.is_multiple_of(11);
+                limit = v.update(s);
+                let fresh = Vegas::log10_root(v.estimated);
+                assert_eq!(v.step().to_bits(), fresh.to_bits(), "limit {}", v.estimated);
+            }
+        }
+    }
 
     // ── AdaptiveThrottle (Google SRE) ─────────────────────────────────────
 
