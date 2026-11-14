@@ -1239,3 +1239,110 @@ fn deploy_check_grader_names_exclude_the_manifest_warning() {
         );
     }
 }
+
+/// Option-shaped `[deploy]` values. `ssh` and `scp` read an argument that
+/// starts with `-` as an option, and `ProxyCommand` runs a local command.
+const OPTION_SHAPED: &str = "-oProxyCommand=touch /tmp/autumn-ssh-injection";
+
+/// Every deploy-family command that can reach `ssh` or `scp`, plus `doctor`.
+const SSH_COMMANDS: &[&[&str]] = &[
+    &["deploy", "check"],
+    &["deploy", "plan"],
+    &["deploy", "status"],
+    &["deploy", "rollback"],
+    &["deploy", "up"],
+    &["deploy", "maintenance", "on"],
+    &["deploy", "maintenance", "off"],
+    &["doctor"],
+];
+
+/// A `PATH` directory with fake `ssh` and `scp` that record each call in
+/// `marker`. Returns the directory guard and the marker path.
+///
+/// The fakes are shell scripts, so they exist on Unix only. On Windows the
+/// marker check cannot fail; the refusal text check still applies there.
+fn fake_ssh_path() -> (TempDir, std::path::PathBuf) {
+    let bin = tempfile::tempdir().expect("create fake bin dir");
+    let marker = bin.path().join("ssh-was-called");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["ssh", "scp"] {
+            let path = bin.path().join(name);
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\necho \"{name} $*\" >> '{}'\nexit 1\n",
+                    marker.display()
+                ),
+            )
+            .expect("write fake binary");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .expect("make fake binary executable");
+        }
+    }
+    (bin, marker)
+}
+
+/// Run each SSH command against `deploy_body`. Each one must fail, name
+/// `key`, and never start `ssh` or `scp`.
+fn assert_ssh_commands_refuse(deploy_body: &str, key: &str) {
+    let dir = project(deploy_body);
+    let (bin, marker) = fake_ssh_path();
+    let path = bin.path().to_string_lossy().into_owned();
+    for args in SSH_COMMANDS {
+        let (stdout, stderr, code) = run_autumn(dir.path(), args, &[("PATH", &path)]);
+        let combined = format!("{stdout}{stderr}");
+        assert_ne!(
+            code,
+            Some(0),
+            "{args:?} must fail\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            !marker.exists(),
+            "{args:?} started ssh/scp with an option-shaped value: {}",
+            fs::read_to_string(&marker).unwrap_or_default()
+        );
+        // On Windows, `up`, `rollback`, `status` and `maintenance` stop at the
+        // Tier 2 refusal before they read the config.
+        let reads_config_on_windows = matches!(*args, ["deploy", "check" | "plan"] | ["doctor"]);
+        if !reads_config_on_windows && ended_in_windows_tier_two_refusal(&stdout, &stderr) {
+            continue;
+        }
+        assert!(
+            combined.contains(key) && combined.contains(OPTION_SHAPED),
+            "{args:?} must name {key} and the bad value\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn deploy_commands_refuse_an_option_shaped_user() {
+    assert_ssh_commands_refuse(
+        &format!("host = \"127.0.0.1\"\nssh_port = 1\nuser = \"{OPTION_SHAPED}\"\n"),
+        "`[deploy] user`",
+    );
+}
+
+#[test]
+fn deploy_commands_refuse_an_option_shaped_host() {
+    assert_ssh_commands_refuse(&format!("host = \"{OPTION_SHAPED}\"\n"), "deploy host");
+}
+
+#[test]
+fn deploy_commands_refuse_an_option_shaped_fleet_host() {
+    assert_ssh_commands_refuse(
+        &format!("hosts = [\"127.0.0.1\", \"{OPTION_SHAPED}\"]\nssh_port = 1\n"),
+        "deploy host",
+    );
+}
+
+#[test]
+fn deploy_commands_refuse_an_option_shaped_group_host() {
+    assert_ssh_commands_refuse(
+        &format!(
+            "ssh_port = 1\n[[deploy.groups]]\nrole = \"web\"\nhosts = [\"{OPTION_SHAPED}\"]\n"
+        ),
+        "deploy host",
+    );
+}

@@ -373,6 +373,20 @@ deploy subcommand.
 > twice would corrupt its previous-release chain). A one-entry `hosts` list is
 > byte-for-byte the historical single-server deploy.
 
+> **`user` and each host must be plain values.** `ssh` and `scp` read an
+> argument that starts with `-` as an option. An option such as
+> `ProxyCommand` runs a local command. Every deploy subcommand and
+> `autumn doctor` accept only these values:
+>
+> - `user`: 1 to 64 ASCII letters, digits, `.`, `_`, `-` or `@`. The first
+>   character is a letter, digit or `_`.
+> - Each host: a plain IPv6 address, or a name or IPv4 address of ASCII
+>   letters, digits, `.`, `_` and `-`. The first character is a letter or
+>   digit.
+>
+> For a host that needs other characters, add a `Host` alias in
+> `~/.ssh/config` and use the alias here.
+
 **Env wins over the file for *both* spellings.** Because the two are mutually
 exclusive, setting one spelling in the environment now **clears the other from
 `autumn.toml`**: a non-empty `AUTUMN_DEPLOY__HOSTS` retargets a `[deploy] host`
