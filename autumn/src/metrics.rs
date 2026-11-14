@@ -3507,7 +3507,7 @@ mod tests {
             } else {
                 sanitized_chars(&text, MAX_LABEL_VALUE_LEN)
             };
-            proptest::prop_assert_eq!(sanitize_owned_label_value(text.clone()), by_character);
+            proptest::prop_assert_eq!(sanitize_owned_label_value(text), by_character);
         }
     }
 
