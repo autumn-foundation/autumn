@@ -1987,6 +1987,11 @@ impl Default for DeployBakeConfig {
 pub struct DeployConfig {
     /// SSH-reachable address (hostname or IP) of the target server.
     ///
+    /// The CLI accepts a plain IPv6 address, a host name or an IPv4 address.
+    /// A name uses only ASCII letters, digits, `.`, `_` and `-`. It starts
+    /// with a letter or digit. This rule also applies to
+    /// [`hosts`](Self::hosts) and group hosts.
+    ///
     /// Required when a deploy actually runs (`autumn deploy`), but `None` is
     /// valid at rest so a bare `[deploy]` table parses. Enforced by
     /// [`validate`](Self::validate).
@@ -2013,6 +2018,10 @@ pub struct DeployConfig {
     pub hosts: Vec<String>,
 
     /// SSH user to connect as. Default: `"root"`.
+    ///
+    /// The CLI accepts 1 to 64 ASCII letters, digits, `.`, `_`, `-` or `@`.
+    /// The first character is a letter, digit or `_`. The CLI refuses other
+    /// values, because `ssh` can read them as an option.
     #[serde(default = "default_deploy_user")]
     pub user: String,
 

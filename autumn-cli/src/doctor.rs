@@ -9977,27 +9977,15 @@ fn media_check_result(check: crate::deploy::PreflightCheck) -> CheckResult {
 /// The SSH target for the media host checks: the one `[deploy]` host.
 ///
 /// Media provisioning supports one host, so a fleet or an empty host list is
-/// an error. A user or host that starts with `-` is an error too.
+/// an error. [`crate::deploy::exec::SshTarget::new`] refuses a user or host
+/// that `ssh` can read as an option. The deploy paths use the same check.
 fn media_ssh_target(
     hosts: &Result<Vec<String>, String>,
     deploy_cfg: &DeployConfig,
 ) -> Result<crate::deploy::exec::SshTarget, String> {
-    // `ssh` reads a leading `-` as an option, so refuse it.
-    if deploy_cfg.user.starts_with('-') {
-        return Err(format!(
-            "`[deploy] user` {:?} starts with `-`; ssh would read it as an option",
-            deploy_cfg.user
-        ));
-    }
     match hosts.as_ref()?.as_slice() {
-        [host] if host.starts_with('-') => Err(format!(
-            "`[deploy]` host {host:?} starts with `-`; ssh would read it as an option"
-        )),
-        [host] => Ok(crate::deploy::exec::SshTarget {
-            host: host.clone(),
-            user: deploy_cfg.user.clone(),
-            port: deploy_cfg.ssh_port,
-        }),
+        [host] => crate::deploy::exec::SshTarget::new(host, &deploy_cfg.user, deploy_cfg.ssh_port)
+            .map_err(|e| e.to_string()),
         others => Err(format!(
             "MediaMTX provisioning needs exactly one `[deploy]` host; found {}",
             others.len()
@@ -10183,7 +10171,8 @@ fn deploy_profile_config_load_check(
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 /// Remedy printed when `[deploy] host` / `[deploy] hosts` are spelled in a way the
-/// shared validator refuses (both keys set, a blank entry, a duplicate).
+/// shared validator refuses (both keys set, a blank entry, a duplicate), or when
+/// the user or a host is not a valid SSH value.
 ///
 /// A named constant so a unit test can pin its exact text: it is a `hint` field on
 /// `CheckResult`, so it is emitted verbatim into `autumn doctor --json` as well as
@@ -10191,7 +10180,7 @@ fn deploy_profile_config_load_check(
 /// mid-sentence on a machine-readable surface (issue #1621).
 const DEPLOY_HOST_SPELLING_HINT: &str = "Fix the [deploy] host spelling in autumn.toml — \
      set one of `host` (one server), `hosts` (a fleet) or `[[deploy.groups]]` (a role per \
-     host group), never two (see `autumn deploy check`)";
+     host group), never two, and use a plain SSH user and host (see `autumn deploy check`)";
 
 /// Remedy printed on the SSH-reachability row when the host spelling itself is
 /// broken, so there is no list to probe. See [`DEPLOY_HOST_SPELLING_HINT`].
@@ -13356,8 +13345,8 @@ mod media_doctor_tests {
         };
         let one = media_ssh_target(&Ok(vec!["app.example.com".to_owned()]), &deploy)
             .expect("one host is a target");
-        assert_eq!(one.host, "app.example.com");
-        assert_eq!(one.user, "deployer");
+        assert_eq!(one.host.as_str(), "app.example.com");
+        assert_eq!(one.user.as_str(), "deployer");
         assert_eq!(one.port, 2222);
 
         let two = vec!["a.example.com".to_owned(), "b.example.com".to_owned()];
@@ -13376,9 +13365,13 @@ mod media_doctor_tests {
             user: "-oProxyCommand=touch /tmp/x".to_owned(),
             ..DeployConfig::default()
         };
-        assert!(media_ssh_target(&Ok(vec!["app.example.com".to_owned()]), &bad_user).is_err());
+        let err = media_ssh_target(&Ok(vec!["app.example.com".to_owned()]), &bad_user)
+            .expect_err("an option-shaped user is refused");
+        assert!(err.contains("`[deploy] user`"), "{err}");
         let deploy = DeployConfig::default();
-        assert!(media_ssh_target(&Ok(vec!["-oProxyCommand=x".to_owned()]), &deploy).is_err());
+        let err = media_ssh_target(&Ok(vec!["-oProxyCommand=x".to_owned()]), &deploy)
+            .expect_err("an option-shaped host is refused");
+        assert!(err.contains("deploy host"), "{err}");
     }
 
     #[test]
@@ -13420,7 +13413,7 @@ mod tests {
             DEPLOY_HOST_SPELLING_HINT,
             "Fix the [deploy] host spelling in autumn.toml \u{2014} set one of `host` (one \
              server), `hosts` (a fleet) or `[[deploy.groups]]` (a role per host group), never \
-             two (see `autumn deploy check`)",
+             two, and use a plain SSH user and host (see `autumn deploy check`)",
         );
         assert_eq!(
             DEPLOY_HOST_SPELLING_REACHABILITY_HINT,
