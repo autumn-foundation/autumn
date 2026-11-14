@@ -686,6 +686,35 @@ fn the_guest_drops_proxy_assertions_the_host_forgot_to() {
     assert_eq!(body, "accept-language: en\nif-none-match: \"v1\"");
 }
 
+#[test]
+fn the_native_filter_keeps_every_value_of_an_allowed_name_in_order() {
+    let request = http::Request::builder()
+        .uri("/x")
+        .header("accept", "text/html")
+        .header("cookie", "sid=secret")
+        .header("accept", "*/*")
+        .header("cf-access-jwt-assertion", "ey.cf")
+        .header("if-none-match", "\"v1\"")
+        .body(axum::body::Body::empty())
+        .expect("valid request");
+
+    let request = futures::executor::block_on(autumn_edge::strip_request_credentials(request));
+
+    let kept: Vec<(&str, &str)> = request
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.to_str().expect("ASCII")))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            ("accept", "text/html"),
+            ("accept", "*/*"),
+            ("if-none-match", "\"v1\""),
+        ]
+    );
+}
+
 // ── the extractor is state-agnostic ──────────────────────────────────
 
 #[derive(Clone)]

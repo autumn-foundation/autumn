@@ -579,7 +579,7 @@ mod tests {
         assert_eq!(sorted, ALLOWED_REQUEST_HEADERS);
         for name in ALLOWED_REQUEST_HEADERS {
             assert_eq!(*name, name.to_ascii_lowercase());
-            assert!(http::HeaderName::from_static(name).as_str() == *name);
+            assert_eq!(http::HeaderName::from_static(name).as_str(), *name);
         }
     }
 

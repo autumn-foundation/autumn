@@ -451,10 +451,10 @@ fn the_request_frame_and_kv_values_are_the_same_bytes() {
     with_credentials.request = with_credentials
         .request
         .with_header("Cookie", "sid=1")
-        .with_header("X-B", "2")
+        .with_header("ACCEPT", "b")
         .with_header("authorization", "Bearer x")
-        .with_header("x-a", "1")
-        .with_header("X-B", "1");
+        .with_header("If-None-Match", "x")
+        .with_header("accept", "a");
     let cases = [with_credentials, Case::get("/no-kv")];
     let Some(js) = run_js(&wasm, &cases) else {
         return;
@@ -469,6 +469,11 @@ fn the_request_frame_and_kv_values_are_the_same_bytes() {
     };
     assert!(
         !detail.contains("sid=1") && !detail.contains("Bearer"),
+        "{detail}"
+    );
+    // Lowercased, sorted by name, and in arrival order within a name.
+    assert!(
+        detail.contains(r#""headers":[["accept","text/plain"],["accept","b"],["accept","a"],["if-none-match","x"]]"#),
         "{detail}"
     );
     assert!(

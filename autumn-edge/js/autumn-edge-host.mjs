@@ -154,9 +154,11 @@ export function canonicalizeHeaders(pairs) {
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
 
-/// Whether a request header of this name may reach a capsule. Case-insensitive.
+/// Whether a request header of this name may reach a capsule. ASCII
+/// case-insensitive, the same as `autumn_edge::wire::request_header_allowed`.
 export function requestHeaderAllowed(name) {
-  return ALLOWED_REQUEST_HEADERS.includes(String(name).toLowerCase());
+  const ascii = String(name).replace(/[A-Z]/g, (c) => c.toLowerCase());
+  return ALLOWED_REQUEST_HEADERS.includes(ascii);
 }
 
 /// Keep only `ALLOWED_REQUEST_HEADERS`. The order does not change.

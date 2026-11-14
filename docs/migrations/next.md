@@ -825,8 +825,10 @@ negotiation, conditional requests, `cache-control` and `user-agent`.
 
 **You are affected if** your code names `SENSITIVE_HEADERS` (from
 `autumn_edge` or `autumn_edge::wire`) or `strip_sensitive_headers`, or an
-`#[edge]` handler reads a header that is not on the list (for example `host`,
-`x-request-id` or a custom header) through `HeaderMap`.
+`#[edge]` handler reads a header that is not on the list through `HeaderMap`.
+Examples: `host`, `referer`, `x-request-id`, htmx headers such as
+`hx-request`, or a custom header. A handler that gives a fragment for
+`hx-request` now always gives the full page.
 Both lanes now drop that header. The origin middleware still sees it.
 
 **Before (`{X.Y}`):**
