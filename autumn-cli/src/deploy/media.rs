@@ -848,11 +848,9 @@ impl MediaMtxController {
         let cfg_new = super::exec::shell_quote(&config_tmp);
         let unit_live = super::exec::shell_quote(&unit_path);
         let unit_new = super::exec::shell_quote(&unit_tmp);
-        // The systemd unit id passed to `systemctl` is a config-derived string
-        // (`unit_name`), so shell-quote `<unit_name>.service` (issue #2051, Finding
-        // T sweep) — an unquoted unit name containing whitespace/special chars
-        // would otherwise split the `systemctl enable/is-active/restart` arguments.
-        let unit_service = super::exec::shell_quote(&format!("{unit}.service"));
+        // `unit_name` comes from config, so `<unit>.service` is one quoted word
+        // (issue #2051).
+        let unit_service = super::exec::unit_service_word(&unit);
         // POSIX-sh, fail-fast (`set -e`): compare each staged file to its live
         // counterpart; a missing live file (`cmp` non-zero) or a real diff copies
         // it over and flags `changed`. daemon-reload + enable are idempotent. The
@@ -1231,9 +1229,9 @@ fn managed_process_name(cfg: &MediaMtxHostConfig) -> &str {
 /// at most once per check and the result reused.
 #[must_use]
 fn unit_is_active(exec: &impl DeployExecutor, unit_name: &str) -> bool {
-    // `unit_name` is a config-derived string, so shell-quote `<unit>.service`
-    // (issue #2051, Finding T sweep) rather than interpolating it bare.
-    let unit_service = super::exec::shell_quote(&format!("{unit_name}.service"));
+    // `unit_name` comes from config, so `<unit>.service` is one quoted word
+    // (issue #2051).
+    let unit_service = super::exec::unit_service_word(unit_name);
     let cmd = RemoteCommand::new(
         "media-unit-active",
         format!("systemctl is-active --quiet {unit_service}"),

@@ -2592,7 +2592,7 @@ pub(crate) async fn request_routing_key(
     let config = state
         .extension::<crate::config::AutumnConfig>()
         .ok_or(RoutingKeyError::NoConfig)?;
-    crate::tenancy::extract_tenant_from_parts(parts, &config)
+    crate::tenancy::extract_tenant_with_state(parts, &config, state)
         .await
         .map_err(RoutingKeyError::Tenant)
 }
@@ -2609,6 +2609,13 @@ async fn resolve_shard_key(
             RoutingKeyError::NoConfig => {
                 AutumnError::service_unavailable_msg("Config is not available")
             }
+            // A refused tenant or a bad config keeps its status.
+            RoutingKeyError::Tenant(error)
+                if error.status() == axum::http::StatusCode::FORBIDDEN
+                    || error.status() == axum::http::StatusCode::INTERNAL_SERVER_ERROR =>
+            {
+                error
+            }
             RoutingKeyError::Tenant(error) => AutumnError::bad_request_msg(format!(
                 "ShardedDb could not resolve a shard key: {error}. Enable [tenancy] so \
                  the tenant id can route the request, or insert a ShardKeyOverride \
@@ -2620,6 +2627,82 @@ async fn resolve_shard_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn header_tenancy_state(trust: crate::config::TenantHeaderTrust) -> crate::AppState {
+        let state = crate::AppState::for_test();
+        let mut config = crate::config::AutumnConfig::default();
+        config.tenancy.enabled = true;
+        "header".clone_into(&mut config.tenancy.source);
+        config.tenancy.header_trust = Some(trust);
+        config.security.trusted_proxies.trust_forwarded_headers = true;
+        config.security.trusted_proxies.ranges = vec!["10.0.0.0/8".to_owned()];
+        state.insert_extension(config);
+        state
+    }
+
+    fn header_parts(tenant: &str, session_tenant: Option<&str>) -> axum::http::request::Parts {
+        let mut builder = axum::http::Request::builder().header("x-tenant-id", tenant);
+        if let Some(bound) = session_tenant {
+            builder = builder.extension(crate::session::Session::new_for_test(
+                "sid".to_owned(),
+                std::collections::HashMap::from([("tenant_id".to_owned(), bound.to_owned())]),
+            ));
+        }
+        builder.body(()).expect("request").into_parts().0
+    }
+
+    async fn routing_status(
+        state: &crate::AppState,
+        mut parts: axum::http::request::Parts,
+    ) -> Result<String, axum::http::StatusCode> {
+        request_routing_key(&mut parts, state)
+            .await
+            .map_err(|error| match error {
+                RoutingKeyError::Tenant(error) => error.status(),
+                RoutingKeyError::NoConfig => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            })
+    }
+
+    /// `ShardedDb` reads the tenant itself when the middleware did not run.
+    /// That path must apply the session binding.
+    #[tokio::test]
+    async fn the_routing_key_follows_the_session_tenant() {
+        let state = header_tenancy_state(crate::config::TenantHeaderTrust::AnyClient);
+        assert_eq!(
+            routing_status(&state, header_parts("tenant-b", Some("tenant-a"))).await,
+            Err(axum::http::StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            routing_status(&state, header_parts("tenant-a", Some("tenant-a"))).await,
+            Ok("tenant-a".to_owned())
+        );
+        // `ShardedDb` keeps the 403. It does not report a missing shard key.
+        let mut parts = header_parts("tenant-b", Some("tenant-a"));
+        let error = resolve_shard_key(&mut parts, &state)
+            .await
+            .expect_err("a refused tenant has no shard");
+        assert_eq!(error.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// The fallback also applies `header_trust = "trusted_proxy"`.
+    #[tokio::test]
+    async fn the_routing_key_needs_a_trusted_proxy() {
+        let state = header_tenancy_state(crate::config::TenantHeaderTrust::TrustedProxy);
+        assert_eq!(
+            routing_status(&state, header_parts("tenant-b", None)).await,
+            Err(axum::http::StatusCode::FORBIDDEN)
+        );
+        let mut parts = header_parts("tenant-b", None);
+        parts.extensions.insert(axum::extract::ConnectInfo(
+            "10.0.0.5:4000"
+                .parse::<std::net::SocketAddr>()
+                .expect("addr"),
+        ));
+        assert_eq!(
+            routing_status(&state, parts).await,
+            Ok("tenant-b".to_owned())
+        );
+    }
 
     /// Tenant databases that share a routing slot are still distinct
     /// databases: their `ShardId`s must differ, or callers aggregating by id

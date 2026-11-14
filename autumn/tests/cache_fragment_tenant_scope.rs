@@ -128,6 +128,7 @@ fn tenancy_config() -> AutumnConfig {
     let mut config = AutumnConfig::default();
     config.tenancy.enabled = true;
     "header".clone_into(&mut config.tenancy.source);
+    config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
     "x-tenant-id".clone_into(&mut config.tenancy.header_name);
     config
 }

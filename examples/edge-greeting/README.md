@@ -164,7 +164,7 @@ This is the interesting part. Every test builds a real capsule from these
 sources and compares it against both the native edge lane and the full origin
 app over a shared request corpus — percent-encoding, `%2F` inside a segment,
 trailing slashes, repeated query keys, float and integer rendering, a stripped
-credential, and each of the four ways the edge can decline.
+credential and proxy assertion, and each of the four ways the edge can decline.
 
 Three more tiers follow. The gateway tier puts the capsule in front of the
 origin and checks that the client gets the origin's bytes from either lane.
@@ -190,7 +190,7 @@ handler, and a panic hook is process-global.
 | GET | `/note/{key}` | edge (`needs(kv)`) + origin | the cached note, or a miss message |
 | GET | `/stats` | edge + origin | route count, the query tags in order, a formatted float |
 | GET | `/stats/count` | edge + origin | a bare `usize` |
-| GET | `/whoami` | edge + origin | which credential headers the handler sees (none, on both lanes) |
+| GET | `/whoami` | edge + origin | which credential or proxy-assertion headers the handler sees (none, on both lanes) |
 | GET | `/link/{name}` | edge + origin | a link from the typed path helper `paths::greet`, with a query |
 | GET | `/boom` | edge + origin | panics on purpose: a trap at the edge, a 500 at the origin |
 | POST | `/feedback` | origin only | the write path — declined at the edge with `method_not_edge_eligible` |

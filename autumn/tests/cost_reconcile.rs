@@ -121,6 +121,7 @@ async fn per_tenant_cost_reconciles_with_process_cpu() {
     config.cost.enabled = true;
     config.tenancy.enabled = true;
     "header".clone_into(&mut config.tenancy.source);
+    config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
     "x-tenant-id".clone_into(&mut config.tenancy.header_name);
 
     let client = TestApp::new()

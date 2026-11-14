@@ -373,20 +373,6 @@ deploy subcommand.
 > twice would corrupt its previous-release chain). A one-entry `hosts` list is
 > byte-for-byte the historical single-server deploy.
 
-> **`user` and each host must be plain values.** `ssh` and `scp` read an
-> argument that starts with `-` as an option. An option such as
-> `ProxyCommand` runs a local command. Every deploy subcommand and
-> `autumn doctor` accept only these values:
->
-> - `user`: 1 to 64 ASCII letters, digits, `.`, `_`, `-` or `@`. The first
->   character is a letter, digit or `_`.
-> - Each host: a plain IPv6 address, or a name or IPv4 address of ASCII
->   letters, digits, `.`, `_` and `-`. The first character is a letter or
->   digit.
->
-> For a host that needs other characters, add a `Host` alias in
-> `~/.ssh/config` and use the alias here.
-
 **Env wins over the file for *both* spellings.** Because the two are mutually
 exclusive, setting one spelling in the environment now **clears the other from
 `autumn.toml`**: a non-empty `AUTUMN_DEPLOY__HOSTS` retargets a `[deploy] host`
@@ -403,6 +389,27 @@ it is the documented env-over-TOML precedence applied to the spelling you did
   and `AUTUMN_DEPLOY__HOSTS=" , "` are the shape a CI or compose template emits
   for an unfilled slot, so they can never silently drop a fleet list configured
   in the file.
+
+> **`autumn deploy` checks these keys before it runs a command.** A remote
+> shell line, `systemctl`, `ssh` and the systemd unit file use them.
+> `autumn deploy` refuses a value that is too long or that has a character
+> that one of them can read as code:
+>
+> | Key | Characters |
+> | --- | --- |
+> | `app_name`, `service_name`, `profile` | 1 to 128 ASCII letters, digits, `_`, `.`, `-`. Start with a letter, a digit or `_`. |
+> | `user` | 1 to 64 ASCII letters, digits, `_`, `.`, `-`, `@`. Start with a letter, a digit or `_`. |
+> | `app_dir` | An absolute path of 1 to 1024 ASCII letters, digits, `/`, `_`, `.`, `-`, `+`, `@`, `:`. |
+> | `host`, `hosts` | An IPv6 address without brackets. It can have a zone, for example `fe80::1%eth0`. Or a name or IPv4 address of 1 to 253 ASCII letters, digits, `_`, `.`, `-`. Start a name with a letter or a digit. |
+>
+> The check also applies to a default. If you do not set `app_name`, it comes
+> from the package name or the directory name. If that name fails the check,
+> set `app_name`. `autumn doctor` reports the same failure as `deploy_config`,
+> or as `deploy_host` for a host.
+>
+> `ssh` and `scp` read an argument that starts with `-` as an option. An option
+> such as `ProxyCommand` runs a local command. For a host that needs other
+> characters, add a `Host` alias in `~/.ssh/config` and use the alias here.
 
 Put these two values in a project `.env` (git-ignored — never committed). The
 deploy reads them and writes **only** them to a `0600` env file

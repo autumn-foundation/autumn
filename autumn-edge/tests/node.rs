@@ -889,7 +889,7 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
 }
 
 #[tokio::test]
-async fn both_lanes_get_the_replaced_forwarded_headers() {
+async fn the_origin_gets_the_replaced_forwarded_headers() {
     let (edge, seen) = recording_node(&[], None).await;
 
     client()

@@ -1326,14 +1326,14 @@ fn deploy_commands_refuse_an_option_shaped_user() {
 
 #[test]
 fn deploy_commands_refuse_an_option_shaped_host() {
-    assert_ssh_commands_refuse(&format!("host = \"{OPTION_SHAPED}\"\n"), "deploy host");
+    assert_ssh_commands_refuse(&format!("host = \"{OPTION_SHAPED}\"\n"), "`[deploy] host`");
 }
 
 #[test]
 fn deploy_commands_refuse_an_option_shaped_fleet_host() {
     assert_ssh_commands_refuse(
         &format!("hosts = [\"127.0.0.1\", \"{OPTION_SHAPED}\"]\nssh_port = 1\n"),
-        "deploy host",
+        "`[deploy] host`",
     );
 }
 
@@ -1343,6 +1343,6 @@ fn deploy_commands_refuse_an_option_shaped_group_host() {
         &format!(
             "ssh_port = 1\n[[deploy.groups]]\nrole = \"web\"\nhosts = [\"{OPTION_SHAPED}\"]\n"
         ),
-        "deploy host",
+        "`[deploy] host`",
     );
 }

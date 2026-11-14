@@ -31,6 +31,28 @@ const fn is_user_byte(b: u8) -> bool {
     is_word_byte(b) || b == b'@'
 }
 
+/// Whether `raw` is 1 to `max_len` ASCII letters, digits, `.`, `_` or `-` that
+/// start with a letter or digit.
+fn is_plain_word(raw: &str, max_len: usize) -> bool {
+    raw.len() <= max_len
+        && raw
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+        && raw.bytes().all(is_word_byte)
+}
+
+/// Whether `raw` is an IPv6 address, with an optional `%zone`.
+///
+/// `%` is not a shell character. `ssh` expands `%` tokens in one pass, so it
+/// does not expand a `%` in the host again.
+fn is_ipv6(raw: &str) -> bool {
+    let (address, zone) = raw
+        .split_once('%')
+        .map_or((raw, None), |(a, z)| (a, Some(z)));
+    address.parse::<Ipv6Addr>().is_ok() && zone.is_none_or(|z| is_plain_word(z, MAX_HOST_LEN))
+}
+
 /// A `[deploy]` user or host that is not safe to put in `ssh`/`scp` argv.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshIdentError {
@@ -51,9 +73,10 @@ impl fmt::Display for SshIdentError {
             ),
             Self::InvalidHost(raw) => write!(
                 f,
-                "deploy host {raw:?} is not a valid SSH host. Use a plain IPv6 address, \
-                 or a host name or IPv4 address of 1 to {MAX_HOST_LEN} ASCII letters, \
-                 digits, `.`, `_` or `-`. Start a name with a letter or digit"
+                "`[deploy] host` {raw:?} is not a valid SSH host. Use an IPv6 address \
+                 without brackets, or a host name or IPv4 address of 1 to {MAX_HOST_LEN} \
+                 ASCII letters, digits, `.`, `_` or `-`. Start a name with a letter or \
+                 digit"
             ),
         }
     }
@@ -111,16 +134,13 @@ impl SshHost {
     ///
     /// Returns [`SshIdentError::InvalidHost`] when the value is not one of:
     ///
-    /// - A plain IPv6 address (no brackets, no zone).
+    /// - An IPv6 address without brackets. It can have a zone, for example
+    ///   `fe80::1%eth0`. The zone uses only ASCII letters, digits, `.`, `_`
+    ///   and `-`, and starts with a letter or digit.
     /// - 1 to [`MAX_HOST_LEN`] ASCII letters, digits, `.`, `_` or `-`. The
     ///   first character is a letter or digit.
     pub fn parse(raw: &str) -> Result<Self, SshIdentError> {
-        let first_ok = raw
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_alphanumeric());
-        let is_name = first_ok && raw.len() <= MAX_HOST_LEN && raw.bytes().all(is_word_byte);
-        if is_name || raw.parse::<Ipv6Addr>().is_ok() {
+        if is_plain_word(raw, MAX_HOST_LEN) || is_ipv6(raw) {
             Ok(Self(raw.to_owned()))
         } else {
             Err(SshIdentError::InvalidHost(raw.to_owned()))
@@ -236,6 +256,7 @@ mod tests {
             "localhost",
             "2001:db8::1",
             "::1",
+            "fe80::1%eth0",
             longest.as_str(),
         ] {
             assert_eq!(SshHost::parse(raw).expect(raw).as_str(), raw);
@@ -264,7 +285,11 @@ mod tests {
             "a@b",
             "host:22",
             "[::1]",
-            "fe80::1%eth0",
+            "fe80::1%",
+            "fe80::1%-oX",
+            "fe80::1%e th0",
+            "fe80::1%$(id)",
+            "host%eth0",
             "a;b",
             "$(id)",
             "%h",
@@ -286,6 +311,10 @@ mod tests {
             "[2001:db8::1]"
         );
         assert_eq!(
+            SshHost::parse("fe80::1%eth0").unwrap().scp_form(),
+            "[fe80::1%eth0]"
+        );
+        assert_eq!(
             SshHost::parse("app.example.com").unwrap().scp_form(),
             "app.example.com"
         );
@@ -304,7 +333,7 @@ mod tests {
         );
         let host = SshHost::parse("-oX").unwrap_err().to_string();
         assert!(
-            host.contains("deploy host") && host.contains("\"-oX\""),
+            host.contains("`[deploy] host`") && host.contains("\"-oX\""),
             "{host}"
         );
     }
@@ -335,9 +364,10 @@ mod tests {
             if let Ok(host) = SshHost::parse(&raw) {
                 prop_assert_eq!(host.as_str(), raw.as_str());
                 prop_assert!(!raw.starts_with('-'));
-                prop_assert!(!raw.contains(['@', ' ', '%', '$', '\'']));
-                if raw.contains(':') {
-                    prop_assert!(raw.parse::<std::net::Ipv6Addr>().is_ok());
+                prop_assert!(!raw.contains(['@', ' ', '$', '\'']));
+                if raw.contains([':', '%']) {
+                    let address = raw.split('%').next().unwrap_or_default();
+                    prop_assert!(address.parse::<std::net::Ipv6Addr>().is_ok());
                 }
             }
         }

@@ -60,6 +60,7 @@ Environment overrides:
 | `AUTUMN_TENANCY__ENABLED` | `tenancy.enabled` |
 | `AUTUMN_TENANCY__SOURCE` | `tenancy.source` |
 | `AUTUMN_TENANCY__HEADER_NAME` | `tenancy.header_name` |
+| `AUTUMN_TENANCY__HEADER_TRUST` | `tenancy.header_trust` |
 | `AUTUMN_TENANCY__SESSION_KEY` | `tenancy.session_key` |
 | `AUTUMN_TENANCY__JWT_CLAIM` | `tenancy.jwt_claim` |
 | `AUTUMN_TENANCY__JWT_SECRET` | `tenancy.jwt_secret` |
@@ -75,6 +76,48 @@ Environment overrides:
 The entire `[tenancy]` section is now settable from the environment via
 `AUTUMN_TENANCY__*`, so every field above can be supplied without an
 `autumn.toml`.
+
+## Tenant sources
+
+`tenancy.source` tells Autumn where to read the tenant id. Generated
+repositories, `ShardedDb`, `Tenant` and the tenant cell all use that id.
+
+| `source` | The tenant comes from | Who selects it |
+| --- | --- | --- |
+| `session` (default) | the session key `tenancy.session_key` | the app, at sign-in |
+| `jwt` | a claim in a verified token | the token issuer |
+| `subdomain` | the host name | the client |
+| `header` | the header `tenancy.header_name` | see `header_trust` |
+
+`source = "header"` needs `header_trust`. Without it, the app does not start.
+
+```toml
+[tenancy]
+enabled = true
+source = "header"
+header_trust = "trusted_proxy"   # or "any_client" (unsafe)
+
+[security.trusted_proxies]
+trust_forwarded_headers = true
+ranges = ["10.0.0.0/8"]
+```
+
+- `trusted_proxy`: Autumn accepts the header only from a peer address in
+  `security.trusted_proxies.ranges`. Other peers get `403`. `trusted_hops`
+  does not count, because a client that connects directly can forge the
+  chain. The boot fails when no range is valid. The proxy must authenticate
+  the user, set the header, and remove the client's copy.
+- `any_client`: any client selects its tenant. This is unsafe. Use it only
+  when the app checks tenant membership itself, or for a demo.
+
+With `source = "header"`, two header values get `400`.
+
+**The session binds the tenant.** This applies to every source except
+`session`. If the session holds `tenancy.session_key`, the resolved tenant
+must be equal to it, with the same case. If not, the request gets `403`. An
+empty value does not bind. Thus a user of tenant A cannot select tenant B
+with a header, a host name or a token. To get this check, write the tenant
+to the session at sign-in.
 
 ## Using the cell in a handler
 

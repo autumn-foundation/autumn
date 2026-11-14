@@ -34,6 +34,9 @@ slots = ["8192-16383"]
 enabled = true
 source = "header"
 header_name = "x-tenant-id"
+# Demo only: any client selects its tenant. A real app uses
+# `source = "session"` or `"jwt"`, or `header_trust = "trusted_proxy"`.
+header_trust = "any_client"
 # The browser auto-requests /favicon.ico for any page load; without this it's
 # rejected by the same header check as every other route (400, not the 404 a
 # missing route would give), which the browser's headless smoke test reports

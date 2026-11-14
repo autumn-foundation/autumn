@@ -10113,6 +10113,25 @@ fn resolve_deploy_doctor_config(
     // `[deploy]` TOML and no `AUTUMN_DEPLOY__*` env exist, this stays `None` and
     // the preflight skips gracefully.
     autumn_web::config::apply_deploy_env_overrides(&mut deploy_cfg, env);
+    // Use the same name check as `autumn deploy`, so doctor does not pass a
+    // config that every deploy command refuses.
+    let names = deploy_cfg.as_ref().map(|cfg| {
+        crate::deploy::resolve_deploy_names(cfg, &crate::deploy::resolve_project_name())
+    });
+    if let Some(Err(message)) = names {
+        return (
+            deploy_cfg,
+            Some(CheckResult {
+                name: "deploy_config",
+                status: CheckStatus::Fail,
+                detail: Some(message),
+                hint: Some(
+                    "Change the [deploy] value in autumn.toml to a permitted value \
+                     (see `autumn deploy check`)",
+                ),
+            }),
+        );
+    }
     (deploy_cfg, None)
 }
 
@@ -10172,7 +10191,7 @@ fn deploy_profile_config_load_check(
 
 /// Remedy printed when `[deploy] host` / `[deploy] hosts` are spelled in a way the
 /// shared validator refuses (both keys set, a blank entry, a duplicate), or when
-/// the user or a host is not a valid SSH value.
+/// a host is not a valid SSH value.
 ///
 /// A named constant so a unit test can pin its exact text: it is a `hint` field on
 /// `CheckResult`, so it is emitted verbatim into `autumn doctor --json` as well as
@@ -10180,7 +10199,7 @@ fn deploy_profile_config_load_check(
 /// mid-sentence on a machine-readable surface (issue #1621).
 const DEPLOY_HOST_SPELLING_HINT: &str = "Fix the [deploy] host spelling in autumn.toml — \
      set one of `host` (one server), `hosts` (a fleet) or `[[deploy.groups]]` (a role per \
-     host group), never two, and use a plain SSH user and host (see `autumn deploy check`)";
+     host group), never two, and use a plain SSH host (see `autumn deploy check`)";
 
 /// Remedy printed on the SSH-reachability row when the host spelling itself is
 /// broken, so there is no list to probe. See [`DEPLOY_HOST_SPELLING_HINT`].
@@ -13371,7 +13390,7 @@ mod media_doctor_tests {
         let deploy = DeployConfig::default();
         let err = media_ssh_target(&Ok(vec!["-oProxyCommand=x".to_owned()]), &deploy)
             .expect_err("an option-shaped host is refused");
-        assert!(err.contains("deploy host"), "{err}");
+        assert!(err.contains("`[deploy] host`"), "{err}");
     }
 
     #[test]
@@ -13413,7 +13432,7 @@ mod tests {
             DEPLOY_HOST_SPELLING_HINT,
             "Fix the [deploy] host spelling in autumn.toml \u{2014} set one of `host` (one \
              server), `hosts` (a fleet) or `[[deploy.groups]]` (a role per host group), never \
-             two, and use a plain SSH user and host (see `autumn deploy check`)",
+             two, and use a plain SSH host (see `autumn deploy check`)",
         );
         assert_eq!(
             DEPLOY_HOST_SPELLING_REACHABILITY_HINT,
@@ -23938,6 +23957,21 @@ redirect_uri = "http://localhost/callback"
         let cfg = cfg.expect("valid [deploy] must parse into a config");
         assert_eq!(cfg.host.as_deref(), Some("203.0.113.10"));
         assert_eq!(cfg.ssh_port, 2222);
+    }
+
+    #[test]
+    fn deploy_doctor_config_fails_a_hostile_service_name_like_deploy_check() {
+        use autumn_web::config::MockEnv;
+        let table: toml::Table = "[deploy]\nhost = \"203.0.113.10\"\nservice_name = \"x; id\"\n"
+            .parse()
+            .unwrap();
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &MockEnv::new());
+        assert!(cfg.is_some(), "the config still parses");
+        let check = check.expect("doctor must fail the name");
+        assert_eq!(check.name, "deploy_config");
+        assert!(matches!(check.status, CheckStatus::Fail));
+        let detail = check.detail.expect("detail");
+        assert!(detail.contains("[deploy] service_name"), "{detail}");
     }
 
     #[test]

@@ -54,11 +54,11 @@ the request handler and in a streaming response body. It does not count:
 - a connection that a spawned task takes;
 - a connection that does not come from `Db` or a shard extractor.
 
-With `tenancy.source = "header"` or `"subdomain"`, the client selects the
-tenant id. Then the cap is per tenant id, not per client. A client can use
-many ids, or fill the cap of a different tenant with slow requests. Use an
-authenticated source (`session` or `jwt`) and a request timeout with these
-caps.
+With `tenancy.source = "subdomain"`, or `"header"` with
+`header_trust = "any_client"`, the client selects the tenant id. Then the cap
+is per tenant id, not per client. A client can use many ids, or fill the
+cap of a different tenant with slow requests. Use an authenticated source
+(`session` or `jwt`) and a request timeout with these caps.
 
 | Variable | Field |
 | --- | --- |

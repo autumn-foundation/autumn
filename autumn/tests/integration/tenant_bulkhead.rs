@@ -29,6 +29,7 @@ fn app_with_cors(max_concurrent_requests: usize, origins: Vec<String>) -> (Route
     config.cors.allowed_origins = origins;
     config.tenancy.enabled = true;
     config.tenancy.source = "header".to_string();
+    config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
     config.tenancy.header_name = "x-tenant-id".to_string();
     config.tenancy.max_concurrent_requests = max_concurrent_requests;
     state.insert_extension(config);

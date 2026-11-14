@@ -15,6 +15,7 @@ import {
   decodeBase64,
   intoResponse,
   isSafePath,
+  requestFrame,
 } from "../autumn-edge-host.mjs";
 
 // ── a tiny wasm assembler ────────────────────────────────────────────
@@ -220,7 +221,12 @@ test("every decline forwards the original request to the origin", async () => {
     const gateway = createEdgeGateway({ capsule: respond([declined(reason)]), origin });
     const { response, lane, reason: why } = await gateway.handle(
       new Request("https://edge.test/p?q=1", {
-        headers: { cookie: "sid=secret", authorization: "Bearer t", accept: "text/html" },
+        headers: {
+          cookie: "sid=secret",
+          authorization: "Bearer t",
+          "cf-access-jwt-assertion": "ey.cf",
+          accept: "text/html",
+        },
       }),
     );
     assert.equal(lane, "fallthrough");
@@ -231,6 +237,7 @@ test("every decline forwards the original request to the origin", async () => {
     // The origin gets the credentials the capsule never saw.
     assert.equal(seen[0].headers.cookie, "sid=secret");
     assert.equal(seen[0].headers.authorization, "Bearer t");
+    assert.equal(seen[0].headers["cf-access-jwt-assertion"], "ey.cf");
     assert.equal(seen[0].url, "https://edge.test/p?q=1");
   }
 });
@@ -270,13 +277,46 @@ test("an upgrade handshake goes to the origin, with its pair kept", async () => 
   assert.equal(seen[0].headers.upgrade, "websocket");
 });
 
-test("a non-ASCII header value is origin-only", async () => {
+test("a non-ASCII value on a header the capsule gets is origin-only", async () => {
+  const { origin } = recordingOrigin();
+  const gateway = createEdgeGateway({ capsule: respond([served(200)]), origin });
+  const headers = new Headers();
+  headers.set("accept-language", "café");
+  const { lane } = await gateway.handle(new Request("https://edge.test/x", { headers }));
+  assert.equal(lane, "origin_only");
+});
+
+test("a non-ASCII value on a dropped header does not block the capsule", async () => {
   const { origin } = recordingOrigin();
   const gateway = createEdgeGateway({ capsule: respond([served(200)]), origin });
   const headers = new Headers();
   headers.set("x-name", "café");
   const { lane } = await gateway.handle(new Request("https://edge.test/x", { headers }));
-  assert.equal(lane, "origin_only");
+  assert.equal(lane, "edge");
+});
+
+test("the request frame drops proxy assertions and keeps negotiation headers", () => {
+  const frame = requestFrame({
+    method: "GET",
+    uri: "/x",
+    headers: [
+      ["Cf-Access-Jwt-Assertion", "ey.cf"],
+      ["X-Amzn-Oidc-Data", "ey.alb"],
+      ["X-Ms-Client-Principal", "ey.azure"],
+      ["X-Goog-Iap-Jwt-Assertion", "ey.iap"],
+      ["X-Forwarded-User", "ada"],
+      ["X-Forwarded-Host", "edge.test"],
+      ["Host", "internal.example"],
+      ["Accept", "text/html"],
+      ["If-None-Match", '"v1"'],
+      ["Range", "bytes=0-9"],
+    ],
+  });
+  assert.deepEqual(frame.headers, [
+    ["accept", "text/html"],
+    ["if-none-match", '"v1"'],
+    ["range", "bytes=0-9"],
+  ]);
 });
 
 test("the gateway is the first proxy: forwarded headers are its own", async () => {

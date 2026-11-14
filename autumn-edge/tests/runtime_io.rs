@@ -115,6 +115,16 @@ async fn oversized_body() -> Vec<u8> {
     vec![b'x'; 16 * 1024 * 1024 + 1]
 }
 
+/// Echo every request header name and value, one per line, sorted.
+async fn echo_headers(headers: HeaderMap) -> String {
+    let mut lines: Vec<String> = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {}", value.to_str().unwrap_or("?")))
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
 /// A handler whose response header value is valid HTTP but not valid UTF-8 —
 /// it cannot cross the JSON wire byte-faithfully, so the runtime must decline
 /// rather than serve a lossily rewritten value the origin would never send.
@@ -148,6 +158,13 @@ fn routes() -> Vec<EdgeRoute> {
             path: "/greet/{name}",
             handler: edge_get(greet),
             name: "greet",
+            needs: &[],
+        },
+        EdgeRoute {
+            method: http::Method::GET,
+            path: "/echo-headers",
+            handler: edge_get(echo_headers),
+            name: "echo_headers",
             needs: &[],
         },
         EdgeRoute {
@@ -640,8 +657,62 @@ fn the_guest_strips_credentials_the_host_forgot_to() {
     let line = format!("{}\n", serde_json::to_string(&frame).expect("serializes"));
 
     let frames = drive(&[line]);
-    let rendered = serde_json::to_string(&frames).expect("serializes");
-    assert!(!rendered.contains("sid=secret"), "{rendered}");
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    let body = String::from_utf8(expect_response(&frames[0]).body.clone()).expect("UTF-8");
+    assert_eq!(body, "accept: text/html");
+}
+
+#[test]
+fn the_guest_drops_proxy_assertions_the_host_forgot_to() {
+    // A host that forwards every header must still not hand a capsule an
+    // identity-aware proxy's bearer assertion.
+    let frame = HostFrame::Request {
+        wire_version: WIRE_VERSION,
+        provided_capabilities: Vec::new(),
+        request: EdgeRequest::get("/echo-headers")
+            .with_header("cf-access-jwt-assertion", "ey.cf")
+            .with_header("x-amzn-oidc-data", "ey.alb")
+            .with_header("x-ms-client-principal", "ey.azure")
+            .with_header("x-goog-iap-jwt-assertion", "ey.iap")
+            .with_header("x-forwarded-user", "ada")
+            .with_header("if-none-match", "\"v1\"")
+            .with_header("accept-language", "en"),
+    };
+    let line = format!("{}\n", serde_json::to_string(&frame).expect("serializes"));
+
+    let frames = drive(&[line]);
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    let body = String::from_utf8(expect_response(&frames[0]).body.clone()).expect("UTF-8");
+    assert_eq!(body, "accept-language: en\nif-none-match: \"v1\"");
+}
+
+#[test]
+fn the_native_filter_keeps_every_value_of_an_allowed_name_in_order() {
+    let request = http::Request::builder()
+        .uri("/x")
+        .header("accept", "text/html")
+        .header("cookie", "sid=secret")
+        .header("accept", "*/*")
+        .header("cf-access-jwt-assertion", "ey.cf")
+        .header("if-none-match", "\"v1\"")
+        .body(axum::body::Body::empty())
+        .expect("valid request");
+
+    let request = futures::executor::block_on(autumn_edge::strip_request_credentials(request));
+
+    let kept: Vec<(&str, &str)> = request
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.to_str().expect("ASCII")))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            ("accept", "text/html"),
+            ("accept", "*/*"),
+            ("if-none-match", "\"v1\""),
+        ]
+    );
 }
 
 // ── the extractor is state-agnostic ──────────────────────────────────
