@@ -22,12 +22,9 @@ pub fn run_issue(principal_id: &str, name: &str, scopes: &[String], expires_at: 
     let raw_token = generate_token();
     let token_hash = sha256_hex(&raw_token);
     let scopes_json = scopes_to_json(scopes);
-    // Normalize expires_at to a UTC naive timestamp string before passing to
-    // psql.  The column is TIMESTAMP (no time zone), storing UTC; we cast with
-    // ::timestamp so PostgreSQL never applies a session-timezone conversion.
-    // Without normalization, '2026-12-31T23:59:59'::timestamptz would be
-    // interpreted in the session's TimeZone and then stripped of its zone,
-    // causing tokens to expire hours early/late on non-UTC DB sessions.
+    // The column is TIMESTAMP (no time zone) holding UTC. Normalizing here and casting with
+    // ::timestamp keeps PostgreSQL from applying the session time zone, which would shift
+    // expiry by hours on a non-UTC session.
     let expires_at_owned;
     let expires_at = match expires_at {
         Some(s) if !s.trim().is_empty() => {
@@ -37,11 +34,8 @@ pub fn run_issue(principal_id: &str, name: &str, scopes: &[String], expires_at: 
         _ => "",
     };
 
-    // Use psql variable substitution (:'var') to avoid any SQL injection risk.
-    // psql quotes each value as a SQL string literal, so no manual escaping is
-    // needed. `:'scopes'::jsonb` casts the JSON array text into the JSONB
-    // column; an empty `:'expires_at'` becomes NULL via NULLIF.  The ::timestamp
-    // cast is safe here because expires_at is already UTC-normalized above.
+    // psql's `:'var'` substitution quotes each value as a string literal, so nothing needs
+    // escaping. An empty `:'expires_at'` becomes NULL via NULLIF.
     run_psql_silent(
         &database_url,
         "INSERT INTO api_tokens (token_hash, principal_id, name, scopes, expires_at) \
@@ -56,7 +50,7 @@ pub fn run_issue(principal_id: &str, name: &str, scopes: &[String], expires_at: 
         ],
     );
 
-    // Print raw token last so it's easy to capture with $(...)
+    // The raw token is the only stdout line, so `$(...)` captures it.
     println!("{raw_token}");
     eprintln!("\u{2713} Token issued for principal: {principal_id}");
 }
@@ -84,10 +78,8 @@ pub fn run_rotate(raw_token: &str) {
     let new_token = generate_token();
     let new_hash = sha256_hex(&new_token);
 
-    // Revoke the old row and copy its name/scopes/expiry onto a new row in a
-    // single statement so the rotation is atomic.
-    // The SELECT 1/COUNT(*) forces psql to error if the old token was not found
-    // (already revoked or never existed), preventing a silent no-op rotation.
+    // One statement, so the rotation is atomic. `1 / COUNT(*)` divides by zero when no live old
+    // token matched, so the rotation fails instead of silently doing nothing.
     run_psql_silent(
         &database_url,
         "WITH rotated AS ( \
@@ -138,13 +130,10 @@ fn sha256_hex(input: &str) -> String {
 /// match, letting psql produce a clear error.
 fn normalize_expires_at_utc(s: &str) -> String {
     let s = s.trim();
-    // Try RFC 3339 / ISO 8601 with explicit offset — convert to UTC.
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string();
     }
-    // Minute-precision offset forms (e.g. `date -Iminutes` → "2026-12-31T23:59-05:00").
-    // RFC 3339 requires seconds; pad ":00" after the minutes field so the
-    // full RFC 3339 parser can still apply the offset and produce UTC.
+    // Minute precision with an offset (`date -Iminutes`): RFC 3339 requires seconds, so pad ":00".
     if s.len() >= 17 {
         let b = s.as_bytes();
         if b[10] == b'T' && b[13] == b':' && matches!(b[16], b'Z' | b'+' | b'-') {
@@ -154,15 +143,9 @@ fn normalize_expires_at_utc(s: &str) -> String {
             }
         }
     }
-    // Hour-only offset forms (ISO 8601 allows ±HH with no minutes, e.g.
-    // "2026-12-31T23:59:59-05" or "2026-12-31 23:59:59-05"). Expand the
-    // offset to ±HH:00 and re-run so the existing parsers handle the rest.
-    // Guard: require a datetime separator (T or space) at position 10 to
-    // avoid treating the day-separator in date-only strings ("2026-12-31")
-    // as an offset sign (the `-` before `31` would otherwise be mistaken
-    // for a `-HH` hour-offset, causing `2026-12-31:00` → passthrough).
-    // Termination: the expanded string ends with ±HH:MM; `b[n-3]` = `:`
-    // so this branch is never re-entered.
+    // Hour-only offset (ISO 8601 `±HH`): expand to `±HH:00` and re-parse. The separator check at
+    // index 10 keeps a date's own `-DD` from reading as an offset. The expanded string ends in
+    // `:MM`, so the recursion does not re-enter this branch.
     {
         let b = s.as_bytes();
         let n = b.len();
@@ -175,11 +158,9 @@ fn normalize_expires_at_utc(s: &str) -> String {
             return normalize_expires_at_utc(&format!("{s}:00"));
         }
     }
-    // Offset-aware formats not accepted by `parse_from_rfc3339`:
-    //   - compact offset (e.g. "2026-12-31T23:59:59-0500" from `date +%Y-%m-%dT%H:%M:%S%z`)
-    //   - space-separated SQL form with extended or compact offset
-    //     (e.g. "2026-12-31 23:59:59-05:00" from psql or ORMs)
-    // Must come before the naive formats so offsets are applied, not silently stripped.
+    // Offset forms `parse_from_rfc3339` rejects: compact offsets (`date +%z`) and the
+    // space-separated SQL form psql prints. Must run before the naive formats, or the offset
+    // would be dropped.
     for fmt in [
         "%Y-%m-%dT%H:%M:%S%z",  // T, compact offset, seconds
         "%Y-%m-%dT%H:%M%z",     // T, compact offset, minute-precision
@@ -192,13 +173,12 @@ fn normalize_expires_at_utc(s: &str) -> String {
             return dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string();
         }
     }
-    // Datetime without offset — treat as UTC directly.
+    // No offset: already UTC.
     for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
             return naive.format("%Y-%m-%dT%H:%M:%S").to_string();
         }
     }
-    // Date only — midnight UTC.
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return NaiveDateTime::new(date, NaiveTime::from_hms_opt(0, 0, 0).unwrap())
             .format("%Y-%m-%dT%H:%M:%S")
@@ -368,7 +348,6 @@ mod tests {
 
     #[test]
     fn normalize_utc_strips_offset_and_converts_to_utc() {
-        // +05:30 → subtract 5h30m to get UTC
         assert_eq!(
             normalize_expires_at_utc("2026-12-31T23:59:59+05:30"),
             "2026-12-31T18:29:59"
@@ -406,7 +385,7 @@ mod tests {
 
     #[test]
     fn normalize_utc_minute_precision_negative_offset() {
-        // `date -Iminutes` → "2026-12-31T23:59-05:00"; 23:59 EST = 04:59 UTC next day
+        // `date -Iminutes` output.
         assert_eq!(
             normalize_expires_at_utc("2026-12-31T23:59-05:00"),
             "2027-01-01T04:59:00"
@@ -415,7 +394,6 @@ mod tests {
 
     #[test]
     fn normalize_utc_minute_precision_positive_offset() {
-        // +05:30 → 23:59 - 5h30m = 18:29 UTC
         assert_eq!(
             normalize_expires_at_utc("2026-12-31T23:59+05:30"),
             "2026-12-31T18:29:00"
@@ -432,7 +410,7 @@ mod tests {
 
     #[test]
     fn normalize_utc_compact_offset_with_seconds() {
-        // `date +%Y-%m-%dT%H:%M:%S%z` → "2026-12-31T23:59:59-0500"; 23:59:59 EST = 04:59:59 UTC
+        // `date +%Y-%m-%dT%H:%M:%S%z` output.
         assert_eq!(
             normalize_expires_at_utc("2026-12-31T23:59:59-0500"),
             "2027-01-01T04:59:59"
@@ -441,7 +419,6 @@ mod tests {
 
     #[test]
     fn normalize_utc_compact_offset_minute_precision() {
-        // Minute-precision compact offset: "2026-12-31T23:59-0500" → 04:59:00 UTC
         assert_eq!(
             normalize_expires_at_utc("2026-12-31T23:59-0500"),
             "2027-01-01T04:59:00"
@@ -450,7 +427,7 @@ mod tests {
 
     #[test]
     fn normalize_utc_space_separator_extended_offset() {
-        // SQL/psql form: "2026-12-31 23:59:59-05:00"; 23:59:59 EST = 04:59:59 UTC next day
+        // The form psql prints.
         assert_eq!(
             normalize_expires_at_utc("2026-12-31 23:59:59-05:00"),
             "2027-01-01T04:59:59"
@@ -459,7 +436,6 @@ mod tests {
 
     #[test]
     fn normalize_utc_space_separator_compact_offset() {
-        // Space separator + compact offset: "2026-12-31 23:59:59-0500"
         assert_eq!(
             normalize_expires_at_utc("2026-12-31 23:59:59-0500"),
             "2027-01-01T04:59:59"
@@ -468,7 +444,6 @@ mod tests {
 
     #[test]
     fn normalize_utc_hour_only_offset_t_separator() {
-        // ISO 8601 hour-only offset: "2026-12-31T23:59:59-05"; 23:59:59 UTC-5 = 04:59:59 UTC
         assert_eq!(
             normalize_expires_at_utc("2026-12-31T23:59:59-05"),
             "2027-01-01T04:59:59"
@@ -477,7 +452,6 @@ mod tests {
 
     #[test]
     fn normalize_utc_hour_only_offset_space_separator() {
-        // SQL form with hour-only offset: "2026-12-31 23:59:59-05"
         assert_eq!(
             normalize_expires_at_utc("2026-12-31 23:59:59-05"),
             "2027-01-01T04:59:59"

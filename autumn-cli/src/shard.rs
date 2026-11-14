@@ -91,27 +91,18 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     );
 
     // ── 1. Snapshot source and destination ────────────────────────────────
-    // Verify first so re-runs with `--confirm` are idempotent: if the dry-run
-    // already copied the rows to the destination and the slot was then flipped,
-    // re-running with `--confirm` must skip the copy (which would fail on
-    // duplicate PKs) and go straight to delete.
+    // Verify before copying so a `--confirm` re-run after the dry-run copy skips the copy
+    // (which would fail on duplicate PKs) and goes straight to delete.
     eprintln!("\u{2192} Checking source\u{2026}");
     let src_count = psql_scalar(&from_url, &count_sql(&args.table, &filter));
-    // Source rows captured as `md5(row)|id` snapshot entries, so a later
-    // `--confirm` deletes exactly the rows that were verified copied — never a
-    // row written to the source after this snapshot (a fresh id is absent from
-    // the snapshot) and never a row whose content changed in the cutover window
-    // (its current md5 no longer matches the staged entry).
+    // `md5(row)|id` entries, so `--confirm` deletes exactly the rows verified as copied, never a
+    // row inserted or changed on the source after this snapshot.
     let mut verified_src_entries: Vec<String> = Vec::new();
     if src_count == "0" {
         eprintln!("\u{26A0}\u{FE0F}  No rows found on source shard for the given tenant(s).");
     } else {
-        // Verify by content fingerprint that the destination CONTAINS every
-        // source row, rather than requiring an exact match. After the dry-run
-        // copy and a route flip, new writes for the moved tenant make the
-        // destination a superset of the source; a `--confirm` re-run must then
-        // skip the copy (re-inserting copied PKs would abort) and proceed to
-        // delete the snapshotted source rows.
+        // Containment, not an exact match: after the dry-run copy and a route flip, new writes
+        // make the destination a superset of the source.
         let (src_entries, src_fp) =
             source_snapshot(&from_url, &args.table, &args.id_column, &filter);
         verified_src_entries = src_entries;
@@ -125,8 +116,6 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
             eprintln!("\u{2192} Copying rows\u{2026}");
             copy_rows(&from_url, &to_url, &args.table, &filter);
 
-            // Re-verify after copy: destination must contain all source rows
-            // (it may legitimately hold additional rows written post-route).
             let dst_fp2 = row_fingerprints(&to_url, &args.table, &filter);
             eprintln!("   source rows: {}", src_fp.len());
             eprintln!("   dest rows:   {}", dst_fp2.len());
@@ -140,11 +129,8 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     }
 
     // ── 2b. Advance the destination PK sequence ───────────────────────────
-    // PK values are copied verbatim, so the destination's BIGSERIAL/identity
-    // sequence may still point below the moved ids and hand out a duplicate on
-    // the next insert once traffic is routed there. Reset it to the table's
-    // current max (no-op if the column has no owned sequence, or the table is
-    // empty). Skipped when nothing was on the source to move.
+    // PKs are copied verbatim, so the destination's sequence may sit below the moved ids and
+    // hand out a duplicate once traffic is routed there.
     if src_count != "0" {
         eprintln!(
             "\u{2192} Advancing destination sequence for {:?}.{:?}\u{2026}",
@@ -236,10 +222,8 @@ fn delete_source_rows_by_id(
         eprintln!("  No verified source rows for these tenant(s); nothing deleted.");
         return psql_scalar(from_url, &count_sql(table, filter));
     }
-    // Stream the snapshot entries into a temp table over stdin and delete by
-    // joining against it, all in one transaction. This avoids building one giant
-    // `ARRAY[...]` delete that could blow the OS argv / statement-size limit for
-    // a large tenant, and keeps the cleanup atomic.
+    // Stream the entries into a temp table over stdin and delete by joining against it, in one
+    // transaction. An inline `ARRAY[...]` could exceed the argv / statement-size limit.
     let delete = delete_by_staged_ids_sql(table, id_column, filter);
     let mut child = Command::new("psql")
         .args([
@@ -261,8 +245,7 @@ fn delete_source_rows_by_id(
     {
         let mut stdin = child.stdin.take().expect("piped stdin");
         for entry in entries {
-            // Each entry is `md5(row)|id::text` from the snapshot; one per line
-            // for the single-column `\copy ... FROM STDIN`.
+            // One entry per line for the single-column `\copy ... FROM STDIN`.
             writeln!(stdin, "{entry}")
                 .unwrap_or_else(|e| fail(&format!("failed to stream entries to psql: {e}")));
         }
@@ -275,12 +258,8 @@ fn delete_source_rows_by_id(
         fail("source delete failed (see psql output above).");
     }
 
-    // The fingerprint-guarded delete intentionally preserves any moved-tenant row
-    // that changed in the cutover window (its current md5 no longer matches the
-    // staged entry) or was inserted after the snapshot. Re-count what remains so
-    // the caller never reports a clean "source removed" while live moved-tenant
-    // rows still sit on the source — which would let an operator decommission it
-    // and lose those rows.
+    // The guarded delete keeps rows changed or added during the cutover window; count them so
+    // the source is never reported clean while they remain.
     psql_scalar(from_url, &count_sql(table, filter))
 }
 
@@ -381,16 +360,11 @@ fn count_sql(table: &str, filter: &str) -> String {
     format!("SELECT count(*) FROM {qt} WHERE {filter}")
 }
 
-// NOTE: `SELECT *` preserves column declaration order. Both shards are expected
-// to have identical schemas (Autumn migrations run in order on all shards), so
-// the order will match. If you have added columns manually outside the migration
-// system, verify column order matches before using this tool.
+// `SELECT *` relies on both shards declaring columns in the same order, which holds when the
+// schemas come from the same migrations.
 //
-// Copying the primary key is intentional: it keeps cross-table FK references
-// valid after the move. If your table uses `GENERATED ALWAYS AS IDENTITY`,
-// `\copy` will fail; use `GENERATED BY DEFAULT AS IDENTITY` or `BIGSERIAL`
-// instead. The destination sequence is advanced automatically after a verified
-// copy (see `reset_sequence_sql` / `--id-column`).
+// The primary key is copied so FK references stay valid. `\copy` fails on
+// `GENERATED ALWAYS AS IDENTITY`; the destination sequence is advanced by `reset_sequence_sql`.
 fn copy_out_sql(table: &str, filter: &str) -> String {
     let qt = quote_identifier(table);
     format!("\\copy (SELECT * FROM {qt} WHERE {filter}) TO STDOUT")
@@ -427,13 +401,9 @@ fn staging_insert_sql(table: &str) -> String {
 fn reset_sequence_sql(table: &str, id_column: &str) -> String {
     let qt = quote_identifier(table);
     let qcol = quote_identifier(id_column);
-    // pg_get_serial_sequence parses its first argument as a (possibly
-    // schema-qualified) identifier with normal case folding, so pass the
-    // *quoted* table to preserve case-sensitive / schema-qualified names (a raw
-    // `Bookmarks` would fold to `bookmarks` and return NULL). Its second
-    // argument, however, is treated as a literal column name (not parsed), so
-    // the column must be *raw* (a quoted `"id"` would be looked up verbatim and
-    // return NULL). Either NULL would make the reset a silent no-op.
+    // pg_get_serial_sequence case-folds its first argument as an identifier, so the table is
+    // passed quoted; its second argument is a literal column name, so the column is passed raw.
+    // Either mistake returns NULL and silently skips the reset.
     let tbl_lit = qt.replace('\'', "''");
     let col_lit = id_column.replace('\'', "''");
     format!(
@@ -459,8 +429,6 @@ fn copy_rows(from_url: &str, to_url: &str, table: &str, filter: &str) {
         .unwrap_or_else(|e| fail(&format!("failed to start source psql: {e}")));
 
     let src_out = src.stdout.take().expect("piped stdout");
-    // Single session/transaction: stage the streamed rows, then upsert with
-    // ON CONFLICT DO NOTHING so re-runs only insert rows not already present.
     let dst_status = Command::new("psql")
         .args([
             to_url,
@@ -546,9 +514,7 @@ fn source_snapshot(
     filter: &str,
 ) -> (Vec<String>, Vec<String>) {
     let entries = psql_lines(url, &source_snapshot_sql(table, id_column, filter));
-    // md5 (32 hex, no `|`) is first, so the first `|` separates it from the id;
-    // the id half may itself contain `|`, which is fine — the delete matches the
-    // whole entry string, and verification only needs the md5 prefix here.
+    // The md5 (32 hex, no `|`) comes first, so the first `|` ends it even if the id contains `|`.
     let fps = entries
         .iter()
         .filter_map(|line| line.split_once('|').map(|(fp, _)| fp.to_owned()))
@@ -574,10 +540,8 @@ const fn stage_ids_copy_in_sql() -> &'static str {
 fn delete_by_staged_ids_sql(table: &str, id_column: &str, filter: &str) -> String {
     let qt = quote_identifier(table);
     let qcol = quote_identifier(id_column);
-    // Reconstruct the same `md5(row)|id` string the snapshot captured and match
-    // it against the staged entries: only rows whose current content (md5) and
-    // id both still match are deleted. The alias `t` mirrors the snapshot query
-    // so `to_jsonb(t)` sees the identical column set/order.
+    // The alias `t` mirrors the snapshot query so `to_jsonb(t)` sees the same columns in the
+    // same order.
     format!(
         "DELETE FROM {qt} t WHERE {filter} AND EXISTS (\
          SELECT 1 FROM __autumn_del_ids d \
@@ -721,27 +685,23 @@ mod tests {
     #[test]
     fn reset_sequence_sql_quotes_and_guards() {
         let sql = reset_sequence_sql("bookmarks", "id");
-        // Quoted table (case/schema preserved) + raw column passed to
-        // pg_get_serial_sequence; a raw `Bookmarks` would fold to `bookmarks`,
-        // and a quoted `"id"` would be taken literally — either returns NULL.
+        // Quoted table, raw column: the other way round, pg_get_serial_sequence returns NULL.
         assert!(
             sql.contains("pg_get_serial_sequence('\"bookmarks\"', 'id')"),
             "{sql}"
         );
-        // max()/FROM still use quoted identifiers.
         assert!(
             sql.contains("SELECT max(\"id\") INTO mx FROM \"bookmarks\""),
             "{sql}"
         );
-        // No-op guards: only when a sequence exists, and empty table is safe.
+        // No-op without a sequence; an empty table leaves the sequence at its start.
         assert!(sql.contains("IF seq IS NOT NULL"), "{sql}");
         assert!(
             sql.contains("setval(seq, COALESCE(mx, 1), mx IS NOT NULL)"),
             "{sql}"
         );
 
-        // Schema-qualified table is quoted per-part for pg_get_serial_sequence
-        // (and for max()/FROM); the column stays raw.
+        // A schema-qualified table is quoted per part.
         let sql = reset_sequence_sql("public.bookmarks", "id");
         assert!(
             sql.contains("pg_get_serial_sequence('\"public\".\"bookmarks\"', 'id')"),
@@ -759,8 +719,7 @@ mod tests {
         }
     }
 
-    // Mirror of validate_identifier's logic (without process exit) so the
-    // predicate is unit-testable.
+    // validate_identifier's logic without the process exit.
     fn is_valid_schema_or_simple(value: &str) -> bool {
         let parts: Vec<&str> = value.split('.').collect();
         if parts.is_empty() || parts.len() > 2 {
@@ -773,20 +732,16 @@ mod tests {
     fn dest_contains_source_handles_subset_superset_and_multiplicity() {
         let v = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
 
-        // Empty source is vacuously contained.
         assert!(dest_contains_source(&v(&[]), &v(&[])));
         assert!(dest_contains_source(&v(&[]), &v(&["a"])));
 
-        // Exact match and superset both pass (destination may hold extra rows
-        // written after the dry-run copy).
+        // A superset passes: the destination may hold rows written after the dry-run copy.
         assert!(dest_contains_source(&v(&["a", "b"]), &v(&["a", "b"])));
         assert!(dest_contains_source(&v(&["a", "b"]), &v(&["a", "b", "c"])));
 
-        // A source row missing on the destination fails (would block deletion).
         assert!(!dest_contains_source(&v(&["a", "b"]), &v(&["a"])));
         assert!(!dest_contains_source(&v(&["a"]), &v(&[])));
 
-        // Multiplicity is respected: two of a needs two of a on the destination.
         assert!(!dest_contains_source(&v(&["a", "a"]), &v(&["a"])));
         assert!(dest_contains_source(&v(&["a", "a"]), &v(&["a", "a", "a"])));
     }

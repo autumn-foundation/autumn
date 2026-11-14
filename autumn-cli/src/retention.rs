@@ -245,11 +245,8 @@ mod tests {
 
     #[test]
     fn extract_dry_run_json_ignores_incidental_stdout_noise() {
-        // Regression (#1342 review round 14): the default `dev` profile's
-        // stdout-backed tracing formatter and Diesel's migration-progress
-        // output can both print before the report line whenever anything
-        // is pending — the extractor must not choke on (or accidentally
-        // match) any of that.
+        // The `dev` tracing formatter and Diesel's migration progress both print to stdout before
+        // the report line; the extractor must skip them.
         let stdout = "Running migration 20260101000000_create_widgets\n\
                        {\"level\":\"INFO\",\"message\":\"listening\"}\n\
                        AUTUMN_RETENTION_DRY_RUN_REPORT=[]\n";
@@ -264,15 +261,9 @@ mod tests {
 
     #[test]
     fn clear_competing_one_shot_env_removes_every_var_checked_before_retention_dry_run() {
-        // Regression (#1342 review round 23): AppBuilder::run checks
-        // AUTUMN_BUILD_STATIC, AUTUMN_DUMP_ROUTES,
-        // AUTUMN_DUMP_CACHE_COHERENCE, AUTUMN_DUMP_DATA_FLOW,
-        // AUTUMN_DUMP_AGENT_AUTHORITY, AUTUMN_DUMP_JOBS, AUTUMN_LIST_TASKS,
-        // AUTUMN_RUN_TASK, and AUTUMN_MIGRATE *before*
-        // AUTUMN_RETENTION_DRY_RUN in its dispatch chain — any of them left
-        // over in the CLI's own environment would hijack a --dry-run
-        // invocation into a completely different (potentially mutating)
-        // mode via Command's default environment inheritance.
+        // AppBuilder::run dispatches each of these before AUTUMN_RETENTION_DRY_RUN, so one
+        // inherited from the CLI's environment would turn --dry-run into another, possibly
+        // mutating, mode.
         let competing_vars = [
             "AUTUMN_BUILD_STATIC",
             "AUTUMN_DUMP_ROUTES",
@@ -308,14 +299,9 @@ mod tests {
 
     #[test]
     fn apply_model_env_removes_an_inherited_var_when_no_model_given() {
-        // Regression (#1342 review round 20): without an explicit removal,
-        // an AUTUMN_RETENTION_MODEL already present in the CLI's own
-        // environment (e.g. exported by a wrapping script) would otherwise
-        // leak into a filter-less --dry-run via Command's default
-        // environment inheritance.
+        // Without an explicit removal, an AUTUMN_RETENTION_MODEL inherited from the CLI's
+        // environment would filter a --dry-run that asked for no model.
         let mut command = std::process::Command::new("true");
-        // Simulate the var already being set, as it would be if inherited
-        // from the parent process's environment.
         command.env("AUTUMN_RETENTION_MODEL", "LeftoverFromParentEnv");
 
         apply_model_env(&mut command, None);
@@ -387,9 +373,8 @@ mod tests {
 
     #[test]
     fn format_retention_report_disambiguates_same_model_name_by_table() {
-        // Regression (#1342 review round 5): two policies can share a model
-        // name (same-named model in different modules); the table column is
-        // what keeps their rows distinguishable in an unfiltered report.
+        // Two policies can share a model name (same-named models in different modules); the
+        // table column keeps their rows apart.
         let table = format_retention_report(&[
             RetentionSweepReport {
                 model: "Session".to_string(),

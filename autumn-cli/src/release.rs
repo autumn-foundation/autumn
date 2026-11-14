@@ -150,9 +150,8 @@ const SBOM_LABELS: &str = concat!(
 /// expression and env block in Rust, the steps live in the template between
 /// markers and this either unwraps them or removes them wholesale.
 fn strip_sbom_block(rendered: &str, keep: bool) -> String {
-    // Most templates carry no markers; leave those byte-for-byte alone rather
-    // than round-tripping them through a line splitter that would normalise
-    // their trailing newline.
+    // Most templates carry no markers; return them untouched so their trailing newline is
+    // not normalised.
     if !rendered.contains("{{sbom_steps_begin}}") {
         return rendered.to_owned();
     }
@@ -317,8 +316,6 @@ pub fn run(action: ReleaseAction) {
                         eprintln!("\n{warning}");
                     }
 
-                    // Smoke gate: verify the generated production config does
-                    // not contain a committed signing secret literal.
                     let config_path = cwd.join("autumn.production.toml.example");
                     if let Ok(content) = std::fs::read_to_string(&config_path)
                         && let Err(e) = check_production_config_signing_secret(&content)
@@ -393,8 +390,7 @@ pub fn check_production_config_signing_secret(content: &str) -> Result<(), Strin
         if trimmed.starts_with('#') {
             continue;
         }
-        // A non-comment line containing a `secret =` assignment with a non-empty
-        // RHS is a committed secret literal — a critical misconfiguration.
+        // A `secret = <non-empty>` line outside a comment is a committed secret literal.
         if let Some(rest) = trimmed.strip_prefix("secret") {
             let rest = rest.trim_start();
             if let Some(rest) = rest.strip_prefix('=') {
@@ -453,11 +449,8 @@ fn nested_workflow_relocation_warning(dir: &Path, workflow_rel_path: &str) -> Op
         return None;
     }
     let rel = dir.strip_prefix(&git_root).ok()?;
-    // The suggested `working-directory:` always runs inside the generated
-    // workflow's own YAML on a Linux CI runner (every template here targets
-    // `ubuntu-latest`), regardless of which OS `autumn release init` itself
-    // ran on — so this must always render with forward slashes, even when
-    // `rel.display()` would use `\` on a Windows host.
+    // The `working-directory:` runs on a Linux CI runner whatever OS ran `autumn release init`,
+    // so join with `/`: `rel.display()` uses `\` on Windows.
     let rel_forward_slash = rel
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -525,11 +518,8 @@ pub fn init_with_roles(
         }
     }
 
-    // Validate/merge .gitignore BEFORE writing any scaffold file below, not
-    // after: this can fail (an existing .gitignore that isn't valid UTF-8,
-    // say), and failing after the other files are already on disk would
-    // leave a partial, complete-looking scaffold that then blocks a retry
-    // without --force on the very files this call just created.
+    // Merge .gitignore before writing any scaffold file: it can fail (e.g. invalid UTF-8), and
+    // failing afterwards would leave a partial scaffold that blocks a retry without --force.
     if is_terraform_target(target) {
         ensure_terraform_gitignore_entries(dir)?;
     }
@@ -537,9 +527,7 @@ pub fn init_with_roles(
     let mut created = Vec::new();
     for (name, content) in files {
         let path = dir.join(&name);
-        // Most planned files sit at the project root, but some targets (e.g.
-        // azure-container-apps' `.github/workflows/...`) nest under a
-        // subdirectory that a fresh project won't have yet.
+        // Some targets nest files under a subdirectory (e.g. `.github/workflows/`).
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -563,10 +551,8 @@ pub fn plan_output(
     split_workers: bool,
     roles: &[String],
 ) -> Result<Vec<(String, String)>, ReleaseError> {
-    // Embed assets into the binary only when the project opts in via the
-    // `embed-assets` feature (as `autumn new` generates). Pre-existing apps
-    // without that feature get the disk-based build (`cargo build --release`
-    // plus `COPY static`), so their Docker builds keep working.
+    // Embed assets only when the project defines the `embed-assets` feature. Older apps keep the
+    // disk-based build (`cargo build --release` plus `COPY static`).
     let embed = project_has_embed_assets(dir);
     if !roles.is_empty() && !matches!(target, Target::Kubernetes | Target::Fly) {
         return Err(ReleaseError::Roles(
@@ -662,11 +648,8 @@ fn gitignore_pattern_still_effective(existing: &str, pattern: &str) -> bool {
 /// final (and therefore effective) matching rule again.
 fn ensure_terraform_gitignore_entries(dir: &Path) -> std::io::Result<()> {
     let path = dir.join(".gitignore");
-    // Only a missing file is safe to default to empty. Any other read
-    // failure (invalid UTF-8, permission denied, ...) must propagate —
-    // silently treating it as "no file" would make the fs::write below
-    // replace the operator's existing (unreadable-by-us, but still real)
-    // content with just the Terraform entries.
+    // Only a missing file defaults to empty. Any other read error must propagate, or the write
+    // below would replace the operator's real content with just the Terraform entries.
     let existing = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -762,11 +745,9 @@ fn render_for_cli(
     split_workers: bool,
     cli_version: &str,
 ) -> String {
-    // `--auditable` is a flag on the autumn CLI, so — unlike `cargo auditable build`
-    // on the default path, which needs only the cargo-auditable crate — it is subject
-    // to the same pin gate as `autumn sbom`: an older pinned CLI rejects the argument
-    // and the image fails to build. The explanatory comment is gated with it, so a
-    // generated Dockerfile never documents a flag it does not pass.
+    // `--auditable` is an autumn CLI flag (unlike `cargo auditable build`, which needs only the
+    // cargo-auditable crate), so an older pinned CLI rejects it. Gate it and its Dockerfile
+    // comment on the CLI version.
     let (embed_auditable_note, embed_auditable) = if cli_supports_supply_chain_flags(cli_version) {
         (
             "# `--auditable` routes BOTH compile phases through `cargo auditable`, so the\n\
@@ -787,7 +768,6 @@ fn render_for_cli(
     let (build_step, static_copy) = if embed {
         (
             embed_build_step.as_str(),
-            // Assets/locales are embedded; only migrations/ is staged below.
             "# Assets and locales are embedded in the binary (`autumn build --embed`);\n\
              # only migrations/ is staged, for the one-shot `autumn migrate` job.\n",
         )
@@ -800,14 +780,9 @@ fn render_for_cli(
             "COPY --chown=autumn:autumn --from=builder /app/static /app/static\n",
         )
     };
-    // The in-image SBOM needs `autumn sbom`, which only a CLI at or past
-    // `SUPPLY_CHAIN_MIN_CLI_VERSION` has. Emitting these steps against an older pin
-    // would make `docker build` fail outright, so they are omitted instead: the image
-    // is merely SBOM-less, not broken. The SBOM must resolve the same features the
-    // binary above was compiled with. The embed build turns on `embed-assets`, which
-    // pulls in optional dependencies, so resolving the default set would omit crates
-    // that are genuinely linked and make the documented sidecar-vs-binary cross-check
-    // report spurious binary-only entries.
+    // `autumn sbom` exists only from `SUPPLY_CHAIN_MIN_CLI_VERSION`. Against an older pin the
+    // steps are omitted, so `docker build` still succeeds without an SBOM. The SBOM resolves the
+    // binary's features: `embed-assets` pulls in optional dependencies the default set misses.
     let emits_sbom = cli_supports_supply_chain_flags(cli_version);
     let sbom_generate_step = if emits_sbom {
         SBOM_GENERATE_STEP.replace(
@@ -826,10 +801,8 @@ fn render_for_cli(
     } else {
         ("", "")
     };
-    // Split-topology placeholders exist only in the docker-compose template, so
-    // these replacements are no-ops for the other files. Substitute them before
-    // `{{project_name}}` so the worker block's own `{{project_name}}` tokens are
-    // resolved by the shared replacement below.
+    // Split-topology placeholders exist only in the docker-compose template. Substitute them
+    // before `{{project_name}}` so the worker block's own `{{project_name}}` tokens are replaced.
     let (worker_service, web_role_env) = if split_workers {
         (WORKER_SERVICE_BLOCK, WEB_ROLE_ENV)
     } else {
@@ -1082,11 +1055,9 @@ mod tests {
 
     #[test]
     fn dockerfile_passes_through_git_provenance_build_args() {
-        // Issue #1676: the build context excludes `/.git`, so the release
-        // Dockerfile must surface the `AUTUMN_BUILD_*` provenance as build-arg
-        // ENV before the build step. Otherwise the generated build.rs finds no
-        // git repo and the container reports `git.*` as `null` on
-        // `/actuator/info`, defeating deploy/rollback verification.
+        // #1676: the build context excludes `/.git`, so build.rs finds no git repo. The Dockerfile
+        // must pass `AUTUMN_BUILD_*` as ENV before the build step, or `/actuator/info` reports
+        // `git.*` as null.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default, false).unwrap();
@@ -1112,9 +1083,7 @@ mod tests {
         // The provenance ENV must precede the build step so the compile sees it.
         let env_pos = content.find("AUTUMN_BUILD_GIT_SHA=${AUTUMN_BUILD_GIT_SHA}");
         let build_pos = content.find("{{build_step}}").or_else(|| {
-            // `{{build_step}}` is already substituted; both variants run cargo,
-            // now through `cargo auditable` so the binary carries its own
-            // dependency list (issue #1615).
+            // `{{build_step}}` is already substituted, so find either rendered build command.
             content
                 .find("RUN cargo auditable build --release")
                 .or_else(|| content.find("RUN autumn build --embed"))
@@ -1127,11 +1096,9 @@ mod tests {
 
     #[test]
     fn an_embed_build_does_not_pass_auditable_to_a_cli_that_lacks_it() {
-        // `--auditable` is a NEW flag on `autumn build`, so it is subject to
-        // exactly the same pin problem as `autumn sbom`: the embed branch
-        // invokes the crates.io CLI the image installed, and an older one
-        // rejects the argument outright. (The non-embed branch is unaffected —
-        // `cargo auditable build` needs only the cargo-auditable crate.)
+        // `--auditable` is an `autumn build` flag, so an older pinned CLI rejects it, as it does
+        // `autumn sbom`. The non-embed `cargo auditable build` needs only the cargo-auditable
+        // crate.
         let rendered = render_for_cli(
             include_str!("templates/release/Dockerfile.tmpl"),
             "my-app",
@@ -1190,10 +1157,8 @@ mod tests {
     /// elsewhere, and a whole-file substring check would read them as this
     /// command's.
     fn sbom_command(rendered: &str) -> String {
-        // Normalize first: `.gitattributes` says `* text=auto`, so on a Windows
-        // checkout this file's own raw string literals carry CRLF, and the
-        // `\`-continuation join below would silently no-op — leaving the
-        // assertions matching against a truncated one-line command.
+        // Normalize CRLF first: on a Windows checkout (`* text=auto`) the raw strings carry CRLF,
+        // and the `\`-continuation join below would silently do nothing.
         rendered
             .replace("\r\n", "\n")
             .replace("\\\n", " ")
@@ -1207,10 +1172,8 @@ mod tests {
 
     #[test]
     fn a_cli_pin_that_predates_autumn_sbom_omits_the_sbom_steps() {
-        // The Dockerfile `cargo install`s the CLI at its own version. Between a
-        // merge and the next release that is an already-published version with
-        // no `sbom` subcommand — emitting the step anyway would make every
-        // `docker build` fail on an unrecognised subcommand.
+        // The Dockerfile installs the CLI at its own version. Until the next release that version
+        // has no `sbom` subcommand, and emitting the step would fail every `docker build`.
         let rendered = render_for_cli(
             include_str!("templates/release/Dockerfile.tmpl"),
             "my-app",
@@ -1226,8 +1189,7 @@ mod tests {
             !rendered.contains("sbom.cdx.json"),
             "and must not COPY a file that was never generated:\n{rendered}"
         );
-        // The rest of the supply-chain posture does not depend on the CLI at
-        // all, so it stays on.
+        // The rest of the supply-chain steps do not depend on the CLI.
         assert!(
             rendered.contains("cargo auditable build --release"),
             "{rendered}"
@@ -1331,8 +1293,7 @@ mod tests {
                 "{v} predates autumn sbom"
             );
         }
-        // A pre-release sorts BEFORE its base version, so `0.7.0-dev` still
-        // predates the feature — the gate must not be fooled by the suffix.
+        // A pre-release sorts before its base version, so `0.7.0-dev` still predates the feature.
         assert!(!cli_supports_supply_chain_flags("0.7.0-dev"));
         assert!(cli_supports_supply_chain_flags("0.8.0-rc.1"));
         // A string cargo could never resolve is not a published release at
@@ -1476,9 +1437,8 @@ mod tests {
 
     #[test]
     fn dockerfile_uses_disk_build_without_embed_feature() {
-        // A project that doesn't define the `embed-assets` feature (e.g. one
-        // scaffolded before embedding existed) must get the disk-based build so
-        // its Docker build keeps working.
+        // A project scaffolded before embedding existed has no `embed-assets` feature; its Docker
+        // build must keep working.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default, false).unwrap();
@@ -1499,8 +1459,6 @@ mod tests {
 
     #[test]
     fn dockerfile_embeds_when_project_has_embed_feature() {
-        // A project that opts into the `embed-assets` feature gets a
-        // single-binary build with no static/ sidecar.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         fs::write(
@@ -1665,11 +1623,11 @@ mod tests {
         // (stdout is redirected to /dev/null by the probe itself).
         let harness = format!("curl() {{ printf '%s\\n' \"$*\" >&2; }}\n{healthcheck}");
 
-        // (url, insecure env, expect --insecure, expect this URL to be probed)
+        // (url, AUTUMN_HEALTHCHECK_INSECURE, expect --insecure)
         let cases: [(Option<&str>, Option<&str>, bool); 7] = [
-            // Default: today's plain-HTTP probe, verification on.
+            // Default: a plain-HTTP probe with verification on.
             (None, None, false),
-            // An https URL alone is NOT enough — fail safe, not fail open.
+            // An https URL alone does not opt in.
             (Some("https://localhost:3000/startup"), None, false),
             // The documented direct-TLS pairing.
             (Some("https://localhost:3000/startup"), Some("1"), true),
@@ -1815,14 +1773,9 @@ mod tests {
 
     #[test]
     fn dockerignore_excludes_terraform_state() {
-        // The azure-container-apps target scaffolds main.tf/terraform.tfvars
-        // directly alongside the Dockerfile in the same directory. Docker's
-        // build context is whatever the positional path argument points at
-        // (`docker build .`), so running that from this directory AFTER
-        // `terraform apply` would otherwise upload the plaintext
-        // terraform.tfstate — every secret value, `sensitive` flag or not —
-        // into the builder/build cache even though no stage ever COPYs it
-        // into the final image.
+        // The azure target scaffolds Terraform files next to the Dockerfile, so `docker build .`
+        // after `terraform apply` would send the plaintext terraform.tfstate, with every secret,
+        // into the build context.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -1921,12 +1874,11 @@ previous_secrets = []
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
-        // Must have a DB URL entry
         assert!(
             content.contains("DATABASE_URL") || content.contains("url"),
             "production config must document the database URL setting"
         );
-        // Must not contain real credentials (no 'password' in a non-commented line)
+        // No uncommented line may mention a secret.
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with('#') {
@@ -2354,10 +2306,8 @@ previous_secrets = []
 
     #[test]
     fn main_tf_postgres_server_does_not_hardcode_availability_zone() {
-        // Not every Container Apps region offers Postgres Flexible Server
-        // availability zone 1 — a hardcoded `zone = "1"` fails
-        // `terraform apply` in those regions even though an unzoned server
-        // would succeed. Omitting `zone` lets Azure pick a placement itself.
+        // Not every region offers Postgres Flexible Server zone 1, so a hardcoded `zone` fails
+        // `terraform apply` there. Omitting it lets Azure choose.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2367,9 +2317,7 @@ previous_secrets = []
             .nth(1)
             .and_then(|rest| rest.split("\n}").next())
             .expect("main.tf must declare the postgresql_flexible_server resource");
-        // Check for an actual `zone = ...` attribute assignment, not just
-        // the substring "zone" — the resource's own explanatory comment
-        // about why zone is omitted legitimately mentions the word.
+        // Match a `zone` attribute, not the word: the resource's comment mentions it.
         assert!(
             !server_block.lines().any(|l| {
                 let t = l.trim_start();
@@ -2381,9 +2329,7 @@ previous_secrets = []
 
     #[test]
     fn main_tf_postgres_database_name_is_length_bounded() {
-        // Postgres database identifiers are capped at 63 bytes; a 64
-        // -character Cargo package name (valid) would otherwise overflow
-        // it since the name was previously passed through unbounded.
+        // Postgres identifiers are capped at 63 bytes; a valid Cargo package name can be longer.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2413,14 +2359,9 @@ previous_secrets = []
 
     #[test]
     fn main_tf_postgres_database_name_avoids_reserved_names() {
-        // A fresh Flexible Server already owns "postgres", "azure_maintenance",
-        // and "azure_sys" as Azure-specific system databases, plus
-        // "template0"/"template1" — every Postgres cluster, on any host, is
-        // initialized with those two as its own templates. A Cargo package
-        // literally named one of those (or "azure-sys"/"template0", which
-        // sanitize to the same underscored form) must not collide with them,
-        // or `terraform apply` fails trying to create/manage a database that
-        // already exists.
+        // A Flexible Server already has the databases "postgres", "azure_maintenance",
+        // "azure_sys", "template0" and "template1". A package named one of those (or "azure-sys",
+        // which sanitizes to "azure_sys") must not collide, or `terraform apply` fails.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2472,11 +2413,8 @@ previous_secrets = []
 
     #[test]
     fn main_tf_wires_trusted_hosts_so_prod_actually_binds() {
-        // AUTUMN_PROFILE=prod makes fail_fast_on_invalid_trusted_hosts exit
-        // the process immediately when security.trusted_hosts.hosts is
-        // empty (see docs/guide/deployment.md's "Trusted hosts" section).
-        // Without this, the container never binds after the first real
-        // deploy — it would crash-loop instead of serving traffic.
+        // Under AUTUMN_PROFILE=prod an empty `security.trusted_hosts.hosts` makes the app exit at
+        // boot, so without this the container crash-loops instead of serving.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2496,11 +2434,9 @@ previous_secrets = []
 
     #[test]
     fn main_tf_grants_key_vault_access_to_terraform_identity() {
-        // Access-policy-model Key Vaults grant NO data-plane access by
-        // default (subscription-level Owner/Contributor does not imply Key
-        // Vault secret access), so without a policy for Terraform's own
-        // caller identity, `terraform apply` fails at the
-        // azurerm_key_vault_secret resources with a 403.
+        // Access-policy Key Vaults grant no data-plane access by default, even to subscription
+        // Owners, so without a policy for Terraform's caller `terraform apply` gets a 403 on the
+        // secrets.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2515,14 +2451,9 @@ previous_secrets = []
 
     #[test]
     fn main_tf_acr_pull_role_assignment_skips_aad_check() {
-        // The AcrPull grant targets the identity the SAME apply just
-        // created above it — Entra ID replication lag can make the role
-        // assignment fail with PrincipalNotFound before that object has
-        // propagated, even though the identity itself was created
-        // successfully. skip_service_principal_aad_check exists for
-        // exactly this "newly provisioned principal" case; a user-assigned
-        // identity's principal_id IS backed by a Service Principal object
-        // in Entra ID, so it applies here.
+        // The AcrPull grant targets an identity the same apply just created, and Entra ID
+        // replication lag can fail it with PrincipalNotFound. skip_service_principal_aad_check
+        // covers that case; a user-assigned identity is backed by a service principal.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2542,11 +2473,8 @@ previous_secrets = []
 
     #[test]
     fn main_tf_key_vault_name_never_exceeds_azure_length_limit() {
-        // Azure Key Vault names are capped at 24 characters. Extract the
-        // substr() bound and random_id byte_length from the template and
-        // verify the worst-case rendered name (prefix + "kv" + hex suffix)
-        // fits, so a future edit to either constant can't silently regress
-        // past the limit.
+        // Key Vault names are capped at 24 characters. Read the substr() bound and random_id
+        // byte_length from the template and check the worst-case name (prefix + "kv" + hex suffix).
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2575,10 +2503,8 @@ previous_secrets = []
 
     #[test]
     fn main_tf_sanitizes_names_consistently_via_shared_local() {
-        // Postgres Flexible Server and Redis Cache names must use the same
-        // sanitized local as ACR/Key Vault, not raw var.app_name — a Cargo
-        // package name may contain underscores/uppercase that are invalid
-        // in those resource names.
+        // Postgres and Redis names use the same sanitized local as ACR/Key Vault: a Cargo package
+        // name may contain underscores or uppercase, which those names reject.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2613,10 +2539,8 @@ previous_secrets = []
 
     #[test]
     fn main_tf_derives_database_url_from_created_postgres_server() {
-        // A single `terraform apply` must be enough: the connection string
-        // is computed from the Postgres server this same apply creates
-        // (its FQDN + the admin password variable), never taken as a
-        // separate pre-computed `var.database_url` input.
+        // One `terraform apply` must be enough: the connection string comes from the server this
+        // apply creates, not a separate `var.database_url` input.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2633,12 +2557,8 @@ previous_secrets = []
 
     #[test]
     fn main_tf_postgres_admin_login_is_alphanumeric() {
-        // Azure Database for PostgreSQL Flexible Server rejects
-        // administrator_login values containing anything but letters and
-        // digits (no underscore, no hyphen) — `terraform apply` fails
-        // while creating the server otherwise. Also assert the server
-        // resource and the derived database_url secret share a single
-        // local so they can't drift out of sync with each other.
+        // Flexible Server accepts only letters and digits in administrator_login. The server and
+        // the database_url secret must share one local so they cannot drift.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2678,13 +2598,9 @@ previous_secrets = []
 
     #[test]
     fn main_tf_container_apps_family_resources_use_sanitized_name() {
-        // Log Analytics, the Container Apps environment, the app, its
-        // container, and the migration job all require lowercase
-        // alphanumerics-and-hyphens — unlike ACR/Key Vault/Postgres/Redis,
-        // they DO allow hyphens, so they share `local.app_name_safe` (not
-        // `app_name_alnum`, which strips hyphens too) rather than raw
-        // `var.app_name`, which may contain underscores/uppercase from a
-        // Cargo package name.
+        // Log Analytics and the Container Apps resources allow lowercase alphanumerics and hyphens,
+        // so they use `local.app_name_safe`: `app_name_alnum` strips hyphens, and raw
+        // `var.app_name` may hold underscores or uppercase.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2722,11 +2638,9 @@ previous_secrets = []
 
     #[test]
     fn main_tf_app_name_safe_collapses_and_trims_hyphens() {
-        // Naively mapping every invalid character to "-" turns "my__app"
-        // into "my--app" (consecutive hyphens, invalid) and "my-" into a
-        // name with a trailing hyphen (also invalid — Container App names
-        // must end in an alphanumeric character). The locals must collapse
-        // hyphen runs and trim leading/trailing hyphens after substitution.
+        // Mapping each invalid character to "-" turns "my__app" into "my--app" and "my-" into a
+        // name ending in a hyphen; both are invalid. The locals must collapse hyphen runs and trim
+        // the ends.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2750,10 +2664,8 @@ previous_secrets = []
 
     #[test]
     fn main_tf_app_name_safe_is_length_bounded() {
-        // Azure Container Apps-family names must be 2-32 characters. A
-        // 1-character Cargo package name (valid) would produce a
-        // below-minimum app name; a >24-character one would push
-        // "${app_name_safe}-migrate" (8-char suffix) past the 32-char cap.
+        // Container Apps names must be 2-32 characters: a 1-character package name is too short,
+        // and past 24 characters "${app_name_safe}-migrate" exceeds 32.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2778,15 +2690,9 @@ previous_secrets = []
 
     #[test]
     fn main_tf_sanitized_locals_fall_back_when_input_sanitizes_to_nothing_or_a_digit() {
-        // A Cargo package name made entirely of characters sanitization strips — the
-        // legal but unusual name "_" — sanitizes to an empty string. That would produce
-        // a Postgres server name starting with "-" (the `${app_name_alnum}-pg-...`
-        // pattern), an empty Postgres database name, and a violation of resource types
-        // requiring a letter-led name, such as Key Vault, rather than merely
-        // alphanumeric, such as ACR. Both base locals must fall back to a fixed
-        // alphabetic prefix whenever sanitization leaves nothing, or leaves a value not
-        // starting with a letter — a leading digit survives sanitization, and several
-        // consumers reject it.
+        // A package name like "_" sanitizes to an empty string, and a leading digit survives
+        // sanitization. Key Vault, the Postgres server and others need a non-empty, letter-led
+        // name, so both base locals fall back to a fixed alphabetic prefix in either case.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2812,12 +2718,8 @@ previous_secrets = []
 
     #[test]
     fn main_tf_app_name_alnum_is_length_bounded() {
-        // ACR names are capped at 50 characters; "${app_name_alnum}acr" +
-        // an 8-hex-char suffix reserves 11, so an unbounded app_name_alnum
-        // (Cargo package names may be much longer than 39 characters)
-        // overflows it. Postgres (63) and Redis (63) are more permissive
-        // but derive from the same local, so bounding it once covers all
-        // three rather than truncating per-resource.
+        // ACR names are capped at 50 characters, and "acr" plus an 8-hex suffix take 11. Postgres
+        // and Redis (63) derive from the same local, so bounding it once covers all three.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2840,12 +2742,9 @@ previous_secrets = []
 
     #[test]
     fn main_tf_resource_group_and_identity_use_bounded_name() {
-        // Resource groups (90-char limit) and the user-assigned identity
-        // (128-char limit) are far more permissive than Container
-        // Apps-family resources, but a Cargo package name is unbounded —
-        // one longer than 87 characters overflows the resource group's own
-        // limit once "-rg" is appended. Both must use the already
-        // length-safe local.app_name_safe, not raw var.app_name.
+        // Resource groups (90 chars) and identities (128) are looser, but a package name is
+        // unbounded: past 87 characters, "-rg" overflows. Both use the length-safe
+        // `local.app_name_safe`.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2876,11 +2775,8 @@ previous_secrets = []
 
     #[test]
     fn main_tf_uses_bootstrap_image_and_ignores_later_image_drift() {
-        // Container Apps must pull an image to create the app's/job's first
-        // revision, but a brand-new ACR has none yet, so Terraform points
-        // both at a public placeholder and then ignores further image
-        // changes so a later `terraform apply` doesn't revert a live
-        // cutover or job deploy back to the placeholder.
+        // A new ACR has no image for the first revision, so the app and job start on a public
+        // placeholder and ignore later image changes: `terraform apply` must not revert a cutover.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2938,10 +2834,8 @@ previous_secrets = []
             content.contains("azurerm_key_vault_secret\" \"redis_url\""),
             "main.tf must store the Redis connection string in Key Vault: {content}"
         );
-        // The cutover sets the env vars (#2314). Autumn's config path is
-        // `[cache.redis] url` (env: AUTUMN_CACHE__REDIS__URL, double
-        // underscore before URL). Without AUTUMN_CACHE__BACKEND=redis,
-        // Autumn keeps its in-memory cache and never reads the URL.
+        // The cutover sets the env vars (#2314). Without AUTUMN_CACHE__BACKEND=redis, Autumn keeps
+        // its in-memory cache and never reads AUTUMN_CACHE__REDIS__URL.
         let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
         assert!(
             script.contains(r#"{name: "AUTUMN_CACHE__BACKEND", value: "redis"}"#)
@@ -2962,10 +2856,8 @@ previous_secrets = []
 
     #[test]
     fn main_tf_urlencodes_redis_access_key() {
-        // Azure Redis access keys are base64-like and may contain "/" — raw
-        // in a URL's userinfo segment, that would terminate the authority
-        // before "@hostname" and produce a malformed URL depending on the
-        // randomly issued key.
+        // Redis access keys may contain "/", which in a URL's userinfo would end the authority
+        // early.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2979,11 +2871,8 @@ previous_secrets = []
 
     #[test]
     fn main_tf_documents_redis_cache_requires_app_level_plugin() {
-        // Provisioning the cache and wiring its env vars is infrastructure
-        // only — Autumn's cache subsystem has no built-in Redis
-        // implementation (unlike sessions/channels/jobs), so the app must
-        // ALSO depend on autumn-cache-redis and register RedisCachePlugin,
-        // or the env vars are silently never read.
+        // Autumn's cache has no built-in Redis backend, so the app must also depend on
+        // autumn-cache-redis and register RedisCachePlugin, or the env vars are never read.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -3081,10 +2970,8 @@ previous_secrets = []
 
     #[test]
     fn azure_container_apps_defaults_to_zero_replicas_for_bootstrap_safety() {
-        // The initial Terraform-managed app revision uses a public placeholder image
-        // solely because Container Apps requires an image before the user's ACR has
-        // one. Keep it scaled to zero by default so that placeholder is not started
-        // with production secret refs or the app's Key Vault-capable identity.
+        // The first revision runs a public placeholder only because Container Apps needs an image
+        // before the ACR has one. Scale it to zero so it never starts with secrets or the identity.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7085,11 +6972,8 @@ esac
 
     #[test]
     fn variables_tf_does_not_declare_database_url() {
-        // A single `terraform apply` must succeed without a second, targeted
-        // apply to fill in a value that depends on a resource the same apply
-        // is about to create. main.tf derives the connection string from the
-        // Postgres server it creates instead of requiring this as an input —
-        // regression guard against reintroducing that two-apply footgun.
+        // main.tf derives the connection string from the Postgres server it
+        // creates. As an input, it would need a second, targeted apply.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7116,9 +7000,8 @@ esac
 
     #[test]
     fn main_tf_provider_sets_subscription_id() {
-        // AzureRM v4 made subscription_id mandatory for plan/apply, even
-        // under `az login` CLI auth — without it, `terraform apply` fails
-        // before provisioning anything.
+        // AzureRM v4 requires subscription_id for plan/apply, even under
+        // `az login` CLI auth.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7149,13 +7032,9 @@ esac
 
     #[test]
     fn tfvars_example_generates_postgres_compliant_admin_password() {
-        // Azure Postgres Flexible Server requires the admin password to use
-        // characters from at least 3 of {uppercase, lowercase, digit,
-        // symbol}. `openssl rand -hex` only ever produces lowercase hex
-        // digits (2 of 4 categories); even `-base64` alone only samples its
-        // alphabet randomly and could still land on just 2 categories. The
-        // command must deterministically guarantee coverage, not rely on
-        // probability, by appending a fixed suffix containing all 4.
+        // Azure Postgres Flexible Server requires 3 of {uppercase, lowercase,
+        // digit, symbol} in the admin password. Random `openssl rand` output
+        // can miss them, so a fixed suffix with all 4 guarantees it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7199,12 +7078,9 @@ esac
 
     #[test]
     fn outputs_tf_app_fqdn_is_the_stable_ingress_hostname_not_revision_specific() {
-        // azurerm_container_app.this.latest_revision_fqdn names a specific
-        // *revision*, not the app's stable ingress hostname — visiting it
-        // sends a different Host header than AUTUMN_SECURITY__
-        // TRUSTED_HOSTS__HOSTS allows (400), and it would go stale as soon
-        // as CI creates a new revision outside Terraform. Must use the same
-        // local.app_fqdn already wired into the trusted-hosts env var.
+        // latest_revision_fqdn names one revision, not the stable ingress
+        // hostname: its Host header fails the trusted-hosts check (400), and it
+        // goes stale when CI creates a revision. local.app_fqdn feeds that check.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7274,19 +7150,14 @@ esac
 
     #[test]
     fn azure_workflow_documents_resource_group_scope_rbac() {
-        // RBAC granted on the Container App does not inherit to the
-        // sibling migration Container Apps Job — a service principal with
-        // Contributor scoped only to the app would 403 when the migration
-        // step tries to start the job. The header must say resource-group
-        // scope, not "on the Container App".
+        // RBAC on the Container App does not reach the sibling migration job,
+        // so a principal scoped to the app gets 403 starting it. The header
+        // must say resource-group scope.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let content = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
-        // Scope to the header comment (before the workflow body) — the body
-        // legitimately contains `--resource-group` CLI flags, which would
-        // make a bare substring check pass regardless of whether the header
-        // actually documents the RBAC scoping requirement.
+        // Only the header: the body's `--resource-group` flags would match too.
         let header = content
             .split("\nname: azure-deploy")
             .next()
@@ -7325,10 +7196,8 @@ esac
 
     #[test]
     fn azure_workflow_passes_git_provenance_build_args_to_docker() {
-        // The Dockerfile's AUTUMN_BUILD_* ARGs default to empty unless
-        // passed at `docker build` time, and .dockerignore excludes .git
-        // from the build context — so without these, every image this
-        // workflow builds reports null git provenance at /actuator/info.
+        // The AUTUMN_BUILD_* ARGs default to empty and .dockerignore excludes
+        // .git, so without them /actuator/info reports no git provenance.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7349,13 +7218,9 @@ esac
 
     #[test]
     fn azure_workflow_updates_migration_job_image_before_starting_it() {
-        // `az containerapp job start --image ...` sends an execution-template override,
-        // which Azure treats as a full replacement rather than a merge. An override
-        // containing only `--image` drops the Terraform-configured `command` (autumn
-        // migrate) and the `AUTUMN_DATABASE__PRIMARY_URL` secret env, so the execution
-        // would run the container's default command with no DB URL instead of applying
-        // migrations. The image must instead be persisted onto the job's stored template
-        // via `job update --image` before a bare `job start` runs that complete template.
+        // `job start --image` sends an execution-template override that replaces the
+        // template, dropping the `autumn migrate` command and the database URL env.
+        // `job update --image` stores the image; a bare `job start` then runs it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7384,9 +7249,7 @@ esac
             "`job update` must be the one that carries --image: {update_block}"
         );
 
-        // `job start`'s own invocation (up to its `EXECUTION=$(...)` closing
-        // paren) must be bare — no --image — since sending one there would
-        // reintroduce the template-override bug this test guards against.
+        // The `job start` invocation, up to its `EXECUTION=$(...)` closing paren.
         let start_block_end = migration_step[start_pos..]
             .find("--query name -o tsv)")
             .map(|i| start_pos + i)
@@ -7402,12 +7265,9 @@ esac
 
     #[test]
     fn azure_workflow_migration_poll_budget_exceeds_job_timeout() {
-        // main.tf sets replica_timeout_in_seconds = 600 on the migration
-        // job; Azure self-terminates the execution at that point
-        // regardless. Polling for any less risks reporting "timed out" on
-        // a migration that's still validly running (and would have
-        // succeeded), while leaving it to keep mutating the schema in the
-        // background after this workflow has already given up.
+        // Azure stops the migration job at replica_timeout_in_seconds. A
+        // shorter poll would report a running migration as timed out and leave
+        // it changing the schema after the workflow gave up.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7507,13 +7367,9 @@ esac
 
     #[test]
     fn azure_workflow_sources_app_name_from_terraform_not_hardcoded() {
-        // If an operator edits `app_name` in terraform.tfvars after
-        // scaffolding, Terraform renames the Container App to match — the
-        // workflow must follow that rename, not target whatever the Cargo
-        // package was called when `autumn release init` ran. So it reads
-        // AZURE_APP_NAME from `terraform output app_name` (like
-        // AZURE_RESOURCE_GROUP/AZURE_MIGRATE_JOB_NAME) rather than having
-        // any project-derived name baked in at scaffold time.
+        // Editing `app_name` in terraform.tfvars renames the Container App, so
+        // the workflow reads AZURE_APP_NAME from `terraform output app_name`
+        // instead of a name baked in at scaffold time.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "My_Test_App");
         init(
@@ -7547,11 +7403,9 @@ esac
 
     #[test]
     fn azure_workflow_sanitizes_ref_name_for_docker_tag() {
-        // A `v*` push tag or a workflow_dispatch branch name may contain
-        // characters Docker tags reject beyond just "/" (a branch like
-        // "feature/login") — e.g. "+" (a valid SemVer tag like
-        // "v1.2.3+build"). Docker tags only allow [A-Za-z0-9_.-], so every
-        // other character must be sanitized, not just "/" special-cased.
+        // Docker tags allow only [A-Za-z0-9_.-]. Refs can hold "/"
+        // ("feature/login") and "+" ("v1.2.3+build"), so every other
+        // character is mapped, not just "/".
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7569,11 +7423,8 @@ esac
 
     #[test]
     fn azure_workflow_image_tag_never_starts_with_invalid_character() {
-        // Docker's tag grammar requires the first character to be a word
-        // character ([A-Za-z0-9_]) — "." and "-" are valid elsewhere but
-        // not at position zero. `tr` mapping invalid characters to "-" can
-        // leave one at the start (e.g. a ref beginning with "+"), which
-        // `docker build` rejects.
+        // A Docker tag must start with [A-Za-z0-9_]. The `tr` mapping can leave
+        // a leading "-" (a ref starting with "+"), which `docker build` rejects.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7591,17 +7442,10 @@ esac
 
     #[test]
     fn azure_workflow_image_tag_is_unique_per_execution() {
-        // Two workflow_dispatch runs on the same branch would otherwise compute the
-        // identical tag despite different commits, which the commit SHA guards against.
-        // But re-running workflow_dispatch on the same branch, or clicking "Re-run jobs"
-        // on an existing run, reuses the identical ref and commit while still producing a
-        // genuinely different build — a fresh `AUTUMN_BUILD_TIMESTAMP`, possibly
-        // different base-image bytes. So the tag must also include `GITHUB_RUN_ID`,
-        // unique per trigger, and `GITHUB_RUN_ATTEMPT`, which disambiguates re-runs of
-        // that trigger, to be unique per execution rather than per commit. Re-pushing
-        // bytes under a tag Azure already has configured on the Container App is not
-        // guaranteed to register as a revision-scope change, so the old binary could keep
-        // serving against a newly migrated schema.
+        // The SHA separates commits on one branch. A re-run reuses ref and commit but
+        // builds different bytes, so `GITHUB_RUN_ID` and `GITHUB_RUN_ATTEMPT` make the
+        // tag unique per execution. New bytes under a tag Azure already has may not
+        // create a revision, leaving the old binary on a migrated schema.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7616,9 +7460,7 @@ esac
              a re-run of the same trigger (same ref, same commit) never collides with \
              the original run's tag: {content}"
         );
-        // Docker tags cap at 128 characters; reserve room for the
-        // SHA/run-id/run-attempt suffix rather than letting the sanitized
-        // ref alone consume it.
+        // Docker tags cap at 128 characters; the ref leaves room for the suffix.
         assert!(
             content.contains("cut -c1-80"),
             "the sanitized ref portion must leave headroom for the rest of the tag \
@@ -7628,10 +7470,8 @@ esac
 
     #[test]
     fn azure_workflow_serializes_overlapping_runs() {
-        // Two overlapping runs (e.g. two rapid tag pushes, or a tag push
-        // racing a manual dispatch) must not interleave: the older run's
-        // later cutover (`azure-cutover.sh`) could run after the newer one
-        // and roll production back.
+        // Overlapping runs must not interleave: the older run's cutover could
+        // land after the newer one and roll production back.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7650,13 +7490,9 @@ esac
 
     #[test]
     fn azure_workflow_guards_against_superseded_run_before_migrating() {
-        // GitHub does not document strict FIFO ordering for which queued
-        // run in a concurrency group goes next. A same-ref check isn't
-        // enough either: two DIFFERENT immutable tags (e.g. v1 then v2)
-        // each trigger their own run against their own never-moving ref,
-        // so the guard must be ref-agnostic — comparing run_number (GitHub's
-        // own monotonic-in-trigger-order counter) against other runs of
-        // this workflow, not "has my own ref moved".
+        // GitHub does not promise FIFO order for queued runs in a concurrency
+        // group. A same-ref check misses two different tags (v1, then v2), so
+        // the guard compares run_number, which grows in trigger order.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -7670,14 +7506,9 @@ esac
             "the guard must compare against other runs' run_number, not just whether \
              this run's own ref has moved: {content}"
         );
-        // The guard must NOT filter by status/conclusion (e.g. only
-        // "in_progress"/"queued", or "completed" + conclusion == "success")
-        // — a newer run can migrate (the actual point of no return, since
-        // the schema is advanced at that point) and then fail on a LATER
-        // step, reporting an overall conclusion of "failure". There's no
-        // cheap way to tell "failed before migrating" apart from "failed
-        // after migrating" from a run's top-level status, so the mere
-        // existence of any newer run must be disqualifying, full stop.
+        // No status/conclusion filter: a newer run can migrate and then fail a
+        // later step, and its top-level status cannot tell that apart from a
+        // failure before migrating. Any newer run disqualifies this one.
         let guard_step = content
             .split("Abort if a newer run of this workflow exists")
             .nth(1)
@@ -7762,12 +7593,8 @@ esac
 
     #[test]
     fn azure_target_reasserts_a_gitignore_entry_negated_after_its_earlier_occurrence() {
-        // Git applies the LAST matching rule: an existing .gitignore with
-        // "terraform.tfvars" followed later by "!terraform.tfvars" makes
-        // the file trackable, even though the literal pattern is present.
-        // A naive "is this line already there" check would wrongly treat
-        // it as already protected and add nothing, letting an operator
-        // commit the plaintext secrets this scaffold exists to keep out.
+        // Git applies the last matching rule, so a later "!terraform.tfvars"
+        // makes the file trackable even though the pattern is present.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         fs::write(
@@ -7779,13 +7606,9 @@ esac
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let content = fs::read_to_string(dir.join(".gitignore")).unwrap();
 
-        // The negation must not have been touched (still there, doing its
-        // job for whatever the operator originally wanted un-ignored)...
+        // The operator's negation stays...
         assert!(content.contains("!terraform.tfvars"), "{content}");
-        // ...but "terraform.tfvars" must be re-asserted AFTER it (not just
-        // matched as a substring of "!terraform.tfvars" itself), since
-        // that's the only way to make it the final (and therefore
-        // effective) matching rule again.
+        // ...and the pattern is re-added after it, so it is the last rule.
         let after_negation = content.find("!terraform.tfvars").unwrap() + "!terraform.tfvars".len();
         assert!(
             content[after_negation..].contains("terraform.tfvars"),
@@ -7795,12 +7618,8 @@ esac
 
     #[test]
     fn azure_target_reasserts_entry_after_a_broader_wildcard_negation() {
-        // A wildcard negation like "!*.tfvars" or a blanket "!*" also
-        // un-ignores "terraform.tfvars" under git's own semantics, not
-        // just an exact "!terraform.tfvars" match. Matching gitignore's
-        // full glob syntax is out of scope, so any negation line
-        // appearing after the pattern must conservatively be treated as
-        // potentially applying to it.
+        // "!*.tfvars" or "!*" un-ignore the file too. The merge does not match
+        // globs, so any later negation is treated as applying to it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         fs::write(dir.join(".gitignore"), "terraform.tfvars\n!*.tfvars\n").unwrap();
@@ -7818,11 +7637,9 @@ esac
 
     #[test]
     fn azure_target_propagates_gitignore_read_errors_instead_of_clobbering_it() {
-        // A read failure that ISN'T "file doesn't exist" (invalid UTF-8,
-        // permission denied, ...) must not be silently treated as "no
-        // file" — doing so would make the merge overwrite the operator's
-        // real (if unreadable-by-us) .gitignore with just the Terraform
-        // entries, destroying whatever rules were already there.
+        // A read failure other than "not found" (invalid UTF-8, permission
+        // denied) must not count as no file, or the merge overwrites the
+        // operator's rules with only the Terraform entries.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         fs::write(dir.join(".gitignore"), [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
@@ -7833,17 +7650,14 @@ esac
             "an unreadable .gitignore must surface as an I/O error, not be silently \
              replaced: {err}"
         );
-        // The original (if unreadable) content must be left untouched.
         let raw = fs::read(dir.join(".gitignore")).unwrap();
         assert_eq!(raw, vec![0xFF, 0xFE, 0x00, 0xFF]);
     }
 
     #[test]
     fn azure_target_gitignore_failure_leaves_no_partial_scaffold() {
-        // The .gitignore merge must be validated BEFORE any scaffold file
-        // is written — otherwise a read failure here leaves a partial,
-        // complete-looking scaffold on disk, and a retry without --force
-        // immediately fails on the files this very call just created.
+        // The .gitignore merge is checked before any file is written. A partial
+        // scaffold would make a retry without --force fail on its own files.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         fs::write(dir.join(".gitignore"), [0xFF, 0xFE, 0x00, 0xFF]).unwrap();
@@ -7912,7 +7726,6 @@ esac
             !content.contains("AUTUMN_ROLE"),
             "default (combined) docker-compose.yml must not pin a process role: {content}"
         );
-        // No leftover template placeholders.
         assert!(
             !content.contains("{{"),
             "docker-compose.yml must not contain unsubstituted placeholders: {content}"
@@ -7930,7 +7743,6 @@ esac
             content.contains("worker:"),
             "--split-workers must scaffold a worker service: {content}"
         );
-        // Worker runs the SAME image as the web/app service.
         assert_eq!(
             content.matches("build: .").count(),
             3,
@@ -7944,13 +7756,11 @@ esac
             content.contains("AUTUMN_ROLE: web"),
             "app service must run the web role when split: {content}"
         );
-        // Both tiers must use a durable jobs backend (not in-process `local`).
         assert_eq!(
             content.matches("AUTUMN_JOBS__BACKEND: postgres").count(),
             2,
             "both app and worker must share the durable postgres jobs backend: {content}"
         );
-        // Worker shares the migration gate and signing secret.
         assert!(
             content.contains("condition: service_completed_successfully"),
             "worker must wait for the one-shot migration job: {content}"
@@ -7961,7 +7771,6 @@ esac
             ),
             "worker must pass the required signing secret like the app service: {content}"
         );
-        // Placeholders (including the worker block's own project name) resolved.
         assert!(
             !content.contains("{{"),
             "split docker-compose.yml must not contain unsubstituted placeholders: {content}"
@@ -7974,8 +7783,6 @@ esac
 
     #[test]
     fn split_workers_only_affects_docker_compose_output() {
-        // The split-topology flag is scoped to the compose file; the Dockerfile
-        // and other scaffolds are byte-for-byte identical regardless.
         let default_dockerfile = render(templates::DOCKERFILE, "my-app", false, false);
         let split_dockerfile = render(templates::DOCKERFILE, "my-app", false, true);
         assert_eq!(
@@ -8011,10 +7818,7 @@ esac
 
     #[test]
     fn nested_workflow_relocation_warning_is_silent_at_the_git_root() {
-        // The common case: `dir` IS the git repository root (a single-crate
-        // repo, or a workspace member the user happens to be running from
-        // the top of anyway). `.github/workflows/azure-deploy.yml` lands
-        // exactly where GitHub looks for it — nothing to warn about.
+        // At the git root the workflow lands where GitHub looks for it.
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
         fs::create_dir_all(dir.join(".git")).unwrap();
@@ -8026,12 +7830,9 @@ esac
 
     #[test]
     fn nested_workflow_relocation_warning_flags_a_nested_workspace_member() {
-        // `autumn release init` explicitly supports running from a Cargo
-        // workspace member directory (read_project_name only rejects the
-        // workspace root itself) — but GitHub Actions only discovers
-        // workflows under the git repository ROOT's .github/workflows/, so
-        // a workflow written under a member subdirectory would silently
-        // never fire. This must be flagged, not silently mis-scaffolded.
+        // `autumn release init` runs from a workspace member, but GitHub only
+        // reads workflows under the git root's .github/workflows/, so a
+        // workflow written under a member would never fire.
         let tmp = TempDir::new().unwrap();
         let git_root = tmp.path().to_path_buf();
         fs::create_dir_all(git_root.join(".git")).unwrap();
@@ -8171,8 +7972,8 @@ esac
 
     #[test]
     fn aws_app_runner_target_does_not_create_a_workflow() {
-        // Per the issue: aws-app-runner is the fast/minimal path with no CI
-        // workflow (unlike azure-container-apps and aws-ecs).
+        // aws-app-runner is the minimal path: no CI workflow, unlike
+        // azure-container-apps and aws-ecs.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         let files = init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
@@ -8236,10 +8037,8 @@ esac
 
     #[test]
     fn aws_app_runner_main_tf_has_nat_gateway_for_general_egress() {
-        // network_configuration.egress_configuration.egress_type = "VPC"
-        // routes ALL of the app's own outbound traffic through the private
-        // subnets, not just RDS-bound traffic — without a NAT gateway, any
-        // outbound call the app itself makes would silently hang or fail.
+        // egress_type = "VPC" routes all outbound traffic through the private
+        // subnets, so without a NAT gateway every non-RDS call hangs or fails.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
@@ -8280,10 +8079,8 @@ esac
 
     #[test]
     fn aws_app_runner_provisions_a_reachable_one_shot_migration_task() {
-        // App Runner has no release-phase hook of its own, and RDS is
-        // private with no public entry point — main.tf must provision SOME
-        // real, reachable compute for `autumn migrate` to run against,
-        // rather than leaving that to unwritten operator infrastructure.
+        // App Runner has no release-phase hook and RDS is private, so main.tf
+        // provisions compute inside the VPC for `autumn migrate`.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
@@ -8316,11 +8113,8 @@ esac
 
     #[test]
     fn aws_app_runner_migration_task_reuses_the_vpc_connector_security_group() {
-        // RDS's ingress rule (aws_security_group.database) only trusts
-        // aws_security_group.vpc_connector as a source — the migration
-        // task must be run with that SAME security group attached (via the
-        // vpc_connector_security_group_id output) rather than provisioning
-        // a second, parallel security group RDS's rule doesn't know about.
+        // RDS's ingress rule only trusts aws_security_group.vpc_connector, so
+        // the migration task runs with that group, exported as an output.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
@@ -8431,11 +8225,9 @@ esac
 
     #[test]
     fn aws_app_runner_instance_sizing_vars_stay_terraform_managed_after_cutover() {
-        // Issue #2256: the cutover call (docs/guide/deployment.md) only
-        // ever sets instance_role_arn, never cpu/memory. Ignoring the whole
-        // instance_configuration block — not just the role field — used to
-        // suppress a later `terraform apply` from resizing the service
-        // even after an operator changed var.instance_cpu/instance_memory.
+        // The cutover call only sets instance_role_arn. Ignoring all of
+        // instance_configuration would stop `terraform apply` from applying
+        // var.instance_cpu/instance_memory changes (#2256).
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
@@ -8464,9 +8256,8 @@ esac
 
     #[test]
     fn aws_app_runner_instance_sizing_vars_are_declared_and_wired() {
-        // Guards the other half of issue #2256's fix: a narrowed
-        // `ignore_changes` is worthless if instance_cpu/instance_memory
-        // stop being declared or wired into instance_configuration.
+        // The narrowed `ignore_changes` only helps while instance_cpu and
+        // instance_memory are declared and wired in (#2256).
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
@@ -8499,13 +8290,9 @@ esac
 
     #[test]
     fn aws_app_runner_bootstrap_health_check_matches_the_placeholder_not_the_real_app() {
-        // aws_apprunner_service blocks `terraform apply` until the service
-        // reaches a stable state — declaring port 3000 / path "/ready"
-        // against a bootstrap image that doesn't serve either would hang
-        // the very first apply. The placeholder (nginx) listens on 80 and
-        // returns 200 for "/" by default; the real port/path are restored
-        // by the deploy walkthrough's cutover call, which owns App
-        // Runner's mutable, service-level health check configuration.
+        // `terraform apply` waits for the service to be stable, so a check on
+        // port 3000 / "/ready" would hang against the nginx placeholder, which
+        // serves "/" on 80. The cutover call sets the real port and path.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
@@ -8529,12 +8316,8 @@ esac
 
     #[test]
     fn aws_app_runner_ignores_health_check_drift_after_cutover_restores_it() {
-        // The cutover call (docs/guide/deployment.md) switches
-        // health_check_configuration from the bootstrap's "/" to the real
-        // app's "/ready" — without ignoring this block too, a later
-        // `terraform apply` would see that as drift from this resource's
-        // own declared "/" and revert it, breaking the real app's health
-        // check.
+        // The cutover call switches the health check from "/" to "/ready". A
+        // later `terraform apply` would otherwise revert it as drift.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
@@ -8688,10 +8471,8 @@ esac
 
     #[test]
     fn aws_app_runner_region_output_reflects_the_configured_region_variable() {
-        // The deploy walkthrough sources AWS_REGION from this output so
-        // every `aws` CLI call targets the same region Terraform
-        // provisioned into, regardless of the operator's ambient CLI
-        // config — it must echo var.region, not a hardcoded default.
+        // The deploy walkthrough sets AWS_REGION from this output, so every
+        // `aws` call targets the region Terraform used.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
@@ -8701,11 +8482,8 @@ esac
 
     #[test]
     fn aws_app_runner_secret_arn_outputs_reference_the_real_secrets() {
-        // The deploy walkthrough's cutover `update-service` call must
-        // re-supply RuntimeEnvironmentSecrets (the call replaces the image
-        // configuration wholesale, not merges it) — these outputs are how
-        // it gets the ARNs, so they must point at the actual secrets, not
-        // just exist as a name.
+        // The cutover `update-service` call replaces the image configuration,
+        // so it re-supplies RuntimeEnvironmentSecrets from these ARNs.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsAppRunner, false).unwrap();
@@ -8722,11 +8500,8 @@ esac
 
     #[test]
     fn aws_app_runner_gitignore_merge_is_idempotent_on_repeat_init() {
-        // The merge function itself is exhaustively tested against the
-        // shared azure-container-apps target (idempotency, negation
-        // re-assertion, I/O-failure propagation); this pins that the
-        // aws-app-runner call site is actually wired to it under --force,
-        // not just on a fresh project.
+        // The merge is tested on azure-container-apps; this pins that
+        // aws-app-runner uses it under --force too.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         fs::write(dir.join(".gitignore"), "/target\n.env\n").unwrap();
@@ -8858,9 +8633,8 @@ esac
 
     #[test]
     fn aws_ecs_alb_and_target_group_names_never_exceed_32_char_limit() {
-        // ALB and target group names are capped at 32 characters by AWS.
-        // Extract the substr() bound in the sanitization local and verify
-        // the worst-case rendered name (base + longest suffix) fits.
+        // AWS caps ALB and target group names at 32 characters. The capped
+        // base plus the longest suffix must fit.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -8917,14 +8691,10 @@ esac
 
     #[test]
     fn aws_ecs_service_waits_for_secret_versions_before_starting() {
-        // local.container_secrets only references the secret CONTAINERS
-        // (aws_secretsmanager_secret.*.arn), so Terraform's implicit
-        // dependency graph doesn't wait for the *_version resources that
-        // actually write the secret values — without an explicit
-        // depends_on, the service can schedule tasks before RDS's derived
-        // database_url value (or, when enabled, Redis's) exists, and the
-        // deployment circuit breaker can permanently fail the first
-        // deployment as a result.
+        // local.container_secrets references only the secret ARNs, not the
+        // *_version resources that write the values. Without depends_on, tasks
+        // can start before the values exist and the circuit breaker fails the
+        // first deployment.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -8948,11 +8718,9 @@ esac
 
     #[test]
     fn aws_ecs_service_waits_for_execution_role_policies_before_starting() {
-        // The task definition's execution_role_arn only orders creation
-        // after the ROLE itself, not the policies attached to it — without
-        // an explicit depends_on, tasks could be scheduled before the
-        // execution role can actually pull the image, ship logs, or inject
-        // secrets, failing during resource initialization.
+        // execution_role_arn orders creation after the role, not its policies.
+        // Without depends_on, tasks can start before the role may pull the
+        // image, ship logs or inject secrets.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9028,13 +8796,9 @@ esac
 
     #[test]
     fn aws_ecs_migrate_task_carries_the_full_app_secret_set() {
-        // Issue #2255: CI (and the manual walkthrough) copy the "migrate"
-        // task definition's `secrets` onto the "app" task definition when
-        // registering the real image. A migrate task that only reads
-        // AUTUMN_DATABASE__PRIMARY_URL therefore strips the signing secret
-        // (and Redis URL) from every real app deploy. The migrate task must
-        // carry the SAME secret set as the app, not just what `autumn
-        // migrate` itself needs.
+        // CI and the manual walkthrough copy the migrate task's `secrets` onto
+        // the app task when registering the real image, so the migrate task
+        // carries the app's full secret set, not only the database URL (#2255).
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9055,10 +8819,7 @@ esac
              inline: {migrate}"
         );
 
-        // The migrate task only reuses `local.container_secrets` — confirm
-        // that local itself carries all three secrets (database URL,
-        // signing secret, and the Redis URL gated by enable_redis_cache),
-        // so reuse alone is not enough if that local ever narrows.
+        // Reuse only helps while the local itself carries all three secrets.
         let container_secrets_local = content
             .split("container_secrets = concat(")
             .nth(1)
@@ -9084,11 +8845,8 @@ esac
 
     #[test]
     fn aws_ecs_ignores_desired_count_drift_managed_by_autoscaling() {
-        // Application Auto Scaling changes desired_count directly at
-        // runtime — without ignoring it, a later `terraform apply` would
-        // treat a live scaling decision as drift from var.desired_count
-        // and forcibly reset capacity, either yanking it during a load
-        // spike or adding unwanted tasks right after a scale-in.
+        // Application Auto Scaling changes desired_count at runtime. A later
+        // `terraform apply` would otherwise reset it to var.desired_count.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9106,12 +8864,9 @@ esac
 
     #[test]
     fn aws_ecs_app_bootstrap_container_actually_listens_on_the_alb_health_check_port() {
-        // Unlike App Runner, the ALB target group's health check (port
-        // 3000, path /ready) is a PERMANENT Terraform-managed resource —
-        // there's no separate "swap it back after cutover" step available,
-        // so the bootstrap container must satisfy it directly. The public
-        // placeholder (nginx) doesn't do this out of the box; the "app"
-        // container must override its entrypoint/command to configure it.
+        // Unlike App Runner, the target group's health check (port 3000,
+        // /ready) never changes after cutover, so the bootstrap container
+        // overrides nginx's entrypoint to serve it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9136,10 +8891,8 @@ esac
             "the app container's bootstrap command must serve the same /ready path the \
              target group checks: {app_block}"
         );
-        // The "migrate" task's command is already overridden to run `autumn
-        // migrate` and is never actually invoked against the bootstrap
-        // image in practice (CI always registers a real-image revision
-        // first) — it doesn't need the nginx trick.
+        // The migrate task never runs the bootstrap image (CI registers a real
+        // revision first), so it keeps its `autumn migrate` command.
         let migrate_block = content
             .split("resource \"aws_ecs_task_definition\" \"migrate\"")
             .nth(1)
@@ -9171,10 +8924,8 @@ esac
 
     #[test]
     fn aws_ecs_trusted_hosts_uses_the_required_domain_name_variable() {
-        // Unlike App Runner (whose subdomain is only known after the
-        // service is created), ECS's ALB serves under the operator-supplied
-        // domain_name, known before the apply even starts — so trusted
-        // hosts can be set correctly on the very first apply.
+        // Unlike App Runner's generated subdomain, domain_name is known before
+        // the apply, so trusted hosts are right on the first apply.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9375,10 +9126,8 @@ esac
 
     #[test]
     fn aws_ecs_region_output_reflects_the_configured_region_variable() {
-        // Both the deploy walkthrough's exported AWS_REGION env var and
-        // aws-deploy.yml's documented AWS_REGION repo variable are meant to
-        // be sourced from this output, so it must echo var.region, not a
-        // hardcoded default.
+        // The walkthrough's AWS_REGION and aws-deploy.yml's AWS_REGION repo
+        // variable both come from this output.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9388,10 +9137,8 @@ esac
 
     #[test]
     fn aws_ecs_execution_and_task_role_arns_are_both_exported_for_ci_pass_role_grants() {
-        // aws-deploy.yml's header comment tells operators to grant the CI
-        // deploy role iam:PassRole on both roles' ARNs "terraform output
-        // prints" — that promise is only true if both are actually
-        // exported outputs, not just Terraform-internal resources.
+        // aws-deploy.yml's header tells operators to grant iam:PassRole on both
+        // role ARNs that `terraform output` prints.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9480,11 +9227,8 @@ esac
 
     #[test]
     fn aws_workflow_never_uses_the_invalid_output_none_value() {
-        // The AWS CLI's --output only accepts json/yaml/yaml-stream/text/
-        // table/off — "none" isn't a valid value and makes the command
-        // exit non-zero instead of suppressing output. Discarding via
-        // shell redirection works regardless of CLI version (older
-        // versions may not support "off" either).
+        // "none" is not a valid AWS CLI --output value: the command exits
+        // non-zero. Older CLIs lack "off" too, so output goes to a redirect.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9594,11 +9338,9 @@ esac
 
     #[test]
     fn aws_workflow_grants_actions_read_for_the_staleness_guard() {
-        // Declaring `permissions:` at all switches GITHUB_TOKEN from its
-        // default repo scopes to exactly the listed allow-list. The
-        // "Abort if a newer run" step calls the Actions API via `gh api`,
-        // which needs `actions: read` — without it that step 403s on every
-        // single run, after the image has already built and pushed.
+        // A `permissions:` block limits GITHUB_TOKEN to the listed scopes. The
+        // staleness guard's `gh api` call needs `actions: read`, or it 403s on
+        // every run.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9617,10 +9359,8 @@ esac
 
     #[test]
     fn aws_workflow_documents_describe_task_definition_permission() {
-        // The task-definition re-registration steps call
-        // `aws ecs describe-task-definition` before `register-task-definition`
-        // — a distinct IAM action the documented CI role policy must list,
-        // or the very first deploy 403s before ever reaching migration.
+        // The registration steps call `describe-task-definition`, a separate IAM
+        // action. Without it in the CI role policy the first deploy 403s.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9642,11 +9382,9 @@ esac
 
     #[test]
     fn aws_workflow_subnet_ids_env_is_used_as_json_directly_not_reparsed_from_csv() {
-        // ECS_PRIVATE_SUBNET_IDS is documented as the compact JSON array
-        // `terraform output -json private_subnet_ids | jq -c .` prints. The
-        // migration step must consume it as JSON directly (a bare
-        // `tr ',' '\n' | jq -R . | jq -s -c .` reconstruction would mangle
-        // a real JSON array like ["subnet-1","subnet-2"] into garbage).
+        // ECS_PRIVATE_SUBNET_IDS is already the JSON array that
+        // `terraform output -json private_subnet_ids | jq -c .` prints. A
+        // comma-split rebuild would mangle it.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9699,13 +9437,9 @@ esac
 
     #[test]
     fn aws_workflow_strips_bootstrap_entrypoint_only_from_the_app_registration() {
-        // Terraform's bootstrap "app" task definition overrides entryPoint and command
-        // so the placeholder nginx image satisfies the ALB health check (main.tf).
-        // `describe-task-definition` would otherwise carry that override forward onto the
-        // real image, which has no nginx and runs as an unprivileged user, so the
-        // container would exit immediately instead of falling through to its own
-        // Dockerfile ENTRYPOINT/CMD. The "migrate" family's own `command` (autumn
-        // migrate) is intentional and permanent, so its registration step must not strip it.
+        // The bootstrap "app" task overrides entryPoint and command for nginx. Carried
+        // onto the real image, which has no nginx, the container would exit at once.
+        // The migrate task's `autumn migrate` command is permanent and stays.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9750,13 +9484,9 @@ esac
 
     #[test]
     fn aws_workflow_detects_circuit_breaker_rollback_after_stabilizing() {
-        // `services-stable`'s predicate only requires ONE deployment to
-        // have runningCount == desiredCount — if the new revision failed
-        // its health checks, the circuit breaker rolls the service back to
-        // the PREVIOUS revision, and that older deployment satisfies the
-        // waiter just as well. Without an explicit check, this step would
-        // report success even though the requested task definition was
-        // never actually running.
+        // `services-stable` passes when any one deployment is at its desired
+        // count. After a circuit-breaker rollback the previous revision
+        // satisfies it, so the step checks the PRIMARY task definition.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9781,12 +9511,9 @@ esac
 
     #[test]
     fn aws_workflow_stops_migration_task_on_timeout() {
-        // ECS tasks have no runtime limit of their own; without an
-        // explicit stop-task call, a migration that exceeds its polling
-        // budget keeps running in the background after this job gives up
-        // and releases the concurrency group — letting a later deploy
-        // start a second migration while the timed-out one is still
-        // mutating the schema.
+        // ECS tasks have no runtime limit. A timed-out migration left running
+        // would overlap the next deploy's migration once the concurrency
+        // group is released.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AwsEcs, false).unwrap();
@@ -9879,7 +9606,6 @@ esac
                 "{name} must be created for --target=gcp-cloud-run"
             );
         }
-        // Base scaffolding is still emitted alongside the GCP-specific files.
         assert!(dir.join("Dockerfile").is_file());
         assert!(dir.join(".dockerignore").is_file());
         assert!(dir.join("autumn.production.toml.example").is_file());
@@ -9983,15 +9709,10 @@ esac
 
     #[test]
     fn gcp_vpc_connector_name_respects_the_weighted_21_char_limit() {
-        // Serverless VPC Access connector names must stay under 21 characters, where
-        // each hyphen counts as two toward that limit. Google's own docs: "must be less
-        // than 21 characters long, and ... hyphens (-) count as two characters" — an
-        // undocumented-in-the-provider quirk distinct from the RFC 1035 label rule every
-        // other resource here follows. A 10-letter, hyphen-free base ("abcdefghij") plus
-        // the fixed "-connector" suffix already sits at the weighted boundary (10 + 2 + 9
-        // = 21, rejected), so a naive raw character cap — this scaffold's previous
-        // 15-character cap — is far too permissive, and any cap that does not first strip
-        // hyphens from the base can blow the budget on hyphens alone.
+        // Serverless VPC Access connector names must be under 21 characters, and each
+        // hyphen counts as two (Google's docs; the provider does not check it). A
+        // 10-letter base plus "-connector" is already 21, so the base drops hyphens and
+        // is capped at 9.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10010,11 +9731,8 @@ esac
 
     #[test]
     fn gcp_main_tf_vpc_network_waits_for_compute_api_activation() {
-        // Nothing in google_compute_network.this references an attribute of
-        // google_project_service.apis, so without an explicit depends_on,
-        // Terraform has no reason to order network creation after API
-        // enablement — on a fresh project it can race the enablement and
-        // fail the first `terraform apply`.
+        // The network references nothing from google_project_service.apis, so
+        // without depends_on it can race API enablement on a fresh project.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10034,11 +9752,8 @@ esac
 
     #[test]
     fn gcp_redis_instance_name_stays_under_memorystores_40_char_limit() {
-        // app_name_safe alone is already capped at 40 (Memorystore's own
-        // limit) — appending the fixed "-redis" suffix on top of it would
-        // overflow the limit for any sanitized name longer than 34
-        // characters, exactly the class of bug the VPC connector's own
-        // shorter budget already guards against.
+        // app_name_safe is capped at 40, Memorystore's limit, so the "-redis"
+        // suffix needs a base capped at 34.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10058,10 +9773,8 @@ esac
 
     #[test]
     fn gcp_service_account_waits_for_iam_api_activation() {
-        // Nothing in google_service_account.cloud_run references an
-        // attribute of google_project_service.apis, so without an explicit
-        // depends_on, Terraform has no reason to order it after the IAM API
-        // is enabled — on a fresh project this fails with SERVICE_DISABLED.
+        // The service account references nothing from google_project_service.apis,
+        // so without depends_on a fresh project fails with SERVICE_DISABLED.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10141,15 +9854,10 @@ esac
 
     #[test]
     fn gcp_main_tf_secret_refs_pin_the_created_version_not_latest() {
-        // Cloud Run resolves a `secret_key_ref`'s version once, when a new revision is
-        // created; an already-running revision's instances never re-read "latest". If the
-        // env block kept the literal string "latest", rotating `database_admin_password`
-        // or `signing_secret` via Terraform — which creates a new
-        // `google_secret_manager_secret_version` — would change nothing Terraform sees as
-        // a diff in the Cloud Run service or job spec, so no new revision would roll out.
-        // The whole fleet would stay pinned to the old secret value while Cloud SQL had
-        // already started requiring the new password. Referencing the version resource's
-        // own `.version` attribute makes a rotation a diff, and rolls out a new revision.
+        // Cloud Run resolves a `secret_key_ref` version once per revision. With
+        // "latest", a Terraform rotation is no diff in the service spec, so no revision
+        // rolls out and the fleet keeps the old value. Pinning `.version` makes a
+        // rotation a diff.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10175,15 +9883,9 @@ esac
 
     #[test]
     fn gcp_database_url_secret_version_waits_for_sql_user_password_update() {
-        // Unlike AWS RDS, where the master password lives on the DB instance resource
-        // itself and referencing its `.address` already creates an implicit ordering
-        // edge, Cloud SQL splits the instance and its user credentials into two
-        // independent resources: `google_sql_database_instance.this`, referenced for the
-        // private IP, and `google_sql_user.this`, which owns `password`. Without an
-        // explicit dependency, rotating `database_admin_password` gives Terraform no
-        // reason to apply the `google_sql_user.this` password update before this secret
-        // version — so the Cloud Run revision that version triggers, via the pinned
-        // `.version`, could start using the new password before Cloud SQL accepts it.
+        // Cloud SQL keeps the password on `google_sql_user.this`, not on the instance
+        // the URL references. Without depends_on, a rotation can publish the secret
+        // version, and roll out a revision, before Cloud SQL accepts the new password.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10205,11 +9907,8 @@ esac
 
     #[test]
     fn gcp_main_tf_secret_access_is_scoped_per_secret_not_project_wide() {
-        // A project-wide `roles/secretmanager.secretAccessor` grant (via
-        // google_project_iam_member) would let a compromised container read
-        // every secret in the project — the grant must instead be scoped to
-        // exactly the secrets this app uses via
-        // google_secret_manager_secret_iam_member.
+        // A project-wide secretAccessor grant would let a compromised container
+        // read every secret in the project.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10227,11 +9926,8 @@ esac
 
     #[test]
     fn gcp_main_tf_wires_trusted_hosts_so_prod_actually_binds() {
-        // AUTUMN_PROFILE=prod makes fail_fast_on_invalid_trusted_hosts exit
-        // the process immediately when security.trusted_hosts.hosts is
-        // empty (see docs/guide/deployment.md's "Trusted hosts" section).
-        // Without this, the container never binds after the first real
-        // deploy — it would crash-loop instead of serving traffic.
+        // Under AUTUMN_PROFILE=prod an empty trusted-hosts list exits at boot,
+        // so without it the real deploy crash-loops.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10255,9 +9951,8 @@ esac
 
     #[test]
     fn gcp_main_tf_grants_public_invoker_access() {
-        // Cloud Run services default to requiring IAM-authenticated
-        // invocations — without an explicit allUsers invoker grant, the
-        // deployed app would 403 every request from a browser.
+        // Cloud Run requires IAM-authenticated invocations by default; without
+        // an allUsers invoker grant every browser request gets 403.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10311,12 +10006,9 @@ esac
 
     #[test]
     fn gcp_main_tf_redis_api_is_gated_behind_enable_redis_cache() {
-        // Every core resource (VPC, Artifact Registry, service account,
-        // Secret Manager) depends on the ENTIRE google_project_service.apis
-        // for_each set — unconditionally including redis.googleapis.com
-        // would mean a project/org policy that merely disallows Redis
-        // (even with enable_redis_cache left false, Redis never requested)
-        // fails the whole apply, not just the optional Redis piece.
+        // Core resources depend on the whole google_project_service.apis set,
+        // so an always-on Redis API would fail the apply wherever a policy
+        // disallows Redis, even with enable_redis_cache false.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10330,12 +10022,8 @@ esac
 
     #[test]
     fn gcp_main_tf_psa_range_is_explicit_and_wont_collide_with_connector_cidr() {
-        // Both the PSA global address and the VPC connector are
-        // independently scheduled after network creation; if Google
-        // auto-picked the PSA /16 and it happened to contain the
-        // connector's CIDR, one of the two creations would fail with an
-        // overlap error. An explicit, documented address removes the
-        // ambiguity entirely.
+        // An auto-allocated PSA /16 could contain the connector's CIDR and fail
+        // one of the two creations with an overlap error.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10393,11 +10081,8 @@ esac
 
     #[test]
     fn gcp_main_tf_wires_redis_env_vars_into_cloud_run_service() {
-        // Provisioning the Redis instance alone does nothing — Autumn's
-        // cache subsystem only activates it via these two env vars. A
-        // regression dropping the `dynamic "env"` blocks would silently
-        // leave the (paid) Memorystore instance unused while every other
-        // "redis is gated" assertion still passes.
+        // The cache uses Redis only through these two env vars; without them the
+        // paid Memorystore instance sits unused.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10452,16 +10137,11 @@ esac
             "vpcaccess.googleapis.com",
             "artifactregistry.googleapis.com",
             "servicenetworking.googleapis.com",
-            // google_compute_network / google_compute_global_address are
-            // Compute Engine resources — a fresh project without this API
-            // pre-enabled would fail the very first apply at VPC creation.
+            // The VPC and global address are Compute Engine resources.
             "compute.googleapis.com",
-            // google_service_account.cloud_run fails with SERVICE_DISABLED
-            // on a fresh project without this API pre-enabled.
+            // The Cloud Run service account fails with SERVICE_DISABLED without it.
             "iam.googleapis.com",
-            // data.google_project.this reads project metadata through the
-            // Cloud Resource Manager API — a fresh project without this API
-            // pre-enabled fails at plan time with SERVICE_DISABLED.
+            // data.google_project.this reads through this API at plan time.
             "cloudresourcemanager.googleapis.com",
         ] {
             assert!(
@@ -10473,13 +10153,9 @@ esac
 
     #[test]
     fn gcp_main_tf_project_data_source_waits_for_resourcemanager_api_activation() {
-        // data.google_project.this is a data source, which Terraform will
-        // otherwise try to read during the initial refresh/plan phase —
-        // before google_project_service.apis has run — on a fresh project
-        // where cloudresourcemanager.googleapis.com isn't enabled yet, that
-        // read fails with SERVICE_DISABLED before any resource here even
-        // starts creating. depends_on defers a data source's read until
-        // after its dependencies have applied.
+        // Terraform reads a data source at plan time, before the APIs are
+        // enabled, so a fresh project fails with SERVICE_DISABLED. depends_on
+        // defers the read until the APIs are applied.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10499,14 +10175,9 @@ esac
 
     #[test]
     fn gcp_main_tf_redis_avoids_a_tls_mode_the_client_cant_verify() {
-        // Memorystore's SERVER_AUTHENTICATION mode presents a private,
-        // instance-specific CA — not a publicly-trusted one — and
-        // autumn-cache-redis's RedisCache::connect has no hook to trust a
-        // custom CA. Unlike AWS ElastiCache/Azure Redis Cache (both use
-        // publicly-trusted certs and work with the same client), enabling
-        // that mode here would generate a rediss:// URL the app can never
-        // actually connect with. Traffic stays inside the private VPC
-        // regardless, so AUTH-only (no transit encryption) is correct here.
+        // SERVER_AUTHENTICATION uses a private, per-instance CA, and
+        // RedisCache::connect cannot trust a custom CA, so a rediss:// URL would
+        // never connect. Traffic stays in the private VPC; AUTH-only is used.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10560,12 +10231,8 @@ esac
 
     #[test]
     fn gcp_variables_tf_documents_db_tier_connection_budget_vs_max_instances() {
-        // db-f1-micro's small max_connections ceiling (~25) combined with
-        // pool_size=10 (autumn.production.toml.example) and the default
-        // max_instances of 10 means scaling out under real load can exhaust
-        // the tier's connection budget well before hitting max_instances —
-        // not an apply-time failure, but a documented gotcha operators must
-        // resize for before relying on autoscaling in production.
+        // db-f1-micro allows about 25 connections. With pool_size=10 and
+        // max_instances=10, scale-out exhausts it long before max_instances.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10580,11 +10247,9 @@ esac
 
     #[test]
     fn gcp_main_tf_documents_always_allocated_cpu_option() {
-        // Issue #1280 asks for a "CPU: always-allocated option commented
-        // out for latency-sensitive workloads" — Cloud Run's cost-optimized
-        // default only allocates CPU while a request is in flight
-        // (cpu_idle = true); the always-allocated alternative must be
-        // present, just not the active setting.
+        // cpu_idle = true allocates CPU only during requests. The
+        // always-allocated option stays commented out for latency-sensitive
+        // workloads (#1280).
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10637,9 +10302,8 @@ esac
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
         let tfvars = fs::read_to_string(dir.join("terraform.tfvars.example")).unwrap();
-        // The documented placeholder ("# database_admin_password = (set via ...)") is a
-        // commented-out line, matching the azure-container-apps/aws-* targets' identical
-        // convention — only a non-comment assignment would be a real committed secret.
+        // The documented placeholder is a commented-out line; only a non-comment
+        // assignment would commit a secret.
         for line in tfvars.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with('#') {
@@ -10770,9 +10434,6 @@ esac
 
     #[test]
     fn gcp_workflow_authenticates_via_workload_identity_federation() {
-        // No long-lived service account key: the workflow must use OIDC via
-        // google-github-actions/auth with a workload identity provider, not
-        // a downloaded JSON key.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10794,11 +10455,8 @@ esac
 
     #[test]
     fn gcp_workflow_selects_the_configured_target_project() {
-        // WIF authentication alone doesn't set gcloud's active project — if
-        // the deployer service account lives in a different project than
-        // the one this scaffold's resources were created in (e.g. a shared
-        // CI project), every gcloud command below would target the wrong
-        // project (or fail to find the resources) without this.
+        // WIF does not set gcloud's project. A deployer account in another
+        // project (a shared CI project) would point every command there.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -10818,9 +10476,8 @@ esac
 
     #[test]
     fn gcp_workflow_sets_up_gcloud_and_configures_docker_before_building() {
-        // ubuntu-latest doesn't ship gcloud, and `docker push` to Artifact
-        // Registry needs a configured credential helper — without both,
-        // every build/push step in this workflow fails.
+        // ubuntu-latest has no gcloud, and `docker push` to Artifact Registry
+        // needs its credential helper.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();
@@ -11045,13 +10702,9 @@ esac
 
     #[test]
     fn gcp_workflow_documents_that_repo_variables_need_manual_resync() {
-        // GCP_SERVICE_NAME/GCP_MIGRATE_JOB_NAME/GCP_ARTIFACT_REGISTRY_URL are
-        // GitHub repository variables — a one-time snapshot of `terraform
-        // output`, not a live link to Terraform state. If app_name/region
-        // changes after the workflow is configured, Terraform renames the
-        // underlying GCP resources but GitHub has no way to know that
-        // happened; the header comment must say so explicitly rather than
-        // implying this stays in sync automatically.
+        // The GCP_* repository variables are a one-time copy of `terraform
+        // output`. After an app_name/region change Terraform renames the
+        // resources, but the variables keep the old names.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::GcpCloudRun, false).unwrap();

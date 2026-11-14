@@ -337,8 +337,8 @@ mod imp {
                 for source in migrations {
                     builder = builder.migration_source("app", source);
                 }
-                // The check of `refuse_unknown_versions` again, on the file
-                // each run migrates: another process can replace it between.
+                // Repeat the `refuse_unknown_versions` check on the file each run
+                // migrates: another process can replace it in between.
                 builder = builder
                     .framework_migrations()
                     .refuse_unknown_migrations(true);

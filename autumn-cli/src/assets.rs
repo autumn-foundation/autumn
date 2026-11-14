@@ -430,8 +430,7 @@ fn execute_update_with_manifest(
                 let (source_url, file_rel) = if in_registry {
                     resolve_source(&name, &version, None)?
                 } else {
-                    // Package was added with `--url`; we cannot derive the new
-                    // version's URL automatically.  The user must re-add it:
+                    // Added with `--url`: there is no way to derive the new version's URL.
                     return Err(AssetsError::UpdateFailed(format!(
                         "{name} was added with --url and is not in the built-in registry; \
                          re-pin with `autumn assets add {name}@{version} --url <url>`"
@@ -475,10 +474,6 @@ fn execute_update_with_manifest(
     save_manifest(manifest_path, &manifest)?;
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -648,12 +643,10 @@ mod tests {
         let js_dir = static_dir.join("js");
         fs::create_dir_all(&js_dir).unwrap();
 
-        // Write a file with known content.
         let original = b"console.log('htmx');";
         let good_sri = compute_sri(original);
         fs::write(js_dir.join("htmx.min.js"), original).unwrap();
 
-        // Record the good hash in the manifest.
         let manifest_path = static_dir.join(".autumn-assets.json");
         let mut manifest = VendorManifest::default();
         manifest.assets.insert(
@@ -667,10 +660,8 @@ mod tests {
         );
         save_manifest(&manifest_path, &manifest).unwrap();
 
-        // Tamper the file.
         fs::write(js_dir.join("htmx.min.js"), b"console.log('evil');").unwrap();
 
-        // Verify should fail.
         let result = verify_all(&manifest_path, &static_dir);
         assert!(result.is_err(), "expected verify to fail after tampering");
     }
@@ -713,7 +704,7 @@ mod tests {
         assert!(!dest.with_extension("tmp").exists());
     }
 
-    // --- Fix #2: execute_update for --url packages ---
+    // --- execute_update for --url packages ---
 
     #[test]
     fn execute_update_with_version_for_url_package_errors_with_hint() {
@@ -734,7 +725,6 @@ mod tests {
         );
         save_manifest(&manifest_path, &manifest).unwrap();
 
-        // Attempting to re-pin with @version should fail with a clear message.
         let result =
             execute_update_with_manifest(Some("my-custom-lib@2.0.0"), &manifest_path, &static_dir);
         let err = result.expect_err("expected error for --url package re-pin");
@@ -750,7 +740,7 @@ mod tests {
         );
     }
 
-    // --- Fix #3: URL→filename sanitization ---
+    // --- URL→filename sanitization ---
 
     #[test]
     fn resolve_url_with_query_string_strips_it() {
@@ -772,7 +762,7 @@ mod tests {
         );
     }
 
-    // --- Fix #4: Schema-identity test (CLI types ↔ framework types) ---
+    // --- Schema identity: CLI types ↔ framework types ---
 
     #[test]
     fn cli_and_web_vendor_manifest_schemas_are_compatible() {
@@ -788,12 +778,10 @@ mod tests {
             }
         }"#;
 
-        // Must parse as CLI type.
         let cli: VendorManifest = serde_json::from_str(json).unwrap();
         assert_eq!(cli.assets["htmx"].version, "2.0.4");
         assert_eq!(cli.assets["htmx"].integrity, "sha384-abc");
 
-        // Must also parse as the framework type.
         let fw: autumn_web::assets::VendorManifest = serde_json::from_str(json).unwrap();
         assert_eq!(fw.assets["htmx"].version, "2.0.4");
         assert_eq!(fw.assets["htmx"].file, "js/htmx.min.js");

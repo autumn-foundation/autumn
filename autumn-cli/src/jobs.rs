@@ -62,13 +62,8 @@ pub fn run(opts: &ManifestOptions<'_>) {
         }
     };
 
-    // A clean exit is not enough: the child's stdout must be the expected TOML
-    // manifest. If the app prints anything else to stdout (from a custom config
-    // or telemetry initializer, say), writing it verbatim would produce a
-    // corrupt manifest that `autumn doctor` rejects outright (#2419) — which
-    // fails the topology coverage check the manifest exists to guard.
-    // Mirror `autumn routes`, which strict-parses the child's stdout and errors
-    // on anything unexpected rather than emitting garbage.
+    // A clean exit is not enough: anything else the app prints to stdout would make a corrupt
+    // manifest that `autumn doctor` rejects (#2419).
     let manifest = match validate_manifest(&stdout) {
         Ok(manifest) => manifest,
         Err(message) => {
@@ -173,8 +168,6 @@ fn validate_manifest(stdout: &str) -> Result<String, String> {
     let hint = "app did not emit a valid jobs manifest on stdout; \
                 ensure nothing else writes to stdout during `autumn jobs manifest`";
 
-    // Return the stdout unchanged so the on-disk bytes are byte-identical to what
-    // the app emitted (preserving the highest-priority-first ordering).
     match parse_manifest_queues(stdout) {
         Ok(ManifestQueues::Present(_)) => Ok(stdout.to_owned()),
         Ok(ManifestQueues::Absent) => Err(format!("{hint} (no top-level `queues` array found)")),
@@ -209,15 +202,10 @@ fn write_manifest(path: &Path, contents: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    // ── clear_other_dump_modes(_, DUMP_ENV) ─────────────────────────────────
-
     #[test]
     fn clear_other_dump_modes_removes_every_other_mode_var() {
-        // Every one of these is dispatched before AUTUMN_DUMP_JOBS (the LAST
-        // mode in AppBuilder::run's dispatch chain), so any one left in the
-        // CLI's own environment would hijack `autumn jobs manifest` into a
-        // different dump (AUTUMN_DUMP_CACHE_COHERENCE in particular — issue
-        // #2370). Previously only 4 of these 7 were cleared.
+        // AUTUMN_DUMP_JOBS is the last mode `AppBuilder::run` dispatches, so any other mode var
+        // left in the CLI's environment would hijack `autumn jobs manifest` (#2370).
         let other_modes: Vec<&str> = crate::routes::ALL_DUMP_MODE_ENVS
             .iter()
             .copied()
@@ -244,10 +232,8 @@ mod tests {
 
     #[test]
     fn an_inherited_openapi_dump_cannot_hijack_the_jobs_manifest() {
-        // AUTUMN_DUMP_OPENAPI is checked before AUTUMN_DUMP_JOBS in
-        // AppBuilder::run, so an ambient `=1` would have answered `autumn jobs
-        // manifest` with the OpenAPI document instead of the TOML queues one
-        // (issue #2370) — the one entry every prior ad hoc list omitted.
+        // AUTUMN_DUMP_OPENAPI is checked before AUTUMN_DUMP_JOBS, so an inherited `=1` would
+        // answer with the OpenAPI document instead of the queues manifest (#2370).
         let mut command = Command::new("true");
         command.env(crate::openapi::DUMP_ENV, "1");
         clear_other_dump_modes(&mut command, DUMP_ENV);
@@ -261,8 +247,6 @@ mod tests {
         );
     }
 
-    // ── manifest_from_child ─────────────────────────────────────────────────
-
     #[test]
     fn manifest_from_child_returns_stdout_on_success() {
         let manifest =
@@ -272,8 +256,7 @@ mod tests {
 
     #[test]
     fn manifest_from_child_lossily_decodes_non_utf8_stdout() {
-        // A clean exit with invalid UTF-8 bytes must not panic — it is decoded
-        // lossily, mirroring the previous `String::from_utf8_lossy` behaviour.
+        // Invalid UTF-8 on a clean exit is decoded lossily, not a panic.
         let manifest = manifest_from_child(true, Some(0), &[0xff, 0xfe, b'x']).expect("clean exit");
         assert!(manifest.ends_with('x'));
         assert!(manifest.contains('\u{FFFD}'), "invalid bytes become U+FFFD");
@@ -286,26 +269,20 @@ mod tests {
 
     #[test]
     fn manifest_from_child_defaults_missing_code_to_one() {
-        // A signal-terminated child has no exit code; default to 1 so callers
-        // still exit non-zero.
+        // A signal-terminated child has no exit code; callers must still exit non-zero.
         assert_eq!(manifest_from_child(false, None, b""), Err(1));
     }
-
-    // ── validate_manifest ───────────────────────────────────────────────────
 
     #[test]
     fn validate_manifest_accepts_well_formed_manifest() {
         let stdout = "queues = [\"critical\", \"email\"]\n";
         let validated = validate_manifest(stdout).expect("valid manifest should pass");
-        // The stdout is returned byte-for-byte so the on-disk manifest is exactly
-        // what the app emitted (preserving highest-priority-first ordering).
+        // Byte-for-byte, so the highest-priority-first ordering survives.
         assert_eq!(validated, stdout);
     }
 
     #[test]
     fn validate_manifest_accepts_empty_queues_array() {
-        // A configured-but-empty queue set is a legitimate manifest, distinct
-        // from missing output.
         let stdout = "queues = []\n";
         assert_eq!(
             validate_manifest(stdout).expect("empty array is valid"),
@@ -315,9 +292,7 @@ mod tests {
 
     #[test]
     fn validate_manifest_rejects_leading_stray_line() {
-        // A stray log/telemetry line before the manifest makes the whole payload
-        // fail to parse as TOML — we must error and refuse to write, not silently
-        // persist a corrupt file (strict-parse, mirroring `autumn routes`).
+        // A stray log line before the manifest must be refused, not written to disk.
         let stdout = "some log line\nqueues = [\"critical\"]\n";
         let err = validate_manifest(stdout).expect_err("stray line must be rejected");
         assert!(
@@ -337,8 +312,6 @@ mod tests {
 
     #[test]
     fn validate_manifest_rejects_toml_without_queues_key() {
-        // Valid TOML that lacks the `queues` array must be rejected, and the
-        // message should name the missing key.
         let stdout = "other = [\"critical\"]\n";
         let err = validate_manifest(stdout).expect_err("missing queues key must be rejected");
         assert!(
@@ -349,7 +322,6 @@ mod tests {
 
     #[test]
     fn validate_manifest_rejects_non_string_queue_elements() {
-        // `queues` present but not an array of strings must be rejected.
         let stdout = "queues = [1, 2]\n";
         let err = validate_manifest(stdout).expect_err("non-string elements must be rejected");
         assert!(
@@ -357,8 +329,6 @@ mod tests {
             "expected element-type error, got: {err}"
         );
     }
-
-    // ── parse_manifest_queues (shared with doctor, #2419) ────────────────
 
     #[test]
     fn parse_manifest_queues_accepts_a_well_formed_array() {
@@ -373,8 +343,6 @@ mod tests {
 
     #[test]
     fn parse_manifest_queues_empty_array_is_present_not_absent() {
-        // Empty is the app answering "no job-declared queues", a real answer
-        // rather than a missing one.
         assert_eq!(
             parse_manifest_queues("queues = []\n"),
             Ok(ManifestQueues::Present(Vec::new())),
@@ -391,9 +359,8 @@ mod tests {
 
     #[test]
     fn parse_manifest_queues_distinguishes_parse_failure_from_shape_failure() {
-        // Unparseable TOML and a present-but-malformed `queues` array are
-        // different defects: the reader falls through on the former and fails
-        // loudly on the latter.
+        // Distinct because doctor falls through on unparseable TOML but fails loudly on a
+        // malformed `queues` array.
         assert!(matches!(
             parse_manifest_queues("this is not toml ="),
             Err(ManifestQueuesError::NotToml(_))
@@ -408,8 +375,6 @@ mod tests {
         ));
     }
 
-    // ── write_manifest ──────────────────────────────────────────────────────
-
     #[test]
     fn write_manifest_writes_contents_to_path() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -422,7 +387,6 @@ mod tests {
     #[test]
     fn write_manifest_creates_missing_parent_directories() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Nested parents that do not yet exist must be created.
         let path = dir.path().join("nested/deeper/jobs-manifest.toml");
         write_manifest(&path, "queues = []\n").expect("nested write should succeed");
         assert!(path.exists(), "manifest file should exist");
@@ -435,8 +399,7 @@ mod tests {
     #[test]
     fn write_manifest_errors_when_parent_creation_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // Create a regular file, then try to treat it as a parent directory:
-        // `create_dir_all` must fail because a path component is a file.
+        // A path component is a regular file, so `create_dir_all` fails.
         let blocker = dir.path().join("iam-a-file");
         std::fs::write(&blocker, "x").expect("create blocker file");
         let path = blocker.join("sub/jobs-manifest.toml");
@@ -450,8 +413,7 @@ mod tests {
     #[test]
     fn write_manifest_errors_when_write_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // The target path is an existing directory, so the write itself fails
-        // even though the parent exists.
+        // The target is an existing directory, so the write fails though the parent exists.
         let path = dir.path().to_path_buf();
         let err = write_manifest(&path, "queues = []\n").expect_err("writing to a dir must fail");
         assert!(

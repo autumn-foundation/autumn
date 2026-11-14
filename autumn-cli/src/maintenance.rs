@@ -195,7 +195,6 @@ mod tests {
     fn run_off_no_op_when_not_active() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("maintenance.json");
-        // File doesn't exist — should not panic
         run_off(Some(&path));
     }
 

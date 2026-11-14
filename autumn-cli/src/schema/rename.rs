@@ -233,10 +233,9 @@ fn index_renames(
             let Some(index) = renamed_index(idx, &new_name) else {
                 continue;
             };
-            // An index name is unique in its schema. Thus check every table in
-            // the schema of `base`. If another table uses the new name, refuse
-            // the rename: an added index with that name also fails. Names
-            // compare without case (SQLite resolves them that way).
+            // Index names are unique per schema: refuse a new name another table in `base`'s schema
+            // uses, since adding an index with that name would fail too. Compare without case, as
+            // SQLite does.
             let mut schema_tables = work.iter().filter(|t| same_schema(t, base));
             let owner = schema_tables.clone().find(|t| {
                 t.indexes

@@ -211,9 +211,8 @@ pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         return;
     };
     for entry in entries.flatten() {
-        // Never follow symlinks: a symlinked directory cycle under the project
-        // would otherwise recurse forever and hang this CI tool. `file_type()`
-        // (unlike `Path::is_dir`) does not traverse the link.
+        // Never follow symlinks: a directory cycle would recurse forever. `file_type()`, unlike
+        // `Path::is_dir`, does not traverse the link.
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -224,7 +223,6 @@ pub fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if file_type.is_dir() {
-            // Skip build artifacts, VCS metadata, and hidden dirs.
             if name == "target" || name.starts_with('.') {
                 continue;
             }
@@ -259,10 +257,8 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
         if let TokenTree::Ident(ident) = &trees[i] {
             let name = ident.to_string();
 
-            // Macro form: `t ! ( <locale>, "key" [, args] )`. `t!` is a proc
-            // macro, so every Rust macro delimiter — `t!(...)`, `t!{...}`,
-            // `t![...]` — compiles and carries the same token stream; accept
-            // all three (but not `Delimiter::None` implicit groups).
+            // Macro form `t!(<locale>, "key", ...)`. `t!` is a proc macro, so `{}` and `[]`
+            // invocations compile too; accept all three, but not implicit `Delimiter::None` groups.
             if name == "t"
                 && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
                 && let Some(TokenTree::Group(group)) = trees.get(i + 2)
@@ -272,23 +268,16 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
                 )
             {
                 record_key_at(&group.stream(), 1, file, result);
-                // The key slot is recorded above; still descend into the whole
-                // argument group so a translation call NESTED in the args (e.g.
-                // `t!(locale, "a", t!(locale, "b"))`) is scanned too. The key
-                // slot is a string literal / format expr, never a `t!`/`.t`
-                // call pattern, so the recursion cannot re-extract the outer key.
+                // Also scan the args for nested calls (`t!(locale, "a", t!(locale, "b"))`). The key
+                // slot is never a call pattern, so this cannot re-record the outer key.
                 scan_stream(&group.stream(), file, result);
                 i += 3;
                 continue;
             }
 
-            // Call form: `(t|t_with) ( <args> )`, not a macro invocation.
-            // Only a METHOD (`receiver.t(...)`) or ASSOCIATED (`Type::t(...)`)
-            // call is an Autumn translation site — the sole `t`/`t_with` entry
-            // points are the `Locale::t` / `Locale::t_with` methods. A bare
-            // free-function `t("...")` (some project's own helper/fixture) is
-            // NOT a translation reference and must be left alone; the
-            // free-standing translation form is the `t!` macro handled above.
+            // Call form `t(...)` / `t_with(...)`: only a method (`x.t(...)`) or associated
+            // (`Locale::t(...)`) call is a translation site. A bare free function `t(...)` belongs
+            // to the project and is ignored.
             if (name == "t" || name == "t_with")
                 && let Some(TokenTree::Group(group)) = trees.get(i + 1)
                 && group.delimiter() == Delimiter::Parenthesis
@@ -298,40 +287,24 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
                     _ => None,
                 });
                 match prev_punct {
-                    // Method call `receiver.t("key")`: preceded by `.`, key is
-                    // the first argument.
+                    // Method call `receiver.t("key")`: the key is argument 0.
                     Some('.') => {
                         record_key_at(&group.stream(), 0, file, result);
-                        // Recurse into the arg group so a nested translation
-                        // call in the args (e.g.
-                        // `t_with("m", &[("s", &locale.t("status.open"))])`) is
-                        // scanned too. The key slot cannot re-match as a call.
+                        // Scan the args for nested calls; the key slot cannot re-match as a call.
                         scan_stream(&group.stream(), file, result);
                         i += 2;
                         continue;
                     }
-                    // Associated call `Locale::t(&loc, "key")`: the `::` path
-                    // separator tokenizes as two `:` puncts, so the token before
-                    // `t` is `:`. The `&self` receiver occupies argument 0, so the
-                    // key is argument 1 — the same slot as the `t!` macro form.
-                    // Reading the fixed key slot (rather than the first literal
-                    // anywhere) means a dynamic key like `&format!("status.{s}")`
-                    // records the KEY argument's `status.` prefix instead of
-                    // mistaking the receiver for a fully-dynamic (empty-prefix)
-                    // key and suppressing every Unused warning project-wide.
+                    // Associated call `Locale::t(&loc, "key")`: the receiver is argument 0, so the
+                    // key is argument 1. Reading that fixed slot keeps a `&format!("status.{s}")`
+                    // key's prefix; reading the receiver would yield an empty prefix and suppress
+                    // every Unused warning.
                     //
-                    // Require a *real* `::` — TWO consecutive `:` puncts (the
-                    // second, immediately before `t`, joined to the first with
-                    // `Spacing::Joint`). A SINGLE `:` is a struct field value
-                    // (`Widget { label: t(loc, "k") }`), a type annotation, a
-                    // match arm, etc. — there the `t`/`t_with` is a bare free
-                    // function, NOT `Locale::t`, and must be left alone (same as
-                    // any other free function named `t`).
+                    // Require a real `::` (two joined `:` puncts). After a single `:` (struct field
+                    // value, type annotation, match arm) `t` is a free function.
                     Some(':') if has_double_colon_before(&trees, i) => {
                         record_key_at(&group.stream(), 1, file, result);
-                        // Recurse into the arg group so a nested translation
-                        // call in the args is scanned too. The key slot cannot
-                        // re-match as a call.
+                        // Scan the args for nested calls.
                         scan_stream(&group.stream(), file, result);
                         i += 2;
                         continue;
@@ -342,7 +315,6 @@ fn scan_stream(stream: &TokenStream, file: &str, result: &mut ScanResult) {
             }
         }
 
-        // Descend into any nested group (block, macro body, tuple, etc.).
         if let TokenTree::Group(group) = &trees[i] {
             scan_stream(&group.stream(), file, result);
         }
@@ -513,21 +485,11 @@ fn record_dynamic_segment(segment: &TokenStream, file: &str, result: &mut ScanRe
 /// untrustworthy — the safe direction, which avoids a false `--strict` failure.
 fn dynamic_key_prefix(segment: &TokenStream) -> String {
     let trees: Vec<TokenTree> = segment.clone().into_iter().collect();
-    // Peel leading borrows/derefs and unwrap any group that merely *wraps* the
-    // whole key expression — e.g. `&(format!("status.{s}"))`, `&(&format!(...))`,
-    // `((format!(...)))` — so the leading `format!`/literal is exposed. Without
-    // this, a wrapped `format!` is invisible to the detection below and the site
-    // is misread as fully dynamic (empty prefix), which suppresses every Unused
-    // warning project-wide.
+    // Expose a wrapped `format!` or literal (`&(format!(...))`); otherwise the site reads as fully
+    // dynamic and suppresses every Unused warning.
     let normalized = normalize_key_segment(&trees);
 
-    // Case 1: a `format!(...)` invocation that spans the whole segment (e.g. the
-    // `format!` in `&format!("nav.{}", x)`, now exposed at the front by
-    // normalization). Its first argument's format string supplies the static
-    // prefix — the text before the first `{` interpolation. A `format!` followed
-    // by trailing tokens (`format!("status.{s}").to_uppercase()`) is not
-    // whole-segment, so `leading_format_group` returns `None` and it falls
-    // through to an empty prefix.
+    // A whole-segment `format!`: the prefix is its format string's text before the first `{`.
     if let Some(group) = leading_format_group(&normalized) {
         return split_top_level_args(&group.stream())
             .first()
@@ -535,12 +497,8 @@ fn dynamic_key_prefix(segment: &TokenStream) -> String {
             .map_or_else(String::new, |fmt| format_static_prefix(&fmt));
     }
 
-    // Case 2: a string literal that spans the whole segment. In practice a lone
-    // literal is already classified as a *referenced* key, so this mainly guards
-    // against a literal that is the *receiver* of a transform
-    // (`" nav.home ".trim()`, `"footer.".to_owned() + s`): those have trailing
-    // tokens, so `leading_str_literal` returns an empty prefix rather than
-    // lifting the raw literal text out as a bogus static prefix.
+    // Otherwise a whole-segment string literal. A transformed literal (`" nav.home ".trim()`)
+    // yields an empty prefix.
     leading_str_literal(&normalized)
 }
 
@@ -568,16 +526,6 @@ fn normalize_key_segment(trees: &[TokenTree]) -> Vec<TokenTree> {
         return Vec::new();
     };
     let rest = &trees[start..];
-    // Only unwrap a leading group when it spans the WHOLE remaining segment —
-    // i.e. after peeling leading `&`/`*` the remaining trees are exactly a
-    // single group and nothing else. A group followed by further tokens (a
-    // method call `.trim()`, an operator `+ x`, an index `[..]`, …) is part of a
-    // larger derived expression; descending into it would silently drop those
-    // trailing tokens and misread e.g. `(" nav.home ").trim()` as the literal
-    // key `" nav.home "` (which the runtime actually looks up post-`trim` as
-    // `nav.home`). Leaving such a segment intact keeps it correctly classified
-    // as a dynamic site and prevents a bogus literal prefix being lifted out of
-    // the wrapped group.
     if rest.len() == 1
         && let TokenTree::Group(g) = &rest[0]
         && matches!(g.delimiter(), Delimiter::Parenthesis | Delimiter::None)
@@ -632,10 +580,7 @@ fn leading_format_group(trees: &[TokenTree]) -> Option<&Group> {
         && *id == "format"
         && matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '!')
         && let Some(TokenTree::Group(group)) = trees.get(i + 1)
-        // Whole-segment guard: the arg group must be the final token. A trailing
-        // method call / operator after it (`format!(...).to_uppercase()`,
-        // `format!(...) + x`) means the runtime value is a derived expression,
-        // not the raw format string — so this is not a format prefix source.
+        // The arg group must be the last token: `format!(...).to_uppercase()` is a derived value.
         && trees.get(i + 2).is_none()
     {
         return Some(group);
@@ -692,9 +637,8 @@ fn format_static_prefix(fmt: &str) -> String {
 pub fn parse_ftl_keys(src: &str) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     for line in src.lines() {
-        // Continuation of a multi-line value, a comment, or a blank line.
-        // Mirror the runtime `parse_ftl`, which treats only ' ' and '\t' as
-        // continuation indent.
+        // Continuation, comment or blank line. Like the runtime `parse_ftl`, only ' ' and '\t'
+        // indent a continuation.
         if line.starts_with(' ')
             || line.starts_with('\t')
             || line.trim_start().starts_with('#')
@@ -752,8 +696,8 @@ pub fn build_report(
     let default_locale = config.default_locale.clone();
     let chain = config.resolved_fallback_chain();
 
-    // Keys resolvable purely through the shared fallback chain (used by every
-    // locale). `Bundle::translate` walks this chain on a per-locale miss.
+    // `Bundle::translate` walks this shared chain on a per-locale miss, so its keys resolve in
+    // every locale.
     let mut chain_keys: BTreeSet<String> = BTreeSet::new();
     for locale in &chain {
         if let Some(keys) = per_locale_keys.get(locale) {
@@ -764,12 +708,9 @@ pub fn build_report(
     let empty = BTreeSet::new();
     let default_keys = per_locale_keys.get(&default_locale).unwrap_or(&empty);
 
-    // Dynamic key sites make the **Unused** set imprecise: a key a dynamic site
-    // could build must not be flagged Unused. A site with a non-empty static
-    // prefix (`format!("status.{s}")` → `"status."`) suppresses only keys under
-    // that prefix; a *fully*-dynamic site (empty prefix, e.g. `t(&key)`) could
-    // reference any key, so Unused is suppressed wholesale (reported for info,
-    // never failing `--strict`).
+    // A key a dynamic site could build must not be flagged Unused. A static prefix
+    // (`format!("status.{s}")` → `"status."`) suppresses only keys under it; an empty prefix
+    // (`t(&key)`) could be any key, so Unused is informational only and never fails `--strict`.
     let unused_suppressed_by_dynamic = scan.dynamic.iter().any(|d| d.key_prefix.is_empty());
     let dynamic_prefixes: Vec<&str> = scan
         .dynamic
@@ -778,13 +719,8 @@ pub fn build_report(
         .filter(|p| !p.is_empty())
         .collect();
 
-    // Seed the set of locales to report on from BOTH the `.ftl` files present on
-    // disk AND the locales declared in `[i18n].supported_locales`. A configured
-    // locale with no `.ftl` file must still be reported (its keys resolve to the
-    // default via the fallback chain, so they surface as Untranslated warnings)
-    // — otherwise "added a second locale but shipped untranslated UI" slips past
-    // even `--strict`. The union deduplicates locales that are both configured
-    // and have a file.
+    // Also report configured locales with no `.ftl` file: their keys fall back to the default and
+    // must surface as Untranslated, or an untranslated locale passes `--strict`.
     let mut name_set: BTreeSet<&String> = per_locale_keys.keys().collect();
     name_set.extend(config.supported_locales.iter());
 
@@ -798,7 +734,6 @@ pub fn build_report(
             let keys = per_locale_keys.get(locale).unwrap_or(&empty);
             let is_default = *locale == default_locale;
 
-            // Resolvable in this locale = its own keys + the fallback chain's.
             let mut resolvable = keys.clone();
             resolvable.extend(chain_keys.iter().cloned());
 
@@ -809,18 +744,10 @@ pub fn build_report(
                 .cloned()
                 .collect();
 
-            // **Untranslated** = a default-locale key that resolves all the way
-            // to the *default* locale for this locale — i.e. neither this locale
-            // nor any NON-default locale in its resolved fallback chain defines
-            // it, so the user sees default-language text. If an intermediate
-            // non-default fallback (e.g. `pt` for `pt-BR`) supplies the key, the
-            // user sees proper localized text, so it is NOT untranslated.
-            //
-            // Mirror the runtime `Bundle::lookup_template` resolution order: the
-            // locale itself first, then the shared resolved fallback chain
-            // (skipping the locale if it reappears), always ending at the default
-            // locale. A default key is untranslated exactly when the *first*
-            // locale in that order to define it is the default locale.
+            // Untranslated: a default-locale key whose first definer, in the runtime
+            // `Bundle::lookup_template` order (this locale, then the fallback chain, ending at the
+            // default), is the default locale. A key an intermediate fallback supplies (`pt` for
+            // `pt-BR`) is translated.
             let untranslated: Vec<String> = if is_default {
                 Vec::new()
             } else {
@@ -844,11 +771,7 @@ pub fn build_report(
                     .collect()
             };
 
-            // Fluent terms (`-brand = …`) are only referenced from within other
-            // messages via `{ -brand }`, never through `t!`, so they would
-            // always show up as Unused. Exclude them to avoid false-positive CI
-            // noise. Also exclude any key a dynamic site's static prefix could
-            // build (e.g. `status.open` under a `format!("status.{s}")` site).
+            // Fluent terms (`-brand`) are referenced only from other messages, never through `t!`.
             let unused: Vec<String> = keys
                 .iter()
                 .filter(|k| !k.starts_with('-') && !scan.referenced.contains(*k))
@@ -963,12 +886,8 @@ fn i18n_is_configured(root: &Path, profile: Option<&str>, selected_input: &str) 
         }
     }
 
-    // `autumn-<env>.toml` overlay. The runtime loads only the FIRST existing
-    // override file in `profile_override_file_lookup_names` order and `break`s
-    // (see `AutumnConfig::load_with_env` in `autumn/src/config.rs`), so only
-    // that file's `[i18n]` table participates. Consulting later aliases here
-    // would let an *unloaded* file's `[i18n]` falsely report i18n as configured
-    // (e.g. `autumn-production.toml` when `autumn-prod.toml` already won).
+    // `autumn-<env>.toml` overlay. The runtime loads only the first existing file in this order
+    // (`AutumnConfig::load_with_env`), so a later alias's `[i18n]` must not count.
     if let Some(profile) = profile {
         for name in profile_override_file_lookup_names(profile, selected_input) {
             let path = root.join(format!("autumn-{name}.toml"));
@@ -1067,11 +986,8 @@ pub fn run_in(root: &Path, env: &dyn Env, opts: I18nCheckOptions) -> i32 {
     let (config, profile) = load_i18n_config(root, env);
     let dir = root.join(&config.dir);
 
-    // Skip (exit 0) *only* when the project has no i18n configuration at all.
-    // When i18n is configured but the resolved directory is absent, fall
-    // through to `Bundle::load_from_dir` so the missing directory surfaces the
-    // same `MissingDefaultLocale` error the app would fail with at startup —
-    // rather than a false CI pass.
+    // Skip only when nothing configures i18n. A configured but missing directory falls through so
+    // `Bundle::load_from_dir` reports the same `MissingDefaultLocale` error as app startup.
     if !dir.exists() && !i18n_is_configured(root, profile.as_deref(), &selected_profile_input(env))
     {
         if opts.format == OutputFormat::Json {
@@ -1244,11 +1160,6 @@ mod tests {
 
     #[test]
     fn nested_translation_call_in_args_is_recorded() {
-        // When a translation call carries ANOTHER translation call in its
-        // arguments — e.g. `t_with("message", &[("status", &locale.t("status.open"))])`
-        // — BOTH the outer key AND the nested key must be recorded. The outer
-        // branch records the outer key and then recurses into the argument group
-        // so the nested call is not skipped.
         let src = r#"
             fn view(locale: &Locale) {
                 let _ = locale.t_with("message", &[("status", &locale.t("status.open"))]);
@@ -1271,8 +1182,6 @@ mod tests {
 
     #[test]
     fn deeply_nested_translation_calls_are_recorded() {
-        // A translation call nested inside another call's arguments, in both the
-        // macro form and a method-in-args form, records every level's key.
         let src = r#"
             fn view(locale: &Locale) {
                 let _ = t!(locale, "a", t!(locale, "b"));
@@ -1293,12 +1202,8 @@ mod tests {
 
     #[test]
     fn generic_arg_before_key_does_not_shift_key_out_of_slot() {
-        // When an earlier argument carries a turbofish / generic with more than
-        // one type parameter — `locale_for::<A, B>()`, `&get::<A, B>()` — the
-        // comma inside `<A, B>` is NOT wrapped in a `TokenTree::Group`, so the
-        // raw token splitter would miscount it as an argument separator and shift
-        // the literal key out of slot 1. The grammar-aware `syn` split keeps the
-        // key in its slot for both the macro and the associated call form.
+        // The comma in `<A, B>` is not inside a `TokenTree::Group`, so a raw token split would
+        // shift the key out of slot 1.
         let src = r#"
             fn view(locale: &Locale) {
                 let _ = t!(locale_for::<A, B>(), "nav.home");
@@ -1323,9 +1228,6 @@ mod tests {
 
     #[test]
     fn generic_arg_in_non_key_position_of_method_form_is_recorded() {
-        // The method form `x.t_with("nav.count", &make::<A, B>())` puts the key
-        // at slot 0 and a multi-param generic in slot 1. The `<A, B>` comma must
-        // not fragment the argument list in a way that loses the key.
         let src = r#"
             fn view(locale: &Locale) {
                 let _ = locale.t_with("nav.count", &make::<A, B>());
@@ -1344,10 +1246,6 @@ mod tests {
 
     #[test]
     fn free_function_t_is_not_a_translation_reference() {
-        // A bare `t("...")` free function (e.g. a project's own helper or a test
-        // fixture accessor) is NOT an Autumn translation call — only the `t!`
-        // macro, the `.t(...)`/`.t_with(...)` methods, and the `Type::t(...)`
-        // associated form are. A free `t(...)` must not pollute referenced keys.
         let src = r#"
             fn t(name: &str) -> Fixture {
                 Fixture::load(name)
@@ -1371,13 +1269,8 @@ mod tests {
 
     #[test]
     fn single_colon_field_value_t_call_is_not_an_associated_call() {
-        // A `t`/`t_with` free function used as a struct field value is preceded
-        // by the FIELD colon — a SINGLE `:` punct, not the `::` path separator of
-        // an associated `Locale::t` call. Treating a lone `:` as `::` would record
-        // unrelated literals as referenced keys and turn `t_with(.., &[])` into an
-        // empty-prefix dynamic site that suppresses `--strict` unused checks. A
-        // real `::` (two joined colons) is required, so these bare calls are
-        // ignored just like any other free function named `t`.
+        // A field colon is a single `:`, not the `::` of an associated call, so these are free
+        // functions.
         let src = r#"
             fn view(locale: &Locale) {
                 let _ = Widget { label: t(locale, "fixture") };
@@ -1402,9 +1295,6 @@ mod tests {
 
     #[test]
     fn real_associated_call_with_two_colons_still_records_key() {
-        // The genuine associated form `Locale::t(&loc, "key")` /
-        // `Locale::t_with(&loc, "key", &[])` carries a real `::` (two joined `:`
-        // puncts) before the fn name and must still record its key at slot 1.
         let src = r#"
             fn view(loc: &Locale) {
                 let _ = Locale::t(&loc, "nav.home");
@@ -1424,8 +1314,6 @@ mod tests {
 
     #[test]
     fn macro_accepts_all_delimiters() {
-        // `t!` is a proc macro, so brace/bracket invocations compile just like
-        // the parenthesized form and carry the same key; all three must record.
         let src = r#"
             fn view(locale: &Locale) {
                 let _ = t!(locale, "nav.paren");
@@ -1460,12 +1348,8 @@ mod tests {
 
     #[test]
     fn wrapped_literal_key_recorded_as_referenced() {
-        // A literal key passed through a borrow or a parenthesized group —
-        // `t(("nav.home"))`, `t(&"nav.home")`, `t(&("nav.home"))` — must still be
-        // recorded as a referenced key, not misclassified as a dynamic
-        // (unanalyzable) site. Otherwise deleting `nav.home` from the `.ftl`
-        // would exit 0 rather than reporting the runtime miss. A genuinely
-        // dynamic key stays dynamic.
+        // A borrowed or parenthesized literal is still a referenced key, not a dynamic site;
+        // otherwise deleting it from the `.ftl` would pass the check.
         let src = r#"
             fn view(locale: &Locale, section: &str) {
                 let _ = locale.t(("nav.home"));
@@ -1493,14 +1377,8 @@ mod tests {
 
     #[test]
     fn group_followed_by_trailing_tokens_is_dynamic_not_referenced() {
-        // A leading parenthesized literal that continues AFTER the group —
-        // `t((" nav.home ").trim())` — is a DERIVED expression, not a literal
-        // key. The runtime looks up the post-`trim` value (`nav.home`), so the
-        // check must NOT record the raw wrapped literal `" nav.home "` (spaces
-        // included) — nor the trimmed `nav.home` — as a referenced key. Only a
-        // group that spans the WHOLE segment unwraps; this one is followed by
-        // `.trim()`, so the site is treated as dynamic. An unrelated real key on
-        // the same file is still recorded normally.
+        // Only a group spanning the whole segment unwraps. `(" nav.home ").trim()` is a derived
+        // value, so neither the raw nor the trimmed literal is a referenced key.
         let src = r#"
             fn view(locale: &Locale) {
                 let _ = locale.t((" nav.home ").trim());
@@ -1541,12 +1419,7 @@ mod tests {
 
     #[test]
     fn format_group_followed_by_trailing_tokens_has_no_prefix() {
-        // A leading `format!` group followed by further tokens —
-        // `t((format!("status.{state}")).to_uppercase())` — is also a derived
-        // expression: the group does not span the whole segment (it is followed
-        // by `.to_uppercase()`), so it is NOT unwrapped. No prefix is recovered;
-        // the site is fully dynamic (empty prefix). This documents the
-        // whole-segment rule for the `format!` prefix path.
+        // The group does not span the whole segment, so it is not unwrapped and yields no prefix.
         let src = r#"
             fn view(locale: &Locale, state: &str) {
                 let _ = locale.t((format!("status.{state}")).to_uppercase());
@@ -1565,11 +1438,7 @@ mod tests {
 
     #[test]
     fn macro_metavariables_do_not_discard_literal_key() {
-        // A translation call written inside a `macro_rules!` transcriber carries
-        // `$metavariable` tokens in non-key argument positions. Parsing the whole
-        // argument list as `syn::Expr` would reject the `$...` tokens and drop the
-        // call — but the key slot is still a plain string literal and must be
-        // recorded as referenced.
+        // `syn::Expr` rejects `$metavariable` tokens, but the literal key slot must still record.
         let src = r#"
             macro_rules! nav {
                 ($locale:expr, $n:expr) => {{
@@ -1590,13 +1459,8 @@ mod tests {
 
     #[test]
     fn metavariable_with_generic_in_earlier_arg_keeps_key_slot() {
-        // A `macro_rules!` transcriber can combine a `$metavariable` argument
-        // with a turbofish carrying more than one type parameter in an EARLIER
-        // argument: `t!(locale_for::<A, B>(), "nav.home", name = $name)`. The `$`
-        // token makes the grammar-aware `syn` split fail, so the fallback token
-        // splitter runs — and it must be angle-bracket aware, or the comma in
-        // `<A, B>` shifts the key out of slot 1 (slot 1 becomes `B>()`) and the
-        // literal key is silently lost, letting a deleted key pass the check.
+        // The `$` token defeats the `syn` split, so the fallback token splitter must be
+        // angle-bracket aware or the `<A, B>` comma shifts the key out of slot 1.
         let src = r#"
             macro_rules! nav {
                 ($name:expr) => {
@@ -1622,8 +1486,6 @@ mod tests {
 
     #[test]
     fn metavariable_in_key_slot_is_dynamic_not_referenced() {
-        // When the key slot ITSELF is a metavariable (genuinely non-literal), it
-        // is correctly classified as dynamic — not recorded as a referenced key.
         let src = r"
             macro_rules! tr {
                 ($locale:expr, $key:expr) => {
@@ -1643,11 +1505,8 @@ mod tests {
 
     #[test]
     fn dynamic_prefix_from_format_and_leading_literal() {
-        // The static prefix is the text before the first `{` interpolation for a
-        // whole-segment `format!`. A leading literal that is only the *receiver*
-        // of a transform (`"footer.".to_owned() + x`) yields an EMPTY prefix —
-        // the runtime key is a derived value, not the raw literal — as does a
-        // `format!("{x}")` with no static head and a bare variable.
+        // A literal that is only the receiver of a transform (`"footer.".to_owned() + x`) yields
+        // an empty prefix: the runtime key is derived from it.
         let src = r#"
             fn view(locale: &Locale, state: &str, x: &str, key: &str) {
                 let _ = locale.t(&format!("status.{state}"));
@@ -1669,13 +1528,8 @@ mod tests {
 
     #[test]
     fn dynamic_prefix_empty_for_transformed_leading_literal() {
-        // Regression for the direct (UNPARENTHESIZED) transformed-literal path:
-        // `t(" nav.home ".trim())` starts with a literal that is then transformed
-        // by `.trim()`, so the runtime key is `nav.home`, NOT the raw
-        // `" nav.home "`. The prefix must be EMPTY (fully dynamic) rather than the
-        // spaced literal, otherwise the real `nav.home` entry is falsely reported
-        // Unused and `--strict` fails. Likewise a directly-transformed `format!`
-        // (`format!("status.{s}").to_uppercase()`) yields an empty prefix.
+        // The runtime key is `nav.home`, not `" nav.home "`. Lifting the spaced literal as a prefix
+        // would falsely report `nav.home` Unused.
         let src = r#"
             fn view(locale: &Locale, s: &str) {
                 let _ = locale.t(" nav.home ".trim());
@@ -1694,10 +1548,6 @@ mod tests {
 
     #[test]
     fn transformed_leading_literal_suppresses_unused() {
-        // End-to-end: an `.ftl` defines `nav.home`, and the only code site looks
-        // it up via a transformed literal `t(" nav.home ".trim())`. The empty
-        // prefix sets `unused_suppressed_by_dynamic`, so `nav.home` is NOT
-        // reported Unused and `--strict` does not falsely fail.
         let src = r#"
             fn view(locale: &Locale) {
                 let _ = locale.t(" nav.home ".trim());
@@ -1712,9 +1562,7 @@ mod tests {
         per_locale.insert("en".to_owned(), keys(&["nav.home"]));
         let report = build_report(&scan, &cfg("en", &[]), &per_locale);
 
-        // The empty prefix sets the wholesale-suppression flag, so the (still
-        // listed, but informational) `nav.home` Unused entry does not count as a
-        // warning and `--strict` passes rather than falsely failing.
+        // `nav.home` stays listed as Unused, but only as information.
         assert!(report.unused_suppressed_by_dynamic);
         assert!(!report.has_warnings());
         assert_eq!(report.exit_code(true), 0);
@@ -1722,11 +1570,6 @@ mod tests {
 
     #[test]
     fn dynamic_prefix_descends_through_wrapping_groups() {
-        // A `format!` wrapped in an extra group behind borrows — `&(format!(…))`,
-        // `&(&format!(…))`, `(format!(…))` — must still expose the leading
-        // `format!` so its static prefix is recovered, rather than being misread
-        // as a fully-dynamic (empty-prefix) site that suppresses all Unused
-        // checking. A bare variable still yields an empty prefix.
         let src = r#"
             fn view(locale: &Locale, state: &str, x: &str, y: &str, key: &str) {
                 let _ = locale.t(&(format!("status.{state}")));
@@ -1747,12 +1590,6 @@ mod tests {
 
     #[test]
     fn path_qualified_format_prefix_recognized() {
-        // A path-qualified `format!` — `std::format!(...)`, `::std::format!(...)`
-        // — must be recognized as a format macro so its leading static prefix is
-        // recovered, rather than leaving the stream starting with `std` and being
-        // misread as a fully-dynamic (empty-prefix) site. Plain `format!` still
-        // works; an unrelated path macro (`std::concat!`) or a bare variable
-        // yields an empty prefix.
         let src = r#"
             fn view(locale: &Locale, state: &str, x: &str, a: &str, b: &str, key: &str) {
                 let _ = locale.t(&std::format!("status.{state}"));
@@ -1774,10 +1611,6 @@ mod tests {
 
     #[test]
     fn path_qualified_format_suppresses_only_matching_unused_keys() {
-        // `t(&std::format!("status.{state}"))` records prefix `status.` (NOT
-        // empty), so `unused_suppressed_by_dynamic` stays false: `status.*` is
-        // suppressed from Unused, but an unrelated stale `footer.legacy` still
-        // fails `--strict`.
         let src = r#"
             fn view(locale: &Locale, state: &str) {
                 let _ = locale.t("nav.home");
@@ -1810,10 +1643,6 @@ mod tests {
 
     #[test]
     fn wrapped_dynamic_prefix_suppresses_only_matching_unused_keys() {
-        // A `format!` wrapped in an extra group — `t(&(format!("status.{s}")))` —
-        // records prefix `status.` (NOT empty), so `unused_suppressed_by_dynamic`
-        // stays false: `status.*` is suppressed from Unused, but an unrelated
-        // stale `footer.legacy` still fails `--strict`.
         let src = r#"
             fn view(locale: &Locale, state: &str) {
                 let _ = locale.t("nav.home");
@@ -1855,9 +1684,6 @@ mod tests {
 
     #[test]
     fn dynamic_prefix_suppresses_only_matching_unused_keys() {
-        // A dynamic site `t(&format!("status.{state}"))` records prefix
-        // `status.`, so `status.open`/`status.closed` must NOT be flagged Unused
-        // — but an unrelated `footer.legacy` (matching no prefix) still is.
         let src = r#"
             fn view(locale: &Locale, state: &str) {
                 let _ = locale.t("nav.home");
@@ -1889,12 +1715,8 @@ mod tests {
 
     #[test]
     fn associated_dynamic_key_records_key_arg_not_receiver() {
-        // `Locale::t(&locale, &format!("status.{state}"))` is an associated call:
-        // the receiver `&locale` is argument 0 and the key is argument 1. The
-        // scanner must classify the KEY argument, deriving prefix `status.` — not
-        // fall back to the receiver (empty prefix), which would suppress every
-        // Unused warning project-wide. So `status.*` is suppressed but an
-        // unrelated `footer.legacy` still fails `--strict`.
+        // Classifying the receiver (argument 0) instead of the key would yield an empty prefix and
+        // suppress every Unused warning.
         let src = r#"
             fn view(locale: &Locale, state: &str) {
                 let _ = Locale::t(&locale, "nav.home");
@@ -1905,10 +1727,7 @@ mod tests {
         let mut scan = ScanResult::default();
         scan_source(src, "view.rs", &mut scan);
 
-        // The literal associated key is recorded as referenced (no regression).
         assert!(scan.referenced.contains("nav.home"));
-        // Both dynamic associated sites derive the `status.` prefix from their
-        // KEY argument, never the receiver.
         assert_eq!(scan.dynamic.len(), 2);
         assert!(scan.dynamic.iter().all(|d| d.key_prefix == "status."));
 
@@ -1934,10 +1753,6 @@ mod tests {
 
     #[test]
     fn associated_fully_dynamic_key_still_suppresses_entirely() {
-        // A bare-variable key in the associated form `Locale::t(&locale, key)`
-        // yields an empty prefix (could reference any key), so Unused reporting is
-        // suppressed wholesale — confirming index-1 classification does not read
-        // the receiver, which would also (wrongly) yield an empty prefix.
         let src = r#"
             fn view(locale: &Locale, key: &str) {
                 let _ = Locale::t(&locale, "nav.home");
@@ -1959,9 +1774,6 @@ mod tests {
 
     #[test]
     fn fully_dynamic_site_suppresses_unused_entirely() {
-        // A bare-variable key site `t(&key)` (empty prefix) could reference any
-        // key, so Unused reporting is suppressed wholesale: even otherwise-unused
-        // keys must not fail `--strict`.
         let src = r#"
             fn view(locale: &Locale, key: &str) {
                 let _ = locale.t("nav.home");
@@ -1978,10 +1790,9 @@ mod tests {
         let report = build_report(&scan, &cfg("en", &[]), &per_locale);
 
         assert!(report.unused_suppressed_by_dynamic);
-        // The unused key is still listed (informational) …
+        // Still listed, as information only.
         let en = &report.locales[0];
         assert_eq!(en.unused, vec!["footer.legacy".to_owned()]);
-        // … but does NOT count as a warning or fail --strict.
         assert!(!report.has_warnings());
         assert_eq!(report.exit_code(false), 0);
         assert_eq!(report.exit_code(true), 0);
@@ -1999,9 +1810,7 @@ mod tests {
 
     #[test]
     fn missing_key_flags_every_locale() {
-        // `nav.about` is referenced but defined in NO locale (not even the
-        // default) — so it cannot be resolved through any fallback chain and is
-        // Missing everywhere. This is the correctness failure.
+        // `nav.about` is defined in no locale, so no fallback can resolve it.
         let scan = scan_with(&["nav.home", "nav.about"]);
         let mut per_locale = BTreeMap::new();
         per_locale.insert("en".to_owned(), keys(&["nav.home"]));
@@ -2018,9 +1827,7 @@ mod tests {
 
     #[test]
     fn untranslated_key_is_a_warning_not_missing() {
-        // `nav.about` is in the default locale `en` but not `es`. The default
-        // fallback chain supplies it, so `es` is NOT Missing it — but it IS
-        // Untranslated (a warning, error only under `--strict`).
+        // The default `en` supplies `nav.about` to `es`, so it is Untranslated, not Missing.
         let scan = scan_with(&["nav.home", "nav.about"]);
         let mut per_locale = BTreeMap::new();
         per_locale.insert("en".to_owned(), keys(&["nav.home", "nav.about"]));
@@ -2038,8 +1845,6 @@ mod tests {
 
     #[test]
     fn fallback_chain_suppresses_missing() {
-        // `es` lacks `nav.about`, but the fallback chain `es -> en` supplies
-        // it, so it is NOT reported missing.
         let scan = scan_with(&["nav.home", "nav.about"]);
         let mut per_locale = BTreeMap::new();
         per_locale.insert("en".to_owned(), keys(&["nav.home", "nav.about"]));
@@ -2054,11 +1859,8 @@ mod tests {
 
     #[test]
     fn intermediate_fallback_locale_supplies_key_so_not_untranslated() {
-        // Three-locale fallback: default `en` and the regional-parent `pt` both
-        // define `nav.home`; the regional child `pt-BR` does NOT, with the
-        // resolved chain `pt-BR -> pt -> en`. Runtime `lookup_template` resolves
-        // `nav.home` from the localized `pt`, never the default `en`, so it must
-        // NOT be flagged Untranslated for `pt-BR` — and `--strict` passes.
+        // `pt-BR` resolves `nav.home` through `pt` before reaching the default `en`, so it is
+        // translated.
         let scan = scan_with(&["nav.home"]);
         let mut per_locale = BTreeMap::new();
         per_locale.insert("en".to_owned(), keys(&["nav.home"]));
@@ -2077,7 +1879,6 @@ mod tests {
             "nav.home resolves to localized `pt`, not default `en`: {:?}",
             pt_br.untranslated
         );
-        // The intermediate parent `pt` defines nav.home itself → not untranslated.
         let pt = report.locales.iter().find(|l| l.locale == "pt").unwrap();
         assert!(pt.untranslated.is_empty(), "{:?}", pt.untranslated);
 
@@ -2088,12 +1889,8 @@ mod tests {
 
     #[test]
     fn default_only_key_is_untranslated_through_chain() {
-        // Contrast to the intermediate-fallback case: `brand.tagline` is defined
-        // ONLY by the default `en`, absent from both `pt` and `pt-BR`. It resolves
-        // all the way to the default for both non-default locales, so the user
-        // sees default-language text — Untranslated for `pt` and `pt-BR` (a
-        // warning that fails `--strict`), but NOT Missing (the default supplies
-        // it). The localized `nav.home` stays translated for `pt-BR` via `pt`.
+        // `brand.tagline` exists only in the default `en`, so it is untranslated in `pt` and
+        // `pt-BR`.
         let scan = scan_with(&["nav.home", "brand.tagline"]);
         let mut per_locale = BTreeMap::new();
         per_locale.insert("en".to_owned(), keys(&["nav.home", "brand.tagline"]));
@@ -2125,16 +1922,11 @@ mod tests {
 
     #[test]
     fn configured_locale_without_ftl_file_is_untranslated() {
-        // `es` is declared in `[i18n].supported_locales` but has NO `es.ftl` on
-        // disk. Runtime negotiation can still select `es` and fall back to the
-        // default bundle, so the untranslated UI must surface: `es` appears in
-        // the report with every default key Untranslated (resolvable via the
-        // fallback chain → NOT Missing), a warning that fails only under
-        // `--strict`.
+        // Runtime negotiation can select a configured `es` with no `es.ftl` and serve the default
+        // bundle, so every default key is Untranslated there.
         let scan = scan_with(&["nav.home", "nav.about"]);
         let mut per_locale = BTreeMap::new();
         per_locale.insert("en".to_owned(), keys(&["nav.home", "nav.about"]));
-        // Only `en` has a file; `es` is configured but its file is absent.
         let config = I18nConfig {
             default_locale: "en".to_owned(),
             supported_locales: vec!["en".to_owned(), "es".to_owned()],
@@ -2146,7 +1938,6 @@ mod tests {
         };
         let report = build_report(&scan, &config, &per_locale);
 
-        // `es` is present in the report even though it has no `.ftl` file.
         let es = report
             .locales
             .iter()
@@ -2163,7 +1954,6 @@ mod tests {
         );
         assert!(es.unused.is_empty());
 
-        // Warning by default (exit 0), failure under --strict (exit 1).
         assert!(!report.has_missing());
         assert!(report.has_warnings());
         assert_eq!(report.exit_code(false), 0);
@@ -2187,9 +1977,7 @@ mod tests {
 
     #[test]
     fn fluent_terms_are_not_reported_unused() {
-        // A Fluent term (`-brand = …`) is referenced only from within other
-        // messages via `{ -brand }`, never through `t!`, so it must not be
-        // flagged Unused (that would be false-positive CI noise).
+        // A Fluent term is referenced only from other messages (`{ -brand }`), never through `t!`.
         let src = "nav.home = Home\n-brand = Autumn\n";
         assert_eq!(parse_ftl_keys(src), keys(&["-brand", "nav.home"]));
 
@@ -2209,8 +1997,7 @@ mod tests {
 
     #[test]
     fn framework_keys_are_not_reported_unused() {
-        // The framework looks up `common.error.nul_character` at runtime. No
-        // source file names it. It must not fail `--strict`.
+        // The framework looks up `common.error.nul_character` at runtime; no app source names it.
         let scan = scan_with(&["nav.home"]);
         let mut per_locale = BTreeMap::new();
         per_locale.insert(
@@ -2228,10 +2015,8 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        // One real source file, to be collected exactly once.
         std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
-        // A subdirectory holding a symlink back to the root, forming a cycle:
-        // root/sub/loop -> root. Following it would recurse forever.
+        // root/sub/loop -> root forms a cycle.
         let sub = root.join("sub");
         std::fs::create_dir(&sub).unwrap();
         symlink(root, sub.join("loop")).unwrap();
@@ -2239,8 +2024,6 @@ mod tests {
         let mut files = Vec::new();
         collect_rs_files(root, &mut files);
 
-        // Terminates (no infinite recursion / stack overflow) and does not
-        // double-count `main.rs` by traversing the symlinked cycle.
         assert_eq!(files.len(), 1, "cycle must not be followed: {files:?}");
         assert!(files[0].ends_with("main.rs"));
     }

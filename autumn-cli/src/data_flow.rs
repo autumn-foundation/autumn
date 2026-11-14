@@ -90,10 +90,8 @@ pub fn format_drift(committed: &DataFlowManifest, current: &DataFlowManifest) ->
             committed.schema_version, current.schema_version
         ));
     }
-    // Keyed and printed on the module-qualified path, not the display name: two
-    // crates can each define a `Customer` with a classified `email`, and a drift
-    // report that cannot tell them apart would attribute one model's new release
-    // edge to the other. This is a CI failure message, so exactness beats brevity.
+    // Keyed on the module-qualified path, not the display name: two crates can
+    // each define a `Customer` with a classified `email`.
     let key = |f: &autumn_web::classify::manifest::ClassifiedFieldFlow| {
         format!("{}.{}", f.model_path, f.field)
     };
@@ -104,10 +102,8 @@ pub fn format_drift(committed: &DataFlowManifest, current: &DataFlowManifest) ->
                 let was = sink_list(before);
                 let now = sink_list(row);
                 if was == now {
-                    // Same sinks, different tier or different justification --
-                    // a re-worded reason is exactly the kind of change a
-                    // reviewer must see, so say so rather than printing an
-                    // identical before/after pair.
+                    // Same sinks, but the tier or reason changed. Say so instead
+                    // of printing an identical before/after pair.
                     lines.push(format!(
                         "  ~ {} still reaches {now}, but its classification or its                          declared reason changed",
                         key(row)
@@ -202,9 +198,8 @@ pub fn run(opts: &DataFlowOptions<'_>) {
         std::process::exit(1);
     };
 
-    // Read the committed copy BEFORE writing anything. `--manifest P --check P`
-    // would otherwise compare the fresh manifest against the copy this very run
-    // just wrote and always pass -- a gate that certifies itself.
+    // Read the committed copy before writing anything: with `--manifest P
+    // --check P` the check would otherwise compare against this run's own output.
     let committed = opts.check.map(|path| match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<DataFlowManifest>(&text) {
             Ok(m) => m,

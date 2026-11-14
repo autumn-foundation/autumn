@@ -113,10 +113,8 @@ fn options_for(shape: ColdStartShape) -> crate::new::GenerateOptions {
             with_daemon: true,
             ..Default::default()
         },
-        // The database-backed shape uses the bundled managed-Postgres provider so
-        // the app self-provisions a real Postgres (via `postgresql_embedded`),
-        // runs migrations, and connects before serving — a genuine DB-backed
-        // onboarding cold start with no external service required.
+        // The bundled managed-Postgres provider self-provisions a real Postgres
+        // (`postgresql_embedded`), so the DB shape needs no external service.
         ColdStartShape::Db => crate::new::GenerateOptions {
             with_bundled_pg: true,
             ..Default::default()
@@ -132,8 +130,7 @@ fn scaffold(shape: ColdStartShape, parent: &Path, project_name: &str) -> Result<
          set AUTUMN_BENCH_AUTUMN_WEB_PATH to its directory"
             .to_string()
     })?;
-    // Quiet scaffold: keep stdout clean so `--cold-start --json` emits only the
-    // JSON report.
+    // Quiet, so `--cold-start --json` emits only the JSON report on stdout.
     crate::new::generate_with_quiet(project_name, parent, options_for(shape))
         .map_err(|e| format!("autumn new failed: {e}"))?;
     let project_dir = parent.join(project_name);
@@ -173,8 +170,7 @@ fn build_command(project_dir: &Path, target: Option<&str>) -> Command {
         .args(["build", "--message-format=json", "--target-dir"])
         .arg(project_dir.join("target"))
         .current_dir(project_dir);
-    // No inherited target settings, no compiler wrapper (e.g. `sccache`), and
-    // no incremental mode. See `COLD_BUILD_ENV`.
+    // No inherited target settings, compiler wrapper or incremental mode. See `COLD_BUILD_ENV`.
     apply_cold_env(&mut build);
     if let Some(triple) = target {
         build.arg("--target").arg(triple);
@@ -231,20 +227,16 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
     let tmp = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
     let project_name = "coldstart_app";
 
-    // Start the clock just before `autumn new` so the whole onboarding journey
-    // (scaffold → first clean compile → boot → first 200) is captured.
+    // The measurement covers the whole journey: scaffold, cold compile, boot, first 200.
     let start = Instant::now();
 
     let project_dir = scaffold(shape, tmp.path(), project_name)?;
 
     let bin = cold_build(&project_dir, project_name)?;
 
-    // Pick the port the app binds and we poll, *after* the minutes-long build and
-    // immediately before spawning, to minimise the window between reserving the
-    // ephemeral port (the listener is dropped right away) and the child binding
-    // it. A fresh port per sample also avoids colliding with a lingering
-    // TIME_WAIT socket from the previous sample. An explicit AUTUMN_BENCH_PORT
-    // override is honoured as-is.
+    // Reserve the port after the build, right before spawning, to shrink the window between
+    // dropping the reserving listener and the child binding it. A fresh port per sample also
+    // avoids a lingering TIME_WAIT socket from the previous sample.
     let port = match std::env::var("AUTUMN_BENCH_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
@@ -255,25 +247,19 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
 
     let mut cmd = Command::new(&bin);
     cmd.current_dir(&project_dir);
-    // Isolate the child from the surrounding environment: clear every inherited
-    // `AUTUMN_*` var so app-mode settings can't change how the scaffolded app
-    // boots or what it binds. Without this, e.g. `AUTUMN_ENV=prod` would trigger
-    // production boot checks, `AUTUMN_BUILD_STATIC=1` would render static output
-    // and exit instead of serving, and a stray `AUTUMN_SERVER__UNIX_SOCKET`
-    // would make the app bind a socket instead of the TCP port we poll.
+    // Clear inherited `AUTUMN_*` vars: `AUTUMN_ENV=prod` would run production boot checks,
+    // `AUTUMN_BUILD_STATIC=1` would render and exit, and `AUTUMN_SERVER__UNIX_SOCKET` would bind
+    // a socket instead of the TCP port we poll.
     for (key, _) in std::env::vars() {
         if key.starts_with("AUTUMN_") {
             cmd.env_remove(&key);
         }
     }
-    // Then pin exactly the host+port we poll (env vars are the highest-precedence
-    // config source, overriding autumn.toml).
+    // Env vars override autumn.toml, so this pins the host and port we poll.
     cmd.env("AUTUMN_SERVER__HOST", "127.0.0.1")
         .env("AUTUMN_SERVER__PORT", port.to_string());
-    // For the DB shape, keep the bundled managed-Postgres cluster inside the
-    // throwaway temp dir so the run is self-contained: otherwise the provider
-    // defaults to `$HOME/.local/share/autumn/...` and leaves a full Postgres
-    // data/extraction directory behind after the tempdir is removed.
+    // Keep the managed-Postgres cluster in the temp dir. The provider otherwise defaults to
+    // `$HOME/.local/share/autumn/...` and leaves a full Postgres data directory behind.
     if matches!(shape, ColdStartShape::Db) {
         cmd.env(
             "AUTUMN_MANAGED_PG_DATA_DIR",
@@ -281,19 +267,15 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
         );
     }
     cmd
-        // Discard the app's own logs so they never interleave with the JSON
-        // report on stdout; the harness reports progress on stderr separately.
+        // Discard the app's logs so they never interleave with the JSON report on stdout.
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to start the built server binary: {e}"))?;
 
-    // Poll the configured root route until the first 200 or the deadline.
-    // The poll timeout is measured from *now* (after the multi-minute build), not
-    // from `start`: a slow cold compile must not eat the boot-poll window and make
-    // a server that boots fine look like a serve failure. `start` still drives the
-    // measured duration recorded below.
+    // The poll deadline runs from now, not from `start`: a slow cold compile must not eat the
+    // boot window and make a healthy server look like a serve failure.
     let url = format!("http://127.0.0.1:{port}/");
     let deadline = Instant::now() + Duration::from_millis(budget_for(class_for(shape)).max_ms * 2);
     let client = reqwest::blocking::Client::builder()
@@ -303,19 +285,15 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
 
     let mut measured = None;
     while Instant::now() < deadline {
-        // If the app exited (e.g. the chosen port is already in use → bind
-        // failure → process exit), stop immediately so we never record a 200
-        // served by some other process listening on this port.
+        // An exited child (e.g. the port was taken) means any 200 would come from another process.
         if let Ok(Some(status)) = child.try_wait() {
             return Err(format!(
                 "scaffolded server exited before serving (exit: {status}); \
                  port {port} may already be in use"
             ));
         }
-        // Accept only a 200 whose body proves it came from OUR scaffolded app:
-        // its index page renders the project name. This rules out a 200 served by
-        // some unrelated service that happens to answer on this port during the
-        // child's boot-toward-bind-failure window.
+        // The index page renders the project name, which proves the 200 came from our app and
+        // not an unrelated service on this port.
         if let Ok(resp) = client.get(&url).send()
             && resp.status().is_success()
             && resp.text().is_ok_and(|body| body.contains(project_name))
@@ -326,9 +304,7 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Graceful shutdown so the app's on-shutdown hooks run — notably the
-    // managed-Postgres provider stopping its supervised cluster on the DB shape,
-    // which otherwise orphans Postgres processes/data between samples.
+    // Graceful, so the managed-Postgres provider stops its cluster instead of orphaning it.
     stop_child(&mut child);
 
     measured.ok_or_else(|| "server did not return HTTP 200 before the deadline".to_string())
@@ -412,11 +388,8 @@ pub fn reserve_free_port() -> Result<u16, String> {
 pub fn stop_child(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        // Graceful SIGTERM first (via the shared helper) so the app's on_shutdown
-        // hooks run — notably the managed-Postgres provider stopping its cluster.
-        // Note: a *forced* fallback can still leave that Postgres behind, because
-        // it `setsid`s into its own process group (see process::stop_postmaster);
-        // the SIGTERM path is what reaps it.
+        // Only the SIGTERM path reaps a managed Postgres: it `setsid`s into its own process
+        // group (see `process::stop_postmaster`), so the forced fallback can leave it behind.
         if let Err(e) = crate::process::signal_terminate(child.id()) {
             eprintln!("  Warning: failed to SIGTERM cold-start server: {e}");
         }
@@ -456,9 +429,8 @@ fn measure_cold_start(
 /// In `--dry-run` mode it prints the cold-start budget table with no build or
 /// server. Otherwise it measures the no-DB `hello` cold start (gated) and,
 /// when `include_db` is set, the database-backed shape (informational).
-// Mirrors the flag set of [`crate::dev_loop_bench::run`] (json /
-// fail_on_regression / dry_run) plus the cold-start-only `include_db` toggle;
-// grouping these into a struct would not improve the single CLI call site.
+// Mirrors the flags of `crate::dev_loop_bench::run` plus `include_db`; a struct would not help
+// the single CLI call site.
 #[allow(clippy::fn_params_excessive_bools)]
 pub fn run_cold_start(
     runs: u32,
@@ -473,9 +445,8 @@ pub fn run_cold_start(
         return 0;
     }
 
-    // A measurement run with zero samples would publish an all-zero, "passing"
-    // report without compiling or starting anything. Refuse it so the gate can
-    // never go green on no data.
+    // Zero samples would publish an all-zero "passing" report: the gate would go green on
+    // no data.
     if runs == 0 {
         eprintln!("Error: --runs must be at least 1 for a cold-start measurement.");
         return 1;
@@ -501,8 +472,7 @@ pub fn run_cold_start(
         match measure_cold_start(ColdStartShape::Db, runs) {
             Ok((_, s)) => DbOutcome::Measured(s),
             Err(e) => {
-                // The DB shape is informational; a failure must not break the run,
-                // but it is recorded in the report rather than silently dropped.
+                // The DB shape is informational: record the failure, do not fail the run.
                 eprintln!("Warning: informational DB cold-start measurement failed: {e}");
                 DbOutcome::Failed(e)
             }
@@ -672,8 +642,7 @@ mod tests {
 
     #[test]
     fn run_cold_start_rejects_zero_runs() {
-        // --runs 0 must not publish an all-zero "passing" report without
-        // measuring anything; it returns a non-zero exit instead.
+        // Zero runs would publish an all-zero "passing" report without measuring anything.
         let exit = run_cold_start(0, None, false, false, false, false);
         assert_eq!(exit, 1, "zero runs must be rejected");
     }

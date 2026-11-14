@@ -54,10 +54,8 @@ pub struct PackageOptions<'a> {
 /// manifest does not validate, the payload is not a WebAssembly module, or the
 /// module imports something the sandbox does not provide.
 pub fn package(opts: &PackageOptions<'_>) -> Result<SandboxArtifact, String> {
-    // Bounded reads, for the same reason the loader's are: a ceiling applied
-    // after `fs::read` returns is a decision made after the damage. Packaging
-    // takes both of its inputs from whoever ran the command, and a
-    // multi-gigabyte one should be an error message rather than an OOM.
+    // Bounded reads: a ceiling checked after `fs::read` returns is too late, and
+    // a multi-gigabyte input should be an error, not an OOM.
     let manifest_bytes = read_bounded(opts.manifest, MAX_MANIFEST_BYTES)
         .map_err(|err| format!("{}: {err}", opts.manifest.display()))?;
     let manifest_src = String::from_utf8(manifest_bytes)
@@ -67,8 +65,7 @@ pub fn package(opts: &PackageOptions<'_>) -> Result<SandboxArtifact, String> {
         .map_err(|err| format!("{}: {err}", opts.module.display()))?;
 
     let artifact = SandboxArtifact::seal(manifest, module).map_err(|err| err.to_string())?;
-    // Load it before writing it. Refusing here costs the author a second;
-    // refusing at the operator's boot costs them a deploy.
+    // Load before writing: refusing here is cheaper than at the operator's boot.
     SandboxHost::load(&artifact).map_err(|err| err.to_string())?;
 
     artifact
@@ -203,9 +200,7 @@ fn granted_class(manifest: &SandboxManifest, class: &str) -> bool {
         "database" => {
             manifest.is_granted(SandboxCapability::Db) || manifest.is_granted(SandboxCapability::Kv)
         }
-        // Filesystem, environment and process control have no capability that
-        // grants them and are not on the roadmap to; they stay in the list
-        // whatever the manifest asks for.
+        // No capability grants filesystem, environment or process control.
         _ => false,
     }
 }
@@ -242,16 +237,11 @@ impl Report {
     #[must_use]
     pub fn of(artifact: &SandboxArtifact) -> Self {
         let manifest = artifact.manifest();
-        // The import list is a property of the module, not of whether the
-        // sandbox will run it — and it is *most* interesting when the sandbox
-        // will not. Reporting "(none)" for a module that was refused for what
-        // it imports would make the consent screen contradict itself.
-        // Excerpted *here*, not where they are rendered. Both strings come out
-        // of an artifact nobody has audited, and `to_json` serializes the
-        // report's own fields — so a bound applied in `to_text` leaves the JSON
-        // path carrying a name that fills most of the module allowance, which
-        // `serde_json` then expands again escaping it. Capping at construction
-        // is what makes every renderer safe rather than the one that remembered.
+        // Imports are read from the module whether or not it loads: they matter
+        // most for a module refused for what it imports.
+        // Both strings are excerpted here, not in a renderer, because `to_json`
+        // serializes these fields directly; a bound only in `to_text` would leave
+        // the JSON carrying an unbounded artifact-supplied name.
         let imports = SandboxHost::imports_of(artifact.module())
             .ok()
             .map(|imports| imports.iter().map(|import| excerpt(import)).collect());
@@ -288,24 +278,16 @@ impl Report {
                 .into_iter()
                 .map(|(field, value)| (field.to_owned(), u64::try_from(value).unwrap_or(u64::MAX)))
                 .collect(),
-            // Only the classes this build cannot grant *at all*, minus anything
-            // this manifest was actually granted. A screen that printed "no
-            // database access" under a manifest holding `db` would be a consent
-            // screen contradicting itself, and a reader believes the reassuring
-            // half.
+            // The classes this build cannot grant, minus what this manifest was
+            // granted, so the screen never says "no database access" under `db`.
             denied: DENIED_CLASSES
                 .iter()
                 .filter(|class| !granted_class(manifest, class))
                 .map(|&name| name.to_owned())
                 .collect(),
-            // From `route_infos`, not from `manifest.routes`: HTTP serves HEAD
-            // wherever it serves GET, and the runtime mounts it, so a manifest
-            // declaring only GET serves a method its own literal route list
-            // never names. The human surfaces already say so — `consent_summary`
-            // prints the implied HEAD and `autumn routes` reports it — and this
-            // is the surface a policy check reads. Underreporting here is how an
-            // automated approval signs off on a route set smaller than the one
-            // the artifact actually answers on.
+            // From `route_infos`, not `manifest.routes`: the runtime also mounts
+            // HEAD wherever GET is declared, and a policy check reading this
+            // report must see every method the artifact answers on.
             routes: manifest
                 .route_infos()
                 .into_iter()
@@ -340,11 +322,9 @@ impl Report {
         self.loads
             && self.artifact_sha256.is_some()
             && self.conformance.passed()
-            // An upgrade that asks for more authority is not a failed artifact
-            // — it may be exactly what the operator wants — but it is not one
-            // an unattended `inspect` may wave through. Failing here is what
-            // makes `--against` a gate rather than a note: a pipeline that
-            // installs on a passing verdict stops and asks.
+            // An upgrade asking for more authority may be wanted, but an
+            // unattended `inspect` must not pass it: this makes `--against` a
+            // gate rather than a note.
             && self
                 .upgrade
                 .as_ref()
@@ -355,11 +335,9 @@ impl Report {
     #[must_use]
     pub fn to_text(&self) -> String {
         let mut out = self.consent.clone();
-        // Printed right under the consent block, because it is the number this
-        // screen is asking to be trusted on. The module digest above it answers
-        // a narrower question — "are these the author's bytes" — and stays
-        // correct if the grant beside them is rewritten, so an operator
-        // comparing that one could match a wider artifact than they approved.
+        // The artifact digest is the one to record: the module digest above it
+        // stays the same when the grant is rewritten, so it could match a wider
+        // artifact than the operator approved.
         match self.artifact_sha256.as_deref() {
             Some(digest) => {
                 out.push_str("  artifact sha256 (record this one): ");
@@ -370,10 +348,7 @@ impl Report {
                 "  artifact sha256: (could not be computed; review the manifest by hand)\n",
             ),
         }
-        // Above the imports and right under the digest, because it is the one
-        // block on this screen that answers "has anything changed since I
-        // agreed" — an operator re-reading a familiar screen needs it before
-        // their eyes glaze.
+        // Near the top: this block answers "has anything changed since I agreed?"
         if let Some(delta) = self.upgrade.as_ref() {
             if delta.requires_consent() {
                 out.push_str("  \u{26A0} ");
@@ -387,23 +362,16 @@ impl Report {
         }
         out.push_str("  host functions it imports:\n");
         match self.imports.as_ref() {
-            // Not the same as none, and saying so matters: the artifacts whose
-            // imports cannot be read are the ones already refused for their
-            // shape, which is when an operator most needs the screen not to
-            // claim they ask for nothing.
+            // Not the same as none: imports go unread for a module refused for
+            // its shape, and the screen must not claim it asks for nothing.
             None => out
                 .push_str("    (could not be read; the module was refused before they could be)\n"),
             Some(imports) if imports.is_empty() => out.push_str("    (none)\n"),
             Some(imports) => {
                 for import in imports {
-                    // Import names are arbitrary UTF-8 lifted straight out of a
-                    // module an operator has explicitly not audited. A terminal
-                    // escape here could rewrite the lines above it — the routes,
-                    // the grant, the verdict — which is an attack on the
-                    // decision this screen exists to inform.
                     out.push_str("    ");
-                    // Already excerpted in `of`; escaping twice would render
-                    // `\n` as `\\n`.
+                    // Already escaped and bounded in `of`; escaping again would
+                    // render `\n` as `\\n`.
                     out.push_str(import);
                     out.push('\n');
                 }
@@ -448,14 +416,9 @@ fn conformance_routes(manifest: &SandboxManifest) -> Vec<RouteInfo> {
             api_version: None,
             status: None,
             sunset_opt_out: None,
-            // Inert at this site, and deliberately left so. The capacity
-            // contract (#1733) derives these from a handler's declared
-            // extractors at macro-expansion time; a sandboxed route has no
-            // such handler, `build_report` reads neither field, and neither is
-            // serialized — the report carries no route fields. Giving
-            // them a computed-looking value here would publish a claim nothing
-            // derived and nothing reads. Empty matches every other
-            // `RouteInfo` built by hand in this crate.
+            // Capacity fields come from a handler's extractors at macro-expansion
+            // time (#1733). A sandboxed route has no such handler and
+            // `build_report` reads none of these, so they stay empty.
             pools: Vec::new(),
             resource_shape: String::new(),
             group: None,
@@ -471,17 +434,10 @@ fn conformance_routes(manifest: &SandboxManifest) -> Vec<RouteInfo> {
 fn conformance(manifest: &SandboxManifest) -> PluginCheckReport {
     let routes = conformance_routes(manifest);
 
-    // A sandboxed plugin holds no session or auth capability, so a route it
-    // serves is unauthenticated by construction. Declaring that here is the
-    // honest answer to the sensitive-surface check — the gating is the sandbox
-    // itself.
-    //
-    // The grant is named in full rather than summarised as "no database or
-    // network": since #1632 a manifest may hold `db`, `kv`, `http-outbound`,
-    // `jobs` or `render`, and a check line that says otherwise would be wrong
-    // about exactly the artifacts whose authority matters. `capabilities`
-    // answers "may it?"; the scope lists answer "to what?", and an automated
-    // reader needs both.
+    // A sandboxed plugin holds no session or auth capability, so its routes are
+    // unauthenticated by construction: the sandbox is the gating. The grant is
+    // named in full, capabilities and scopes, because a manifest may hold `db`,
+    // `kv`, `http-outbound`, `jobs` or `render`.
     let mut granted: Vec<String> = manifest
         .capabilities
         .iter()
@@ -511,25 +467,16 @@ fn conformance(manifest: &SandboxManifest) -> PluginCheckReport {
             bin: None,
             plugin_name: &manifest.name,
             expected_prefix: Some(&manifest.prefix),
-            // Sandboxed plugins declare routes only through their manifest,
-            // which has no intentional-root spelling yet (follow-up, issue
-            // #2828): the exemption list stays empty on this lane.
+            // The manifest has no intentional-root spelling yet (#2828).
             intentional_root_routes: &[],
             sensitive_routes: &sensitive,
             format: ReportFormat::Text,
-            // `Absent`, and deliberately so. A `ContractDump` reports what a
-            // built binary wrote to its stderr (#1601) — and this path never
-            // builds or runs one: a sandboxed plugin is a `.wasm` artifact, and
-            // the report is derived from its manifest alone. `Present(vec![])`
-            // would be the stronger claim that the plugin declared no
-            // contracts, which is not something anything here established.
-            // Both contract checks resolve to `Skip` on `Absent`, which is the
-            // honest verdict for a check that could not be evaluated.
+            // No binary runs here, so there is no contract dump. `Present(vec![])`
+            // would claim the plugin declared none; `Absent` makes both contract
+            // checks `Skip`.
             contracts: &plugin_check::ContractDump::Absent,
-            // The sandbox lane exposes no `--deny-experimental`, and the flag
-            // fails closed on an unread contract — passing `true` would hard
-            // fail every sandboxed artifact over a contract that cannot exist
-            // for one. `false` leaves the check a `Skip`.
+            // `true` fails closed on the absent contract and would fail every
+            // sandboxed artifact. `false` leaves the check a `Skip`.
             deny_experimental: false,
             // A manifest serves its declared routes: never routeless.
             no_routes: false,
@@ -537,19 +484,13 @@ fn conformance(manifest: &SandboxManifest) -> PluginCheckReport {
         &routes,
     );
 
-    // The gating string above reaches the report only through the
-    // sensitive-surfaces check, and that check only looks at routes whose path
-    // is *named* like a sensitive one (`/admin`, `/debug`, …). A plugin that
-    // holds `db` and `http-outbound` under the prefix `/shop` is exactly as
-    // authoritative and would have been reported with the grant nowhere in
-    // sight. So the grant gets a check of its own, present on every sandboxed
-    // artifact: an automated reader gating an install on this report needs to
-    // see the authority whether or not the path happens to say "admin".
+    // The sensitive-surfaces check shows the gating string only for routes named
+    // like sensitive ones (`/admin`, `/debug`), so a plugin holding `db` under
+    // `/shop` would hide its grant. This check reports the grant on every
+    // sandboxed artifact.
     //
-    // `Pass`, because a declared grant is conformant — `SandboxManifest::parse`
-    // has already refused an ungrantable host, table, job type or slot by the
-    // time this runs. The check reports authority; it does not adjudicate it.
-    // Consent is `autumn plugin inspect`'s job, and it fails the verdict there.
+    // `Pass`: `SandboxManifest::parse` already refused any ungrantable scope.
+    // This reports authority; `autumn plugin inspect` judges consent.
     report.report.checks.push(plugin_check::CheckResult {
         name: "capability-grants".to_owned(),
         status: plugin_check::CheckStatus::Pass,
@@ -591,12 +532,9 @@ pub fn run_inspect(path: &Path, format: &ReportFormat, against: Option<&Path>) {
             eprintln!("\u{2717} {err}");
             std::process::exit(1);
         });
-        // A delta against a *different* plugin is not an upgrade, and reading
-        // it as one is worse than not reading it at all: the candidate would
-        // inherit the unrelated baseline's capabilities, grants, routes and
-        // limits and come back "asks for no authority", which is exactly the
-        // verdict an unattended install is gated on. Refused rather than
-        // compared, because there is no answer to give.
+        // A delta against a different plugin is meaningless: the candidate would
+        // inherit the unrelated baseline's authority and could come back "asks
+        // for no authority", the verdict an unattended install is gated on.
         let (name, baseline) = (&artifact.manifest().name, &previous.manifest().name);
         if name != baseline {
             eprintln!(
@@ -639,9 +577,8 @@ mod tests {
 
     #[test]
     fn artifact_text_is_bounded_and_escaped_before_it_is_rendered() {
-        // Both halves, on one string. The name is long enough that expanding it
-        // whole would dwarf the excerpt, and it carries the escape sequence a
-        // hostile artifact would use to rewrite the verdict printed above it.
+        // Long enough that expanding it whole would dwarf the excerpt, and
+        // carrying an escape that could repaint the verdict above it.
         let hostile = format!("wasi_snapshot_preview1::\u{1b}[2K{}", "a".repeat(100_000));
         let rendered = excerpt(&hostile);
 
@@ -718,7 +655,7 @@ path = "/hello/greet"
         .expect("packages")
     }
 
-    // ── The grown vocabulary (issue #1632) ───────────────────────────
+    // ── Capability grants and scopes (#1632) ─────────────────────────
 
     /// The same plugin, asking for the whole vocabulary.
     fn granted_manifest_toml() -> String {
@@ -779,9 +716,6 @@ job_types = ["reindex"]
 
     #[test]
     fn the_consent_screen_stops_denying_what_the_manifest_was_just_granted() {
-        // A screen that prints "no database access" over a manifest holding
-        // `db` is a screen contradicting itself, and the reader believes the
-        // reassuring half.
         let granted = Report::of(&pack(&granted_fixture()));
         assert!(!granted.denied.contains(&"database".to_owned()));
         assert!(!granted.denied.contains(&"network".to_owned()));
@@ -795,8 +729,7 @@ job_types = ["reindex"]
 
     #[test]
     fn the_conformance_input_names_the_head_a_get_route_also_serves() {
-        // Same source as the report: a GET also serves HEAD, so the checks
-        // must see it.
+        // A GET also serves HEAD, so the checks must see it, as the report does.
         let artifact = pack(&good_fixture());
         let routes = conformance_routes(artifact.manifest());
         let pairs: Vec<(&str, &str)> = routes
@@ -809,9 +742,8 @@ job_types = ["reindex"]
 
     #[test]
     fn the_plugin_check_gating_line_carries_the_grant_and_its_scope() {
-        // `autumn plugin-check` reads this line, and since #1632 a summary that
-        // said "no database or network" would be wrong about exactly the
-        // artifacts whose authority matters most.
+        // `autumn plugin-check` reads this line; it must name the grant and its
+        // scopes rather than claim "no database or network".
         let report = conformance(pack(&granted_fixture()).manifest());
         let text = report.to_text_report();
         for expected in ["http-outbound", "hosts=api.example.com", "tables=orders"] {
@@ -822,11 +754,8 @@ job_types = ["reindex"]
 
     #[test]
     fn an_upgrade_baseline_naming_another_plugin_is_refused_rather_than_compared() {
-        // `--against` pointed at the wrong installed artifact is a typo an
-        // operator makes once. Comparing anyway would let a new plugin inherit
-        // the unrelated baseline's capabilities, grants, routes and limits and
-        // come back "asks for no authority" — the exact verdict an unattended
-        // install is gated on.
+        // Comparing against another plugin would let the new one inherit the
+        // baseline's authority and pass as "asks for no authority".
         let next = pack(&granted_fixture());
         let other = pack(&fixture(
             &granted_manifest_toml().replace(
@@ -911,9 +840,8 @@ job_types = ["reindex"]
 
     #[test]
     fn packaging_refuses_an_oversized_input_before_reading_it() {
-        // `fs::read` sizes its buffer from the file, so a ceiling applied after
-        // it returns is a decision made after the damage. Sparse files, so the
-        // test does not allocate what it is proving is refused.
+        // `fs::read` sizes its buffer from the file, so the ceiling must apply
+        // before it. Sparse files keep the test from allocating the oversize.
         for oversize_manifest in [true, false] {
             let fixture = good_fixture();
             let target = if oversize_manifest {
@@ -1014,15 +942,8 @@ job_types = ["reindex"]
         let mut report = Report::of(&artifact);
         assert!(report.passed(), "the fixture should pass to begin with");
 
-        // `artifact_digest()` fails when the container cannot be re-rendered —
-        // a manifest that fits the size limit on disk can exceed it once
-        // written back in canonical form — and `Report::of` turns that into
-        // `None` rather than papering over it. But reporting it is not the same
-        // as failing on it: `SandboxedPlugin::from_artifact` computes the same
-        // digest and refuses, so a report that still passed said "fit to
-        // install" about an artifact the runtime rejects. It is also the number
-        // the consent screen asks the operator to record, and there is nothing
-        // to record when it is missing.
+        // A missing artifact digest means `SandboxedPlugin::from_artifact` would
+        // refuse the artifact, and the operator has no digest to record.
         report.artifact_sha256 = None;
         assert!(
             !report.passed(),
@@ -1046,11 +967,8 @@ job_types = ["reindex"]
 
     #[test]
     fn both_review_surfaces_carry_the_identity_that_covers_the_grant() {
-        // The guide tells an operator to record the digest this screen printed
-        // and compare it against what the deployment loads. The module digest
-        // cannot carry that: the grant being reviewed — prefix, routes,
-        // capabilities, ceilings — is all manifest, and rewriting it leaves the
-        // module digest correct, because the module really did not change.
+        // The operator records the digest this screen prints. It must cover the
+        // manifest: rewriting the grant leaves the module digest unchanged.
         let artifact = pack(&good_fixture());
         let identity = artifact.artifact_digest().expect("the artifact re-renders");
         let report = Report::of(&artifact);
@@ -1079,12 +997,8 @@ job_types = ["reindex"]
 
     #[test]
     fn the_json_report_names_the_head_a_get_route_also_serves() {
-        // The JSON report is the surface an automated consent or policy check
-        // reads. HTTP serves HEAD wherever it serves GET and the runtime mounts
-        // it, so a manifest declaring only GET — which this fixture does — still
-        // answers HEAD. Listing only the literal manifest entries let a machine
-        // approve a route set smaller than the artifact actually serves, while
-        // the human surfaces (`consent_summary`, `autumn routes`) named it.
+        // Automated policy checks read the JSON. This fixture declares only GET,
+        // but the runtime also mounts HEAD, so the JSON must list both.
         let artifact = pack(&good_fixture());
         let json = Report::of(&artifact).to_json().expect("serializes");
         let value: serde_json::Value = serde_json::from_str(&json).expect("parses");
@@ -1117,14 +1031,9 @@ job_types = ["reindex"]
 
     #[test]
     fn the_json_report_bounds_artifact_strings_the_way_the_text_one_does() {
-        // The text renderer excerpted; `to_json` serialized the report's own
-        // fields, so the bound stopped at whichever renderer remembered it.
-        //
-        // The wasm parser caps one name near 100 KiB, so a single import cannot
-        // fill the module allowance — but the reported list holds up to 256 of
-        // them, and `serde_json` expands every control character again escaping
-        // it. The bound belongs on the report either way: which renderer is
-        // safe should not depend on which one remembered to call `excerpt`.
+        // The bound lives on the report, so the JSON renderer is bounded too.
+        // The wasm parser caps one name near 100 KiB, but the list holds up to
+        // 256 imports and `serde_json` expands control characters again.
         let name = format!("\\1b[2K{}", "a".repeat(50_000));
         let module = wat::parse_str(format!(
             r#"(module
@@ -1198,12 +1107,9 @@ job_types = ["reindex"]
 
     #[test]
     fn a_module_refused_for_its_shape_reports_unread_imports_not_no_imports() {
-        // The consent screen exists to answer "what authority does this ask
-        // for?", and the artifacts where that answer matters most are the ones
-        // the sandbox already refuses. Enumeration is refused with them — the
-        // shape ceiling fires before the module is compiled — and reporting
-        // that as an empty list made the screen answer "none" for an artifact
-        // refused *for how much it imports*.
+        // The shape ceiling fires before the module is compiled, so a module
+        // refused for importing too much has no readable import list. That must
+        // read as unknown, not as "none".
         let imports = (0..=autumn_web::plugin_sandbox::host::MAX_IMPORTS)
             .map(|_| {
                 r#"  (import "wasi_snapshot_preview1" "fd_write"
@@ -1236,9 +1142,7 @@ job_types = ["reindex"]
         );
         assert!(text.contains("could not be read"), "{text}");
 
-        // …and the JSON surface agrees, since a reviewer diffing reports reads
-        // that one instead. `null` is distinguishable from `[]`; `[]` is not
-        // distinguishable from the truth.
+        // The JSON agrees: `null`, not `[]`.
         let json = report.to_json().expect("serializes");
         let value: serde_json::Value = serde_json::from_str(&json).expect("parses");
         assert!(value["imports"].is_null(), "{}", value["imports"]);

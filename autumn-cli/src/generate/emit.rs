@@ -400,14 +400,10 @@ impl Revert {
                 ..
             } => remove_schema_table(content, table, expected_block),
             Self::CargoDeps { names, .. } => {
-                // In addition to the `owner_dir` sibling-directory check the caller
-                // already applied, remove a name only if nothing else in the project's
-                // source tree still references it — a hand-added dependency unrelated
-                // to any generator (#1048 PR review) survives the way a dependency
-                // shared with a sibling resource already does. Best-effort: usage via a
-                // re-export, or a derive macro that never spells out the crate's own
-                // name — a plain `#[derive(Serialize)]` with no qualified `serde::`
-                // path — is not detected.
+                // Beyond the caller's `owner_dir` check, remove a name only if nothing else in the
+                // source tree references it, so a hand-added dependency survives. Best-effort: use
+                // through a re-export or an unqualified derive (`#[derive(Serialize)]`) is not
+                // detected.
                 let survives: Vec<&str> = names
                     .iter()
                     .map(String::as_str)
@@ -514,14 +510,9 @@ fn remove_i18n_keys(
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,
 ) -> String {
-    // The WHOLE source tree, not just `src/routes`. Chrome keys are ordinary
-    // Fluent keys once written, and nothing stops application code reusing
-    // them — a `t!(locale, "common.save")` in `src/components/navigation.rs` is
-    // exactly the sort of thing a project does. Scanning only the routes
-    // directory would call such a key unused when the last scaffold is
-    // destroyed, prune it, and break the surviving call at COMPILE time, which
-    // is the one failure mode this set exists to prevent. `autumn i18n check`
-    // reads the whole tree for the same reason.
+    // The whole tree, not just `src/routes`: application code can reuse chrome keys
+    // (`t!(locale, "common.save")` in a component), and pruning a key still in use breaks the
+    // build at compile time. `autumn i18n check` reads the whole tree too.
     let surviving = keys_still_referenced(content, project_root, excluding, overrides);
     super::scaffold_i18n::remove_en_ftl_keys(content, pascal, snake, &surviving)
 }
@@ -554,22 +545,15 @@ pub(super) fn keys_still_referenced_in(
     scan: &crate::i18n::ScanResult,
     bundle: &str,
 ) -> HashSet<String> {
-    // Every key the surviving tree references, NOT just the `common.*` ones.
-    // The resource's own keys are ordinary Fluent keys too, and hand-written
-    // code reaches for them: a dashboard card or a nav link labelled
-    // `t!(locale, "post.index.title")` outlives `src/routes/post.rs`. Deleting
-    // the whole marked `post.*` block out from under it breaks the build at
-    // COMPILE time — the exact failure this set exists to prevent — and the
-    // `common.` prefix was never what made a call site live.
+    // Every referenced key, not only `common.*`: hand-written code can name a resource's own keys
+    // (`t!(locale, "post.index.title")` in a dashboard card), and pruning them breaks the build at
+    // compile time.
     let mut surviving: HashSet<String> = scan.referenced.iter().cloned().collect();
 
-    // A key built at runtime — `locale.t(&format!("common.{action}"))`, or a bare
-    // `locale.t(key)` — names no key a static scan can record, so `scan_source` files it
-    // under `dynamic`. Dropping those prunes definitions such a call still reaches at
-    // runtime, leaving a missing-key marker in a surviving view. `autumn i18n check`
-    // suppresses its unused-key report for exactly these sites, so this must be at least
-    // as conservative, or pruning would delete what the checker declines to complain
-    // about. `key_prefix` is the leading literal, empty meaning "could be any key", so
+    // A key built at runtime (`locale.t(&format!("common.{action}"))`, or a bare `locale.t(key)`)
+    // is recorded under `dynamic`. Pruning a key such a site reaches leaves a missing-key marker in
+    // a surviving view, and `autumn i18n check` does not report these keys unused, so this must be
+    // at least as conservative. `key_prefix` is the leading literal; empty means any key, and
     // `starts_with` covers both.
     if !scan.dynamic.is_empty() {
         surviving.extend(
@@ -797,11 +781,9 @@ impl Plan {
             let by_sibling = r.owner.as_ref().is_some_and(|(dir, own)| {
                 resource_dir_has_other_files(dir, std::slice::from_ref(own))
             });
-            // Release only what this run takes away. Some file it overwrites
-            // used the feature before. A feature that no such file used was
-            // not this scaffold's, so keep it.
-            // An attachment column enables `multipart` and `storage` together,
-            // and an `--api` scaffold uses only `storage` in code.
+            // Release only a feature that some file this run overwrites used before; a feature no
+            // such file used was not this scaffold's. An attachment column enables `multipart` and
+            // `storage` together, and an `--api` scaffold uses only `storage` in code.
             let mut used_markers = markers.clone().unwrap_or_default();
             if r.feature == "multipart" {
                 used_markers.extend(release_markers("storage").unwrap_or_default());
@@ -914,7 +896,6 @@ impl Plan {
 
         self.print_warnings();
 
-        // Make sure parent directories of every file action exist.
         let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
         for action in &self.actions {
             let path = action.path();
@@ -1192,10 +1173,9 @@ impl Plan {
         self.forget_provenance(&removed, result.is_ok());
         result?;
 
-        // Nested sub-module declarations (e.g. `src/mailers/mod.rs`'s
-        // `pub mod previews;`) must be synced BEFORE `src/main.rs`'s, so a
-        // now-empty-and-deleted `src/mailers/mod.rs` is already gone by the
-        // time the `mod mailers;` orphan check runs.
+        // Sync nested `mod` declarations (`pub mod previews;` in `src/mailers/mod.rs`) before
+        // `src/main.rs`'s, so an emptied `src/mailers/mod.rs` is gone before the `mod mailers;`
+        // orphan check.
         sync_mod_declarations_in(
             &self.project_root.join("src").join("mailers"),
             &["previews"],
@@ -1343,18 +1323,13 @@ impl Plan {
             invocation: &self.invocation,
         };
 
-        // `Create`/`CreateBytes`/`CreateIfAbsent` actions living directly
-        // under `migrations/<dir>/` need suffix-based matching (see
-        // `resolve_migration_removal`); everything else is a normal,
-        // path-stable file to check-and-delete.
+        // Actions directly under `migrations/<dir>/` match by suffix (see
+        // `resolve_migration_removal`); everything else is a path-stable file.
         let mut migration_groups: Vec<(PathBuf, Vec<&Action>)> = Vec::new();
         let mut normal_actions: Vec<&Action> = Vec::new();
-        // `CreateIfAbsent` actions for a *shared* file (e.g. a mailer's
-        // `templates/mailers/_layout.html`) are deferred to their own pass
-        // below — unlike an owned `Create`, a later resource's `generate`
-        // call silently skips writing to it once an earlier resource's call
-        // already created it, so the action being present in THIS resource's
-        // plan doesn't mean this resource is the only one still using it.
+        // Shared `CreateIfAbsent` files (a mailer's `templates/mailers/_layout.html`) get their own
+        // pass below: a later resource's `generate` skips a file an earlier one created, so its
+        // presence in this plan does not make this resource its only user.
         let mut create_if_absent_actions: Vec<&Action> = Vec::new();
         for action in &self.actions {
             if matches!(action, Action::Modify { .. }) {
@@ -1417,12 +1392,9 @@ impl Plan {
             }
         }
 
-        // Now resolve the deferred `CreateIfAbsent` actions: only remove a
-        // shared file once its directory holds no other file this destroy
-        // isn't itself already removing — including sibling `CreateIfAbsent`
-        // files from the SAME batch (excluded up front, so whichever one is
-        // checked first doesn't see the other, still-unprocessed one as
-        // false evidence that the directory is still occupied).
+        // Remove a shared `CreateIfAbsent` file only once its directory holds no file this destroy
+        // keeps. Sibling `CreateIfAbsent` files from this batch are excluded up front, so the first
+        // one checked does not count the other as an occupant.
         let create_if_absent_paths: Vec<PathBuf> = create_if_absent_actions
             .iter()
             .map(|a| a.path().to_path_buf())
@@ -1443,15 +1415,10 @@ impl Plan {
             if matches {
                 files_to_remove.push(path.to_path_buf());
             } else {
-                // Unlike an owned `Create`, a `CreateIfAbsent` target may have existed
-                // before any generator ran — `generate` silently skips writing to it
-                // either way — such as a hand-rolled
-                // `templates/mailers/_layout.html`. Divergence here cannot be
-                // attributed to this destroy's own edit gone stale the way it can for
-                // an owned `Create`, so it is never a blocking error and never
-                // force-deleted (#1048 PR review): guessing wrong would destroy real,
-                // pre-existing project content this destroy never touched. Leave it and
-                // say why.
+                // A `CreateIfAbsent` target may predate every generator (a hand-written
+                // `templates/mailers/_layout.html`), so divergence is not this destroy's stale
+                // edit. Never block on it or force-delete it: guessing wrong destroys pre-existing
+                // content. Leave it and say why.
                 warnings.push(format!(
                     "{} doesn't match what this generator produces; leaving it in \
                      place since it may predate this resource — remove it by hand \
@@ -1498,32 +1465,18 @@ impl Plan {
         }
 
         let grouped_reverts = group_reverts_by_path(&self.reverts);
-        // Every path this destroy is itself rewriting — `src/schema.rs`, emptied by a
-        // `SchemaTable` revert — must be excluded from
-        // `crate_referenced_elsewhere_in_project`'s scan alongside `files_to_remove`.
-        // Its pre-destroy content, still on disk at scan time since the real rewrite
-        // happens later in `Plan::revert`'s apply phase, is not evidence of anything a
-        // different resource still needs, because this same operation is about to change
-        // it too. `scan_overrides` below supplies each such file's real final content
-        // instead, so this exclusion only ever falls back to "treat as absent" for a file
-        // that becomes empty, never for one that survives with other content.
+        // Also exclude every file this destroy rewrites (`src/schema.rs` after a `SchemaTable`
+        // revert): its on-disk content is pre-destroy. `scan_overrides` below supplies the final
+        // content of each such file that survives, so only a file that ends up empty reads as
+        // absent.
         let mut cargo_deps_excluding = files_to_remove.clone();
         cargo_deps_excluding.extend(grouped_reverts.iter().map(|(path, _)| path.clone()));
 
-        // Precompute the final, post-destroy content of every modified file other than
-        // `Cargo.toml`, via each file's own self-contained reverts — none of
-        // `SchemaTable`, `ModDecl`, and the rest consult another file's content.
-        // `Cargo.toml`'s `CargoDeps`, `CargoAutumnWebFeature`, and
-        // `CargoAutumnWebDevFeature` reverts are the only ones that do, through the
-        // project-wide crate and feature usage scan, and they always target `Cargo.toml`
-        // itself — so computing every other file's result first and excluding
-        // `Cargo.toml` here avoids an ordering cycle. That is what lets the scan see what
-        // `src/schema.rs`, `src/main.rs`, or a `mod.rs` will actually look like once this
-        // destroy is done: a table this destroy is not touching, still present after its
-        // own removal. The alternatives are worse — stale pre-destroy content would
-        // wrongly count a table being removed as still needed, and hiding the file from
-        // the scan entirely would wrongly hide unrelated content in the same file that
-        // legitimately still needs the dependency (#1048 PR review).
+        // The post-destroy content of every modified file except `Cargo.toml`. These reverts read
+        // only their own file; only the `Cargo.toml` reverts scan the project, so computing the
+        // rest first avoids an ordering cycle. The scan then sees what survives in a shared file
+        // (another table in `src/schema.rs`), rather than stale pre-destroy content or no file at
+        // all.
         let cargo_toml_path = self.project_root.join("Cargo.toml");
         let mut scan_overrides: HashMap<PathBuf, String> = HashMap::new();
         for (path, reverts) in &grouped_reverts {
@@ -1565,9 +1518,8 @@ impl Plan {
                 if let Some(dir) = revert.owner_dir()
                     && resource_dir_has_other_files(dir, &files_to_remove)
                 {
-                    // A sibling resource of the same generator still lives
-                    // in `owner_dir` and may still need this dependency or
-                    // feature — leave the Cargo.toml edit in place.
+                    // A sibling resource in `owner_dir` may still need this dependency or feature:
+                    // keep the edit.
                     continue;
                 }
                 content = revert.apply(
@@ -1701,10 +1653,7 @@ fn resource_dir_has_other_files(dir: &Path, excluding: &[PathBuf]) -> bool {
     };
     entries.filter_map(Result::ok).any(|entry| {
         let path = entry.path();
-        // `mod.rs` is the shared aggregator every one of these directories
-        // has (declaring `pub mod <resource>;` per file) — it is not itself
-        // a resource, so its mere presence must never count as "a sibling
-        // resource still needs this dependency/feature".
+        // `mod.rs` is the directory's aggregator, not a sibling resource.
         path.is_file()
             && path.file_name() != Some(std::ffi::OsStr::new("mod.rs"))
             && !excluding.contains(&path)
@@ -1747,10 +1696,8 @@ pub fn crate_reference_site(
     overrides: &HashMap<PathBuf, String>,
 ) -> Option<PathBuf> {
     let markers = crate_reference_markers(crate_name);
-    // `examples` alongside the build targets: an example that uses the crate is
-    // a target that stops compiling when the dependency goes (issue #1631
-    // review). Erring toward retaining a dependency only ever costs an unused
-    // manifest line; erring the other way breaks a build.
+    // `examples` too: an example that uses the crate stops compiling when the dependency goes.
+    // Over-retaining costs an unused manifest line; under-retaining breaks a build.
     ["src", "tests", "benches", "examples"]
         .iter()
         .find_map(|dir| {
@@ -1805,27 +1752,17 @@ pub fn crate_reference_markers(crate_name: &str) -> Vec<String> {
 /// back to the `owner_dir` check alone.
 fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
     match feature {
-        // `maud` and `htmx` are in autumn-web's own `default = [...]` feature set (see
-        // `autumn/Cargo.toml`), so a project's default-features dependency already
-        // carries them regardless of any generator. Removing the explicit `features =
-        // [...]` entry therefore never disables the capability, and a project-wide
-        // marker check would wrongly treat autumn's own default-feature boilerplate —
-        // `src/main.rs`'s stock `layout()`, which always calls `maud::html!` — as still
-        // needed in every project. No check needed: fall through to the `owner_dir`
-        // check alone.
+        // `maud` and `htmx` are autumn-web default features, so dropping them from `features` never
+        // disables them, and the stock `layout()` calls `maud::html!` in every project. They have
+        // no markers and fall back to the `owner_dir` check.
         "mail" => &["Mail::builder("],
         "oauth2" => &["OAuth2"],
         "webauthn" => &["Webauthn"],
-        // Real WebSocket-transport channels (`#[ws]`) AND SSE-transport
-        // channels/`--live` scaffolds (`autumn_web::sse::stream(`, no
-        // `#[ws]` marker at all) are both gated behind the same "ws"
-        // feature (issue #1048 PR review: destroying the only channel/live
-        // scaffold of one transport must not strip a feature the other
-        // transport, generated separately, still needs).
+        // `#[ws]` channels and SSE channels or `--live` scaffolds (`autumn_web::sse::stream`) share
+        // the `ws` feature, so destroying one transport must not strip it from the other.
         //
-        // The prelude re-exports the `ws` types unqualified (`Channels`,
-        // `Broadcast`, `ChannelMessage`, `ChannelStats`), so a route that
-        // uses `autumn_web::prelude::*` names none of the paths above.
+        // The prelude re-exports `Channels`, `Broadcast`, `ChannelMessage` and `ChannelStats`, so a
+        // route using `autumn_web::prelude::*` names none of the paths above.
         "ws" => &[
             "#[ws]",
             "autumn_web::sse::stream",
@@ -1835,38 +1772,24 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
             "ChannelMessage",
             "ChannelStats",
         ],
-        // `TestDb::` (not bare `TestDb`) so a doc comment merely mentioning
-        // the type (e.g. the template-shipped `tests/integration_test.rs`'s
-        // "Add DB-backed tests with `TestDb`...") doesn't count as usage.
+        // `TestDb::`, not bare `TestDb`, so a doc comment naming the type (as the template's
+        // `tests/integration_test.rs` does) is not usage.
         "test-support" => &["TestDb::"],
-        // Attachment scaffolds (`generate scaffold ... --attachment`) enable both
-        // `multipart` and `storage`, but a hand-written route can use these APIs
-        // directly. Destroying the last attachment model must not strip a feature such
-        // a route still needs (PR #1867 review).
+        // Attachment scaffolds enable `multipart` and `storage`, and a hand-written route can use
+        // either directly.
         //
-        // Bare `Multipart`, not `extract::Multipart`, so the marker also catches a
-        // hand-written route that pulls the extractor in through `use
-        // autumn_web::prelude::*;` and names it unqualified. The prelude re-exports
-        // `Multipart` (`autumn/src/prelude.rs`), so such a route contains neither
-        // `extract::Multipart` nor any storage path, and the narrower marker would let
-        // `destroy` wrongly strip the feature. This still matches the fully-qualified
-        // `autumn_web::extract::Multipart` the scaffold emits and any `use
-        // ...::Multipart;` import; the only extra hits are identifiers like
-        // `MultipartField` and `MultipartError`, themselves part of the multipart API
-        // surface, so over-retaining on them is harmless.
+        // Bare `Multipart` also catches the extractor named unqualified through the prelude, not
+        // only `extract::Multipart`. Its extra hits (`MultipartField`, `MultipartError`) are
+        // multipart API too, so over-retaining on them is harmless.
         "multipart" => &["Multipart"],
-        // The prelude does not re-export storage types (`Blob`,
-        // `BlobStoreState`, …), so each use starts with `autumn_web::storage`.
-        // The marker has no trailing `::` (issue #2186). A module import
-        // (`use autumn_web::storage;` or `… as blobs;`) ends at the module name.
-        // A doc comment that names the module now also keeps the feature.
-        // This extra match is safe. `multipart` and `csv` accept the same risk.
+        // The prelude does not re-export storage types, so each use starts with
+        // `autumn_web::storage`. No trailing `::`, so a module import (`use autumn_web::storage;`)
+        // counts too (#2186). A doc comment naming the module also keeps the feature; `multipart`
+        // and `csv` accept the same over-retention.
         "storage" => &["autumn_web::storage"],
-        // A `richtext` scaffold (issue #1255) enables `markdown` for
-        // `render_user_content`. Hand-written code can also use `render` or
-        // `MarkdownRegistry`. The prelude re-exports none of them, so each use
-        // starts with `autumn_web::markdown`. The marker has no trailing `::`,
-        // for the same reason as `storage` (issue #2186).
+        // A `richtext` scaffold (#1255) enables `markdown` for `render_user_content`; hand-written
+        // code can also use `render` or `MarkdownRegistry`. None is in the prelude. No trailing
+        // `::`, as for `storage`.
         "markdown" => &["autumn_web::markdown"],
         // Widget families (issue #3408). A scaffold renders these widgets by
         // their full path, and hand-written code may import them. Each marker
@@ -1888,26 +1811,13 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
             "transition_controls",
             "TransitionLabels",
         ],
-        // A scaffolded CSV export (issue #1315) enables `csv` for the
-        // `CsvSchema` impl and `export_csv` call its `export.csv` route emits,
-        // but a hand-written route, job or task can use the same module —
-        // `import_csv` has no generator at all, so an author wiring an upload
-        // form is doing it by hand by definition. Destroying the last
-        // scaffolded resource must not strip the feature out from under them.
-        // The prelude re-exports nothing from `data::csv`, so every spelling
-        // goes through this path. Deliberately NO trailing `::`: an author can
-        // import the MODULE (`use autumn_web::data::csv;` or `… as data_csv;`)
-        // and then call `csv::export_csv(…)`, and that import line ends at the
-        // module name. A `autumn_web::data::csv::` marker misses it, and
-        // destroying the last export-enabled scaffold would then strip a
-        // feature the surviving code needs — a build break. Dropping the `::`
-        // costs only over-retention (a doc comment naming the module now
-        // counts as usage, leaving the feature enabled), which is the same
-        // harmless direction `multipart` already accepts above; under-retention
-        // is the one that does not compile.
+        // A CSV export scaffold (#1315) enables `csv`, and hand-written code uses the module too
+        // (`import_csv` has no generator). Nothing from `data::csv` is in the prelude. No trailing
+        // `::`, so a module import (`use autumn_web::data::csv;`) counts: over-retaining is
+        // harmless, under-retaining breaks the build.
         //
-        // `Csv<T>` is the extractor and responder gated by the same feature. It
-        // lives in `autumn_web::extract` and is not in the prelude.
+        // `Csv<T>` is the extractor and responder gated by the same feature. It lives in
+        // `autumn_web::extract` and is not in the prelude.
         "csv" => &[
             "autumn_web::data::csv",
             "extract::Csv",
@@ -2100,9 +2010,7 @@ fn rs_tree_marker_site(
     overrides: &HashMap<PathBuf, String>,
 ) -> Option<PathBuf> {
     let entries = fs::read_dir(dir).ok()?;
-    // Sorted so the reported site is stable across runs and filesystems —
-    // `read_dir` order is not specified, and a report that names a different
-    // file on each run reads like a different finding.
+    // Sorted: `read_dir` order is unspecified, and the reported site must be the same on every run.
     let mut paths: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
     paths.sort();
     for path in paths {
@@ -2345,10 +2253,8 @@ fn resolve_migration_removal(
         0 => return MigrationOutcome::NotFound,
         1 => candidates.into_iter().next().expect("len checked above"),
         _ => {
-            // Multiple on-disk directories share this suffix — disambiguate
-            // by exact content match rather than guessing (filesystem read
-            // order is unspecified, so picking the first would be
-            // non-deterministic).
+            // Several directories share this suffix. Pick the one whose content matches exactly;
+            // `read_dir` order is unspecified, so taking the first would be nondeterministic.
             let mut matching: Vec<PathBuf> = candidates
                 .into_iter()
                 .filter(|dir| migration_dir_matches_actions(dir, actions))
@@ -2364,9 +2270,8 @@ fn resolve_migration_removal(
         let Some(file_name) = action.path().file_name() else {
             continue;
         };
-        // A byte asset inside a migration directory was never content-checked
-        // here, and still is not — the unplanned-file sweep below is what
-        // guards this directory. No generator emits one today.
+        // A byte asset in a migration directory is not content-checked; the unplanned-file sweep
+        // below guards the directory. No generator emits one.
         if matches!(action, Action::CreateBytes { .. } | Action::Modify { .. }) {
             continue;
         }
@@ -2379,12 +2284,8 @@ fn resolve_migration_removal(
         }
     }
 
-    // Refuse to sweep up files this generator never planned — a hand-added
-    // `README.md` or an auxiliary fixture living alongside `up.sql`/
-    // `down.sql` — unless `--force` is passed (issue #1048 PR review).
-    // Without this, `remove_dir_all` below would silently delete
-    // hand-authored content just because it happens to share a directory
-    // with the generated migration files.
+    // Without `--force`, refuse to remove files the generator never planned (a hand-added
+    // `README.md` next to `up.sql`), which `remove_dir_all` below would delete.
     if !force && let Ok(entries) = fs::read_dir(&real_dir) {
         for entry in entries.filter_map(Result::ok) {
             let name = entry.file_name();
@@ -2403,13 +2304,8 @@ fn resolve_migration_removal(
         return MigrationOutcome::StillNeededElsewhere(real_dir);
     }
 
-    // Deliberately NOT gated on `force`: `--force` bypasses content
-    // divergence and the sibling-resource "still needed elsewhere" caution,
-    // but never the applied-migration check (issue #1048 PR review) —
-    // removing files backing a migration the database already recorded as
-    // applied would leave that database unable to reconstruct or roll back
-    // the step, which is a data-safety concern `--force`'s documented
-    // purpose (bypassing content mismatches) was never meant to cover.
+    // Not gated on `force`: deleting the files of a migration a database recorded as applied leaves
+    // that database unable to reconstruct or roll back the step.
     let real_dir_name = real_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let (version, _) = split_migration_dir_name(real_dir_name);
     match migration_applied_status(version, migrations_root) {
@@ -2481,22 +2377,17 @@ enum MigrationStatus {
 }
 
 fn migration_applied_status(version: &str, migrations_dir: &Path) -> MigrationStatus {
-    // Resolve the same profile/overlay `autumn migrate` would (see
-    // `migrate::resolve_targets`), not just the bare base `autumn.toml` — a
-    // project that only configures its database via `[profile.prod.database]`
-    // or an `autumn-prod.toml` overlay must not look "NotConfigured" here,
-    // which would defeat the applied-migration safety guard below.
+    // Resolve the profile and overlays `autumn migrate` would (see `migrate::resolve_targets`): a
+    // database configured only in `[profile.prod.database]` or `autumn-prod.toml` must not read as
+    // `NotConfigured`.
     let profile = crate::migrate::effective_profile(None);
     let table = crate::migrate::read_autumn_toml_table_with_profile(Some(&profile));
     let control_url = crate::migrate::resolve_primary_database_url_from_sources(
         |k| std::env::var(k),
         table.as_ref(),
     );
-    // `autumn migrate run --shard <name>` applies user migrations to shard
-    // databases too, independently of the control database (issue #1048 PR
-    // review) — a sharded project checking only the control URL could
-    // delete a migration's files while a shard still records it as applied,
-    // leaving that shard unable to reconstruct or roll back the step.
+    // `autumn migrate run --shard <name>` applies user migrations to shards independently, so a
+    // shard can record a migration the control database does not.
     let shard_urls = crate::migrate::resolve_shard_database_urls_from_sources(
         |k| std::env::var(k),
         table.as_ref(),
@@ -2508,10 +2399,8 @@ fn migration_applied_status(version: &str, migrations_dir: &Path) -> MigrationSt
     if urls.is_empty() {
         return MigrationStatus::NotConfigured;
     }
-    // Applied on ANY target (control or a shard) blocks removal outright;
-    // otherwise an unreachable target is treated the same as "applied"
-    // (conservative: never delete migration files destroy can't confirm are
-    // safe to remove on every configured database).
+    // Applied on any target, control or shard, blocks removal. An unreachable target counts as
+    // applied: never delete files destroy cannot confirm are safe on every database.
     let mut any_unreachable = false;
     for url in urls {
         match autumn_web::migrate::applied_user_migrations(&url, migrations_dir) {
@@ -2544,17 +2433,11 @@ const SHARED_MAIN_MODULE_NAMES: &[&str] = &[
     "jobs",
     "mailers",
     "inbound_mailers",
-    // `autumn generate webhook` (issue #1366) — directory-backed like the
-    // entries above, so `shared_module_backing_path_exists` treats it as
-    // orphaned once `src/webhooks/` is gone.
     "webhooks",
     "policies",
-    // A fixed single-file module (`src/notifications.rs`, no directory) —
-    // `shared_module_backing_path_exists` already handles that shape.
+    // A single file (`src/notifications.rs`), not a directory; `shared_module_backing_path_exists`
+    // handles both.
     "notifications",
-    // `autumn generate teams` (issue #1261) — like the other directory-backed
-    // entries above, `shared_module_backing_path_exists` treats this as
-    // orphaned once `src/teams/` is gone.
     "teams",
 ];
 
@@ -2642,8 +2525,7 @@ pub fn relative_display(path: &Path, root: &Path) -> String {
     let display = path
         .strip_prefix(root)
         .map_or_else(|_| path.display().to_string(), |p| p.display().to_string());
-    // Always render with forward slashes so the generator's output (and any
-    // tests that grep for it) is platform-consistent.
+    // Forward slashes on every platform, so the output and tests that grep it agree.
     display.replace('\\', "/")
 }
 
@@ -2779,8 +2661,7 @@ mod tests {
             ),
             ("field locale", r#"let g = t!(ctx.locale, "common.field");"#),
             ("spaced call", r#"let h = t! (locale, "common.spaced");"#),
-            // Not a macro at all — the `Locale` methods are equally supported,
-            // and were invisible to the text scanner.
+            // Not a macro: the `Locale` methods are supported too.
             ("method call", r#"let i = locale.t("common.method");"#),
             (
                 "method with args",
@@ -2896,16 +2777,11 @@ mod tests {
         let (_tmp, mut plan) = fixture();
         plan.warn("referenced table 'posts' is assumed to exist");
         assert_eq!(plan.warnings.len(), 1);
-        // A warning never fails the plan — it's advisory only.
         plan.execute(Flags::default()).unwrap();
     }
 
     #[test]
     fn warnings_do_not_block_a_collision_error() {
-        // A colliding Create must still fail with Collisions even when the
-        // plan also carries a warning (the warning is printed to stderr,
-        // which this test can't capture in-process, but it must never be
-        // allowed to suppress or alter the underlying error).
         let (tmp, mut plan) = fixture();
         let target = tmp.path().join("out.txt");
         fs::write(&target, "existing").unwrap();
@@ -3011,8 +2887,7 @@ mod tests {
         plan.create(b.clone(), "2");
         let err = plan.execute(Flags::default()).unwrap_err();
         let msg = err.to_string();
-        // The error message normalises path separators to `/` so the
-        // assertion needs to match that form (Windows uses `\` natively).
+        // The error message uses `/` separators on every platform.
         assert!(msg.contains(a.display().to_string().replace('\\', "/").as_str()));
         assert!(msg.contains(b.display().to_string().replace('\\', "/").as_str()));
     }
@@ -3094,10 +2969,9 @@ mod tests {
 
     // ---- issue #1835: provenance-tolerant revert -------------------------
     //
-    // `destroy` run by a NEWER CLI recomputes the plan from the CURRENT
-    // template, so any generator whose template changed since the project was
-    // generated reported `Diverged` on untouched files. These tests pin the
-    // provenance manifest that tells the two cases apart.
+    // `destroy` from a newer CLI recomputes the plan from the current template, so without
+    // provenance every file whose template changed looks diverged. These tests pin the manifest
+    // that tells the two cases apart.
 
     /// The plan a newer CLI would recompute: same path, newer template text.
     fn newer_template_plan(tmp: &tempfile::TempDir, path: &Path, contents: &str) -> Plan {
@@ -3588,10 +3462,9 @@ mod tests {
 
     #[test]
     fn editing_the_generator_config_drops_the_baseline() {
-        // `autumn.generate.toml` never appears in the arguments, so an edited
-        // recipe would otherwise leave a textually identical `destroy` looking
-        // like the same inputs while the plan is rebuilt from different fields
-        // (Codex review of PR #2551).
+        // `autumn.generate.toml` is not in the arguments, so an edited recipe would otherwise leave
+        // an identical `destroy` command looking like the same inputs while the plan is rebuilt
+        // from different fields.
         let tmp = tempfile::TempDir::new().unwrap();
         let config = tmp.path().join("autumn.generate.toml");
         fs::write(&config, "[scaffold.Post]\nfields = [\"title:String\"]\n").unwrap();
@@ -4189,11 +4062,9 @@ mod tests {
 
     #[test]
     fn the_last_consumer_of_a_shared_file_can_still_remove_it() {
-        // Only the FIRST writer of a `CreateIfAbsent` file is recorded. The
-        // sibling that destroys last has a different command, so requiring it
-        // to be that writer would strand the layout the moment a template
-        // change stopped the content compare from matching (Codex review of
-        // PR #2551).
+        // Only the first writer of a `CreateIfAbsent` file is recorded. The sibling that destroys
+        // last ran a different command, so requiring it to be that writer would strand the layout
+        // once a template change stops the content compare from matching.
         let (tmp, mut first) = fixture();
         let shared = tmp.path().join("templates/mailers/_layout.html");
         first.invocation = "mailer\u{1f}Welcome".to_owned();
@@ -4312,13 +4183,8 @@ mod tests {
 
     #[test]
     fn revert_never_deletes_a_diverged_create_if_absent_file_even_with_force() {
-        // A `CreateIfAbsent` target (e.g. a shared mailer layout) may
-        // pre-exist before ANY generator ever wrote to it — `generate`
-        // silently skips it either way, so content divergence here can't be
-        // attributed to "this destroy's own edit gone stale" the way it can
-        // for an owned `Create`. `--force` must never delete it (issue
-        // #1048 PR review): guessing wrong would destroy real, pre-existing
-        // project content this destroy never touched.
+        // A `CreateIfAbsent` target (a shared mailer layout) may predate every generator, so
+        // divergence is not this destroy's stale edit. `--force` must never delete it.
         let (tmp, mut plan) = fixture();
         let layout = tmp.path().join("templates/mailers/_layout.html");
         fs::create_dir_all(layout.parent().unwrap()).unwrap();
@@ -4357,13 +4223,9 @@ mod tests {
 
     #[test]
     fn revert_keeps_a_dependency_still_needed_by_another_table_in_the_same_schema_file() {
-        // issue #1048 PR review: excluding the WHOLE `src/schema.rs` from
-        // the crate-usage scan (because this destroy is also rewriting it)
-        // hid a second, unrelated `diesel::table!` block that survives the
-        // destroy — wrongly treating `diesel` as unused project-wide when
-        // it's still needed by that other table. The scan must see
-        // `schema.rs`'s real POST-destroy content, not exclude the file
-        // outright.
+        // The crate scan must read `schema.rs`'s post-destroy content. Excluding the whole file
+        // because this destroy rewrites it would hide a second `diesel::table!` that survives, and
+        // strip `diesel`.
         use crate::generate::dsl::parse_fields;
         use crate::generate::schema_edit::append_schema_table;
 
@@ -4418,12 +4280,9 @@ mod tests {
 
     #[test]
     fn revert_keeps_ws_feature_when_a_live_scaffold_route_still_uses_sse_stream() {
-        // `--live` scaffolds and SSE-transport channels both need the "ws"
-        // feature via `autumn_web::sse::stream(...)`, with no `#[ws]`
-        // marker at all (issue #1048 PR review) — destroying the only
-        // WebSocket-transport channel must not strip "ws" while a live
-        // scaffold's route in a completely different directory still needs
-        // it.
+        // `--live` scaffolds and SSE channels need `ws` through `autumn_web::sse::stream(...)`,
+        // with no `#[ws]` marker. Destroying the only WebSocket channel must not strip `ws` while a
+        // live scaffold's route still uses it.
         let (tmp, mut plan) = fixture();
         let routes_dir = tmp.path().join("src/routes");
         fs::create_dir_all(&routes_dir).unwrap();
@@ -4628,14 +4487,8 @@ mod tests {
 
     #[test]
     fn revert_never_removes_a_migration_with_an_unreachable_database_even_with_force() {
-        // A configured but unreachable database is treated the same as
-        // "applied" (conservative: destroy can't confirm it's safe). Even
-        // `--force` must not remove the migration files in that case
-        // (issue #1048 PR review) — `--force` bypasses content divergence
-        // and shared-resource caution, never the applied-migration guard,
-        // since deleting files backing a migration the database might
-        // already record as applied would leave it unable to reconstruct
-        // or roll back that step.
+        // An unreachable database counts as applied. `--force` bypasses content divergence and
+        // shared-resource checks, never the applied-migration guard.
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -4673,12 +4526,9 @@ mod tests {
 
     #[test]
     fn revert_never_removes_a_migration_when_only_an_unreachable_shard_is_configured() {
-        // A shard-only deployment (no control database role) is a valid
-        // shape (issue #1048 PR review): `autumn migrate run --shard
-        // <name>` applies user migrations to shard databases independently
-        // of any control URL. Checking only the control URL would see "no
-        // database configured" and happily delete migration files a shard
-        // still needs.
+        // A shard-only deployment is valid: `autumn migrate run --shard <name>` applies user
+        // migrations with no control URL. Checking only the control URL would see no database and
+        // delete files a shard still needs.
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -4737,11 +4587,9 @@ mod tests {
             let (tmp, mut plan) = fixture();
             fs::create_dir_all(tmp.path().join("migrations")).unwrap();
             let plan_dir = tmp.path().join("migrations/99999999999999_create_posts");
-            // Two independently-created directories normalize to the same
-            // suffix (e.g. a `model`-generated one and a hand-run `generate
-            // migration` for the same resource), and BOTH have content that
-            // exactly matches what this plan expects — content-based
-            // disambiguation genuinely can't tell them apart either.
+            // Two directories share the suffix (a `model`-generated one and a hand-run
+            // `generate migration`), and both match this plan's content exactly, so content
+            // cannot tell them apart.
             let first = tmp.path().join("migrations/20260101000000_create_posts");
             let second = tmp.path().join("migrations/20260201000000_create_posts");
             fs::create_dir_all(&first).unwrap();
@@ -4773,9 +4621,8 @@ mod tests {
             let (tmp, mut plan) = fixture();
             fs::create_dir_all(tmp.path().join("migrations")).unwrap();
             let plan_dir = tmp.path().join("migrations/99999999999999_create_posts");
-            // Two directories share a suffix, but only one has content that
-            // exactly matches what this plan would have produced — that one
-            // (and only that one) should be identified and removed.
+            // Two directories share a suffix, but only one matches what this plan renders: remove
+            // that one only.
             let matching = tmp.path().join("migrations/20260101000000_create_posts");
             let other = tmp.path().join("migrations/20260201000000_create_posts");
             fs::create_dir_all(&matching).unwrap();
@@ -4803,12 +4650,9 @@ mod tests {
 
     #[test]
     fn revert_prunes_now_empty_directory_after_shared_submodule_deletion() {
-        // A single mailer's `src/mailers/previews/mod.rs` empties down to
-        // nothing (deleted + pruned by the ordinary Modify-turned-empty
-        // path), which then orphans `pub mod previews;` in
-        // `src/mailers/mod.rs` — cleaned up by `sync_mod_declarations_in`.
-        // That leaves `src/mailers/` itself empty; it must be pruned too,
-        // exactly like every other now-empty generated directory.
+        // Emptying `src/mailers/previews/mod.rs` deletes it, which orphans `pub mod previews;` in
+        // `src/mailers/mod.rs` (removed by `sync_mod_declarations_in`). The now-empty
+        // `src/mailers/` must be pruned too.
         let tmp = tempfile::TempDir::new().unwrap();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -4839,14 +4683,9 @@ mod tests {
 
     #[test]
     fn multipart_and_storage_have_feature_markers() {
-        // Attachment scaffolds enable `autumn-web/multipart` and
-        // `autumn-web/storage`; both must carry markers so `autumn destroy`
-        // of the last attachment model can't strip a feature a hand-written
-        // route still uses (PR #1867 review).
-        // The marker is the bare `Multipart` substring so it also catches a
-        // route that names the extractor unqualified via `use
-        // autumn_web::prelude::*;` (the prelude re-exports `Multipart`), not
-        // just the fully-qualified `autumn_web::extract::Multipart` spelling.
+        // Attachment scaffolds enable `multipart` and `storage`; both need markers so destroying
+        // the last attachment model keeps a feature a hand-written route uses. Bare `Multipart`
+        // also catches the extractor named unqualified through the prelude.
         let multipart = autumn_web_feature_markers("multipart");
         assert!(
             multipart.contains(&"Multipart"),
@@ -4863,14 +4702,9 @@ mod tests {
 
     #[test]
     fn multipart_and_storage_markers_retain_features_for_handwritten_routes() {
-        // A hand-written route using the multipart extractor and the blob
-        // store must keep those features alive even when the model/route the
-        // attachment scaffold generated is being destroyed (excluded). The
-        // route deliberately imports through `use autumn_web::prelude::*;` and
-        // names `Multipart` UNQUALIFIED (the prelude re-exports it), the exact
-        // shape the narrower `extract::Multipart` marker used to miss; the
-        // blob store stays a `autumn_web::storage::` path since the prelude
-        // does not re-export storage types.
+        // A hand-written route keeps both features while the scaffold's files are destroyed. It
+        // names `Multipart` unqualified through the prelude; the blob store stays an
+        // `autumn_web::storage::` path because the prelude does not re-export storage types.
         let tmp = tempfile::TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("src/routes")).unwrap();
         let handwritten = tmp.path().join("src/routes/manual.rs");

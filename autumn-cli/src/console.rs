@@ -62,12 +62,9 @@ pub enum ConsoleError {
 
     // ── isolation guards ───────────────────────────────────────────────────
     //
-    // The playground compiles the app's own modules into a separate crate and
-    // is not always self-contained, so it must never join the default build
-    // set — otherwise a broken playground breaks `cargo build`, and with it
-    // `autumn dev`. Each of these is a configuration we cannot make safe on
-    // the user's behalf, so we refuse before touching anything rather than
-    // scaffold a project-wide outage.
+    // The playground is not always self-contained, so it must never join the default build set:
+    // a broken playground would break `cargo build`, and with it `autumn dev`. We cannot make
+    // these configurations safe for the user, so we refuse before touching anything.
     #[error(
         "`[features] default` enables `playground`, so the playground would be \
          built by a plain `cargo build` — the isolation `autumn console` relies \
@@ -289,9 +286,8 @@ pub fn repl_handshake(ack: &Path) -> Result<(), String> {
 /// The `cargo` arguments that build and run the playground.
 #[must_use]
 pub fn playground_cargo_args(package: Option<&str>, repl: bool) -> Vec<String> {
-    // `--features playground` lifts the target's `required-features` gate;
-    // without it Cargo skips the bin, which keeps a broken playground out of
-    // `autumn dev`'s builds.
+    // `--features playground` lifts the target's `required-features` gate, which keeps the bin
+    // out of every other build.
     let features = if repl {
         format!("{PLAYGROUND_FEATURE},{REPL_FEATURE}")
     } else {
@@ -341,11 +337,9 @@ pub fn app_module_decls(project_root: &Path, playground_rel: &str) -> String {
         .parent()
         .unwrap_or(&playground_dir)
         .to_path_buf();
-    // Resolve both ends through symlinks before measuring between them. The
-    // kernel applies `..` AFTER following a link, so a playground reached via
-    // `custom -> tools/bin` has its `#[path]` values resolved from
-    // `tools/bin/`, not from `custom/`. Measuring lexically would aim every
-    // declaration one directory tree sideways.
+    // Resolve both ends through symlinks: the kernel applies `..` after following a link, so a
+    // playground reached via `custom -> tools/bin` resolves its `#[path]` values from
+    // `tools/bin/`, not `custom/`.
     let playground_dir = resolve_through_symlinks(&playground_dir);
 
     let mut out = String::new();
@@ -443,8 +437,7 @@ pub fn render_playground(project_name: &str, app_modules: &str) -> String {
         .replace("\r\n", "\n")
         .replace("{{project_name}}", project_name)
         .replace("{{app_modules}}", app_modules.trim_end());
-    // An empty `{{app_modules}}` leaves a double blank line behind; collapse
-    // any run of blank lines so both shapes render identically.
+    // An empty `{{app_modules}}` leaves a double blank line behind.
     collapse_blank_lines(&rendered)
 }
 
@@ -504,8 +497,6 @@ pub fn ensure_manifest_wiring(
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| ConsoleError::ManifestParse(e.to_string()))?;
 
-    // Fail early and clearly on a project that is not an Autumn app, before
-    // any edit is staged.
     if doc
         .get("dependencies")
         .and_then(|deps| deps.get("autumn-web"))
@@ -524,10 +515,9 @@ pub fn ensure_manifest_wiring(
     {
         return Err(problem);
     }
-    // A `bin` key we cannot append to (e.g. a valid root-level `bin = []`,
-    // which toml_edit exposes as a plain array) means the target can never be
-    // registered — and the scaffolded file would then be auto-discovered
-    // ungated, rejoining the default build. Refuse rather than report success.
+    // A `bin` key we cannot append to (e.g. a valid root-level `bin = []`, a plain array) means
+    // the target can never be registered, and the scaffolded file would be auto-discovered
+    // ungated into the default build.
     if doc
         .get("bin")
         .is_some_and(|b| b.as_array_of_tables().is_none())
@@ -577,12 +567,9 @@ fn playground_bin_gate_problem(
         return Some(ConsoleError::PlaygroundBinNotGated);
     }
 
-    // What `cargo run --features playground` actually turns on. We never pass
-    // `--no-default-features`, so the default set is active too — but only if
-    // the package declares one. A gate naming a feature that does not exist
-    // can never be satisfied: cargo warns "`default` is not present in
-    // [features] section" and refuses to build the target. Seeding `default`
-    // unconditionally would accept exactly that unrunnable gate.
+    // What `cargo run --features playground` turns on. We never pass `--no-default-features`, so
+    // `default` is active too, but only if the package declares it: cargo refuses a gate naming
+    // an undeclared `default`, so seeding it unconditionally would accept an unrunnable gate.
     let mut roots = vec![PLAYGROUND_FEATURE];
     if declares_feature(doc, "default") {
         roots.push("default");
@@ -683,8 +670,8 @@ fn enabled_by(
         .filter_map(|edge| match edge.split_once('/') {
             // Weak: contributes nothing by itself.
             Some((dep, _)) if dep.ends_with('?') => None,
-            // Strong: activates the implicit feature named after the
-            // dependency — which exists only if that dependency is optional.
+            // Strong: activates the implicit feature named after the dependency, which exists only
+            // if that dependency is optional.
             Some((dep, _)) => is_optional_dependency(doc, dep).then(|| dep.to_owned()),
             None if edge.starts_with("dep:") => None,
             None => Some(edge.to_owned()),
@@ -701,12 +688,9 @@ fn enabled_by(
 /// scanning only the top level would miss a real manifest and suppress an edge
 /// Cargo then demands, rejecting the manifest outright.
 fn is_optional_dependency(doc: &toml_edit::DocumentMut, name: &str) -> bool {
-    // Every lookup goes through `as_table_like`, which covers BOTH the header
-    // form (`[target.'cfg(unix)'.dependencies]`, a `Table`) and the inline form
-    // (`target = { 'cfg(unix)' = { dependencies = { … } } }`, an
-    // `InlineTable`). Enumerating representations is what left the two earlier
-    // versions of this scan incomplete: the same manifest written a different
-    // valid way slipped through each time.
+    // Every lookup goes through `as_table_like`, which covers both the header form
+    // (`[target.'cfg(unix)'.dependencies]`, a `Table`) and the inline form
+    // (`target = { 'cfg(unix)' = { dependencies = { … } } }`, an `InlineTable`).
     fn declares_optional(table: Option<&toml_edit::Item>, name: &str) -> bool {
         table
             .and_then(toml_edit::Item::as_table_like)
@@ -763,13 +747,10 @@ fn ensure_playground_feature(doc: &mut toml_edit::DocumentMut) -> Result<bool, C
         return Err(ConsoleError::UnusableFeaturesTable);
     };
 
-    // An optional dependency named `playground` gets an implicit
-    // `playground = ["dep:playground"]` feature from Cargo. Declaring the key
-    // explicitly suppresses that, and Cargo then rejects the manifest outright
-    // ("optional dependency `playground` is not included in any feature"),
-    // breaking every command. Carry the edge over when we create the key; an
-    // already-explicit feature is the user's and Cargo has already validated
-    // it, so it is left alone.
+    // Cargo gives an optional dependency named `playground` an implicit
+    // `playground = ["dep:playground"]` feature. Declaring the key suppresses that, and Cargo then
+    // rejects the manifest ("optional dependency `playground` is not included in any feature").
+    // Carry the edge over when we create the key; an explicit feature is the user's.
     let seed_with_dep = !features.contains_key(PLAYGROUND_FEATURE) && optional_dep_named_playground;
     let enables = features.entry(PLAYGROUND_FEATURE).or_insert_with(|| {
         let mut initial = Array::new();
@@ -866,21 +847,17 @@ pub fn adding_bin_would_break_autodiscovery(
     doc: &toml_edit::DocumentMut,
     inherited_edition: Option<&str>,
 ) -> bool {
-    // `as_table_like`, not `as_table`: `package = { name = "app", edition =
-    // "2015" }` is a valid inline declaration, and reading it as "no package"
-    // waved an edition-2015 project straight past this guard — appending the
-    // first `[[bin]]` and dropping every auto-discovered binary with it.
+    // `as_table_like`, not `as_table`: `package = { name = "app", edition = "2015" }` is a valid
+    // inline declaration, and reading it as "no package" would skip this guard.
     let Some(package) = doc.get("package").and_then(toml_edit::Item::as_table_like) else {
         return false;
     };
     if !package_is_edition_2015(package, inherited_edition) {
         return false;
     }
-    // Only *binary* configuration proves bin auto-discovery is already off.
-    // A `[lib]`, `[[test]]`, or `[[example]]` says nothing about it: an
-    // edition-2015 package with `[lib]` and no `[[bin]]` still auto-discovers
-    // `src/main.rs` and `src/bin/*.rs`, so treating the library as evidence
-    // would let us append an entry that silently drops every one of them.
+    // Only binary configuration proves bin auto-discovery is already off. An edition-2015
+    // package with `[lib]` and no `[[bin]]` still auto-discovers `src/main.rs` and
+    // `src/bin/*.rs`.
     let bin_config_present = doc.get("bin").is_some() || package.get("autobins").is_some();
     !bin_config_present
 }
@@ -899,10 +876,8 @@ fn package_is_edition_2015(
 ) -> bool {
     package.get("edition").is_none_or(|item| {
         item.as_str().map_or_else(
-            // Inherited: believe the workspace root. When it cannot be read,
-            // assume modern — `[workspace.package]` inheritance postdates
-            // edition 2015 by years, so an inherited 2015 is vanishingly rare
-            // while inherited 2021/2024 is the common case.
+            // Inherited: believe the workspace root. When it cannot be read, assume modern:
+            // `[workspace.package]` inheritance postdates edition 2015 by years.
             || inherited_edition == Some("2015"),
             |edition| edition == "2015",
         )
@@ -982,9 +957,8 @@ fn playground_destination_problem(project_dir: &Path, playground_rel: &str) -> O
     let root = lexically_normalize(project_dir);
     let path = lexically_normalize(&project_dir.join(playground_rel.replace('\\', "/")));
 
-    // `symlink_metadata` rather than `exists`, so a dangling symlink counts as
-    // present: `is_file()` is false for one, and a plain write would silently
-    // replace the link instead of the file the user thinks they named.
+    // `symlink_metadata` rather than `exists`, so a dangling symlink counts as present: a plain
+    // write would replace the link instead of the file the user named.
     if path.symlink_metadata().is_ok() && !path.is_file() {
         return Some(format!(
             "`{playground_rel}` exists but is not a regular file"
@@ -1045,14 +1019,10 @@ fn stage_atomic(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("autumn-console");
 
-    // The scratch file is created with O_EXCL, which fails outright if the
-    // path already exists — including when it exists as a *symlink*. A
-    // deterministic name opened with a plain write would instead follow such a
-    // link and truncate whatever it points at, anywhere on the filesystem, and
-    // the rename would then install the link in place of the real file. A
-    // checked-out repository can contain any name we might pick, so the
-    // exclusive create (not the name) is what makes this safe; the pid and
-    // counter only avoid colliding with our own concurrent runs.
+    // O_EXCL fails if the path exists, even as a symlink. A plain write would follow a planted
+    // link and truncate its target anywhere on disk, and the rename would install the link. A
+    // checked-out repository can contain any name we pick, so the exclusive create is what makes
+    // this safe; the pid and attempt number only avoid colliding with our own concurrent runs.
     for attempt in 0..MAX_TEMP_FILE_ATTEMPTS {
         let tmp = dir.join(format!(
             ".{stem}.autumn-console-{}-{attempt}.tmp",
@@ -1210,15 +1180,11 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
     )
     .unwrap_or_else(|e| fail(&e));
 
-    // EVERY rejection has to happen before the first byte is written. The
-    // manifest edit used to land here, ahead of the path checks below, so a
-    // project refused for an out-of-package playground was left with a
-    // modified `Cargo.toml` while the error said "nothing has been created".
-    // Resolve and validate the destination first; only then commit anything.
+    // Every rejection happens before the first byte is written, so the destination is validated
+    // before the manifest is committed.
     //
-    // Honour a user-relocated playground: if their manifest already declares
-    // the bin somewhere else, scaffold there rather than writing a file Cargo
-    // would de-duplicate away and never run.
+    // Honour a user-relocated playground: Cargo would de-duplicate a second file away by name and
+    // never run it.
     let playground_rel =
         declared_playground_path(&doc).unwrap_or_else(|| PLAYGROUND_REL_PATH.to_owned());
     if playground_path_escapes_package(&project_dir, &playground_rel) {
@@ -1226,9 +1192,7 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
     }
     let playground_path = project_dir.join(&playground_rel);
     let exists = playground_path.is_file();
-    // `--force` overwrites; refuse when the path is a symlink, so the write
-    // cannot land on a link target elsewhere in the tree while we report
-    // regenerating the file the user named.
+    // Refuse `--force` through a symlink, so the write cannot land on a link target elsewhere.
     if exists
         && force
         && std::fs::symlink_metadata(&playground_path).is_ok_and(|m| m.file_type().is_symlink())
@@ -1239,8 +1203,7 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
         );
         std::process::exit(1);
     }
-    // Only a run that will actually write the file needs a usable destination:
-    // an existing playground we are keeping is left alone either way.
+    // An existing playground we are keeping is left alone, so only a writing run is checked.
     let outcome = scaffold_outcome(exists, force);
     if outcome.writes_file()
         && let Some(problem) = playground_destination_problem(&project_dir, &playground_rel)
@@ -1248,19 +1211,12 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
         fail(&ConsoleError::PlaygroundDestinationUnusable(problem));
     }
 
-    // Validation is complete, but writing can still fail for reasons no check
-    // can predict: a read-only `src`, a full disk, a revoked permission. So do
-    // every fallible part of the source write FIRST — create the directory,
-    // write the bytes, fsync — into a `.tmp` scratch file that Cargo cannot
-    // auto-discover (target discovery only matches `*.rs`). Only once that has
-    // succeeded is the manifest committed, and only then is the scratch file
-    // renamed into place.
+    // Writing can still fail (read-only `src`, full disk). Do every fallible part of the source
+    // write first, into a `.tmp` file Cargo cannot auto-discover (discovery matches `*.rs`), then
+    // commit the manifest, then rename the file into place.
     //
-    // The ordering matters in both directions. Manifest-first left a failed run
-    // with the feature and `[[bin]]` entry persisted and no source file behind
-    // them. Source-first would be worse: an ungated `src/bin/playground.rs`
-    // with no `[[bin]]` entry is auto-discovered into the default build, which
-    // is the exact hazard the gate exists to prevent. Staging satisfies both.
+    // Manifest-first would leave the feature and `[[bin]]` entry with no source file on failure.
+    // Source-first would expose an ungated `src/bin/playground.rs` to the default build.
     let staged = outcome
         .writes_file()
         .then(|| stage_playground(&playground_path, &playground_rel, &project_dir, &manifest));
@@ -1363,7 +1319,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    // ── scaffold_outcome (AC5: idempotent, --force regenerates) ────────────
+    // ── scaffold_outcome (idempotent, --force regenerates) ─────────────────
 
     #[test]
     fn scaffold_outcome_created_when_absent() {
@@ -1448,7 +1404,7 @@ mod tests {
         assert!(args.ends_with(&["--package".to_owned(), "my-app".to_owned()]));
     }
 
-    // ── template contents (AC2, AC4) ───────────────────────────────────────
+    // ── template contents ──────────────────────────────────────────────────
 
     #[test]
     fn playground_template_marks_the_your_code_here_region() {
@@ -1529,7 +1485,7 @@ mod tests {
         );
     }
 
-    // ── app_module_decls (AC3: model/repository APIs reachable) ────────────
+    // ── app_module_decls (model/repository APIs reachable) ─────────────────
 
     fn project_with(files: &[&str]) -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -1596,7 +1552,7 @@ mod tests {
         );
     }
 
-    // ── ensure_manifest_wiring (AC3/AC4: the target actually builds) ───────
+    // ── ensure_manifest_wiring (the target actually builds) ────────────────
 
     const PLAIN_MANIFEST: &str = r#"[package]
 name = "my-app"
@@ -1609,11 +1565,8 @@ autumn-web = "0.6.0"
 
     #[test]
     fn ensure_manifest_wiring_gates_the_bin_behind_required_features() {
-        // The load-bearing property: the playground must NOT join the default
-        // build set. Auto-discovery would put it there, and a playground that
-        // fails to compile (its `#[path]`-included repository referencing
-        // `crate::routes`, say) would then break the bare `cargo build` that
-        // `autumn dev` and `autumn build` run.
+        // The playground must not join the default build set: one that fails to compile would
+        // break the bare `cargo build` that `autumn dev` and `autumn build` run.
         let (out, changes) = ensure_manifest_wiring(PLAIN_MANIFEST, None).unwrap();
         assert!(changes.added_bin && changes.added_feature);
         assert!(
@@ -1643,11 +1596,8 @@ autumn-web = "0.6.0"
 
     #[test]
     fn ensure_manifest_wiring_never_touches_the_autumn_web_dependency() {
-        // Routing through `autumn-web/seed` means the dependency line — whose
-        // shape and decoration we do not control — is never rewritten. That
-        // removes a whole class of corruption (e.g. a trailing `# comment`
-        // being relocated inside a newly-created inline table, commenting out
-        // the closing brace).
+        // Routing through `autumn-web/seed` never rewrites the dependency line, so a trailing
+        // `# comment` cannot be moved inside a new inline table and comment out its closing brace.
         let manifest = "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n\
                         [dependencies]\nautumn-web = \"0.6.0\" # pinned for the demo\n";
         let (out, _) = ensure_manifest_wiring(manifest, None).unwrap();
@@ -1805,10 +1755,8 @@ autumn-web = "0.6.0"
 
     #[test]
     fn ensure_manifest_wiring_recognises_a_path_less_playground_bin() {
-        // `[[bin]] name = "playground"` with no `path` is valid — Cargo infers
-        // `src/bin/playground.rs`. Failing to see it and appending a second
-        // entry makes `cargo metadata` reject the manifest outright, which
-        // breaks EVERY cargo command in the project.
+        // `[[bin]] name = "playground"` with no `path` is valid (Cargo infers
+        // `src/bin/playground.rs`). A second entry would make `cargo metadata` reject the manifest.
         let manifest = r#"[package]
 name = "my-app"
 version = "0.1.0"
@@ -1830,13 +1778,12 @@ autumn-web = "0.6.0"
         );
     }
 
-    // ── isolation guards (Codex review, a07f2f1..) ────────────────────────
+    // ── isolation guards: feature gates ───────────────────────────────────
 
     #[test]
     fn ensure_manifest_wiring_rejects_a_default_enabled_playground_feature() {
-        // `default = ["playground"]` satisfies `required-features` on every
-        // build, so the gate becomes vacuous and the playground rejoins the
-        // default build set.
+        // `default = ["playground"]` satisfies `required-features` on every build, so the gate is
+        // vacuous.
         let manifest = r#"[package]
 name = "my-app"
 version = "0.1.0"
@@ -1921,14 +1868,13 @@ autumn-web = "0.6.0"
         );
     }
 
-    // ── isolation guards, round 3 ─────────────────────────────────────────
+    // ── isolation guards: auto-discovery and manifest shapes ──────────────
 
     #[test]
     fn edition_2015_lib_is_not_proof_that_bin_discovery_is_off() {
-        // Verified against cargo: with `[lib]` and no `[[bin]]`, an
-        // edition-2015 package still auto-discovers src/main.rs and
-        // src/bin/*.rs. Appending our entry turned targets
-        // [g-app, g_app, worker] into [g_app, playground].
+        // With `[lib]` and no `[[bin]]`, an edition-2015 package still auto-discovers src/main.rs
+        // and src/bin/*.rs. Appending our entry would turn targets [g-app, g_app, worker] into
+        // [g_app, playground].
         let manifest = r#"[package]
 name = "legacy-app"
 version = "0.1.0"
@@ -1970,11 +1916,8 @@ autumn-web = "0.6.0"
 
     #[test]
     fn an_inline_package_table_is_still_guarded_on_edition_2015() {
-        // `package = { … }` is a valid inline declaration, and `as_table()`
-        // returned None for it — so the edition-2015 guard saw "no package",
-        // treated the project as safe, and appended the first `[[bin]]`.
-        // Verified against cargo: targets went from ['v-app', 'worker'] to
-        // ['playground'], dropping BOTH application binaries.
+        // `package = { … }` is a valid inline declaration, and `as_table()` returns None for it.
+        // Appending a `[[bin]]` here would drop both application binaries.
         let manifest = r#"package = { name = "legacy-app", version = "0.1.0", edition = "2015" }
 
 [dependencies]
@@ -1988,8 +1931,7 @@ autumn-web = "0.6.0"
 
     #[test]
     fn an_inline_package_table_on_a_modern_edition_is_allowed() {
-        // The accept case: the inline shape itself must not become a refusal —
-        // only edition 2015 carries the auto-discovery hazard.
+        // Only edition 2015 carries the auto-discovery hazard, not the inline shape itself.
         let manifest = r#"package = { name = "app", version = "0.1.0", edition = "2021" }
 
 [dependencies]
@@ -2001,10 +1943,8 @@ autumn-web = "0.6.0"
 
     #[test]
     fn staging_does_not_publish_the_file_until_it_is_committed() {
-        // The ordering this enables is the point: every fallible part of the
-        // source write happens before the manifest is touched, but the file only
-        // becomes visible to Cargo afterwards. The scratch name must therefore
-        // not end in `.rs`, or auto-discovery would pick it up mid-run.
+        // The file is written before the manifest is touched but must stay invisible to Cargo until
+        // committed, so the scratch name must not end in `.rs`.
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("playground.rs");
 
@@ -2025,8 +1965,8 @@ autumn-web = "0.6.0"
 
     #[test]
     fn inherited_edition_is_resolved_before_applying_the_2015_rule() {
-        // `edition.workspace = true` yields None from as_str(); reading that as
-        // "2015" would refuse a modern workspace member for a hazard it has no.
+        // `edition.workspace = true` yields None from as_str(); reading that as "2015" would refuse
+        // a modern workspace member for a hazard it does not have.
         let manifest = r#"[package]
 name = "member"
 version = "0.1.0"
@@ -2047,10 +1987,9 @@ autumn-web = "0.6.0"
 
     #[test]
     fn playground_feature_preserves_an_implicit_optional_dependency() {
-        // Cargo synthesises `playground = ["dep:playground"]` for an optional
-        // dependency of that name. Declaring the key without the edge makes
-        // cargo reject the manifest: "optional dependency `playground` is not
-        // included in any feature" — verified against cargo.
+        // Cargo synthesises `playground = ["dep:playground"]` for an optional dependency of that
+        // name. Declaring the key without the edge makes cargo reject the manifest: "optional
+        // dependency `playground` is not included in any feature".
         let manifest = r#"[package]
 name = "my-app"
 version = "0.1.0"
@@ -2074,8 +2013,7 @@ playground = { version = "0.1", optional = true }
     #[test]
     fn playground_feature_preserves_a_target_specific_optional_dependency() {
         // Cargo synthesises the implicit feature for optional dependencies in
-        // `[target.'cfg(...)'.dependencies]` too — verified against cargo,
-        // which reports `{'playground': ['dep:playground']}` for this manifest.
+        // `[target.'cfg(...)'.dependencies]` too: `{'playground': ['dep:playground']}`.
         let manifest = r#"[package]
 name = "my-app"
 version = "0.1.0"
@@ -2097,9 +2035,8 @@ playground = { version = "0.1", optional = true }
 
     #[test]
     fn ensure_manifest_wiring_rejects_an_unusable_bin_key() {
-        // A root-level `bin = []` is valid TOML that cargo accepts, but it is
-        // not an array-of-tables, so the gated entry can never be appended and
-        // the scaffolded file would be auto-discovered UNGATED.
+        // A root-level `bin = []` is valid but not an array-of-tables, so the gated entry can never
+        // be appended and the scaffolded file would be auto-discovered ungated.
         let manifest = r#"bin = []
 
 [package]
@@ -2138,8 +2075,6 @@ playground = "0.1"
     #[test]
     fn playground_feature_preserves_an_inline_table_target_dependency() {
         // The same optional dependency, written in Cargo's inline-table form.
-        // Two earlier versions of this scan enumerated representations and each
-        // missed one, so the lookup is now shape-agnostic (`as_table_like`).
         let manifest = r#"target = { 'cfg(unix)' = { dependencies = { playground = { version = "0.1", optional = true } } } }
 
 [package]
@@ -2178,10 +2113,9 @@ edition = "2024"
     #[cfg(unix)]
     #[test]
     fn app_module_decls_resolve_a_symlinked_playground_directory() {
-        // `custom -> tools/bin`, both inside the package. Containment holds, so
-        // this is not refused — but the kernel applies `..` after following the
-        // link, so a lexically-measured `../src/schema.rs` would land in
-        // `tools/src/`. Verified against the filesystem below.
+        // `custom -> tools/bin`, both inside the package, so this is not refused. The kernel
+        // applies `..` after following the link, so a lexically measured `../src/schema.rs` would
+        // land in `tools/src/`.
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -2204,10 +2138,8 @@ edition = "2024"
 
     #[test]
     fn ensure_manifest_wiring_rejects_a_strong_dependency_feature_edge_to_playground() {
-        // `default = ["playground/std"]` is a STRONG edge: it activates the
-        // optional dependency `playground`, and with it the implicit package
-        // feature of the same name — so the gate is on in every normal build.
-        // Verified against cargo:
+        // `default = ["playground/std"]` is a strong edge: it activates the optional dependency
+        // `playground` and its implicit feature of the same name, so the gate is on in every build:
         //   {'default': ['playground/std'], 'playground': ['dep:playground']}
         let manifest = r#"[package]
 name = "my-app"
@@ -2231,18 +2163,10 @@ default = ["playground/std"]
 
     #[test]
     fn strong_edge_to_a_required_dependency_does_not_activate_a_local_feature() {
-        // The mirror of the case above, and the reason the strong-edge rule is
-        // conditional rather than blanket: a strong edge activates the package
-        // feature named after the dependency only when that dependency is
-        // OPTIONAL, because what it really activates is the implicit
-        // `playground = ["dep:playground"]` feature Cargo synthesises for one.
-        // Against a required dependency no such feature exists, and a
-        // same-named feature the package declares itself stays off — so this
-        // project is properly isolated and must be accepted.
-        //
-        // Verified against cargo with a deliberately broken target gated on
-        // `required-features = ["playground"]`: the build succeeds, i.e. the
-        // target was skipped, i.e. the local feature was never activated.
+        // A strong edge activates the feature named after the dependency only when that dependency
+        // is optional: what it activates is the implicit `playground = ["dep:playground"]`.
+        // Against a required dependency, a same-named local feature stays off, so this project is
+        // isolated and must be accepted. Cargo skips a broken target gated on it.
         let manifest = r#"[package]
 name = "my-app"
 version = "0.1.0"
@@ -2263,9 +2187,8 @@ playground = []
 
     #[test]
     fn ensure_manifest_wiring_allows_a_weak_dependency_feature_edge() {
-        // `playground?/std` is WEAK: it adds `std` only if `playground` is
-        // already active, so it never activates the gate by itself. Treating
-        // both forms alike would refuse a project that is perfectly safe.
+        // `playground?/std` is weak: it adds `std` only if `playground` is already active, so it
+        // never activates the gate by itself.
         let manifest = r#"[package]
 name = "my-app"
 version = "0.1.0"
@@ -2304,16 +2227,11 @@ default = ["autumn-web/mail"]
 
     #[test]
     fn an_inline_root_features_table_is_usable() {
-        // `features = { playground = [] }` at the document root is a valid
-        // manifest — cargo reports `features = {'playground': []}` for it — but
-        // toml_edit exposes it as an InlineTable, so an `as_table_mut()` check
-        // rejected EVERY console invocation on such a project. Same class of
-        // mistake as the dependency scan: enumerating representations instead
-        // of going through `as_table_like`.
+        // `features = { playground = [] }` at the document root is a valid manifest, which
+        // toml_edit exposes as an InlineTable rather than a Table.
         //
-        // NOTE the key sits above the first table header. Placed after
-        // `[package]` it would nest inside it and be inert — which is how a
-        // first attempt at this repro accidentally passed.
+        // The key must sit above the first table header: after `[package]` it would nest inside
+        // it and the test would pass vacuously.
         let manifest = r#"features = { playground = [] }
 
 [package]
@@ -2334,9 +2252,8 @@ autumn-web = "0.6.0"
 
     #[test]
     fn an_inline_root_features_table_is_still_scanned_for_a_default_gate() {
-        // The read paths matter as much as the write: with an inline table the
-        // default-enables-playground guard used to see no features at all and
-        // wave the project through.
+        // The read paths must see an inline table too, or the default-enables-playground guard
+        // would find no features and accept the project.
         let manifest = r#"features = { default = ["playground"], playground = [] }
 
 [package]
@@ -2357,11 +2274,10 @@ autumn-web = "0.6.0"
 
     #[test]
     fn a_gate_naming_an_undeclared_default_feature_is_rejected() {
-        // `default` is not implicitly present. Verified against cargo:
+        // `default` is not implicitly present, so cargo can never run the target:
         //   warning: invalid feature `default` in required-features of target
         //            `playground`: `default` is not present in [features]
         //   error: target `playground` requires the features: `playground`, `default`
-        // so the target can never run and the gate must be refused.
         let manifest = r#"[package]
 name = "my-app"
 version = "0.1.0"
@@ -2388,9 +2304,8 @@ required-features = ["playground", "default"]
 
     #[test]
     fn a_gate_naming_a_declared_default_feature_is_accepted() {
-        // The accept case the fix must not swallow: when the package really
-        // does declare `default`, the runner activates it (no
-        // `--no-default-features` is ever passed), so the gate is satisfiable.
+        // A declared `default` is activated by the runner (it never passes
+        // `--no-default-features`), so the gate is satisfiable.
         let manifest = r#"[package]
 name = "my-app"
 version = "0.1.0"
@@ -2448,10 +2363,8 @@ required-features = ["playground", "default"]
 
     #[test]
     fn a_directory_at_the_playground_path_is_reported() {
-        // `is_file()` is false for a directory exactly as it is for nothing at
-        // all, so without this guard the run reads it as "create", commits the
-        // manifest, and only then fails with `Is a directory (os error 21)` —
-        // leaving the feature and `[[bin]]` entry behind with no source file.
+        // `is_file()` is false for a directory as for nothing at all. Without this guard the run
+        // would commit the manifest and only then fail with `Is a directory (os error 21)`.
         let tmp = project_with(&["src/main.rs"]);
         std::fs::create_dir_all(tmp.path().join(PLAYGROUND_REL_PATH)).unwrap();
         let problem = playground_destination_problem(tmp.path(), PLAYGROUND_REL_PATH)
@@ -2487,9 +2400,8 @@ required-features = ["playground", "default"]
     #[cfg(unix)]
     #[test]
     fn playground_path_through_a_symlinked_ancestor_is_rejected() {
-        // A checked-out `src/bin -> /elsewhere` writes outside the repository
-        // even though the declared path is the perfectly ordinary default.
-        // Only canonicalizing an existing ancestor catches this.
+        // A checked-out `src/bin -> /elsewhere` writes outside the repository even though the
+        // declared path is the default. Only canonicalizing an existing ancestor catches this.
         let tmp = TempDir::new().unwrap();
         let project = tmp.path().join("app");
         let outside = tmp.path().join("outside");
@@ -2507,9 +2419,8 @@ required-features = ["playground", "default"]
 
     #[test]
     fn write_atomic_does_not_write_through_a_symlinked_scratch_file() {
-        // A checked-out repo can contain any name we might pick for the temp
-        // file. Opening a deterministic path with a plain write would follow
-        // such a link and truncate its target anywhere on disk.
+        // A checked-out repo can contain any name we might pick for the temp file. A plain write
+        // would follow such a link and truncate its target anywhere on disk.
         let tmp = TempDir::new().unwrap();
         let victim = tmp.path().join("victim.txt");
         std::fs::write(&victim, "SECRET").unwrap();
@@ -2564,9 +2475,8 @@ required-features = ["playground", "default"]
 
     #[test]
     fn ensure_manifest_wiring_rejects_a_partially_satisfiable_gate() {
-        // `required-features` is an ALL-of list. The runner enables the default
-        // set plus `playground`, so a gate naming `tools` as well can never be
-        // satisfied — checking only that `playground` appears is not enough.
+        // `required-features` is an all-of list. The runner enables the default set plus
+        // `playground`, so a gate also naming `tools` can never be satisfied.
         let manifest = r#"[package]
 name = "my-app"
 version = "0.1.0"
@@ -2593,8 +2503,7 @@ autumn-web = "0.6.0"
 
     #[test]
     fn ensure_manifest_wiring_accepts_a_gate_whose_extras_playground_enables() {
-        // Same shape, but `playground` pulls `tools` in — so `--features
-        // playground` does satisfy the whole gate and the target is usable.
+        // Same shape, but `playground` pulls `tools` in, so the whole gate is satisfied.
         let manifest = r#"[package]
 name = "my-app"
 version = "0.1.0"
@@ -2699,9 +2608,8 @@ autumn-web = "0.6.0"
 
     #[test]
     fn app_module_decls_normalize_a_dot_prefixed_playground_path() {
-        // `./custom/playground.rs` is a valid `[[bin]] path`. Counting raw
-        // components charges an extra `../` for the leading `.`, which would
-        // aim the declaration a directory too high.
+        // `./custom/playground.rs` is a valid `[[bin]] path`. Counting raw components would add an
+        // extra `../` for the leading `.`.
         let tmp = project_with(&["src/main.rs", "src/schema.rs"]);
         assert_eq!(
             app_module_decls(tmp.path(), "./custom/playground.rs"),
@@ -2712,8 +2620,8 @@ autumn-web = "0.6.0"
 
     #[test]
     fn app_module_decls_handle_a_playground_outside_the_package() {
-        // A `[[bin]] path` may point outside the package root; the ascent then
-        // has to climb back down into it by name rather than blindly counting.
+        // A `[[bin]] path` may point outside the package root; the ascent then has to climb back
+        // into it by name.
         let tmp = project_with(&["src/main.rs", "src/schema.rs"]);
         let decls = app_module_decls(tmp.path(), "../tools/playground.rs");
         let leaf = tmp
@@ -2795,10 +2703,8 @@ autumn-web = "0.6.0"
 
     #[test]
     fn declared_playground_path_finds_a_relocated_playground() {
-        // Cargo de-duplicates bin targets by name, so scaffolding to the
-        // default location while the manifest points elsewhere would create a
-        // file that is never compiled — `autumn console` would report creating
-        // one program and then run a different one.
+        // Cargo de-duplicates bin targets by name, so scaffolding to the default location while the
+        // manifest points elsewhere would create a file that is never compiled.
         let manifest = r#"[package]
 name = "my-app"
 
@@ -2823,9 +2729,8 @@ path = "custom/playground.rs"
 
     #[test]
     fn edition_2015_without_manual_targets_refuses_the_bin_entry() {
-        // On edition 2015, `autobins` flips to false the moment any target is
-        // declared by hand — so appending ours would silently drop the
-        // package's `src/main.rs` and every `src/bin/*.rs` from the build.
+        // On edition 2015, `autobins` turns off once any target is declared by hand, so appending
+        // ours would drop `src/main.rs` and every `src/bin/*.rs` from the build.
         let manifest = r#"[package]
 name = "legacy-app"
 version = "0.1.0"
@@ -2833,9 +2738,7 @@ version = "0.1.0"
 [dependencies]
 autumn-web = "0.6.0"
 "#;
-        // Refused outright: we cannot add the gated entry, and a scaffolded
-        // file would be auto-discovered as an UNGATED binary that joins every
-        // normal build — the exact outage the gate exists to prevent.
+        // Without the gated entry, a scaffolded file would be auto-discovered as an ungated binary.
         assert_eq!(
             ensure_manifest_wiring(manifest, None),
             Err(ConsoleError::CannotIsolateOnEdition2015)
@@ -2891,12 +2794,9 @@ autumn-web = "0.6.0"
 
     #[test]
     fn ensure_manifest_wiring_errors_on_an_unusable_features_key() {
-        // A `features` key we cannot extend must be an error, never a silent
-        // no-op that leaves the user with a playground that cannot build and
-        // nothing said about why.
-        // Root-level keys must precede the first table header, so `features`
-        // sits at the top — this is a top-level `features` key that is a
-        // string rather than the expected `[features]` table.
+        // A `features` key we cannot extend must be an error, not a silent no-op that leaves a
+        // playground that cannot build. Root-level keys precede the first table header, so this
+        // is a top-level `features` string.
         let manifest = "features = \"nope\"\n\n[package]\nname = \"my-app\"\n\
                         edition = \"2024\"\n\n[dependencies]\nautumn-web = \"0.6.0\"\n";
         assert_eq!(

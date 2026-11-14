@@ -134,10 +134,9 @@ fn run_import_inner(
         .send()
         .map_err(|e| format!("Failed to fetch import form: {e}"))?;
 
-    // Collect cookies issued by the server during the GET (the CSRF cookie) so we
-    // can merge them with the user-supplied session cookie on the POST. Setting an
-    // explicit Cookie header suppresses reqwest's internal cookie jar, so we build
-    // the merged cookie string ourselves when --cookie is provided.
+    // Keep the cookies the GET sets (the CSRF cookie) for the POST. An explicit
+    // Cookie header bypasses reqwest's cookie jar, so with `--cookie` they are
+    // merged by hand below.
     let server_cookies: Vec<String> = get_resp
         .headers()
         .get_all(reqwest::header::SET_COOKIE)
@@ -177,9 +176,6 @@ fn run_import_inner(
 
     let mut post_req = client.post(&url).multipart(form);
     if let Some(c) = cookie {
-        // Merge the user-supplied session cookie with server-issued cookies (the
-        // CSRF cookie). We must do this explicitly because setting a Cookie header
-        // prevents reqwest from appending its jar cookies automatically.
         let mut parts = vec![c];
         let sc_refs: Vec<&str> = server_cookies.iter().map(String::as_str).collect();
         parts.extend_from_slice(&sc_refs);
@@ -201,8 +197,6 @@ fn run_import_inner(
         return Err(format!("Server returned HTTP {status}:\n{body}"));
     }
 
-    // The admin plugin returns HTML. Parse out the key numbers from the
-    // import result page if we can; otherwise just print the status.
     print_import_summary(&body, dry_run);
     Ok(())
 }
@@ -211,7 +205,7 @@ fn run_import_inner(
 /// and print a concise summary.  Falls back gracefully if the page structure
 /// changes.
 fn print_import_summary(html: &str, dry_run: bool) {
-    // Simple heuristic: look for digit-only content in the summary grid cells.
+    // Heuristic: the summary grid's count cells are styled `font-size: 1.5rem`.
     let counts: Vec<u64> = html
         .split("font-size: 1.5rem")
         .skip(1)
@@ -302,9 +296,8 @@ mod tests {
 
     #[test]
     fn run_export_prints_error_and_exits_on_bad_url() {
-        // We cannot connect to localhost:9 (IANA discard port)
-        // so the function should fail gracefully. We test that the
-        // inner function returns Err rather than testing that it exits.
+        // Port 9 (discard) refuses the connection. The inner function returns
+        // the error; the outer one exits the process.
         let result = run_export_inner("posts", "http://127.0.0.1:9", None, None, None);
         assert!(result.is_err(), "should fail with unreachable URL");
     }
@@ -327,7 +320,6 @@ mod tests {
 
     #[test]
     fn print_import_summary_handles_incomplete_html_gracefully() {
-        // Should not panic on HTML that doesn't have the expected grid structure
         print_import_summary("<html>Something went wrong</html>", false);
     }
 

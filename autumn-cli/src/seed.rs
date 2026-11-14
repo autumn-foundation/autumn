@@ -304,11 +304,8 @@ pub fn run(
         std::process::exit(1);
     }
     if let Some((count, model)) = &fake_request {
-        // Do not claim the rows were created: this command only *delegates* the
-        // request to the project's seed binary (via AUTUMN_SEED_COUNT/MODEL).
-        // Only a seed binary from a current scaffold — one that calls
-        // `autumn_web::seed::maybe_fake_seed` — actually performs the fake seed
-        // and reports the real inserted count itself.
+        // Do not claim the rows were created: only a seed binary that calls
+        // `autumn_web::seed::maybe_fake_seed` performs the request and reports the count.
         eprintln!(
             "  Requesting fake seed: {count} row(s) of model `{model}` \
              (delegated to the seed binary; requires a seed binary from a \
@@ -316,8 +313,6 @@ pub fn run(
         );
     }
 
-    // Determine the project directory: either the workspace member's root (when
-    // --package is given) or the current working directory.
     let project_dir: PathBuf = package
         .and_then(find_package_dir)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -340,11 +335,8 @@ pub fn run(
 
     eprintln!("  Running seed binary...\n");
 
-    // The seed binary's *target* name need not be `seed`: projects may rename
-    // the target (autumn #2639 renamed colliding example `seed` targets to
-    // `<crate>-seed`) while keeping the conventional `src/bin/seed.rs` path.
-    // Resolve the real target name from cargo metadata; fall back to `seed`
-    // when metadata is unreadable.
+    // A project may rename the target of `src/bin/seed.rs` (e.g. `<crate>-seed`,
+    // #2639), so read its name from cargo metadata.
     let seed_bin =
         resolve_seed_bin_name(&project_dir, package).unwrap_or_else(|| "seed".to_owned());
     let mut cmd = Command::new("cargo");
@@ -354,12 +346,8 @@ pub fn run(
     }
     cmd.env("AUTUMN_ENV", profile);
     cmd.env("AUTUMN_PROFILE", profile);
-    // Forward the fake-seed request (if any) to the seed binary, which
-    // dispatches on these vars via `autumn_web::seed::maybe_fake_seed`. When no
-    // request was made, explicitly *remove* these vars from the child's
-    // environment so a stray ambient `AUTUMN_SEED_MODEL`/`AUTUMN_SEED_COUNT`
-    // inherited by this process can't silently trigger a fake seed the user did
-    // not ask for.
+    // With no request, remove the vars so an inherited `AUTUMN_SEED_MODEL` /
+    // `AUTUMN_SEED_COUNT` cannot trigger a fake seed nobody asked for.
     if let Some((count, model)) = &fake_request {
         cmd.env("AUTUMN_SEED_COUNT", count.to_string());
         cmd.env("AUTUMN_SEED_MODEL", model);
@@ -367,9 +355,8 @@ pub fn run(
         cmd.env_remove("AUTUMN_SEED_COUNT");
         cmd.env_remove("AUTUMN_SEED_MODEL");
     }
-    // Run from the project directory so the seed binary's SeedContext reads
-    // autumn.toml from the correct location (the package root, not the
-    // workspace root).
+    // The seed binary's `SeedContext` reads autumn.toml from its working directory,
+    // so run it from the package root, not the workspace root.
     cmd.current_dir(&project_dir);
 
     let status = cmd.status();
@@ -476,8 +463,7 @@ mod tests {
 
     #[test]
     fn production_guard_ignores_plain_seed_without_fake_request() {
-        // No --count/--model: running the project's own seed binary against
-        // prod is unaffected by this guard (existing, unrelated behavior).
+        // Without --count/--model this guard does not apply.
         assert_eq!(check_production_guard("prod", None, false), Ok(()));
     }
 
@@ -490,7 +476,7 @@ mod tests {
         );
     }
 
-    // ── resolve_fake_request (--count / --model, #1343 AC4) ─────────────────
+    // ── resolve_fake_request (--count / --model) ──────────────────────────
 
     #[test]
     fn resolve_fake_request_none_when_both_absent() {
@@ -553,7 +539,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let seed_dir = tmp.path().join("src/bin/seed.rs");
         std::fs::create_dir_all(&seed_dir).unwrap();
-        // seed_dir is a directory, not a file
         assert!(!seed_binary_exists_at(&seed_dir));
     }
 
@@ -583,7 +568,7 @@ mod tests {
 
     #[test]
     fn seed_bin_name_resolves_renamed_target_by_src_path() {
-        // Regression for autumn #2639: the target name may differ from `seed`.
+        // #2639: the target name may differ from `seed`.
         let name =
             seed_bin_name_from_metadata(&seed_metadata(), Path::new("/projects/todo-app"), None);
         assert_eq!(name.as_deref(), Some("todo-app-seed"));
@@ -725,7 +710,6 @@ mod tests {
         let tmp_empty = TempDir::new().unwrap();
         let env =
             |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
-        // Using tmp_empty as base_dir — no autumn.toml there, so must fail.
         assert!(resolve_database_url_with_env(env, tmp_empty.path(), "dev").is_err());
     }
 

@@ -140,7 +140,6 @@ mod tests {
 
     #[test]
     fn a_file_in_two_spellings_of_a_directory_follows_the_same_rule() {
-        // Only the directory changes case. The file name is the same.
         let dir = tmp();
         let upper = dir.path().join("Widgets/foo.rs");
         fs::create_dir(dir.path().join("Widgets")).unwrap();

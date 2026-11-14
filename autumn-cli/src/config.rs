@@ -54,9 +54,9 @@ const GET_SQL: &str = "SELECT key, raw_value, updated_at::text AS updated_at \
      FROM autumn_runtime_config_values \
      WHERE key = $1;";
 
-// Per-key advisory lock: serializes concurrent set/unset on the same key so
-// T2 blocks here until T1 commits, and the next statement then sees T1's
-// committed row under READ COMMITTED's per-statement snapshot.
+// Per-key advisory lock serializing set/unset on one key: a second writer blocks until the
+// first commits, and its next statement sees the committed row (READ COMMITTED snapshots per
+// statement).
 const CONFIG_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(1, hashtext($1));";
 
 const CONFIG_GET_PRIOR_SQL: &str =
@@ -123,10 +123,8 @@ pub fn run_set(opts: &SetOptions) {
     pg::block_on_or_die("config set", async {
         let mut client = pg::connect("config set", &url).await?;
         let txn = client.transaction().await.pg()?;
-        // Acquire the per-key advisory lock before reading the prior value
-        // so concurrent writers on a brand-new key are serialised: T2 blocks
-        // here until T1 commits, and the next statement then sees T1's
-        // committed row under READ COMMITTED's per-statement snapshot.
+        // Lock before reading the prior value, so concurrent writers on a brand-new key are
+        // serialized too.
         txn.execute(CONFIG_LOCK_SQL, &[&opts.key]).await.pg()?;
         let prior_rows = txn.query(CONFIG_GET_PRIOR_SQL, &[&opts.key]).await.pg()?;
         let old_value: Option<String> = prior_rows.first().map(|r| r.get::<_, String>(0));
@@ -156,9 +154,7 @@ pub fn run_unset(opts: &UnsetOptions) {
     pg::block_on_or_die("config unset", async {
         let mut client = pg::connect("config unset", &url).await?;
         let txn = client.transaction().await.pg()?;
-        // Same per-key advisory lock as `set`, taken before the DELETE
-        // RETURNING captures old_value, keeping set/unset audit history
-        // ordered under concurrent writes.
+        // Lock before DELETE ... RETURNING captures old_value, so audit history stays ordered.
         txn.execute(CONFIG_LOCK_SQL, &[&opts.key]).await.pg()?;
         let removed = txn
             .query(CONFIG_UNSET_DELETE_SQL, &[&opts.key])

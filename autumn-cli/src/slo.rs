@@ -125,11 +125,9 @@ pub fn generate(slos: &[Slo], options: &GenerateOptions) -> Result<Generated, St
         .map(Matcher::render)
         .collect::<Vec<_>>()
         .join(",");
-    // `slo_scope` names the selector. Every recorded series carries it, and
-    // every consumer matches it exactly, so two rule sets for one app (for
-    // example staging and prod on one Prometheus) never read or write each
-    // other's series. An equality matcher also becomes a plain label, so an
-    // alert can be routed on it.
+    // `slo_scope` names the selector. Every recorded series carries it and every consumer matches
+    // it exactly, so two rule sets for one app (staging and prod on one Prometheus) never mix
+    // series. Equality matchers also become plain labels, so alerts can be routed on them.
     let scope = format!("{:08x}", fnv1a(&selector) & 0xffff_ffff);
     let rule_labels: Vec<(String, String)> = matchers
         .iter()

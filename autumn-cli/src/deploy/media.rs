@@ -108,7 +108,7 @@ use serde::Deserialize;
 use super::PreflightCheck;
 use super::exec::{DeployExecutor, DeployOp, FileContents, RemoteCommand};
 
-// ── MediaMTX ports (real u16 constants, NOT parsed from URLs) ────────────────
+// ── MediaMTX ports ───────────────────────────────────────────────────────────
 
 /// `MediaMTX` RTMP ingest port. (`WHIP` ingest publishes on the WebRTC port.)
 pub const MEDIAMTX_RTMP_PORT: u16 = 1935;
@@ -123,12 +123,11 @@ pub const MEDIAMTX_API_PORT: u16 = 9997;
 /// `MediaMTX` WebRTC local UDP port (ICE host candidates).
 pub const MEDIAMTX_WEBRTC_LOCAL_UDP_PORT: u16 = 8189;
 
-// ── LL-HLS window (copied verbatim from arroyo's mediamtx.yml) ───────────────
+// ── LL-HLS window ────────────────────────────────────────────────────────────
 //
-// The DVR-on-live window = `HLS_SEGMENT_COUNT * HLS_SEGMENT_DURATION` = 60 * 2s
-// = 120s. Kept as constants (not config) so the low-latency segmenting contract
-// matches the players' assumptions; changing them means updating the app's
-// advertised DVR window to match.
+// DVR-on-live window = `HLS_SEGMENT_COUNT * HLS_SEGMENT_DURATION` = 60 * 2s = 120s. Constants,
+// not config, so segmenting matches what the players assume; changing them means updating the
+// app's advertised DVR window.
 
 /// LL-HLS variant selector.
 const HLS_VARIANT: &str = "lowLatency";
@@ -139,7 +138,9 @@ const HLS_SEGMENT_DURATION: &str = "2s";
 /// LL-HLS retained-segment count (× segment duration = the DVR window).
 const HLS_SEGMENT_COUNT: u32 = 60;
 
-// ── Config-section defaults (free fns so serde + `Default` share one source) ──
+// ── Config-section defaults ──────────────────────────────────────────────────
+//
+// Free fns so the serde defaults and `Default` share one source.
 
 fn default_recordings_dir() -> String {
     "/recordings".to_owned()
@@ -185,15 +186,13 @@ const fn default_webrtc_local_udp() -> u16 {
     MEDIAMTX_WEBRTC_LOCAL_UDP_PORT
 }
 
-// ── App-side base-URL defaults (MIRRORED from the plugin) ────────────────────
+// ── App-side base-URL defaults ───────────────────────────────────────────────
 //
-// The value an unset `*_base` resolves to, so `mediamtx_ports_match_bases` can
-// grade it. Mirrored rather than imported, like `DEFAULT_FFMPEG_BIN`: this
-// module does not depend on the plugin.
+// What an unset `*_base` resolves to, so `mediamtx_ports_match_bases` can grade it. Mirrored
+// rather than imported because this module does not depend on the plugin.
 //
 // KEEP IN SYNC with `MediaMtxConfig` in `autumn-media-plugin/src/config.rs`.
-// `ports_match_bases_passes_for_default_config` pins them against the port
-// constants above.
+// `ports_match_bases_passes_for_default_config` pins them against the port constants above.
 
 /// Plugin default for `[media.mediamtx] api_base`.
 const DEFAULT_API_BASE: &str = "http://127.0.0.1:9997";
@@ -281,7 +280,7 @@ pub struct MediaMtxHostConfig {
     pub webrtc_additional_hosts: Vec<String>,
 
     // App-side base URLs, read only by `mediamtx_ports_match_bases`.
-    // `None` = unset, which resolves to the mirrored `DEFAULT_*_BASE`.
+    // `None` resolves to the mirrored `DEFAULT_*_BASE`.
     /// App-side `api_base` (control API), when set.
     pub api_base: Option<String>,
     /// App-side `rtmp_base` (RTMP ingest), when set.
@@ -468,9 +467,8 @@ pub fn media_host_config_from_value(
 /// added key against that reference before shipping it.
 #[must_use]
 pub fn render_mediamtx_yml(cfg: &MediaMtxHostConfig) -> String {
-    // `webrtcAdditionalHosts` renders as an inline YAML list. Each host is
-    // single-quoted so an IPv6 literal or a host with special chars stays a
-    // single scalar; empty -> `[]`.
+    // Inline YAML list. Each host is single-quoted so an IPv6 literal or a host with special
+    // chars stays one scalar.
     let webrtc_hosts = if cfg.webrtc_additional_hosts.is_empty() {
         "[]".to_owned()
     } else {
@@ -483,14 +481,10 @@ pub fn render_mediamtx_yml(cfg: &MediaMtxHostConfig) -> String {
         format!("[{joined}]")
     };
 
-    // The two config-derived string values in this template (the `recordPath`
-    // prefix built from `recordings_dir`, and the `recordDeleteAfter` retention
-    // window) are rendered as single-quoted YAML scalars (issue #2051, Finding T
-    // sweep). A plain scalar carrying a leading/trailing space or a YAML
-    // structural char (`:`/`#`/`{`/`[`/…) would otherwise break parsing — and a
-    // `mediamtx.yml` that fails to parse strands the daemon on the deferred
-    // post-cutover `systemctl restart`, the worst time. Quoting a path/duration
-    // is loss-free for MediaMTX (both parse the same string either way).
+    // Config-derived strings are single-quoted YAML scalars. A plain scalar with a leading or
+    // trailing space or a structural char (`:`, `#`, `{`, `[`) breaks parsing, and a
+    // `mediamtx.yml` that fails to parse strands the daemon on the post-cutover
+    // `systemctl restart`. MediaMTX reads the same value either way.
     let record_path = yaml_single_quote(&format!(
         "{}/%path/%Y-%m-%d_%H-%M-%S-%f",
         cfg.recordings_dir
@@ -722,7 +716,7 @@ impl MediaMtxController {
         let mkdir = parent_dir(path)
             .map(|parent| format!("mkdir -p {} || exit 1; ", quote(parent)))
             .unwrap_or_default();
-        // Exit 2 = a refusal with its own message; the outer handler then
+        // Exit 2 is a refusal that printed its own message; the outer handler then
         // skips the apt / Docker Hub text.
         format!(
             "( if [ -f {bin} ] && [ -x {bin} ]; then exit 0; fi; \
@@ -802,15 +796,12 @@ impl MediaMtxController {
         let unit_path = self.unit_path();
         let unit_tmp = format!("{unit_path}.autumn-new");
         let mut ops = Vec::new();
-        // Create the host dirs provisioning writes into, before anything writes
-        // into them (the rustdoc above says why each is needed). `mkdir -p -m`
-        // applies the mode only to a dir it creates, so an existing recordings
-        // root keeps the mode the operator gave it.
+        // `mkdir -p -m` applies the mode only to a dir it creates, so an existing
+        // recordings root keeps the mode the operator gave it.
         let config_parent = parent_dir(&self.cfg.config_path);
-        // Skip a recordings root this deploy cannot resolve to one host
-        // directory: `recordings_dir_writable` fails closed on an empty or
-        // relative path and defers a `${...}` one, so creating anything for it
-        // here would only make a wrongly-named dir.
+        // Skip a recordings root that names no single host directory: the preflight
+        // fails closed on an empty or relative path and defers a `${...}` one, so a
+        // mkdir here would only create a wrongly-named dir.
         let recordings = Some(self.cfg.recordings_dir.as_str())
             .filter(|dir| unusable_recordings_dir(dir).is_none() && !dir.contains("${"));
         let mut mkdirs: Vec<String> = Vec::new();
@@ -829,8 +820,8 @@ impl MediaMtxController {
                 mkdirs.join("; "),
             )));
         }
-        // Stage config + unit to TEMP paths (never directly over the live files),
-        // so op 4 can diff them and restart only on a real change.
+        // Stage to temp paths, never over the live files, so the install step can
+        // diff them and restart only on a real change.
         ops.push(DeployOp::WriteFile {
             label: "media-write-config",
             contents: FileContents::Plain(render_mediamtx_yml(&self.cfg)),
@@ -848,17 +839,12 @@ impl MediaMtxController {
         let cfg_new = super::exec::shell_quote(&config_tmp);
         let unit_live = super::exec::shell_quote(&unit_path);
         let unit_new = super::exec::shell_quote(&unit_tmp);
-        // The systemd unit id passed to `systemctl` is a config-derived string
-        // (`unit_name`), so shell-quote `<unit_name>.service` (issue #2051, Finding
-        // T sweep) — an unquoted unit name containing whitespace/special chars
-        // would otherwise split the `systemctl enable/is-active/restart` arguments.
+        // `unit_name` is config-derived; quoted so whitespace or special chars cannot
+        // split the `systemctl` arguments.
         let unit_service = super::exec::shell_quote(&format!("{unit}.service"));
-        // POSIX-sh, fail-fast (`set -e`): compare each staged file to its live
-        // counterpart; a missing live file (`cmp` non-zero) or a real diff copies
-        // it over and flags `changed`. daemon-reload + enable are idempotent. The
-        // unit is restarted ONLY when the config/unit changed OR it is not
-        // already active — an app-only redeploy over unchanged, already-running
-        // media never interrupts live sessions.
+        // A missing live file or a real diff copies the staged file over and sets
+        // `changed`. Restart only on a change or when the unit is not active, so an
+        // app-only redeploy never interrupts live sessions.
         let install = format!(
             "set -e; \
              changed=0; \
@@ -876,13 +862,11 @@ impl MediaMtxController {
     }
 }
 
-// ── Doctor checks (fail-closed, executor-driven) ─────────────────────────────
+// ── Doctor checks ────────────────────────────────────────────────────────────
 //
-// Each check runs a bounded remote command over the injectable `DeployExecutor`
-// and returns the shared `PreflightCheck` type. An unverifiable result (the
-// command could not run, or its output does not prove the healthy case) reports
-// a clear failure — never a silent pass — so a broken media host is caught
-// before ingest/playback/encode silently fail at runtime.
+// Each check runs a bounded remote command over `DeployExecutor` and returns a `PreflightCheck`.
+// They fail closed: a command that could not run, or output that does not prove the healthy
+// case, is a failure, never a silent pass.
 
 /// The check name for the `FFmpeg` preflight.
 pub const CHECK_FFMPEG_PREFLIGHT: &str = "media_ffmpeg_preflight";
@@ -944,10 +928,8 @@ const FFMPEG_UNRESOLVED_HINT: &str = "Set `[media.ffmpeg] bin` to a concrete pat
 /// Fail-closed: a transport error is a blocking failure, not a pass.
 #[must_use]
 pub fn ffmpeg_preflight(exec: &impl DeployExecutor, ffmpeg_bin: &str) -> PreflightCheck {
-    // Env/interpolation indirection the deployed service resolves from its OWN
-    // environment (empty value, or a `${...}` placeholder such as
-    // `${AUTUMN_MEDIA__FFMPEG__BIN}`): defer rather than resolve/probe against the
-    // CLI's local env, which the service does not share.
+    // An empty or `${...}` value is resolved by the service from its own environment, which the
+    // CLI does not share: defer instead of probing a locally resolved path.
     if ffmpeg_bin.trim().is_empty() || ffmpeg_bin.contains("${") {
         return PreflightCheck {
             name: CHECK_FFMPEG_PREFLIGHT,
@@ -1064,12 +1046,11 @@ pub fn recordings_dir_writable(
         return check(false, false, reason);
     }
     let quoted = super::exec::shell_quote(dir);
-    // Walk to the nearest existing ancestor when the dir itself is absent.
-    // The walk uses parameter expansion, not `dirname`: an absent `dirname`, or
-    // a path `dirname` reads as an option, would otherwise leave `$d` empty and
-    // spin forever. `[ ! -L ]` stops the walk at a dangling symlink or a symlink
-    // loop — `[ -e ]` alone resolves it and would step past it as if absent, and
-    // `mkdir -p` then fails after cutover.
+    // When the dir is absent, walk up to the nearest existing ancestor. Parameter
+    // expansion, not `dirname`: a missing `dirname`, or a path it reads as an option,
+    // would leave `$d` empty and spin forever. `[ ! -L ]` stops at a dangling symlink or
+    // a loop; `[ -e ]` alone resolves it and steps past it as if absent, and `mkdir -p`
+    // then fails after cutover.
     let cmd = RemoteCommand::new(
         "media-recordings-dir",
         format!(
@@ -1186,8 +1167,7 @@ fn parse_listening_sockets(ss_output: &str) -> Vec<ListeningSocket> {
                 "udp" => Protocol::Udp,
                 _ => return None,
             };
-            // We already consumed index 0 (Netid); the Local column is index 4,
-            // i.e. the 4th remaining column (skip State/Recv-Q/Send-Q).
+            // Netid is consumed; skip State/Recv-Q/Send-Q to reach Local (index 4).
             let local = cols.nth(3)?;
             let port = local.rsplit(':').next()?.parse::<u16>().ok()?;
             Some(ListeningSocket {
@@ -1231,8 +1211,7 @@ fn managed_process_name(cfg: &MediaMtxHostConfig) -> &str {
 /// at most once per check and the result reused.
 #[must_use]
 fn unit_is_active(exec: &impl DeployExecutor, unit_name: &str) -> bool {
-    // `unit_name` is a config-derived string, so shell-quote `<unit>.service`
-    // (issue #2051, Finding T sweep) rather than interpolating it bare.
+    // `unit_name` is config-derived, so it is shell-quoted.
     let unit_service = super::exec::shell_quote(&format!("{unit_name}.service"));
     let cmd = RemoteCommand::new(
         "media-unit-active",
@@ -1278,10 +1257,9 @@ pub fn mediamtx_ports_available(
     exec: &impl DeployExecutor,
     cfg: &MediaMtxHostConfig,
 ) -> PreflightCheck {
-    // `-p` attaches the owning-process column so a target port held by our own
-    // managed MediaMTX (a same-port redeploy) is distinguished from a foreign
-    // conflict; the Netid column gives the protocol. Deploy runs as root, so `-p`
-    // attribution is available.
+    // `-p` adds the owning process, so a port held by our own MediaMTX (a same-port
+    // redeploy) is told apart from a foreign one. Deploy runs as root, so `-p` can
+    // attribute every socket.
     let cmd = RemoteCommand::new("media-ports", "ss -H -tulnp".to_owned());
     let output = match exec.run(&cmd) {
         Ok(out) => out.stdout,
@@ -1298,9 +1276,7 @@ pub fn mediamtx_ports_available(
     };
 
     let sockets = parse_listening_sockets(&output);
-    // Fail-closed: a non-empty `ss` run that yields zero parseable sockets means we
-    // could not actually read the host's listener state — treat it as
-    // unverifiable rather than a pass.
+    // Non-empty output with no parseable socket means the listener state is unknown.
     if sockets.is_empty() && !output.trim().is_empty() {
         return PreflightCheck {
             name: CHECK_MEDIAMTX_PORTS_AVAILABLE,
@@ -1315,15 +1291,11 @@ pub fn mediamtx_ports_available(
     }
 
     let ours = managed_process_name(cfg);
-    // Ports held by a foreign / unattributable same-protocol listener.
+    // Ports held by a foreign or unattributable same-protocol listener.
     let mut foreign: Vec<u16> = Vec::new();
-    // Ports held only by our own MediaMTX process (pending the Finding-J
-    // is-active gate below).
+    // Ports held only by our own MediaMTX process, pending the is-active check below.
     let mut ours_ports: Vec<u16> = Vec::new();
     for (port, protocol) in mediamtx_required_ports(cfg) {
-        // A listener conflicts only when it matches BOTH the port AND the
-        // protocol (Finding I) — a same-port/different-protocol listener is not
-        // a conflict.
         let mut matching = sockets
             .iter()
             .filter(|s| s.port == port && s.protocol == protocol)
@@ -1331,8 +1303,7 @@ pub fn mediamtx_ports_available(
         if matching.peek().is_none() {
             continue; // no same-protocol listener → free
         }
-        // A listener owned by our own mediamtx is (provisionally) ours; a foreign
-        // process OR an unattributable listener (owner `None`) is a conflict.
+        // An unattributable listener (owner `None`) counts as foreign.
         if matching.all(|s| s.owner.as_deref() == Some(ours)) {
             ours_ports.push(port);
         } else {
@@ -1340,11 +1311,9 @@ pub fn mediamtx_ports_available(
         }
     }
 
-    // Finding J: a MediaMTX-owned port counts as "ours" only when our configured
-    // unit is actually active. If the ports are held by a `mediamtx` process that
-    // is NOT our managed unit (manual run / differently-named service / crashed),
-    // treat them as conflicts (fail-closed) — `enable --now` must not start a
-    // second instance over them. The is-active query runs at most once.
+    // A MediaMTX-owned port is ours only when our unit is active. Otherwise a manual run,
+    // another service or a crashed unit holds it, and starting our unit would launch a
+    // second instance over it.
     let mut held_by_us: Vec<u16> = Vec::new();
     let mut unmanaged: Vec<u16> = Vec::new();
     if !ours_ports.is_empty() {
@@ -1536,8 +1505,7 @@ pub fn mediamtx_binary_preflight(
 /// and every field bound to it.
 #[must_use]
 pub fn mediamtx_ports_distinct(cfg: &MediaMtxHostConfig) -> PreflightCheck {
-    // The five TCP listeners MediaMTX binds — each its own server, so all must be
-    // distinct. `webrtc_local_udp` is UDP and intentionally excluded.
+    // `webrtc_local_udp` is UDP, so it is not compared.
     let tcp: [(u16, &str); 5] = [
         (cfg.rtmp_port, "rtmp_port"),
         (cfg.hls_port, "hls_port"),
@@ -1545,8 +1513,7 @@ pub fn mediamtx_ports_distinct(cfg: &MediaMtxHostConfig) -> PreflightCheck {
         (cfg.playback_port, "playback_port"),
         (cfg.api_port, "api_port"),
     ];
-    // Group fields by port (BTreeMap → deterministic ascending-port ordering) and
-    // report every port claimed by more than one field.
+    // BTreeMap keeps the report in ascending port order.
     let mut by_port: std::collections::BTreeMap<u16, Vec<&str>> = std::collections::BTreeMap::new();
     for (port, field) in tcp {
         by_port.entry(port).or_default().push(field);
@@ -2019,19 +1986,16 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn media_config_fails_closed_on_malformed_mediamtx_section() {
-        // Finding C: a PRESENT `[media.mediamtx]` with an ill-typed value is a hard
-        // error, so the caller must abort rather than silently disable provisioning.
-        // `enabled` as a string, not a bool:
+        // An ill-typed value is an error, so the caller aborts rather than silently
+        // disabling provisioning.
         assert!(host_cfg_from_toml_str("[media.mediamtx]\nenabled = \"yes\"\n").is_err());
-        // A port field as a non-number:
         assert!(host_cfg_from_toml_str("[media.mediamtx]\napi_port = \"nope\"\n").is_err());
     }
 
     #[test]
     fn media_config_fails_closed_on_malformed_ffmpeg_section() {
-        // Finding C: a malformed `[media.ffmpeg]` is also a hard error — the deploy
-        // deserializer reads the whole `[media]` subtree, so a broken ffmpeg table
-        // cannot be tricked into the disabled default.
+        // The whole `[media]` subtree is deserialized, so a broken ffmpeg table is an
+        // error too, not the disabled default.
         let toml = "[media.ffmpeg]\nbin = 123\n";
         assert!(host_cfg_from_toml_str(toml).is_err());
     }
@@ -2041,8 +2005,7 @@ unit_name = \"mediamtx-prod\"
     #[test]
     fn rendered_yml_contains_every_port() {
         let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
-        // The control API binds loopback-only (Finding M) — server-side control
-        // plane for the co-located app, excluded from browser-facing CSP origins.
+        // The control API binds loopback only.
         assert!(
             yml.contains("apiAddress: 127.0.0.1:9997"),
             "api port: {yml}"
@@ -2056,9 +2019,8 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn rendered_yml_binds_api_to_loopback_but_leaves_public_listeners_open() {
-        // Finding M: the control API is the server-side control plane (the
-        // co-located app reaches it at 127.0.0.1) and is excluded from the
-        // browser-facing CSP origins, so it must NOT listen on every interface.
+        // The control API is server-side only (the co-located app reaches it on
+        // 127.0.0.1), so it must not listen on every interface.
         let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
         assert!(
             yml.contains("apiAddress: 127.0.0.1:9997"),
@@ -2068,8 +2030,8 @@ unit_name = \"mediamtx-prod\"
             !yml.contains("apiAddress: :9997"),
             "control API must NOT bind all interfaces: {yml}"
         );
-        // The viewer/ingest-facing listeners MUST stay bound on all interfaces so
-        // encoders and browsers can reach them — none is loopback-bound.
+        // Viewer and ingest listeners stay on all interfaces so encoders and browsers
+        // can reach them.
         for public in [
             "rtmpAddress: :1935",
             "hlsAddress: :8888",
@@ -2090,32 +2052,24 @@ unit_name = \"mediamtx-prod\"
     #[test]
     fn rendered_yml_has_ll_hls_recording_and_webrtc_config() {
         let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
-        // LL-HLS window copied from arroyo.
         assert!(yml.contains("hlsVariant: lowLatency"));
         assert!(yml.contains("hlsPartDuration: 200ms"));
         assert!(yml.contains("hlsSegmentDuration: 2s"));
         assert!(yml.contains("hlsSegmentCount: 60"));
-        // Recording config under the configured recordings dir.
         assert!(yml.contains("record: true"));
-        // Config-derived path/duration values are single-quoted YAML scalars
-        // (Finding T sweep) so a value with whitespace/special chars can't break
-        // parsing.
+        // Config-derived values are single-quoted YAML scalars.
         assert!(yml.contains("recordPath: '/recordings/%path/%Y-%m-%d_%H-%M-%S-%f'"));
         assert!(yml.contains("recordFormat: fmp4"));
         assert!(yml.contains("recordDeleteAfter: '72h'"));
-        // WebRTC config.
         assert!(yml.contains("webrtc: true"));
         assert!(yml.contains("webrtcAdditionalHosts: []"));
     }
 
     #[test]
     fn rendered_yml_uses_current_mediamtx_cors_schema() {
-        // Finding S (issue #2051): MediaMTX rejects unknown config fields at
-        // startup, and this config is installed by a post-cutover `systemctl
-        // restart`. The HLS CORS key is the plural array `hlsAllowOrigins` in the
-        // current schema (v1.19.x / `bluenviron/mediamtx:1`); the singular scalar
-        // `hlsAllowOrigin` is a deprecated alias, so the template must emit the
-        // current plural form, matching the already-plural `webrtcAllowOrigins`.
+        // MediaMTX rejects unknown fields at startup, and this config lands via a
+        // post-cutover restart. In the v1.19.x schema the HLS CORS key is the plural
+        // `hlsAllowOrigins`; the singular `hlsAllowOrigin` is a deprecated alias.
         let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
         assert!(
             yml.contains("hlsAllowOrigins: ['*']"),
@@ -2133,19 +2087,15 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn rendered_yml_disables_unmanaged_protocols_but_keeps_managed_ones() {
-        // Finding E/Q: MediaMTX fills omitted protocol flags from its own defaults, so
-        // RTSP (:8554), SRT (:8890), and MoQ (:8892) would otherwise listen even though
-        // the deploy plan never declares/checks those ports — an occupied default port
-        // could then fail `systemctl restart mediamtx` after preflight passed. The
-        // template pins every unmanaged default-on protocol OFF so the unit only opens
-        // the declared ports.
+        // MediaMTX turns on RTSP (:8554), SRT (:8890) and MoQ (:8892) by default. Their
+        // ports are never preflighted, so an occupied one could fail the post-cutover
+        // restart; the template pins every unmanaged protocol off.
         let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
         assert!(yml.contains("rtsp: no"), "RTSP must be disabled: {yml}");
         assert!(yml.contains("srt: no"), "SRT must be disabled: {yml}");
         assert!(yml.contains("moq: no"), "MoQ must be disabled: {yml}");
         assert!(yml.contains("metrics: no"), "metrics must be off: {yml}");
         assert!(yml.contains("pprof: no"), "pprof must be off: {yml}");
-        // The managed protocols stay enabled (RTMP/HLS/WebRTC/API/playback).
         assert!(yml.contains("rtmp: true"), "rtmp managed: {yml}");
         assert!(yml.contains("hls: true"), "hls managed: {yml}");
         assert!(yml.contains("webrtc: true"), "webrtc managed: {yml}");
@@ -2157,7 +2107,6 @@ unit_name = \"mediamtx-prod\"
     fn rendered_yml_has_both_live_and_room_path_matchers() {
         let yml = render_mediamtx_yml(&MediaMtxHostConfig::default());
         assert!(yml.contains("~^live/.+$:"), "broadcast matcher: {yml}");
-        // The autumn-media addition arroyo lacks.
         assert!(yml.contains("~^room/.+$:"), "room matcher: {yml}");
     }
 
@@ -2184,8 +2133,7 @@ unit_name = \"mediamtx-prod\"
     #[test]
     fn rendered_unit_uses_binary_and_config_paths_and_restarts_always() {
         let unit = render_mediamtx_unit(&MediaMtxHostConfig::default());
-        // Finding T: the binary/config paths are systemd double-quoted so a path
-        // with whitespace stays one argument.
+        // Paths are systemd double-quoted so whitespace stays inside one argument.
         assert!(
             unit.contains("ExecStart=\"/usr/local/bin/mediamtx\" \"/etc/mediamtx/mediamtx.yml\"\n"),
             "ExecStart: {unit}"
@@ -2197,24 +2145,20 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn rendered_unit_quotes_whitespace_paths_in_execstart() {
-        // Finding T (issue #2051): a `binary_path`/`config_path` containing
-        // whitespace must be systemd double-quoted in `ExecStart`, or systemd
-        // parses `ExecStart=/opt/media mtx/mediamtx ...` as the truncated command
-        // `/opt/media` and the deferred post-cutover `systemctl restart` fails.
+        // Unquoted, systemd parses `ExecStart=/opt/media mtx/mediamtx ...` as the
+        // command `/opt/media` and the post-cutover `systemctl restart` fails.
         let cfg = MediaMtxHostConfig {
             binary_path: "/opt/media mtx/mediamtx".to_owned(),
             config_path: "/etc/media mtx/mediamtx.yml".to_owned(),
             ..MediaMtxHostConfig::default()
         };
         let unit = render_mediamtx_unit(&cfg);
-        // Each path is wrapped in systemd double quotes → one argument each.
         assert!(
             unit.contains(
                 "ExecStart=\"/opt/media mtx/mediamtx\" \"/etc/media mtx/mediamtx.yml\"\n"
             ),
             "ExecStart must double-quote whitespace paths: {unit}"
         );
-        // And NOT the bare, space-splitting form.
         assert!(
             !unit.contains("ExecStart=/opt/media mtx/mediamtx"),
             "ExecStart must not interpolate the path unquoted: {unit}"
@@ -2233,9 +2177,7 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn rendered_yml_quotes_whitespace_and_special_config_values() {
-        // Finding T sweep: config-derived path/duration values are single-quoted
-        // YAML scalars, so a recordings dir with a space or a YAML structural char
-        // stays a single scalar instead of breaking `mediamtx.yml` parsing.
+        // A recordings dir with a space or a YAML structural char stays one scalar.
         let cfg = MediaMtxHostConfig {
             recordings_dir: "/mnt/rec ords".to_owned(),
             record_delete_after: "72h".to_owned(),
@@ -2260,9 +2202,8 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn install_op_quotes_whitespace_unit_name() {
-        // Finding T sweep: the config-derived unit name is shell-quoted in every
-        // systemctl invocation, so a unit name with whitespace does not split the
-        // arguments.
+        // The unit name is shell-quoted in every systemctl call, so whitespace does
+        // not split the arguments.
         let cfg = MediaMtxHostConfig {
             enabled: true,
             unit_name: "media mtx".to_owned(),
@@ -2323,8 +2264,8 @@ unit_name = \"mediamtx-prod\"
             "mkdir -p '/etc/mediamtx'; mkdir -p -m 0750 '/recordings'"
         );
 
-        // Finding H: op 1 writes mediamtx.yml to a TEMP path (never over the live
-        // file), so op 3 can diff it and restart only on a real change.
+        // op 1: write mediamtx.yml to a temp path, never over the live file, so op 3
+        // can diff it and restart only on a real change.
         match &ops[1] {
             DeployOp::WriteFile {
                 label,
@@ -2372,10 +2313,8 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn controller_install_op_is_conditional_restart() {
-        // Finding H: op 3 must `cmp` the staged temp files against the live ones,
-        // copy only the changed, and restart the unit ONLY on a real change or an
-        // inactive unit — never unconditionally (which would kill live sessions on
-        // a pure app redeploy).
+        // An unconditional restart would kill live sessions on an app-only redeploy:
+        // restart only on a real change or an inactive unit.
         let cfg = MediaMtxHostConfig {
             enabled: true,
             ..MediaMtxHostConfig::default()
@@ -2386,7 +2325,6 @@ unit_name = \"mediamtx-prod\"
         };
         assert_eq!(cmd.label, "media-install");
         let shell = &cmd.shell;
-        // Diffs the staged temp files against the live counterparts.
         assert!(
             shell.contains(
                 "cmp -s '/etc/mediamtx/mediamtx.yml.autumn-new' '/etc/mediamtx/mediamtx.yml'"
@@ -2400,7 +2338,6 @@ unit_name = \"mediamtx-prod\"
             ),
             "must cmp the staged unit against the live unit: {shell}"
         );
-        // Copies over only the changed files and tracks a `changed` flag.
         assert!(
             shell.contains("changed=1"),
             "must track a changed flag: {shell}"
@@ -2411,7 +2348,6 @@ unit_name = \"mediamtx-prod\"
             ),
             "must copy the staged config into place on change: {shell}"
         );
-        // Cleans up the temp files.
         assert!(
             shell.contains(
                 "rm -f '/etc/mediamtx/mediamtx.yml.autumn-new' \
@@ -2419,11 +2355,9 @@ unit_name = \"mediamtx-prod\"
             ),
             "must clean up the staged temp files: {shell}"
         );
-        // Idempotent daemon-reload + enable (NOT `enable --now` — start is handled
-        // by the conditional restart).
+        // `enable`, not `enable --now`: the conditional restart starts the unit.
         assert!(shell.contains("systemctl daemon-reload"), "{shell}");
-        // The unit id is shell-quoted (`'mediamtx.service'`, Finding T sweep) in
-        // every systemctl invocation.
+        // The unit id is shell-quoted in every systemctl call.
         assert!(
             shell.contains("systemctl enable 'mediamtx.service'"),
             "{shell}"
@@ -2432,7 +2366,6 @@ unit_name = \"mediamtx-prod\"
             !shell.contains("enable --now"),
             "must not `enable --now` (that would start unconditionally): {shell}"
         );
-        // Restart gated on change-OR-inactive, never unconditional.
         assert!(
             shell.contains(
                 "if [ \"$changed\" -ne 0 ] || ! systemctl is-active --quiet 'mediamtx.service'; then"
@@ -2479,8 +2412,8 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn controller_mkdirs_config_parent_before_writing_config() {
-        // Finding B: `scp` never creates parent dirs, so a `mkdir -p` of the
-        // config's parent must precede the `media-write-config` upload.
+        // `scp` never creates parent dirs, so a `mkdir -p` of the config's parent
+        // must precede the `media-write-config` upload.
         let cfg = MediaMtxHostConfig {
             enabled: true,
             config_path: "/opt/media/etc/mediamtx.yml".to_owned(),
@@ -2601,13 +2534,12 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn ffmpeg_preflight_fails_without_banner() {
-        // A binary that runs but is not FFmpeg (no banner) fails — fail-closed.
+        // A binary that runs but prints no FFmpeg banner fails.
         let exec =
             RecordingExecutor::new().with_stdout("media-ffmpeg-preflight", "not-ffmpeg output");
         let check = ffmpeg_preflight(&exec, "/usr/bin/ffmpeg");
         assert!(!check.passed);
-        // A concrete literal that is not FFmpeg is a BLOCKING failure (not
-        // deferred) — it must still abort the deploy (Finding U, #2051).
+        // A concrete path that is not FFmpeg blocks the deploy; only indirection defers.
         assert!(!check.deferred);
         assert!(check.blocking());
         assert!(check.hint.is_some());
@@ -2615,8 +2547,7 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn ffmpeg_preflight_fails_when_binary_missing() {
-        // A non-zero exit (missing / not executable) surfaces as a transport
-        // error — fail-closed, not a pass.
+        // A non-zero exit (missing / not executable) surfaces as a transport error.
         let exec = RecordingExecutor::failing_on("media-ffmpeg-preflight");
         let check = ffmpeg_preflight(&exec, "/usr/bin/ffmpeg");
         assert!(!check.passed);
@@ -2626,33 +2557,26 @@ unit_name = \"mediamtx-prod\"
         assert!(check.detail.contains("could not run"));
     }
 
-    // ── Finding L: verify only a concrete literal; defer env-indirected paths ──
+    // ── Doctor: ffmpeg env-indirected paths ──────────────────────────────────
     //
-    // The deploy side must NOT resolve `[media.ffmpeg] bin` against the operator's
-    // LOCAL shell — the generated service env-file does not propagate it, so the
-    // service would resolve a different path. Only an environment-independent
-    // concrete literal is probed; anything env/interpolation-indirected (a
-    // `${...}` placeholder — including `${AUTUMN_MEDIA__FFMPEG__BIN}` — or an empty
-    // value) is deferred to runtime with NO probe, regardless of any local env.
+    // The service env-file does not carry the operator's shell, so `[media.ffmpeg] bin` is never
+    // resolved locally. Only a concrete path is probed; an empty value or a `${...}` placeholder
+    // is deferred to runtime with no probe.
 
     #[test]
     fn ffmpeg_preflight_defers_env_indirected_paths_without_probing() {
-        // A whole-string `${VAR}`, an embedded placeholder, a value that relies on
-        // the AUTUMN_MEDIA__FFMPEG__BIN override, and an empty value all DEFER — a
-        // clear non-passing outcome, and crucially NO probe runs.
+        // Each defers, and no probe runs.
         for configured in [
             "${FF_BIN_UNSET_XYZ}",
             "/opt/${VER}/ffmpeg",
-            // A value that relies on the AUTUMN_MEDIA__FFMPEG__BIN override — the
-            // service resolves it from ITS own env; the deploy side must defer.
+            // Relies on the service-side AUTUMN_MEDIA__FFMPEG__BIN override.
             "${AUTUMN_MEDIA__FFMPEG__BIN}",
             "",
         ] {
             let exec = RecordingExecutor::new();
             let check = ffmpeg_preflight(&exec, configured);
             assert!(!check.passed, "must be non-passing for `{configured}`");
-            // Deferred, not failed: the service resolves FFmpeg from its own
-            // runtime env, so this must NOT abort the deploy (Finding U, #2051).
+            // Deferred, not failed: this must not abort the deploy.
             assert!(check.deferred, "must be deferred for `{configured}`");
             assert!(
                 !check.blocking(),
@@ -2664,7 +2588,6 @@ unit_name = \"mediamtx-prod\"
                 check.detail
             );
             assert!(check.hint.is_some());
-            // Fail-closed-honest: never probed a locally-resolved / placeholder path.
             assert!(
                 exec.labels().is_empty(),
                 "no probe must run for `{configured}`, ran {:?}",
@@ -2675,8 +2598,7 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn ffmpeg_preflight_probes_a_concrete_literal_path() {
-        // A concrete (non-placeholder) literal path IS probed verbatim — the
-        // healthy, environment-independent path.
+        // A concrete path is probed verbatim.
         let exec = RecordingExecutor::new()
             .with_stdout("media-ffmpeg-preflight", "ffmpeg version 6.1.1 Copyright");
         let check = ffmpeg_preflight(&exec, "/usr/bin/ffmpeg");
@@ -3123,7 +3045,7 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn recordings_dir_fails_when_not_writable() {
-        // `test -w` exits non-zero → transport error → fail-closed.
+        // A probe that could not run fails closed.
         let exec = RecordingExecutor::failing_on("media-recordings-dir");
         let check = recordings_dir_writable(&exec, &MediaMtxHostConfig::default());
         assert!(!check.passed);
@@ -3133,7 +3055,7 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn recordings_dir_fails_when_output_proves_nothing() {
-        // Unverifiable output is never a silent pass (module discipline).
+        // Unverifiable output is never a silent pass.
         for stdout in ["", "yes", "presentish"] {
             let exec = RecordingExecutor::new().with_stdout("media-recordings-dir", stdout);
             let check = recordings_dir_writable(&exec, &MediaMtxHostConfig::default());
@@ -3158,8 +3080,7 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn recordings_dir_probe_is_quoted_and_walks_without_dirname() {
-        // The probe's own command text is the load-bearing part of this check,
-        // so assert it rather than only that the command ran.
+        // The probe's command text is the load-bearing part of this check.
         let exec = RecordingExecutor::new().with_stdout("media-recordings-dir", "present");
         let cfg = MediaMtxHostConfig {
             recordings_dir: "/srv/media recordings".to_owned(),
@@ -3238,7 +3159,6 @@ unit_name = \"mediamtx-prod\"
 
     #[test]
     fn parse_listening_sockets_extracts_port_protocol_and_owner() {
-        // Finding I: the Netid (tcp/udp) column is parsed onto each socket.
         let ss = "\
 tcp   LISTEN 0 128  0.0.0.0:8888  0.0.0.0:*  users:((\"mediamtx\",pid=10,fd=5))
 tcp   LISTEN 0 128  [::]:22       [::]:*     users:((\"sshd\",pid=5,fd=3))
@@ -3264,7 +3184,6 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_available_passes_when_ports_free() {
-        // ss shows only sshd — none of MediaMTX's ports are taken.
         let exec = RecordingExecutor::new().with_stdout(
             "media-ports",
             "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n",
@@ -3277,7 +3196,7 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_available_fails_when_foreign_process_holds_port() {
-        // Finding D (b): a foreign process (nginx) is bound to the HLS port (8888).
+        // nginx holds the HLS port (8888).
         let exec = RecordingExecutor::new().with_stdout(
             "media-ports",
             "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n\
@@ -3292,9 +3211,8 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_available_passes_when_our_mediamtx_owns_all_ports() {
-        // Finding D (a): every required port is held by OUR managed mediamtx (a
-        // same-port redeploy) — not a conflict, so the check passes and never
-        // aborts the 2nd+ `deploy up`.
+        // Every port is held by our managed mediamtx (a same-port redeploy), so a second
+        // `deploy up` is not aborted.
         let exec = RecordingExecutor::new().with_stdout(
             "media-ports",
             "tcp LISTEN 0 128 0.0.0.0:9997 0.0.0.0:* users:((\"mediamtx\",pid=10,fd=3))\n\
@@ -3311,18 +3229,15 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
             "detail: {}",
             check.detail
         );
-        // Finding J: because MediaMTX-owned ports were found, the is-active gate
-        // runs exactly once after the `ss` scan (the fake reports the unit active
-        // by default), so the same-port redeploy passes.
+        // MediaMTX-owned ports were found, so the is-active check runs once after the
+        // `ss` scan (the fake reports the unit active by default).
         assert_eq!(exec.labels(), vec!["media-ports", "media-unit-active"]);
     }
 
     #[test]
     fn ports_available_fails_when_changed_port_held_by_foreign_service() {
-        // Finding D core: a redeploy that MOVED the HLS port to 8080, where a
-        // foreign service is already bound. The old managed unit only held the old
-        // ports, so a process-aware scan of the NEW target port must still fail —
-        // exactly the case the removed is-active skip missed.
+        // A redeploy moves the HLS port to 8080, where a foreign service is bound. Our
+        // active unit holds only the old ports, so the new port must still fail.
         let cfg = MediaMtxHostConfig {
             hls_port: 8080,
             ..MediaMtxHostConfig::default()
@@ -3342,8 +3257,8 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_available_ignores_same_port_different_protocol_listener() {
-        // Finding I: the WebRTC local port 8189 is UDP-only. A TCP service on 8189
-        // is a DIFFERENT protocol, so it must NOT be flagged as a conflict.
+        // The WebRTC local port 8189 is UDP-only, so a TCP service on 8189 is not a
+        // conflict.
         let exec = RecordingExecutor::new().with_stdout(
             "media-ports",
             "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n\
@@ -3365,8 +3280,6 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_available_fails_on_same_protocol_foreign_listener() {
-        // Finding I: a TCP listener on the TCP HLS port (8888), owned by a foreign
-        // process, IS a same-protocol conflict.
         let exec = RecordingExecutor::new().with_stdout(
             "media-ports",
             "tcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:* users:((\"nginx\",pid=99,fd=6))\n",
@@ -3379,7 +3292,6 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_available_fails_on_udp_foreign_listener_on_udp_target() {
-        // Finding I: a UDP foreign listener on the UDP-target 8189 IS a conflict.
         let exec = RecordingExecutor::new().with_stdout(
             "media-ports",
             "udp UNCONN 0 0 0.0.0.0:8189 0.0.0.0:* users:((\"coturn\",pid=42,fd=8))\n",
@@ -3391,9 +3303,8 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_available_fails_closed_when_mediamtx_owns_ports_but_unit_inactive() {
-        // Finding J: the ports are held by a `mediamtx` process, but OUR configured
-        // unit is NOT active (manual run / differently-named service / crashed).
-        // Starting our unit would launch a second instance over them → fail-closed.
+        // A `mediamtx` process holds the ports but our unit is not active: starting it
+        // would launch a second instance over them.
         let exec = RecordingExecutor::new()
             .with_stdout(
                 "media-ports",
@@ -3417,9 +3328,7 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_available_does_not_query_is_active_when_no_mediamtx_port_held() {
-        // Finding J: the is-active gate runs at most once, and only when a
-        // MediaMTX-owned port is actually found. A foreign-only conflict (or a
-        // free host) never queries it.
+        // The is-active check runs only when a MediaMTX-owned port is found.
         let exec = RecordingExecutor::new().with_stdout(
             "media-ports",
             "tcp LISTEN 0 128 0.0.0.0:8888 0.0.0.0:* users:((\"nginx\",pid=99,fd=6))\n",
@@ -3431,10 +3340,8 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_available_fails_closed_on_unattributable_listener() {
-        // Finding D (e): a listener on a required port whose owner cannot be
-        // attributed (no `users:` column — e.g. insufficient privilege) is treated
-        // as a conflict, not assumed benign. Deploy runs as root so this is rare,
-        // but fail-closed is the safe default.
+        // A listener with no `users:` column (e.g. insufficient privilege) is a
+        // conflict, not assumed benign.
         let exec = RecordingExecutor::new().with_stdout(
             "media-ports",
             "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n\
@@ -3481,21 +3388,15 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
             "all should pass: {:?}",
             checks.iter().filter(|c| !c.passed).collect::<Vec<_>>()
         );
-        // The pure ports-distinct config check (Finding P) leads and runs NO
-        // command, so the recorded command order is unchanged from the four
-        // executor-driven checks.
+        // The two pure config checks lead and run no command.
         assert_eq!(checks[0].name, CHECK_MEDIAMTX_PORTS_DISTINCT);
         assert_eq!(
             exec.labels(),
             vec![
                 "media-ffmpeg-preflight",
-                // The MediaMTX binary preflight (Finding N) runs before cutover,
-                // symmetric with the FFmpeg preflight, so a host missing the
-                // deferred-provisioned binary fails fast.
                 "media-mediamtx-binary",
                 "media-recordings-dir",
-                // The ports check is a single process-aware `ss -tulnp` scan; the
-                // old `systemctl is-active` gate was removed (Finding D).
+                // No port is held by MediaMTX, so `media-unit-active` does not run.
                 "media-ports"
             ]
         );
@@ -3503,11 +3404,8 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn collect_with_env_indirected_ffmpeg_has_no_blocking_failures() {
-        // Finding U (#2051): an env/interpolation-indirected `[media.ffmpeg] bin`
-        // is DEFERRED to the service runtime — non-passing but non-blocking — so
-        // the aggregate has zero blocking checks and `deploy up` proceeds (the
-        // deploy gate counts `blocking()`, not `!passed`). A concrete missing
-        // FFmpeg would instead block.
+        // An indirected `[media.ffmpeg] bin` is deferred: non-passing but non-blocking,
+        // so `deploy up` (which counts `blocking()`, not `!passed`) proceeds.
         let exec = RecordingExecutor::new()
             .with_stdout("media-mediamtx-binary", "present")
             .with_stdout("media-recordings-dir", "present")
@@ -3520,16 +3418,12 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
             &MediaMtxHostConfig::default(),
             "${AUTUMN_MEDIA__FFMPEG__BIN}",
         );
-        // The ffmpeg check is present, deferred, and non-passing …
         let ffmpeg = checks
             .iter()
             .find(|c| c.name == CHECK_FFMPEG_PREFLIGHT)
             .expect("ffmpeg check present");
         assert!(ffmpeg.deferred && !ffmpeg.passed);
-        // … and no probe ran for it (no ffmpeg-preflight label recorded).
         assert!(!exec.labels().contains(&"media-ffmpeg-preflight"));
-        // The deploy gate keys on `blocking()`: the deferred ffmpeg does NOT
-        // count, so the aggregate is non-blocking and the deploy is not aborted.
         assert_eq!(
             checks.iter().filter(|c| c.blocking()).count(),
             0,
@@ -3537,7 +3431,7 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
         );
     }
 
-    // ── Ports ↔ app base URLs (#1974 slice-7 deferral 6) ─────────────────────
+    // ── Ports ↔ app base URLs (#1974) ────────────────────────────────────────
 
     #[test]
     fn ports_match_bases_passes_for_default_config() {
@@ -3550,9 +3444,8 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_match_bases_fails_when_a_custom_port_leaves_the_base_behind() {
-        // Two values the operator wrote, contradicting each other: the daemon
-        // binds 1936 and the app calls 1935 on the same host. This is the silent
-        // runtime break the check exists to catch before cutover.
+        // Two values the operator wrote contradict each other: the daemon binds 1936
+        // and the app calls 1935 on the same host.
         let cfg = MediaMtxHostConfig {
             rtmp_port: 1936,
             rtmp_base: Some("rtmp://127.0.0.1:1935/live".to_owned()),
@@ -3596,9 +3489,8 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_match_bases_defers_an_env_indirected_base() {
-        // Same rule as the FFmpeg preflight: a value the service resolves from
-        // its own environment is deferred (non-passing, NON-blocking), never
-        // guessed against the operator's shell.
+        // Same rule as the FFmpeg preflight: a value the service resolves from its
+        // own environment is deferred, never guessed against the operator's shell.
         let cfg = MediaMtxHostConfig {
             hls_port: 9999,
             hls_base: Some("${MEDIA_HLS_BASE}".to_owned()),
@@ -3700,9 +3592,8 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_match_bases_skips_a_proxied_base_on_an_explicit_port() {
-        // A TLS proxy in front of the daemon publishes its own port. That is the
-        // documented production shape, not a misconfiguration, so it must not
-        // block a deploy.
+        // A TLS proxy in front of the daemon publishes its own port: the production
+        // shape, not a misconfiguration.
         let cfg = MediaMtxHostConfig {
             hls_port: 8888,
             hls_base: Some("https://media.example.com:8443/hls".to_owned()),
@@ -3714,9 +3605,8 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_match_bases_defers_rather_than_blocks_when_the_base_is_unset() {
-        // The app can be told its base by `AUTUMN_MEDIA__MEDIAMTX__*_BASE`, which
-        // the deploy side does not hold — so an unset base warns loudly and lets
-        // the deploy through, rather than blocking a correct configuration.
+        // The app may get its base from `AUTUMN_MEDIA__MEDIAMTX__*_BASE`, which the
+        // deploy side does not hold, so an unset base warns instead of blocking.
         let cfg = MediaMtxHostConfig {
             rtmp_port: 1936,
             ..MediaMtxHostConfig::default()
@@ -3742,7 +3632,7 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
         assert!(check.detail.contains("no valid port"), "{}", check.detail);
     }
 
-    // ── Distinct listener ports (Finding P) ──────────────────────────────────
+    // ── Distinct listener ports ──────────────────────────────────────────────
 
     #[test]
     fn ports_distinct_passes_for_default_config() {
@@ -3757,8 +3647,8 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_distinct_fails_when_two_tcp_listeners_share_a_port() {
-        // hls_port == playback_port: two MediaMTX servers asked to bind one TCP
-        // port. `ss` passes on a fresh host, but the deferred restart fails.
+        // Two MediaMTX servers asked to bind one TCP port. `ss` passes on a fresh
+        // host, but the post-cutover restart fails.
         let cfg = MediaMtxHostConfig {
             hls_port: 8888,
             playback_port: 8888,
@@ -3766,7 +3656,7 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
         };
         let check = mediamtx_ports_distinct(&cfg);
         assert!(!check.passed);
-        // Names the duplicated value and BOTH conflicting fields.
+        // Names the duplicated value and both conflicting fields.
         assert!(check.detail.contains("8888"), "detail: {}", check.detail);
         assert!(
             check.detail.contains("hls_port"),
@@ -3783,8 +3673,7 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
 
     #[test]
     fn ports_distinct_allows_tcp_port_equal_to_udp_port() {
-        // The WebRTC local UDP port (8189) is a separate protocol namespace, so a
-        // TCP listener numerically equal to it is NOT a conflict.
+        // UDP and TCP are separate port namespaces.
         let cfg = MediaMtxHostConfig {
             rtmp_port: MEDIAMTX_WEBRTC_LOCAL_UDP_PORT,
             ..MediaMtxHostConfig::default()
@@ -3798,7 +3687,7 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
         );
     }
 
-    // ── media_host_config_from_value (Finding O merge target) ────────────────
+    // ── media_host_config_from_value ─────────────────────────────────────────
 
     #[test]
     fn media_host_config_from_value_reads_merged_media_subtree() {
@@ -3841,7 +3730,7 @@ sctp  LISTEN 0 128  0.0.0.0:9999  0.0.0.0:*
             origins.contains(&"http://127.0.0.1:9996".to_owned()),
             "playback"
         );
-        // The control API (9997) is server-side only and must NOT be advertised.
+        // The control API (9997) is server-side only and must not be advertised.
         assert!(!origins.iter().any(|o| o.contains("9997")));
     }
 }

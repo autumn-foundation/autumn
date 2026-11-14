@@ -74,13 +74,9 @@ const DEV_RELOAD_STATE_FILE: &str = "live-reload.json";
 /// module's other wire constants; `dev_shutdown_env_var_matches_the_runtime_constant`
 /// pins the two together so a rename on either side fails the build's tests
 /// rather than silently breaking the Windows dev loop.
-// The cooperative-stop machinery below is the NON-UNIX stop path (#1616), but it
-// is compiled and unit-tested on every platform on purpose: Windows is the one
-// platform this project's contributors and most of its CI never run
-// interactively, so logic that only compiled there would be logic nobody ever
-// exercised before a user did. `allow(dead_code)` on Unix is the price of that
-// coverage — the alternative is `cfg(not(unix))` guards that hide the code from
-// Linux CI entirely, which is how the orphaned-Postgres bug survived.
+// The cooperative-stop machinery below is the non-Unix stop path (#1616). It is compiled and
+// unit-tested on every platform so Linux CI exercises the logic Windows depends on;
+// `allow(dead_code)` on Unix is the cost of that coverage.
 #[cfg_attr(
     unix,
     allow(
@@ -778,8 +774,7 @@ impl Drop for DependencyAudit {
 pub fn run(package: Option<&str>, show_config: bool) {
     eprintln!("\u{1F342} autumn dev\n");
 
-    // Warn when maintenance mode is currently active so the operator is not
-    // surprised by 503 responses during local development.
+    // Maintenance mode makes the app answer 503; say so up front.
     if let Some(config) = crate::maintenance::check_status(None) {
         eprintln!("  \u{26A0}\u{FE0F}  MAINTENANCE MODE IS ON");
         if let Some(msg) = &config.message {
@@ -789,8 +784,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
         eprintln!();
     }
 
-    // Register SIGINT handler so Ctrl+C triggers a graceful shutdown instead
-    // of immediately terminating the process (and leaving the child running).
+    // Ctrl+C only sets a flag, so the loop can stop the child instead of leaving it running.
     if let Err(err) = ctrlc::set_handler(move || {
         SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     }) {
@@ -804,11 +798,8 @@ pub fn run(package: Option<&str>, show_config: bool) {
             None
         }
     };
-    // Initial build. There is no prior server here (cold start), so a browser
-    // overlay isn't reachable — the CLI doesn't know the app's port and no
-    // process is up to answer the state endpoint. We still record the failure
-    // in the state file (harmless, and dismissed by the first green build);
-    // the terminal errors remain the primary feedback for this case.
+    // Cold start: no server is up to render the overlay, so the terminal errors are the
+    // feedback. The state file still records a failure; the first green build dismisses it.
     let (built, diagnostics) = cargo_build_capturing(package);
 
     if !built {
@@ -828,13 +819,10 @@ pub fn run(package: Option<&str>, show_config: bool) {
         show_config,
     );
 
-    // Dependency findings (issue #1633). Started once every synchronous step
-    // that runs Cargo is done — the build, and `find_binary`'s own `cargo
-    // metadata` — because cargo-deny runs `cargo metadata` too and the two
-    // contend for Cargo's package-cache lock. From here it is only polled,
-    // never awaited, so nothing delays startup or the rebuild loop. Quiet by
-    // default: an advisory-clean, policy-clean tree adds nothing.
-    // Resolve the member directory first: `cargo metadata` contends with the audit.
+    // Dependency audit (#1633). cargo-deny runs `cargo metadata`, which contends for Cargo's
+    // package-cache lock, so it starts after every synchronous Cargo step: the build,
+    // `find_binary`, and `selected_member_dir`. It is only polled, never awaited, so it never
+    // delays startup or rebuilds. A clean tree prints nothing.
     let member_dir = selected_member_dir(package);
     let mut dependency_audit = DependencyAudit::start(Path::new("."));
 
@@ -843,14 +831,12 @@ pub fn run(package: Option<&str>, show_config: bool) {
     let custom_watch_dirs = resolve_custom_watch_dirs(&normalized_dirs, &cwd);
     register_watch_roots(&cwd, member_dir.as_deref());
 
-    // Set up file watcher
     let (tx, rx) = mpsc::channel();
     let mut debouncer = new_debouncer(Duration::from_millis(DEBOUNCE_MS), tx)
         .expect("failed to create file watcher");
 
     let watcher = debouncer.watcher();
 
-    // Watch the default directories.
     for dir in DEFAULT_WATCH_DIRS {
         let path = Path::new(dir);
         if path.exists()
@@ -860,7 +846,6 @@ pub fn run(package: Option<&str>, show_config: bool) {
         }
     }
 
-    // Watch any additional directories from `[dev] watch_dirs` in autumn.toml.
     for dir in &custom_watch_dirs {
         let display = dir.relative.display();
         if let Err(e) = watcher.watch(&dir.relative, notify::RecursiveMode::Recursive) {
@@ -870,7 +855,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
         }
     }
 
-    // Watch the project root for config and build script changes.
+    // The project root, non-recursively, for config and build script changes.
     if let Err(e) = watcher.watch(Path::new("."), notify::RecursiveMode::NonRecursive) {
         eprintln!("  Warning: could not watch project root: {e}");
     }
@@ -885,9 +870,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
 
     eprintln!("  Watching for changes... (press Ctrl+C to stop)\n");
 
-    // Main event loop – periodically checks the shutdown flag so that a
-    // Ctrl+C breaks the loop and triggers
-    // graceful server shutdown via `stop_server` below.
+    // Poll the shutdown flag so Ctrl+C breaks the loop and stops the server gracefully.
     loop {
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             eprintln!("\n  Shutting down...");
@@ -1094,19 +1077,12 @@ fn execute_plan(
     show_config: bool,
 ) {
     if plan.build {
-        // The order of "stop old binary" vs. "cargo build" is platform-gated.
+        // On Unix a running binary can be replaced mid-build (inode semantics), so build first
+        // with the old binary still serving: a failed rebuild leaves it up to render the
+        // diagnostics overlay.
         //
-        // On Unix/macOS, replacing a running binary file mid-build is safe
-        // (inode semantics), so we build FIRST with the old binary still
-        // serving. A failed rebuild then leaves the stale app up to answer the
-        // live-reload endpoint and render the diagnostics overlay.
-        //
-        // On Windows the running `target/debug/<app>.exe` is LOCKED while the
-        // process is alive, so `cargo build` can't relink over it (access
-        // denied / linker failure). There we must stop the old binary BEFORE
-        // building. The tradeoff: a failed Windows rebuild leaves the app down,
-        // so the overlay's stale-page serving isn't available and the client
-        // falls back to a normal reconnect (documented limitation).
+        // On Windows the running `.exe` is locked and cargo cannot relink over it, so stop it
+        // first. A failed Windows rebuild then leaves the app down and the client reconnects.
         let stop_before_build = cfg!(windows);
 
         if stop_before_build {
@@ -1127,15 +1103,13 @@ fn execute_plan(
             ) && let Some(reload_state) = reload_state.as_mut()
                 && let Err(error) = reload_state.signal_build_success(ReloadKind::Full)
             {
-                // A green build is the only thing that clears the overlay.
+                // Only a green build clears the overlay.
                 eprintln!("  Warning: live reload signal failed: {error}");
             }
         } else {
             eprintln!("  \u{2717} Build failed. Waiting for changes...\n");
-            // On Unix the (stale) binary is still running, so it keeps
-            // answering the live-reload state endpoint and the browser renders
-            // the overlay. On Windows we already stopped it above, so nothing
-            // is serving: `child.is_some()` is false there and the client
+            // On Unix the stale binary still answers the state endpoint, so the browser renders
+            // the overlay. On Windows it was stopped above, so `child` is `None` and the client
             // falls back to a normal reconnect.
             let stale = child.is_some();
             if let Some(reload_state) = reload_state.as_mut()
@@ -1331,10 +1305,8 @@ fn cargo_build_capturing(package: Option<&str>) -> (bool, Vec<BuildDiagnostic>) 
 
     let mut cmd = build_cargo_command(package, false);
     cmd.arg("--message-format=json");
-    // Pipe stdout so we can read structured JSON diagnostics line by line as the
-    // compiler emits them, while cargo's own progress/status output (the live
-    // "Compiling ..." lines) streams straight through on inherited stderr. This
-    // keeps the terminal responsive instead of freezing until the build ends.
+    // JSON diagnostics come in on stdout as the compiler emits them; cargo's progress lines
+    // stream through on inherited stderr, so the terminal stays live during the build.
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
 
@@ -1347,17 +1319,14 @@ fn cargo_build_capturing(package: Option<&str>) -> (bool, Vec<BuildDiagnostic>) 
         }
     };
 
-    // Accumulate raw stdout so `parse_build_diagnostics` can build the returned
-    // Vec once at the end. Error `rendered` blocks are echoed live in compiler
-    // order as their lines arrive, so each error appears exactly once and the
-    // final parse never re-prints them.
+    // Errors are echoed live as their lines arrive; `parse_build_diagnostics` builds the returned
+    // Vec from the buffer at the end without printing them again.
     let mut buffer = String::new();
     if let Some(stdout) = child.stdout.take() {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
             let Ok(line) = line else {
-                // A read error mid-stream: stop consuming and fall back to
-                // whatever we captured so far rather than panicking.
+                // Read error: keep what was captured so far.
                 break;
             };
             if let Some(rendered) = compiler_message_rendered(&line) {
@@ -1436,14 +1405,10 @@ fn start_server(
     eprintln!("  Starting server...\n");
 
     let member_dir = selected_member_dir(package);
-    // Read `.env` from the selected package, as the app and the stop budget do.
-    // Resolve `.env` fresh right before each spawn so a hot-reload restart
-    // picks up an edited `.env`. Values are injected explicitly into the child
-    // process (rather than mutating this process's environment); the child also
-    // self-loads via the config overlay, so this is belt-and-suspenders and
-    // makes a bare `DATABASE_URL` visible to the child. A malformed `.env`
-    // fails loudly. Applied BEFORE the explicit `.env(...)` calls below so those
-    // win on any key overlap.
+    // Read `.env` from the selected package, fresh before each spawn so a restart picks up edits.
+    // The child also loads it itself; injecting it here makes a bare `DATABASE_URL` visible to
+    // it. A malformed `.env` fails loudly. Applied before the explicit `.env(...)` calls below
+    // so those win on overlap.
     let dotenv_vars = match autumn_web::dotenv::resolve_process_dotenv_in(&package_dir_from(
         member_dir.clone(),
     )) {
@@ -1467,15 +1432,12 @@ fn start_server(
     command.env_remove(crate::data_flow::DUMP_ENV);
     command.env_remove(crate::agents::DUMP_ENV);
     command.env_remove(crate::graph::DUMP_ENV);
-    // Same reasoning, worse outcome (#1605): `AUTUMN_DB_RETENTION=report|purge`
-    // is dispatched before the server starts, so an inherited one would make
-    // every hot-reload restart enforce the retention policy and exit -- deleting
-    // data on each save rather than merely failing to serve.
+    // Same for `AUTUMN_DB_RETENTION=report|purge` (#1605), with a worse outcome: every restart
+    // would enforce the retention policy and exit, deleting data on each save.
     crate::db::retention::clear_inherited_one_shot_env(&mut command);
     // Same for `autumn data capsule` (#1811).
     crate::data_capsule::clear_inherited_one_shot_env(&mut command);
-    // Inherit stdio so tracing output (including --show-config) is visible.
-    // Previously used Stdio::null(), but server logs are valuable during dev.
+    // Server logs (and --show-config output) matter during dev.
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     if let Some(path) = reload_state_path {
         command.env(DEV_RELOAD_ENV, "1");
@@ -1484,20 +1446,16 @@ fn start_server(
     if show_config {
         command.env("AUTUMN_SHOW_CONFIG", "1");
     }
-    // Hand the app its own shutdown and ready files so a stop can run its
-    // `on_shutdown` hooks on a platform with no `SIGTERM` (#1616), and so the
-    // app can report its drain budget and when it is up. Fresh paths for each
-    // child: an old file can never drain this child at boot or pass for its
-    // ready file. Only wired where it is the stop mechanism: on Unix
-    // `stop_server` signals, and an unset variable keeps the watcher inert.
+    // Give the app its own shutdown and ready files so a stop can run its `on_shutdown` hooks
+    // without `SIGTERM` (#1616), and the app can report its drain budget and readiness. Fresh
+    // paths per child, so an old file can never drain it at boot or pass for its ready file.
+    // Unix stops by signal and leaves the variable unset.
     #[cfg(not(unix))]
     if let Some(paths) = begin_child_paths() {
         command.env(DEV_SHUTDOWN_SIGNAL_ENV, &paths.signal);
         command.env(SERVE_READY_FILE_ENV, &paths.ready);
-        // Resolve the child's stop budget from the config it is about to boot
-        // with, and keep it for the stop. `autumn.toml` is watched, so by the
-        // time this child is stopped the file may say something different, and
-        // the child would still be draining on these numbers.
+        // Resolve the stop budget from the config this child boots with: `autumn.toml` may
+        // change before the stop, but the child still drains on these numbers.
         record_child_stop_budget(resolve_cooperative_stop_budget(package));
     }
 
@@ -1534,7 +1492,6 @@ fn stop_server_unix(child: &mut Option<Child>) {
         {
             eprintln!("  Warning: failed to send SIGTERM to process: {e}");
         }
-        // Wait briefly for graceful shutdown before forcing
         if crate::process::wait_with_timeout(proc, Duration::from_secs(5)).is_err() {
             let _ = proc.kill();
             let _ = proc.wait();
@@ -1550,11 +1507,8 @@ fn stop_server_unix(child: &mut Option<Child>) {
 #[cfg(not(unix))]
 fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
     let Some(paths) = current_child_paths() else {
-        // `start_server` sets `AUTUMN_SHUTDOWN_SIGNAL_FILE` from the same
-        // paths, so with none the child was never told to watch anything.
-        // Waiting out the full budget for a request nobody can receive would
-        // make every rebuild slower than the hard kill this replaced. So kill
-        // directly, and say why.
+        // With no paths the child was never told to watch a signal file, and waiting out the
+        // budget would only slow every rebuild. Kill directly, and say why.
         if let Some(proc) = child.as_mut() {
             let _ = proc.kill();
             let _ = proc.wait();
@@ -1623,11 +1577,8 @@ fn classify_change_in(
     let original = path;
     let path = strip_watch_root(path, watch_roots);
 
-    // A root-level dotenv file the config loader reads (`.env`, `.env.local`,
-    // `.env.<profile>`, `.env.<profile>.local`) must restart the server so an
-    // edited `.env` takes effect — even though `should_ignore_path` would
-    // otherwise discard it as a dotfile. Checked before that ignore so the
-    // dotenv exception wins, while all other dotfiles stay ignored.
+    // A root dotenv file the config loader reads restarts the server. Checked before
+    // `should_ignore_path`, which drops every other dotfile.
     if is_watched_dotenv_file(path) {
         return ChangeEffect::RestartOnly;
     }
@@ -1678,15 +1629,9 @@ fn classify_change_in(
         return ChangeEffect::BrowserReloadOnly;
     }
 
-    // Files inside a user-configured custom watch directory don't have known
-    // semantics — restart the server and trigger a full reload so the change
-    // is picked up regardless of what the directory contains.
-    //
-    // Matching is anchored at the project root via the resolved absolute
-    // path, so an entry like `views` cannot false-match an ancestor
-    // directory of the same name (e.g. project at `/home/alice/views/app`).
-    // The relative form is also tried so events emitted as relative paths
-    // (rare but possible on some platforms) still match.
+    // A custom watch directory has no known semantics, so any change in it restarts. Matching
+    // tries the absolute path, so `views` cannot match an ancestor of the same name, then the
+    // relative form, for platforms that emit relative event paths.
     for dir in custom_watch_dirs {
         if dir.matches(original) {
             return ChangeEffect::RestartOnly;
@@ -1712,9 +1657,7 @@ fn is_dotenv_loader_filename(name: &str) -> bool {
     if name == ".env" {
         return true;
     }
-    // Must be `.env.<something>`; a bare `.env~`/`.env.swp`-style backup that
-    // lacks the `.env.` prefix is rejected here, and a trailing `~` backup
-    // (e.g. `.env.local~`) is rejected explicitly.
+    // Otherwise it must be `.env.<name>`. A trailing `~` marks an editor backup (`.env.local~`).
     let Some(rest) = name.strip_prefix(".env.") else {
         return false;
     };
@@ -2113,10 +2056,8 @@ fn current_child_paths() -> Option<ChildPaths> {
     )
 )]
 fn child_reported_stop_budget(ready_file: &Path) -> Option<Duration> {
-    // Line ONE only. The readiness file carries the drain budget on line one and
-    // the app's bound address on line two (#1639); parsing the whole file would
-    // silently stop reporting a budget, and every rebuild would fall back to the
-    // CLI's own config guess — the guess this seam exists to avoid.
+    // Line one only: it holds the drain budget, line two the bound address (#1639). Parsing the
+    // whole file would fail, and every rebuild would fall back to the CLI's config guess.
     let secs = std::fs::read_to_string(ready_file)
         .ok()?
         .lines()
@@ -2621,13 +2562,9 @@ pub fn find_binary(package: Option<&str>, release: bool) -> PathBuf {
 mod tests {
     // ── Cooperative child shutdown (#1616) ─────────────────────────────────
     //
-    // The Windows dev loop used to stop the app with `TerminateProcess`
-    // (`Child::kill`), which skips the app's `on_shutdown` hooks — so a managed
-    // Postgres child was orphaned on every rebuild. `stop_child_cooperatively`
-    // is the fix, and it is compiled on every platform so Linux CI actually
-    // exercises the logic Windows depends on. It writes the signal file
-    // autumn-web watches (`AUTUMN_SHUTDOWN_SIGNAL_FILE`), waits for the child
-    // to drain, and only then escalates.
+    // `Child::kill` on Windows skips the app's `on_shutdown` hooks and orphans a managed
+    // Postgres child. `stop_child_cooperatively` writes the signal file the app watches
+    // (`AUTUMN_SHUTDOWN_SIGNAL_FILE`), waits for it to drain, and only then escalates.
 
     fn signal_path(dir: &Path) -> PathBuf {
         dir.join("dev-shutdown.signal")
@@ -2721,10 +2658,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cooperative_stop_reports_unreachable_when_the_request_cannot_be_written() {
-        // If the signal file cannot be created, the app was never *asked* to
-        // stop. Reporting that as an escalation would blame the app for
-        // ignoring a request it never received — and would hide a broken dev
-        // setup behind a message about shutdown hooks.
+        // If the signal file cannot be created, the app was never asked to stop. Calling that an
+        // escalation would blame the app and hide a broken dev setup.
         let tmp = tempfile::TempDir::new().unwrap();
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, b"not a directory").unwrap();
@@ -2968,15 +2903,11 @@ mod tests {
         );
     }
 
-    // ── The stop budget must not undercut the app's own (#1616, Codex P1) ──
+    // ── The stop budget must not undercut the app's own (#1616) ──
     //
-    // A fixed ten seconds was wrong: `DrainCause::Signal` runs the app's full
-    // lifecycle — readiness flip, prestop grace, drain — and THEN its
-    // `on_shutdown` hooks. An app configured with the prod defaults (grace 5 +
-    // timeout 30) is still legitimately shutting down at t=35s, and a managed
-    // Postgres `pg_ctl stop` runs after that under its own 60s ceiling. Killing
-    // at t=10s reintroduces the orphaned postmaster this change exists to fix,
-    // on a perfectly valid configuration.
+    // `DrainCause::Signal` runs the readiness flip, prestop grace and drain, then the
+    // `on_shutdown` hooks. With prod defaults (grace 5 + timeout 30) an app is still shutting
+    // down at 35s, and a managed Postgres `pg_ctl stop` runs after that under its own 60s ceiling.
 
     #[test]
     fn the_stop_budget_never_undercuts_the_apps_configured_drain() {
@@ -3006,34 +2937,24 @@ mod tests {
 
     #[test]
     fn the_stop_budget_saturates_instead_of_overflowing() {
-        // The drain budget comes from user config (`[server]` keys, or
-        // `AUTUMN_SERVER__*`), so it is attacker-adjacent arithmetic: a
-        // `u64::MAX` timeout must clamp, not wrap to a tiny budget that would
-        // hard-kill instantly.
+        // The drain budget comes from user config, so a `u64::MAX` timeout must clamp, not wrap
+        // to a tiny budget that hard-kills at once.
         let budget = cooperative_stop_budget(u64::MAX);
         assert!(budget >= Duration::from_secs(60), "{budget:?}");
     }
 
-    // ── The budget must belong to the RUNNING child (#1616, Codex round 3) ──
+    // ── The budget must belong to the running child (#1616) ──
     //
-    // `autumn.toml` is a watched file, so `execute_plan` reaches the stop only
-    // AFTER the edit that triggered it has landed. Resolving the budget there
-    // grades the outgoing child against the incoming config: lower
-    // `shutdown_timeout_secs` from 300 to 1 and the parent force-kills a child
-    // that is still legitimately inside its original 300s drain — and a
-    // half-saved (malformed) `autumn.toml` collapses to the defaults with the
-    // same effect. Either way the `on_shutdown` hooks are skipped and the
-    // managed cluster is orphaned, which is the bug this all exists to prevent.
+    // `autumn.toml` is watched, so the stop runs after the edit that triggered it has landed.
+    // Resolving the budget then grades the outgoing child against the incoming config: a lower
+    // `shutdown_timeout_secs`, or a half-saved file that falls back to the defaults, kills a
+    // child still inside its original drain and orphans the managed cluster.
 
-    // ── The child's OWN budget beats any CLI reconstruction (Codex round 5) ──
+    // ── The child's own budget beats any CLI reconstruction ──
     //
-    // An app using `AppBuilder::with_config_loader` can resolve a budget no
-    // amount of TOML/env reading reproduces. The runtime already solved this for
-    // `autumn serve`: the app writes its resolved drain budget to the file named
-    // by `AUTUMN_SERVE_READY_FILE`, and `signal_serve_ready`'s contract says why
-    // — so `stop` "waits for the budget the app will actually drain for ...
-    // instead of reconstructing it from TOML/env and risking a premature
-    // SIGKILL". `autumn dev` was doing exactly the reconstructing it warns about.
+    // An app using `AppBuilder::with_config_loader` can resolve a budget no TOML/env reading
+    // reproduces. As for `autumn serve`, the app writes its resolved drain budget to the file
+    // named by `AUTUMN_SERVE_READY_FILE`.
 
     #[test]
     fn a_child_reported_budget_beats_everything_the_cli_can_reconstruct() {
@@ -3076,10 +2997,9 @@ mod tests {
 
     #[test]
     fn the_budget_survives_the_readiness_file_gaining_an_address_line() {
-        // The runtime writes the budget on line one and its bound address on
-        // line two (#1639). Written by the runtime's OWN writer, so a future
-        // format change fails here rather than silently costing every Windows
-        // rebuild its drain budget and reintroducing the orphaned-cluster bug.
+        // The runtime writes the budget on line one and its bound address on line two (#1639).
+        // Uses the runtime's own writer, so a format change fails here instead of silently
+        // costing every Windows rebuild its drain budget.
         let tmp = tempfile::TempDir::new().unwrap();
         let ready = tmp.path().join("dev-ready.state");
         std::fs::write(
@@ -3136,9 +3056,8 @@ mod tests {
 
     #[test]
     fn the_stop_budget_falls_back_when_nothing_was_recorded() {
-        // No child was spawned through `start_server` this session (or the
-        // spawn predates the recording); resolving now is the best available
-        // answer and is still better than a fixed constant.
+        // No child was spawned through `start_server` this session, so resolving now is the
+        // best available answer.
         let budget = stop_budget_for_running_child(None, None, || Duration::from_secs(95));
         assert_eq!(budget, Duration::from_secs(95));
     }
@@ -3180,8 +3099,7 @@ mod tests {
 
     #[test]
     fn escalation_warning_names_the_consequence_not_just_the_timeout() {
-        // "silent degradation" is the thing #1616 forbids: if hooks were
-        // skipped, the developer has to be told what that means for them.
+        // If hooks were skipped, the developer must be told what that means for them (#1616).
         let warning = escalation_warning(Duration::from_secs(10));
         assert!(warning.contains("10s"), "{warning}");
         assert!(warning.contains("shutdown hooks"), "{warning}");
@@ -4029,7 +3947,6 @@ mod tests {
     fn start_server_returns_child_for_valid_binary() {
         let child = start_server(Path::new("/bin/sleep"), None, None, false);
         assert!(child.is_some());
-        // Clean up
         let mut child = child.unwrap();
         let _ = child.kill();
         let _ = child.wait();
@@ -4163,9 +4080,8 @@ mod tests {
         assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/server"));
     }
 
-    // Regression: packages with multiple binaries (e.g. `seed` + main server)
-    // must start the `default-run` binary, not whichever happens to be listed
-    // first in `cargo metadata` targets.
+    // A package with several binaries (`seed` + server) must start its `default-run` binary,
+    // not the first target `cargo metadata` lists.
     #[test]
     fn resolve_binary_prefers_default_run_over_first_target() {
         let metadata = serde_json::json!({
@@ -4227,7 +4143,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stop_server_terminates_child() {
-        // Spawn a long-running process, then stop it
         let proc = Command::new("sleep")
             .arg("60")
             .stdout(Stdio::null())
@@ -4426,11 +4341,9 @@ mod tests {
 
     #[test]
     fn dev_reload_state_signal_carries_build_error_across_non_build_reloads() {
-        // P2 regression guard: once a Rust build is broken, an ordinary CSS
-        // (or other non-build) reload must NOT dismiss the overlay. It carries
-        // the build_error payload forward while still bumping the version so
-        // the client re-polls but stays on the overlay instead of reloading the
-        // stale app.
+        // Once a Rust build is broken, a CSS (or other non-build) reload must not dismiss the
+        // overlay. It carries `build_error` forward and bumps the version, so the client re-polls
+        // but stays on the overlay instead of reloading the stale app.
         let reload_file = tempfile::NamedTempFile::new().expect("reload file");
         let path = reload_file.path().to_path_buf();
         let mut state = DevReloadState {
@@ -4914,11 +4827,8 @@ watch_dirs = ["views", "locales"]
     #[cfg(unix)]
     #[test]
     fn custom_watch_dir_does_not_match_ancestor_directory() {
-        // Regression: matching is anchored to the project root via the
-        // resolved absolute path. If the project itself lives under
-        // `/home/alice/views/app`, a custom entry `views` must NOT match
-        // the root-level `README.md` event, even though `views` appears
-        // in the parent path.
+        // Matching is anchored at the project root: with the project at `/home/alice/views/app`,
+        // a `views` entry must not match the root `README.md` though `views` is in its path.
         let custom = vec![CustomWatchDir {
             relative: PathBuf::from("views"),
             absolute: PathBuf::from("/home/alice/views/app/views"),
@@ -5071,11 +4981,9 @@ watch_dirs = ["views", "locales"]
 
     #[test]
     fn the_dependency_audit_starts_after_the_build_and_is_never_awaited() {
-        // Running the auditor beside the build makes its `cargo metadata`
-        // contend with Cargo's package-cache lock and slow the build. Awaiting
-        // it anywhere would delay startup or a rebuild.
-        // Only the module's own code, not this test — the needles below
-        // otherwise match the assertions that look for them.
+        // Running the auditor beside the build makes its `cargo metadata` contend for Cargo's
+        // package-cache lock; awaiting it would delay startup or a rebuild. Search only the
+        // module's own code, or the needles would match this test's assertions.
         let source = include_str!("dev.rs");
         let code = &source[..source.find("#[cfg(test)]").expect("test module")];
         let build = code

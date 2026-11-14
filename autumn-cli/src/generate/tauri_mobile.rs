@@ -93,10 +93,8 @@ pub fn plan_tauri_mobile(
     } = read_app_meta(project_root)?;
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
-    // The shell's own autumn-web dependency (offline sync only) must mirror
-    // the app crate's actual dependency SOURCE — version, path, or git — so
-    // cargo unifies the two dependency edges into one crate instance (see
-    // [`shell_autumn_web_dep`]).
+    // The shell's autumn-web edge must mirror the app's dependency source (version, path or git)
+    // so cargo unifies both edges into one crate instance.
     let autumn_web_dep = opts
         .offline_sync
         .then(|| shell_autumn_web_dep(project_root, &mut plan));
@@ -112,7 +110,6 @@ pub fn plan_tauri_mobile(
         );
     }
 
-    // Core Tauri project files
     plan.create(
         tauri.join("tauri.conf.json"),
         render_mobile_tauri_conf(&package_name, &package_version),
@@ -131,7 +128,6 @@ pub fn plan_tauri_mobile(
         render_mobile_lib_rs(&package_name, &lib_ident, opts.offline_sync),
     );
 
-    // Icons — reuse the PWA icon when the user already ran `autumn generate pwa`.
     let icons_dir = tauri.join("icons");
     let pwa_icon_src = project_root.join("static").join("icons").join("icon.svg");
     if pwa_icon_src.is_file() {
@@ -140,8 +136,8 @@ pub fn plan_tauri_mobile(
     } else {
         plan.create_if_absent(icons_dir.join("icon.svg"), render_placeholder_icon_svg());
     }
-    // Placeholder raster icons so `cargo tauri build` works immediately.
-    // Replace with proper icons by running: cd src-tauri && cargo tauri icon icons/icon.svg
+    // Placeholder raster icons so `cargo tauri build` works immediately; replace them with
+    // `cd src-tauri && cargo tauri icon icons/icon.svg`.
     plan.create_bytes(icons_dir.join("32x32.png"), PLACEHOLDER_PNG);
     plan.create_bytes(icons_dir.join("128x128.png"), PLACEHOLDER_PNG);
     plan.create_bytes(icons_dir.join("128x128@2x.png"), PLACEHOLDER_PNG);
@@ -151,8 +147,7 @@ pub fn plan_tauri_mobile(
 
     plan.create(tauri.join(".gitignore"), render_mobile_gitignore());
 
-    // App-crate lib extraction so the shell can call `<app_lib>::serve()`
-    // in-process.
+    // The shell calls `<app_lib>::serve()` in-process, so the app needs a lib target.
     plan_lib_extraction(
         project_root,
         &lib_ident,
@@ -161,7 +156,6 @@ pub fn plan_tauri_mobile(
         &mut plan,
     );
 
-    // App-crate offline-sync feature (Cargo.toml edit, offline sync only).
     if opts.offline_sync {
         plan_app_offline_sync_feature(project_root, &mut plan);
     }
@@ -232,9 +226,6 @@ pub fn ensure_no_other_mode_scaffold(project_root: &Path) -> Result<(), Generate
 /// Human-readable prerequisites message printed after a successful scaffold,
 /// honouring `opts` (`--offline-sync` swaps the remote-connection step).
 pub fn render_mobile_prerequisites(opts: TauriMobileOptions) -> String {
-    // Step 3 is where the app meets the network: a direct remote-Postgres
-    // connection by default, the background sync engine under --offline-sync
-    // (where the device needs no database connection at all).
     let connect_step = if opts.offline_sync {
         "3. Point the background sync engine at your remote deployment:\n\
          edit src-tauri/src/lib.rs and set AUTUMN_SYNC__REMOTE_URL to the\n\
@@ -494,12 +485,8 @@ fn dep_source_from_table(
         let adjusted = if Path::new(path).has_root() {
             path.replace('\\', "/")
         } else if manifest_dir == project_root {
-            // Same backslash normalization as the other branches: a
-            // Windows-separated relative path written into the app's
-            // manifest would otherwise land in src-tauri/Cargo.toml as an
-            // invalid TOML basic-string escape (`\a`, `\v`) — or, where it
-            // happens to escape cleanly, as a checked-in platform-specific
-            // path.
+            // A Windows-separated path would otherwise become an invalid TOML basic-string
+            // escape (`\a`, `\v`) or a checked-in platform-specific path.
             format!("../{}", path.replace('\\', "/"))
         } else {
             let target = manifest_dir.join(path);
@@ -550,10 +537,8 @@ fn resolve_app_autumn_web_value(
         toml::from_str(&read_or_empty(&dir.join("Cargo.toml"))).ok()
     };
     let doc = parse(project_root);
-    // Resolve by PACKAGE, not by key: apps may rename the dependency
-    // (`autumn = { package = "autumn-web", ... }`), and a hard-coded
-    // `autumn-web` lookup would miss it (same convention as the desktop
-    // generator's `resolve_dep_key`).
+    // Resolve by package, not by key: apps may rename the dependency
+    // (`autumn = { package = "autumn-web", ... }`).
     let dep_key = doc.as_ref().map_or_else(
         || "autumn-web".to_owned(),
         |d| super::tauri::resolve_dep_key(project_root, d, "autumn-web"),
@@ -568,28 +553,17 @@ fn resolve_app_autumn_web_value(
         // Capture the member-level default-features BEFORE the member table
         // is replaced by the workspace entry.
         let member_default_features = table_default_features(t);
-        // Workspace-inherited: Cargo resolves `workspace = true` against
-        // the [workspace.dependencies] table of exactly ONE manifest — the
-        // app's EFFECTIVE workspace root (the member's own [workspace],
-        // the target of an explicit `package.workspace = "…"` pointer, or
-        // the nearest non-excluding ancestor root). Reuse the same root
-        // resolution the [patch.crates-io] mirroring uses, so both walks
-        // agree: a plain ancestor scan would never find a pointer target
-        // that is not an ancestor, and — worse — could stop at a NEARER
-        // manifest's [workspace.dependencies] entry that a pointer
-        // deliberately skips past, mirroring a framework source the app
-        // never builds against.
+        // Cargo resolves `workspace = true` against the effective workspace root only. A plain
+        // ancestor scan would miss a non-ancestor `package.workspace` target, or stop at a nearer
+        // root the pointer skips, and mirror a framework source the app never builds against.
         let root = effective_workspace_root(project_root);
         if let Some(v) = parse(&root)
             .as_ref()
             .and_then(|doc| doc.get("workspace")?.get("dependencies")?.get(&dep_key))
             .cloned()
         {
-            // Relative `path` sources in the returned value resolve
-            // against the ROOT manifest's directory — the caller's
-            // re-relativization (dep_source_from_table) computes from it,
-            // and lexical_relative folds any `..` a pointer target
-            // carries.
+            // Relative `path` sources resolve against the root manifest's directory, so the
+            // caller re-relativizes from `root`.
             return (Some(v), root, member_default_features);
         }
         return (None, project_root.to_path_buf(), member_default_features);
@@ -606,15 +580,11 @@ fn resolve_app_autumn_web_value(
 /// `package` rename preserved), warning when a patch exists but cannot be
 /// represented.
 fn mirror_autumn_web_patch(project_root: &Path, plan: &mut Plan) -> Option<String> {
-    // Cargo only honors the [patch] tables of the EFFECTIVE workspace root
-    // (member-local [patch] tables are ignored, with a cargo warning), so
-    // mirror exclusively from that manifest: copying a member-local patch
-    // would make the shell compile a framework checkout the app itself
-    // never uses.
+    // Cargo honors only the effective workspace root's [patch] tables; a member-local patch is
+    // ignored, so mirroring it would build a framework checkout the app never uses.
     let root = effective_workspace_root(project_root);
 
-    // A member-local framework patch is skipped — tell the user why, since
-    // "my patch wasn't mirrored" is otherwise mystifying.
+    // Explain the skipped member-local patch.
     if root != project_root && autumn_web_patch_entry(project_root).is_some() {
         plan.warn(format!(
             "Cargo ignores [patch] tables outside the workspace root, so the \
@@ -642,8 +612,7 @@ fn mirror_autumn_web_patch(project_root: &Path, plan: &mut Plan) -> Option<Strin
         );
         return None;
     };
-    // Mirror the whole entry: original key plus its `package` rename, so
-    // the emitted section patches exactly what the root's does.
+    // Keep the original key and its `package` rename so the section patches what the root's does.
     let package_part = table
         .and_then(|t| t.get("package"))
         .and_then(toml::Value::as_str)
@@ -733,14 +702,9 @@ pub fn effective_workspace_root(project_root: &Path) -> std::path::PathBuf {
                 .get("exclude")
                 .and_then(toml::Value::as_array)
                 .is_some_and(|entries| {
-                    // Cargo treats exclude entries as DIRECTORY PREFIXES: a
-                    // package anywhere under an excluded dir is excluded
-                    // (root `exclude = ["examples"]` excludes
-                    // examples/mobile). `Path::starts_with` compares whole
-                    // components, so "examples" matches examples/mobile but
-                    // never examples-extra/mobile. Glob patterns are still
-                    // not expanded (the sanctioned cheap rule) — a literal
-                    // component comparison simply never matches them.
+                    // Cargo treats exclude entries as directory prefixes. `Path::starts_with`
+                    // compares whole components, so "examples" matches examples/mobile but not
+                    // examples-extra/mobile. Glob patterns are not expanded.
                     let relative = lexical_relative(project_root, d);
                     entries.iter().filter_map(toml::Value::as_str).any(|entry| {
                         relative
@@ -751,11 +715,8 @@ pub fn effective_workspace_root(project_root: &Path) -> std::path::PathBuf {
             if !excluded {
                 return d.to_path_buf();
             }
-            // An excluding ancestor doesn't make the app standalone:
-            // exclusion only removes the app from THIS workspace, not from
-            // an outer workspace's membership. Keep walking — an outer root
-            // (e.g. repo root with `members = ["mid/app"]` while `mid`
-            // excludes `app`) is the one Cargo binds the app to.
+            // Exclusion removes the app from this workspace only; an outer root may still list it
+            // as a member, so keep walking.
         }
         dir = d.parent();
     }
@@ -776,24 +737,16 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
     let (dep_value, manifest_dir, member_default_features) =
         resolve_app_autumn_web_value(project_root);
 
-    // `default-features = false` must survive the mirroring: cargo unifies
-    // features per dependency EDGE, so a shell edge without it would
-    // re-enable the framework's default features across the whole src-tauri
-    // build even though the app opted out. For workspace-inherited deps the
-    // MEMBER-level setting wins when present — that mirrors Cargo's
-    // re-enable rule (member `default-features = true` over a workspace
-    // `false`); for member `false` over workspace defaults-on Cargo today
-    // IGNORES the member key with a warning slated to become a hard error,
-    // and we honor the written opt-out instead — harmless either way, since
-    // the app's own edge still carries the workspace value and cargo
-    // unifies the edges by union. Otherwise the resolved (workspace or
-    // direct) table's setting applies.
+    // `default-features = false` must survive: cargo unifies features per edge, so a shell edge
+    // without it re-enables the framework defaults for the whole src-tauri build. A member-level
+    // setting wins over the workspace entry (Cargo's re-enable rule). Cargo ignores a member
+    // `false` over workspace defaults-on; honoring it here is harmless, since the app's own edge
+    // still carries the workspace value and cargo unions the edges.
     let resolved_default_features = match &dep_value {
         Some(toml::Value::Table(t)) => table_default_features(t),
         _ => None,
     };
-    // With defaults off, `offline-sync` needs a backend (#2605). Name
-    // `postgres`, as `db` did before.
+    // With defaults off, `offline-sync` needs a backend (#2605), so name `postgres`.
     let (default_features_part, shell_features) =
         if member_default_features.or(resolved_default_features) == Some(false) {
             (
@@ -831,14 +784,9 @@ fn shell_autumn_web_dep(project_root: &Path, plan: &mut Plan) -> ShellAutumnWebD
             .map(str::to_owned),
         _ => None,
     };
-    // An alternate-registry selection must survive the mirroring too: a
-    // bare version requirement would make the shell workspace resolve
-    // autumn-web from crates.io — failing outright for private registries,
-    // or silently compiling a different framework. `registry` only combines
-    // with version deps (Cargo rejects it on path/git sources, and member
-    // manifests cannot override it on workspace-inherited entries), so
-    // reading it from the RESOLVED table covers both direct and
-    // workspace-inherited shapes.
+    // Keep an alternate registry: a bare version would resolve autumn-web from crates.io and fail
+    // for private registries or compile a different framework. `registry` only applies to version
+    // deps and members cannot override it on inherited entries, so the resolved table covers both.
     let registry_part = match &dep_value {
         Some(toml::Value::Table(t)) => t
             .get("registry")
@@ -972,43 +920,23 @@ fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
         |doc| super::tauri::resolve_dep_key(project_root, doc, "autumn-web"),
     );
     let feature_line = format!("offline-sync = [\"{dep_key}/offline-sync\"]\n");
-    // Detect an existing feature via the PARSED [features] table (the same
-    // source of truth the graph checks below read), never a
-    // substring scan: `offline-sync=[]` (no spaces) or a multiline array
-    // would slip past a textual `"offline-sync = ["` check into the
-    // fresh-insert branch below, which would then write a DUPLICATE
-    // `offline-sync` key under [features] — a manifest cargo rejects.
+    // Detect the feature in the parsed table, not by substring: `offline-sync=[]` or a multiline
+    // array would miss a textual check and get a duplicate key, which cargo rejects.
     let features = doc
         .as_ref()
         .and_then(|doc| doc.get("features"))
         .and_then(toml::Value::as_table);
     if let Some(features) = features.filter(|f| f.contains_key("offline-sync")) {
-        // The feature exists — but "wired" requires two more things, each
-        // patched with the same anchored discipline as the fresh edit
-        // (byte-precise anchor or a loud warning, never a guessed rewrite
-        // of a customised manifest):
-        //
-        // 1. It must PROPAGATE to the dependency — include
-        //    `{dep_key}/offline-sync`, directly or transitively through
-        //    other own-crate features. serve()'s sync code compiles under
-        //    #[cfg(feature = "offline-sync")] but calls autumn_web::sync,
-        //    which only exists when the DEPENDENCY's feature is on, so a
-        //    non-propagating declaration (e.g. `offline-sync = []`) is a
-        //    guaranteed build failure.
-        // 2. `default` must enable it: the extracted serve() mounts /sync
-        //    behind the cfg, and the documented flow assumes a plain
-        //    `cargo run` deployment serves those endpoints. A defined but
-        //    non-default feature would ship a mobile client whose server
-        //    never mounts /sync.
+        // An existing feature is wired only when it (1) enables `{dep_key}/offline-sync`, since
+        // serve() calls autumn_web::sync under its own cfg, and (2) is in `default`, so a plain
+        // `cargo run` deployment mounts /sync. Each fix uses an exact anchor or warns.
         let mut edited = content;
         let mut changed = false;
         let default_ok = offline_sync_enabled_by_default(features);
         let propagation_ok = if offline_sync_feature_propagates(features, &dep_key) {
             true
         } else {
-            // The one unambiguous anchored shape: an EMPTY declaration
-            // gains exactly the dep entry. Any other non-propagating array
-            // is a customised feature we refuse to guess at.
+            // Only an empty declaration is patched; any other array is customised.
             const EMPTY_DECL: &str = "offline-sync = []\n";
             if edited.contains(EMPTY_DECL) {
                 edited = edited.replacen(EMPTY_DECL, &feature_line, 1);
@@ -1019,11 +947,8 @@ fn plan_app_offline_sync_feature(project_root: &Path, plan: &mut Plan) {
             }
         };
         if !propagation_ok {
-            // The default edit below is deliberately GATED on propagation:
-            // adding a broken `offline-sync` to `default` would turn a
-            // previously-compiling default build into a guaranteed build
-            // failure. So when propagation could not be fixed here, warn
-            // about BOTH steps and touch nothing.
+            // Adding a non-propagating feature to `default` would break the default build, so
+            // warn about both steps and edit nothing.
             let default_note = if default_ok {
                 String::new()
             } else {
@@ -1305,9 +1230,7 @@ fn plan_lib_extraction(
     let main_rs = read_or_empty(&main_path);
 
     if lib_path.exists() {
-        // Re-run after a successful extraction: nothing to do, stay silent —
-        // unless this run wants sync mounting and the existing lib lacks it
-        // (e.g. the first run had no --offline-sync).
+        // Already extracted: stay silent unless --offline-sync is new and the lib lacks it.
         if main_rs.contains(&format!("{crate_ident}::serve()")) {
             if offline_sync && !read_or_empty(&lib_path).contains("mount_offline_sync") {
                 plan.warn(format!(
@@ -1382,13 +1305,10 @@ fn render_thin_app_main_rs(crate_ident: &str) -> String {
 // ── Content renderers ─────────────────────────────────────────────────────────
 
 fn render_mobile_tauri_conf(package_name: &str, version: &str) -> String {
-    // Bundle identifier: reverse-DNS, valid on BOTH stores. Android forbids
-    // hyphens in application-id segments (`cargo tauri android init` panics,
-    // tauri-apps/tauri#9707) and Apple forbids underscores, so both are
-    // stripped — the same normalization as the thin-client generator.
+    // Android forbids hyphens in application-id segments (tauri-apps/tauri#9707) and Apple
+    // forbids underscores, so both are stripped.
     let identifier = super::tauri::derive_mobile_identifier(package_name);
-    // Display title: capitalise first letter of each word; split on both '-'
-    // and '_' so kebab-case and snake_case both work.
+    // Split on '-' and '_' so kebab-case and snake_case names both title-case.
     let title: String = package_name
         .split(['-', '_'])
         .map(|word| {
@@ -1399,10 +1319,8 @@ fn render_mobile_tauri_conf(package_name: &str, version: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    // Deliberately NO bundle.externalBin and NO bundle.resources: the mobile
-    // model runs the server in-process (mobile sandboxes forbid sidecar
-    // processes) and is configured entirely via environment variables set in
-    // src/lib.rs — no staged config files.
+    // No bundle.externalBin or bundle.resources: mobile sandboxes forbid sidecar processes, so
+    // the server runs in-process, configured by env vars set in src/lib.rs.
     format!(
         r#"{{
   "$schema": "https://schema.tauri.app/config/2",
@@ -1437,9 +1355,7 @@ fn render_mobile_cargo_toml(
     autumn_web_dep: Option<&ShellAutumnWebDep>,
 ) -> String {
     let shell_name = format!("{package_name}-mobile");
-    // Enable the app's `embed-assets` feature so CSS/htmx/static assets are
-    // compiled into the binary: a mobile app has no working directory holding
-    // a `static/` tree, so disk-served assets would 404 on device.
+    // A device has no on-disk `static/` tree, so assets must be embedded or they 404.
     let app_dep = if has_embed_assets {
         format!(
             "# The `embed-assets` feature compiles the app's static/ tree (CSS, htmx,\n\
@@ -1450,10 +1366,8 @@ fn render_mobile_cargo_toml(
     } else {
         format!("{package_name} = {{ path = \"..\" }}")
     };
-    // Offline sync: the shell itself opens the local SyncStore and runs the
-    // background SyncEngine, so it needs autumn-web directly — mirroring the
-    // app's own dependency source (version, path, or git) so cargo unifies
-    // both edges into one instance.
+    // The offline-sync shell runs the SyncStore and SyncEngine itself, so it depends on
+    // autumn-web directly.
     let sync_dep = autumn_web_dep.map_or_else(String::new, |dep| {
         format!(
             "\n# Offline sync (issue #1508): the shell opens the local SyncStore and runs\n\
@@ -1580,9 +1494,7 @@ fn render_mobile_lib_rs(package_name: &str, crate_ident: &str, offline_sync: boo
     } else {
         ""
     };
-    // The offline-sync shell observes run-loop events (RunEvent::Resumed →
-    // immediate sync pass), so it must go through build().run(callback); the
-    // default shell keeps the simpler run(context).
+    // The offline-sync shell needs build().run(callback) to sync on RunEvent::Resumed.
     let tauri_run_tail = if offline_sync {
         format!(
             r#"    tauri::Builder::default()
@@ -1998,14 +1910,10 @@ fn render_mobile_gitignore() -> String {
 }
 
 // ── Placeholder icon bytes ────────────────────────────────────────────────────
-// Duplicated byte-for-byte from `generate::tauri` — the desktop generator's
-// PLACEHOLDER_PNG/_ICO/_ICNS are the same bytes, hand-copied when this file
-// was built (originally to dodge a merge conflict with tauri.rs's concurrent
-// rework, #1506 — that landed long ago). Two instances is below Echo's rule
-// of three (see issue #2509), so these stay linked rather than merged into a
-// shared `generate::icons` module. Change one, change the other: `tests::
-// placeholder_icon_assets_match_between_desktop_and_mobile_tauri_generators`
-// in `generate::mod` fails if they drift.
+// Byte-for-byte copies of `generate::tauri`'s PLACEHOLDER_PNG/_ICO/_ICNS, kept duplicated
+// rather than shared (#2509). Change one, change the other: `tests::
+// placeholder_icon_assets_match_between_desktop_and_mobile_tauri_generators` in
+// `generate::mod` fails if they drift.
 // Minimal valid 1×1 RGBA PNG (autumn green #4F7942, opaque).
 pub const PLACEHOLDER_PNG: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
@@ -2100,9 +2008,7 @@ mod tests {
     fn conf_has_identifier_product_name_and_no_external_bin() {
         let conf = render_mobile_tauri_conf("my-app", "1.2.3");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
-        // Hyphens are stripped: Android forbids them in application-id
-        // segments (`cargo tauri android init` panics on them), Apple
-        // forbids underscores — same normalization as the thin client.
+        // Hyphens are stripped: Android forbids them in application-id segments.
         assert_eq!(parsed["identifier"], "com.example.myapp");
         assert_eq!(parsed["productName"], "My App");
         assert_eq!(parsed["version"], "1.2.3");
@@ -2134,7 +2040,6 @@ mod tests {
         );
         assert!(toml_src.contains(r#"name = "my-app-mobile""#));
         assert!(!toml_src.contains("tauri-plugin-shell"));
-        // The rendered manifest must be valid TOML.
         toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
     }
 
@@ -2173,8 +2078,7 @@ mod tests {
         assert!(lib.contains("std::thread::spawn"));
         assert!(lib.contains("block_on(my_app::serve())"));
         assert!(lib.contains("tauri::mobile_entry_point"));
-        // The advertised flaky-network defaults are pinned by VALUE, not just
-        // by variable name (comments also name the variables).
+        // Pin the pool defaults by value: the template's comments also name the variables.
         assert!(lib.contains(r#"set_var("AUTUMN_DATABASE__POOL_SIZE", "2")"#));
         assert!(lib.contains(r#"set_var("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS", "5")"#));
         assert!(lib.contains("AUTUMN_DATABASE__URL"));
@@ -2185,10 +2089,8 @@ mod tests {
     #[test]
     fn lib_rs_pins_prod_profile_in_release_builds() {
         let lib = render_mobile_lib_rs("my-app", "my_app", false);
-        // Release builds must run the prod profile: serve() bypasses the
-        // #[autumn_web::main] macro that would otherwise mark release builds,
-        // so leaving AUTUMN_ENV unset would silently fall back to dev
-        // (permissive CORS, debug logging, no fail-fast secret checks).
+        // serve() bypasses #[autumn_web::main], so an unset AUTUMN_ENV would run release builds
+        // on the dev profile (permissive CORS, no fail-fast secret checks).
         assert!(lib.contains(r#"set_var("AUTUMN_ENV", "prod")"#));
         assert!(lib.contains(r#"set_var("AUTUMN_ENV", "dev")"#));
         assert!(
@@ -2200,8 +2102,7 @@ mod tests {
     #[test]
     fn lib_rs_sets_env_before_tauri_builder_starts() {
         let lib = render_mobile_lib_rs("my-app", "my_app", false);
-        // std::env::set_var is only sound before other (platform) threads
-        // exist; the static env block must precede tauri::Builder in run().
+        // std::env::set_var is only sound before platform threads exist.
         let env_pos = lib
             .find(r#"set_var("AUTUMN_ENV""#)
             .expect("template must set AUTUMN_ENV");
@@ -2212,8 +2113,7 @@ mod tests {
             env_pos < builder_pos,
             "the env-var block must run before tauri::Builder::default()"
         );
-        // Storage backend must be enabled explicitly: the prod profile
-        // defaults storage.backend to \"disabled\".
+        // The prod profile defaults storage.backend to "disabled".
         assert!(lib.contains(r#"set_var("AUTUMN_STORAGE__BACKEND", "local")"#));
     }
 
@@ -2356,10 +2256,8 @@ mod tests {
 
     #[test]
     fn read_app_meta_resolves_workspace_version_through_a_pointer_root() {
-        // `[package] workspace = "…"` may name a NON-ANCESTOR root — an
-        // ancestor-only walk never reads its [workspace.package] and falls
-        // back to "0.1.0", stamping the generated tauri.conf.json (the
-        // mobile bundle version) with the wrong release number.
+        // `[package] workspace = "…"` may name a non-ancestor root; an ancestor-only walk would
+        // fall back to "0.1.0" for the bundle version.
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
@@ -2522,7 +2420,6 @@ mod tests {
 
         let plan = plan_tauri_mobile(tmp.path(), TauriMobileOptions::default()).unwrap();
 
-        // Shell lib.rs must call custom_lib::serve(), not my_app::serve().
         let shell_lib = plan
             .actions
             .iter()
@@ -2545,7 +2442,6 @@ mod tests {
             "shell lib.rs must not call the dash-to-underscore package name"
         );
 
-        // The rewritten app main.rs must call custom_lib::serve() too.
         let main_action =
             app_src_action(&plan, "main.rs").expect("plan must rewrite the app src/main.rs");
         let Action::Modify { contents, .. } = main_action else {
@@ -2559,8 +2455,7 @@ mod tests {
 
     #[test]
     fn extraction_reruns_silently_with_custom_lib_name() {
-        // Re-run detection matches on `<lib_ident>::serve()` — with a custom
-        // [lib] name the already-extracted thin main.rs must be recognised.
+        // Re-run detection matches `<lib_ident>::serve()`, so it must use the custom [lib] name.
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -2624,8 +2519,7 @@ mod tests {
         let clean = app_dir("my-app");
         assert!(ensure_no_other_mode_scaffold(clean.path()).is_ok());
 
-        // An existing MOBILE scaffold (same mode) carries none of the other
-        // modes' marker files, so a --force regenerate keeps working.
+        // A same-mode scaffold has no other mode's markers, so --force regenerate still works.
         let mobile = app_dir("my-app");
         let tauri = mobile.path().join("src-tauri");
         std::fs::create_dir_all(tauri.join("src")).unwrap();
@@ -2780,11 +2674,8 @@ mod tests {
 
     #[test]
     fn offline_shell_dep_normalizes_backslash_relative_paths() {
-        // Windows-style separators in the app's OWN manifest (a TOML
-        // literal string like path = 'vendor\autumn') must not leak into
-        // the generated src-tauri/Cargo.toml: emitted inside a BASIC
-        // string they become invalid escapes (\a), and where they happen
-        // to escape cleanly they are platform-specific checked-in paths.
+        // A backslash path (TOML literal 'vendor\autumn') emitted in a basic string would be an
+        // invalid escape (\a) or a platform-specific checked-in path.
         let (dep, warnings) = shell_dep_for(r"autumn-web = { path = 'vendor\autumn' }", "");
         assert_eq!(
             dep.dep_entry,
@@ -2812,7 +2703,7 @@ mod tests {
         let toml_src = render_mobile_cargo_toml("my-app", true, Some(&dep));
         toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
 
-        // Forward-slash input stays byte-identical (regression).
+        // Forward-slash input is unchanged.
         let (dep, warnings) = shell_dep_for("autumn-web = { path = \"vendor/autumn\" }", "");
         assert_eq!(
             dep.dep_entry,
@@ -2846,9 +2737,7 @@ mod tests {
 
     #[test]
     fn offline_shell_dep_preserves_default_features_false() {
-        // Feature unification is per dependency edge: a shell edge without
-        // `default-features = false` would re-enable the framework's default
-        // features across the whole src-tauri build.
+        // Features unify per edge: without the opt-out the shell would re-enable the defaults.
         let (dep, warnings) = shell_dep_for(
             "autumn-web = { version = \"0.9.1\", default-features = false, \
              features = [\"maud\"] }",
@@ -2860,8 +2749,7 @@ mod tests {
         );
         assert!(warnings.is_empty(), "got {warnings:?}");
 
-        // Path deps preserve it too, and the pre-2021 `default_features`
-        // spelling cargo still accepts is recognized.
+        // Path deps keep it too, and the legacy `default_features` spelling is recognized.
         let (dep, _) = shell_dep_for(
             "autumn-web = { path = \"../autumn\", default_features = false }",
             "",
@@ -2882,8 +2770,7 @@ mod tests {
 
     #[test]
     fn offline_shell_dep_resolves_renamed_dependency_by_package() {
-        // Apps may rename the framework dep: the source must be resolved by
-        // PACKAGE, and the shell edge is emitted under the real package name.
+        // A renamed dep resolves by package; the shell edge uses the real package name.
         let (dep, warnings) = shell_dep_for(
             "autumn = { package = \"autumn-web\", version = \"0.9.1\" }",
             "",
@@ -2907,9 +2794,8 @@ mod tests {
 
     #[test]
     fn offline_feature_edit_targets_the_actual_dependency_key() {
-        // Cargo feature syntax names the dependency KEY: with a renamed dep
-        // the edit must reference `<key>/offline-sync`, or cargo rejects the
-        // manifest outright.
+        // Cargo feature syntax names the dependency key, so a renamed dep needs
+        // `<key>/offline-sync`.
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -2944,9 +2830,7 @@ mod tests {
 
     #[test]
     fn offline_shell_dep_mirrors_crates_io_patch_into_shell_manifest() {
-        // The common test-harness / local-development shape: a registry dep
-        // plus a [patch.crates-io] path override. The shell is its own
-        // [workspace], so the patch must be mirrored explicitly.
+        // The shell is its own [workspace], so the app's patch must be mirrored explicitly.
         let (dep, warnings) = shell_dep_for(
             "autumn-web = \"0.9.1\"",
             "\n[patch.crates-io]\nautumn-web = { path = \"/src/autumn/autumn\" }\n",
@@ -2966,7 +2850,6 @@ mod tests {
         );
         assert!(warnings.is_empty(), "got {warnings:?}");
 
-        // And the rendered manifest carries the section and stays valid TOML.
         let toml_src = render_mobile_cargo_toml("my-app", true, Some(&dep));
         assert!(toml_src.contains("[patch.crates-io]"));
         toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
@@ -2974,8 +2857,7 @@ mod tests {
 
     #[test]
     fn offline_shell_dep_default_features_across_workspace_inheritance() {
-        // Build a workspace whose root declares the dep, with the member
-        // inheriting it via `workspace = true` plus `member_extra` keys.
+        // The member inherits the root's dep via `workspace = true` plus `member_extra` keys.
         fn workspace_dep(workspace_entry: &str, member_extra: &str) -> ShellAutumnWebDep {
             let tmp = TempDir::new().unwrap();
             std::fs::write(
@@ -3002,9 +2884,7 @@ mod tests {
             dep
         }
 
-        // Member-level opt-out survives resolution even when the workspace
-        // entry leaves defaults on (previously erased by the inheritance
-        // walk replacing the member table).
+        // A member-level opt-out survives resolution when the workspace entry leaves defaults on.
         let dep = workspace_dep(r#"{ version = "0.9.1" }"#, ", default-features = false");
         assert_eq!(
             dep.dep_entry,
@@ -3026,8 +2906,7 @@ mod tests {
             dep.dep_entry
         );
 
-        // Member re-enables defaults over a workspace opt-out — Cargo's
-        // documented inheritance rule.
+        // A member re-enable wins over a workspace opt-out (Cargo's inheritance rule).
         let dep = workspace_dep(
             r#"{ version = "0.9.1", default-features = false }"#,
             ", default-features = true",
@@ -3073,8 +2952,7 @@ mod tests {
             (edit, plan.warnings)
         }
 
-        // Feature present AND directly in default: wired — untouched,
-        // silent (byte-identical, since no action is planned at all).
+        // Feature present and directly in default: wired, no action, no warning.
         let (tmp, _) = manifest(
             "default = [\"flash\", \"offline-sync\"]\nflash = []\n\
              offline-sync = [\"autumn-web/offline-sync\"]\n",
@@ -3096,8 +2974,7 @@ mod tests {
         );
         assert!(warnings.is_empty(), "got {warnings:?}");
 
-        // A default entry naming only the DEP feature does not enable the
-        // crate's own cfg — not wired.
+        // A default entry naming only the dep feature leaves the crate's own cfg off: not wired.
         let (tmp, _) = manifest(
             "default = [\"flash\", \"autumn-web/offline-sync\"]\nflash = []\n\
              offline-sync = [\"autumn-web/offline-sync\"]\n",
@@ -3108,8 +2985,7 @@ mod tests {
             "a dep-feature default entry must not count as wired"
         );
 
-        // Feature present but NOT in default, stock default line: only the
-        // default line is edited; the feature is not re-declared.
+        // Not in default, stock default line: only that line is edited.
         let (tmp, _) = manifest(
             "default = [\"flash\"]\nflash = []\n\
              offline-sync = [\"autumn-web/offline-sync\"]\n",
@@ -3127,8 +3003,7 @@ mod tests {
             "the existing feature declaration must not be duplicated:\n{edited}"
         );
 
-        // Feature present, NOT in default, customised default line: loud
-        // warning instead of a guessed rewrite; manifest untouched.
+        // Not in default, customised default line: warning, manifest untouched.
         let (tmp, _) = manifest(
             "default = [\"flash\", \"extra\"]\nflash = []\nextra = []\n\
              offline-sync = [\"autumn-web/offline-sync\"]\n",
@@ -3149,12 +3024,8 @@ mod tests {
 
     #[test]
     fn offline_feature_detection_survives_spacing_and_layout_variants() {
-        // Detection must key on the parsed [features] TABLE, not on the
-        // exact `offline-sync = [` byte sequence: `offline-sync=[]` (no
-        // spaces) or a multiline array are the same manifest to cargo, and
-        // a substring miss would route them into the fresh-insert branch —
-        // which would write a DUPLICATE `offline-sync` key that cargo
-        // rejects outright.
+        // `offline-sync=[]` and multiline arrays must be detected, or the fresh insert would add a
+        // duplicate key that cargo rejects.
         fn manifest(features: &str) -> TempDir {
             let tmp = TempDir::new().unwrap();
             std::fs::write(
@@ -3191,8 +3062,7 @@ mod tests {
         );
         assert!(warnings.is_empty(), "got {warnings:?}");
 
-        // No-spaces spelling, not in default: only the stock default line
-        // gains the feature — the declaration is not re-inserted.
+        // No-spaces spelling, not in default: only the stock default line changes.
         let tmp = manifest(
             "default = [\"flash\"]\nflash = []\n\
              offline-sync=[\"autumn-web/offline-sync\"]\n",
@@ -3213,8 +3083,7 @@ mod tests {
             "the existing declaration must not be duplicated:\n{edited}"
         );
 
-        // Multiline array form, not in default: same — detected, no
-        // duplicate declaration inserted.
+        // Multiline array, not in default: same.
         let tmp = manifest(
             "default = [\"flash\"]\nflash = []\n\
              offline-sync = [\n    \"autumn-web/offline-sync\",\n]\n",
@@ -3229,8 +3098,7 @@ mod tests {
         toml::from_str::<toml::Value>(&edited)
             .expect("the edited manifest must stay valid TOML (no duplicate keys)");
 
-        // Regression: a manifest WITHOUT the feature still gets the fresh
-        // insert (detection must not report false positives either).
+        // No false positive: a manifest without the feature still gets the fresh insert.
         let tmp = manifest("default = [\"flash\"]\nflash = []\n");
         let (edit, warnings) = planned_edit(&tmp);
         let edited = edit.expect("an absent feature must still be inserted");
@@ -3269,9 +3137,7 @@ mod tests {
             r#"autumn-web = { version = "0.9.1", registry = "internal", default-features = false, features = ["offline-sync", "postgres"] }"#,
         );
 
-        // Workspace-inherited entries carry their registry key through the
-        // inheritance walk (members cannot override it, so the resolved
-        // workspace table is authoritative).
+        // Workspace-inherited entries keep the root's registry key.
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -3296,7 +3162,7 @@ mod tests {
         );
         assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
 
-        // No registry key: output stays byte-identical to before.
+        // No registry key: no registry part.
         let (dep, _) = shell_dep_for("autumn-web = { version = \"0.9.1\" }", "");
         assert_eq!(
             dep.dep_entry,
@@ -3306,9 +3172,7 @@ mod tests {
 
     #[test]
     fn offline_shell_dep_mirrors_renamed_crates_io_patch() {
-        // A renamed patch entry is just as valid as the literal key: it
-        // must be matched by its `package` field and mirrored whole —
-        // key, rename, and source.
+        // A renamed patch entry is matched by `package` and mirrored whole.
         let (dep, warnings) = shell_dep_for(
             "autumn-web = \"0.9.1\"",
             "\n[patch.crates-io]\naw_local = { package = \"autumn-web\", path = \"/src/autumn/autumn\" }\n",
@@ -3327,16 +3191,14 @@ mod tests {
         );
         assert!(warnings.is_empty(), "got {warnings:?}");
 
-        // And the rendered manifest stays valid TOML.
         let toml_src = render_mobile_cargo_toml("my-app", true, Some(&dep));
         toml::from_str::<toml::Value>(&toml_src).expect("generated Cargo.toml must parse");
     }
 
     #[test]
     fn offline_shell_dep_mirrors_renamed_patch_from_ancestor_workspace() {
-        // The renamed-patch lookup walks ancestor manifests exactly like
-        // the literal-key one; a relative patch path declared at the
-        // workspace root is absolutized against that root.
+        // A relative patch path declared at the workspace root is re-relativized against
+        // src-tauri/.
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -3371,9 +3233,8 @@ mod tests {
 
     #[test]
     fn offline_member_local_patch_is_skipped_with_a_warning() {
-        // Cargo ignores [patch] tables outside the workspace root — a
-        // member-local patch must NOT be mirrored (the app never builds
-        // against it), and the skip must be explained.
+        // Cargo ignores [patch] tables outside the workspace root, so a member-local patch is
+        // skipped with a warning.
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -3471,12 +3332,8 @@ mod tests {
 
     #[test]
     fn offline_exclude_entries_match_as_directory_prefixes() {
-        // Cargo treats `workspace.exclude` entries as DIRECTORY PREFIXES: a
-        // package anywhere under an excluded dir is excluded and becomes
-        // its own workspace. The common layout — root
-        // `exclude = ["examples"]` with the app at examples/mobile — must
-        // therefore use the APP's own manifest, not adopt the excluding
-        // ancestor and mirror its patches.
+        // `workspace.exclude` entries are directory prefixes: `exclude = ["examples"]` makes
+        // examples/mobile standalone, so its own patch table applies.
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -3511,11 +3368,8 @@ mod tests {
 
     #[test]
     fn offline_exclude_prefix_match_respects_component_boundaries() {
-        // `exclude = ["examples"]` must NOT exclude examples-extra/mobile —
-        // the comparison is whole path components, not a string prefix. The
-        // app IS a member of the ancestor workspace, so the ancestor's
-        // patch table governs and the member-local one is skipped with the
-        // established loud warning.
+        // `exclude = ["examples"]` must not exclude examples-extra/mobile (whole components, not a
+        // string prefix). The app is a member, so the ancestor's patch table governs.
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -3557,11 +3411,8 @@ mod tests {
 
     #[test]
     fn offline_exclusion_by_an_intermediate_ancestor_walks_to_the_outer_root() {
-        // Repo root `members = ["mid/app"]` while `mid` declares its own
-        // `[workspace]` excluding `app`: exclusion at the intermediate level
-        // only removes the app from MID's workspace, not from the repo
-        // root's membership — Cargo reports the repo root as
-        // `workspace_root`, so the ROOT's patch table is the effective one.
+        // Root `members = ["mid/app"]` while `mid` excludes `app`: the exclusion only affects
+        // mid's workspace, so Cargo binds the app to the root and the root's patch table applies.
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -3603,10 +3454,8 @@ mod tests {
 
     #[test]
     fn offline_exclusion_with_no_outer_workspace_is_still_standalone() {
-        // Regression for the continue-the-walk fix: when the excluding
-        // ancestor is the ONLY workspace above the app, the walk finds no
-        // outer root and the app remains standalone — its own patch table
-        // stays the effective one (the pre-existing behavior).
+        // With no outer root above the excluding ancestor, the app is standalone and its own patch
+        // table applies.
         let tmp = TempDir::new().unwrap();
         let mid = tmp.path().join("mid");
         std::fs::create_dir_all(&mid).unwrap();
@@ -3660,9 +3509,8 @@ mod tests {
         .unwrap();
         let mut plan = Plan::new(&app);
         let dep = shell_autumn_web_dep(&app, &mut plan);
-        // Declared in the workspace root: re-relativized against the
-        // generated src-tauri/ — src-tauri/Cargo.toml is checked in, so an
-        // absolute path would break every other checkout.
+        // Re-relativized against src-tauri/: the manifest is checked in, so an absolute path would
+        // break other checkouts.
         assert_eq!(
             dep.dep_entry,
             r#"autumn-web = { path = "../../vendor/autumn", features = ["offline-sync"] }"#,
@@ -3676,11 +3524,8 @@ mod tests {
 
     #[test]
     fn offline_shell_dep_follows_package_workspace_pointer_for_inheritance() {
-        // An explicit `[package] workspace = "…"` pointer names the app's
-        // workspace root directly — the root need not be an ancestor of the
-        // app at all, so an ancestor-only [workspace.dependencies] scan
-        // never finds it and --offline-sync would fall back to a bare
-        // registry edge instead of mirroring the inherited path source.
+        // A `[package] workspace = "…"` pointer may name a non-ancestor root; an ancestor-only
+        // scan would miss it and fall back to a bare registry edge.
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
@@ -3700,8 +3545,7 @@ mod tests {
         .unwrap();
         let mut plan = Plan::new(&app);
         let dep = shell_autumn_web_dep(&app, &mut plan);
-        // vendor/autumn resolves against the POINTED root (tmp/ws), then
-        // re-relativizes against the generated tmp/app/src-tauri/.
+        // vendor/autumn resolves against tmp/ws, then re-relativizes against tmp/app/src-tauri/.
         assert_eq!(
             dep.dep_entry,
             r#"autumn-web = { path = "../../ws/vendor/autumn", features = ["offline-sync"] }"#,
@@ -3715,12 +3559,8 @@ mod tests {
 
     #[test]
     fn offline_shell_dep_pointer_skips_a_nearer_excluding_workspace() {
-        // A pointer may deliberately skip PAST a nearer workspace root (the
-        // Cargo-legal layout requires that nearer root to exclude the app).
-        // The inheritance scan must resolve against the POINTED root, not
-        // stop at the nearer manifest's [workspace.dependencies] entry —
-        // otherwise the shell mirrors a framework source the app never
-        // builds against.
+        // A pointer may skip past a nearer root that excludes the app; inheritance must resolve
+        // against the pointed root, not the nearer [workspace.dependencies].
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("Cargo.toml"),
@@ -3761,14 +3601,9 @@ mod tests {
 
     #[test]
     fn offline_pointer_root_resolves_renamed_inherited_dep_key() {
-        // A `[package] workspace = "…"` pointer plus a RENAMED inherited
-        // dep: the dep-key resolution must read the pointed root's
-        // [workspace.dependencies] to learn that `autumn` is the
-        // autumn-web package. An ancestor-only walk misses it: the key
-        // mis-resolves to "autumn-web", the member lookup finds no such
-        // dependency (falling back to a registry edge), and the feature
-        // edit emits `autumn-web/offline-sync` — a spelling cargo rejects
-        // for a renamed dependency.
+        // Only the pointed root's [workspace.dependencies] says `autumn` is autumn-web. Missing it
+        // would fall back to a registry edge and emit `autumn-web/offline-sync`, which cargo
+        // rejects for a renamed dependency.
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
@@ -3789,7 +3624,7 @@ mod tests {
         )
         .unwrap();
 
-        // Shell edge: mirrored from the pointed root — no registry fallback.
+        // Shell edge: mirrored from the pointed root.
         let mut plan = Plan::new(&app);
         let dep = shell_autumn_web_dep(&app, &mut plan);
         assert_eq!(
@@ -3799,8 +3634,7 @@ mod tests {
         );
         assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
 
-        // Feature entry: names the ALIAS key — the only spelling cargo
-        // accepts for a renamed dependency.
+        // Feature entry: names the alias key.
         let mut plan = Plan::new(&app);
         plan_app_offline_sync_feature(&app, &mut plan);
         assert!(plan.warnings.is_empty(), "got {:?}", plan.warnings);
@@ -3825,13 +3659,8 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // one linear case list, clearest unsplit
     fn offline_feature_wired_check_requires_dep_propagation() {
-        // A declared `offline-sync` feature only counts as wired when it
-        // actually ENABLES `{dep_key}/offline-sync` (directly or through
-        // another own-crate feature): serve()'s sync code compiles under
-        // cfg(feature = "offline-sync") but calls autumn_web::sync, which
-        // only exists when the dependency's feature is on — so e.g.
-        // `offline-sync = []` satisfies the cfg while guaranteeing a build
-        // failure.
+        // `offline-sync` is wired only when it enables `{dep_key}/offline-sync`:
+        // `offline-sync = []` satisfies serve()'s cfg but leaves autumn_web::sync uncompiled.
         fn manifest(deps: &str, features: &str) -> TempDir {
             let tmp = TempDir::new().unwrap();
             std::fs::write(
@@ -3856,8 +3685,7 @@ mod tests {
         }
         const STOCK_DEP: &str = "autumn-web = \"0.9.1\"";
 
-        // Empty declaration, default-enabled: the anchored patch fills in
-        // exactly the dep entry; the default line is untouched.
+        // Empty declaration, default-enabled: only the dep entry is filled in.
         let tmp = manifest(
             STOCK_DEP,
             "default = [\"flash\", \"offline-sync\"]\nflash = []\noffline-sync = []\n",
@@ -3875,8 +3703,7 @@ mod tests {
         );
         toml::from_str::<toml::Value>(&edited).expect("edited manifest must stay valid TOML");
 
-        // Empty declaration AND missing from default: both anchored
-        // patches land in one edit.
+        // Empty declaration and missing from default: both fixes land in one edit.
         let tmp = manifest(
             STOCK_DEP,
             "default = [\"flash\"]\nflash = []\noffline-sync = []\n",
@@ -3891,8 +3718,7 @@ mod tests {
         );
         toml::from_str::<toml::Value>(&edited).expect("edited manifest must stay valid TOML");
 
-        // A non-empty, non-propagating array is a customised feature: loud
-        // warning naming the missing entry, never a guessed rewrite.
+        // A non-empty, non-propagating array is customised: warn, never rewrite.
         let tmp = manifest(
             STOCK_DEP,
             "default = [\"flash\", \"offline-sync\"]\nflash = []\n\
@@ -3907,8 +3733,7 @@ mod tests {
             "the warning must name the missing dep entry, got {warnings:?}"
         );
 
-        // Propagating TRANSITIVELY through another own-crate feature:
-        // wired, untouched.
+        // Propagating transitively through another own-crate feature: wired.
         let tmp = manifest(
             STOCK_DEP,
             "default = [\"flash\", \"offline-sync\"]\nflash = []\n\
@@ -3950,11 +3775,8 @@ mod tests {
              got {warnings:?}"
         );
 
-        // A NON-PROPAGATING feature that is also missing from default must
-        // NOT get the default edit: enabling a broken feature by default
-        // would turn a previously-compiling `cargo build` into a
-        // guaranteed failure. Nothing is edited (stock anchor present or
-        // not), and ONE warning covers both required steps.
+        // A non-propagating feature missing from default gets no default edit, which would break
+        // `cargo build`. Nothing is edited and one warning covers both steps.
         let tmp = manifest(
             STOCK_DEP,
             "default = [\"flash\"]\nflash = []\n\
@@ -3973,8 +3795,7 @@ mod tests {
              edit, got {warnings:?}"
         );
 
-        // Regression (AF): a PROPAGATING feature missing from default
-        // still gets the anchored default edit.
+        // A propagating feature missing from default still gets the default edit.
         let tmp = manifest(
             STOCK_DEP,
             "default = [\"flash\"]\nflash = []\n\
@@ -3991,8 +3812,7 @@ mod tests {
 
     #[test]
     fn offline_shell_dep_warns_and_falls_back_when_source_is_unrepresentable() {
-        // No autumn-web dependency at all: fall back to the CLI's own version
-        // with a loud warning instead of silently inventing a registry edge.
+        // No autumn-web dependency: fall back to the CLI's own version, with a warning.
         let (dep, warnings) = shell_dep_for("serde = \"1\"", "");
         assert_eq!(
             dep.dep_entry,
@@ -4047,10 +3867,8 @@ mod tests {
 
     #[test]
     fn offline_lib_rs_sends_the_sync_bearer_token() {
-        // Client half of the fail-closed server mount (#1612 review): the
-        // engine sends AUTUMN_SYNC__TOKEN as its bearer token, matching the
-        // deployment's SYNC_TOKEN — and warns (without aborting: local-first
-        // still works) when it is missing.
+        // Client half of the fail-closed server mount (#1612): the engine sends AUTUMN_SYNC__TOKEN
+        // as its bearer token and warns, without aborting, when it is missing.
         let lib = render_mobile_lib_rs("my-app", "my_app", true);
         assert!(lib.contains(r#"std::env::var("AUTUMN_SYNC__TOKEN")"#));
         assert!(lib.contains("config.bearer_token = Some(token)"));
@@ -4058,8 +3876,7 @@ mod tests {
             lib.contains("AUTUMN_SYNC__TOKEN is not set"),
             "a missing client token must be called out at startup"
         );
-        // The commented env block documents the pairing without shipping a
-        // hard-coded secret.
+        // The env block documents the token only as a comment, never a hard-coded secret.
         assert!(lib.contains(r#"// std::env::set_var("AUTUMN_SYNC__TOKEN", sync_token);"#));
         assert!(!render_mobile_lib_rs("my-app", "my_app", false).contains("AUTUMN_SYNC__TOKEN"));
     }
@@ -4143,8 +3960,7 @@ mod tests {
 
     #[test]
     fn offline_plan_warns_on_customised_cargo_toml_features() {
-        // No `default = ["flash"]` anchor — the feature edit must be skipped
-        // with a warning, never guessed.
+        // No `default = ["flash"]` anchor: skip the feature edit with a warning.
         let tmp = app_dir("my-app");
         std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
 
@@ -4177,7 +3993,6 @@ mod tests {
             contents.contains(".layer(axum::middleware::from_fn(require_sync_auth)),"),
             "the sync router must be mounted behind the generated auth middleware"
         );
-        // The mount call must precede the final run().
         let mount = contents.find("mount_offline_sync(app)").unwrap();
         let run = contents.find(".run()").unwrap();
         assert!(mount < run, "sync mounting must happen before .run()");
@@ -4185,10 +4000,8 @@ mod tests {
 
     #[test]
     fn offline_extraction_mounts_sync_fail_closed_behind_sync_token() {
-        // Review hardening (#1612): a fresh scaffold must never expose an
-        // UNAUTHENTICATED /sync — the endpoints trust `device_id` as sent,
-        // so an open mount lets any network client read and overwrite every
-        // synced row. The generated helper fails closed instead.
+        // The endpoints trust `device_id` as sent, so an open /sync would let any client read and
+        // overwrite every synced row (#1612). The generated helper fails closed.
         let tmp = stock_app_dir("my-app");
         std::fs::write(tmp.path().join("src/main.rs"), stock_main_rs()).unwrap();
 
@@ -4207,8 +4020,7 @@ mod tests {
             contents.contains("/sync NOT mounted"),
             "the skipped mount must be explained loudly at startup"
         );
-        // Per-request guard: the generated middleware fails closed on an
-        // empty expected token and compares in constant time.
+        // Per-request guard: fails closed on an empty expected token, compares in constant time.
         assert!(contents.contains("async fn require_sync_auth"));
         assert!(contents.contains("StatusCode::INTERNAL_SERVER_ERROR"));
         assert!(contents.contains("StatusCode::UNAUTHORIZED"));
@@ -4216,7 +4028,7 @@ mod tests {
             contents.contains("autumn_web::sync::server::constant_time_token_eq"),
             "the token comparison must be constant-time"
         );
-        // The old unauthenticated one-liner mount must be gone.
+        // No unauthenticated mount.
         assert!(
             !contents.contains(r#".nest("/sync", server::router(backend, Arc::new(LwwResolver)))"#),
             "an unauthenticated /sync mount must not be emitted"

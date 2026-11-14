@@ -57,7 +57,6 @@ pub fn plan_wizard(
         )));
     }
 
-    // Reject reserved step names and duplicates after normalization.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for step in steps {
         let normalized = snake(step);
@@ -80,13 +79,11 @@ pub fn plan_wizard(
 
     let wizards_dir = project_root.join("src").join("wizards");
 
-    // Main wizard file
     plan.create(
         wizards_dir.join(format!("{snake_name}.rs")),
         render_wizard_file(&snake_name, &pascal_name, steps),
     );
 
-    // Update src/wizards/mod.rs — idempotent
     let mod_file = wizards_dir.join("mod.rs");
     let updated_mod = add_mod_declaration(&read_or_empty(&mod_file), &snake_name);
     plan.modify(mod_file.clone(), updated_mod);
@@ -95,7 +92,6 @@ pub fn plan_wizard(
         name: snake_name.clone(),
     });
 
-    // Integration test
     plan.create(
         project_root
             .join("tests")
@@ -673,7 +669,6 @@ mod tests {
     #[test]
     fn wizard_file_clears_on_cancel() {
         let content = render_wizard_file("checkout", "Checkout", &steps3());
-        // clear() appears at least twice (commit + cancel)
         let count = content.matches("wizard.clear().await").count();
         assert!(
             count >= 2,

@@ -22,10 +22,8 @@ pub fn plan_plugin(
     path: Option<&Path>,
     flags: Flags,
 ) -> Result<PluginPlan, GenerateError> {
-    // Call ensure_project_root first
     super::ensure_project_root(project_root)?;
 
-    // Strip prefixes/suffixes
     let mut clean_name = name;
     if let Some(stripped) = clean_name.strip_prefix("autumn-") {
         clean_name = stripped;
@@ -43,7 +41,6 @@ pub fn plan_plugin(
         clean_name = stripped;
     }
 
-    // Validate clean_name
     if clean_name.is_empty() {
         return Err(GenerateError::InvalidName(
             name.to_string(),
@@ -71,7 +68,6 @@ pub fn plan_plugin(
     let name_snake = name_kebab.replace('-', "_");
     let struct_name = format!("{}Plugin", super::naming::pascal(&name_snake));
 
-    // Validate path components
     if let Some(p) = path {
         for component in p.components() {
             match component {
@@ -100,7 +96,6 @@ pub fn plan_plugin(
         |p| project_root.join(p),
     );
 
-    // Prevent target_dir == project_root
     let clean_target: std::path::PathBuf = target_dir
         .components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))
@@ -135,12 +130,10 @@ pub fn plan_plugin(
         .collect::<Vec<_>>()
         .join(".");
 
-    // The range the scaffolded plugin declares in `Plugin::contract` (issue
-    // #1601). Below 1.0 that is the minor series and from 1.0 on the major —
-    // the compatibility key `STABILITY.md` defines — which is *wider* than the
-    // `major_minor` dependency line above once past 1.0, and deliberately so:
-    // the dependency says what cargo resolves, the contract says what the
-    // plugin claims to work with.
+    // The range the scaffold declares in `Plugin::contract` (#1601): the minor series below 1.0,
+    // the major from 1.0 on, as `STABILITY.md` defines. Past 1.0 that is wider than the
+    // `major_minor` dependency on purpose: the dependency is what cargo resolves, the contract is
+    // what the plugin claims to work with.
     let autumn_web_range = autumn_web::plugin_contract::lockstep_range(cargo_version);
 
     let cargo_toml_content = format!(
@@ -349,7 +342,6 @@ mod tests {
         let plugin_plan = plan_plugin(project_root, "Foo", None, Flags::default()).unwrap();
         let plan = plugin_plan.plan;
 
-        // Verify Cargo.toml, src/lib.rs, README.md, and tests/conformance.rs are planned for creation
         let paths: std::collections::HashSet<PathBuf> = plan
             .actions
             .iter()
@@ -373,7 +365,6 @@ mod tests {
             "Should plan tests/conformance.rs"
         );
 
-        // Verify crate name and struct name
         let cargo_action = plan
             .actions
             .iter()
@@ -419,7 +410,6 @@ mod tests {
         let plugin_plan = plan_plugin(project_root, "foo", None, Flags::default()).unwrap();
         let plan = plugin_plan.plan;
 
-        // Check Cargo.toml content
         let cargo_action = plan
             .actions
             .iter()
@@ -445,7 +435,6 @@ mod tests {
         )));
         assert!(cargo_content.contains("serde = { version = \"1\", features = [\"derive\"] }"));
 
-        // Check src/lib.rs content
         let lib_action = plan
             .actions
             .iter()
@@ -465,7 +454,6 @@ mod tests {
         assert_scaffold_declares_a_contract(lib_content);
         assert!(lib_content.contains("index"));
 
-        // Check README.md content
         let readme_action = plan
             .actions
             .iter()
@@ -481,7 +469,6 @@ mod tests {
         assert!(readme_content.contains("autumn-foo-plugin = { path = \"./autumn-foo-plugin\" }"));
         assert!(readme_content.contains(".plugin(FooPlugin::new())"));
 
-        // Check tests/conformance.rs content
         let conformance_action = plan
             .actions
             .iter()
@@ -496,7 +483,7 @@ mod tests {
         };
         assert_scaffold_conformance_test_is_wired(conformance_content);
 
-        // Test non-empty directory collision check
+        // A non-empty target directory is refused without --force.
         let collision_dir = project_root.join("autumn-bar-plugin");
         fs::create_dir_all(&collision_dir).unwrap();
         fs::write(collision_dir.join("some-file.txt"), "hello").unwrap();
@@ -513,7 +500,7 @@ mod tests {
             _ => panic!("Expected GenerateError::Config, got {err:?}"),
         }
 
-        // If force is true, it should bypass the check and succeed
+        // --force skips the check.
         let plan_forced = plan_plugin(
             project_root,
             "bar",

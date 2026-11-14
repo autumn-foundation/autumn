@@ -39,10 +39,8 @@
 //! schema moves before ANY host in the fleet cuts over. Every other host builds
 //! with [`exec::MigrateStep::Skip`].
 
-// Every item here is crate-internal by design (see the note on `mod fleet` in
-// `deploy.rs`). In this bin-only crate `deploy` is a private module, so clippy
-// flags each `pub(crate)` as redundant; they are kept to document the intended
-// visibility rather than widening to `pub`.
+// `deploy` is a private module of a bin-only crate, so clippy flags each `pub(crate)` as
+// redundant. They stay to document the intended visibility.
 #![allow(clippy::redundant_pub_crate)]
 
 use std::path::Path;
@@ -200,15 +198,11 @@ pub(crate) fn plan_fleet(
         .zip(modes)
         .enumerate()
         .map(|(index, (cfg, mode))| HostPlan {
-            // `ResolvedFleet` guarantees a non-blank host for every entry; the
-            // total fallback keeps this function panic-free rather than
-            // `expect`-ing an invariant enforced two modules away.
+            // `ResolvedFleet` guarantees a non-blank host; the fallback keeps this panic-free.
             host: cfg.host.clone().unwrap_or_default(),
             mode: *mode,
-            // Exactly one host runs the migration; everyone else skips it. Since
-            // #1607 that host is simply the first in rollout order — a
-            // `HostMode::First` host carries the migrate op too, so the schema is
-            // guaranteed to move before any host in the fleet cuts over.
+            // Exactly one host, the first in rollout order, runs the migration, so the schema
+            // moves before any host cuts over.
             migrate: if placement == MigratePlacement::FirstHost(index) {
                 MigrateStep::Run
             } else {
@@ -678,11 +672,9 @@ pub(crate) fn failed_step_label(err: &exec::DeployExecError) -> &'static str {
         exec::DeployExecError::CandidateRolledBack { failed_step, .. }
         | exec::DeployExecError::FirstDeployTornDown { failed_step, .. }
         | exec::DeployExecError::RollbackFailed { failed_step, .. } => failed_step,
-        // The post-cutover wrapper is a CLASSIFIER input, not a reporting one: it
-        // adds the op that was running, while the operator-facing step label stays
-        // exactly what the underlying failure would have reported on its own. A
-        // dropped transport is still attributed to the transport, never to a
-        // fabricated step (see `attributed_step_label` for the other question).
+        // The post-cutover wrapper only feeds classification: the reported label is the
+        // underlying failure's own, so a dropped transport is attributed to the transport
+        // (see `attributed_step_label`).
         exec::DeployExecError::PostCutover { source, .. } => failed_step_label(source),
         exec::DeployExecError::UploadFailed { .. } => "upload",
         exec::DeployExecError::Stage { .. } => "stage-local-file",
@@ -745,11 +737,10 @@ const fn attributed_step_label(err: &exec::DeployExecError) -> Option<&'static s
 ///   ([`PostBoundaryClass::Ambiguous`]) rather than compensate it blind.
 fn post_boundary_class(err: &exec::DeployExecError, reported_label: &str) -> PostBoundaryClass {
     match attributed_step_label(err) {
-        // The marker transaction (whatever error shape carried the failure), or a
-        // failure that names no op at all: both leave the rollback target unprovable.
+        // The marker transaction, in any error shape, or a failure that names no op: both
+        // leave the rollback target unprovable.
         Some(AMBIGUOUS_MARKERS_LABEL) | None => PostBoundaryClass::Ambiguous,
-        // Otherwise today's policy, keyed on the label the failure REPORTS — so a
-        // label-less transport error is never waved through as housekeeping.
+        // Key on the label the failure REPORTS, so a transport error is never housekeeping.
         Some(_) => classify_post_boundary(reported_label),
     }
 }
@@ -949,8 +940,7 @@ pub(crate) fn fleet_rollout_lines(plan: &FleetPlan, release_id: &str) -> Vec<Str
         };
         lines.push(format!("  {}. {} — {mode}", index + 1, host.host));
     }
-    // A plan always has at least one host, so `migrating_host()` is always `Some`;
-    // `if let` keeps the renderer total rather than panicking on the impossible.
+    // A non-empty plan always has a migrating host; `if let` keeps the renderer total.
     if let Some(migrating) = plan.migrating_host() {
         let skipped: Vec<&str> = plan
             .hosts
@@ -958,9 +948,7 @@ pub(crate) fn fleet_rollout_lines(plan: &FleetPlan, release_id: &str) -> Vec<Str
             .filter(|h| h.host != migrating.host)
             .map(|h| h.host.as_str())
             .collect();
-        // A `--only`-narrowed repair reaches here with a one-host plan, so there
-        // is nobody left to skip the migration; the "; N skip it" clause would
-        // render as a dangling fragment ("fleet-wide;  skip it").
+        // A `--only` run can plan a single host, leaving nobody to skip the migration.
         lines.push(if skipped.is_empty() {
             format!(
                 "  \u{2192} migrate ({} only \u{2014} the schema is fleet-wide)",
@@ -1027,16 +1015,15 @@ pub(crate) fn fleet_summary_lines(
         let state = match outcome {
             HostOutcome::Untouched => "untouched (not reached)".to_owned(),
             HostOutcome::Serving => format!("serving {release_id}"),
-            // Live and healthy on the new release: only bookkeeping failed. The
-            // remedy is named because a failed `record-proxy-options` makes the NEXT
+            // The remedy is named because a failed `record-proxy-options` makes the NEXT
             // deploy of this host fail closed.
             HostOutcome::Degraded { label } => format!(
                 "serving {release_id} \u{2014} DEGRADED: `{label}` failed after the cutover; \
                  traffic is fine, but repair it (a redeploy of this host does) before the \
                  next deploy refuses it"
             ),
-            // Traffic already moved before the failure, so this host IS on the new
-            // release — saying only "failed" would be the dangerous half-truth.
+            // Traffic already moved, so this host IS on the new release; "failed" alone would
+            // mislead.
             HostOutcome::LiveOnNew { failed_step } => live_on_new_row(release_id, failed_step),
             HostOutcome::AmbiguousMarkers => format!(
                 "serving {release_id} \u{2014} `{AMBIGUOUS_MARKERS_LABEL}` failed AFTER the \
@@ -1097,33 +1084,19 @@ pub(crate) fn fleet_summary_lines(
             on_new.join(", ")
         ));
     }
-    // The binaries-versus-schema truth, said once, in whichever tense is TRUE.
-    //
-    // The question the operator needs answered is never "did the fleet compensate"
-    // — it is "the schema is at the new release; where are the binaries?". So the
-    // migration is the gate, and the fleet's shape only picks the sentence:
-    //
-    // * some host is still forward — a rollback from here restores binaries only;
-    // * the fleet undid hosts itself — that rollback restored binaries only;
-    // * nothing is forward and nothing was compensated — the migrating host tore
-    //   its own candidate down (a pre-boundary failure AFTER `migrate`), so every
-    //   binary went back on its own and the schema stayed put. This last case used
-    //   to print NOTHING at all, which is the worst of the three to be silent about.
-    //
-    // Gating on the migration and not on liveness also keeps a rollout that never
-    // GOT to its migration silent — one that failed while preparing the host or
-    // uploading the binary (see `schema_moved`, which rules those out by failing
-    // step). Since #1607 every rollout schedules a migration, so that, rather than
-    // "this fleet migrates nowhere", is the case this gate exists to keep quiet.
+    // Once the schema moved, say where the binaries are, in whichever tense is true:
+    // * some host is still forward: a rollback from here restores binaries only;
+    // * the fleet compensated hosts: that rollback restored binaries only;
+    // * nothing is forward and nothing was compensated: the migrating host tore its own
+    //   candidate down after `migrate`, so the binaries went back and the schema did not.
+    // Gating on the migration keeps a rollout that failed before migrating silent.
     if schema_moved(plan, outcomes) {
         if !on_new.is_empty() {
             lines.push(format!("  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_MOVED_NOTE}"));
         }
-        // Only hosts the fleet actually PUT BACK count as compensated: a
-        // `CompensationFailed` host is still on the new release (it is in `on_new`
-        // above), so on its own it restored no binaries and the note would be false.
-        // `CompensatedTeardownRouteFailed` DOES count: its app came back too — only
-        // its proxy route stayed stuck.
+        // Only hosts the fleet PUT BACK count: a `CompensationFailed` host is still on the
+        // new release. `CompensatedTeardownRouteFailed` counts: its app is gone, only the
+        // proxy route is stuck.
         let compensated = outcomes.iter().any(|outcome| {
             matches!(
                 outcome,
@@ -1137,11 +1110,8 @@ pub(crate) fn fleet_summary_lines(
                 "  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_NOT_ROLLED_BACK_NOTE}"
             ));
         } else if on_new.is_empty() && outcomes.iter().any(HostOutcome::went_back) {
-            // `on_new_release()` and `went_back()` partition every touched host, and
-            // `schema_moved` proves at least one host was touched — so the second
-            // half of this condition is implied by the first; it is spelled out so
-            // the sentence below ("the binaries went back") is read off the outcomes
-            // rather than inferred from them.
+            // `went_back` is implied (the two predicates partition every touched host), but
+            // spelled out so "the binaries went back" is read off the outcomes.
             lines.push(format!(
                 "  \u{26A0}\u{FE0F}  {FLEET_SCHEMA_AHEAD_OF_BINARIES_NOTE}"
             ));
@@ -1188,7 +1158,6 @@ pub(crate) fn fleet_completion_line(
         "\u{26A0}\u{FE0F} "
     };
     if untouched == 0 {
-        // Byte-identical to pre-review for a full fleet.
         return if degraded == 0 {
             format!(
                 "\n\u{2705} Fleet deploy complete \u{2014} all {total} hosts serving {release_id}."
@@ -1210,7 +1179,7 @@ pub(crate) fn fleet_completion_line(
     )
 }
 
-// ── `deploy status`: per-host state and drift (issue #1621, AC-6) ────────────
+// ── `deploy status`: per-host state and drift (#1621) ────────────────────────
 
 /// The deployed release a host reports, or the honest absence of one.
 ///
@@ -1445,8 +1414,7 @@ impl HostStatus {
             release: ReleaseId::Unknown,
             live_slot: None,
             ready_code: None,
-            // Nothing was probed, so nothing is proved — and `fleet_drift` never
-            // derives drift from an unreachable host, so this stays a bare `?`.
+            // Nothing was probed; `fleet_drift` never derives drift from an unreachable host.
             maintenance: exec::MaintenanceStatus::Unknown,
             maintenance_flag_source: exec::MaintenanceFlagSource::Unknown,
             installed_proxy_port: exec::InstalledProxyPort::Absent,
@@ -1564,26 +1532,19 @@ pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
         }
     }
 
-    // Whether ANY reachable host proved it is serving a release — the peer a
-    // not-deployed host is judged against.
     let any_release_deployed = hosts
         .iter()
         .any(|status| status.reachable && matches!(status.release, ReleaseId::Known(_)));
 
     let mut state_drift: Vec<(String, &'static str)> = Vec::new();
     for status in hosts.iter().filter(|status| status.reachable) {
-        // A PROVEN absence, judged against the fleet: nothing is deployed here while
-        // a peer is serving a release. A fleet that has never been deployed at all
-        // has no peer to be out of step with, so it stays silent.
+        // A proven absence while a peer serves a release. A never-deployed fleet has no peer
+        // to be out of step with, so it stays silent.
         if status.mode == Some(HostMode::First) && any_release_deployed {
             state_drift.push((status.host.clone(), DRIFT_HOST_NOT_DEPLOYED));
         }
-        // The mirror image, and the one `--strict` used to exit 0 on: the host
-        // PROVED it has a `current` symlink (that is what `Redeploy` means) yet the
-        // release behind it could not be read. Unknown still contributes no VERSION
-        // drift — rule 1 above is untouched — but it is actionable marker damage,
-        // so it is state drift. Judged against nothing: a lone damaged host needs
-        // the same alert a damaged host in a big fleet does.
+        // `Redeploy` proves a `current` symlink exists, yet its release could not be read.
+        // That is marker damage: state drift, never version drift, even on a lone host.
         if status.mode == Some(HostMode::Redeploy) && matches!(status.release, ReleaseId::Unknown) {
             state_drift.push((status.host.clone(), DRIFT_RELEASE_UNREADABLE));
         }
@@ -1605,12 +1566,9 @@ pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
             }
             _ => {}
         }
-        // Review round 1: the maintenance column is only as good as the CLI's
-        // knowledge of WHICH file the running unit polls. Both failure shapes are
-        // named here rather than buried in the column, because both need an
-        // operator action (inspect the unit / redeploy the host). A host with
-        // nothing deployed has no slot unit by definition and is already reported
-        // as such, so it is not double-flagged.
+        // The maintenance column is only as good as knowing WHICH file the running unit
+        // polls; both failure shapes need operator action. A host with nothing deployed has
+        // no slot unit and is already reported above.
         if status.mode == Some(HostMode::Redeploy) {
             match status.maintenance_flag_source {
                 exec::MaintenanceFlagSource::Unknown => {
@@ -1659,8 +1617,7 @@ fn status_row_cells(status: &HostStatus, report: &DriftReport) -> [String; 8] {
         match status.maintenance {
             exec::MaintenanceStatus::On => "maintenance ON".to_owned(),
             exec::MaintenanceStatus::Off => "maintenance off".to_owned(),
-            // Fail closed: "we could not tell" is its own cell, never an `off` that
-            // reads as proof the host is serving traffic normally.
+            // Fail closed: "could not tell" never renders as `off`.
             exec::MaintenanceStatus::Unknown => "maintenance ?".to_owned(),
         },
         match &status.installed_proxy_port {
@@ -1780,8 +1737,7 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
                     state.push_str("  ");
                 }
                 state.push_str(cell);
-                // Pad every column but the last (the ragged prose column) by hand
-                // — no `format!` allocation per cell.
+                // Pad all but the last column by hand: no `format!` allocation per cell.
                 if index + 1 < cells.len() {
                     for _ in cell.chars().count()..widths[index] {
                         state.push(' ');
@@ -1805,22 +1761,17 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
     }
     let unknown = report.unknown_releases();
     if !unknown.is_empty() {
-        // Two different facts, deliberately split: a host that reported
-        // `HostMode::First` PROVED it has no `current` symlink, while every other
-        // unknown really is "we could not read it". Describing the first as an
-        // unreadable symlink sends the operator to inspect something that was never
-        // there.
+        // A `HostMode::First` host PROVED it has no `current` symlink; every other unknown
+        // is "could not read it". Calling the first unreadable sends the operator looking
+        // for a symlink that was never there.
         let (not_deployed, rest): (Vec<&str>, Vec<&str>) = unknown.iter().partition(|host| {
             hosts.iter().any(|status| {
                 status.host == **host && status.reachable && status.mode == Some(HostMode::First)
             })
         });
-        // Review round 2: a REACHABLE host that reports a `current` symlink whose
-        // release could not be read is now state drift, and its reason is printed
-        // per host below. Repeating it here under "reported, not counted as drift"
-        // would contradict that line — so this footer now covers only the hosts it
-        // is still true for (chiefly the unreachable ones, whose markers were never
-        // read at all).
+        // A reachable `Redeploy` host with an unreadable release is state drift, reported
+        // per host below. Listing it here as "not counted as drift" would contradict that,
+        // so this footer covers the rest, chiefly unreachable hosts.
         let unreadable: Vec<&str> = rest
             .into_iter()
             .filter(|host| {
@@ -1839,8 +1790,6 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
             ));
         }
         if !unreadable.is_empty() {
-            // Named, and explicitly NOT called drift — the evidence matters more than
-            // the verdict here.
             lines.push(format!(
                 "  \u{2139}\u{FE0F}  release unknown on {} (the `current` symlink was unreadable) \
                  \u{2014} reported, not counted as drift.",
@@ -1852,10 +1801,8 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
         lines.push(format!("  \u{26A0}\u{FE0F}  {host}: {reason}"));
     }
     lines.extend(readiness_footer_lines(hosts));
-    // AC-6's third fact carries its own limits, printed where it is read rather
-    // than only in the guide — a column whose scope is misread is worse than no
-    // column. Only when there is a reachable host, so an all-unreachable report
-    // stays about the outage.
+    // The `last deploy` column's scope is printed where it is read. Skipped when no host is
+    // reachable, so that report stays about the outage.
     if hosts.iter().any(|status| status.reachable) {
         lines.push(format!("  \u{2139}\u{FE0F}  {LAST_DEPLOY_SCOPE_NOTE}"));
     }
@@ -1870,7 +1817,7 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
     lines
 }
 
-// ── Fleet-wide `deploy maintenance` (issue #1621, AC-5) ──────────────────────
+// ── Fleet-wide `deploy maintenance` (#1621) ──────────────────────────────────
 
 /// What the maintenance fan-out did to ONE host (issue #1621, §6.2).
 ///
@@ -1967,10 +1914,8 @@ pub(crate) fn fleet_maintenance_summary_lines(
     let changed: Vec<&str> = hosts
         .iter()
         .zip(outcomes)
-        // Only the hosts that are DONE. A partially-changed host is named on the
-        // failed side instead, and its own row spells out that its shared flag did
-        // change — listing it as simply "changed" would read as "this host is
-        // maintained", which is the one thing it is not known to be.
+        // A partially-changed host is listed as failed: "changed" would read as "this host
+        // is maintained", which is not known.
         .filter(|(_, outcome)| !outcome.failed())
         .map(|(host, _)| host.as_str())
         .collect();
@@ -1981,9 +1926,8 @@ pub(crate) fn fleet_maintenance_summary_lines(
         .map(|(host, _)| host.as_str())
         .collect();
     if !failed.is_empty() && !changed.is_empty() {
-        // Naming the hosts that DID change is the point: a partial change is never
-        // rolled back automatically (that would reopen the window being closed), so
-        // the operator needs the exact list to reverse by hand if that is the call.
+        // A partial change is never reversed automatically (that would reopen the window
+        // being closed), so the operator needs the exact list to reverse by hand.
         lines.push(format!(
             "  \u{26A0}\u{FE0F}  Changed anyway: {changed}. NOT reversed automatically \u{2014} \
              reverse them with `autumn deploy maintenance {reverse}` if the fleet must stay \
@@ -2001,7 +1945,7 @@ pub(crate) fn fleet_maintenance_summary_lines(
     lines
 }
 
-// ── `--only`: the repair lever (issue #1621, §3.2) ───────────────────────────
+// ── `--only`: the repair lever (#1621) ───────────────────────────────────────
 
 /// The loud warning printed whenever `--only` excludes a configured host.
 ///
@@ -2047,7 +1991,7 @@ pub(crate) fn only_selection_warning_lines(
     ]
 }
 
-// ── Fleet-wide `deploy rollback` (issue #1621, §3.2) ─────────────────────────
+// ── Fleet-wide `deploy rollback` (#1621) ─────────────────────────────────────
 
 /// What a fleet-wide rollback did to ONE host.
 ///
@@ -2109,8 +2053,6 @@ pub(crate) fn fleet_rollback_summary_lines(
         .map(|(host, _)| host.as_str())
         .collect();
     if !stalled.is_empty() {
-        // A partly-rolled-back fleet is mixed on purpose-by-accident: say which half
-        // is which, and name the single-host lever for finishing the job.
         lines.push(format!(
             "  \u{26A0}\u{FE0F}  The fleet is now MIXED: {} did not roll back. Retry one host \
              with `autumn deploy rollback --only <host>`, or deploy the intended release to \
@@ -2118,8 +2060,6 @@ pub(crate) fn fleet_rollback_summary_lines(
             stalled.join(", "),
         ));
     }
-    // The mirror of the rollout's promise, and just as important here: a rollback
-    // moves binaries, never schema.
     lines.push(
         "  \u{26A0}\u{FE0F}  This restored BINARIES only \u{2014} no migration was rolled \
          back; confirm the schema still fits the release now serving."
@@ -2473,18 +2413,15 @@ mod tests {
 
     #[test]
     fn fleet_plan_runs_migrations_exactly_once() {
-        // #1621 (AC-4, T1.8): the schema is fleet-wide, so a rollout migrates ONCE,
-        // before the first host's cutover. A naive per-host loop would run the
-        // one-shot N times: the Postgres advisory lock keeps that safe, but hosts
-        // 2..N each pay the lock wait and — worse — a migration failing on host 2
-        // AFTER host 1 cut over is exactly the mixed-version fleet AC-3 forbids.
+        // #1621: the schema is fleet-wide, so a rollout migrates ONCE, before the first
+        // cutover. A per-host loop would migrate N times: the advisory lock keeps that safe,
+        // but a migration failing on host 2 after host 1 cut over leaves a mixed fleet.
         let (plan, per_host) = plan_and_build(
             &["web-a", "web-b", "web-c"],
             &[HostMode::Redeploy, HostMode::Redeploy, HostMode::Redeploy],
         );
 
-        // (a) the plan itself names exactly one migrating host — the first in
-        // rollout order — and the built ops agree.
+        // (a) The plan names exactly one migrating host, the first, and the ops agree.
         assert_eq!(
             plan.migrating_host().map(|h| h.host.as_str()),
             Some("web-a"),
@@ -2508,8 +2445,7 @@ mod tests {
             "a fleet rollout must schedule exactly one migrate op, got: {flat:?}"
         );
 
-        // (b) the single migrate precedes the FIRST cutover anywhere in the fleet,
-        // so no host is serving the new release before the schema is at it.
+        // (b) The migrate precedes the FIRST cutover anywhere in the fleet.
         let migrate = flat
             .iter()
             .position(|l| *l == "migrate")
@@ -2524,9 +2460,8 @@ mod tests {
              migrate at {migrate}, first boundary at {first_flip}, labels: {flat:?}"
         );
 
-        // (c) the migrate op is still the real, blocking one-shot: `--wait` is what
-        // propagates a failed migration into an abort, and `AUTUMN_MIGRATE=1` is the
-        // runtime trigger.
+        // (c) It is the real blocking one-shot: `--wait` turns a failed migration into an
+        // abort, and `AUTUMN_MIGRATE=1` is the runtime trigger.
         let migrate_shell = per_host
             .iter()
             .find_map(|ops| shell_for(ops, "migrate"))
@@ -2543,12 +2478,10 @@ mod tests {
 
     #[test]
     fn every_fleet_host_vector_carries_exactly_one_boundary_label() {
-        // #1621 (AC-3, T1.9): `execute_with_teardown` resolves the boundary with
-        // `ops.iter().position(|op| op.label() == boundary)` — the FIRST match. Two
-        // hosts' ops in one vector would make every later host's pre-flip failure
-        // look post-boundary and silently disable auto-rollback. This is the
-        // structural tripwire for that: one boundary per host vector, `proxy-flip`
-        // for a redeploy and `proxy-route` for a first deploy.
+        // `execute_with_teardown` resolves the boundary by FIRST match, so two hosts' ops in
+        // one vector would make every later host's pre-flip failure look post-boundary and
+        // disable auto-rollback. One boundary per host vector: `proxy-flip` for a redeploy,
+        // `proxy-route` for a first deploy.
         let (plan, per_host) = plan_and_build(
             &["web-a", "web-b", "web-c"],
             &[HostMode::First, HostMode::Redeploy, HostMode::Redeploy],
@@ -2580,9 +2513,8 @@ mod tests {
 
     #[test]
     fn migrate_placement_picks_the_first_host_in_rollout_order() {
-        // #1607 (AC-3): both per-host builders carry a migrate op now, so the fleet's
-        // one migration lands on host 1 whatever its mode — the earliest point in the
-        // rollout, and therefore before ANY host cuts over.
+        // #1607: both per-host builders carry a migrate op, so the migration lands on host 1
+        // whatever its mode, before ANY host cuts over.
         assert_eq!(
             migrate_placement(&[HostMode::First, HostMode::Redeploy, HostMode::Redeploy]),
             MigratePlacement::FirstHost(0),
@@ -2607,10 +2539,8 @@ mod tests {
 
     #[test]
     fn host_mode_projects_the_probed_deploy_mode() {
-        // #1621: the planner's input is the payload-free projection of the probe's
-        // `DeployMode`. The live slot the probe carries belongs to the host's
-        // `SlotPlan`, not to the planning decision, so the driver maps once here
-        // instead of threading the probe type through the pure layer.
+        // The planner's input drops the probe's live-slot payload; that belongs to the
+        // host's `SlotPlan`.
         assert_eq!(
             HostMode::from_deploy_mode(&exec::DeployMode::First),
             HostMode::First,
@@ -2634,11 +2564,8 @@ mod tests {
 
     #[test]
     fn a_mixed_fleet_migrates_once_on_host_one_before_any_cutover() {
-        // The scale-up shape — a NEW host listed ahead of an already-deployed one —
-        // is the case #1621's placement rule made hazardous and #1607's fixed. Assert
-        // it at the OPS level, not just in the rendered header: the leading
-        // first-deploy host carries the migration, and it lands before any host in
-        // the fleet cuts over.
+        // Scale-up: a NEW host listed ahead of a deployed one (#1607). At the ops level, the
+        // leading first-deploy host migrates before any host cuts over.
         let (plan, per_host) =
             plan_and_build(&["web-a", "web-b"], &[HostMode::First, HostMode::Redeploy]);
         assert_eq!(
@@ -2671,10 +2598,7 @@ mod tests {
 
     #[test]
     fn an_all_first_deploy_fleet_migrates_exactly_once_on_host_one() {
-        // #1607 (AC-3): the companion of the placement rule at the op level. A brand
-        // new fleet used to migrate NOWHERE and tell the operator to run `autumn
-        // migrate` by hand; now host 1 carries the one migration and hosts 2..N skip
-        // it, exactly like an all-redeploy fleet.
+        // #1607: a brand-new fleet migrates on host 1, and hosts 2..N skip it.
         let (plan, per_host) =
             plan_and_build(&["web-a", "web-b"], &[HostMode::First, HostMode::First]);
         assert_eq!(
@@ -2708,9 +2632,8 @@ mod tests {
 
     #[test]
     fn every_fleet_host_deploys_the_identical_release_id() {
-        // #1621 (AC-3/AC-6, T1.18): ONE release id per fleet run. Minting per host
-        // would give un-comparable `current` symlink targets (permanent reported
-        // drift) and no single rollback target for the whole fleet.
+        // ONE release id per fleet run. Minting per host would give incomparable `current`
+        // targets (permanent reported drift) and no single fleet rollback target.
         let (_plan, per_host) = plan_and_build(
             &["web-a", "web-b", "web-c"],
             &[HostMode::Redeploy, HostMode::Redeploy, HostMode::Redeploy],
@@ -2742,8 +2665,7 @@ mod tests {
 
     #[test]
     fn plan_fleet_refuses_a_mode_count_mismatch_without_panicking() {
-        // #1621: `plan_fleet` is pure and total — a caller that hands it a probe
-        // list of the wrong length gets a typed refusal, never a panic mid-rollout.
+        // A probe list of the wrong length gets a typed refusal, never a panic mid-rollout.
         let fleet = fleet_of(&["web-a", "web-b"]);
         let err = plan_fleet(&fleet, &[HostMode::Redeploy])
             .expect_err("a short mode list must be refused");
@@ -2756,11 +2678,9 @@ mod tests {
 
     #[test]
     fn failure_classification_distinguishes_a_clean_host_from_a_live_one() {
-        // #1621 (AC-3): the whole "no mixed versions" decision turns on ONE
-        // question per host — did traffic move? `execute_with_teardown` already
-        // answers it: it returns `CandidateRolledBack`/`FirstDeployTornDown` ONLY
-        // for a failure at or before the go-live boundary, and the raw error
-        // otherwise. Nothing here re-derives that; it only names the two cases.
+        // Did traffic move? `execute_with_teardown` returns `CandidateRolledBack` /
+        // `FirstDeployTornDown` ONLY for a failure at or before the go-live boundary, and
+        // the raw error otherwise.
         let boxed = || {
             Box::new(exec::DeployExecError::CommandFailed {
                 label: "readiness-gate",
@@ -2787,9 +2707,8 @@ mod tests {
             },
             "a pre-boundary first deploy has no previous release to fall back to"
         );
-        // Fail closed: anything else means the executor did NOT tear down, which it
-        // only declines to do when the failure landed after the boundary (or when
-        // the boundary could not be located) — either way, assume the host is live.
+        // Fail closed: no teardown means the failure landed after the boundary (or the
+        // boundary was not found), so assume the host is live.
         assert_eq!(
             classify_failure(&exec::DeployExecError::CommandFailed {
                 label: "drain-old",
@@ -2804,9 +2723,8 @@ mod tests {
 
     #[test]
     fn failed_step_labels_are_static_and_never_quote_a_driver_message() {
-        // #1621: every fleet-facing error/summary field is a host name or a
-        // `&'static str` op label. A migration driver error can embed the database
-        // URL, so a fleet error must never format a source error into its own text.
+        // A migration driver error can embed the database URL, so fleet errors carry only
+        // host names and static op labels, never a formatted source error.
         assert_eq!(
             failed_step_label(&exec::DeployExecError::CommandFailed {
                 label: "migrate",
@@ -2837,9 +2755,8 @@ mod tests {
 
     #[test]
     fn the_rollout_header_names_the_single_migrating_host_and_who_skips() {
-        // #1621 (AC-4, §8.1): three hosts is ~48 visually identical op lines, and
-        // the first 3 a.m. question is "which host was that on?". The header answers
-        // it up front, and states where the ONE migration lands.
+        // Three hosts print ~48 near-identical op lines; the header names the order, each
+        // host's mode, and where the ONE migration lands.
         let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
         let plan = plan_fleet(
             &fleet,
@@ -2863,12 +2780,8 @@ mod tests {
 
     #[test]
     fn the_rollout_header_drops_the_skip_clause_for_a_one_host_plan() {
-        // #1621. A `--only`-narrowed repair reaches this renderer
-        // with a ONE-host plan (`single` is false whenever the config declares more
-        // than one host), so nobody is left to "skip it": `skipped.join(", ")` is
-        // empty and the sentence used to render as "…fleet-wide;  skip it)" — a
-        // dangling clause with a doubled space, on the one line that tells the
-        // operator where the fleet's single migration lands.
+        // A `--only` run reaches this renderer with a ONE-host plan, so nobody is left to
+        // skip the migration; the line must not end in a dangling "; skip it" clause.
         let fleet = fleet_of(&["web-b"]);
         let plan =
             plan_fleet(&fleet, &[HostMode::Redeploy]).expect("a one-host plan is well-formed");
@@ -2894,13 +2807,8 @@ mod tests {
 
     #[test]
     fn every_rollout_migrates_on_host_one_whatever_the_mix() {
-        // #1607 (AC-3) retires BOTH hazard warnings this header used to carry:
-        //   * first-deploy hosts cutting over ahead of the fleet's migration, and
-        //   * an all-first-deploy fleet migrating nowhere and telling the operator
-        //     to run `autumn migrate` by hand.
-        // Neither state is reachable now that `first_deploy_ops` carries a migrate
-        // op and the placement is simply host 1, so the header states the placement
-        // and warns about nothing.
+        // #1607: `first_deploy_ops` carries a migrate op and the placement is host 1, so no
+        // mode mix produces a migration-ordering warning or a "run `autumn migrate`" hint.
         let fleet = fleet_of(&["10.0.0.2", "10.0.0.3", "10.0.0.1"]);
         for modes in [
             [HostMode::First, HostMode::First, HostMode::Redeploy],
@@ -2928,11 +2836,8 @@ mod tests {
 
     #[test]
     fn the_completion_line_is_honest_about_a_narrowed_run() {
-        // #1621. `--only` narrows the plan, the outcomes AND the
-        // state table, so `total` is the SELECTED count: "all 1 hosts serving R2"
-        // on a 3-host config reads as a full-fleet success while web-a/web-c are
-        // still on the previous release. The closing line must say it was narrowed
-        // and that the untouched hosts may be on another release.
+        // `--only` narrows the plan and outcomes, so `total` is the SELECTED count. "All 1
+        // hosts serving" on a 3-host config would read as a full-fleet success.
         let narrowed = fleet_completion_line("20260714T120000Z", 1, 3, 0);
         assert!(
             !narrowed.contains("Fleet deploy complete"),
@@ -2957,8 +2862,7 @@ mod tests {
             "a narrowed run with a degraded host must say both:\n{narrowed_degraded}"
         );
 
-        // A FULL run is byte-identical to the pre-review text — the e2e harness
-        // pins this exact string.
+        // The e2e harness pins the full-run string exactly.
         assert_eq!(
             fleet_completion_line("20260714T120000Z", 2, 2, 0),
             "\n\u{2705} Fleet deploy complete \u{2014} all 2 hosts serving 20260714T120000Z.",
@@ -2979,10 +2883,8 @@ mod tests {
 
     #[test]
     fn the_summary_names_every_host_state_and_the_recovery_command() {
-        // #1621 (§8.2): a halted rollout is exactly the moment the operator has no
-        // other source of truth, so the last thing printed is per-host state — with
-        // the recovery command and the plain statement that the schema did NOT move
-        // back.
+        // On a halt the summary is the operator's only source of truth: per-host state, the
+        // recovery command, and that the schema did NOT move back.
         let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
         let plan = plan_fleet(
             &fleet,
@@ -3050,12 +2952,9 @@ mod tests {
 
     #[test]
     fn classify_post_boundary_separates_housekeeping_from_functional_failures() {
-        // #1621 (AC-3, T1.15 / §4.6). After the go-live boundary the host IS on the
-        // new release, so "it failed" is not enough to decide anything: the three
-        // answers below are materially different, and getting them wrong in either
-        // direction is an outage — roll a fleet back because `prune` failed and you
-        // caused one; auto-roll-back on mid-transaction markers and you may restore
-        // the WRONG release.
+        // Wrong in either direction is an outage: rolling a fleet back because `prune`
+        // failed causes one, and auto-rolling-back mid-transaction markers may restore the
+        // WRONG release.
         for label in ["record-proxy-options", "drain-old", "prune"] {
             assert_eq!(
                 classify_post_boundary(label),
@@ -3070,8 +2969,7 @@ mod tests {
             "`commit-markers` writes the marker triple as one transaction — a failure \
              inside it leaves the rollback target unprovable, so it must fail closed"
         );
-        // Fail closed on anything unknown: a NEW op added after the boundary is
-        // treated as mattering until someone deliberately lists it as housekeeping.
+        // A NEW post-boundary op matters until it is deliberately listed as housekeeping.
         for label in ["proxy-flip", "some-future-post-flip-op", ""] {
             assert_eq!(
                 classify_post_boundary(label),
@@ -3148,9 +3046,8 @@ mod tests {
 
     #[test]
     fn a_post_boundary_housekeeping_failure_degrades_instead_of_halting() {
-        // #1621 (§4.6): the composition the driver actually calls. A pre-boundary
-        // outcome passes through untouched (the executor already tore the candidate
-        // down); a post-boundary raw error is refined by its label.
+        // The composition the driver calls: a pre-boundary outcome passes through, and a
+        // post-boundary raw error is refined by its label.
         let boxed = || {
             Box::new(exec::DeployExecError::CommandFailed {
                 label: "prune",
@@ -3197,12 +3094,9 @@ mod tests {
 
     #[test]
     fn a_post_boundary_failure_is_classified_by_the_op_that_was_running() {
-        // #1621 (§4.6). The never-auto-roll-back guard is about an OP, not about an
-        // error shape. `DeployExecError::Spawn` carries no label of its own, so
-        // before `execute_with_teardown` attached one a dropped transport during
-        // `commit-markers` classified as Functional and the host was auto-rolled-back
-        // onto whatever `shared/previous-release` still named — a marker the failed
-        // command never rewrote.
+        // The never-auto-roll-back guard is about an OP, not an error shape. `Spawn` carries
+        // no label, so the attribution comes from the `PostCutover` wrapper. Without it a
+        // transport drop during `commit-markers` would auto-roll-back onto an unproven marker.
         let transport = || {
             Box::new(exec::DeployExecError::Spawn {
                 program: "ssh".to_owned(),
@@ -3218,9 +3112,8 @@ mod tests {
             "a transport that dropped during `commit-markers` leaves the marker triple \
              exactly as unprovable as a non-zero exit does — it must fail closed too"
         );
-        // Attribution only ever makes the verdict MORE conservative. A transport that
-        // dropped during housekeeping is not proof that only bookkeeping broke: the
-        // deploy host can no longer talk to this host at all, so it stays Functional.
+        // Attribution only makes the verdict MORE conservative: a transport dropped during
+        // housekeeping means the host is unreachable, so it stays Functional.
         assert_eq!(
             classify_host_outcome(&exec::DeployExecError::PostCutover {
                 failed_step: "drain-old",
@@ -3243,9 +3136,8 @@ mod tests {
             HostOutcome::Degraded { label: "prune" },
             "a remote `prune` failure is still bookkeeping — the rollout continues"
         );
-        // Nothing names the failing op: we cannot say WHICH post-cutover step broke,
-        // which is exactly when the rollback target is least provable. Fail closed to
-        // "do not touch this host" rather than compensating it blind.
+        // Nothing names the failing op, so the rollback target is unprovable: do not touch
+        // the host.
         assert_eq!(
             classify_host_outcome(&exec::DeployExecError::Spawn {
                 program: "ssh".to_owned(),
@@ -3258,10 +3150,9 @@ mod tests {
 
     #[test]
     fn the_compensation_set_is_the_reverse_of_the_rollout_order() {
-        // #1621 (AC-3, T1.13 / §4.7). Everything on the NEW release is compensated,
-        // newest cutover first; everything already clean or never reached is left
-        // alone. Mode decides HOW: a redeploy host rolls back to its previous
-        // release, a first-deploy host has no previous release and is torn down.
+        // Everything on the NEW release is compensated, newest cutover first; clean or
+        // unreached hosts are left alone. A redeploy host rolls back; a first-deploy host
+        // has no previous release and is torn down.
         let actions = fleet_rollback_set(
             &[
                 HostOutcome::Serving,
@@ -3293,11 +3184,8 @@ mod tests {
 
     #[test]
     fn a_degraded_host_is_still_compensated_when_the_fleet_rolls_back() {
-        // #1621 (§4.7): a degraded host is live and HEALTHY on the new release —
-        // that is exactly why it must come back with everyone else. Leaving it
-        // forward while hosts 1..k return to the old release is the mixed-version
-        // fleet AC-3 forbids. (Its housekeeping debris is reported separately, from
-        // the driver's own record, so compensating it does not erase the warning.)
+        // A degraded host is live on the new release, so it must come back with everyone
+        // else or the fleet ends up mixed.
         let actions = fleet_rollback_set(
             &[
                 HostOutcome::Degraded { label: "prune" },
@@ -3316,10 +3204,8 @@ mod tests {
 
     #[test]
     fn clean_and_ambiguous_hosts_are_never_auto_rolled_back() {
-        // #1621 (§4.7): the two "hands off" cases. A host whose own pre-boundary
-        // teardown ran is already back where it started — touching it again would
-        // roll it back PAST the release it is serving. A host whose markers are
-        // mid-transaction cannot be resolved safely, so it fails closed to Manual.
+        // A host whose own teardown ran is already back; touching it again would roll it
+        // PAST the release it serves. Mid-transaction markers fail closed to Manual.
         let actions = fleet_rollback_set(
             &[
                 HostOutcome::RolledBack {
@@ -3345,10 +3231,8 @@ mod tests {
 
     #[test]
     fn the_summary_reports_degraded_compensated_and_manual_hosts() {
-        // #1621 (§8.2): after a compensated halt the state table is the operator's
-        // only source of truth, so every distinct state must render as itself —
-        // "rolled back by the fleet" is a very different sentence from "rolled back
-        // at `readiness-gate`", and a degraded host must not read as a failure.
+        // Every distinct state renders as itself: "rolled back by the fleet" differs from
+        // "rolled back at `readiness-gate`", and a degraded host must not read as a failure.
         let fleet = fleet_of(&["web-a", "web-b", "web-c", "web-d"]);
         let plan = plan_fleet(
             &fleet,
@@ -3398,11 +3282,9 @@ mod tests {
 
     #[test]
     fn a_failed_deregister_reads_as_torn_down_never_as_still_serving() {
-        // Issue #2270: `CompensatedTeardownRouteFailed` means the app is gone and
-        // only the proxy route removal failed. It must NEVER be told to `rollback`
-        // (a first deploy has none to roll back to), and it must still count as a
-        // compensated host for the binaries-vs-schema note (its binaries DID come
-        // back — only the route lagged).
+        // #2270: the app is gone and only the route removal failed. Never suggest
+        // `rollback` (a first deploy has nothing to roll back to), and still count it as
+        // compensated for the schema note.
         let outcome = HostOutcome::CompensatedTeardownRouteFailed {
             failed_step: "proxy-deregister",
         };
@@ -3445,10 +3327,8 @@ mod tests {
 
     #[test]
     fn a_rollout_that_died_before_migrating_never_claims_the_schema_moved() {
-        // #1607: every rollout now schedules a migration (on host 1), so the old
-        // "was the migrating host reached at all" gate would report "the migration
-        // that already ran was NOT rolled back" for a fleet that failed while
-        // installing the proxy or uploading the binary — a migration that never ran.
+        // #1607: every rollout schedules a migration on host 1, so "was host 1 reached" is
+        // not enough: a failure before `migrate` must not claim the migration ran.
         let fleet = fleet_of(&["web-a", "web-b"]);
         let plan = plan_fleet(&fleet, &[HostMode::First, HostMode::First])
             .expect("a well-formed fleet plans");
@@ -3481,9 +3361,7 @@ mod tests {
             );
         }
 
-        // …but the conservative direction is untouched: a failure AT or AFTER the
-        // migration still says the schema moved, and so does anything the label list
-        // does not recognise.
+        // A failure AT or AFTER the migration, or at an unrecognised label, still counts.
         for failed_step in ["migrate", "readiness-gate", "some-future-op"] {
             assert!(
                 schema_moved(
@@ -3500,9 +3378,8 @@ mod tests {
 
     #[test]
     fn the_schema_note_tracks_whether_the_migration_host_was_reached() {
-        // #1621 (T1.12): the note is conservative by design — it fires whenever the
-        // migrating host was REACHED, because the only evidence available is a step
-        // label and a pre-boundary failure after `migrate` still moves the schema.
+        // Conservative: the note fires whenever the migrating host was REACHED, since a
+        // pre-boundary failure after `migrate` still moves the schema.
         let fleet = fleet_of(&["web-a", "web-b"]);
         let migrating = plan_fleet(&fleet, &[HostMode::Redeploy, HostMode::Redeploy])
             .expect("a well-formed fleet plans");
@@ -3525,10 +3402,7 @@ mod tests {
             ),
             "an unreached migrating host migrated nothing"
         );
-        // #1607 (AC-3): an all-first-deploy fleet migrates too — on host 1, before it
-        // starts its release — so the same conservative rule applies to it. What used
-        // to be the "this fleet migrates nowhere" case is now just "host 1 was not
-        // reached".
+        // #1607: an all-first-deploy fleet migrates on host 1 too, so the same rule applies.
         let first_only = plan_fleet(&fleet, &[HostMode::First, HostMode::First])
             .expect("a well-formed fleet plans");
         assert!(
@@ -3560,10 +3434,8 @@ mod tests {
             "a rollout that reached no migrating host must never claim the schema \
              moved:\n{rendered}"
         );
-        // The newly-reachable case #1607 creates: an all-first-deploy fleet that
-        // migrated on host 1 and was then COMPENSATED. The binaries went back; the
-        // schema did not, and the summary must say so — before this change such a
-        // fleet migrated nowhere, so it could never reach this state.
+        // An all-first-deploy fleet that migrated on host 1 and was then COMPENSATED: the
+        // binaries went back, the schema did not.
         assert!(
             schema_moved(
                 &first_only,
@@ -3620,14 +3492,9 @@ mod tests {
 
     #[test]
     fn the_summary_states_the_schema_truth_when_the_migrating_host_rolls_itself_back() {
-        // #1621: the fleet's single migration runs on the FIRST redeploy host, and a
-        // pre-boundary failure AFTER it (a `readiness-gate` timeout, say) tears that
-        // host's own candidate down — no fleet compensation is involved, and every
-        // later host stays untouched. That leaves the whole fleet on the PREVIOUS
-        // binaries against the NEW schema, which is exactly the state an operator
-        // must be told about; before this test the summary said nothing at all,
-        // because one note was gated on a host being on the new release and the
-        // other on fleet compensation having run.
+        // A pre-boundary failure after `migrate` on host 1 tears its own candidate down with
+        // no fleet compensation and no host forward. The fleet runs the PREVIOUS binaries
+        // on the NEW schema, and the summary must say so.
         let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
         let plan = plan_fleet(
             &fleet,
@@ -3673,11 +3540,9 @@ mod tests {
 
     #[test]
     fn exactly_one_schema_note_speaks_for_every_outcome_mix() {
-        // #1621: the three schema notes describe the SAME fact in three different
-        // states of the fleet, so two rules hold across every mix: whenever the
-        // migration ran, at least one of them speaks (the hole this pins shut), and
-        // the "nothing is forward" note never appears next to either the recovery
-        // hint or the compensation note, whose sentences would contradict it.
+        // Across every mix: whenever the migration ran, at least one schema note speaks,
+        // and the "nothing is forward" note never appears next to the recovery hint or the
+        // other notes, which would contradict it.
         let fleet = fleet_of(&["web-a", "web-b", "web-c"]);
         let plan = plan_fleet(
             &fleet,
@@ -3761,9 +3626,8 @@ mod tests {
 
     #[test]
     fn manual_recovery_lines_name_the_markers_and_carry_no_secret() {
-        // #1621 (§8.2): "we did not touch it" is only useful next to "here is what
-        // to look at". The command is read-only, works today, and quotes nothing but
-        // the SSH user, the host and the marker paths the deploy already prints.
+        // The command is read-only and quotes only the SSH user, the host and the marker
+        // paths the deploy already prints.
         let cfg = &fleet_of(&["web-b"]).hosts[0];
         let rendered = manual_recovery_lines(cfg, MANUAL_AMBIGUOUS_MARKERS).join("\n");
 
@@ -3794,9 +3658,8 @@ mod tests {
 
     #[test]
     fn fleet_plan_lines_render_hosts_in_rollout_order_with_one_migrate_note() {
-        // #1621 (AC-4): the offline `deploy plan` fleet section. `plan` contacts no
-        // host, so it cannot know per-host first-vs-redeploy modes — it therefore
-        // renders the migrate placement as a RULE, exactly once, not per host.
+        // `deploy plan` contacts no host, so it renders the migrate placement as a RULE,
+        // once, not per host.
         let hosts = vec![
             "web-1.example.com".to_owned(),
             "web-2.example.com".to_owned(),
@@ -3823,11 +3686,8 @@ mod tests {
     }
     #[test]
     fn only_warns_loudly_whenever_it_excludes_a_configured_host() {
-        // #1621 (§3.2). `--only` is a repair lever: it deliberately leaves the
-        // hosts it skips on their old release, which IS the mixed fleet the rollout
-        // driver otherwise refuses to create. That trade is never made silently —
-        // the warning names every skipped host and the command that converges the
-        // fleet again.
+        // `--only` leaves skipped hosts on their old release: a mixed fleet. The warning
+        // names every skipped host and the command that converges the fleet.
         let configured = ["web-a".to_owned(), "web-b".to_owned(), "web-c".to_owned()];
         let rendered = only_selection_warning_lines(&configured, &["web-b".to_owned()]).join("\n");
 
@@ -3851,9 +3711,7 @@ mod tests {
 
     #[test]
     fn a_selection_that_excludes_nothing_prints_nothing() {
-        // AC-1: an ordinary deploy — and every single-host deploy, which can never
-        // exclude anything — must be byte-identical to pre-#1621, so the warning
-        // block is empty unless a host was actually skipped.
+        // Ordinary and single-host deploys print no warning block.
         let configured = ["web-a".to_owned(), "web-b".to_owned()];
         assert!(
             only_selection_warning_lines(&configured, &configured).is_empty(),
@@ -3867,8 +3725,7 @@ mod tests {
 
     #[test]
     fn the_fleet_rollback_table_names_every_host_and_its_state() {
-        // #1621 (§3.2): after a partial rollback the fleet is deliberately mixed,
-        // and this table is the operator's only record of which half is which — so
+        // After a partial rollback this table is the only record of which host is where, so
         // every host appears, including the ones nothing happened to.
         let hosts = ["web-a".to_owned(), "web-b".to_owned(), "web-c".to_owned()];
         let rendered = fleet_rollback_summary_lines(
@@ -3908,7 +3765,7 @@ mod tests {
             );
         }
     }
-    // ── `deploy status`: per-host state and drift (issue #1621, AC-6) ─────────
+    // ── `deploy status`: per-host state and drift (#1621) ─────────────────────
 
     /// A synthetic status row, with every "everything is fine" default in place so
     /// each test varies exactly the one fact it is about.
@@ -3938,9 +3795,7 @@ mod tests {
 
     #[test]
     fn fleet_drift_reports_two_different_releases_as_version_drift() {
-        // #1621 (T1.20, AC-6): the whole point of `deploy status`. Two hosts on
-        // different KNOWN releases is a mixed fleet — the state a rolling deploy
-        // exists to avoid — so it must be reported as drift, with the evidence.
+        // Two hosts on different KNOWN releases is a mixed fleet: drift, with the evidence.
         let report = fleet_drift(&[
             status("web-a", Some("20260714T120000Z")),
             status("web-b", Some("20260714T130000Z")),
@@ -3977,10 +3832,8 @@ mod tests {
 
     #[test]
     fn fleet_drift_never_treats_an_unknown_release_as_drift() {
-        // #1621 (T1.20): an unreadable `current` symlink means "we do not know",
-        // not "this host differs". A false "your fleet is mixed" at 3 am trains
-        // operators to ignore the warning, which is worse than no warning — so
-        // Unknown is a DISTINCT reported state that never contributes to drift.
+        // An unreadable `current` means "we do not know", not "this host differs": Unknown
+        // is reported but never contributes to version drift.
         let all_unknown = fleet_drift(&[status("web-a", None), status("web-b", None)]);
         assert!(
             !all_unknown.version_drift,
@@ -4008,10 +3861,8 @@ mod tests {
 
     #[test]
     fn fleet_drift_reports_state_drift_separately_from_version_drift() {
-        // #1621 (T1.20, plan §7.2): these are two different things and collapsing
-        // them hides the dangerous one. Every state-drift reason below makes a
-        // FUTURE deploy of that host fail closed or take the wrong slot, on a fleet
-        // that is perfectly converged version-wise.
+        // Each state-drift reason makes a FUTURE deploy fail closed or take the wrong slot,
+        // even on a fleet that is converged version-wise.
         let mut marker_drift = status("web-a", Some("r1"));
         marker_drift.live_slot_marker_drift = true;
         let mut unreadable_options = status("web-b", Some("r1"));
@@ -4045,12 +3896,8 @@ mod tests {
 
     #[test]
     fn fleet_drift_flags_a_host_that_is_not_deployed_at_all() {
-        // #1621 (AC-6). A host the probe proved has NO `current` symlink is not
-        // "unknown", it is empty: `HostMode::First` is a positive fact (the probe
-        // shell tests `[ -L current ]`, and even a dangling symlink takes the
-        // redeploy branch). Folding it into `ReleaseId::Unknown` made `--strict`
-        // exit 0 on a fleet running a fraction of its capacity — the documented cron
-        // alert never fired — and blamed an "unreadable symlink" that was never there.
+        // `HostMode::First` proves there is NO `current` symlink (even a dangling one takes
+        // the redeploy branch). That host is empty, not unknown, and `--strict` must fail.
         let mut not_deployed = status("web-b", None);
         not_deployed.mode = Some(HostMode::First);
         let report = fleet_drift(&[status("web-a", Some("r1")), not_deployed.clone()]);
@@ -4068,9 +3915,7 @@ mod tests {
             "`deploy status --strict` must exit non-zero on it"
         );
 
-        // A fleet where NOTHING is deployed yet is not drifted: there is no peer
-        // serving a release for it to be out of step with (the first `deploy up` of a
-        // brand-new fleet must not page anyone).
+        // A fleet where NOTHING is deployed yet has no peer to be out of step with.
         let mut second = status("web-a", None);
         second.mode = Some(HostMode::First);
         let fresh = fleet_drift(&[second, not_deployed.clone()]);
@@ -4099,20 +3944,14 @@ mod tests {
 
     #[test]
     fn a_deployed_host_whose_release_is_unreadable_is_state_drift() {
-        // #1621 review round 2. `[ -L current ]` succeeds for a dangling symlink, so
-        // such a host reports `Redeploy`, but the probe names no release (#2277).
-        // The release reads back `Unknown`. That combination
-        // used to produce ONLY the footer line explicitly labelled "reported, not
-        // counted as drift", so `deploy status --strict` exited 0 on a host with
-        // actionable marker damage — and the next deploy's `commit-markers` copies
-        // `readlink current` verbatim into `previous-release`, recording an
-        // unresolvable directory as that host's rollback point.
+        // `[ -L current ]` succeeds for a dangling symlink, so the host reports `Redeploy`
+        // with an `Unknown` release (#2277). The next deploy's `commit-markers` would record
+        // that target as the rollback point, so `--strict` must fail.
         let damaged = status("web-b", None); // Redeploy + ReleaseId::Unknown
         let rows = [status("web-a", Some("r1")), damaged];
         let report = fleet_drift(&rows);
 
-        // Rule 1 is untouched: an unknown release still names no version, so it can
-        // never make a converged fleet look mixed.
+        // An unknown release names no version, so it never makes a fleet look mixed.
         assert!(
             !report.version_drift,
             "unknown is still never VERSION drift: {:?}",
@@ -4128,8 +3967,7 @@ mod tests {
             "`deploy status --strict` must exit non-zero on it"
         );
 
-        // A lone damaged host is still drift — there is no peer to be judged
-        // against, because the damage is on the host itself.
+        // A lone damaged host is still drift: the damage is on the host itself.
         let alone = [status("web-a", None)];
         assert!(fleet_drift(&alone).drifted());
 
@@ -4143,8 +3981,7 @@ mod tests {
             "the footer must not contradict the drift it is now counted as:\n{rendered}"
         );
 
-        // An UNREACHABLE host keeps the old, still-true footer: its markers were
-        // never read, so nothing about them is drift.
+        // An UNREACHABLE host keeps the footer: its markers were never read, so no drift.
         let outage = [
             status("web-a", Some("r1")),
             HostStatus::unreachable("web-b"),
@@ -4254,11 +4091,8 @@ mod tests {
 
     #[test]
     fn fleet_status_table_shows_readiness_and_maintenance_as_separate_columns() {
-        // #1621 (plan §6.4/§7.3): maintenance mode does NOT drain a host from a load
-        // balancer — `/ready` is on the probe-bypass list, so a maintained host stays
-        // in rotation serving 503s to real users. Reporting them in one column would
-        // teach exactly the wrong mental model, so they are separate and the table
-        // says so.
+        // Maintenance does NOT drain a host: `/ready` bypasses it, so a maintained host
+        // stays in rotation serving 503s. The columns are separate and the table says so.
         let mut maintained = status("web-b", Some("r1"));
         maintained.maintenance = exec::MaintenanceStatus::On;
         let rows = [status("web-a", Some("r1")), maintained];
@@ -4278,11 +4112,8 @@ mod tests {
 
     #[test]
     fn a_torn_down_host_never_renders_as_a_successful_deploy() {
-        // #1621 (AC-6, audit gap G3). A host compensated by `CompensatedTeardown`
-        // has nothing installed, and its teardown records
-        // `LAST_DEPLOY_TORN_DOWN` over the `deployed` its first deploy wrote. The
-        // status column must show that verbatim: `not deployed` in the mode cell
-        // and a last-deploy cell that does not claim a deploy.
+        // A `CompensatedTeardown` host records `LAST_DEPLOY_TORN_DOWN` over the `deployed`
+        // its first deploy wrote. The row must not claim a deploy.
         let mut torn_down = status("web-a", None);
         torn_down.mode = Some(HostMode::First);
         torn_down.release = ReleaseId::Unknown;

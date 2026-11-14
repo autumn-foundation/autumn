@@ -589,10 +589,8 @@ fn action_changes(before: &ActionRow, after: &ActionRow) -> Vec<String> {
             before.provenance, after.provenance
         ));
     }
-    // A hatch appearing or disappearing changes what the row *proves*, not
-    // what it lists, so nothing else in this diff would show it. That is
-    // exactly why it is here: adding `#[agent_effect(none, ...)]` over a
-    // statement that really does call out used to produce no drift at all.
+    // A hatch appearing or disappearing changes what the row proves, not what it lists, so nothing
+    // else in this diff would show it.
     for site in &after.asserted_effect_free {
         if !before.asserted_effect_free.contains(site) {
             lines.push(format!(
@@ -859,8 +857,7 @@ mod tests {
             operation_id: handler,
             module_path,
             mcp_tool,
-            // The fixtures speak in terms of "is a tool"; how it got that way
-            // is the hatch tests' business, and they set it explicitly.
+            // Hatch tests set `exposed_by` themselves; the fixtures only say whether it is a tool.
             exposed_by: mcp_tool.then_some(McpExposedBy::Attribute),
             duplicate_operation_id: false,
             webmcp_tool: false,
@@ -966,9 +963,7 @@ mod tests {
 
     #[test]
     fn the_report_states_that_the_caps_are_declared_only() {
-        // A reader who sees `rate: 10/min` in a manifest will assume something
-        // enforces it. Nothing does, in this slice, and the report is where
-        // that has to be said.
+        // Nothing enforces the caps yet, so the report must say they are declared only.
         let manifest = manifest_of(&[&DRAFT_REFUND], &[governed_route(&DRAFT_REFUND)]);
         let report = format_report(&manifest);
         assert!(report.contains("declared"), "{report}");
@@ -1019,9 +1014,7 @@ mod tests {
 
     #[test]
     fn a_widened_effect_set_is_named_effect_by_effect() {
-        // "the manifest changed" is not reviewable. "`draft_refund` gained
-        // `outbound https://api.stripe.com/v1/refunds`" is exactly the line a
-        // reviewer needs, so the report has to name the effect, not the row.
+        // A reviewer needs the effect that was gained, not just the row that changed.
         let before = manifest_of(&[&DRAFT_REFUND], &[governed_route(&DRAFT_REFUND)]);
         let after = manifest_of(
             &[&DRAFT_REFUND_WIDENED],
@@ -1167,7 +1160,7 @@ mod tests {
         assert_eq!(describe_tool(tool), "DELETE /widgets/{id} (destroy_widget)");
     }
 
-    // ── The unaudited gate (#1691 P1-2) ──────────────────────────────
+    // ── The unaudited gate (#1691) ───────────────────────────────────
 
     fn manifest_with_sink(
         authorities: &[&'static AgentAuthority],
@@ -1203,11 +1196,8 @@ mod tests {
 
     #[test]
     fn an_action_no_agent_can_reach_does_not_fail_the_check() {
-        // A linked plugin registers a compensable action this app mounts only
-        // as a plain HTTP route (or not at all). No agent can call it, so it
-        // cannot leave the unrecorded *agent* invocation this gate is about --
-        // and failing here would cost an unrelated app an `--allow-unaudited`
-        // for somebody else's dependency.
+        // A plugin's compensable action that this app mounts only as plain HTTP (or not at all) is
+        // unreachable by agents, so it cannot leave an unrecorded agent invocation.
         let http_only = manifest_with_sink(
             &[&DRAFT_REFUND],
             &[route(
@@ -1269,13 +1259,12 @@ mod tests {
         );
     }
 
-    // ── The unregistered-authority gate (#1691 P3-1) ─────────────────
+    // ── The unregistered-authority gate (#1691) ──────────────────────
 
     #[test]
     fn a_route_naming_an_authority_nothing_registered_fails_the_check() {
-        // The route claims an envelope, so it is not "ungoverned"; no
-        // descriptor registered, so it is not an action either. It used to
-        // land in no list and therefore in no gate.
+        // The route claims an envelope, so it is not ungoverned; no descriptor is registered, so it
+        // is not an action either. Only this gate catches it.
         let manifest = manifest_of(&[], &[governed_route(&DRAFT_REFUND)]);
         assert!(manifest.actions.is_empty());
         assert!(manifest.ungoverned_tools.is_empty());
@@ -1299,13 +1288,12 @@ mod tests {
         assert!(drift.contains("draft_refund"), "{drift}");
     }
 
-    // ── Hatch sites in the drift report (#1691 P2-5) ─────────────────
+    // ── Hatch sites in the drift report (#1691) ──────────────────────
 
     #[test]
     fn an_added_asserted_effect_free_site_is_a_drift_line() {
-        // The proved effect set does not move when a hatch is added, and
-        // nothing else in the row does either -- so without this the change
-        // that most needs review produced no drift at all.
+        // Adding a hatch moves nothing else in the row, so this line is the only drift a reviewer
+        // sees.
         static HATCHED: AgentAuthority = AgentAuthority {
             action: "draft_refund",
             module_path: "billing::refunds",
@@ -1347,7 +1335,7 @@ mod tests {
         );
     }
 
-    // ── Hatch-exposed tools (#1691 P2-6) ─────────────────────────────
+    // ── Hatch-exposed tools (#1691) ──────────────────────────────────
 
     #[test]
     fn the_reports_say_whether_an_attribute_or_the_hatch_exposed_a_tool() {

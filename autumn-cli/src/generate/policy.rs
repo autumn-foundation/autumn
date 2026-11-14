@@ -56,12 +56,9 @@ pub fn plan_policy(
     let pascal_name = pascal(name);
     let plural = pluralize(&snake_name);
 
-    // Model guard (AC5): the policy references the model type, so the model must
-    // already exist — but only in generate mode. On destroy the model may
-    // legitimately be gone already; erroring here would strand the policy file,
-    // its mod entry, and the app registrations before `Plan::revert` runs.
-    // Because all writes happen in `Plan::execute`, returning here leaves no
-    // half-written files.
+    // The policy references the model type, so generate needs the model. Destroy skips the check:
+    // the model may already be gone, and erroring would strand the policy file and its
+    // registrations. Nothing is written before `Plan::execute`, so returning here is clean.
     if !for_destroy && !model_file_exists(project_root, &plural, &snake_name) {
         return Err(GenerateError::Config(format!(
             "no model '{pascal_name}' found — run `autumn generate model {pascal_name}` first \
@@ -316,11 +313,8 @@ fn render_policy_file(
     let (update_delete_bodies, scope_body, scope_ctx_param) = match owner {
         Some(owner) => {
             let col = &owner.name;
-            // A nullable owner column is already `Option<i64>`, so compare it
-            // directly against `user_id_i64()` (also `Option<i64>`); wrapping it
-            // in `Some(...)` would compare `Option<i64>` to `Option<Option<i64>>`
-            // and fail to compile. A non-nullable owner is a plain `i64` and
-            // needs the `Some(...)` wrap.
+            // A nullable owner is already `Option<i64>`, like `user_id_i64()`; wrapping it in
+            // `Some(...)` would compare against `Option<Option<i64>>` and not compile.
             let owner_match = if owner.nullable {
                 format!("ctx.user_id_i64() == {snake_name}.{col}")
             } else {
@@ -350,13 +344,9 @@ fn render_policy_file(
             )
         }
         None => (
-            // Issue #1830: no owner column was detected, so there is no per-record
-            // ownership rule to emit. Rather than default-deny (which would make a
-            // fresh scaffold 403 on every update/delete) or ship `#[secured]`-only
-            // handlers (which let ANY authenticated user mutate ANY row), authorize
-            // any authenticated user here — a no-regression over the prior behavior
-            // that routes the mutation through this ONE enforceable policy method
-            // for the developer to tighten.
+            // No owner column (#1830): authorize any authenticated user rather than default-deny,
+            // which would make a fresh scaffold 403 on every update/delete. The SECURITY TODO
+            // tells the developer to tighten this one policy method.
             format!(
                 "    fn can_update<'a>(&'a self, ctx: &'a PolicyContext, _{snake_name}: &'a {pascal_name}) -> BoxFuture<'a, bool> {{\n        \
                  // SECURITY TODO: this only checks authentication — replace with a real\n        \
@@ -379,12 +369,9 @@ fn render_policy_file(
     // `conn` is only referenced when an owner filter is emitted.
     let scope_conn_param = if owner.is_some() { "conn" } else { "_conn" };
 
-    // Diesel is used unconditionally, mirroring the scaffold's other generated
-    // files (`src/routes/*.rs`, `src/repositories/*.rs`): a generated Autumn app
-    // always compiles against autumn-web's `db` feature, and the app crate does
-    // not define its own `db` feature — so gating these on `#[cfg(feature =
-    // \"db\")]` would (wrongly) drop them while autumn-web's 3-arg `Scope::list`
-    // stays in scope. The `use` lines are only needed for the owner filter.
+    // Not gated on `#[cfg(feature = "db")]`: generated apps always build autumn-web with `db` and
+    // define no `db` feature of their own, so the gate would drop these imports while the owner
+    // filter in `Scope::list` still uses them. Without an owner filter they are not emitted.
     let diesel_imports = if owner.is_some() {
         "use diesel::prelude::*;\nuse diesel_async::RunQueryDsl;\n"
     } else {
@@ -599,10 +586,8 @@ async fn main() {
 
     #[test]
     fn no_owner_column_authorizes_authenticated_with_security_todo() {
-        // Issue #1830: the no-owner policy authorizes any authenticated user
-        // (a no-regression over `#[secured]`-only handlers) rather than
-        // default-denying, so a fresh scaffold never 403s on first use — with a
-        // loud SECURITY TODO steering the developer to a real ownership rule.
+        // No owner column (#1830): authorize any authenticated user rather than default-deny, so a
+        // fresh scaffold never 403s, with a SECURITY TODO steering to a real ownership rule.
         let tmp = project_with_model("    pub title: String,\n    pub body: String,\n");
         plan_policy(tmp.path(), "Post", false)
             .unwrap()
@@ -665,9 +650,8 @@ async fn main() {
 
     #[test]
     fn single_file_models_layout_imports_and_registers_crate_models_pascal() {
-        // A `Post` declared in single-file `src/models.rs` lives at
-        // `crate::models::Post` — the import and registrations must NOT point at
-        // a non-existent `crate::models::post` module.
+        // A `Post` in single-file `src/models.rs` is `crate::models::Post`; there is no
+        // `crate::models::post` module.
         let tmp = project_with_single_file_model("    pub user_id: i64,\n");
         plan_policy(tmp.path(), "Post", false)
             .unwrap()
@@ -750,12 +734,9 @@ async fn main() {
 
     #[test]
     fn destroy_succeeds_after_model_already_deleted() {
-        // `autumn destroy model Post` then `autumn destroy policy Post`: the
-        // model file is gone by the time the policy is destroyed. The destroy
-        // planner must skip the model guard (generate mode still errors) and,
-        // with --force, revert every artifact. As with `plan_admin_destroy_fallback`,
-        // the policy file's content is unverifiable once the model is gone, so
-        // --force is required to remove it.
+        // `destroy model Post` then `destroy policy Post`: the destroy planner must skip the model
+        // guard. The policy file's content cannot be verified without the model, so --force is
+        // required to remove it (as in `plan_admin_destroy_fallback`).
         let tmp = project_with_model("    pub user_id: i64,\n");
         let main_path = tmp.path().join("src/main.rs");
         let original_main = fs::read_to_string(&main_path).unwrap();

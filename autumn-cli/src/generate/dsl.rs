@@ -230,9 +230,8 @@ impl Field {
     /// `String` storage-representation fallback.
     #[must_use]
     pub fn rust_type(&self) -> String {
-        // #1384: a `{translatable}` column is a per-locale container in Rust,
-        // not a `String`. The SQL type is unchanged (`TEXT`) — the container
-        // is stored as a JSON object — so only the Rust type moves.
+        // A `{translatable}` column is a per-locale container in Rust. The SQL type stays `TEXT`
+        // (holding a JSON object), so only the Rust type changes.
         if self.constraints.translatable {
             return TRANSLATED_RUST_TYPE.to_owned();
         }
@@ -344,15 +343,9 @@ impl Field {
     /// through `rust_decimal`'s text representation instead.
     #[must_use]
     pub fn sql_column_type_for(&self, backend: DatabaseBackend) -> String {
-        // Postgres stays byte-for-byte identical to `sql_column_type`, including
-        // the exact `NUMERIC(precision,scale)` rendering for decimals. Mirrors
-        // `schema_type_for`'s structure.
         if backend == DatabaseBackend::Postgres {
             return self.sql_column_type();
         }
-        // On SQLite every kind maps to the plain per-backend column type;
-        // `Decimal` collapses to `TEXT` (see `FieldKind::sqlite_sql_type`) with
-        // no `(p,s)` suffix, since SQLite has no fixed-precision NUMERIC.
         self.kind.sql_type_for(backend).to_owned()
     }
 
@@ -361,7 +354,6 @@ impl Field {
     /// [`Field::schema_type`] for Postgres.
     #[must_use]
     pub fn schema_type_for(&self, backend: DatabaseBackend) -> String {
-        // Postgres stays byte-for-byte identical to `schema_type`.
         if backend == DatabaseBackend::Postgres {
             return self.schema_type();
         }
@@ -394,9 +386,8 @@ impl Field {
         let c = &self.constraints;
         let mut out = Vec::new();
         match self.kind {
-            // `RichText` shares `Text`'s length rules; its `email`/`url`
-            // constraints are rejected at parse time, so the flags below are
-            // always false for it.
+            // `RichText` shares `Text`'s length rules; `email`/`url` are rejected for it at parse
+            // time, so those flags are always false here.
             FieldKind::String | FieldKind::Text | FieldKind::RichText => {
                 if c.min.is_some() || c.max.is_some() {
                     out.push(format!(
@@ -633,13 +624,11 @@ impl FieldKind {
     #[must_use]
     pub const fn rust_type(self) -> &'static str {
         match self {
-            // `Enum`'s "String" here is a storage-representation fallback
-            // only — `Field::rust_type()` overrides it with the generated
-            // enum's real type name.
+            // For `Enum` this is the storage fallback; `Field::rust_type` returns the generated
+            // enum's name.
             Self::String | Self::Text | Self::RichText | Self::Enum | Self::Slug => "String",
             Self::I32 => "i32",
-            // `References` and `Position` are always `i64`, matching the
-            // default `i64` PK convention.
+            // `References` and `Position` are `i64`, matching the default `i64` primary key.
             Self::I64 | Self::References | Self::Position | Self::Commentable => "i64",
             Self::Bool => "bool",
             Self::F32 => "f32",
@@ -1129,9 +1118,8 @@ impl IdType {
     #[must_use]
     pub const fn migration_comment_for(self, backend: DatabaseBackend) -> Option<&'static str> {
         match backend {
-            // The comment documents the Postgres-only `gen_random_uuid()` /
-            // `uuid_generate_v7()` upgrade path, which does not apply to a
-            // SQLite target (no such functions; the app supplies the id).
+            // The UUIDv7 upgrade path uses Postgres-only functions; on SQLite the app supplies
+            // the id.
             DatabaseBackend::Postgres => self.migration_comment(),
             DatabaseBackend::Sqlite => None,
         }
@@ -1236,19 +1224,9 @@ pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
         "timestamptz" => Some(FieldKind::DateTime),
         "time" => Some(FieldKind::Time),
         "bytea" => Some(FieldKind::Bytea),
-        // `jsonb` is intentionally unsupported: although the DSL maps
-        // `Attachment` -> `JSONB`, the inverse is ambiguous. A brownfield
-        // `jsonb` column is usually arbitrary application JSON, not an Autumn
-        // `Blob`, and introspection cannot tell them apart (both report
-        // `udt_name = jsonb`). Mapping it to `Attachment` would emit a
-        // `Blob` field that fails to deserialize real JSON rows, so we leave
-        // it unsupported rather than risk corrupting brownfield data. Issue
-        // #1341 deepens the same ambiguity rather than resolving it: `json`
-        // fields ALSO forward-map to `JSONB`, so a pulled `jsonb` column could
-        // now be either a `Blob` or a `serde_json::Value` — still no way to
-        // tell, so this stays unsupported on purpose (`db pull` is forward-
-        // generation tooling; reverse introspection of a JSONB column is out
-        // of this issue's scope).
+        // `jsonb` stays unsupported: `Attachment` (`Blob`) and `json` (`serde_json::Value`) both
+        // map to `JSONB`, and introspection cannot tell either from arbitrary app JSON. Guessing
+        // `Attachment` would emit a `Blob` field that fails to deserialize real rows.
         _ => None,
     }
 }
@@ -1277,19 +1255,9 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         })?;
 
     let name = name.trim();
-    // A trailing `:unique` modifier marks the column for a `CREATE UNIQUE
-    // INDEX` in the migration (issue #1032), e.g. `email:String:unique`.
-    // Split it off the *end* first: a `references` `{label:col}` constraint
-    // modifier (issue #1146) also contains a colon, but it lives inside the
-    // trailing `{…}` block, so stripping a literal `:unique` suffix — never
-    // the colon inside the braces — stays unambiguous. Any other stray
-    // colon outside the braces is caught as an unknown modifier below.
     let rest = rest.trim();
-    // Peel a trailing `:states(from -> to, …)` state-machine modifier (issue
-    // #1326) *before* the `:unique` split below, so its internal `->`, `,`,
-    // and guard `:` tokens are never mistaken for a `:unique` suffix. The
-    // clause is paren-delimited (like the `{…}` constraint block is
-    // brace-delimited), so it stays unambiguous against the other modifiers.
+    // Peel a trailing `:states(from -> to, …)` (issue #1326) before the `:unique` split, so its
+    // `->`, `,` and guard `:` are never mistaken for a modifier colon.
     let (rest, state_machine_body) = split_state_machine_modifier(rest);
     let state_machine = match state_machine_body {
         Some(body) => {
@@ -1303,14 +1271,10 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         None => None,
     };
     let (ty, unique) = match rest.rsplit_once(':') {
-        // A trailing `:unique` (whitespace-tolerant) is the UNIQUE-index
-        // modifier. Its colon is always the last one — a `references`
-        // `{label:col}` colon sits *inside* the braces before it, so
-        // `rsplit_once` never mistakes the label colon for `:unique`.
+        // `:unique` (issue #1032) is always the last colon: a `references` `{label:col}` colon
+        // sits inside the braces before it.
         Some((before, modifier)) if modifier.trim() == "unique" => (before.trim(), true),
-        // Any other trailing `:segment` (including a label colon inside a
-        // `{…}` block) is left on `ty` for the constraint/type parsing below
-        // to interpret or reject — not an error yet.
+        // Any other trailing `:segment` stays on `ty` for the parsing below to interpret or reject.
         _ => (rest, false),
     };
 
@@ -1379,18 +1343,14 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         });
     }
 
-    // Fall-through: a scalar / `references` type, optionally carrying a
-    // trailing `{…}` constraint-modifier block (issue #1388 validation +
-    // HTML5 constraints; issue #1146 `references` `{label:col}`). `enum{…}`
-    // and `decimal{…}` were handled above — their braces are part of the
-    // *type*, so they never reach this generic modifier split.
+    // A scalar or `references` type with an optional trailing `{…}` constraint block (issues
+    // #1388, #1146). `enum{…}` and `decimal{…}` were handled above: their braces are part of
+    // the type.
     let (base_ty, modifier_body) = split_constraint_modifier(ty);
 
-    // A leftover `{` means an unbalanced brace block (e.g. a shell that
-    // brace-expanded `String{min=3,max=120}` into two arguments, leaving a
-    // fragment like `String{min=3`). Any leftover `:` outside the braces is a
-    // stray trailing modifier (the only supported one, `:unique`, was already
-    // consumed above; a `references` label colon lives inside the braces).
+    // A leftover `{` means unbalanced braces, often a shell brace-expanding
+    // `String{min=3,max=120}` into two arguments. A leftover `:` outside the braces is a
+    // stray modifier: `:unique` was already consumed.
     if base_ty.contains('{') {
         return Err(GenerateError::InvalidField {
             token: token.to_owned(),
@@ -1463,11 +1423,8 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         None => FieldConstraints::default(),
     };
 
-    // A state machine (issue #1326) is only meaningful on a plain, non-nullable
-    // `String`/`Text` column — the `#[state_machine]` macro requires the field's
-    // Rust type to be exactly `String`, and the generated `transition_*` methods
-    // operate on `&str`. Reject it anywhere else with a clear message rather than
-    // emitting an attribute the macro will refuse to compile.
+    // `#[state_machine]` (issue #1326) requires the field type to be exactly `String`, and the
+    // generated `transition_*` methods take `&str`.
     if state_machine.is_some() && (nullable || !matches!(kind, FieldKind::String | FieldKind::Text))
     {
         return Err(GenerateError::InvalidField {
@@ -1476,17 +1433,12 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         });
     }
 
-    // `references` fields always end in `_id` — `post:references` resolves to
-    // the column `post_id`. Tolerate an already-suffixed name (`post_id:references`)
-    // rather than doubling the suffix.
+    // `post:references` becomes the column `post_id`; an already-suffixed name is not doubled.
     let name = if kind == FieldKind::References && !name.ends_with("_id") {
         format!("{name}_id")
     } else if kind == FieldKind::Commentable {
-        // `comments:commentable` names the *feature*, not the column. The
-        // column it actually adds is the counter-cache source, whose name
-        // follows `#[model]`'s `{snake(child)}_count` convention — so the
-        // declared name is singularised and suffixed, and an already-suffixed
-        // name is left alone rather than doubled.
+        // `comments:commentable` names the feature; the column is the `{singular}_count` counter
+        // `#[model]` expects. An already-suffixed name is not doubled.
         if name.ends_with("_count") {
             name.to_owned()
         } else {
@@ -1496,11 +1448,8 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         name.to_owned()
     };
 
-    // `commentable` is a whole feature behind one token, not a value the caller
-    // supplies: the counter it adds is maintained by the framework inside each
-    // comment's transaction, so it can be neither nullable (`NULL + 1` is
-    // `NULL`) nor `:unique` (every model starts at 0), and it takes no `{…}`
-    // modifiers at all.
+    // `commentable` is a framework-maintained comment counter, so it takes no nullability,
+    // `:unique` or `{…}` modifiers.
     if kind == FieldKind::Commentable {
         if nullable {
             return Err(GenerateError::InvalidField {
@@ -1529,10 +1478,6 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
         }
     }
 
-    // A `slug` field (issue #1260) is always the record's routing key: it
-    // can never be nullable (every record needs a URL) and always needs a
-    // `{from:...}` modifier naming the field it auto-derives from on
-    // create — enforced here rather than left to a downstream codegen panic.
     if kind == FieldKind::Slug {
         if nullable {
             return Err(GenerateError::InvalidField {
@@ -1551,15 +1496,10 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
             });
         }
     }
-    // A slug is implicitly unique (it's the routing key) — falls into the
-    // existing `unique`-field `UNIQUE INDEX` and `find_by_slug` repository
-    // machinery (issue #1032) for free, whether or not `:unique` was typed.
+    // A slug is the routing key, so it is always unique. That reuses the `UNIQUE INDEX` and
+    // `find_by_slug` machinery whether or not `:unique` was typed.
     let unique = unique || kind == FieldKind::Slug;
 
-    // A `position` field (issue #1358) can never be nullable — every row has
-    // a place in its ordering — and can never be `:unique` — the whole point
-    // is a dense, repository-maintained `0..len-1` sequence per scope, not a
-    // one-off distinct value.
     if kind == FieldKind::Position {
         if nullable {
             return Err(GenerateError::InvalidField {
@@ -1580,13 +1520,10 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     }
 
     // ── `{encrypted}` cross-checks (issue #1340) ────────────────────────────
-    // The kind allowlist already ran in `set_encrypted_constraint`; what's left
-    // are the checks that need the *whole* parsed field.
+    // The kind allowlist ran in `set_encrypted_constraint`; these checks need the whole field.
     if let Some(mode) = constraints.encrypted {
-        // `#[encrypted]` supports non-null `String` columns in v1 — the diesel
-        // `serialize_as`/`deserialize_as` wrappers are not threaded through
-        // `Option<String>`. Reject here rather than emit a model the macro
-        // refuses to compile.
+        // Diesel's `serialize_as`/`deserialize_as` wrappers are not threaded through
+        // `Option<String>`, so the macro refuses a nullable encrypted column.
         if nullable {
             return Err(GenerateError::InvalidField {
                 token: token.to_owned(),
@@ -1596,15 +1533,6 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
                     .into(),
             });
         }
-        // The concrete blocker: the scaffold's generated transition handler
-        // writes the new state with a RAW `diesel::update(...).set(col.eq(
-        // new_state))`, which never passes through the `serialize_as` wrapper
-        // that encrypts the column — so every transition would store PLAINTEXT
-        // in a column the reader then tries to decrypt. (Encrypting a state
-        // column is also semantically wrong: it is a low-entropy closed set, so
-        // randomized mode makes state queries impossible and deterministic mode
-        // leaks every row's state through ciphertext equality.) Refuse the pair
-        // rather than half-support it.
         if state_machine.is_some() {
             return Err(GenerateError::InvalidField {
                 token: token.to_owned(),
@@ -1617,11 +1545,8 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
                     .into(),
             });
         }
-        // AC6: a randomized column can never satisfy an equality lookup, so a
-        // `UNIQUE` index over it enforces nothing and the free `find_by_<col>`
-        // the generators derive from `unique` fails at runtime with
-        // `EncryptionError::RandomizedEqualityLookup`. Fail here, where the fix
-        // is one word away.
+        // A randomized column cannot satisfy an equality lookup: a UNIQUE index over it enforces
+        // nothing, and the derived `find_by_<col>` fails at runtime.
         if unique && mode == EncryptedMode::Randomized {
             return Err(GenerateError::InvalidField {
                 token: token.to_owned(),
@@ -1631,12 +1556,10 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
     }
 
     // ── `{translatable}` cross-checks (issue #1384) ─────────────────────────
-    // The kind allowlist already ran while parsing the modifier; these need the
-    // whole parsed field.
+    // The kind allowlist ran while parsing the modifier; these checks need the whole field.
     if constraints.translatable {
-        // The container itself models "no translation" as an empty map, so a
-        // nullable column would give two spellings for one state — and the
-        // `#[model]` macro refuses `Option<Translated>` for the same reason.
+        // An empty map already means "no translation", and `#[model]` refuses
+        // `Option<Translated>`.
         if nullable {
             return Err(GenerateError::InvalidField {
                 token: token.to_owned(),
@@ -1646,8 +1569,6 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
                     .into(),
             });
         }
-        // The column holds one opaque ciphertext envelope under `{encrypted}`,
-        // which has no per-locale structure to resolve against.
         if constraints.encrypted.is_some() {
             return Err(GenerateError::InvalidField {
                 token: token.to_owned(),
@@ -1657,9 +1578,6 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
                     .into(),
             });
         }
-        // A UNIQUE index (and the free `find_by_<col>` the generators derive
-        // from it) would compare whole JSON containers, so two records with
-        // identical text translated into different locale sets never collide.
         if unique {
             return Err(GenerateError::InvalidField {
                 token: token.to_owned(),
@@ -1671,12 +1589,6 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
                     .into(),
             });
         }
-        // The `{min}/{max}/{email}/{url}` fan-out emits `#[validate(length(..))]`
-        // / `#[validate(email)]` on the field, and `validator` implements those
-        // rules for `String`-shaped types only — there is no impl for a
-        // per-locale container, so the generated model would not compile. (And
-        // even with one, "which locale is this rule about?" has no single
-        // answer.) Refuse here, where the fix is one token away.
         let validation_modifiers = !constraints.validation_attrs_are_empty();
         if validation_modifiers {
             return Err(GenerateError::InvalidField {
@@ -1689,10 +1601,6 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
                     .into(),
             });
         }
-        // The scaffold's transition handler writes the state with a raw
-        // `UPDATE … SET col = 'state'`, which would replace the whole container
-        // with a bare state name. A state is also locale-invariant by
-        // definition.
         if state_machine.is_some() {
             return Err(GenerateError::InvalidField {
                 token: token.to_owned(),
@@ -1799,9 +1707,8 @@ fn parse_state_machine(body: &str) -> Result<StateMachine, String> {
         let (from, to_and_guard) = segment.split_once("->").ok_or_else(|| {
             format!("malformed transition '{segment}'; expected `from -> to` (missing `->`)")
         })?;
-        // Split an optional `: guard` off the right-hand side. The states clause
-        // is peeled whole before any `:unique` handling, so this colon is
-        // unambiguously the guard separator.
+        // The states clause is peeled before the `:unique` split, so this colon is the guard
+        // separator.
         let (to, guard) = match to_and_guard.split_once(':') {
             Some((to, guard)) => (to.trim(), Some(guard.trim())),
             None => (to_and_guard.trim(), None),
@@ -1903,10 +1810,8 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
         );
     }
 
-    // `min`/`max` length bounds apply to every text-shaped column, `richtext`
-    // included. The `email`/`url` *format* validators do not: a Markdown body
-    // can never satisfy a single-line format rule, so accepting them would emit
-    // a field no submission could ever fill (issue #1255).
+    // `richtext` takes `min`/`max` length bounds but not `email`/`url`: a Markdown body cannot
+    // satisfy a single-line format rule (issue #1255).
     let length_bounded = matches!(
         kind,
         FieldKind::String | FieldKind::Text | FieldKind::RichText
@@ -1924,9 +1829,8 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
         if tok.is_empty() {
             return Err("empty constraint (stray comma) in the `{…}` block".to_owned());
         }
-        // `label:col` (references display column) and `from:col` (slug source
-        // field) use a colon; every other key/value pair uses `=`. Bare
-        // tokens (`email`, `url`) have neither.
+        // `min`/`max` use `=` (`label`/`from` accept either); `label`, `from`, `scope` and
+        // `encrypted` use a colon. Bare tokens (`email`, `url`) have neither.
         if let Some((key, value)) = tok.split_once('=') {
             parse_constraint_kv(&mut c, key.trim(), value.trim(), kind)?;
         } else if let Some((key, value)) = tok.split_once(':') {
@@ -1934,9 +1838,8 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
                 "label" => set_label_constraint(&mut c, value.trim(), is_reference)?,
                 "from" => set_from_constraint(&mut c, value.trim(), is_slug)?,
                 "scope" => set_scope_constraint(&mut c, value.trim(), kind.is_position())?,
-                // The kind check runs FIRST: on `count:i64{encrypted:bogus}` the
-                // useful diagnosis is that `encrypted` doesn't apply to an
-                // `i64` at all, not that `bogus` isn't a mode.
+                // Check the kind first: on `count:i64{encrypted:bogus}` the useful error is that
+                // `encrypted` does not apply to an `i64`.
                 "encrypted" => {
                     reject_encrypted_on_kind(kind)?;
                     reject_repeated_encrypted(&c)?;
@@ -1965,9 +1868,8 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
                     reject_repeated_encrypted(&c)?;
                     c.encrypted = Some(EncryptedMode::Randomized);
                 }
-                // #1384: per-locale content storage. Bare token only — the
-                // storage strategy is the framework's to choose, so unlike
-                // `{encrypted}` there is no mode to spell.
+                // Bare token only (issue #1384): the framework picks the storage, so there is no
+                // mode to spell.
                 "translatable" => {
                     reject_translatable_on_kind(kind)?;
                     if c.translatable {
@@ -1984,11 +1886,8 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
         }
     }
 
-    // `email` and `url` are mutually exclusive format validators: emitting both
-    // `#[validate(email)]` and `#[validate(url)]` makes the field unwritable (a
-    // valid email fails `url` and vice versa), and the HTML5 renderer can only
-    // pick one `type`. Reject the pair rather than silently choosing a winner,
-    // which would change the author's intent (issue #1388).
+    // Both validators would make the field unwritable, and the HTML5 input can take only one
+    // `type` (issue #1388).
     if c.email && c.url {
         return Err(
             "the `email` and `url` constraints are mutually exclusive — a value can't satisfy \
@@ -1997,8 +1896,6 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
         );
     }
 
-    // Cross-check the combination against the kind: length/range bounds need a
-    // string or numeric field, and require min <= max when both are present.
     if (c.min.is_some() || c.max.is_some()) && !length_bounded && !numeric {
         return Err(format!(
             "min/max constraints are not supported for {} fields",
@@ -2006,12 +1903,9 @@ fn parse_field_constraints(body: &str, kind: FieldKind) -> Result<FieldConstrain
         ));
     }
     if let (Some(min), Some(max)) = (&c.min, &c.max) {
-        // Compare at the field's CONCRETE width, never via `f64`: a large `i64`
-        // pair such as `{min=9007199254740993,max=9007199254740992}` would
-        // otherwise round to the same float and slip past this check, emitting
-        // an impossible `range(min > max)` that rejects every submitted value
-        // instead of failing generation here. Each bound already passed
-        // `parse_bound` for `kind`, so these re-parses succeed exactly.
+        // Compare at the field's concrete width, not via `f64`: a large `i64` pair such as
+        // `{min=9007199254740993,max=9007199254740992}` rounds to one float and would slip
+        // through. Both bounds passed `parse_bound` for `kind`, so these parses succeed.
         let inverted = match kind {
             FieldKind::String | FieldKind::Text | FieldKind::RichText => {
                 matches!((min.parse::<u64>(), max.parse::<u64>()), (Ok(lo), Ok(hi)) if lo > hi)
@@ -2058,13 +1952,9 @@ fn parse_constraint_kv(
 /// a `String`/`Text` field must be a non-negative integer; a range bound on a
 /// numeric field must be a valid number.
 fn parse_bound(value: &str, kind: FieldKind) -> Result<String, String> {
-    // Every arm returns the CANONICAL reparsed value, never the raw user token:
-    // the stored bound is spliced verbatim into both `#[validate(range/length(…))]`
-    // and the HTML5 `min`/`max`/`minlength`/`maxlength` attributes, so a token
-    // that parses but isn't a valid Rust literal (`.5`, `+1`, `007`, `1.`) would
-    // otherwise fail to COMPILE the generated app. Reparsing at the field's
-    // concrete type and re-`to_string()`-ing yields a literal that is always
-    // valid and value-preserving (issue #1388 follow-up).
+    // Return the canonical reparsed value, never the raw token. It is spliced verbatim into
+    // `#[validate(…)]` and the HTML5 attributes, and tokens like `.5`, `+1`, `007` or `1.`
+    // parse but are not valid Rust literals.
     match kind {
         FieldKind::String | FieldKind::Text | FieldKind::RichText => {
             let n = value
@@ -2079,10 +1969,8 @@ fn parse_bound(value: &str, kind: FieldKind) -> Result<String, String> {
             Ok(n.to_string())
         }
         FieldKind::I32 => {
-            // Parse at the field's CONCRETE width, not a wider `i64`: a bound
-            // that overflows `i32` (e.g. `count:i32{max=3000000000}`) would
-            // otherwise be emitted as `#[validate(range(max = ...))]` on an
-            // `i32` field and fail to COMPILE the generated app.
+            // Parse at `i32` width: an out-of-range bound in `#[validate(range(…))]` on an `i32`
+            // field would not compile.
             let n = value.parse::<i32>().map_err(|_| {
                 format!(
                     "range bound '{value}' must be an integer within the i32 range ({}..={})",
@@ -2103,9 +1991,8 @@ fn parse_bound(value: &str, kind: FieldKind) -> Result<String, String> {
             Ok(n.to_string())
         }
         FieldKind::F32 => {
-            // Rust's float parse saturates overflow to ±∞ rather than erroring,
-            // so an out-of-`f32`-range literal would compile to a non-finite
-            // bound; reject non-finite explicitly, then canonicalize.
+            // Float parsing saturates overflow to ±∞ instead of erroring, so reject non-finite
+            // bounds.
             let parsed = value
                 .parse::<f32>()
                 .map_err(|_| format!("range bound '{value}' must be a number"))?;
@@ -2226,9 +2113,8 @@ fn reject_encrypted_on_kind(kind: FieldKind) -> Result<(), String> {
     if matches!(kind, FieldKind::String | FieldKind::Text) {
         return Ok(());
     }
-    // Name the DSL token, not `rust_type()` — `richtext`, `enum{…}` and `slug`
-    // all render as `String` in Rust, so reporting the Rust type would produce
-    // the self-contradicting "only applies to `String` … Got a `String` field".
+    // Name the DSL token: `richtext`, `enum{…}` and `slug` are all `String` in Rust, so the
+    // Rust type would read "only applies to `String` … Got a `String` field".
     Err(format!(
         "the `encrypted` modifier only applies to `String`/`Text` fields; \
          `#[encrypted]` supports non-null `String` columns in v1 (encrypt structured \
@@ -2245,8 +2131,7 @@ fn reject_translatable_on_kind(kind: FieldKind) -> Result<(), String> {
     if matches!(kind, FieldKind::String | FieldKind::Text) {
         return Ok(());
     }
-    // Name the DSL token, not `rust_type()` — `richtext`, `enum{…}` and `slug`
-    // all render as `String` in Rust (see `reject_encrypted_on_kind`).
+    // Name the DSL token, not `rust_type()` (see `reject_encrypted_on_kind`).
     Err(format!(
         "the `translatable` modifier only applies to `String`/`Text` fields; it stores a \
          per-locale JSON container in the column, which needs free-form text. Got a `{}` \
@@ -2262,9 +2147,8 @@ fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
         FieldKind::String | FieldKind::Text => {
             "min=N, max=N, email, url, encrypted, encrypted:deterministic, translatable"
         }
-        // `RichText` shares the numeric arm's accepted set, not `String`'s: it
-        // takes the `min`/`max` length bounds but NOT the `email`/`url` format
-        // validators, which a Markdown body could never satisfy (issue #1255).
+        // `RichText` takes length bounds but not `email`/`url`, which a Markdown body cannot
+        // satisfy (issue #1255).
         FieldKind::RichText | FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 => {
             "min=N, max=N"
         }
@@ -2273,9 +2157,7 @@ fn unknown_constraint_message(token: &str, kind: FieldKind) -> String {
         FieldKind::Position => "scope:col",
         _ => "(none — this field type takes no constraint modifiers)",
     };
-    // Reported by the DSL token the author actually typed (`commentable`),
-    // not by the Rust type it happens to lower to (`i64`) — the latter reads
-    // like a different field entirely.
+    // Name the DSL token (`commentable`), not the Rust type it lowers to (`i64`).
     format!(
         "unknown constraint '{token}' for `{}` fields; supported: {accepted}",
         kind.dsl_token()
@@ -2302,14 +2184,9 @@ fn parse_enum_type(ty: &str) -> Result<Option<(Vec<String>, bool)>, String> {
     let rest = rest.trim_start();
 
     let Some(inner) = rest.strip_prefix('{') else {
-        // Looks like an enum token (starts with `enum`) but has no opening
-        // brace. The most common cause is bash/zsh brace-expanding an
-        // unquoted `enum{a,b}` before the CLI ever sees it, turning
-        // `status:enum{draft,published}` into two separate arguments whose
-        // surviving fragment reads like `status:enumdraft` — but `ty` could
-        // also just be an unrelated typo (e.g. `enumerable`), so the message
-        // covers both: the quoting hint for the shell-expansion case, and
-        // the full supported-types list for a genuine typo.
+        // Usually bash/zsh brace-expanded an unquoted `enum{a,b}` (leaving `status:enumdraft`),
+        // but it may be a typo like `enumerable`, so the message gives the quoting hint and the
+        // supported types.
         return Err(format!(
             "expected enum{{variant1,variant2,…}}. If you typed this in bash or zsh, \
              quote the token so the shell doesn't brace-expand it, \
@@ -2336,11 +2213,8 @@ fn parse_enum_type(ty: &str) -> Result<Option<(Vec<String>, bool)>, String> {
             ));
         }
         let pascal = naming::pascal(variant);
-        // `is_valid_ident` allows a leading/all-underscore variant (e.g.
-        // `_2fa`, `__`), but `pascal()` strips leading underscores without
-        // introducing a letter, which can leave an empty string or a result
-        // starting with a digit — neither is a valid Rust identifier, so the
-        // generated enum variant would fail to compile.
+        // `is_valid_ident` allows `_2fa` and `__`, but `pascal()` turns them into `2fa` and an
+        // empty string, neither of which is a Rust identifier.
         if pascal.is_empty() || pascal.starts_with(|c: char| c.is_ascii_digit()) {
             return Err(format!(
                 "'{variant}' does not produce a valid Rust identifier once converted to \
@@ -2392,11 +2266,8 @@ pub const MAX_DECIMAL_PRECISION: u32 = 28;
 fn parse_decimal_type(ty: &str) -> Result<Option<(u32, u32, bool)>, String> {
     let (body, nullable) =
         strip_wrapper(ty, "Option").map_or((ty, false), |inner| (inner.trim(), true));
-    // Defensive: every caller of `parse_field` already trims the outer `ty`
-    // before it reaches here, but trimming `body` again costs nothing and
-    // guards against a caller that doesn't (e.g. a direct unit-test call, or
-    // future refactor) — see the shell-brace-expansion hint below, which
-    // depends on `body` ending exactly at `}` with no trailing whitespace.
+    // Callers already trim `ty`; trim again so a direct call with trailing whitespace still
+    // ends at `}`.
     let body = body.trim();
 
     // money (issue #3405): an exact `NUMERIC(12,2)`, the same column as a
@@ -2425,15 +2296,9 @@ fn parse_decimal_type(ty: &str) -> Result<Option<(u32, u32, bool)>, String> {
     }
 
     let Some(inner) = rest.strip_prefix('{') else {
-        // Looks like a decimal token (starts with `decimal`/`Decimal` and
-        // has more text after it) but has no opening brace. As with
-        // `enum{...}`, the most common cause is bash/zsh brace-expanding an
-        // unquoted `decimal{10,2}` before the CLI ever sees it, turning
-        // `price:decimal{10,2}` into two separate arguments whose surviving
-        // fragments read like `price:decimal10` and `price:decimal2` — but
-        // `ty` could also just be an unrelated typo (e.g. `decimalize`), so
-        // the message covers both: the quoting hint for the shell-expansion
-        // case, and the full supported-types list for a genuine typo.
+        // Usually bash/zsh brace-expanded an unquoted `decimal{10,2}` (leaving
+        // `price:decimal10`), but it may be a typo like `decimalize`, so the message gives the
+        // quoting hint and the supported types.
         return Err(format!(
             "expected decimal{{precision,scale}} (or bare `decimal` for the \
              default NUMERIC(12,2)). If you typed this in bash or zsh, quote \
@@ -2563,15 +2428,9 @@ fn validate_position_fields(tokens: &[String], fields: &[Field]) -> Result<(), G
                 ),
             });
         }
-        // A nullable scope FK renders as `Option<i64>` at the Rust level,
-        // but the generated triggers/`move_to` compare the scope column via
-        // Postgres `hashtext(NEW."{scope}"::text)` / `"{scope}" = $1`
-        // equality, both of which are SQL-NULL-strict: a NULL scope value
-        // hashes to NULL (taking no advisory lock at all) and never equals
-        // itself in a `WHERE` filter, so every NULL-scoped row would
-        // silently get position 0 with no working compaction. Reject the
-        // combination outright rather than emit ordering that quietly
-        // breaks the moment a scope value is unset.
+        // The triggers and `move_to` compare the scope with `hashtext(…)` and `= $1`, both
+        // NULL-strict: a NULL scope takes no advisory lock and never matches, so those rows would
+        // all sit at position 0 with no compaction.
         if source.nullable {
             return Err(GenerateError::InvalidField {
                 token,
@@ -2622,9 +2481,7 @@ fn validate_commentable_fields(tokens: &[String], fields: &[Field]) -> Result<()
 /// individually, since `from`'s target may be declared earlier OR later in
 /// the token list.
 fn validate_slug_fields(tokens: &[String], fields: &[Field]) -> Result<(), GenerateError> {
-    // `parse_fields` builds `fields` from `tokens` one-to-one with no skips,
-    // so `tokens[i]` is always the token that produced `fields[i]` — no need
-    // to rediscover the index via a linear name search below.
+    // `parse_fields` maps tokens to fields one-to-one, so `tokens[i]` produced `fields[i]`.
     let slug_fields: Vec<(usize, &Field)> = fields
         .iter()
         .enumerate()
@@ -2641,8 +2498,6 @@ fn validate_slug_fields(tokens: &[String], fields: &[Field]) -> Result<(), Gener
         });
     }
     for (idx, slug_field) in &slug_fields {
-        // Presence of `constraints.from` is already enforced per-token in
-        // `parse_field`; this is the cross-field half of that check.
         let from = slug_field
             .constraints
             .from
@@ -2673,15 +2528,9 @@ fn validate_slug_fields(tokens: &[String], fields: &[Field]) -> Result<(), Gener
                 ),
             });
         }
-        // Issue #1340: a slug is derived by `slugify`ing the source value and
-        // is then stored in its OWN plaintext, UNIQUE-indexed column *and* used
-        // as the record's route key. Deriving one from an `{encrypted}` column
-        // would therefore write a lightly-mangled copy of the secret to disk in
-        // the clear (defeating the encryption entirely), leak plaintext
-        // equality through the unique index, and put it in URL paths — where it
-        // reaches access logs, `Referer` headers, browser history, and proxy
-        // caches. Refuse the pair outright; there is no mode of encryption that
-        // makes it safe.
+        // The slug is stored in plaintext, unique-indexed and put in URLs (access logs, `Referer`,
+        // history), so deriving it from an encrypted column leaks the secret in either mode
+        // (issue #1340).
         if source.is_encrypted() {
             return Err(GenerateError::InvalidField {
                 token,
@@ -2695,9 +2544,7 @@ fn validate_slug_fields(tokens: &[String], fields: &[Field]) -> Result<(), Gener
                 ),
             });
         }
-        // A nullable source renders as `Option<String>` on the generated
-        // `New*` insert struct, but `autumn_web::slugify` takes `&str` — the
-        // create handler's `slugify(&new.{from})` would not compile.
+        // `slugify(&new.{from})` takes `&str`; an `Option<String>` source would not compile.
         if source.nullable {
             return Err(GenerateError::InvalidField {
                 token,
@@ -2713,10 +2560,7 @@ fn validate_slug_fields(tokens: &[String], fields: &[Field]) -> Result<(), Gener
 }
 
 fn parse_type(ty: &str) -> Option<(FieldKind, bool)> {
-    // A trailing `?` is a terser nullable marker than `Option<…>`, but is only
-    // recognized for `references` (`post:references?`) — every other type
-    // must use `Option<…>` for nullability, so this doesn't silently expand
-    // the DSL's accepted grammar (e.g. `count:i64?` stays an error).
+    // The `?` nullable shorthand is for `references` only; `count:i64?` stays an error.
     if matches!(
         ty.strip_suffix('?').map(str::trim),
         Some("references" | "References")
@@ -2728,9 +2572,7 @@ fn parse_type(ty: &str) -> Option<(FieldKind, bool)> {
         Some((kind, true))
     } else {
         atomic_type(ty).map(|k| {
-            // Attachment fields are always nullable: a file attachment is
-            // almost universally optional (a post might not have a cover image),
-            // and `Option<Blob>` is the idiomatic Rust representation.
+            // An attachment is almost always optional, so it is always `Option<Blob>`.
             let nullable = matches!(k, FieldKind::Attachment);
             (k, nullable)
         })
@@ -2752,27 +2594,18 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
         // time (issue #3405): a time of day, `chrono::NaiveTime`.
         "time" | "Time" | "NaiveTime" => Some(FieldKind::Time),
         "Bytea" => Some(FieldKind::Bytea),
-        // Attachment / attachment: file-attachment blob stored as JSONB.
-        // Accept both casing variants so `cover_image:Attachment` and
-        // `cover_image:attachment` both work.
+        // A file-attachment blob stored as JSONB.
         "Attachment" | "attachment" => Some(FieldKind::Attachment),
         // References / references: foreign-key column, resolved to `_id` and
         // `BIGINT REFERENCES <table>(id)` by the callers that emit SQL.
         "References" | "references" => Some(FieldKind::References),
-        // richtext (issue #1255): a TEXT column holding user-submitted Markdown
-        // that the generated views render through the sanitizing
-        // `markdown::render_user_content`. All three spellings are accepted so
-        // the token reads naturally however the author types it.
+        // richtext (issue #1255): Markdown in a TEXT column, rendered through the sanitizing
+        // `markdown::render_user_content`.
         "richtext" | "RichText" | "rich_text" => Some(FieldKind::RichText),
         // slug (issue #1260): a URL-safe routing key auto-derived from
         // another field, e.g. `slug:slug{from:title}`.
         "slug" | "Slug" => Some(FieldKind::Slug),
-        // json / jsonb (issue #1341): arbitrary structured data stored as
-        // `serde_json::Value`. `jsonb` is accepted as an alias per the AC —
-        // both spellings (and their PascalCase forms, consistent with
-        // `Attachment`/`attachment` and `decimal`/`Decimal`) map to the same
-        // kind; there is no separate non-binary "json" storage distinction on
-        // the Postgres side (the column is always `JSONB`).
+        // json / jsonb (issue #1341): `serde_json::Value`, always a `JSONB` column on Postgres.
         "json" | "Json" | "jsonb" | "Jsonb" => Some(FieldKind::Json),
         // position (issue #1358): a server-managed contiguous ordering
         // column, e.g. `rank:position` or `rank:position{scope:board_id}`.
@@ -2843,9 +2676,7 @@ pub(super) fn is_rust_keyword(s: &str) -> bool {
 }
 
 #[cfg(test)]
-// Test inputs like `"title:String{min=3}"` / `"post:references{label:title}"`
-// are literal DSL tokens passed to `parse_field`, not format strings — the
-// `{…}` is the scaffold's own constraint-modifier syntax under test.
+// The `{…}` in test inputs is DSL constraint syntax, not format arguments.
 #[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
@@ -3023,7 +2854,6 @@ mod tests {
                 expected,
                 "SQLite column type for `{token}`"
             );
-            // Postgres path must stay byte-for-byte identical to the legacy output.
             assert_eq!(
                 f.sql_column_type_for(DatabaseBackend::Postgres),
                 f.sql_column_type(),
@@ -3038,8 +2868,7 @@ mod tests {
         assert_eq!(e.sql_column_type_for(DatabaseBackend::Sqlite), "TEXT");
         assert_eq!(e.sql_column_type_for(DatabaseBackend::Postgres), "TEXT");
 
-        // Decimal collapses to TEXT on SQLite (no fixed-precision NUMERIC),
-        // while Postgres keeps the exact `NUMERIC(precision,scale)` rendering.
+        // SQLite has no fixed-precision NUMERIC; Postgres keeps `NUMERIC(precision,scale)`.
         let d = parse_field("price:decimal{10,2}").unwrap();
         assert_eq!(d.sql_column_type_for(DatabaseBackend::Sqlite), "TEXT");
         assert_eq!(
@@ -3055,8 +2884,6 @@ mod tests {
     #[test]
     fn sqlite_schema_type_avoids_postgres_only_diesel_types() {
         let cases = [
-            // `NaiveDateTime` maps to the core, ungated `Timestamp`; `DateTime`
-            // maps to diesel's SQLite `TimestamptzSqlite` (issue #1924).
             ("at:DateTime", "TimestamptzSqlite"),
             ("naive:NaiveDateTime", "Timestamp"),
             ("token:Uuid", "Text"),
@@ -3076,15 +2903,12 @@ mod tests {
                 "SQLite schema type for `{token}`"
             );
         }
-        // Nullable wrapping is preserved on the SQLite path.
         let opt = parse_field("token:Option<Uuid>").unwrap();
         assert_eq!(
             opt.schema_type_for(DatabaseBackend::Sqlite),
             "Nullable<Text>"
         );
-        // No SQLite schema type may be a Postgres-only diesel type.
-        // `TimestamptzSqlite` is deliberately NOT forbidden — it is a diesel
-        // *SQLite* sql-type (issue #1924), not a Postgres-only one.
+        // `TimestamptzSqlite` is a diesel SQLite type, so it is not in the forbidden list.
         for token in [
             "at:DateTime",
             "token:Uuid",
@@ -3195,7 +3019,6 @@ mod tests {
             IdType::BigSerial.rust_type_for(DatabaseBackend::Sqlite),
             "i64"
         );
-        // Postgres primary keys stay byte-for-byte identical.
         assert_eq!(
             IdType::BigSerial.pk_sql_for(DatabaseBackend::Postgres),
             IdType::BigSerial.pk_sql()
@@ -3204,7 +3027,6 @@ mod tests {
             IdType::Uuid.pk_sql_for(DatabaseBackend::Postgres),
             IdType::Uuid.pk_sql()
         );
-        // The UUIDv7 migration comment is Postgres-only guidance.
         assert!(
             IdType::Uuid
                 .migration_comment_for(DatabaseBackend::Postgres)
@@ -3339,7 +3161,6 @@ mod tests {
 
     #[test]
     fn parse_fields_accepts_slug_deriving_from_later_string_field() {
-        // Declaration order shouldn't matter for the `from` reference.
         let tokens = vec!["slug:slug{from:title}".into(), "title:String".into()];
         assert!(parse_fields(&tokens).is_ok());
     }
@@ -3362,10 +3183,7 @@ mod tests {
 
     #[test]
     fn parse_fields_rejects_slug_from_nullable_source_field() {
-        // `new.{from}` would be `Option<String>` on the generated `New*`
-        // insert struct — `autumn_web::slugify(&new.{from})` doesn't compile
-        // against that type, so this must be rejected at generate time
-        // rather than emit uncompilable code.
+        // `slugify(&new.title)` would not compile against an `Option<String>`.
         let tokens = vec![
             "title:Option<String>".into(),
             "slug:slug{from:title}".into(),
@@ -3392,7 +3210,6 @@ mod tests {
 
     #[test]
     fn parse_fields_rejects_more_than_one_slug_field() {
-        // A slug is the model's routing key -- only one makes sense.
         let tokens = vec![
             "title:String".into(),
             "slug:slug{from:title}".into(),
@@ -3417,7 +3234,6 @@ mod tests {
 
     #[test]
     fn parse_fields_accepts_position_scoped_to_later_reference_field() {
-        // Declaration order shouldn't matter for the `scope` reference.
         let tokens = vec![
             "rank:position{scope:board_id}".into(),
             "board:references".into(),
@@ -3471,7 +3287,7 @@ mod tests {
         assert_eq!(fs[0].constraints.scope, None);
     }
 
-    // ── RED: Attachment field kind ──────────────────────────────────────────
+    // ── Attachment field kind ───────────────────────────────────────────────
 
     #[test]
     fn parse_attachment_pascal() {
@@ -3509,8 +3325,6 @@ mod tests {
 
     #[test]
     fn richtext_stores_markdown_source_in_a_text_column() {
-        // The column holds the Markdown *source*, not rendered HTML — so it is
-        // an ordinary TEXT/String column everywhere in the storage stack.
         let f = parse_field("body:richtext").unwrap();
         assert_eq!(f.rust_type(), "String");
         assert_eq!(f.sql_type(), "TEXT");
@@ -3548,8 +3362,7 @@ mod tests {
 
     #[test]
     fn richtext_rejects_format_constraints() {
-        // `email`/`url` are single-line format validators; a Markdown body can
-        // never satisfy them, so accepting them would emit an unwritable field.
+        // A Markdown body can never satisfy a single-line format validator.
         for token in ["body:richtext{email}", "body:richtext{url}"] {
             let err = parse_field(token).unwrap_err().to_string();
             assert!(
@@ -3639,7 +3452,7 @@ mod tests {
         );
     }
 
-    // ── RED: json/jsonb field kind (issue #1341) ────────────────────────────
+    // ── json/jsonb field kind (issue #1341) ─────────────────────────────────
 
     #[test]
     fn parse_json_lowercase() {
@@ -3687,29 +3500,21 @@ mod tests {
 
     #[test]
     fn json_sqlite_sql_type_is_text() {
-        // AC1: "SQLite dev/test backend: TEXT storing JSON".
         let f = parse_field("config:json").unwrap();
         assert_eq!(f.sql_column_type_for(DatabaseBackend::Sqlite), "TEXT");
     }
 
     #[test]
     fn json_sqlite_schema_type_is_diesels_json_not_text_or_jsonb() {
-        // Diesel ships `FromSql`/`ToSql<Json, Sqlite> for serde_json::Value`
-        // (diesel 2.3+, `serde_json` + `sqlite` features — both already
-        // unconditionally on in this workspace). Using diesel's *bare* `Text`
-        // sql-type here would not compile (no `serde_json::Value` conversion
-        // for it), and diesel's `Jsonb` on SQLite uses a proprietary binary
-        // encoding, not the plain-text JSON the AC calls for — so this must be
-        // `Json`, distinct from both.
+        // Diesel implements `ToSql`/`FromSql<Json, Sqlite>` for `serde_json::Value`. Bare `Text`
+        // has no such impl, and SQLite `Jsonb` is a binary encoding, not plain-text JSON.
         let f = parse_field("config:json").unwrap();
         assert_eq!(f.schema_type_for(DatabaseBackend::Sqlite), "Json");
     }
 
     #[test]
     fn json_sqlite_has_diesel_conversion_is_true() {
-        // Unlike `Decimal`/`Uuid`/`Enum`, `serde_json::Value`'s SQLite
-        // conversion is implemented by diesel itself, so no orphan-rule
-        // wrapper is needed and the kind is fully SQLite-supported.
+        // Diesel implements this conversion itself, so no orphan-rule wrapper is needed.
         assert!(FieldKind::Json.sqlite_has_diesel_conversion());
     }
 
@@ -3732,9 +3537,7 @@ mod tests {
 
     #[test]
     fn unique_json_field_parses() {
-        // Postgres's `jsonb` type has a default B-tree operator class, so a
-        // `UNIQUE INDEX` over a json column is legitimate — not rejected the
-        // way a randomized-encrypted column's equality lookup is.
+        // `jsonb` has a default B-tree operator class, so a UNIQUE index over it is valid.
         let f = parse_field("config:json:unique").unwrap();
         assert_eq!(f.kind, FieldKind::Json);
         assert!(f.unique);
@@ -3877,11 +3680,8 @@ mod tests {
 
     #[test]
     fn json_stays_unmapped_for_db_pull_inverse() {
-        // Same ambiguity as Attachment (both forward-map to `jsonb`): the
-        // inverse can't tell a `Blob` column from a raw `Json` column, so
-        // `db pull` introspection leaves `jsonb`/`json` unsupported rather
-        // than guessing (see `sql_type_inverse_rejects_unknown_types`, which
-        // already locks this and is unchanged by this feature).
+        // `Attachment` and `json` both forward-map to `jsonb`, so the inverse cannot tell them
+        // apart.
         assert!(sql_type_to_field_kind("jsonb").is_none());
         assert!(sql_type_to_field_kind("json").is_none());
     }
@@ -3930,17 +3730,15 @@ mod tests {
 
     #[test]
     fn sql_type_inverse_preserves_i64_for_int8() {
-        // i64 PKs must round-trip as i64 (AC3).
+        // i64 PKs must round-trip as i64.
         assert_eq!(sql_type_to_field_kind("int8"), Some(FieldKind::I64));
         assert_eq!(sql_type_to_field_kind("int8").unwrap().rust_type(), "i64");
     }
 
     #[test]
     fn sql_type_inverse_rejects_unknown_types() {
-        // Unmapped SQL types must be reported, never silently dropped (AC2).
-        // `jsonb` is deliberately unsupported: the inverse of `Attachment ->
-        // JSONB` is ambiguous (arbitrary JSON vs an Autumn `Blob`), so pulling
-        // it must not silently produce a `Blob` field.
+        // Unmapped SQL types are reported, never silently dropped. `jsonb` is ambiguous (arbitrary
+        // JSON, a `Blob` or a `serde_json::Value`), so it stays unmapped.
         for udt in ["numeric", "jsonb", "json", "inet", "money", "point"] {
             assert!(
                 sql_type_to_field_kind(udt).is_none(),
@@ -3960,9 +3758,8 @@ mod tests {
 
     #[test]
     fn sql_type_inverse_round_trips_forward_sql_types() {
-        // Every non-Attachment FieldKind's forward sql_type() (lowercased,
-        // base name) must invert back to an equivalent kind, guaranteeing the
-        // db-pull inverse stays in lockstep with the generate forward map.
+        // Each kind's forward SQL type must invert to an equivalent kind, keeping `db pull` in
+        // step with the forward map.
         for (kind, udt) in [
             (FieldKind::String, "text"),
             (FieldKind::I32, "int4"),
@@ -4101,11 +3898,8 @@ mod tests {
 
     #[test]
     fn references_nullable_form_tolerates_internal_whitespace() {
-        // `parse_field` trims the raw type text before `parse_type` sees it,
-        // but a CLI token could still carry whitespace before the `?` (e.g.
-        // `"post: references ?"` after the name/type split trims only the
-        // outer edges); this must still resolve to a nullable reference
-        // rather than "unsupported type".
+        // Whitespace before the `?` survives the outer trim and must still parse as a nullable
+        // reference.
         let f = parse_field("post: references ?").unwrap();
         assert_eq!(f.kind, FieldKind::References);
         assert!(f.nullable);
@@ -4113,9 +3907,7 @@ mod tests {
 
     #[test]
     fn question_mark_suffix_is_not_a_general_nullability_marker() {
-        // `?` is only recognized for `references` — every other type must use
-        // `Option<…>`. Otherwise this silently expands the DSL's grammar
-        // (undocumented and untested) for every field kind.
+        // `?` is only for `references`; every other type uses `Option<…>`.
         for token in [
             "count:i64?",
             "flag:bool?",
@@ -4179,9 +3971,7 @@ mod tests {
 
     #[test]
     fn email_and_url_together_are_rejected() {
-        // Both format validators on one field make it unwritable (a valid email
-        // fails `url` and vice versa), so the pair is rejected at parse time
-        // rather than silently picking a winner.
+        // A value cannot satisfy both, so the field would be unwritable.
         let err = parse_field("contact:String{email,url}").unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -4208,10 +3998,7 @@ mod tests {
 
     #[test]
     fn i32_range_bound_exceeding_i32_max_is_rejected() {
-        // `3000000000` > i32::MAX (~2.147e9): parsed at the field's concrete
-        // width so it fails generation with an actionable error rather than
-        // emitting `#[validate(range(max = 3000000000))]` on an `i32` field,
-        // which would fail to COMPILE the generated app.
+        // 3000000000 > i32::MAX: emitted on an `i32` field it would not compile.
         let err = parse_field("count:i32{max=3000000000}").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("3000000000"), "must name the bad bound: {msg}");
@@ -4232,18 +4019,14 @@ mod tests {
 
     #[test]
     fn f32_range_bound_overflowing_the_type_is_rejected() {
-        // Rust parses an out-of-f32-range literal to +∞ rather than erroring,
-        // so reject non-finite bounds explicitly.
+        // Float parsing saturates an out-of-range literal to +∞ instead of erroring.
         let err = parse_field("ratio:f32{max=1e40}").unwrap_err();
         assert!(err.to_string().contains("f32"), "{}", err);
     }
 
     #[test]
     fn i64_min_greater_than_max_beyond_f64_precision_is_rejected() {
-        // `min` is exactly one greater than `max`, but both round to the same
-        // `f64` (they exceed 2^53). Comparing at the concrete `i64` width must
-        // still catch the inversion, rather than emitting an impossible
-        // `range(min > max)` that rejects every submitted value.
+        // The bounds differ by one but round to the same `f64` (both exceed 2^53).
         let err = parse_field("count:i64{min=9007199254740993,max=9007199254740992}").unwrap_err();
         assert!(
             err.to_string().contains("cannot be greater than"),
@@ -4274,8 +4057,7 @@ mod tests {
 
     #[test]
     fn integer_signed_and_zero_padded_bounds_are_canonicalized() {
-        // `+1` and `007` parse but aren't the literal we want to splice; the
-        // stored/emitted bound must be the canonical decimal (`1`, `7`).
+        // `+1` and `007` parse but are stored and emitted as the canonical `1` and `7`.
         let f = parse_field("count:i32{min=+1,max=007}").unwrap();
         assert_eq!(f.constraints.min.as_deref(), Some("1"));
         assert_eq!(f.constraints.max.as_deref(), Some("7"));
@@ -4284,7 +4066,6 @@ mod tests {
 
     #[test]
     fn integer_bounds_within_range_are_emitted_verbatim() {
-        // Regression: ordinary in-range integer bounds are unchanged.
         assert_eq!(
             parse_field("age:i32{min=0,max=130}")
                 .unwrap()
@@ -4295,9 +4076,8 @@ mod tests {
 
     #[test]
     fn parse_float_range_constraint_emits_decimal_literals() {
-        // An integer bound on an f64 field must be emitted with a decimal
-        // point, or the generated `#[validate(range(...))]` comparison fails
-        // to type-check against the f64 field.
+        // An integer bound on an f64 field needs a decimal point, or the generated range check
+        // does not type-check.
         let f = parse_field("ratio:f64{min=0,max=1}").unwrap();
         assert_eq!(f.validation_attrs(), vec!["range(min = 0.0, max = 1.0)"]);
     }
@@ -4349,10 +4129,7 @@ mod tests {
 
     #[test]
     fn slug_field_is_implicitly_unique() {
-        // A slug is the record's routing key, so it must be unique even
-        // without an explicit `:unique` modifier — this is what lets it
-        // fall into the existing `unique`-field migration/repository
-        // machinery (issue #1032) for free.
+        // The routing key is unique without `:unique`, which reuses the unique-field machinery.
         let f = parse_field("slug:slug{from:title}").unwrap();
         assert!(f.unique);
     }
@@ -4366,9 +4143,7 @@ mod tests {
 
     #[test]
     fn slug_field_is_never_nullable() {
-        // A slug is always the routing key; a nullable slug would mean some
-        // records have no URL. `NOT NULL` is unconditional (AC3), so reject
-        // rather than silently drop the modifier.
+        // A nullable slug would leave some records without a URL.
         let err = parse_field("slug:Option<slug>{from:title}").unwrap_err();
         assert!(
             err.to_string().contains("slug") && err.to_string().contains("nullable"),
@@ -4402,7 +4177,6 @@ mod tests {
 
     #[test]
     fn slug_field_rejects_min_max_constraints() {
-        // Sanity: `slug` doesn't accidentally pick up unrelated constraints.
         let err = parse_field("slug:slug{from:title,min=3}").unwrap_err();
         assert!(err.to_string().contains("min"), "unexpected error: {err}");
     }
@@ -4500,8 +4274,7 @@ mod tests {
 
     #[test]
     fn parse_encrypted_modifier_defaults_to_randomized() {
-        // AC1: a bare `{encrypted}` marks the column at-rest encrypted in the
-        // safe default mode — randomized AEAD, matching bare `#[encrypted]`.
+        // A bare `{encrypted}` is randomized AEAD, like a bare `#[encrypted]`.
         let f = parse_field("token:String{encrypted}").unwrap();
         assert_eq!(f.name, "token");
         assert_eq!(f.kind, FieldKind::String);
@@ -4512,9 +4285,7 @@ mod tests {
 
     #[test]
     fn parse_encrypted_deterministic_modifier() {
-        // AC2: the deterministic variant is expressible and maps to the
-        // `#[encrypted(deterministic)]` attribute, which keeps `find_by`/
-        // `exists_by` equality lookups working.
+        // Deterministic mode keeps `find_by`/`exists_by` equality lookups working.
         let f = parse_field("email:String{encrypted:deterministic}").unwrap();
         assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Deterministic));
         assert!(f.is_encrypted());
@@ -4523,8 +4294,7 @@ mod tests {
 
     #[test]
     fn parse_encrypted_randomized_modifier_is_explicit_default() {
-        // The `#[encrypted]` attribute macro accepts an explicit `randomized`
-        // option; the DSL mirrors it so a reader can spell out the choice.
+        // Mirrors the attribute's explicit `randomized` option.
         let f = parse_field("token:String{encrypted:randomized}").unwrap();
         assert_eq!(f.encrypted_mode(), Some(EncryptedMode::Randomized));
     }
@@ -4568,9 +4338,7 @@ mod tests {
 
     #[test]
     fn encrypted_modifier_on_nullable_field_is_rejected() {
-        // R1 / macro limit: `#[encrypted]` is only supported on non-null
-        // `String` columns in v1, so reject rather than emit a model the
-        // `#[model]` macro refuses to compile.
+        // `#[encrypted]` supports only non-null `String` columns.
         let err = parse_field("token:Option<String>{encrypted}").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("encrypted"), "must name the modifier: {msg}");
@@ -4579,16 +4347,11 @@ mod tests {
 
     #[test]
     fn encrypted_modifier_on_non_string_kinds_is_rejected() {
-        // R2: every non-`String`/`Text` kind is rejected at parse time with a
-        // message naming the v1 limitation — including `Bytea` (and its
-        // `Vec<u8>` spelling), which the issue's AC text mentions but the
-        // runtime does not support.
+        // `Bytea` and its `Vec<u8>` spelling are rejected too.
         //
-        // The assertion is on the REASON and the kind it names, never on the
-        // echoed token: `GenerateError::InvalidField` renders as
-        // `invalid field '{token}': {reason}`, so a token containing the word
-        // "encrypted" would satisfy `contains("encrypted")` for ANY failure —
-        // including an unrelated parse error that never reached this check.
+        // Assert on the reason and the named kind, never the echoed token: the error renders as
+        // `invalid field '{token}': {reason}`, so a token containing "encrypted" would match any
+        // failure.
         for (token, kind_name) in [
             ("payload:Bytea{encrypted}", "Bytea"),
             ("payload:Vec<u8>{encrypted}", "Bytea"),
@@ -4606,9 +4369,8 @@ mod tests {
                 msg.contains("the `encrypted` modifier only applies to `String`/`Text` fields"),
                 "`{token}` must be rejected by the kind guard: {msg}"
             );
-            // `richtext`, `slug{…}` and `enum{…}` all render as `String` in
-            // Rust, so the message must name the DECLARED kind or it reads
-            // "only applies to String … got a String field".
+            // `richtext`, `slug{…}` and `enum{…}` are `String` in Rust, so the message must name
+            // the declared kind.
             assert!(
                 msg.contains(&format!("Got a `{kind_name}` field")),
                 "`{token}` must name the declared kind `{kind_name}`: {msg}"
@@ -4618,8 +4380,6 @@ mod tests {
 
     #[test]
     fn encrypted_modifier_on_nullable_text_alias_is_rejected() {
-        // The `Option<Text>` spelling hits the same non-null rule as
-        // `Option<String>`.
         let err = parse_field("notes:Option<Text>{encrypted}").unwrap_err();
         assert!(
             err.to_string().contains("cannot be nullable"),
@@ -4654,9 +4414,6 @@ mod tests {
 
     #[test]
     fn encrypted_mode_error_prefers_the_kind_diagnosis() {
-        // On `count:i64{encrypted:bogus}` the useful diagnosis is that
-        // `encrypted` does not apply to an `i64` at all — not that `bogus`
-        // is not a mode.
         let err = parse_field("count:i64{encrypted:bogus}").unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -4667,12 +4424,9 @@ mod tests {
 
     #[test]
     fn encrypted_modifier_on_enum_field_is_rejected() {
-        // `enum{…}`'s braces are part of the TYPE, so `enum{a,b}{encrypted}`
-        // never even reaches the constraint parser — the variant list swallows
-        // the second block and fails as a bad variant name. That is a fine
-        // outcome (the token IS malformed), but it proves nothing about
-        // encryption, so assert the case that does: an `enum` field reaching
-        // the kind guard through the `Option<…>`-free scalar path.
+        // `enum{…}`'s braces are part of the type, so `enum{a,b}{encrypted}` fails as a bad
+        // variant before the constraint parser runs. The direct kind-guard check below is the one
+        // that tests encryption.
         let err = parse_field("status:enum{draft,published}{encrypted}").unwrap_err();
         assert!(
             err.to_string()
@@ -4692,7 +4446,7 @@ mod tests {
 
     #[test]
     fn encrypted_modifier_rejects_unknown_mode() {
-        // R16: a typo must not silently degrade to the randomized default.
+        // A typo must not silently fall back to the randomized default.
         let err = parse_field("token:String{encrypted:determinstic}").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("determinstic"), "must name the token: {msg}");
@@ -4704,11 +4458,9 @@ mod tests {
 
     #[test]
     fn encrypted_modifier_rejects_attribute_only_options() {
-        // `admin_visible` / `versioned_ciphertext` are real `#[encrypted(...)]`
-        // options but deliberately outside the DSL: the whole point of the
-        // generator wiring is that a scaffolded encrypted column is redacted in
-        // the admin by default. Point at the hand-edit instead of silently
-        // accepting or silently dropping them.
+        // `admin_visible` and `versioned_ciphertext` are attribute options kept out of the DSL so
+        // a scaffolded encrypted column stays redacted in the admin; the error points at the
+        // hand-edit.
         for opt in ["admin_visible", "versioned_ciphertext"] {
             let err = parse_field(&format!("token:String{{encrypted:{opt}}}")).unwrap_err();
             let msg = err.to_string();
@@ -4722,14 +4474,11 @@ mod tests {
 
     #[test]
     fn encrypted_modifier_with_state_machine_is_rejected() {
-        // R10: a `:states(…)` column is a low-entropy closed set. Randomized
-        // encryption makes state queries impossible; deterministic encryption
-        // leaks the state of every row through ciphertext equality. Neither is
-        // what the author meant.
+        // The transition handler's raw write would bypass encryption. A state column is also a
+        // low-entropy closed set that neither mode protects.
         let err = parse_field("status:String{encrypted}:states(draft -> published)").unwrap_err();
         let msg = err.to_string();
-        // Assert the REASON, not the echoed token — which contains both
-        // "encrypted" and "states" for free.
+        // Assert the reason, not the echoed token, which contains "encrypted" and "states".
         assert!(
             msg.contains("bypasses encryption"),
             "must name the concrete blocker (the transition handler's raw write): {msg}"
@@ -4738,11 +4487,8 @@ mod tests {
 
     #[test]
     fn randomized_encrypted_unique_field_is_rejected() {
-        // AC6: `{encrypted}` + `:unique` would emit a `CREATE UNIQUE INDEX`
-        // over randomized ciphertext (which can never collide, so it enforces
-        // nothing) and a `find_by_<col>` that fails at RUNTIME with
-        // `EncryptionError::RandomizedEqualityLookup`. Fail at generate time
-        // instead, pointing at the deterministic mode.
+        // A UNIQUE index over randomized ciphertext enforces nothing, and `find_by_<col>` would
+        // fail at runtime.
         let err = parse_field("token:String{encrypted}:unique").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("token"), "must name the field: {msg}");
@@ -4763,10 +4509,7 @@ mod tests {
 
     #[test]
     fn slug_cannot_derive_from_an_encrypted_field() {
-        // A slug is stored in its own PLAINTEXT, unique-indexed column and used
-        // as the route key, so deriving one from an encrypted column would put
-        // a lightly-mangled copy of the secret on disk in the clear and in
-        // every URL. Neither mode makes that safe.
+        // The slug is stored in plaintext and put in every URL, so neither mode makes this safe.
         for mode in ["encrypted", "encrypted:deterministic"] {
             let err = parse_fields(&[
                 format!("api_token:String{{{mode}}}"),
@@ -4789,9 +4532,7 @@ mod tests {
 
     #[test]
     fn encrypted_column_sql_type_is_unbounded_text() {
-        // AC4: the stored value is a base64 ciphertext envelope, always longer
-        // than the plaintext. `TEXT` is unbounded on both backends, so the
-        // envelope always fits.
+        // The base64 envelope is longer than the plaintext; `TEXT` is unbounded on both backends.
         let f = parse_field("token:String{encrypted}").unwrap();
         assert_eq!(f.sql_column_type(), "TEXT");
         assert_eq!(
@@ -4804,7 +4545,6 @@ mod tests {
 
     #[test]
     fn supported_types_help_mentions_the_encrypted_modifier() {
-        // AC7 (docs): the `--help`/error-message surface advertises the token.
         assert!(
             SUPPORTED_TYPES.contains("encrypted"),
             "supported-type help must advertise the encrypted modifier: {SUPPORTED_TYPES}"
@@ -4813,7 +4553,6 @@ mod tests {
 
     #[test]
     fn unknown_constraint_modifier_is_rejected_by_name() {
-        // AC5: a misspelled modifier fails loudly, naming the token.
         let err = parse_field("title:String{maxx=5}").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("maxx"), "must name the bad token: {msg}");
@@ -4885,9 +4624,7 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------------------
-    // enum field kind (issue #1030)
-    // ------------------------------------------------------------------
+    // ── enum field kind (issue #1030) ───────────────────────────────────────
 
     #[test]
     fn parse_enum_field() {
@@ -4943,10 +4680,7 @@ mod tests {
 
     #[test]
     fn enum_rejects_variant_pascalizing_to_leading_digit() {
-        // `_2fa` passes `is_valid_ident` (leading `_` is allowed), but
-        // `pascal("_2fa")` strips the leading underscore and capitalizes
-        // nothing before the digit, producing `2fa` — not a valid Rust
-        // identifier, so the generated enum variant fails to compile.
+        // `_2fa` passes `is_valid_ident`, but `pascal("_2fa")` is `2fa`, not an identifier.
         let err = parse_field("status:enum{_2fa,ok}").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("_2fa"), "must name the bad variant: {msg}");
@@ -4958,9 +4692,7 @@ mod tests {
 
     #[test]
     fn enum_rejects_variant_pascalizing_to_empty() {
-        // `__` passes `is_valid_ident` (all underscores are allowed chars),
-        // but `pascal("__")` produces an empty string — not a valid Rust
-        // identifier.
+        // `__` passes `is_valid_ident`, but `pascal("__")` is empty.
         let err = parse_field("status:enum{__,ok}").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("__"), "must name the bad variant: {msg}");
@@ -5018,9 +4750,8 @@ mod tests {
 
     #[test]
     fn enum_error_hints_about_shell_brace_expansion() {
-        // bash/zsh expand an unquoted `enum{a,b}` into `enuma enumb`, so the
-        // token the CLI actually receives looks like `status:enumdraft`. Point
-        // the user at quoting instead of a bare "unsupported type".
+        // bash/zsh expand an unquoted `enum{a,b}` into `enuma enumb`, so the CLI sees
+        // `status:enumdraft`.
         let err = parse_field("status:enumdraft").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("quote"), "must suggest quoting: {msg}");
@@ -5028,11 +4759,7 @@ mod tests {
 
     #[test]
     fn enum_prefixed_typo_still_lists_supported_types() {
-        // A type name that happens to start with `enum` but isn't a genuine
-        // shell-mangled enum token (e.g. a typo like `enumerable`) must still
-        // see the full supported-types list, not just the brace-expansion
-        // hint — the two audiences (a real shell-expansion victim and a
-        // plain typo) get one message that serves both.
+        // A plain typo gets the supported-types list as well as the quoting hint.
         let err = parse_field("status:enumerable").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("quote"), "got: {msg}");
@@ -5339,10 +5066,8 @@ mod tests {
 
     #[test]
     fn decimal_rejects_precision_over_rust_decimal_max() {
-        // 29 exceeds rust_decimal::Decimal's 28-significant-digit range, even
-        // though Postgres's own NUMERIC would happily hold it — the DSL caps
-        // at what the generated struct field can actually represent, not
-        // what the column type technically permits.
+        // `rust_decimal::Decimal` holds 28 significant digits. Postgres NUMERIC would take 29,
+        // but the generated struct field could not.
         let err = parse_field("price:decimal{29,2}").unwrap_err();
         assert!(err.to_string().contains("precision"));
     }
@@ -5367,9 +5092,8 @@ mod tests {
 
     #[test]
     fn decimal_error_hints_about_shell_brace_expansion() {
-        // bash/zsh expand an unquoted `decimal{10,2}` into two separate
-        // words, so the token the CLI actually receives looks like
-        // `price:decimal10` — point the user at quoting, same as `enum{...}`.
+        // bash/zsh expand an unquoted `decimal{10,2}` into two words, so the CLI sees
+        // `price:decimal10`.
         let err = parse_field("price:decimal10").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("quote"), "must suggest quoting: {msg}");
@@ -5384,11 +5108,7 @@ mod tests {
 
     #[test]
     fn decimal_prefixed_typo_still_lists_supported_types() {
-        // A type name that happens to start with `decimal` but isn't a
-        // genuine shell-mangled decimal token (e.g. a typo like
-        // `decimalize`) must still see the full supported-types list, not
-        // just the brace-expansion hint — mirrors enum's
-        // `enum_prefixed_typo_still_lists_supported_types` precedent.
+        // A plain typo gets the supported-types list as well as the quoting hint.
         let err = parse_field("price:decimalize").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("quote"), "got: {msg}");
@@ -5398,13 +5118,8 @@ mod tests {
 
     #[test]
     fn parse_decimal_type_tolerates_untrimmed_input() {
-        // Defensive-in-depth (PR review, gemini-code-assist): `parse_field`
-        // already trims `ty` before any type parser sees it, so this isn't
-        // reachable through the public `parse_field` API today — but
-        // `parse_decimal_type` re-trims `body` itself too, so a direct call
-        // (or a future caller that doesn't pre-trim) with trailing
-        // whitespace after the closing brace still parses instead of
-        // failing `strip_suffix('}')`.
+        // `parse_field` trims `ty` first, so this covers a direct call: trailing whitespace after
+        // `}` must still parse.
         assert_eq!(
             parse_decimal_type("decimal{10,2} ").unwrap(),
             Some((10, 2, false))
@@ -5435,9 +5150,7 @@ mod tests {
 
     #[test]
     fn decimal_numeric_stays_unmapped_for_db_pull_inverse() {
-        // Precision/scale can't be reconstructed from `numeric` udt_name alone
-        // (same precedent as `jsonb`/Attachment), so `db pull` introspection
-        // deliberately leaves it unsupported rather than guessing.
+        // Precision and scale cannot be recovered from the `numeric` udt_name alone.
         assert!(sql_type_to_field_kind("numeric").is_none());
     }
 }
@@ -5474,15 +5187,13 @@ mod schema_core_parity {
 
     #[test]
     fn field_kind_mappings_match_schema_core() {
-        // (FieldKind, schema-core ColumnType, enum variants for the Field).
-        // `References` maps to `Int64` — a foreign key is a `Column` property in
-        // the IR, not a distinct column type. `Enum` compares the `String`/`TEXT`
-        // storage fallback (the concrete enum type is a later-slice concern).
+        // (FieldKind, schema-core ColumnType, enum variants). `References` maps to `Int64`: a
+        // foreign key is a `Column` property in the IR, not a column type. `Enum` compares the
+        // `String`/`TEXT` storage fallback.
         let cases: Vec<(FieldKind, ColumnType, Vec<String>)> = vec![
             (FieldKind::String, ColumnType::Text, vec![]),
             (FieldKind::Text, ColumnType::Text, vec![]),
-            // `RichText` is a presentation/UX distinction only — it stores the
-            // Markdown *source*, so every storage mapping is `Text`'s.
+            // `RichText` stores the Markdown source, so every storage mapping is `Text`'s.
             (FieldKind::RichText, ColumnType::Text, vec![]),
             (FieldKind::I32, ColumnType::Int32, vec![]),
             (FieldKind::I64, ColumnType::Int64, vec![]),
@@ -5519,14 +5230,12 @@ mod schema_core_parity {
         for (fk, ct, variants) in cases {
             let field = field_of(fk, variants);
 
-            // Rust `#[model]` type (storage fallback for Enum: `String`).
             assert_eq!(
                 fk.rust_type(),
                 ct.rust_type(),
                 "rust_type parity for {fk:?}"
             );
 
-            // Diesel `schema.rs` token, both backends.
             assert_eq!(
                 fk.schema_type_for(DatabaseBackend::Postgres),
                 ct.diesel_type(Backend::Postgres),
@@ -5551,15 +5260,13 @@ mod schema_core_parity {
                 "sqlite sql type parity for {fk:?}"
             );
 
-            // SQLite diesel-conversion eligibility.
             assert_eq!(
                 fk.sqlite_has_diesel_conversion(),
                 ct.sqlite_has_diesel_conversion(),
                 "sqlite diesel-conversion parity for {fk:?}"
             );
 
-            // Rust `#[model]` type on SQLite — `Uuid`/`Decimal` render
-            // autumn-web's TEXT-backed newtypes (issue #1924).
+            // `Uuid`/`Decimal` render autumn-web's TEXT-backed newtypes on SQLite (issue #1924).
             assert_eq!(
                 fk.rust_type_for(DatabaseBackend::Sqlite),
                 ct.rust_type_for(Backend::Sqlite),

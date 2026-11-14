@@ -336,7 +336,6 @@ mod tests {
     fn show_credentials_reveal_no_key_returns_error() {
         use autumn_web::credentials::{MasterKey, encrypt};
         let tmp = TempDir::new().unwrap();
-        // Write encrypted file but no master.key file
         let key = MasterKey::generate();
         let ct = encrypt(&key, b"x = \"y\"\n");
         std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
@@ -345,7 +344,7 @@ mod tests {
             &ct,
         )
         .unwrap();
-        // No master.key, no AUTUMN_MASTER_KEY env var → error
+        // No master.key file and no AUTUMN_MASTER_KEY.
         temp_env::with_var("AUTUMN_MASTER_KEY", None::<&str>, || {
             let err = show_credentials("development", true, tmp.path()).unwrap_err();
             assert!(
@@ -371,8 +370,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.toml");
         std::fs::write(&path, b"").unwrap();
-        // "sh -c true" splits into program="sh", extra_args=["-c", "true"],
-        // then appends file as $0 → runs `true` and exits 0.
+        // Runs `sh -c true <file>`: the file is `$0`, so only `true` runs.
         let status = launch_editor("sh -c true", &path).unwrap();
         assert!(status.success());
     }

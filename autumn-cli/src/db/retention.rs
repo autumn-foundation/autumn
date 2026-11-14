@@ -164,11 +164,9 @@ pub fn run(opts: &RetentionOptions<'_>) {
             "Last output from the app:\n{}",
             tail_for_diagnostics(&stdout)
         );
-        // Never inherit a zero exit here: a binary that exits 0 without
-        // emitting the report line (one whose `main` short-circuits before
-        // `AppBuilder::run`'s dispatch, or one built against an autumn-web
-        // that predates this mode) would otherwise make a scripted purge look
-        // successful when nothing ran.
+        // Never inherit a zero exit: a binary that exits 0 without the report line (its `main`
+        // returns before `AppBuilder::run`, or its autumn-web predates this mode) would make a
+        // scripted purge look successful when nothing ran.
         std::process::exit(output.status.code().filter(|code| *code != 0).unwrap_or(1));
     };
 
@@ -202,24 +200,12 @@ fn production_refusal(opts: &RetentionOptions<'_>) -> Option<String> {
     if opts.mode != RetentionMode::Purge || opts.force {
         return None;
     }
-    // Guard the profile the CHILD will actually boot, which is `opts.profile`
-    // verbatim: `run` sets both `AUTUMN_ENV` and `AUTUMN_PROFILE` to it below,
-    // and `--profile` carries `default_value = "dev"`, so it is always concrete.
+    // Judge the profile the child will boot: `run` sets `AUTUMN_ENV` and `AUTUMN_PROFILE` to
+    // `opts.profile`, which `--profile`'s `default_value = "dev"` keeps concrete. Do not use
+    // `effective_profile`: it lets an inherited `AUTUMN_ENV` win over `--profile`, so
+    // `AUTUMN_ENV=dev autumn db retention --purge --profile prod` would purge prod unguarded.
     //
-    // `effective_profile` is the wrong question here (#1605 review round 12).
-    // It resolves `AUTUMN_ENV` -> `AUTUMN_PROFILE` -> the explicit argument, so
-    // the *inherited* environment wins over `--profile` — while the child is
-    // handed `--profile` regardless. That inversion let
-    //
-    //     AUTUMN_ENV=dev autumn db retention --purge --profile prod
-    //
-    // read as "dev" here, skip this refusal, and then purge production without
-    // `--force`. Reading `opts.profile` closes it in both directions: the guard
-    // and the child now agree on which database is about to lose rows.
-    //
-    // Canonicalized the same way the runtime config loader normalizes, so
-    // `--profile development` is recognized as dev rather than refused as a
-    // custom profile name.
+    // Canonicalized like the runtime config loader, so `--profile development` counts as dev.
     let profile = crate::migrate::canonical_profile(opts.profile);
     if matches!(profile.as_str(), "dev" | "test") {
         return None;
@@ -324,22 +310,15 @@ fn format_window(secs: Option<u64>) -> String {
 /// countable, or what went wrong.
 fn format_rows(report: &RetentionDatasetReport, mode: RetentionMode) -> String {
     if let Some(error) = report.error.as_deref() {
-        // A failure AFTER some batches committed is the case that matters here
-        // (#1605 review round 13). The engine deliberately threads the running
-        // count into its error paths so a partial purge is not reported as
-        // zero — and this formatter, the default human-readable output, was
-        // dropping exactly that. An operator would read "error: ..." and have
-        // no way to know rows were already gone, which is the one fact they
-        // need before retrying or restoring.
+        // A failure can follow committed batches. Show the rows already removed: the operator
+        // needs that before retrying or restoring.
         if report.rows_removed > 0 {
             return format!("removed {}, then error: {error}", report.rows_removed);
         }
         return format!("error: {error}");
     }
     if mode == RetentionMode::Purge && !report.dry_run {
-        // A truncated run left rows behind; saying only "removed N" would read
-        // as "the policy is now enforced", which it is not until a later tick
-        // drains the rest.
+        // A truncated run left rows behind; a bare "removed N" would read as fully enforced.
         if report.truncated {
             return format!("removed {} (more remain)", report.rows_removed);
         }
@@ -413,9 +392,7 @@ pub fn format_report(reports: &[RetentionDatasetReport], mode: RetentionMode) ->
         );
     }
 
-    // A single-dataset report (`--dataset <key>`) has room to answer the
-    // follow-up questions the table cannot: what this dataset actually is,
-    // and the exact instant the window resolves to.
+    // A single-dataset report (`--dataset <key>`) also shows the description and exact cutoff.
     if let [only] = reports {
         let _ = writeln!(out, "\n  {}", only.description);
         let _ = writeln!(
@@ -426,9 +403,8 @@ pub fn format_report(reports: &[RetentionDatasetReport], mode: RetentionMode) ->
         let _ = writeln!(out, "  Took:   {}ms", only.duration_ms);
     }
 
-    // Notes go under the table rather than in a column: a legal-hold reason
-    // is free text an operator wrote and must be shown verbatim, not
-    // truncated to fit.
+    // Notes go under the table, not in a column: a legal-hold reason is operator-written free
+    // text and must be shown verbatim, not truncated.
     let notes: Vec<&RetentionDatasetReport> = reports
         .iter()
         .filter(|report| report.skipped.is_some())
@@ -468,12 +444,9 @@ mod tests {
 
     #[test]
     fn the_engines_report_deserializes_into_this_crates_mirror() {
-        // `RetentionDatasetReport` here is a hand-written mirror of
-        // `autumn_web::data_retention::RetentionDatasetReport`; the two are
-        // joined only by a JSON line on the child's stdout, so a renamed or
-        // dropped field in `autumn-web` would break `autumn db retention` at
-        // runtime with no compile error anywhere. Round-trip a real engine
-        // report through the wire format to catch that at build time.
+        // This crate's `RetentionDatasetReport` is a hand-written mirror joined to autumn-web's
+        // only by JSON on the child's stdout, so a renamed field would break at runtime with no
+        // compile error. Round-trip a real engine report to catch that in tests.
         let engine = autumn_web::data_retention::RetentionDatasetReport {
             dataset: "job_history".to_owned(),
             description: "Finished job rows".to_owned(),
@@ -535,9 +508,8 @@ mod tests {
 
     #[test]
     fn apply_dataset_env_removes_an_inherited_var_when_no_dataset_given() {
-        // Without an explicit removal, an AUTUMN_DB_RETENTION_DATASET already
-        // present in the CLI's environment would narrow a run the operator
-        // asked to cover everything, via Command's default env inheritance.
+        // An inherited AUTUMN_DB_RETENTION_DATASET would otherwise narrow a run meant to cover
+        // every dataset.
         let mut command = Command::new("true");
         command.env(RETENTION_DATASET_ENV, "leftover");
 
@@ -571,9 +543,8 @@ mod tests {
 
     #[test]
     fn clear_competing_one_shot_env_removes_every_earlier_mode_var() {
-        // Each of these is checked before AUTUMN_DB_RETENTION in
-        // AppBuilder::run's dispatch chain, so any one left in the
-        // environment would hijack this invocation into another mode.
+        // AppBuilder::run checks each of these before AUTUMN_DB_RETENTION, so a leftover one
+        // would hijack this invocation into another mode.
         let competing = [
             "AUTUMN_BUILD_STATIC",
             "AUTUMN_DUMP_ROUTES",
@@ -623,8 +594,7 @@ mod tests {
 
     #[test]
     fn format_report_lists_every_dataset_including_unconfigured_ones() {
-        // "Which framework tables exist and how long do you keep them" is the
-        // question; hiding the unbounded ones would hide the answer.
+        // The unconfigured (unbounded) datasets are what an operator most needs to see.
         let mut unconfigured = report("audit_archives");
         unconfigured.window_secs = None;
         unconfigured.source = "unset".to_owned();
@@ -696,10 +666,7 @@ mod tests {
 
     #[test]
     fn a_partial_purge_reports_what_it_removed_before_it_failed() {
-        // #1605 review round 13. The engine threads the running count into its
-        // error paths so a partial purge is not reported as zero; this
-        // formatter is the default human-readable output and was discarding it,
-        // leaving an operator unable to tell that data was already deleted.
+        // #1605: the operator must see that rows were already deleted before the failure.
         let mut partial = report("job_history");
         partial.error = Some("statement timeout".to_owned());
         partial.rows_removed = 4_812;
@@ -780,17 +747,9 @@ mod tests {
 
     #[test]
     fn purge_is_refused_for_the_profile_the_child_will_actually_boot() {
-        // #1605 review round 12. `run` hands the child
-        // `AUTUMN_ENV=AUTUMN_PROFILE=opts.profile`, so `opts.profile` is the
-        // database about to lose rows and is what this guard must judge.
-        //
-        // The guard previously asked `effective_profile`, which resolves
-        // AUTUMN_ENV -> AUTUMN_PROFILE -> the explicit argument — the inherited
-        // environment WINNING over `--profile`, while the child is handed
-        // `--profile` regardless. `AUTUMN_ENV=dev … --purge --profile prod`
-        // therefore read as "dev", skipped this refusal, and purged production
-        // without `--force`. The fix is structural: this function no longer
-        // consults the environment at all, so the inversion cannot recur.
+        // #1605: the child boots `opts.profile`, so that is what the guard judges. It never reads
+        // the environment, so an inherited `AUTUMN_ENV=dev` cannot let a `--profile prod` purge
+        // through without `--force`.
         let refusal = production_refusal(&purge_opts("prod", false))
             .expect("a purge against prod without --force must be refused");
         assert!(
@@ -805,12 +764,8 @@ mod tests {
 
     #[test]
     fn a_development_profile_is_recognized_by_its_long_spelling() {
-        // Canonicalization matters because the guard now reads `--profile`
-        // verbatim: before, `effective_profile` returned "development"
-        // unchanged, which is neither "dev" nor "test", so this ordinary
-        // invocation was refused. The runtime config loader treats
-        // development/dev (and production/prod) as aliases; this guard has to
-        // agree with it or it refuses work it should permit.
+        // The runtime config loader treats development/dev as aliases; the guard must agree or it
+        // refuses an ordinary dev purge.
         for profile in ["dev", "development", "DEV", "Development", "test"] {
             assert!(
                 production_refusal(&purge_opts(profile, false)).is_none(),
@@ -839,14 +794,9 @@ mod tests {
 
     #[test]
     fn clear_inherited_one_shot_env_removes_every_retention_mode_var() {
-        // #1605 review round 10. `AppBuilder::run` dispatches
-        // `AUTUMN_DB_RETENTION` before a server binds a listener, and
-        // `Command` inherits the parent environment — so an `AUTUMN_DB_RETENTION=purge`
-        // left in the shell by an earlier `autumn db retention --purge` turned
-        // the next `autumn serve`/`autumn dev` into a silent destructive purge
-        // that exited 0. `serve::base_command` and `dev::start_server` both call
-        // this; `start_server` spawns directly and has no builder to assert on,
-        // so this is where that path is covered.
+        // #1605: an `AUTUMN_DB_RETENTION=purge` left in the shell would turn the next `autumn
+        // serve`/`autumn dev` into a silent purge. `dev::start_server` spawns directly and has no
+        // builder to assert on, so its path is covered here.
         let mut command = std::process::Command::new("true");
         for var in RETENTION_ONE_SHOT_ENV {
             command.env(var, "purge");

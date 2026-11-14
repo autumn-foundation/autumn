@@ -21,8 +21,7 @@
 //! The bake reads no clock. Each sample is one remote command that sleeps
 //! and then runs `curl`, so the fake executor drives the tests.
 
-// The items are crate-internal, as in `fleet.rs`. `deploy` is a private module
-// of this bin crate, so clippy calls each `pub(crate)` redundant.
+// `deploy` is a private module of this bin crate, so clippy calls each `pub(crate)` redundant.
 #![allow(clippy::redundant_pub_crate)]
 
 use std::fmt::{self, Write as _};
@@ -426,8 +425,7 @@ pub(crate) fn run<E: DeployExecutor>(
 /// The `/actuator/metrics` path for an `[actuator] prefix`. It matches the
 /// app's own prefix rules: trim, add a leading `/` when it is missing, drop trailing `/`.
 pub(crate) fn metrics_path(prefix: &str) -> String {
-    // The same rules as `normalize_actuator_prefix` and `actuator_route_path`
-    // in autumn-web: trailing `/` go, leading `/` stay.
+    // Mirrors `normalize_actuator_prefix` and `actuator_route_path` in autumn-web.
     let trimmed = prefix.trim();
     if trimmed.is_empty() || trimmed == "/" {
         return "/metrics".to_owned();

@@ -54,10 +54,8 @@ const NOTIFICATIONS_DEPS: &[(&str, &str)] = &[
 pub fn plan_notifications(project_root: &Path) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
 
-    // The emitted DDL is backend-aware, resolved the same way `autumn
-    // migrate` resolves the database URL (env vars, then the profile-merged
-    // `autumn.toml` / `.env`); Postgres is the default when nothing is
-    // configured.
+    // The DDL depends on the backend, resolved as `autumn migrate` resolves the database URL
+    // (env vars, then the profile-merged `autumn.toml` / `.env`); Postgres when nothing is set.
     let backend = detect_backend(project_root);
 
     let mut plan = Plan::new(project_root);
@@ -81,23 +79,17 @@ pub fn plan_notifications(project_root: &Path) -> Result<Plan, GenerateError> {
         main_path.clone(),
         update_main_rs(&main_existing, &["notifications"], &route_entries),
     );
-    // `mod notifications;` is stripped by `emit::sync_main_rs_mod_declarations`
-    // once `src/notifications.rs` is gone — only the route entries need an
-    // explicit revert here (same split the channel generator uses).
+    // `emit::sync_main_rs_mod_declarations` strips `mod notifications;` once the module file is
+    // gone, so only the route entries need an explicit revert.
     plan.push_revert(crate::generate::emit::Revert::RoutesEntries {
         path: main_path,
         entries: route_entries,
     });
 
     // ── migrations/<ts>_create_notifications/{up,down}.sql ──────────────────
-    // Notifications are a singleton scaffold: re-running (especially with
-    // `--force` to refresh it) must not mint a SECOND
-    // `*_create_notifications` directory — two `CREATE TABLE notifications`
-    // migrations would fail the next `autumn migrate` on the duplicate table
-    // and make destroy's suffix match ambiguous (PR #2144 finding B). So
-    // reuse an existing `*_create_notifications` dir when one is present,
-    // minting a fresh timestamped dir only on a clean project. Destroy still
-    // matches by the `_create_notifications` suffix either way.
+    // A singleton scaffold: a re-run (e.g. with `--force`) reuses an existing
+    // `*_create_notifications` dir. A second `CREATE TABLE notifications` migration would fail
+    // `autumn migrate` and make destroy's suffix match ambiguous.
     let migration_dir = existing_notifications_migration_dir(project_root).unwrap_or_else(|| {
         project_root
             .join("migrations")
@@ -123,16 +115,9 @@ pub fn plan_notifications(project_root: &Path) -> Result<Plan, GenerateError> {
     if updated_cargo != cargo_existing {
         plan.modify(cargo_path.clone(), updated_cargo);
     }
-    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
-    // model.rs: destroy recomputes this plan against the already-generated
-    // Cargo.toml, where these entries are by definition already present.
-    // Notifications are a fixed, single-instance resource whose only owned
-    // file is `src/notifications.rs` itself, so there is no sibling resource
-    // directory to gate on — passing the module file as `owner_dir` makes
-    // the same-generator sibling check vacuous (`read_dir` on a file never
-    // yields siblings), leaving `Revert::CargoDeps`'s project-wide
-    // crate-reference scan as the real guard against stripping a dependency
-    // some other code still uses.
+    // Pushed unconditionally: destroy recomputes this plan against a Cargo.toml that already holds
+    // these entries. With the module file as `owner_dir` the sibling-resource check is vacuous, so
+    // `Revert::CargoDeps`'s project-wide crate-reference scan keeps any dependency other code uses.
     plan.push_revert(crate::generate::emit::Revert::CargoDeps {
         path: cargo_path,
         names: NOTIFICATIONS_DEPS
@@ -702,7 +687,7 @@ async fn main() {
         entries.into_iter().next().unwrap()
     }
 
-    // ── RED: file plan assertions ─────────────────────────────────────────
+    // ── File plan ─────────────────────────────────────────────────────────
 
     #[test]
     fn plan_creates_migration_up_and_down() {
@@ -714,8 +699,7 @@ async fn main() {
         ] {
             assert!(
                 plan.actions.iter().any(|a| {
-                    // Normalize so the assertion also holds under Windows
-                    // path separators.
+                    // Normalize Windows path separators.
                     a.path()
                         .to_string_lossy()
                         .replace('\\', "/")
@@ -771,12 +755,12 @@ async fn main() {
         assert!(matches!(err, GenerateError::Io(_)));
     }
 
-    // ── GREEN: migration DDL ──────────────────────────────────────────────
+    // ── Migration DDL ─────────────────────────────────────────────────────
 
     #[test]
     fn postgres_migration_matches_framework_store_ddl() {
         with_no_db_env(|| {
-            // No autumn.toml / DB env → Postgres, the detection default.
+            // No autumn.toml / DB env: Postgres, the detection default.
             let tmp = project_with_main(default_main());
             plan_notifications(tmp.path())
                 .unwrap()
@@ -785,11 +769,9 @@ async fn main() {
 
             let dir = migration_dir(tmp.path());
             let up = fs::read_to_string(dir.join("up.sql")).unwrap();
-            // Column-for-column the diesel `table!` in
-            // `autumn_web::notifications` (BigInt / Text / Text /
-            // Nullable<Timestamptz> / Timestamptz) and the framework
-            // integration test's CREATE_NOTIFICATIONS_SQL constant. Then the
-            // feed index, in the default sort order, and the unread index.
+            // Column-for-column the diesel `table!` in `autumn_web::notifications` and the
+            // framework integration test's CREATE_NOTIFICATIONS_SQL, then the feed index (default
+            // sort order) and the unread index.
             assert_eq!(
                 up,
                 "CREATE TABLE notifications (\n\
@@ -862,9 +844,8 @@ async fn main() {
             assert!(up.contains("recipient_id INTEGER NOT NULL"), "{up}");
             assert!(up.contains("kind TEXT NOT NULL"), "{up}");
             assert!(up.contains("payload TEXT NOT NULL"), "{up}");
-            // Timestamps are RFC 3339 TEXT on SQLite (diesel's
-            // `TimestamptzSqlite`), matching the framework store's SQLite
-            // `table!` mapping.
+            // Timestamps are RFC 3339 TEXT on SQLite (diesel's `TimestamptzSqlite`), matching the
+            // framework store's SQLite `table!`.
             assert!(up.contains("read_at TEXT NULL"), "{up}");
             assert!(
                 up.contains("created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
@@ -887,7 +868,7 @@ async fn main() {
         });
     }
 
-    // ── GREEN: idempotent migration directory (PR #2144 finding B) ─────────
+    // ── Idempotent migration directory ────────────────────────────────────
 
     /// Count the `*_create_notifications` migration directories under `root`.
     fn count_notification_migration_dirs(root: &Path) -> usize {
@@ -916,15 +897,10 @@ async fn main() {
 
     #[test]
     fn rerun_reuses_existing_migration_dir_instead_of_minting_a_second() {
-        // PR #2144 finding B: re-running (esp. with --force to refresh this
-        // singleton scaffold) must not create a SECOND
-        // `*_create_notifications` dir — two `CREATE TABLE notifications`
-        // migrations would make `autumn migrate` fail on the duplicate table
-        // and make destroy's suffix match ambiguous.
-        //
-        // Seed a migration dir with an explicit PAST timestamp so the reuse
-        // is genuinely exercised: a fresh `timestamp_now()` would differ from
-        // it, so a plan that reused nothing would mint a second directory.
+        // Re-running (e.g. with --force) must not create a second `*_create_notifications` dir:
+        // two `CREATE TABLE notifications` migrations would fail `autumn migrate` and make
+        // destroy's suffix match ambiguous. The seeded dir has a past timestamp, so a plan that
+        // reused nothing would visibly mint a new one.
         let tmp = project_with_main(default_main());
         let existing = tmp
             .path()
@@ -934,8 +910,7 @@ async fn main() {
         fs::write(existing.join("up.sql"), "-- stale placeholder\n").unwrap();
         fs::write(existing.join("down.sql"), "-- stale placeholder\n").unwrap();
 
-        // The plan must target the SAME existing directory (its past
-        // timestamp), not a freshly minted current-timestamp one.
+        // The plan targets the existing (past-timestamp) directory.
         let plan = plan_notifications(tmp.path()).unwrap();
         assert!(
             plan.actions.iter().any(|a| {
@@ -951,9 +926,7 @@ async fn main() {
                 .collect::<Vec<_>>()
         );
 
-        // Applying it with --force overwrites the placeholder in place —
-        // still exactly one `*_create_notifications` dir, and it is the
-        // pre-existing one.
+        // Applying it with --force overwrites the placeholder in place: still one dir, the old one.
         plan.execute(Flags {
             force: true,
             dry_run: false,
@@ -971,7 +944,7 @@ async fn main() {
         );
     }
 
-    // ── GREEN: app module content ─────────────────────────────────────────
+    // ── App module content ────────────────────────────────────────────────
 
     #[test]
     fn execute_writes_app_module_with_session_scoped_handlers() {
@@ -986,10 +959,7 @@ async fn main() {
             src.contains("use autumn_web::notifications::{Notification, Notifications};"),
             "{src}"
         );
-        // The five production routes: the demo notify plus the four
-        // session-scoped feed routes (no recipient in the URL). The demo
-        // login is TEST-ONLY and must never appear in the production
-        // module or its router (PR #2144 finding A).
+        // The demo login is test-only and must never appear in the production module or router.
         assert!(
             !src.contains("demo_login"),
             "the demo login must be test-only — it must not exist in the \
@@ -1009,8 +979,7 @@ async fn main() {
             src.contains(r#"#[post("/notifications/read_all")]"#),
             "{src}"
         );
-        // Every read/mark route derives the recipient server-side from the
-        // session through the shared helper — never from the request.
+        // Every read/mark route derives the recipient from the session, never from the request.
         assert!(
             src.contains("async fn current_recipient_id(session: &Session)"),
             "{src}"
@@ -1021,15 +990,13 @@ async fn main() {
             "feed, unread_count, mark_read, and mark_all_read must all resolve \
              the recipient from the session: {src}"
         );
-        // An unauthenticated request is rejected, not defaulted — the feed is
-        // dormant until real auth populates the session key.
+        // An unauthenticated request is rejected, not defaulted: the feed stays dormant until real
+        // auth populates the session key.
         assert!(src.contains("unauthorized"), "{src}");
-        // The mark-read route must additionally use the recipient-scoped
-        // (IDOR-safe) store variant, and say why.
+        // The mark-read route uses the recipient-scoped (IDOR-safe) store variant, and says why.
         assert!(src.contains(".mark_read_for(recipient_id, id)"), "{src}");
         assert!(src.contains("IDOR"), "{src}");
-        // The demo notify must carry prominent SECURITY/TODO markers steering
-        // users to real auth / protecting the route.
+        // The demo notify carries SECURITY/TODO markers steering users to protect the route.
         assert!(src.contains("SECURITY"), "{src}");
         assert!(src.contains("TODO"), "{src}");
         // The feed goes through the shipped pagination extractors.
@@ -1040,13 +1007,10 @@ async fn main() {
 
     #[test]
     fn demo_login_is_test_only_never_in_production_router() {
-        // PR #2144 finding A (security regression): a production
-        // `demo_login` route lets an unauthenticated visitor POST
-        // `/notifications/demo_login/<victim>` and then read/mark the
-        // victim's feed. The demo login must be test-only — absent from
-        // `route_entries()`, from the emitted production module, and from
-        // `src/main.rs`'s `routes![...]` — while the smoke test seeds the
-        // session with its own local handler.
+        // A production `demo_login` route would let an unauthenticated visitor sign in as any
+        // recipient and read or mark their feed. It must be absent from `route_entries()`, the
+        // production module and `src/main.rs`; the smoke test seeds the session with its own
+        // handler.
         assert!(
             !route_entries().iter().any(|e| e.contains("demo_login")),
             "route_entries must not register demo_login: {:?}",
@@ -1070,8 +1034,7 @@ async fn main() {
             "main.rs must not register a demo_login route: {main}"
         );
 
-        // The smoke test still seeds the session (its own test-only route),
-        // so the flow stays runnable and honest.
+        // The smoke test still seeds the session through its own test-only route.
         let test_src = fs::read_to_string(tmp.path().join("tests/notifications_feed.rs")).unwrap();
         assert!(
             test_src.contains("fn demo_login"),
@@ -1086,11 +1049,8 @@ async fn main() {
 
     #[test]
     fn production_routes_never_take_the_recipient_from_the_url() {
-        // Regression test for the PR #2144 Codex review finding: a
-        // `{recipient_id}` path segment on any real route lets any caller
-        // read (or mark read) another user's feed — `mark_read_for` scopes
-        // to the *supplied* recipient, not the caller. No production route
-        // may name a recipient in its URL (the demo login is test-only now).
+        // A `{recipient_id}` path segment would let any caller read or mark another user's feed:
+        // `mark_read_for` scopes to the supplied recipient, not the caller.
         let tmp = project_with_main(default_main());
         plan_notifications(tmp.path())
             .unwrap()
@@ -1113,13 +1073,12 @@ async fn main() {
             "no production route may take a recipient id from the URL: \
              {route_attrs:?}"
         );
-        // The demo notify's body-supplied recipient stays (server-side
-        // notifies are legitimately cross-recipient), but it must warn that
-        // the route needs protection before production.
+        // The demo notify keeps its body-supplied recipient: server-side notifies are legitimately
+        // cross-recipient.
         assert!(src.contains("pub recipient_id: i64"), "{src}");
     }
 
-    // ── GREEN: main.rs wiring ─────────────────────────────────────────────
+    // ── main.rs wiring ────────────────────────────────────────────────────
 
     #[test]
     fn execute_updates_main_rs_with_mod_and_route_entries() {
@@ -1147,9 +1106,8 @@ async fn main() {
             !main.contains("demo_login"),
             "main.rs must not register the test-only demo login: {main}"
         );
-        // The demo `notify` write handler (arbitrary body-supplied recipient)
-        // must NOT be wired into the production router either (PR #2144
-        // finding C) — it stays an unregistered example in the module.
+        // The demo `notify` handler (arbitrary body-supplied recipient) is not wired either; it
+        // stays an unregistered example in the module.
         assert!(
             !main.contains("notifications::notify"),
             "main.rs must not register the unguarded demo notify route: {main}"
@@ -1162,7 +1120,7 @@ async fn main() {
         );
     }
 
-    // ── GREEN: smoke test content ─────────────────────────────────────────
+    // ── Smoke test content ────────────────────────────────────────────────
 
     #[test]
     fn execute_writes_smoke_test_with_testapp_flow() {
@@ -1175,9 +1133,8 @@ async fn main() {
         let test_src = fs::read_to_string(tmp.path().join("tests/notifications_feed.rs")).unwrap();
         assert!(test_src.contains("TestApp"), "{test_src}");
         assert!(test_src.contains("#[tokio::test]"), "{test_src}");
-        // The full session-scoped HTTP flow: anonymous 401 → demo login →
-        // notify → list → mark_read → unread_count → unread-only feed empty.
-        // TestClient's cookie jar carries the session across requests.
+        // The session-scoped flow: anonymous 401 → demo login → notify → list → mark_read →
+        // unread_count → empty unread-only feed. TestClient's cookie jar carries the session.
         assert!(test_src.contains("assert_status(401)"), "{test_src}");
         assert!(
             test_src.contains(r#".post("/notifications/demo_login/7")"#),
@@ -1194,8 +1151,7 @@ async fn main() {
         );
         assert!(test_src.contains("/read"), "{test_src}");
         assert!(test_src.contains("filter[unread]=true"), "{test_src}");
-        // Cross-recipient protection: a different signed-in recipient sees
-        // an empty feed — the recipient comes from the session, not a URL.
+        // Cross-recipient protection: a different signed-in recipient sees an empty feed.
         assert!(
             test_src.contains(r#".post("/notifications/demo_login/8")"#),
             "{test_src}"
@@ -1217,11 +1173,8 @@ async fn main() {
 
     #[test]
     fn smoke_test_handlers_match_production_handlers_byte_for_byte() {
-        // The smoke test's doc comment promises its handlers are
-        // "re-declarations of src/notifications.rs's handlers of the same
-        // names, kept byte-for-byte in sync" (`tests/` integration binaries
-        // cannot import the app's binary crate), so they must actually be —
-        // the same contract the channel generator's smoke test enforces.
+        // `tests/` binaries cannot import the app's binary crate, so the smoke test re-declares the
+        // handlers; its doc comment promises they stay byte-for-byte in sync.
         let tmp = project_with_main(default_main());
         plan_notifications(tmp.path())
             .unwrap()
@@ -1238,9 +1191,8 @@ async fn main() {
         );
         assert!(test_src.contains("pub struct NotifyBody"), "{test_src}");
 
-        // Extract each handler (signature + brace-balanced body, so trailing
-        // content like the smoke test's own #[tokio::test] fn is never swept
-        // in) and confirm production and test agree byte-for-byte.
+        // Brace-balanced extraction, so trailing content like the `#[tokio::test]` fn is never
+        // swept in.
         let extract_handler = |src: &str, name: &str| -> String {
             let anchor = format!("async fn {name}(");
             let start = src
@@ -1265,9 +1217,7 @@ async fn main() {
             }
             src[start..=end].to_owned()
         };
-        // `demo_login` is test-only (it lives only in the smoke test), so it
-        // is excluded from the parity contract — only the shared PRODUCTION
-        // handlers must be byte-for-byte identical between the two files.
+        // `demo_login` lives only in the smoke test, so it is outside the parity check.
         for name in [
             "current_recipient_id",
             "notify",
@@ -1296,7 +1246,7 @@ async fn main() {
         );
     }
 
-    // ── GREEN: Cargo.toml ─────────────────────────────────────────────────
+    // ── Cargo.toml ────────────────────────────────────────────────────────
 
     #[test]
     fn execute_adds_serde_serde_json_and_tokio_dev_dependency() {
@@ -1375,11 +1325,8 @@ async fn main() {
     fn generate_then_destroy_round_trips_to_original_project_state() {
         with_no_db_env(|| {
             let tmp = project_with_main(default_main());
-            // Mirrors a real `autumn new` project's Cargo.toml: a `tokio`
-            // dev-dependency with `rt`/`macros` already present, so
-            // `ensure_dev_dependency_tokio_test_features` (which has no
-            // destroy wiring yet — a documented gap, same as the channel
-            // generator) is a no-op here, matching reality.
+            // Like a real `autumn new` Cargo.toml: `tokio` already has `rt`/`macros`, so
+            // `ensure_dev_dependency_tokio_test_features` (which destroy does not undo) is a no-op.
             let cargo_path = tmp.path().join("Cargo.toml");
             fs::write(
                 &cargo_path,

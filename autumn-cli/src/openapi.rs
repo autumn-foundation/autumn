@@ -91,12 +91,8 @@ fn dump_spec(opts: &ExportOptions<'_>) -> String {
     compile_binary_with(opts.package, opts.bin, &opts.features, &profile);
     let binary = find_binary_in_profile(opts.package, opts.bin, &profile);
 
-    // `AppBuilder::run` checks its no-boot protocol modes in a fixed ORDER, and
-    // `AUTUMN_BUILD_STATIC` / `AUTUMN_DUMP_ROUTES` are both checked BEFORE the
-    // OpenAPI one. A caller whose environment already carries one of them — a
-    // build-oriented CI job is the obvious case — would have the child render
-    // static assets or print route JSON instead, and this command would then
-    // fail to parse an OpenAPI document out of it (issue #2370).
+    // `AppBuilder::run` checks `AUTUMN_BUILD_STATIC` and `AUTUMN_DUMP_ROUTES` before the OpenAPI
+    // mode, so clear them: if inherited, the child would print something else (#2370).
     let mut command = Command::new(&binary);
     command.env(DUMP_ENV, "1");
     clear_other_dump_modes(&mut command, DUMP_ENV);
@@ -109,10 +105,8 @@ fn dump_spec(opts: &ExportOptions<'_>) -> String {
             std::process::exit(1);
         });
 
-    // stderr is captured rather than inherited so the unavailable marker can be
-    // scanned for, but everything else the child said is forwarded verbatim —
-    // a swallowed config or telemetry warning would make a failing export much
-    // harder to diagnose than a slightly noisier one.
+    // stderr is captured to scan for the unavailable marker; every other line is forwarded so
+    // config or telemetry warnings stay visible when the export fails.
     let stderr = String::from_utf8_lossy(&output.stderr);
     for line in stderr
         .lines()
@@ -126,9 +120,7 @@ fn dump_spec(opts: &ExportOptions<'_>) -> String {
     // parse error on empty stdout.
     if let Some(reason) = unavailable_reason(&stderr) {
         eprintln!("\u{2717} No OpenAPI spec to export: {reason}.\n");
-        // The marker already distinguishes the two causes, so show only the
-        // remedy that applies rather than making the reader work out which half
-        // of a combined message is theirs.
+        // Show only the remedy for the cause the marker reported.
         if reason == autumn_web::openapi::OPENAPI_UNAVAILABLE_FEATURE {
             eprintln!("  Enable it in the app's Cargo.toml:");
             eprintln!("      autumn-web = {{ version = \"..\", features = [\"openapi\"] }}");
@@ -310,8 +302,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── unavailable_reason ────────────────────────────────────────────────
-
     #[test]
     fn reads_the_reason_after_the_marker() {
         let stderr = format!(
@@ -328,8 +318,6 @@ mod tests {
     fn no_marker_means_available() {
         assert_eq!(unavailable_reason("just a warning\n"), None);
     }
-
-    // ── describe_drift ────────────────────────────────────────────────────
 
     fn doc(paths: &serde_json::Value) -> serde_json::Value {
         json!({ "openapi": "3.1.0", "paths": paths })
