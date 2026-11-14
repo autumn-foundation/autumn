@@ -298,11 +298,9 @@ pub(super) fn merge_en_ftl_keeping(
     let already = defined_keys(existing);
     let resource_prefix = format!("{resource}.");
     let resource_header = format!("{RESOURCE_HEADER_PREFIX}{pascal_name}{RESOURCE_HEADER_SUFFIX}");
-    // A resource literally named `Common` would share its prefix with the chrome
-    // block. `plan_scaffold_with_options_impl` refuses that name under `--i18n`;
-    // classifying chrome FIRST and taking the resource's keys from what is left
-    // is the belt-and-braces half, so no key can ever be written to both blocks
-    // even from a hand-built plan.
+    // A resource named `Common` would share the chrome prefix. The planner refuses that name
+    // under `--i18n`; excluding `common.` here as well means no key lands in both blocks even
+    // from a hand-built plan.
     let missing_common: Vec<(&String, &String)> = keys
         .iter()
         .filter(|(k, _)| k.starts_with("common.") && !already.contains_key(*k))
@@ -315,18 +313,12 @@ pub(super) fn merge_en_ftl_keeping(
                 && !already.contains_key(*k)
         })
         .collect();
-    // Reconciled before the nothing-to-do check below: a regeneration that dropped a field
-    // or a flag has every remaining key already present, so the "missing" sets are empty
-    // while the block still carries keys the rewritten routes no longer reference — exactly
-    // what `autumn i18n check --strict` fails on. Values, comments, and blank lines for
-    // surviving keys carry over.
+    // Reconcile before the nothing-to-do check: a regeneration that dropped a field or flag has
+    // no missing keys but still carries stale ones, which `autumn i18n check --strict` fails on.
     //
-    // The shared chrome is never pruned here: every resource writes those keys, so dropping
-    // one from this resource's render would delete a key a sibling still uses. Chrome is
-    // additive, and `destroy` is what eventually takes it. Keys a surviving call site still
-    // names are held back from the prune — but only ones the bundle already defines, since
-    // a reference to a key no `.ftl` carries was already failing `t!` before this ran, and
-    // reconciliation must not invent an empty message for it.
+    // Chrome is never pruned here, since sibling resources share it; `destroy` removes it.
+    // Keys a surviving call site still names are kept, but only if already defined: a
+    // reference to an undefined key was already failing `t!`, and this must not invent one.
     let mut wanted = keys.clone();
     for key in still_referenced {
         if key.starts_with(&resource_prefix)
@@ -344,10 +336,8 @@ pub(super) fn merge_en_ftl_keeping(
         return existing.to_owned();
     }
 
-    // Re-running the generator — after adding a column, or with a flag that
-    // brings new chrome — must extend the block that already exists rather than
-    // strand the new key at EOF under no header at all. The file's whole promise
-    // to a translator is that it reads by section.
+    // A re-run that brings new chrome extends the existing block rather than stranding the
+    // key at EOF under no header: translators read the file by section.
     if !missing_common.is_empty()
         && let Some(insert_at) = block_end(existing, COMMON_HEADER)
     {
@@ -357,8 +347,8 @@ pub(super) fn merge_en_ftl_keeping(
             let _ = writeln!(out, "{key} = {value}");
         }
         out.push_str(&existing[insert_at..]);
-        // Whatever the resource block still needs lands on the next pass, which
-        // terminates: the chrome keys are now all present.
+        // The resource block is handled on the next pass, which terminates because the
+        // chrome keys are now all present.
         return merge_en_ftl_keeping(&out, pascal_name, resource, keys, still_referenced);
     }
 
@@ -424,10 +414,8 @@ fn reconcile_block(
     let end = block_end(existing, header)?;
     let start = existing.find(header)?;
     let body_start = start + existing[start..].find('\n').map_or(0, |i| i + 1);
-    // The `common.` exclusion applies only when reconciling a RESOURCE block —
-    // a resource named `Common` is refused, but a hand-built plan could still
-    // reach here. Pruning the chrome block passes `prefix == "common."`, where
-    // the exclusion must not fire.
+    // Exclude `common.` keys from a resource block (a hand-built plan could name a resource
+    // `Common`), but not when reconciling the chrome block itself.
     let wanted: BTreeMap<&str, &str> = keys
         .iter()
         .filter(|(k, _)| {
@@ -439,13 +427,9 @@ fn reconcile_block(
     let mut body = String::new();
     let mut keeping_continuations = false;
     for line in existing[body_start..end].lines() {
-        // INDENTATION decides first, before any `=` split. A Fluent
-        // continuation is just indented text and usually contains no `=` at
-        // all (`    and a second line`), so testing for `=` first would file it
-        // as a comment and keep it even when its key is being dropped —
-        // producing exactly the orphan this reconciliation exists to avoid:
-        // the loader either rejects it or silently glues it onto the message
-        // above.
+        // Indentation is checked before any `=` split. A Fluent continuation is indented text,
+        // usually with no `=`; testing `=` first would keep it even when its key is dropped,
+        // leaving an orphan the loader rejects or glues onto the message above.
         if line.starts_with(' ') || line.starts_with('\t') {
             if keeping_continuations {
                 body.push_str(line);
@@ -453,27 +437,20 @@ fn reconcile_block(
             }
             continue;
         }
-        // COMMENTS are tested before the `=` split, and do not end a value.
-        // Both halves matter, and both mirror `parse_ftl` (`autumn/src/i18n.rs`)
-        // rather than guessing:
-        //
-        //   * A comment carrying an `=` (`# use post.x = y here`) would
-        //     otherwise be read as a key line, found absent from `wanted`, and
-        //     deleted — taking a translator's note with it.
-        //   * `parse_ftl` `continue`s past a comment WITHOUT flushing the
-        //     current key, so an indented line after a mid-value comment is
-        //     still part of that value at runtime. Ending the value here would
-        //     drop the continuation and silently truncate the translation.
-        //
-        // A BLANK line does flush there, so it still ends the value here.
+        // Comments are tested before the `=` split and do not end a value, mirroring
+        // `parse_ftl` (`autumn/src/i18n.rs`):
+        //   * a comment carrying `=` (`# use post.x = y here`) would otherwise be read as a
+        //     key line and deleted;
+        //   * `parse_ftl` skips a comment without flushing the current key, so an indented
+        //     line after a mid-value comment still belongs to that value.
+        // A blank line does flush there, so it ends the value here.
         if line.trim_start().starts_with('#') {
             body.push_str(line);
             body.push('\n');
             continue;
         }
         let Some((raw_key, _)) = line.split_once('=') else {
-            // A blank line at the block's own indentation — keep it where the
-            // translator put it. It ends the previous key's value.
+            // A blank line: keep it in place. It ends the previous key's value.
             keeping_continuations = false;
             body.push_str(line);
             body.push('\n');
@@ -484,19 +461,14 @@ fn reconcile_block(
             body.push_str(line);
             body.push('\n');
         } else {
-            // Dropped: its continuation lines go with it.
+            // Dropped, along with its continuation lines.
             keeping_continuations = false;
         }
     }
-    // Scanned over the WHOLE file, not just this block. A key can be defined
-    // outside the block a translator never touched — hand-authored above it, or
-    // left behind by an older layout — and appending a second definition here
-    // would not merely duplicate it: `parse_ftl` inserts each entry into a map
-    // in file order (`autumn/src/i18n.rs`), so the LAST definition wins. The
-    // generated English would silently replace the translation above it, which
-    // is the one thing this merge promises never to do. Reconciliation itself
-    // still reads only the block: keys outside it are not the generator's to
-    // keep or drop, just its to leave alone.
+    // Check the whole file, not just this block. A key may be defined outside it (hand-authored
+    // or from an older layout), and `parse_ftl` lets the last definition win, so appending a
+    // second one would silently replace that translation with generated English. Keys outside
+    // the block are otherwise left alone.
     let defined_anywhere = defined_keys(existing);
     for (key, value) in &wanted {
         if !defined_anywhere.contains_key(*key) {
@@ -523,7 +495,6 @@ fn reconcile_block(
 fn block_end(existing: &str, header: &str) -> Option<usize> {
     let start = existing.find(header)?;
     let mut cursor = start + header.len();
-    // Step past the header's own newline.
     cursor += existing[cursor..].find('\n').map_or(0, |i| i + 1);
     let footer = block_footer(header);
     let mut end = cursor;
@@ -533,9 +504,8 @@ fn block_end(existing: &str, header: &str) -> Option<usize> {
         }
         end += line.len();
     }
-    // No footer: a bundle written before blocks were explicitly closed. Fall
-    // back to the old boundary — the first blank line or foreign comment — so
-    // an existing project still merges and destroys correctly.
+    // No footer: a bundle written before blocks had one. The block ends at the first blank
+    // line or foreign comment.
     let mut end = cursor;
     for line in existing[cursor..].split_inclusive('\n') {
         let trimmed = line.trim();
@@ -559,24 +529,18 @@ pub(super) fn remove_en_ftl_keys(
     existing: &str,
     pascal_name: &str,
     resource: &str,
-    // Every key surviving project source still looks up — the resource's own as
-    // much as the shared chrome. The caller scans the project for these,
-    // because the bundle itself cannot answer it: a resource whose keys were
-    // all hand-authored before it was scaffolded leaves no marker comment
-    // behind, so "no other marker" does NOT mean "no other user".
+    // Every key surviving project source still looks up, resource and chrome alike. It comes
+    // from scanning source because the bundle cannot tell: hand-authored keys leave no marker,
+    // so "no other marker" does not mean "no other user".
     surviving: &std::collections::HashSet<String>,
 ) -> String {
     let stripped = prune_resource_block(existing, pascal_name, resource, surviving);
-    // Chrome exists to be shared. Once nothing references it, every `common.*`
-    // key is dead weight — which is exactly what `autumn i18n check --strict`
-    // fails on, so destroying the only `--i18n` resource would otherwise leave
-    // the project's own lint red. But the asymmetry matters: an orphan key is a
-    // lint warning, while removing one a surviving resource still calls is a
-    // COMPILE error (`t!` validates key existence at compile time). So this errs
-    // toward keeping.
+    // Unreferenced chrome keys fail `autumn i18n check --strict`, so they go. This errs toward
+    // keeping: an orphan key is a lint failure, but removing a key still in use is a compile
+    // error, since `t!` checks keys at compile time.
     //
-    // Never the FILE, either way: `.i18n_auto()` panics at startup when the
-    // default locale's bundle is missing, and a comment-only bundle still loads.
+    // The file itself always stays: `.i18n_auto()` panics at startup without the default
+    // locale's bundle, and a comment-only bundle still loads.
     prune_chrome_block(&stripped, surviving)
 }
 
@@ -593,9 +557,8 @@ pub(super) fn remove_en_ftl_keys(
 /// Marker-bounded like [`remove_marked_block`], so a hand-authored `common.*`
 /// key outside the block is never touched.
 fn prune_chrome_block(existing: &str, surviving: &std::collections::HashSet<String>) -> String {
-    // No source names the framework key (#2439), so the scan never reports it.
-    // It stays while any chrome key stays, because then a sibling scaffold
-    // still has a form.
+    // No source names the framework key (#2439), so the scan never reports it. Keep it while
+    // any chrome key stays, since a sibling scaffold still has a form.
     let mut surviving = surviving.clone();
     if surviving.iter().any(|key| key.starts_with("common.")) {
         surviving.insert(NUL_MESSAGE_KEY.to_owned());
@@ -637,11 +600,8 @@ fn prune_block(
     prefix: &str,
     surviving: &std::collections::HashSet<String>,
 ) -> String {
-    // Only keys the bundle actually DEFINES. `surviving` is a scan of source,
-    // so it can name a key no `.ftl` carries — a call site that was already
-    // failing `t!` before any of this ran — and `reconcile_block` appends keys
-    // it does not find defined. Destroy inventing an empty message for one is
-    // strictly worse than leaving the pre-existing breakage alone.
+    // Only keys the bundle defines. `surviving` comes from source and can name an undefined key
+    // (already failing `t!`); `reconcile_block` would append it as an empty message.
     let defined = defined_keys(existing);
     let kept: BTreeMap<String, String> = surviving
         .iter()
@@ -651,9 +611,8 @@ fn prune_block(
     if kept.is_empty() {
         return remove_marked_block(existing, header);
     }
-    // `reconcile_block` keeps each surviving key's own value and drops the
-    // rest — the empty values above are never written, since every key it keeps
-    // is already defined.
+    // The empty values are never written: every kept key is already defined, and
+    // `reconcile_block` keeps existing values.
     reconcile_block(existing, header, prefix, &kept).unwrap_or_else(|| existing.to_owned())
 }
 
@@ -722,17 +681,13 @@ fn toml_table_name(line: &str) -> Option<&str> {
     let trimmed = line.trim();
     let rest = trimmed.strip_prefix('[')?;
     let close = rest.find(']')?;
-    // Anything after the closing bracket must be blank or a comment — otherwise
-    // this is not a table header at all.
+    // Only a comment may follow the closing bracket of a table header.
     let tail = rest[close + 1..].trim();
     if !tail.is_empty() && !tail.starts_with('#') {
         return None;
     }
-    // `["i18n"]` names the same table as `[i18n]` — TOML lets any key be
-    // quoted. Left quoted, the name never matches, so the caller concludes
-    // there is no `[i18n]` table and appends one: a SECOND definition of the
-    // same table, which makes `autumn.toml` unparseable for the app that has
-    // to read it.
+    // `["i18n"]` is the same table as `[i18n]`. Left quoted, the caller would miss it and
+    // append a duplicate table, making `autumn.toml` unparseable.
     let name = rest[..close].trim();
     Some(
         name.strip_prefix('"')
@@ -770,16 +725,10 @@ fn toml_scalar_value(raw: &str) -> Option<String> {
     let quote = trimmed.chars().next()?;
     let value = if quote == '"' || quote == '\'' {
         let rest = &trimmed[quote.len_utf8()..];
-        // A BASIC string (double quotes) processes escapes; a LITERAL string
-        // (single quotes) does not, by TOML's definition. Both of these values
-        // become filesystem paths, so the raw source text is the wrong thing to
-        // build them from: the app's loader reads the DECODED value, and
-        // `dir = "i18n\\bundles"` on Windows would otherwise have the generator
-        // writing to a directory with a literal double backslash in its name
-        // while the runtime reads the single-backslash one.
-        //
-        // The terminator has to respect escapes for the same reason: a `\"` is
-        // part of the value, so stopping at it would truncate the path.
+        // A basic (double-quoted) string is decoded, a literal one is not, as in TOML. These
+        // values become paths and the app's loader reads the decoded value, so
+        // `dir = "i18n\\bundles"` must yield one backslash. The terminator skips `\"`, which
+        // is part of the value.
         if quote == '"' {
             let mut end = None;
             let mut escaped = false;
@@ -1022,15 +971,14 @@ fn configured_i18n_by_scan(autumn_toml: &str) -> (Option<String>, Option<String>
         let Some((raw_key, value)) = trimmed.split_once('=') else {
             continue;
         };
-        // Dotted keys (`i18n.default_locale = "fr"`) carry the table in the key
-        // itself, so they are read at top level rather than inside `[i18n]`.
+        // Dotted keys (`i18n.default_locale = "fr"`) carry the table in the key, so they are
+        // read at top level.
         let (key, value) = if in_i18n {
             (raw_key, value)
         } else if at_top_level {
             match raw_key.trim().strip_prefix("i18n.") {
                 Some(rest) => (rest, value),
-                // An inline `i18n = { default_locale = "fr", … }`: read the
-                // members out of the braces.
+                // An inline `i18n = { default_locale = "fr", … }`.
                 None if raw_key.trim() == "i18n" => {
                     for member in
                         split_inline_members(value.trim().trim_matches(|c| c == '{' || c == '}'))
@@ -1099,8 +1047,8 @@ impl MacroEnv {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            // NEAREST FIRST, so an entry already seen keeps its value: cargo
-            // merges the chain with the closer file winning.
+            // Nearest file first, so an entry already seen keeps its value: the closer
+            // file wins in cargo's merge.
             for (name, entry) in cargo_config_env(&text, &base) {
                 configured.entry(name).or_insert(entry);
             }
@@ -1127,9 +1075,8 @@ fn cargo_config_files(project_root: &Path) -> Vec<(PathBuf, PathBuf)> {
             cargo_config_in(&dir.join(".cargo")).map(|path| (dir.to_path_buf(), path))
         })
         .collect();
-    // `$CARGO_HOME/config[.toml]` is consulted last, so it loses to every file
-    // above. Its own `relative` entries resolve against the directory holding
-    // it, the same rule the rest of the chain follows.
+    // `$CARGO_HOME/config[.toml]` comes last, so every file above wins over it. Its `relative`
+    // entries resolve against the parent of `$CARGO_HOME`, as for the rest of the chain.
     if let Some(home) = cargo_home()
         && let Some(path) = cargo_config_in(&home)
     {
@@ -1220,20 +1167,15 @@ fn cargo_config_env(config: &str, base: &Path) -> BTreeMap<String, (String, bool
 /// the project deliberately does not have.
 pub(super) fn validator_bundle_path(project_root: &Path, env: &MacroEnv) -> Option<PathBuf> {
     if let Some(file) = &env.file {
-        // A relative `AUTUMN_I18N_FILE` is resolved by the compiler against its
-        // own working directory, which for a cargo build is the workspace root.
-        // The project root is that directory for a generated app.
+        // The compiler resolves a relative `AUTUMN_I18N_FILE` against its working directory,
+        // the workspace root, which is the project root for a generated app.
         let path = project_root.join(file);
         if path.is_file() {
             return Some(path);
         }
-        // FALLS THROUGH when that file is missing, exactly as the macro does:
-        // `locate_default_bundle` guards the explicit path with `is_file()` and
-        // then goes on to the locale candidate. Returning `None` here would
-        // read a stale or mistyped `AUTUMN_I18N_FILE` as "validation is off"
-        // while the macro quietly validates against `i18n/<locale>.ftl`, which
-        // then never receives the generated keys — a `compile_error!` per
-        // lookup.
+        // A missing file falls through to the locale candidate, as `locate_default_bundle`
+        // does. Returning `None` would leave `i18n/<locale>.ftl`, which the macro still
+        // validates against, without the generated keys.
     }
     let locale = env.default_locale.as_deref().unwrap_or("en");
     let path = project_root.join("i18n").join(format!("{locale}.ftl"));
@@ -1281,12 +1223,9 @@ pub(super) fn locale_bundles(project_root: &Path, dir: &str) -> Vec<PathBuf> {
 pub(super) fn ensure_dockerfile_i18n_copy(dockerfile: &str, dir: &str) -> Option<String> {
     let builder_anchor = "COPY migrations ./migrations";
     let runtime_anchor = "COPY --from=builder /app/migrations /app/migrations";
-    // A `dir` carrying whitespace is a legal path, and the shell form splits on
-    // it: `COPY translations v2 ./translations v2` reads as three sources and a
-    // destination, so the build either fails or copies the wrong thing. The
-    // JSON form is exactly what Docker documents for paths with spaces. Used
-    // only when needed, so the ordinary Dockerfile keeps its conventional
-    // shell-form lines.
+    // The shell form splits a `dir` containing whitespace into several sources, so such a
+    // `dir` uses the JSON form Docker documents for paths with spaces. Other dirs keep the
+    // conventional shell form.
     let (builder_line, runtime_line) = if dir.contains(char::is_whitespace) {
         (
             format!(
@@ -1306,12 +1245,8 @@ pub(super) fn ensure_dockerfile_i18n_copy(dockerfile: &str, dir: &str) -> Option
             format!("COPY --from=builder /app/{dir} /app/{dir}"),
         )
     };
-    // ACTIVE lines, not substrings. Docker strips comments before executing, so
-    // a `# COPY i18n ./i18n` left behind as an example installs nothing — and
-    // reading it as installed returns the file untouched, after which the
-    // container panics in `.i18n_auto()` with no bundle to load. The same rule
-    // governs the anchors: inserting after a commented `# COPY migrations …`
-    // would put the new line in a stage that never runs it.
+    // Match active lines, not substrings: a commented `# COPY i18n ./i18n` installs nothing,
+    // and inserting after a commented anchor would add a line Docker never runs.
     if has_active_line(dockerfile, &builder_line) && has_active_line(dockerfile, &runtime_line) {
         return Some(dockerfile.to_owned());
     }
@@ -1433,8 +1368,7 @@ pub(super) fn stale_dockerfile_i18n_dir(dockerfile: &str, dir: &str) -> Option<S
         "COPY --from=builder /app/migrations /app/migrations",
         runtime_copy_dir,
     )?;
-    // Both stages naming the same non-configured directory is what makes this a
-    // moved bundle rather than a coincidence.
+    // Both stages must name the same non-configured directory to count as a moved bundle.
     (builder == runtime && builder != dir).then_some(builder)
 }
 
@@ -1494,14 +1428,10 @@ pub(super) fn profile_i18n_overrides(
     base_dir: &str,
     base_locale: &str,
 ) -> Vec<(String, String)> {
-    // Structural when the file parses, for the same reason `configured_i18n` is
-    // — and this is the half of that change I left undone last round, which
-    // produced a finding immediately. `[profile.prod.i18n]` is only ONE of the
-    // spellings the runtime merges: `[profile.prod]` with `i18n = { … }`, a
-    // dotted `profile.prod.i18n.dir`, and any of them quoted all reach the same
-    // table, and a scan keyed on a header ending in `.i18n` sees none of them.
-    // Missing one means no warning for a production deploy pointed at a bundle
-    // this scaffold never wrote — which is a startup panic, not a cosmetic gap.
+    // Parsed structurally when possible: `[profile.prod]` with `i18n = { … }`, a dotted
+    // `profile.prod.i18n.dir`, and quoted spellings all reach the same table, and the scan
+    // only sees `[profile.<env>.i18n]` headers. A missed override is a startup panic in that
+    // profile.
     if let Ok(table) = autumn_toml.parse::<toml::Table>() {
         let mut out = Vec::new();
         let profiles = table.get("profile").and_then(toml::Value::as_table);
@@ -1591,7 +1521,7 @@ fn profile_i18n_overrides_by_scan(
 /// its `default_locale` may not be `en`, and rewriting it would silently
 /// repoint the bundle the app loads.
 pub(super) fn ensure_i18n_config_block(existing: &str) -> String {
-    // Match the CONFIGURATION, not the literal text — see `defines_i18n`.
+    // Match the configuration, not the literal text: see `defines_i18n`.
     if defines_i18n(existing) {
         return existing.to_owned();
     }
@@ -1796,8 +1726,7 @@ impl<'ast> syn::visit::Visit<'ast> for Collector<'ast> {
 
     fn visit_expr(&mut self, expr: &'ast syn::Expr) {
         if let syn::Expr::MethodCall(mc) = expr {
-            // Compared as an `Ident`, not a `String` — every method call in
-            // `main.rs` reaches this, and only three names need a match.
+            // Compared as an `Ident` so no `String` is allocated for every method call.
             let bucket = if mc.method == "routes" {
                 Some(&mut self.routes_calls)
             } else if mc.method == "embedded_static" {
@@ -2161,29 +2090,17 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
     };
     let collector = Collector::collect(&file);
 
-    // WHICH builders are production is decided first, and everything else
-    // is asked about those builders rather than about the file. A
-    // `main.rs` can hold several `main` functions — a preview helper, a
-    // `#[cfg(test)]` fixture. File-wide questions gave wrong answers on
-    // ordinary layouts. A `.i18n(test_bundle())` in a fixture reported the
-    // whole app as custom-bundled and left production unwired. An
-    // `.i18n_auto()` on the fixture reported the app as already wired.
+    // Decide which builders are production first, then ask everything about those builders,
+    // not the whole file: a `.i18n(...)` or `.i18n_auto()` in a `#[cfg(test)]` fixture or
+    // preview helper says nothing about the binary.
     let anchors = production_anchors(&collector);
     if anchors.is_empty() {
         return I18nAutoWiring::NoAnchor;
     }
 
-    // EVERY production branch, not just the first, and each judged ON ITS OWN.
-    // `main` may build the app conditionally — one `.routes(` per configuration
-    // branch — and one branch carrying `.i18n_auto()` says nothing about its
-    // sibling.
-    //
-    // A chain with its own bundle is LEFT ALONE rather than blocking the rest.
-    // `.i18n_auto()` clears a preloaded bundle and switches to filesystem
-    // loading. Wiring it into that chain would replace the app's embedded or
-    // translation-management-service bundle, and it can panic when nothing is
-    // on disk. That is a reason to skip that one chain, not to leave its
-    // siblings with raw keys.
+    // Judge each production branch on its own: `main` may have one `.routes(` per
+    // configuration branch. A chain with its own `.i18n(...)` bundle is skipped, since
+    // `.i18n_auto()` would replace it with a filesystem load, but its siblings are still wired.
     let mut custom = false;
     let mut pending = Vec::new();
     for anchor in anchors {
@@ -2214,9 +2131,7 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
         let line_start = out[..at].rfind('\n').map_or(0, |i| i + 1);
         let indent = line_indent(&out, at);
         if line_start + indent.len() == at {
-            // `.routes(` is the first token on its line: reuse the line's own
-            // indentation so the inserted call sits in the builder chain
-            // rather than at some arbitrary column.
+            // `.routes(` starts its line: insert a line with the same indentation.
             let indent = indent.to_owned();
             out = format!(
                 "{}{indent}.i18n_auto()\n{}",
@@ -2224,7 +2139,7 @@ pub(super) fn ensure_i18n_auto(main_rs: &str) -> I18nAutoWiring {
                 &out[line_start..]
             );
         } else {
-            // A single-line builder chain — inserted inline, still valid Rust.
+            // A single-line builder chain: insert inline.
             out = format!("{}.i18n_auto(){}", &out[..at], &out[at..]);
         }
     }
@@ -2261,9 +2176,8 @@ fn is_embed_locales_macro(expr: &syn::Expr) -> bool {
 /// warn instead of guessing. It returns the input unchanged when the locales
 /// are already embedded.
 pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String> {
-    // `embed_locales!()` defaults to `i18n/`; a configured directory is passed
-    // through as the macro's literal argument — escaped, because this is the one
-    // place a `dir` read out of `autumn.toml` becomes Rust source.
+    // `embed_locales!()` defaults to `i18n/`. Any other `dir` becomes a Rust string literal,
+    // so it is escaped.
     let macro_call = if dir == "i18n" {
         "autumn_web::embed_locales!()".to_owned()
     } else {
@@ -2277,23 +2191,17 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
     let collector = Collector::collect(&file);
     let index = SourceIndex::new(main_rs);
 
-    // PRODUCTION occurrences only. A `#[cfg(test)]` fixture that happens to
-    // mention `EMBEDDED_LOCALES` is not the binary's embedding, and treating it
-    // as one returns "already wired" while `autumn build --embed` ships a
-    // release binary with no bundle in it.
+    // Production occurrences only: a `#[cfg(test)]` fixture naming `EMBEDDED_LOCALES` does not
+    // embed anything in the release binary.
     let embedded_in_production = collector
         .embedded_locales_idents
         .iter()
         .any(|is_test| !is_test);
 
     if embedded_in_production {
-        // Already embedded — but not necessarily from the right place. A
-        // project that changed `[i18n] dir` after its first `--i18n` scaffold
-        // keeps embedding the OLD directory, so this repoints the PRODUCTION
-        // static's own macro call — never a differently-named neighbour, such
-        // as an `ADMIN_EMBEDDED_LOCALES` beside it — and only when that
-        // initialiser is this macro at all; a hand-rolled or macro-generated
-        // static is left alone, and only the install below is checked.
+        // Already embedded, but `[i18n] dir` may have changed since. Repoint the production
+        // `EMBEDDED_LOCALES` static only when its initialiser is `embed_locales!`; any other
+        // static is left alone and only the install below is checked.
         let production_decl = collector
             .statics
             .iter()
@@ -2309,17 +2217,12 @@ pub(super) fn ensure_embedded_locales(main_rs: &str, dir: &str) -> Option<String
             }
             _ => main_rs.to_owned(),
         };
-        // Unconditionally: the insertion is per-anchor and skips the ones
-        // already served, so "some branch has it" can no longer stand in for
-        // "every branch has it".
+        // Always run: some branches may still lack the install, and served ones are skipped.
         return insert_locale_install(&out);
     }
 
-    // Beside the PRODUCTION static, on the same production test the install
-    // below uses. A `#[cfg(test)]` module can declare its own fixture with the
-    // very same declaration, and treating the FIRST occurrence in the file as
-    // "the" static would declare `EMBEDDED_LOCALES` inside that module while
-    // the install went — correctly — into the production builder.
+    // Declare it beside the production `EMBEDDED_STATIC`, not the first one in the file: a
+    // `#[cfg(test)]` module may declare its own.
     let (production_static, _) = collector
         .statics
         .iter()
@@ -2395,10 +2298,8 @@ fn insert_locale_install(src: &str) -> Option<String> {
         .collect();
 
     if pending.is_empty() {
-        // Nothing to add — but say whether that is because everything is
-        // served or because there was nowhere to write. A file with no
-        // production anchor at all is only "done" when the call is already
-        // there; otherwise the caller has to warn.
+        // Nothing to add. With no production anchor, this is only done if a production
+        // `.embedded_locales(` call already exists; otherwise return `None` so the caller warns.
         let served = !anchors.is_empty()
             || collector
                 .embedded_locales_calls
@@ -2558,9 +2459,7 @@ mod tests {
 
     #[test]
     fn remove_takes_only_the_resource_block() {
-        // A sibling resource keeps the shared chrome in use, so only `Post`'s
-        // own block comes out. (Destroying the LAST resource takes the chrome
-        // too — see `removing_the_last_resource_takes_the_now_unreferenced_chrome_with_it`.)
+        // A sibling resource keeps the chrome in use, so only `Post`'s block comes out.
         let ftl = merge_en_ftl(
             &merge_en_ftl(
                 "",
@@ -2572,7 +2471,7 @@ mod tests {
             "comment",
             &keys(&[("common.create", "Create"), ("comment.name", "Comment")]),
         );
-        // `true`: the surviving `Comment` routes still look chrome keys up.
+        // The surviving `Comment` routes still look `common.create` up.
         let out = remove_en_ftl_keys(&ftl, "Post", "post", &chrome(&["common.create"]));
         assert!(out.contains("common.create = Create"), "{out}");
         assert!(!out.contains("post.name"), "{out}");
@@ -2784,8 +2683,7 @@ mod tests {
 
     #[test]
     fn locales_are_embedded_for_embed_builds() {
-        // `.i18n_auto()` loads from DISK; an `--embed` build is meant to be
-        // self-contained, and the release image ships no sidecar for it.
+        // `.i18n_auto()` loads from disk, and an `--embed` build ships no sidecar.
         let main_rs = concat!(
             "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n",
             "fn main() {\n",
@@ -2838,8 +2736,7 @@ mod tests {
 
     #[test]
     fn config_block_detects_a_spaced_section_header() {
-        // `[ i18n ]` is legal TOML; appending a second `[i18n]` beside it makes
-        // the whole file unparseable and takes the app's config down with it.
+        // `[ i18n ]` is legal TOML; a second `[i18n]` beside it makes the file unparseable.
         let existing = "[ i18n ]\ndefault_locale = \"fr\"\n";
         assert_eq!(ensure_i18n_config_block(existing), existing);
     }
@@ -2887,9 +2784,7 @@ mod tests {
 
     #[test]
     fn config_block_detects_the_inline_and_dotted_spellings() {
-        // TOML expresses one table three ways, and appending `[i18n]` beside any
-        // of them is a duplicate definition that makes the file unparseable —
-        // taking the whole application config down with it.
+        // Appending `[i18n]` beside any of these is a duplicate table definition.
         for existing in [
             "i18n = { default_locale = \"fr\", supported_locales = [\"fr\"] }\n",
             "i18n.default_locale = \"fr\"\n",
@@ -2919,9 +2814,7 @@ mod tests {
 
     #[test]
     fn config_block_detects_a_header_with_a_trailing_comment() {
-        // `[i18n] # locale settings` is one table, not none — appending a second
-        // `[i18n]` beside it makes the file unparseable and takes the whole
-        // application config down with it.
+        // `[i18n] # locale settings` is a table header; a second `[i18n]` would be a duplicate.
         let existing = "[i18n] # locale settings\ndefault_locale = \"fr\"\n";
         assert_eq!(ensure_i18n_config_block(existing), existing);
     }
@@ -2949,9 +2842,7 @@ mod tests {
     /// only the block, so before this it saw the key as absent and appended it.
     #[test]
     fn regeneration_does_not_redefine_a_key_authored_above_the_block() {
-        // Establish a block, then hand-author one of the NEXT run's keys above
-        // it — the shape you get when someone translates a string before the
-        // generator ever emits it, or hoists it out of the block by hand.
+        // A key the next run adds, already hand-authored above the block.
         let generated = merge_en_ftl("", "Post", "post", &keys(&[("post.new", "New Post")]));
         let with_hand_authored = format!("post.field.body = Corps du texte\n\n{generated}");
 
@@ -2984,8 +2875,7 @@ mod tests {
     /// truncates a translation it was told to keep.
     #[test]
     fn a_comment_inside_a_value_does_not_truncate_it_on_regeneration() {
-        // Built from a real generated block so the markers `block_end` looks
-        // for are exactly the ones the generator writes.
+        // Built from a generated block so it carries the real markers.
         let wanted = keys(&[("post.help", "First"), ("post.new", "New Post")]);
         let generated = merge_en_ftl("", "Post", "post", &wanted);
         let with_note = generated.replace(
@@ -3195,8 +3085,7 @@ mod tests {
             1,
             "exactly the unconfigured chain gets it:\n{out}"
         );
-        // The hand-installed bundle is untouched, and `.i18n_auto()` did not
-        // land in its chain — that would clear it.
+        // `.i18n_auto()` must not land in the custom chain: it would clear that bundle.
         assert!(out.contains(".i18n(tms_bundle())"), "{out}");
         let custom_at = out.find(".i18n(tms_bundle())").unwrap();
         let auto_at = out.find(".i18n_auto()").unwrap();
@@ -3365,8 +3254,7 @@ mod tests {
                 "for {call:?}"
             );
         }
-        // `.i18n_auto()` is a different method that starts with the same name,
-        // and must still read as already-wired rather than as a custom bundle.
+        // `.i18n_auto()` shares the `i18n` prefix but reads as wired, not as a custom bundle.
         let wired = "fn main() {\n    let app = App::new()\n        .i18n_auto()\n        .routes(routes![index]);\n}\n";
         assert!(matches!(ensure_i18n_auto(wired), I18nAutoWiring::Wired(_)));
     }
@@ -3377,10 +3265,8 @@ mod tests {
     /// cfg(test) region.
     #[test]
     fn a_cfg_test_static_is_scoped_to_its_own_semicolon() {
-        // The semicolon-terminated static is test-only, and the following
-        // item must not be dragged into `cfg(test)` with it: a test-only
-        // static must not suppress production wiring, and must not have its
-        // install spliced into production either.
+        // The test-only static must neither suppress production wiring nor pull the
+        // following production item into `cfg(test)`.
         let main_rs = concat!(
             "#[cfg(test)]\n",
             "static EMBEDDED_LOCALES: Dir = autumn_web::embed_locales!(\"fixtures\");\n",
@@ -4273,10 +4159,7 @@ mod tests {
 
     #[test]
     fn removal_takes_a_multi_line_value_with_its_key() {
-        // A translator may wrap a value over indented continuation lines. Left
-        // behind, they either fail the loader outright — and `.i18n_auto()`
-        // turns that into a startup panic — or silently glue onto whichever key
-        // precedes them, corrupting an unrelated translation.
+        // Orphaned continuation lines fail the loader or glue onto the preceding key.
         let ftl = concat!(
             "common.show = Show\n",
             "\n",
@@ -4507,8 +4390,8 @@ mod tests {
             "post",
             &keys(&[("post.new", "New Post"), ("post.field.body", "Body")]),
         );
-        // A wrapped value with NO `=` in the continuation, and a kept key that
-        // also wraps — the first must go, the second must stay whole.
+        // A dropped key whose continuation has no `=`, and a kept key that also wraps:
+        // the first must go, the second must stay whole.
         let edited = before
             .replace(
                 "post.field.body = Body\n",
@@ -4539,8 +4422,7 @@ mod tests {
             "}\n",
         );
         let embedded = ensure_embedded_locales(main_rs, "i18n").expect("anchors present");
-        // The project later moves its bundles; the embed has to follow, or an
-        // `--embed` build ships a directory the app no longer reads.
+        // The project moves its bundles; the embed must follow.
         let moved = ensure_embedded_locales(&embedded, "translations").expect("already embedded");
         assert!(
             moved.contains("embed_locales!(\"translations\")"),
@@ -4643,8 +4525,7 @@ mod tests {
             "COPY --from=builder /app/migrations /app/migrations\n",
         );
         let out = ensure_dockerfile_i18n_copy(dockerfile, "i18n").expect("anchors present");
-        // Asserted WITHOUT `has_active_line`: a test that checks the fix
-        // through the helper the fix lives in passes with the fix reverted.
+        // Checked without `has_active_line`, so the assertion does not rely on the helper it tests.
         let active = |needle: &str| out.lines().any(|line| line.trim() == needle);
         assert!(
             active("COPY i18n ./i18n"),
@@ -4816,8 +4697,7 @@ default_locale = "fr"
 
     #[test]
     fn toml_values_are_decoded_before_they_become_paths() {
-        // A basic string processes escapes; the app's loader reads the DECODED
-        // value, so the generator has to write to the same place.
+        // A basic string is decoded, as the app's loader reads it.
         assert_eq!(
             toml_scalar_value(r#" "fr" "#).as_deref(),
             Some("fr"),
@@ -4828,7 +4708,7 @@ default_locale = "fr"
             Some(r"i18n\bundles"),
             "an escaped backslash is one backslash"
         );
-        // A literal string does NOT process escapes, by TOML's definition.
+        // A literal string is not decoded.
         assert_eq!(
             toml_scalar_value(r" 'i18n\\bundles' ").as_deref(),
             Some(r"i18n\\bundles")

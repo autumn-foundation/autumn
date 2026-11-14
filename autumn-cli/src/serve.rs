@@ -193,13 +193,9 @@ fn run_lifecycle(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
         Some(ServeAction::Stop) => stop(opts),
         Some(ServeAction::Status) => status(opts),
         Some(ServeAction::Restart) => {
-            // A registered Windows service owns this project's lifecycle, so
-            // restart it through the Service Control Manager. The daemon path
-            // below would stop the service host (its app drains, the host reports
-            // `Stopped`) and then launch a DETACHED daemon outside the SCM —
-            // reporting a successful restart while leaving the service stopped,
-            // the replacement app unsupervised, and the next boot bringing up a
-            // second instance beside it.
+            // A registered Windows service is restarted through the SCM. The daemon
+            // path below would stop the service and launch a detached daemon outside
+            // it: unsupervised, and a second instance after the next boot.
             if let Some(outcome) =
                 crate::service::restart_registered(&project_identity(opts.package.as_deref()))
             {
@@ -211,67 +207,45 @@ fn run_lifecycle(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
                     }
                 };
             }
-            // `restart` is a fresh invocation, so `opts` reflects the restart
-            // command's flags — not the original `start`. Recover managed-PG mode
-            // and release mode from the running daemon's address file so a bare
-            // `restart` keeps the project data dir, the longer readiness budget,
-            // the optimized binary, and the matching profile defaults. Always
-            // relaunch in the background.
+            // `opts` holds the restart command's flags, not the original start's.
+            // Recover the running daemon's mode so a bare `restart` relaunches it
+            // the same way, always in the background.
             let running = running_daemon_addr(opts.package.as_deref());
-            // Recover managed-PG mode. A parseable address file is authoritative
-            // (respect an explicit `managed_pg = false` even if a `pg/PG_VERSION`
-            // from a prior bundled run still lingers). Only when there is no
-            // usable address file do we infer managed mode from an initialized
-            // cluster in the project data dir, so a bare `restart` after a crash
-            // keeps `AUTUMN_MANAGED_PG_DATA_DIR`/the long readiness budget.
+            // A parseable address file is authoritative, even over a lingering
+            // `pg/PG_VERSION`. Without one (e.g. after a crash), infer managed mode
+            // from an initialized cluster in the project data dir.
             let keep_managed = opts.bundled_pg
                 || running.as_ref().map_or_else(
                     || managed_cluster_present(opts.package.as_deref()),
                     |a| a.managed_pg,
                 );
-            // The address file is authoritative when present; only fall back to
-            // the `serve.mode` marker for release/profile when it is
-            // missing/corrupt. A best-effort marker left over from an older
-            // release run must not force a parseable dev daemon back to release.
+            // Fall back to the `serve.mode` marker only when the address file is
+            // missing or corrupt: a stale marker from an older release run must not
+            // force a dev daemon back to release.
             let recorded_mode = running_daemon_mode(opts.package.as_deref());
             let keep_release = opts.release
                 || running.as_ref().map_or_else(
                     || recorded_mode.as_ref().is_some_and(|m| m.release),
                     |a| a.release,
                 );
-            // Preserve the original daemon's profile: prefer one set on *this*
-            // restart's environment, else what the running daemon recorded —
-            // address file first, the mode marker only when there is no address
-            // file — so a bare `restart` doesn't silently fall back to `dev`.
+            // This shell's profile wins, else the recorded one, so a bare `restart`
+            // doesn't fall back to `dev`.
             let keep_profile = env_profile().or_else(|| {
                 running.as_ref().map_or_else(
                     || recorded_mode.as_ref().and_then(|m| m.profile.clone()),
                     |a| a.profile.clone(),
                 )
             });
-            // Preserve the original daemon's process role: an explicit `--role` on
-            // *this* restart wins, otherwise restore what the running daemon
-            // recorded. The role lives only in the `serve.mode` marker (not the
-            // address file), so a bare `restart` doesn't silently drop the daemon
-            // back to the combined default.
+            // An explicit `--role` wins, else the role recorded in `serve.mode` (the
+            // address file does not carry it), so a bare `restart` keeps the role.
             let keep_role = opts
                 .role
                 .clone()
                 .or_else(|| recorded_mode.as_ref().and_then(|m| m.role.clone()));
-            // Same for the queue pin (#1623), with the same precedence
-            // `keep_profile` uses just above: an explicit `--pin` on *this*
-            // restart wins (spelled `autumn serve --pin critical restart` — like
-            // `--role`, it is an argument of `serve`, not of `restart`), then the
-            // restart shell's own `AUTUMN_JOBS__PIN`, and only then what the
-            // running daemon recorded.
-            //
-            // Consulting the live environment before the recording matters:
-            // without it, re-pointing a tier by exporting a new
-            // `AUTUMN_JOBS__PIN` and running `restart` would be silently
-            // overridden by the pin recorded at the daemon's original start —
-            // and re-recorded, making the stale pin sticky forever. Restoring
-            // the recording is still what stops a bare `restart` from turning a
-            // pinned worker tier into an unpinned one that drains every queue.
+            // Queue pin (#1623): an explicit `--pin` (`autumn serve --pin x restart`)
+            // wins, then this shell's `AUTUMN_JOBS__PIN`, then the recorded pin.
+            // The environment comes before the recording so exporting a new pin and
+            // restarting takes effect; the recording keeps a bare `restart` pinned.
             let keep_pin = resolve_restart_pin(
                 opts.pin.clone(),
                 env_pin(),
@@ -286,11 +260,9 @@ fn run_lifecycle(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
                 pin: keep_pin,
                 ..opts.clone()
             };
-            // Stop using the *recovered* mode, not the bare restart flags: when
-            // `serve.addr` is missing/corrupt, `stop`'s budget falls back to
-            // recomputing from release/profile, and the restart shell's defaults
-            // would otherwise derive a short `dev` budget and SIGKILL a release
-            // daemon before it finishes draining.
+            // Stop with the recovered mode: without `serve.addr`, `stop` derives the
+            // budget from release/profile, and the bare flags would give a short
+            // `dev` budget that SIGKILLs a release daemon mid-drain.
             let _ = stop(&daemon_opts);
             start(&daemon_opts)
         }
@@ -511,21 +483,13 @@ fn confirmed_running(
         return false;
     }
     match (rec.start_time, process::process_start_time(rec.pid)) {
-        // Identity is known on both sides (Linux, Windows): trust the comparison
-        // and do *not* fall back to the endpoint — a reused PID with a different
-        // start time is stale even if some daemon happens to be listening.
+        // Start times known on both sides: conclusive, with no endpoint fallback. A
+        // reused PID is stale even if some daemon is listening.
         (Some(recorded), Some(current)) => recorded == current,
-        // Identity unknown (no recorded start time, or a platform like macOS
-        // that can't report one): a start still in progress means the live PID
-        // is our daemon binding its endpoint; otherwise confirm the PID actually
-        // owns the endpoint (SO_PEERCRED on Linux, else liveness) so a reused PID
-        // isn't accepted.
-        //
-        // The last arm covers a daemon we can see but not query — a Windows
-        // service running as Local System, read from the operator's ordinary
-        // shell. Calling that "stale" would report a running service as stopped
-        // and let `stop` delete its records; calling it "running" costs only that
-        // `stop` then tries and fails to kill it, and correctly refuses.
+        // Identity unknown: accept a start in progress, else require the PID to
+        // own the endpoint. A process we cannot query (a Windows service running
+        // as Local System) counts as running: calling it stale would let `stop`
+        // delete a live service's records.
         _ => {
             startup_in_progress
                 || endpoint_identity_matches(paths, rec.pid)
@@ -549,10 +513,8 @@ fn confirmed_running(
 fn lifecycle_target(paths: &RuntimePaths) -> Option<process::PidRecord> {
     let pidfile_rec = process::read_pidfile(&paths.pid_file());
     // A definitive socket owner (Linux `SO_PEERCRED`) is the live daemon. Prefer
-    // it over a parseable-but-*stale* pidfile (e.g. one overwritten/restored
-    // while the daemon is healthy) so a damaged pidfile doesn't make a running
-    // daemon unmanageable. Keep the pidfile record when it matches the owner so
-    // its recorded start time is retained.
+    // it over a stale pidfile so a damaged pidfile doesn't make a running daemon
+    // unmanageable.
     if let Some(owner) = endpoint_owner_pid(paths) {
         // Keep the pidfile record when it matches the live owner (retains start_time).
         if let Some(rec) = pidfile_rec
@@ -560,10 +522,9 @@ fn lifecycle_target(paths: &RuntimePaths) -> Option<process::PidRecord> {
         {
             return Some(rec);
         }
-        // Trust the socket owner over a missing/stale pidfile only when this
-        // project has daemon state corroborating it (a pidfile or address file).
-        // Without that, an unrelated same-user process that reused or squatted on
-        // the socket path must not be mistaken for our daemon and signalled.
+        // Trust the socket owner only when a pidfile or address file corroborates
+        // it, so a same-user process squatting on the socket path is never
+        // signalled.
         if pidfile_rec.is_some() || read_addr_file(paths).is_some() {
             return Some(process::PidRecord {
                 pid: owner,
@@ -576,9 +537,9 @@ fn lifecycle_target(paths: &RuntimePaths) -> Option<process::PidRecord> {
     if let Some(rec) = pidfile_rec {
         return Some(rec);
     }
-    // Last resort: the address file — but only when a peer-PID proves it owns the
-    // endpoint (it doesn't here, since `endpoint_owner_pid` was `None`), so this
-    // reports "not running" rather than risk signalling a reused PID.
+    // Last resort: the address file, only when a peer-PID proves it owns the
+    // endpoint. `endpoint_owner_pid` was `None` above, so this reports "not
+    // running" rather than risk signalling a reused PID.
     let addr = read_addr_file(paths)?;
     (endpoint_owner_pid(paths) == Some(addr.pid)).then_some(process::PidRecord {
         pid: addr.pid,
@@ -651,16 +612,14 @@ fn project_identity(package: Option<&str>) -> String {
 /// daemon started under one resolution is never orphaned by a later one.
 fn project_dir_hash(package: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
-    // NUL separates the two fields so no root path / package name pair can be
-    // confused for another (paths cannot contain NUL).
+    // NUL cannot appear in a path, so no (root, package) pair collides with another.
     let key = package.map_or_else(
         || canonical_cwd().display().to_string(),
         |pkg| format!("{}\0{pkg}", identity_root().display()),
     );
-    // A fixed SHA-256 over the key — `DefaultHasher` is explicitly not stable
-    // across std/toolchain versions, so a CLI upgrade while a daemon is running
-    // must not change the namespace (which would orphan it). First 4 bytes
-    // (8 hex) keep the resulting Unix socket path within `sun_path`.
+    // SHA-256, not `DefaultHasher`, which is not stable across toolchains: a CLI
+    // upgrade must not change the namespace and orphan a running daemon. 4 bytes
+    // (8 hex) keep the Unix socket path within `sun_path`.
     hex::encode(&Sha256::digest(key.as_bytes())[..4])
 }
 
@@ -707,20 +666,13 @@ fn workspace_anchor_from(start: &Path) -> Option<PathBuf> {
             nearest_manifest = Some(dir.to_path_buf());
         }
         match toml::from_str::<toml::Table>(&contents) {
-            // A nearer transiently-broken workspace root (the one being edited)
-            // takes precedence over an outer valid `[workspace]`: in a nested
-            // checkout the daemon was started under the inner root, so anchoring
-            // to the outer one would make lifecycle commands miss it.
+            // A nearer broken workspace root (mid-edit) beats an outer valid one: in
+            // a nested checkout the daemon was started under the inner root.
             Ok(table) if table.contains_key("workspace") => {
                 return broken_workspace_dir.or_else(|| Some(dir.to_path_buf()));
             }
-            // A *transiently-broken* workspace root: unparsable but still carrying
-            // the `[workspace]` header. Anchor to this exact dir (the nearest such
-            // root), not the topmost manifest in the ancestry — a higher unrelated
-            // `Cargo.toml` above it must not pull the anchor up to the outer
-            // project, or lifecycle commands would target a different runtime dir.
-            // An unrelated broken `Cargo.toml` (no `[workspace]`) is ignored so it
-            // can't hijack a standalone project's anchor.
+            // Unparsable but still carrying `[workspace]`: remember the nearest such
+            // dir. A broken manifest without `[workspace]` is ignored.
             Err(_) if contents.contains("[workspace]") => {
                 if broken_workspace_dir.is_none() {
                     broken_workspace_dir = Some(dir.to_path_buf());
@@ -750,10 +702,8 @@ fn start_daemon(opts: &ServeOptions) -> i32 {
         return 1;
     }
 
-    // Reject a second start while a live daemon holds the lock. Use the
-    // socket-confirmed identity check so a stale pidfile whose PID was reused by
-    // an unrelated process (notably on macOS, where start time isn't available)
-    // doesn't block a legitimate start.
+    // Socket-confirmed identity, so a stale pidfile whose PID was reused (notably
+    // on macOS, with no start time) doesn't block a legitimate start.
     if let Some(rec) = process::read_pidfile(&paths.pid_file())
         && confirmed_running(&rec, &paths, startup_in_progress(&paths))
     {
@@ -765,21 +715,13 @@ fn start_daemon(opts: &ServeOptions) -> i32 {
         return 1;
     }
 
-    // No live daemon owns this namespace (checked above), so a managed Postgres
-    // still bound to the data dir is an orphan from a crashed prior daemon —
-    // `postgresql_embedded` won't attach to it and the app's boot would fail.
-    // Reap it here, where the daemon lifecycle is known to be gone, rather than
-    // in the provider (which can't tell an orphan from a live direct-use app).
+    // No live daemon owns this namespace, so a managed Postgres still bound to the
+    // data dir is an orphan from a crashed daemon and would fail the app's boot.
+    // Reap it here: the provider can't tell an orphan from a live direct-use app.
     //
-    // Skip while another start holds a live startup lock: that concurrent start
-    // may already be *provisioning* this cluster (it took `serve.startlock`
-    // before writing `serve.pid`), and reaping would kill its postmaster. This
-    // losing start will be rejected by the startup-lock acquire below anyway.
-    //
-    // Also skip while a server is live on the socket: the pidfile-only check
-    // above misses a healthy daemon whose `serve.pid` is missing/corrupt, and
-    // reaping would cut that daemon off from its database before
-    // `launch_daemon_child`'s live-socket guard rejects this start.
+    // Skip while another start holds the startup lock (it may be provisioning
+    // this cluster), and while a server is live on the socket (a healthy daemon
+    // whose `serve.pid` is missing); this start is rejected later in both cases.
     if opts.bundled_pg && !startup_in_progress(&paths) && !forced_endpoint_is_live(&paths) {
         reap_managed_postgres(&paths);
     }
@@ -825,42 +767,22 @@ fn start_foreground(opts: &ServeOptions) -> i32 {
 /// runtime directories.
 fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions) -> Command {
     let mut cmd = Command::new(binary);
-    // `autumn serve` is the cluster *owner*: it must provision and supervise its
-    // own managed Postgres, never attach to someone else's. Clear any inherited
-    // `AUTUMN_MANAGED_PG_ATTACH_URL` (e.g. leaked from the launching shell or a
-    // prior task/build run) so the provider can't take the attach branch and
-    // leave the daemon recorded as managed-PG while it never starts/stops a
-    // cluster (and `stop()` no-ops because `attached` is set).
+    // `autumn serve` owns its managed Postgres. An inherited attach URL would make
+    // the provider attach instead, so the daemon would never start or stop a
+    // cluster while recorded as managed-PG.
     cmd.env_remove(MANAGED_PG_ATTACH_URL_ENV);
-    // `AUTUMN_DUMP_DATA_FLOW=1` is dispatched in `AppBuilder::run` *before* the
-    // server ever binds a listener, and `Command` inherits this process's
-    // environment. One left over in the launching shell would make the child
-    // print the data-flow manifest and exit 0 -- a `serve` that reports success
-    // and serves nothing (#1654 review round 5).
+    // One-shot modes dispatched in `AppBuilder::run` before the server binds. One
+    // left in the launching shell would make the child do that job and exit
+    // instead of serving.
     cmd.env_remove(crate::data_flow::DUMP_ENV);
-    // `AUTUMN_DUMP_AGENT_AUTHORITY=1` (#1691) sits one rung further up the same
-    // ladder, with the same consequence.
     cmd.env_remove(crate::agents::DUMP_ENV);
     cmd.env_remove(crate::graph::DUMP_ENV);
-    // Same hazard, sharper consequence (#1605). `AUTUMN_DB_RETENTION=report|purge`
-    // is the internal one-shot mode behind `autumn db retention`, and it is
-    // dispatched in `AppBuilder::run` *before* the server binds a listener. One
-    // left over in the launching shell -- from an earlier `autumn db retention
-    // --purge` in the same terminal, or a wrapping script -- would make
-    // `autumn serve` enforce the retention policy and exit instead of serving.
-    // Unlike a stray manifest dump, that silently DELETES data. The companion
-    // knobs go too: they are inert without the mode variable, but leaving a
-    // half-set internal protocol in a server's environment invites the next
-    // mode check to trip over it.
+    // An inherited `AUTUMN_DB_RETENTION=purge` (#1605) would delete data and exit.
     crate::db::retention::clear_inherited_one_shot_env(&mut cmd);
-    // Same for `autumn data capsule` (#1811): an inherited import mode would
-    // write records and exit instead of serving.
+    // An inherited capsule import mode (#1811) would write records and exit.
     crate::data_capsule::clear_inherited_one_shot_env(&mut cmd);
-    // For a workspace member selected with `-p`, run the child from the member's
-    // manifest dir so its `autumn.toml`/profile and asset dirs resolve correctly
-    // instead of the workspace-root CWD. Set both `current_dir` (covers CWD-
-    // relative assets) and `AUTUMN_MANIFEST_DIR` (the config loader's explicit
-    // override) so the member's config is loaded regardless of build mode.
+    // Run a `-p` workspace member from its manifest dir: `current_dir` for
+    // CWD-relative assets, `AUTUMN_MANIFEST_DIR` so the loader finds its config.
     if let Some(pkg) = opts.package.as_deref()
         && let Some(dir) = crate::dev::find_manifest_dir(pkg)
     {
@@ -870,33 +792,22 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     if opts.daemon
         && let Some(paths) = paths
     {
-        // The app creates this file right after startup completes; the
-        // supervisor polls it to detect readiness without an HTTP probe, then
-        // reads back the drain budget and the address the app actually bound.
+        // The supervisor polls this file for readiness, then reads back the drain
+        // budget and the address the app bound.
         cmd.env(SERVE_READY_FILE_ENV, paths.ready_file());
-        // The Unix-domain socket is the daemon's private transport (for
-        // address-file discovery and the thin client). Only force it for daemon
-        // starts: a plain foreground `autumn serve` must stay on its configured
-        // `server.host`/`port`, so it remains reachable at the expected TCP
-        // address like any production server.
-        //
-        // Windows has no Unix socket to force, so a Windows daemon keeps its
-        // configured `server.host`/`port` — which is also what a self-hosting
-        // operator wants — and reports the bound address back through the
-        // readiness file instead of being told it in advance.
+        // Only a daemon is forced onto the Unix socket; a foreground server stays on
+        // its configured `server.host`/`port`. Windows has no socket to force: the
+        // daemon keeps its configured address and reports it in the readiness file.
         #[cfg(unix)]
         {
-            // The standard nested-config env var feeds the default loader. We
-            // also set a dedicated out-of-band override the framework re-applies
-            // *after* config loading, so a custom `with_config_loader` that
-            // ignores env can't drop the daemon's socket and strand it on TCP.
+            // The second variable is re-applied after config loading, so a custom
+            // `with_config_loader` that ignores env can't strand the daemon on TCP.
             cmd.env("AUTUMN_SERVER__UNIX_SOCKET", paths.socket_file());
             cmd.env("AUTUMN_SERVE_FORCE_UNIX_SOCKET", paths.socket_file());
         }
-        // Where there is no `SIGTERM` to send, `autumn serve stop` asks for the
-        // drain by creating this file — the same graceful path a signal takes,
-        // rather than a `TerminateProcess` that skips `on_shutdown` hooks and
-        // orphans a managed Postgres child (#1639).
+        // Without `SIGTERM`, `stop` requests the drain by creating this file. A
+        // `TerminateProcess` would skip `on_shutdown` hooks and orphan a managed
+        // Postgres (#1639).
         #[cfg(not(unix))]
         cmd.env(autumn_web::app::SHUTDOWN_SIGNAL_FILE_ENV, paths.stop_file());
     }
@@ -905,31 +816,24 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     {
         cmd.env(MANAGED_PG_DATA_DIR_ENV, paths.pg_data_dir());
     }
-    // Select the process role for the spawned app. A worker-role daemon still
-    // binds its socket/port for liveness probes, so the daemon plumbing above
-    // needs no special-casing — just forward the role the app reads at startup.
+    // A worker-role daemon still binds its socket/port for liveness probes, so the
+    // daemon plumbing above needs no special case.
     if let Some(role) = &opts.role {
         cmd.env("AUTUMN_ROLE", role);
     }
-    // Queue pinning (#1623, AC3). The app already reads a comma-separated
-    // `AUTUMN_JOBS__PIN` in `Config::apply_jobs_env_overrides`, so the flag
-    // forwards that exact spelling rather than inventing a second one. An empty
-    // pin leaves the variable untouched (AC4): the child then reads `[jobs] pin`
-    // from its own config, and an inherited `AUTUMN_JOBS__PIN` still applies.
+    // Queue pinning (#1623), in the comma-separated form
+    // `Config::apply_jobs_env_overrides` reads. `None` leaves the variable alone;
+    // `Some(vec![])` sets it empty, which explicitly unpins.
     if let Some(pin) = &opts.pin {
         cmd.env("AUTUMN_JOBS__PIN", pin.join(","));
     }
-    // Restore an explicit profile (set by `restart`) so the relaunched daemon
-    // loads the same config as the original even when the restart shell didn't
-    // set `AUTUMN_ENV`.
+    // `restart` sets an explicit profile to restore the original daemon's config.
     if let Some(profile) = &opts.profile {
         cmd.env("AUTUMN_ENV", profile);
     } else if opts.release && env_profile().is_none() {
-        // A `--release` serve is a production run, and `stop`/the address file
-        // already treat release as the `prod` profile. Without this the child's
-        // config loader would default to `dev` (CSRF/HSTS off, ~1s shutdown
-        // budget). Mirror `effective_profile(None, true)`; don't override an
-        // `AUTUMN_ENV`/`AUTUMN_PROFILE` the caller already set.
+        // `--release` is a production run, as `stop` and the address file assume.
+        // Otherwise the child would default to `dev` (CSRF/HSTS off, ~1s shutdown
+        // budget). Mirrors `effective_profile(None, true)`.
         cmd.env("AUTUMN_ENV", "prod");
     }
     cmd
@@ -947,8 +851,8 @@ fn run_foreground(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptio
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // `exec` only returns on failure; on success this process *becomes* the
-        // app, so termination signals reach it directly.
+        // `exec` returns only on failure; on success this process becomes the app,
+        // so termination signals reach it directly.
         let err = cmd.exec();
         eprintln!("\u{2717} Failed to start {}: {err}", binary.display());
         1
@@ -978,12 +882,8 @@ fn create_private_log(path: &Path) -> std::io::Result<std::fs::File> {
         options.mode(0o600);
     }
     let file = options.open(path)?;
-    // `mode(0o600)` only applies when *creating* the file; an existing log
-    // (from an earlier version or manual creation) keeps its old, possibly
-    // world-readable mode, so tighten it explicitly after opening — and fail
-    // *closed* if we can't. The child's stdout/stderr (request data, panics,
-    // diagnostics) goes here, so in a shared log dir we must not start while it
-    // stays readable to other users.
+    // `mode(0o600)` applies only on creation. Tighten an existing log too, and
+    // fail closed if that fails.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1006,9 +906,8 @@ fn launch_daemon_child(
     socket: &Path,
     working_dir: Option<&Path>,
 ) -> Result<(std::process::Child, PathBuf), String> {
-    // A live listener already owning the endpoint means a daemon is serving here
-    // even if the pidfile is missing or stale; refuse so readiness can't latch
-    // onto the pre-existing listener (mirrors the pidfile guard).
+    // A live listener means a daemon is serving even if the pidfile is missing or
+    // stale. Refuse, so readiness can't latch onto it.
     if let Some(endpoint) = forced_endpoint(paths)
         && endpoint.is_live()
     {
@@ -1019,9 +918,8 @@ fn launch_daemon_child(
         ));
     }
 
-    // Separate startup lock (claimed with our own pid) so two concurrent starts
-    // can't both spawn — but it is NOT the pidfile, so a concurrent `stop`/
-    // `status` during startup never signals the launcher.
+    // A startup lock separate from the pidfile: two starts can't both spawn, and a
+    // concurrent `stop` never signals the launcher.
     let start_lock = start_lock_path(paths);
     match process::acquire_pidfile(&start_lock, std::process::id()) {
         Ok(()) => {}
@@ -1052,19 +950,15 @@ fn launch_daemon_child(
         return Err("autumn serve: cannot duplicate log handle".to_owned());
     };
 
-    // Clear any readiness file left by a previous run so `wait_for_ready` only
-    // returns on the file the child we are about to spawn creates — and reads
-    // back THIS child's budget and bound address, not the last one's.
+    // A stale readiness file would report ready early, with the last run's budget
+    // and address.
     let _ = std::fs::remove_file(paths.ready_file());
-    // Clear a stop request left by a crashed or force-killed predecessor. The
-    // app drains as soon as it sees this file, so a stale one would make the
-    // daemon we are about to start shut down the moment it boots.
+    // A stale stop request would make the new daemon drain as soon as it boots.
     process::clear_stop_request(&paths.stop_file());
 
     let mut cmd = base_command(binary, Some(paths), opts);
-    // The Service Control Manager starts its hosted process from
-    // `C:\Windows\System32`, so the app would look for `autumn.toml` and its
-    // asset dirs there. Point it at the project the install recorded.
+    // The SCM starts its process from `C:\Windows\System32`; point the app at the
+    // project the install recorded.
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
         cmd.env("AUTUMN_MANIFEST_DIR", dir);
@@ -1085,21 +979,15 @@ fn launch_daemon_child(
     };
     let pid = child.id();
 
-    // The live-endpoint guard at the top proved no daemon is serving here, and
-    // we hold the startup lock, so any existing pidfile is from a daemon that
-    // has already exited. On platforms that don't record a process start time
-    // (macOS/BSD, or an older pidfile), `acquire_pidfile` can't tell that
-    // crashed daemon from an unrelated process that reused its PID, and would
-    // reject the start as `AlreadyRunning` — permanently blocking restart until
-    // the pidfile is deleted by hand. Since the endpoint is provably dead, clear
-    // such an unverifiable pidfile so the acquire below can reclaim it.
+    // The endpoint is dead and we hold the startup lock, so any pidfile is from an
+    // exited daemon. Without a start time, `acquire_pidfile` can't tell it from a
+    // reused PID and would refuse every start, so clear it.
     if process::read_pidfile(&paths.pid_file()).is_some_and(|r| r.start_time.is_none()) {
         let _ = std::fs::remove_file(paths.pid_file());
     }
 
-    // Record the real pidfile (child's pid). Keep the startup lock held — the
-    // caller releases it only after the daemon is ready, so a concurrent start
-    // can't spawn a second child while this one is still binding.
+    // The startup lock stays held until the caller sees the daemon ready, so a
+    // concurrent start can't spawn a second child while this one is binding.
     if let Err(e) = process::acquire_pidfile(&paths.pid_file(), pid) {
         let message = match e {
             AcquireError::AlreadyRunning(existing) => {
@@ -1129,8 +1017,7 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
             println!("autumn serve: started (pid {pid}) on {where_it_serves}");
             println!("  address file: {}", paths.addr_file().display());
             println!("  logs: {}", paths.log_file().display());
-            // Detach: leave the running child to be reparented to init on exit.
-            // (Dropping the handle does not signal or reap the live process.)
+            // Dropping the handle neither signals nor reaps the child.
             drop(child);
             0
         }
@@ -1175,23 +1062,16 @@ pub fn start_supervised(
     let (mut child, start_lock) = launch_daemon_child(binary, paths, opts, &socket, working_dir)?;
     let pid = child.id();
     let log_path = paths.log_file();
-    // The startup lock is held until the daemon is ready, then released here on
-    // every path so a concurrent start can't race in during the bind window.
     let release_lock = || {
         let _ = std::fs::remove_file(&start_lock);
     };
-    // Everything a failed start has to undo, in one place so no exit path
-    // forgets a piece.
     let abandon = |child: &mut std::process::Child| {
-        // Kill the whole tree: a startup that timed out may have spawned
-        // children that `Child::kill()` alone would leave orphaned.
+        // Kill the whole tree: a timed-out startup may have spawned children.
         process::force_kill_group(pid);
         let _ = child.kill();
         let _ = child.wait();
-        // A managed Postgres puts itself outside the daemon's group/job, so the
-        // sweep above can't reach it and no `serve.addr` was written for a later
-        // `stop` to consult. Reap it directly via `postmaster.pid` so a failed
-        // start doesn't strand the cluster on the data dir/port.
+        // A managed Postgres sits outside the daemon's group/job and no
+        // `serve.addr` exists yet, so reap it directly.
         if opts.bundled_pg {
             reap_managed_postgres(paths);
         }
@@ -1209,8 +1089,7 @@ pub fn start_supervised(
         ));
     }
     if let Err(e) = write_addr_file(paths, pid, opts) {
-        // Without the discovery file the daemon is unreachable to clients;
-        // treat it like the pidfile failure — stop the child and fail.
+        // Without the discovery file clients can't reach the daemon.
         let message = format!(
             "autumn serve: cannot write address file {}: {e}",
             paths.addr_file().display()
@@ -1331,7 +1210,7 @@ pub fn env_profile_for_record() -> Option<String> {
 #[cfg(unix)]
 fn detach(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // New process group: terminal job-control signals (Ctrl-C) won't reach it.
+    // A new process group, so the terminal's Ctrl-C doesn't reach it.
     cmd.process_group(0);
 }
 
@@ -1361,7 +1240,7 @@ fn wait_for_ready(ready_file: &Path, child: &mut std::process::Child, timeout: D
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            // Child exited/crashed before signalling readiness — fail fast.
+            // Exited before signalling readiness.
             Ok(Some(_)) | Err(_) => return false,
             Ok(None) => {}
         }
@@ -1410,11 +1289,9 @@ fn parse_ready_payload(contents: &str) -> (Option<u64>, Option<DaemonEndpoint>) 
 /// discovery file is unreachable to thin clients/agents, so the caller treats
 /// this as a failed start.
 fn write_addr_file(paths: &RuntimePaths, pid: u32, opts: &ServeOptions) -> std::io::Result<()> {
-    // Prefer where the child says it actually bound: `server.port = 0` resolves
-    // in the kernel, a socket adopted from a predecessor keeps that process's
-    // port, and on Windows the CLI never chose the address at all. Fall back to
-    // the endpoint the CLI forced, which covers an app built before the address
-    // line existed — and is `None` on Windows, where nothing else knows it.
+    // Prefer where the child says it bound: `server.port = 0` resolves in the
+    // kernel, an adopted socket keeps its predecessor's port, and on Windows the
+    // CLI never chose the address. The forced endpoint covers an older app.
     let endpoint = child_reported_endpoint(paths)
         .or_else(|| forced_endpoint(paths))
         .ok_or_else(|| {
@@ -1433,16 +1310,13 @@ fn write_addr_file(paths: &RuntimePaths, pid: u32, opts: &ServeOptions) -> std::
             .map_or(0, |d| d.as_secs()),
         managed_pg: opts.bundled_pg,
         release: opts.release,
-        // Prefer the budget the child reported in its readiness file (its own
-        // *resolved* config, including any custom `with_config_loader`); fall
-        // back to reconstructing it from the daemon's env/profile only if the
-        // child didn't report one. Either way `stop` reads it from here so it
-        // never re-derives a budget from a different shell.
+        // The child's reported budget reflects a custom `with_config_loader`;
+        // reconstruct it only when the child didn't report one. `stop` reads it
+        // from here, never re-deriving it from a different shell.
         stop_budget_secs: Some(
             child_reported_budget(paths).unwrap_or_else(|| resolved_stop_budget_secs(opts)),
         ),
-        // Record the explicit profile (a `restart` override, else this shell's
-        // env) so a later `restart` can restore it.
+        // A `restart` override, else this shell's env.
         profile: opts.profile.clone().or_else(env_profile),
     };
     let path = paths.addr_file();
@@ -1452,10 +1326,8 @@ fn write_addr_file(paths: &RuntimePaths, pid: u32, opts: &ServeOptions) -> std::
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
-    // Persist release/profile in a separate marker too, so a later `restart` can
-    // recover them even if `serve.addr` is deleted/corrupted while the daemon is
-    // running. Best-effort: the address file is the primary record, so a failure
-    // here doesn't fail the start.
+    // A separate marker lets `restart` recover the mode if `serve.addr` is lost.
+    // Best-effort: the address file is the primary record.
     write_mode_file(paths, opts);
     Ok(())
 }
@@ -1487,13 +1359,9 @@ fn write_mode_file(paths: &RuntimePaths, opts: &ServeOptions) {
     let mode = ModeFile {
         release: opts.release,
         profile: opts.profile.clone().or_else(env_profile),
-        // Persist the *effective* role: the explicit `--role`, else the
-        // `AUTUMN_ROLE` an env-selected daemon inherited, so a later bare
-        // `restart` recovers it instead of dropping back to combined.
+        // Record the effective role and pin, including env-selected ones, so a
+        // bare `restart` keeps them (#1623).
         role: effective_role_from(opts.role.clone(), std::env::var("AUTUMN_ROLE").ok()),
-        // Persist the *effective* queue pin for the same reason (#1623): a bare
-        // `restart` must not silently relaunch a pinned worker tier as an
-        // unpinned one that drains everything.
         pin: effective_pin_from(opts.pin.clone(), std::env::var("AUTUMN_JOBS__PIN").ok()),
     };
     let Ok(toml) = toml::to_string(&mode) else {
@@ -1524,16 +1392,12 @@ fn stop(opts: &ServeOptions) -> i32 {
         println!("autumn serve: not running");
         return 0;
     };
-    // Read the address file up front: even when the app PID is stale, a managed
-    // cluster it launched can still be alive (Postgres `setsid`s out of the
-    // daemon's process group, so it survives the app's crash/kill).
+    // Even with a stale app PID, its managed Postgres can still be alive: it
+    // `setsid`s out of the daemon's process group.
     let addr = read_addr_file(&paths);
     if !confirmed_running(&rec, &paths, startup_in_progress(&paths)) {
-        // A concurrent `autumn serve --daemon` can reclaim this stale pidfile and
-        // bring up a successor between the check above and the cleanup below.
-        // Bail out (touching nothing) if the pidfile no longer records `rec`, a
-        // start is now in progress, or the socket went live — otherwise we'd
-        // delete the successor's state and reap its just-started Postgres.
+        // A concurrent start may have brought up a successor since the check
+        // above. Touch nothing if so, or we'd delete its state and its Postgres.
         if process::read_pidfile(&paths.pid_file()).is_some_and(|r| r.pid != rec.pid)
             || startup_in_progress(&paths)
             || forced_endpoint_is_live(&paths)
@@ -1541,13 +1405,9 @@ fn stop(opts: &ServeOptions) -> i32 {
             println!("autumn serve: not running (a newer daemon has since started)");
             return 0;
         }
-        // The daemon is gone, but if it owned a managed cluster reap that too —
-        // otherwise a crash before `stop` leaves Postgres holding the data
-        // dir/port until manual cleanup. Reap when the address file says managed
-        // *or* is absent (a `--bundled-pg` daemon still in `setup_database` may
-        // have started the postmaster before writing `serve.addr`); the reaper
-        // is a no-op when there's no `postmaster.pid`, so this is safe for
-        // non-managed daemons too.
+        // Reap a managed cluster the dead daemon left. An absent address file
+        // counts: a daemon can start the postmaster before writing `serve.addr`.
+        // Without a `postmaster.pid` the reaper is a no-op.
         if addr.as_ref().is_none_or(|a| a.managed_pg) {
             reap_managed_postgres(&paths);
         }
@@ -1556,16 +1416,11 @@ fn stop(opts: &ServeOptions) -> i32 {
         return 0;
     }
 
-    // Prefer the budget the daemon recorded at start (resolved from its own
-    // env/profile); fall back to recomputing it (release flag + config) only for
-    // daemons started before that field was recorded.
     let recorded_release = addr.as_ref().is_some_and(|a| a.release);
     let recorded_budget = addr.as_ref().and_then(|a| a.stop_budget_secs);
-    // How to ask. Unix sends `SIGTERM`; Windows has none, so the daemon was
-    // started watching `serve.stop` and creating it requests the identical
-    // graceful drain — readiness flip, prestop grace, in-flight drain, then
-    // `on_shutdown` hooks. Either way `stop_record` escalates to a force-kill of
-    // the process tree only once the recorded budget expires.
+    // Unix sends `SIGTERM`. Windows has none, so creating `serve.stop` requests
+    // the same graceful drain. Either way the tree is force-killed only once the
+    // budget expires.
     let stop_file = paths.stop_file();
     #[cfg(unix)]
     let request = {
@@ -1581,10 +1436,8 @@ fn stop(opts: &ServeOptions) -> i32 {
     );
     match &outcome {
         process::StopOutcome::Drained => {}
-        // Killed after it missed its budget, or without ever being asked. Either
-        // way its `on_shutdown` hooks may not have run, so say so rather than
-        // print a bare "stopped" — a managed cluster left holding its data dir
-        // is exactly what the operator needs to know about.
+        // Force-killed: its `on_shutdown` hooks may not have run, so tell the
+        // operator rather than print a bare "stopped".
         process::StopOutcome::Escalated => eprintln!(
             "autumn serve: the daemon (pid {}) did not finish draining within its \
              budget and was force-stopped. Its shutdown hooks may not have run.",
@@ -1597,9 +1450,8 @@ fn stop(opts: &ServeOptions) -> i32 {
             rec.pid
         ),
         process::StopOutcome::Failed => {
-            // Still alive and we couldn't stop it (e.g. owned by another user).
-            // Do NOT remove its state or report success: that would orphan a
-            // running daemon and lie to scripts.
+            // Still alive (e.g. owned by another user). Removing its state or
+            // reporting success would orphan a running daemon.
             eprintln!(
                 "autumn serve: could not stop the daemon (pid {}); it may be owned \
                  by another user or unresponsive. Leaving its state in place.",
@@ -1608,23 +1460,15 @@ fn stop(opts: &ServeOptions) -> i32 {
             return 1;
         }
     }
-    // A concurrent `start` can reclaim the now-stale pidfile and bring up a
-    // successor (even a new managed cluster on the same data dir) while we were
-    // draining the old daemon. If the pidfile no longer records the pid we just
-    // stopped, that successor owns this namespace — leave its Postgres and its
-    // pid/addr/ready files alone instead of reaping/removing them.
+    // A concurrent start may have brought up a successor while we drained. If the
+    // pidfile names another pid, leave its Postgres and state files alone.
     if process::read_pidfile(&paths.pid_file()).is_some_and(|r| r.pid != rec.pid) {
         println!("autumn serve: stopped (a newer daemon has since started)");
         return 0;
     }
-    // For a managed-Postgres daemon, reap the cluster too: the app's `on_shutdown`
-    // hook can be cancelled when its drain budget is exhausted (or skipped on a
-    // forced exit), and Postgres `setsid`s itself so a process-group kill won't
-    // reach it. Stop it directly via its `postmaster.pid` so it doesn't keep
-    // holding the data dir/port after `stop` reports success. Reap when the
-    // address file says managed *or* is absent (a daemon stopped mid-boot, before
-    // `serve.addr` was written, can still have a live postmaster); the reaper is
-    // a no-op without a `postmaster.pid`.
+    // The app's `on_shutdown` hook may not have stopped Postgres (budget exhausted
+    // or forced exit), and a group kill can't reach it after `setsid`. An absent
+    // address file counts: a daemon stopped mid-boot may have a live postmaster.
     if addr.as_ref().is_none_or(|a| a.managed_pg) {
         reap_managed_postgres(&paths);
     }
@@ -1644,9 +1488,8 @@ fn stop(opts: &ServeOptions) -> i32 {
 fn live_postmaster_pid(data_dir: &Path) -> Option<u32> {
     let contents = std::fs::read_to_string(data_dir.join("postmaster.pid")).ok()?;
     let lock = PostmasterLock::parse(&contents)?;
-    // The file says which data dir it describes; require it to be ours. Portable
-    // (Windows exposes no process cwd), and stronger than the cwd check it
-    // replaces because it holds even for a postmaster we cannot open.
+    // The file names its data dir; require ours. Portable (Windows exposes no
+    // process cwd), and it holds even for a postmaster we cannot open.
     if !lock.describes(data_dir) {
         return None;
     }
@@ -1656,17 +1499,16 @@ fn live_postmaster_pid(data_dir: &Path) -> Option<u32> {
     if process::process_command_name(lock.pid).is_some_and(|name| name != "postgres") {
         return None;
     }
-    // Bind the PID to *this* postmaster. Without it a recycled PID whose image
-    // happens to be named `postgres` is signalled and force-killed — and the
-    // signal goes through a named pipe whose server could be a squatter, from a
-    // reaper that runs as Local System inside the service host.
+    // Bind the PID to this postmaster by start time, so a recycled PID that is
+    // also named `postgres` is not signalled and force-killed (the reaper can run
+    // as Local System inside a service host).
     if let Some(recorded) = lock.start_epoch_secs
         && let Some(live) = process::process_start_epoch_secs(lock.pid)
         && live.abs_diff(recorded) > POSTMASTER_START_SKEW_SECS
     {
         return None;
     }
-    // Belt and braces where the platform still offers it.
+    // A postmaster `chdir`s to its data dir; check that where the OS exposes cwd.
     if let Some(cwd) = process::process_cwd(lock.pid) {
         let same_dir = std::fs::canonicalize(&cwd)
             .ok()
@@ -1745,11 +1587,9 @@ impl PostmasterLock {
 /// when the cluster already stopped cleanly (pidfile absent or postmaster gone).
 fn reap_managed_postgres(paths: &RuntimePaths) {
     let data_dir = paths.pg_data_dir();
-    // Whether or not a postmaster is still up, drop the published URL: this
-    // reaper bypasses `ManagedPostgresPoolProvider::stop()` (the only path that
-    // normally removes it), so a leftover `.autumn-pg-url` could make a later
-    // `task`/`build` attach to a dead — or, if the port was reused, foreign —
-    // endpoint instead of starting its own cluster.
+    // Always drop the published URL: this bypasses the provider's `stop()`, and a
+    // leftover `.autumn-pg-url` would make a later `task`/`build` attach to a dead
+    // or foreign endpoint.
     let url_file = data_dir
         .parent()
         .unwrap_or(&data_dir)
@@ -1780,43 +1620,30 @@ pub struct ManagedPgEnv {
 /// and, when a reachable cluster is published, its attach URL.
 #[must_use]
 pub fn managed_pg_env(package: Option<&str>) -> Option<ManagedPgEnv> {
-    // Respect an explicit operator override: if the environment already pins the
-    // managed-PG data dir (e.g. a CI/ops run targeting an isolated cluster), don't
-    // clobber it or redirect the run to the CLI's platform cluster. Returning
-    // `None` leaves the child to inherit the caller's `AUTUMN_MANAGED_PG_DATA_DIR`.
+    // An operator-set data dir wins; the child inherits it.
     if std::env::var_os(MANAGED_PG_DATA_DIR_ENV).is_some() {
         return None;
     }
     let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
     let data_dir = paths.pg_data_dir();
 
-    // Only attach when a live postmaster actually owns this data dir. The identity
-    // guard in `live_postmaster_pid` (PID alive + process is `postgres` + its cwd
-    // is this data dir, where observable) prevents trusting a stale `.autumn-pg-url`
-    // whose old random port was reused by a foreign listener — a bare TCP probe
-    // can't tell our cluster from a stranger.
+    // Attach only when a live postmaster owns this data dir: a bare TCP probe can't
+    // tell our cluster from a foreign listener on a reused port.
     if live_postmaster_pid(&data_dir).is_some() {
-        // A live postmaster holds the dir. Attach only when its published URL is
-        // actually reachable; otherwise don't point the child at the *locked* dir
-        // (URL missing/unpublished, or a best-effort publish failure) — starting a
-        // second postmaster there would deadlock. Let it use its own default.
+        // Without a reachable URL, keep the child off the locked dir: a second
+        // postmaster there would deadlock.
         return reachable_published_url(&data_dir).map(|url| ManagedPgEnv {
             data_dir,
             attach_url: Some(url),
         });
     }
 
-    // A daemon start is in flight (the startup lock is held by a live launcher)
-    // but it hasn't started its postmaster or published a URL yet — there's no
-    // `postmaster.pid` to catch above. Sharing the data dir now would let this
-    // run `initdb`/start against the directory the daemon is provisioning and
-    // corrupt or deadlock it, so fall back to the child's own default cluster.
+    // A daemon start may be provisioning the data dir before any `postmaster.pid`
+    // exists; sharing it now could corrupt or deadlock it.
     if startup_in_progress(&paths) {
         return None;
     }
 
-    // Nothing holds the data dir: safe to share its location so this run and a
-    // future `serve` use the same cluster.
     Some(ManagedPgEnv {
         data_dir,
         attach_url: None,
@@ -1828,9 +1655,8 @@ pub fn managed_pg_env(package: Option<&str>) -> Option<ManagedPgEnv> {
 /// the data dir, then confirms a live postmaster answers there so a stale
 /// `.autumn-pg-url` (crash / PID reuse) can't make a run attach to a dead cluster.
 fn reachable_published_url(data_dir: &Path) -> Option<String> {
-    // The provider publishes the URL beside the data dir. Keep this filename in
-    // sync with `autumn_web::managed_pg::PUBLISHED_URL_FILE` (the CLI doesn't
-    // build the `managed-pg` feature, so it can't reference the const).
+    // Keep in sync with `autumn_web::managed_pg::PUBLISHED_URL_FILE`; the CLI
+    // doesn't build `managed-pg`, so it can't reference the const.
     let url_file = data_dir.parent().unwrap_or(data_dir).join(".autumn-pg-url");
     let contents = std::fs::read_to_string(url_file).ok()?;
     let url = contents.trim();
@@ -1861,7 +1687,7 @@ fn published_url_reachable(url: &str) -> bool {
 fn pg_url_host_port(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://")?.1;
     let authority = after_scheme.split(['/', '?']).next()?;
-    // Drop any `user:pass@` userinfo (split at the last '@' before the host).
+    // Split at the last '@' to drop `user:pass@` userinfo.
     let hostport = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
     let (_, port) = hostport.rsplit_once(':')?;
     if port.parse::<u16>().is_err() {
@@ -2060,9 +1886,8 @@ pub fn resolve_shutdown_budget_from(
         }
     }
 
-    // autumn-<profile>.toml [server] overrides. Only the first existing file is
-    // loaded, in the app loader's preference order (the explicitly-selected
-    // spelling first, else the canonical name), so we match the daemon's budget.
+    // autumn-<profile>.toml [server] overrides: only the first existing file, in
+    // the app loader's order, so the budget matches the daemon's.
     if let Some(prof) = profile {
         for name in profile_file_lookup(prof) {
             if let Ok(contents) =
@@ -2075,9 +1900,8 @@ pub fn resolve_shutdown_budget_from(
         }
     }
 
-    // Env overrides win (highest priority; read identically by the daemon). A
-    // malformed or blank value is ignored rather than collapsing the budget to
-    // zero, which would hard-kill the app instantly.
+    // Env overrides win. A malformed or blank value is ignored rather than zeroing
+    // the budget, which would hard-kill the app instantly.
     if let Some(v) = env_u64_from(env, "AUTUMN_SERVER__PRESTOP_GRACE_SECS") {
         prestop = v;
     }
@@ -2196,19 +2020,14 @@ fn cleanup(paths: &RuntimePaths, socket: &Path) {
 #[cfg(unix)]
 fn remove_socket_if_not_live(socket: &Path) {
     use std::os::unix::fs::FileTypeExt;
-    // Not a socket, or missing/unreadable: leave it untouched (never clobber a
-    // regular file we didn't create).
     let Ok(meta) = std::fs::symlink_metadata(socket) else {
         return;
     };
     if !meta.file_type().is_socket() {
         return;
     }
-    // Reclaim only a provably-stale socket: a connect refused with no listener
-    // (`ECONNREFUSED`) or whose path vanished (`NotFound`). A successful connect
-    // (live listener) or `EACCES`/`EPERM` (a mode/ACL-restricted socket whose
-    // liveness we can't prove) is left alone, mirroring the app's bind-path
-    // refusal so we never unlink a service that's still reachable to someone.
+    // Reclaim only a provably stale socket (`ECONNREFUSED` or `NotFound`). A live
+    // listener, or `EACCES`/`EPERM` where liveness can't be proven, is left alone.
     if std::os::unix::net::UnixStream::connect(socket).is_err_and(|e| {
         matches!(
             e.kind(),
@@ -2242,11 +2061,8 @@ mod tests {
 
     // ── Readiness protocol and the daemon endpoint (issue #1639) ───────────
     //
-    // On Unix the CLI chooses the daemon's endpoint (the socket path it forces
-    // on the child), so it is known before the daemon exists. On Windows the app
-    // binds its configured address and reports back through the readiness file,
-    // and this is the parser that reads it. Compiled and tested on every
-    // platform so the Windows arm is not the one nobody exercises.
+    // Windows daemons report their bound address through the readiness file.
+    // These run on every platform so that path is exercised off Windows too.
 
     #[test]
     fn ready_payload_round_trips_the_runtime_writer() {
@@ -2376,9 +2192,8 @@ mod tests {
 
     // ── PostgreSQL lock file (issue #1639) ─────────────────────────────────
     //
-    // The reaper signals and force-kills the PID this file names, from a path
-    // that runs as Local System under a registered service. Binding that PID to
-    // *this* cluster is what stops a recycled one being hit.
+    // The reaper force-kills the PID this file names, so it must be bound to
+    // *this* cluster, never a recycled PID.
 
     #[test]
     fn a_postmaster_lock_reads_pid_data_dir_and_start_time() {
@@ -2431,9 +2246,8 @@ mod tests {
 
     #[test]
     fn a_daemon_start_hands_the_child_its_readiness_file() {
-        // The readiness file is the whole startup handshake — and on Windows the
-        // only channel that reports the bound address — so a daemon start must
-        // always pass it, on every platform.
+        // The readiness file is the startup handshake, and on Windows the only
+        // channel that reports the bound address.
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_base(dir.path(), "proj");
         let opts = ServeOptions {
@@ -2493,9 +2307,7 @@ mod tests {
 
     #[test]
     fn daemon_refusal_names_the_platform_and_the_native_alternative() {
-        // Unix and Windows both run the lifecycle natively (#1639), so this
-        // message is for whatever is left. A developer who hits it needs to know
-        // foreground `autumn serve` still works before concluding nothing does.
+        // A developer who hits this needs to know foreground `autumn serve` works.
         let message = daemon_unsupported_message();
         assert!(message.contains(std::env::consts::OS), "{message}");
         assert!(
@@ -2506,9 +2318,7 @@ mod tests {
 
     #[test]
     fn daemon_refusal_does_not_send_a_windows_developer_to_wsl2() {
-        // The refusal predates #1639, when the lifecycle was Tier 2 on Windows.
-        // Pointing at WSL2 now would send a Windows operator away from a journey
-        // that runs natively on the machine they are already on.
+        // The lifecycle runs natively on Windows (#1639); WSL2 is not needed.
         let message = daemon_unsupported_message();
         assert!(!message.contains("WSL2"), "{message}");
         assert!(!message.contains("Tier 2"), "{message}");
@@ -2531,8 +2341,7 @@ mod tests {
 
     #[test]
     fn addr_file_release_defaults_false_for_legacy_files() {
-        // Address files written before the `release` field omit it; parsing must
-        // not fail and must default to false.
+        // Files written before the `release` field omit it.
         let legacy = "pid = 7\ntransport = \"unix\"\naddress = \"/tmp/s.sock\"\n\
                       started_at = 1700000000\nmanaged_pg = false\n";
         let parsed = AddrFile::parse(legacy).expect("parse legacy addr file");
@@ -2835,12 +2644,9 @@ mod tests {
 
     #[test]
     fn shutdown_budget_consults_an_injected_env_source() {
-        // `autumn dev` injects a project `.env` into the app child but never
-        // loads it into its own process environment, so a budget resolved
-        // against `std::env` alone misses an `AUTUMN_SERVER__*` override the
-        // child will actually honor — and the parent then force-kills the app
-        // mid-shutdown (#1616, Codex round 2). The resolver therefore takes its
-        // environment as a parameter.
+        // `autumn dev` passes a `.env` to the child without loading it itself, so
+        // the resolver must see that override or the parent force-kills the app
+        // mid-shutdown (#1616).
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("autumn.toml"),
@@ -2879,9 +2685,7 @@ mod tests {
 
     #[test]
     fn shutdown_budget_from_ignores_a_malformed_injected_value() {
-        // A `.env` line like `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS=soon` must
-        // leave the configured value alone rather than collapsing to zero,
-        // which would hard-kill the app instantly.
+        // A junk value must not collapse the budget to zero and hard-kill the app.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("autumn.toml"),
@@ -3102,11 +2906,8 @@ mod tests {
 
     #[test]
     fn base_command_clears_an_inherited_data_flow_dump_flag() {
-        // #1654 review round 5. `AppBuilder::run` dispatches the data-flow dump
-        // before the server binds a listener, and `Command` inherits this
-        // process's environment, so an `AUTUMN_DUMP_DATA_FLOW=1` left in the
-        // launching shell made the child print a manifest and exit 0 --
-        // `autumn serve` reporting success while serving nothing.
+        // #1654: an inherited `AUTUMN_DUMP_DATA_FLOW=1` makes the child print a
+        // manifest and exit 0 instead of serving.
         let opts = serve_opts_with_role(None);
         let cmd = base_command(Path::new("/bin/true"), None, &opts);
         let entry = cmd
@@ -3140,11 +2941,8 @@ mod tests {
 
     #[test]
     fn base_command_clears_an_inherited_retention_mode() {
-        // #1605 review round 10. `AUTUMN_DB_RETENTION=purge` is the internal
-        // one-shot mode behind `autumn db retention`, dispatched in
-        // `AppBuilder::run` before the server binds a listener. Inherited from
-        // the launching shell it turns `autumn serve` into a destructive purge
-        // that exits 0 -- the data-flow hazard above, except it deletes data.
+        // #1605: an inherited `AUTUMN_DB_RETENTION=purge` would turn `autumn serve`
+        // into a purge that deletes data and exits 0.
         let opts = serve_opts_with_role(None);
         let cmd = base_command(Path::new("/bin/true"), None, &opts);
         for var in [
@@ -3292,8 +3090,7 @@ mod tests {
 
     #[test]
     fn mode_file_pin_defaults_none_for_legacy_files() {
-        // Mode files written before the `pin` field omit it; parsing must not
-        // fail and must default to None (the daemon ran unpinned).
+        // Files written before the `pin` field omit it.
         let legacy = "release = true\nprofile = \"prod\"\nrole = \"worker\"\n";
         let parsed: ModeFile = toml::from_str(legacy).expect("parse legacy mode file");
         assert_eq!(parsed.pin, None);
@@ -3357,8 +3154,7 @@ mod tests {
 
     #[test]
     fn mode_file_role_defaults_none_for_legacy_files() {
-        // Mode files written before the `role` field omit it; parsing must not
-        // fail and must default to None (the daemon ran the combined role).
+        // Files written before the `role` field omit it.
         let legacy = "release = true\nprofile = \"prod\"\n";
         let parsed: ModeFile = toml::from_str(legacy).expect("parse legacy mode file");
         assert_eq!(parsed.role, None);
@@ -3368,17 +3164,14 @@ mod tests {
 
     #[test]
     fn write_mode_file_persists_role_for_restart_recovery() {
-        // A `serve --role worker` start must persist the role into `serve.mode`
-        // so a bare `serve restart` can recover it (mirroring the profile path)
-        // instead of silently dropping back to the combined default.
+        // A bare `serve restart` recovers the role from `serve.mode`.
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = RuntimePaths::from_base(dir.path(), "p");
         paths.ensure_dirs().expect("dirs");
         let opts = serve_opts_with_role(Some("worker"));
         write_mode_file(&paths, &opts);
 
-        // Recover exactly as `restart`'s `running_daemon_mode` would: read and
-        // parse the marker, then take its role.
+        // Read it back the way `running_daemon_mode` does.
         let contents = std::fs::read_to_string(paths.mode_file()).expect("read mode file");
         let recovered: ModeFile = toml::from_str(&contents).expect("parse mode file");
         assert_eq!(
@@ -3390,20 +3183,16 @@ mod tests {
 
     #[test]
     fn effective_role_prefers_flag_then_env() {
-        // `AUTUMN_ROLE=worker autumn serve --daemon` selects the role via the env
-        // the child inherits (so `opts.role` is None); write_mode_file records the
-        // effective role through this seam so a bare `serve restart` from a shell
-        // without `AUTUMN_ROLE` recovers it instead of relaunching as combined.
-        // The crate forbids `unsafe`, so this exercises the pure precedence/
-        // normalization core rather than mutating the real process environment.
+        // `AUTUMN_ROLE=worker autumn serve --daemon` leaves `opts.role` None; the
+        // recorded role must still be `worker`. Tested on the pure core: the crate
+        // forbids the `unsafe` needed to mutate the process environment.
 
         // An explicit `--role` always wins over the environment.
         assert_eq!(
             effective_role_from(Some("web".to_owned()), Some("worker".to_owned())).as_deref(),
             Some("web"),
         );
-        // No flag: fall back to a non-blank `AUTUMN_ROLE`, trimmed — this is the
-        // env-selected-daemon case that `restart` must recover.
+        // No flag: a non-blank `AUTUMN_ROLE`, trimmed.
         assert_eq!(
             effective_role_from(None, Some("worker".to_owned())).as_deref(),
             Some("worker"),
@@ -3412,8 +3201,7 @@ mod tests {
             effective_role_from(None, Some("  worker  ".to_owned())).as_deref(),
             Some("worker"),
         );
-        // A blank or absent `AUTUMN_ROLE` leaves the role unset (combined default),
-        // so the CLI never records a bogus empty role.
+        // A blank or absent `AUTUMN_ROLE` records no role.
         assert_eq!(effective_role_from(None, Some("   ".to_owned())), None);
         assert_eq!(effective_role_from(None, None), None);
     }

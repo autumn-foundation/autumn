@@ -87,10 +87,9 @@ impl Finding {
             "{}\t{}\t{}\t{}",
             self.kind,
             escape_field(&self.method),
-            // Normalized, like the routes and the manifest digest: a capture
-            // rename is not a posture change, so it must not re-block a
-            // widening a reviewer has already approved. The report still shows
-            // the path as the author wrote it.
+            // Normalized like the routes and the manifest digest: a capture rename is not a posture
+            // change and must not re-block an approved widening. The report still shows the path as
+            // written.
             escape_field(&normalize_captures(&self.path)),
             escape_field(&self.fingerprint)
         )
@@ -155,12 +154,9 @@ fn bind_to_effective_posture(
         let key = (normalize_captures(&finding.path), finding.method.clone());
         let posture = match effective_posture(&key, &routes, &csrf, &bindings, &mtls) {
             Some(own) => own,
-            // The route the finding names is gone at head. Its URLs went
-            // somewhere, and *that* is what the reviewer is approving — so bind
-            // to the routes answering them now. Without this the one case where
-            // the whole posture moved wholesale was the one case it bound
-            // nothing, and the replacement could shed a scope afterwards with
-            // the finding's identity unmoved.
+            // The named route is gone at head. Its URLs went somewhere, and that is what the
+            // reviewer approves, so bind to the routes answering them now. Otherwise the
+            // replacement could shed a scope later without moving the finding's identity.
             None if base_keys.contains(&key) => {
                 let mut inherited: Vec<String> = takers((&key.0, &key.1), &base_keys, &head_keys)
                     .iter()
@@ -171,18 +167,16 @@ fn bind_to_effective_posture(
                     })
                     .collect();
                 inherited.sort();
-                // Nothing took the URLs: they 404 now, and there is no posture
-                // to bind to. Left empty rather than folding in a constant, so
-                // a plain deletion keeps the identity it had.
+                // Nothing took the URLs (they 404). Leave it empty rather than a constant, so a
+                // plain deletion keeps its identity.
                 if inherited.is_empty() {
                     String::new()
                 } else {
                     escape_list(&inherited)
                 }
             }
-            // Findings that name no single route — a collapsed csrf finding, a
-            // header, an exemption prefix — miss every lookup and keep the
-            // identity they built for themselves.
+            // Findings that name no single route (a collapsed csrf finding, a header, an exemption
+            // prefix) miss every lookup and keep their own identity.
             None => String::new(),
         };
         if !posture.is_empty() {
@@ -217,10 +211,8 @@ fn effective_posture(
         enforced,
         escape_list(&checks_at(key, bindings)),
     ];
-    // Appended only when the route requires mTLS (#1640), so an app that uses
-    // none fingerprints byte-for-byte as it did before this dimension existed
-    // and its acknowledgments survive the schema bump. Where it IS required,
-    // dropping the requirement after an acknowledgment moves the digest.
+    // Appended only when the route requires mTLS (#1640), so an app without mTLS fingerprints as
+    // before the dimension existed and its acknowledgments survive the schema bump.
     if mtls.contains(key) {
         parts.push("mtls".to_owned());
     }
@@ -436,9 +428,8 @@ fn report_path_exposure(
                 .map_or_else(|| path.clone(), |(_, entry)| entry.path.clone());
             out.push(Finding {
                 kind: "route_path_exposed",
-                // Newly reachable through an open route blocks, exactly as a
-                // new open route does; through a guarded one it annotates,
-                // exactly as a new guarded route does.
+                // Newly reachable through an open route blocks, like a new open route; through a
+                // guarded one it annotates, like a new guarded route.
                 severity: if open {
                     Severity::Widening
                 } else {
@@ -485,15 +476,14 @@ fn report_displacement(
     (keys_before, keys_after): (&BTreeSet<RouteKey>, &BTreeSet<RouteKey>),
     out: &mut Vec<Finding>,
 ) {
-    // What the new route takes over is whatever *was* serving those URLs, asked
-    // of the base with the same predicate a removal asks of the head.
+    // The new route takes over whatever served those URLs at base, found with the same `takers`
+    // predicate a removal asks of the head.
     for key in takers((path, method), keys_after, keys_before) {
         let Some(displaced) = before.get(&key) else {
             continue;
         };
-        // What changed for those URLs is the posture they used to demand
-        // against the one they demand now — decided, as everywhere else here,
-        // by `compare_route` rather than by a second opinion.
+        // A widening if those URLs now demand less than the displaced route did, decided by
+        // `compare_route` as everywhere else here.
         let mut probe = Vec::new();
         compare_route(displaced, added, &mut probe);
         if !probe.iter().any(|f| f.severity == Severity::Widening) {
@@ -506,8 +496,8 @@ fn report_displacement(
             path: added.path.clone(),
             before: displaced.posture_label(),
             after: added.posture_label(),
-            // Both postures, so an acknowledgment binds to the change it was
-            // written for and not merely to the pair of paths.
+            // Both postures, so an acknowledgment binds to the change it was written for, not just
+            // the pair of paths.
             fingerprint: format!(
                 "added-shadowing:{}",
                 escape_list(&[
@@ -547,9 +537,8 @@ fn report_shadow_exposure(
         let Some(survivor) = after.get(&key) else {
             continue;
         };
-        // Only a survivor that admits callers the deleted route refused is a
-        // widening — and "admits more" is decided by the same comparison the
-        // rest of this module uses, so the two cannot drift apart.
+        // Widening only if the survivor admits callers the deleted route refused, decided by
+        // `compare_route` so the two cannot drift apart.
         let mut probe = Vec::new();
         compare_route(removed, survivor, &mut probe);
         if !probe.iter().any(|f| f.severity == Severity::Widening) {
@@ -562,12 +551,10 @@ fn report_shadow_exposure(
             path: removed.path.clone(),
             before: removed.posture_label(),
             after: survivor.posture_label(),
-            // The survivor's *posture* is part of what a reviewer acknowledged,
-            // not just its path. When the same pull request removes the guarded
-            // route and adds the one that now covers it, the survivor is absent
-            // from the base — so loosening it later is only a neutral
-            // `route_added_gated`, and a fingerprint naming the path alone left
-            // the digest unmoved and the old acknowledgment standing.
+            // The survivor's posture is part of what was acknowledged. When one pull request
+            // removes the guarded route and adds its replacement, the survivor is absent from the
+            // base, so loosening it later is only a neutral `route_added_gated`; a path-only
+            // fingerprint would let the old acknowledgment stand.
             fingerprint: format!(
                 "shadow-exposed:{}",
                 escape_list(&[
@@ -615,9 +602,8 @@ fn posture_fingerprint(entry: &RouteEntry) -> String {
 fn effective_methods(method: &str) -> BTreeSet<String> {
     let declared = method.to_ascii_uppercase();
     let mut answered = BTreeSet::new();
-    // Only a *genuine* `GET` is also served for `HEAD`. A websocket upgrade is
-    // not, which the router states in exactly those terms — so the `HEAD` alias
-    // is added before the `WS` fold, never after it.
+    // Only a genuine `GET` is also served for `HEAD`; a websocket upgrade is not. So the `HEAD`
+    // alias is added before the `WS` fold.
     if declared == "GET" {
         answered.insert("HEAD".to_owned());
     }
@@ -663,11 +649,9 @@ fn takers(
     other_keys: &BTreeSet<RouteKey>,
 ) -> Vec<RouteKey> {
     let answered = answered_methods(method, path, subject_keys);
-    // Within one path node the request never leaves the node, so whichever
-    // handler *there* answers the method takes it. That covers the route
-    // itself, and it covers an explicit `HEAD` trading places with a `GET`'s
-    // `HEAD` fallback — a transfer inside the node, which a bare "the node
-    // exists" test read as no transfer at all.
+    // Within one path node the request never leaves the node, so whichever handler there answers
+    // the method takes it. This includes an explicit `HEAD` trading places with a `GET`'s `HEAD`
+    // fallback.
     let same_path: Vec<RouteKey> = other_keys
         .iter()
         .filter(|(p, m)| p == path && !answered.is_disjoint(&answered_methods(m, p, other_keys)))
@@ -676,17 +660,14 @@ fn takers(
     if !same_path.is_empty() {
         return same_path;
     }
-    // A path node the other side mounts owns that URL for every method — it
-    // answers 405 where it has no handler rather than letting the request fall
-    // through — so nothing passes to another path.
+    // A path node the other side mounts owns that URL for every method (405 where it has no
+    // handler, no fall-through), so nothing passes to another path.
     if other_keys.iter().any(|(p, _)| p == path) {
         return Vec::new();
     }
-    // Rank the *nodes* first, then dispatch the method at the ones that win.
-    // The router picks the most specific node and answers there — a node
-    // without the method returns 405 rather than yielding to a less specific
-    // one — so filtering by method before ranking dropped the node that answers
-    // and blamed one that never sees the request.
+    // Rank the nodes first, then dispatch the method at the winners. The router picks the most
+    // specific node, and a node without the method returns 405 rather than yielding, so filtering
+    // by method first would blame a node that never sees the request.
     let candidates: Vec<&RouteKey> = other_keys
         .iter()
         .filter(|(p, _)| takes_precedence(path, p))
@@ -878,13 +859,10 @@ fn segments_overlap(a: &str, b: &str) -> bool {
     if !(a_suffix.ends_with(b_suffix) || b_suffix.ends_with(a_suffix)) {
         return false;
     }
-    // A capture must consume at least one character — matchit 404s otherwise —
-    // so a segment with L literal characters and n captures only matches text
-    // of length >= L + n. A concrete segment shorter than the other's minimum
-    // can share nothing with it: `/file.{ext}` never serves `/file.`, so the
-    // old edge-only check invented a shadow there. The same comparison keeps
-    // the two required edges from overlapping inside a concrete segment, since
-    // L + n already covers both edge lengths. (#2499)
+    // A capture consumes at least one character (matchit 404s otherwise), so a segment with L
+    // literal characters and n captures matches only text of length >= L + n: `/file.{ext}` never
+    // serves `/file.`. This also keeps the two required edges from overlapping inside a concrete
+    // segment. (#2499)
     if !a.contains(CAPTURE) && min_match_len(b) > a.chars().count() {
         return false;
     }
@@ -958,9 +936,8 @@ fn compare_route(before: &RouteEntry, after: &RouteEntry, out: &mut Vec<Finding>
             fingerprint: format!("class:{}->{}", before.classification, after.classification),
             detail,
         });
-        // A route that stopped being gated has already been reported in the
-        // strongest terms available; enumerating the roles it also lost would
-        // add rows without adding information.
+        // A route that stopped being gated is already reported in the strongest terms; listing the
+        // roles it also lost adds nothing.
         if was_open != now_open {
             return;
         }
@@ -978,9 +955,8 @@ fn compare_route(before: &RouteEntry, after: &RouteEntry, out: &mut Vec<Finding>
             path: after.path.clone(),
             before: label_before,
             after: label_after,
-            // What still guards the route is part of what was acknowledged: a
-            // constant identity let the record check go, then the scope that
-            // replaced it, under one marker.
+            // What still guards the route is part of what was acknowledged, so a later swap of the
+            // record check for a scope moves the digest.
             fingerprint: format!("policy-removed:{}", posture_fingerprint(after)),
             detail: "record-level policy check removed".to_owned(),
         });
@@ -1156,10 +1132,8 @@ fn compare_scopes(
             path: after.path.clone(),
             before: label_before.to_owned(),
             after: label_after.to_owned(),
-            // The scopes still required are part of what was acknowledged:
-            // naming only the lost one let `{read}` → `{mfa}` → `{}` keep a
-            // single identity, so the acknowledgment for the swap covered the
-            // drop as well.
+            // The scopes still required are part of what was acknowledged: naming only the lost one
+            // would give `{read}` → `{mfa}` → `{}` a single identity.
             fingerprint: format!(
                 "scopes-{}",
                 escape_list(&[escape_list(&removed), escape_list(&now_sorted)])
@@ -1248,27 +1222,18 @@ fn diff_authorization_policies(
             continue;
         }
         let (path, method, action, resource) = key;
-        // A binding that vanished because the whole route did is already
-        // reported as `route_removed`, and that is a narrowing, not a widening
-        // — but only when the URL went with it. A surviving route whose shape
-        // and methods overlap still answers that URL, so the record-level check
-        // really did disappear from something reachable.
-        // Every route that answers this one's URLs after the change — none if
-        // the path node is gone entirely, and none if it survives without this
-        // method, since that is a 405 rather than a fall-through.
+        // A binding whose URL left with its route is already a `route_removed` narrowing. `takers`
+        // is every route answering this one's URLs at head: none if the node is gone, and none if
+        // it survives without this method (405, not a fall-through).
         let takers = takers((path, method), &routes_before, &routes_after);
         if takers.is_empty() {
             continue;
         }
-        // ...unless the route that now answers it performs the very same
-        // check, in which case nothing changed for that URL's callers. Both
-        // routes being `gated` with a record-level check is not enough: the
-        // route comparison cannot see *which* check, so `read_self` giving way
-        // to `read_any` reads as no change at all up there.
+        // Skip when the URLs fell through to routes performing the same check. Both being `gated`
+        // is not enough: the route comparison cannot see which check, so `read_self` giving way to
+        // `read_any` looks unchanged there.
         let fell_through = !routes_after.contains(&(path.clone(), method.clone()));
-        // Preserved only if *every* taker performs the same check: one that
-        // does not means some URL reaches a route without it. Asking whether
-        // any taker carries it let a check survive on the route that loses.
+        // Every taker must perform the check: one that does not exposes some URL without it.
         if fell_through
             && takers.iter().all(|(p, m)| {
                 after.contains_key(&(p.clone(), m.clone(), action.clone(), resource.clone()))
@@ -1285,11 +1250,8 @@ fn diff_authorization_policies(
             );
         }
 
-        // A resource *rename* looks exactly like a removal plus an addition,
-        // and nothing in the manifest can tell the two apart. Stay conservative
-        // — this still blocks — but name the pairing so a reviewer who is
-        // looking at a rename can acknowledge it in one step instead of
-        // wondering what was lost.
+        // A resource rename looks exactly like a removal plus an addition. Still block, but name
+        // the pairing so a reviewer can acknowledge a rename in one step.
         if let Some(gained) = gained_on.get(&(path.clone(), method.clone())) {
             let _ = write!(
                 detail,
@@ -1310,12 +1272,9 @@ fn diff_authorization_policies(
                 escape_list(&[
                     action.clone(),
                     resource.clone(),
-                    // Whatever checks these URLs now get, whether that is
-                    // another route's after a fall-through or this route's own
-                    // after a swap. Leaving the exact-route case out let
-                    // `read_any` give way to `read_all` without moving the
-                    // digest, so the acknowledgment for one stood for the
-                    // other.
+                    // Whatever checks these URLs get now, from another route after a fall-through
+                    // or from this route after a swap, so `read_any` giving way to `read_all` moves
+                    // the digest.
                     checks_on((path, method), &after, &routes_after, &routes_before),
                 ])
             ),
@@ -1360,14 +1319,10 @@ fn report_csrf_loss(
             .iter()
             .map(|((_, method), (written_as, ..))| format!("{method} {written_as}"))
             .collect();
-        // The fingerprint names the *routes*, not the spellings: renaming a
-        // capture changes neither the URL set that lost CSRF nor what a
-        // reviewer acknowledged about it.
-        // Each route *and what still guards it*, for the same reason the
-        // per-route fingerprint carries it. The whole posture, not just the
-        // `RouteEntry` half: this finding names `*`, so the pass that folds
-        // head posture into every other widening skips it and a record check
-        // swapped for a weaker one would be invisible behind `policy: true`.
+        // Names the routes, not the spellings: a capture rename changes neither the URLs that lost
+        // CSRF nor what was acknowledged. Each route carries the whole posture still guarding it,
+        // since this finding names `*` and the pass that folds head posture into other widenings
+        // skips it.
         let guarded_keys: Vec<String> = lost
             .iter()
             .map(|((path, method), (_, _, inheritors))| {
@@ -1563,9 +1518,8 @@ fn diff_csrf_exemptions(base: &PostureManifest, head: &PostureManifest, out: &mu
     let before: BTreeSet<&String> = base.dimensions.csrf.exempt_paths.iter().collect();
     let after: BTreeSet<&String> = head.dimensions.csrf.exempt_paths.iter().collect();
 
-    // Coverage, not spelling. Replacing `/api` with `/api/private` exempts a
-    // strict subset of what was exempt before, so calling the new prefix a
-    // widening blocks a change that restores CSRF for most of `/api`.
+    // Coverage, not spelling: replacing `/api` with `/api/private` exempts a strict subset, so it
+    // must not read as a widening.
     let added: Vec<String> = after
         .iter()
         .filter(|p| !before.iter().any(|old| exempts(old, p)))
@@ -1578,10 +1532,9 @@ fn diff_csrf_exemptions(base: &PostureManifest, head: &PostureManifest, out: &mu
         .collect();
 
     if !added.is_empty() {
-        // And what those URLs are still checked by. An exemption acknowledgment
-        // says "I accept that these skip CSRF", which is a statement about the
-        // rest of their posture — and no per-route row can show the exemption,
-        // so loosening the routes it covers moves nothing else in the diff.
+        // Fold in what still guards those URLs: the acknowledgment accepts that they skip CSRF
+        // given the rest of their posture, and no per-route row shows the exemption, so loosening
+        // those routes would move nothing else in the diff.
         let routes = route_index(head);
         let csrf = csrf_index(head);
         let bindings = authz_index(head);
@@ -1651,9 +1604,8 @@ fn checks_on(
     let mut per_route: Vec<String> = takers((path, method), from_routes, routes)
         .into_iter()
         .map(|(p, m)| {
-            // Route identity is kept, not just the union of checks: a losing
-            // route carrying the same names would otherwise mask a change in
-            // the one that actually serves the URL.
+            // Keep route identity, not just the union of checks: a losing route carrying the same
+            // names would mask a change in the route that actually serves the URL.
             let mut checks: Vec<String> = bindings
                 .keys()
                 .filter(|(bp, bm, _, _)| *bp == p && *bm == m)
@@ -1752,9 +1704,8 @@ pub(super) fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool,
         index
             .entry(key)
             .and_modify(|(enforced, exempt, _)| {
-                // Parsing refuses two rows for one route shape. Merge to the
-                // widest reading anyway, so no row order can declare the route
-                // protected.
+                // Parsing refuses two rows for one route shape. Merge to the widest reading anyway,
+                // so no row order can declare the route protected.
                 *enforced = *enforced && e.csrf_enforced;
                 *exempt = *exempt || e.exempt;
             })
@@ -1765,21 +1716,17 @@ pub(super) fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool,
 
 fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
     diff_csrf_exemptions(base, head, out);
-    // What still guards each route, for the fingerprints below: losing CSRF
-    // behind a newly required scope is not the same decision as losing it with
-    // that scope gone again.
+    // What still guards each route, for the fingerprints: losing CSRF behind a newly required scope
+    // is a different decision from losing it with that scope gone.
     let head_routes = route_index(head);
     let before = csrf_index(base);
     let after = csrf_index(head);
     let routes_before = route_keys(base);
     let routes_after = route_keys(head);
 
-    // Keyed rather than pushed, so the two passes below cannot report the same
-    // route twice and the order is the key order either way.
-    // Each lost route with the path it was written as, whether an exemption is
-    // why, and the key of the route that answers those URLs now — not always
-    // the one that left: a `WS` row gives way to a `GET` at the same path, and
-    // the guard posture has to come from the route that inherits it.
+    // Keyed so the two passes below cannot report a route twice. Each lost route maps to its
+    // written path, whether an exemption caused it, and the routes answering its URLs now: a `WS`
+    // row can give way to a `GET` at the same path, and the posture comes from the heir.
     let mut lost: BTreeMap<RouteKey, (String, bool, Vec<RouteKey>)> = BTreeMap::new();
     let mut gained: Vec<(RouteKey, String)> = Vec::new();
     for (key, (enforced_now, exempt_now, written_as)) in &after {
@@ -1794,24 +1741,21 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
             _ => {}
         }
     }
-    // The other direction: an entry that *left* the dimension entirely. The
-    // csrf dimension holds only mutating routes, so widening
-    // `security.csrf.safe_methods` deletes entries rather than flipping them —
-    // and at runtime those requests stop being validated.
+    // Entries that left the dimension entirely. It holds only mutating routes, so widening
+    // `security.csrf.safe_methods` deletes entries rather than flipping them, and those requests
+    // stop being validated.
     for (key, (enforced_before, _, written_as)) in &before {
         if !*enforced_before || after.contains_key(key) {
             continue;
         }
-        // Reachable by the same rule the route findings use, not by an exact
-        // key: a `WS` route and a `GET` route at one path are the same runtime
-        // handler, so replacing an enforced `WS /x` with a `GET /x` that does
-        // not enforce is a lost check, however the manifest spells the method.
+        // Reachable by the same rule the route findings use, not an exact key: `WS /x` and `GET /x`
+        // are one runtime handler, so replacing an enforced `WS /x` with an unenforced `GET /x`
+        // loses the check.
         let (path, method) = key;
-        // Every non-enforcing taker, not the first. A removed route's URLs
-        // split: deleting `/records/me/{id}` sends `/records/me/private` to
-        // `/records/{user}/private` and the rest to `/records/{user}/{id}`, and
-        // `undominated` returns both because neither covers the other's share.
-        // Naming one let the other be weakened after the acknowledgment.
+        // Every non-enforcing taker, not the first. A removed route's URLs can split: deleting
+        // `/records/me/{id}` sends `/records/me/private` to `/records/{user}/private` and the rest
+        // to `/records/{user}/{id}`. Naming one would let the other be weakened after
+        // acknowledgment.
         let inheritors: Vec<RouteKey> = takers((path, method), &routes_before, &routes_after)
             .into_iter()
             .filter(|taker| after.get(taker).is_none_or(|(enforced, ..)| !enforced))
@@ -1822,9 +1766,8 @@ fn diff_csrf(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
         }
     }
 
-    // One collapsed finding when CSRF went off everywhere: an app that flips
-    // `security.csrf.enabled` produces one row per mutating route otherwise,
-    // and a 200-row table is a table nobody reads.
+    // One collapsed finding when CSRF went off everywhere (`security.csrf.enabled` flipped),
+    // instead of one row per mutating route.
     let collapse = after.values().all(|(enforced, ..)| !enforced)
         && before.values().any(|entry| entry.0)
         && lost.len() > 1;
@@ -1887,9 +1830,8 @@ fn diff_mtls(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Findi
             path: path.clone(),
             before: "mtls required".to_owned(),
             after: "mtls not required".to_owned(),
-            // What still guards the route, for the same reason every other
-            // widening carries it: losing mTLS behind a newly required scope is
-            // not the decision that losing it with the scope gone again is.
+            // What still guards the route: losing mTLS behind a newly required scope is a different
+            // decision from losing it with that scope gone.
             fingerprint: format!(
                 "mtls-removed:{}",
                 postures_of(
@@ -1938,10 +1880,8 @@ fn diff_mtls_required_paths(
     head: &PostureManifest,
     out: &mut Vec<Finding>,
 ) {
-    // A listener that stopped requesting certificates has already been reported
-    // by `diff_mtls_mode` in the strongest terms available; enumerating the
-    // prefixes it also stopped honouring would add a row without adding
-    // information.
+    // `diff_mtls_mode` already reports a listener that stopped requesting certificates; listing the
+    // prefixes too adds nothing.
     if !base.dimensions.mtls.requests_certificate() {
         return;
     }
@@ -1968,11 +1908,9 @@ fn diff_mtls_required_paths(
         .collect();
 
     if !dropped.is_empty() {
-        // The fingerprint carries the surviving prefixes too. Narrowing
-        // `/internal` to `/internal/admin` leaves `added` empty, so `dropped`
-        // and `added` alone hash the same as a later swap to
-        // `/internal/public` — and one acknowledgment would then cover two
-        // different sets of URLs.
+        // Carry the surviving prefixes too. Narrowing `/internal` to `/internal/admin` leaves
+        // `added` empty, so `dropped` and `added` alone would hash the same as a later swap to
+        // `/internal/public`, and one acknowledgment would cover two URL sets.
         let mut surviving: Vec<String> = after.iter().map(|p| (*p).clone()).collect();
         surviving.sort();
         out.push(Finding {
@@ -2109,19 +2047,12 @@ fn diff_headers(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fi
     let before = headers_index(base);
     let after = headers_index(head);
 
-    // What the app still emits, folded into every removal's identity.
+    // What the app still emits, folded into every removal's identity. Losing HSTS while gaining CSP
+    // is a decision about the resulting set: dropping CSP later would otherwise leave the same HSTS
+    // removal and the old acknowledgment covering a posture with neither.
     //
-    // The last constant fingerprints in the module, and the argument for
-    // leaving them — a header is emitted or it is not, so there is no third
-    // state — was about the *value* and beside the point. Losing HSTS while
-    // gaining CSP is a decision about the set that results: the addition is a
-    // narrowing, so dropping it later leaves the diff holding the identical
-    // HSTS removal and the old acknowledgment covering a posture with neither.
-    //
-    // Values as well as names, since `security_header_value_changed` is
-    // deliberately neutral — weakening a CSP after the fact would otherwise
-    // reach exactly as far. The cost is the one `bind_to_effective_posture`
-    // already pays and #2497 tracks: a cosmetic header edit re-asks.
+    // Values as well as names, since `security_header_value_changed` is neutral. The cost, as in
+    // `bind_to_effective_posture` (#2497): a cosmetic header edit re-asks.
     let emitted: Vec<String> = after
         .iter()
         .filter(|(_, (emitted, _))| *emitted)
@@ -2172,11 +2103,9 @@ fn diff_headers(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Fi
                         detail: format!("security header `{header}` is now emitted"),
                     });
                 } else if value_before != value_now {
-                    // Deliberately neutral. Whether one CSP is weaker than
-                    // another is not decidable from the strings, and a gate
-                    // that blocks on "the CSP changed" is a gate teams turn
-                    // off. It is reported so a human can look, never so a robot
-                    // can refuse.
+                    // Neutral on purpose: whether one CSP is weaker than another is not decidable
+                    // from the strings, and a gate that blocks on any CSP change gets turned off.
+                    // Reported for a human to review.
                     out.push(Finding {
                         kind: "security_header_value_changed",
                         severity: Severity::Neutral,
@@ -2328,9 +2257,8 @@ mod tests {
             &mtls_entry("/internal/keys", "GET", false),
         );
 
-        // Two findings, deliberately: the route row that lost its requirement,
-        // and the configured prefix that stopped being honoured. They catch
-        // different regressions — see `diff_mtls_required_paths`.
+        // Two findings: the route row that lost its requirement and the prefix that stopped being
+        // honoured catch different regressions (see `diff_mtls_required_paths`).
         let findings = diff(&base, &head);
         let finding = findings
             .iter()
@@ -3104,7 +3032,7 @@ mod tests {
         assert!(widening(&diff(&base, &head)).is_empty());
     }
 
-    // ── security regressions (review findings) ──────────────────────────────
+    // ── security regressions ───────────────────────────────────────────────
 
     /// A fact that vanishes from the head manifest is still a fact that was
     /// lost. Adding `POST` to `security.csrf.safe_methods` turns CSRF
@@ -3112,9 +3040,8 @@ mod tests {
     /// manifest's csrf dimension, so a head-only walk sees nothing at all.
     #[test]
     fn csrf_entries_that_disappear_from_the_manifest_are_still_widening() {
-        // The route is still mounted on both sides — only its csrf entry is
-        // gone, which is exactly what widening `security.csrf.safe_methods`
-        // does: the route stays, its CSRF validation does not.
+        // The route stays mounted; only its csrf entry is gone, which is what widening
+        // `security.csrf.safe_methods` does.
         let r = route("/pay", "POST", "public", &[], &[], false);
         let base = manifest(
             &r,
@@ -4854,9 +4781,8 @@ mod tests {
         let findings = diff(&base, &head);
         assert_eq!(findings[0].severity, Severity::Widening);
         assert_eq!(findings.last().unwrap().severity, Severity::Narrowing);
-        // Same inputs, same order, every time — and see
-        // `findings_do_not_depend_on_manifest_entry_order` for the property
-        // that actually matters.
+        // Deterministic; `findings_do_not_depend_on_manifest_entry_order` covers the property that
+        // matters.
         assert_eq!(findings, diff(&base, &head));
     }
     /// A finding names the route the *base* had. When that route is gone at
@@ -5326,8 +5252,7 @@ mod tests {
             "",
             "",
         );
-        // The *second* taker in key order, so the `.find` that recorded one
-        // inheritor never selected it.
+        // The second taker in key order, so a fingerprint naming only the first would miss it.
         let unselected_requiring = |scopes: &[&str]| {
             let finding = diff(
                 &base,

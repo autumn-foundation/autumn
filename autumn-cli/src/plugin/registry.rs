@@ -141,9 +141,8 @@ pub fn search() -> Option<Vec<CommunityPlugin>> {
 pub fn latest_version(crate_name: &str) -> Option<String> {
     let body = get(&format!("https://crates.io/api/v1/crates/{crate_name}"))?;
     let value = serde_json::from_str::<serde_json::Value>(&body).ok()?;
-    // The SAME field preference as the search path. Diverging here let
-    // `plugin add` pin a back-ported or pre-release version while
-    // `plugin list` had shown the stable one the user picked.
+    // Same field preference as the search path, so `plugin add` pins the version
+    // `plugin list` showed.
     pick_version(value.get("crate")?)
 }
 
@@ -251,8 +250,7 @@ mod tests {
             "{:?}",
             found[0].summary
         );
-        // The ESC and BEL are gone; what remains is inert printable text, which
-        // is the point — the sequence can no longer drive the terminal.
+        // ESC and BEL are stripped; the remaining printable text cannot drive the terminal.
         assert_eq!(found[0].summary, "safe [2J evil");
     }
 

@@ -474,8 +474,7 @@ pub enum ScrubError {
 }
 
 impl std::fmt::Display for ScrubError {
-    // One arm per variant, each a single multi-line, actionable message; splitting
-    // the match would scatter the error copy across helpers for no reader benefit.
+    // One actionable message per variant; splitting the match would scatter the error copy.
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1161,12 +1160,9 @@ const FRAMEWORK_PAYLOAD_TABLES: &[&str] = &[
     // `#[encrypted]` columns — so an unscrubbed ledger hands back exactly the
     // plaintext the column-level scrub just removed.
     "_autumn_ledger_revisions",
-    // Listed for lock-step emptying rather than because it carries a payload:
-    // the #2323 high-water marks hold only table names, tenant keys, sequence
-    // numbers and hashes. But a mark outlives the chain it names, so a copy that
-    // purged the revisions and kept the marks would have `ledger_verify` report
-    // *every* ledgered record as `MissingRevision` — "the whole chain was
-    // erased" — and the write path would then refuse every subsequent write.
+    // Carries no payload (#2323: table names, tenant keys, sequence numbers, hashes), but is
+    // emptied with the revisions: marks kept without their chains make `ledger_verify` report
+    // every record as `MissingRevision` and the write path refuse every later write.
     // `check_purge_list` refuses to empty one of the pair without the other.
     "_autumn_ledger_high_water",
     // Before/after values for every tracked column; only those named in
@@ -1185,9 +1181,9 @@ const FRAMEWORK_PAYLOAD_TABLES: &[&str] = &[
     "autumn_jobs",
     // `context` / `record` JSONB hold the full row a hook was queued for.
     "autumn_repository_commit_hooks",
-    // `raw_value` is the live operator-set override for each key — it can
-    // hold a secret. `autumn_runtime_config_changes` is the append-only audit
-    // log: `old_value` / `new_value` / `actor` for every set/unset (#2366).
+    // `autumn_runtime_config_values.raw_value` is the live override per key and can hold a
+    // secret; `autumn_runtime_config_changes` audits every set/unset with old/new value and
+    // actor (#2366).
     "autumn_runtime_config_changes",
     "autumn_runtime_config_values",
     // The indexed text of app records — the search index is a second copy of
@@ -1489,9 +1485,8 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
 
         for column in &table.columns {
             let qualified = format!("{}.{}", table.name, column.name);
-            // A generated column is derived data Postgres refuses to `UPDATE`
-            // at all — scrubbing the columns it reads already covers it — so it
-            // is structurally safe rather than something to declare.
+            // Postgres refuses to `UPDATE` a generated column, and scrubbing the columns it
+            // reads already covers it.
             if inputs
                 .facts
                 .generated_columns
@@ -1516,10 +1511,8 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
                     // not a cross-table default.
                     continue;
                 } else if is_encrypted {
-                    // An at-rest-encrypted column is never rewritten with a plain
-                    // string: the resolved strategy is always a re-encryption (see
-                    // `Strategy::Encrypted`), so a declaration can only choose to
-                    // NULL it, never to write plaintext into it.
+                    // An encrypted column is only re-encrypted (`Strategy::Encrypted`) or
+                    // NULLed, never written with plaintext.
                     match declared_pii {
                         None | Some(Strategy::Encrypted) => {
                             (Strategy::Encrypted, ClassSource::Encrypted)
@@ -1596,10 +1589,9 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
             let pair = (table.name.clone(), column.name.clone());
             let unique = is_unique_column(table, column, inputs.facts);
 
-            // A `CHECK` predicate is arbitrary SQL, so no fabricated value can be
-            // proven to satisfy it — and a real Autumn closed-set column reaches
-            // the database as plain `TEXT` plus a `CHECK`, so this (not the
-            // model-IR-only `ColumnType::Enum`) is what actually catches it.
+            // No fabricated value can be proven to satisfy an arbitrary `CHECK`. Autumn
+            // closed-set columns reach the database as `TEXT` plus a `CHECK`, so this (not
+            // the IR-only `ColumnType::Enum`) is what catches them.
             if inputs.facts.checked_columns.contains(&pair) {
                 return Err(ScrubError::CheckConstrainedColumn { column: qualified });
             }
@@ -1643,8 +1635,8 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
             }
 
             if plan.strategy == Strategy::Encrypted {
-                // The same plan-time gates the SQL strategies get: a failure at
-                // apply time can land after an artifact restored real data.
+                // Same plan-time gates as the SQL strategies: an apply-time failure can land
+                // after an artifact restored real data.
                 if !is_texty(&column.ty) {
                     return Err(ScrubError::StrategyTypeMismatch {
                         column: qualified,
@@ -1766,9 +1758,8 @@ fn check_config_freshness(
     let mut framework = Vec::new();
     for (name, rule) in &inputs.config.tables {
         let Some(table) = by_name.get(name.as_str()) else {
-            // A framework-owned table is not "missing" — it is deliberately
-            // outside the classified universe, and saying "the database does
-            // not have it" would send the developer hunting for a typo.
+            // A framework-owned table is deliberately unclassified, not missing; calling it
+            // missing would send the developer hunting for a typo.
             if is_framework_table(name) {
                 framework.push(name.clone());
             } else {
@@ -1832,23 +1823,14 @@ fn check_safe_overrides_encrypted(
         }
         let rule = inputs.config.tables.get(table);
         for column in encrypted.keys() {
-            // An explicit PII entry is not an override — it only picks the
-            // strategy — so only `safe` declarations conflict.
+            // A PII entry only picks the strategy, so only `safe` declarations conflict.
             if rule.is_some_and(|r| r.pii.contains_key(column)) {
                 continue;
             }
-            // A key column is exempt: it can never be rewritten anyway, so
-            // refusing its `safe` declaration would leave the developer with no
-            // configuration that terminates.
-            //
-            // This asks `is_key_column` rather than re-deriving the test from
-            // the IR flags alone: the catalog contributes two more sources (the
-            // REFERENCED side of a foreign key, and generated columns) that the
-            // IR does not carry, so the two tests disagreed about what counts as
-            // structural.
-            //
-            // Classification honours that `safe` declaration for a structural
-            // column: the ciphertext stays where it is.
+            // A key column is exempt: it is never rewritten, so refusing its `safe` declaration
+            // would leave no configuration that passes; classification keeps its ciphertext.
+            // `is_key_column` (not the IR flags) also counts the referenced side of a foreign
+            // key and generated columns, which only the catalog knows.
             if by_name
                 .get(table.as_str())
                 .and_then(|t| {
@@ -1886,9 +1868,8 @@ fn unreachable_tables(facts: &DatabaseFacts, introspected: &[Table]) -> Vec<Stri
         .cloned()
         .collect();
 
-    // Privileges are per COLUMN as well as per table: a table can be visible
-    // while some of its columns are not, and those would be scrubbed by nothing
-    // while the table itself classified cleanly.
+    // Privileges are per column too: a visible table can hide columns, which would then be
+    // scrubbed by nothing while the table classified cleanly.
     let seen_columns: BTreeSet<(&str, &str)> = introspected
         .iter()
         .flat_map(|t| {
@@ -2009,10 +1990,9 @@ fn token_expr(table: &Table, column: &str, unique: bool) -> String {
 fn token_expr_from(row_key: &str, column: &str, unique: bool) -> String {
     let seed = format!("{} || '|' || {row_key}", quote_literal(column));
     if unique {
-        // Two independently-salted `md5`s concatenated, rather than `sha256`:
-        // both halves would have to collide at once, and this needs no
-        // `text`-to-`bytea` cast (whose escape-format interpretation would
-        // mangle a row key containing a backslash) and no Postgres 11 floor.
+        // Two independently salted `md5`s rather than `sha256`: both halves must collide at
+        // once, and it needs no `text`-to-`bytea` cast (which mangles a backslash in the row
+        // key) and no Postgres 11 floor.
         format!("md5({seed}) || md5(({seed}) || '#2')")
     } else {
         format!("md5({seed})")
@@ -2070,11 +2050,8 @@ fn auto_strategy(column: &Column) -> Result<Strategy, ScrubError> {
         | ColumnType::Decimal { .. } => Strategy::Zero,
         ColumnType::Timestamp | ColumnType::TimestampTz => Strategy::Epoch,
         ty @ ColumnType::Opaque { .. } if is_texty(ty) => email_shaped(&column.name),
-        // `from_pg_udt` maps only Autumn's own scalar surface, so several
-        // everyday PII column types arrive as `Opaque` — `date_of_birth DATE`
-        // most of all. Without these arms `auto` refuses them and the explicit
-        // fallbacks (`epoch`, `zero`) reject them too, leaving no usable
-        // strategy at all.
+        // `from_pg_udt` maps only Autumn's scalar types, so common PII types such as `DATE`
+        // arrive as `Opaque`. Without these arms no strategy, `auto` or explicit, accepts them.
         ColumnType::Opaque { pg_type }
             if matches!(pg_type.as_str(), "date" | "time" | "timetz") =>
         {
@@ -2126,10 +2103,8 @@ fn replacement_expr(
     let narrow = |overhead: usize| -> Result<String, ScrubError> {
         bounded_token(token, limit, overhead, &column.name, unique)
     };
-    // Every text-shaped strategy needs a character column to land in. Without
-    // this gate `age = "redact"` on an `integer` (or `last_login_ip = "redact"`
-    // on an `inet`) passes classification and only fails once Postgres runs the
-    // statement — after an `--artifact` restore has already written real data.
+    // Text strategies need a character column. Without this gate `redact` on an `integer` or
+    // `inet` fails only when Postgres runs it, after an `--artifact` restore wrote real data.
     if matches!(
         strategy,
         Strategy::Email | Strategy::Name | Strategy::Redact | Strategy::Phone
@@ -2177,10 +2152,8 @@ fn replacement_expr(
         Strategy::Null => "NULL".to_owned(),
         Strategy::Uuid => {
             require_type(column, strategy, matches!(column.ty, ColumnType::Uuid))?;
-            // A UUID is exactly 128 bits, and Postgres rejects any other width —
-            // so the wider token a unique column gets must be trimmed to its
-            // first 32 hex characters. That is the full entropy a UUID can hold,
-            // so nothing is lost.
+            // A UUID is exactly 128 bits, so the wider unique token is trimmed to its first 32
+            // hex characters.
             format!("(substr({token}, 1, 32))::uuid")
         }
         Strategy::Bytes => {
@@ -2193,9 +2166,8 @@ fn replacement_expr(
                 ColumnType::Json | ColumnType::Attachment => format!("{json}::jsonb"),
                 ColumnType::Opaque { pg_type } if pg_type == "json" => format!("{json}::json"),
                 ty if is_texty(ty) => {
-                    // Unlike every other text-producing strategy this one is a
-                    // fixed literal, so a narrow `varchar(n)` has to be checked
-                    // explicitly rather than by narrowing a token.
+                    // A fixed literal, so a narrow `varchar(n)` is checked here rather than
+                    // by narrowing a token.
                     const JSON_LITERAL_LEN: usize = 18;
                     if let Some(limit) = limit
                         && limit < JSON_LITERAL_LEN
@@ -2307,10 +2279,8 @@ fn bounded_token(
 /// column needs no guard.
 fn assignment(column: &Column, value: &str, strategy: Strategy) -> String {
     let ident = quote_ident(&column.name);
-    // A `CASE` whose arms are both bare `NULL` has no type to infer from, so
-    // Postgres resolves it to `text` and the assignment fails on every
-    // non-character column. The guard is pointless there anyway: the
-    // replacement already IS null.
+    // A `CASE` with two bare `NULL` arms resolves to `text` and fails on non-character
+    // columns. The replacement is already null, so it needs no guard.
     if column.nullable && strategy != Strategy::Null {
         format!("{ident} = CASE WHEN {ident} IS NULL THEN NULL ELSE {value} END")
     } else {
@@ -3185,9 +3155,8 @@ pub fn run(args: &ScrubArgs) {
     if let Err(e) = scrub(args) {
         eprintln!("\u{2717} {e}");
         if let ScrubError::Unclassified { columns } = &e {
-            // stdout, not stderr: the diagnostics above are stderr, so
-            // `autumn db scrub --check 2>/dev/null >> scrub.toml` appends a
-            // valid stanza instead of a wall of interleaved prose.
+            // stdout, unlike the diagnostics, so `autumn db scrub --check 2>/dev/null >>
+            // scrub.toml` appends a valid stanza.
             println!("{}", suggested_config_stanza(columns));
         }
         std::process::exit(1);
@@ -3201,10 +3170,9 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
         guard_scrub_target(&profile, args.force)?;
     }
 
-    // Everything that does NOT need the database is resolved first, so a typo in
-    // `scrub.toml`, an unknown strategy, a `purge` entry naming a user table, or
-    // an unparsable model file fails BEFORE an `--artifact` restore writes real
-    // data into the target. Only schema-dependent refusals can land after it.
+    // Everything that needs no database is resolved first, so a config or model-file error
+    // fails before an `--artifact` restore writes real data. Only schema-dependent refusals
+    // can land after it.
     let sources = load_source_classification(args)?;
 
     let mut targets = super::backup::resolve_all_target_urls(args.profile.as_deref())?;
@@ -3215,9 +3183,7 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
 
     let restored = if let Some(artifact) = &args.artifact {
         let artifact_profile = super::backup::artifact_source_profile(artifact);
-        // `--check`/`--dry-run` promise to write nothing, and a restore is the
-        // largest write there is. clap already rejects the combination; this
-        // keeps the invariant true inside the function that relies on it.
+        // `--check`/`--dry-run` write nothing. clap already rejects the combination.
         debug_assert!(
             writes,
             "--check/--dry-run must never reach an artifact restore"
@@ -3273,9 +3239,8 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
         false
     };
 
-    // The classification that remains reads the schema the restore just created,
-    // so it cannot run earlier — and a refusal here leaves the artifact's real
-    // data in the target. Say so in the loudest possible terms.
+    // The rest reads the restored schema, so it cannot run earlier, and a refusal here leaves
+    // the artifact's real data in the target.
     let applied = if on_sqlite {
         sqlite::classify_and_apply(args, &profile, &targets, &sources)
     } else {
@@ -3325,19 +3290,15 @@ fn load_source_classification(args: &ScrubArgs) -> Result<SourceClassification, 
         .iter()
         .any(|(_, rule)| !rule.encrypted.is_empty());
 
-    // Without the model source there is no way to know WHICH columns are
-    // `#[encrypted]`, and an unknown one is the worst possible outcome: declared
-    // `safe` it keeps production ciphertext, given a plaintext strategy it
-    // becomes permanently unreadable. So this is a refusal, not a warning —
+    // Without the model source the `#[encrypted]` columns are unknown. One declared `safe`
+    // keeps production ciphertext; one given a plaintext strategy becomes unreadable. Refuse
     // unless the declaration names them (and their mode) itself.
     if !has_sources && !declared_encrypted {
         return Err(ScrubError::EncryptedMetadataUnavailable);
     }
 
     let mut encrypted = encrypted_columns(project_root)?;
-    // A declaration supplements the model scan (and supplies everything when
-    // there is no model source at all); the model stays authoritative where the
-    // two overlap, since it is the definition rather than a copy of it.
+    // A declaration supplements the model scan; the model wins where they overlap.
     for (table, rule) in &config.tables {
         for (column, mode) in &rule.encrypted {
             encrypted
@@ -3356,9 +3317,7 @@ fn load_source_classification(args: &ScrubArgs) -> Result<SourceClassification, 
         anonymize.len()
     );
 
-    // Parsed here rather than at the call site so a mistyped `--sample` fails
-    // alongside every other file-based refusal: BEFORE an `--artifact` restore
-    // writes real data into the target.
+    // Parsed here so a mistyped `--sample` fails before an `--artifact` restore writes data.
     let roots = args
         .sample
         .iter()
@@ -3425,21 +3384,18 @@ fn classify_and_apply(
             });
         }
 
-        // Before the sample is planned, not after. An inheritance child has no
-        // foreign key of its own — legacy `INHERITS` does not carry constraints
-        // down — so the coverage check would otherwise report it as unreachable
-        // and advise naming it as a root, which is precisely the arrangement
-        // that corrupts. Only the sample is refused: the column rewrites are
-        // per-row UPDATEs that reach the child's rows correctly either way.
+        // Checked before the sample is planned. `INHERITS` does not carry foreign keys down, so
+        // the coverage check would call an inheritance child unreachable and advise naming it
+        // as a root, which corrupts. Only the sample is refused: the column rewrites reach the
+        // child's rows either way.
         if !args.sample.is_empty() && !facts.legacy_inheritance.is_empty() {
             return Err(ScrubError::LegacyInheritance {
                 tables: facts.legacy_inheritance,
             });
         }
-        // A view whose order cannot be DERIVED at all, because its definition
-        // calls a function whose body PostgreSQL does not track. Refused before
-        // the reachability check below, which can only compare two lists built
-        // from a graph this shape is missing from entirely.
+        // Views whose refresh order cannot be derived: they name relations in a string, or call
+        // a function whose body PostgreSQL does not track. Refused before the reachability
+        // check below, whose lists come from the graph these views are missing from.
         if !facts.views_reading_by_name.is_empty() {
             return Err(ScrubError::ViewReadsRelationsByName {
                 views: facts.views_reading_by_name,
@@ -3450,14 +3406,9 @@ fn classify_and_apply(
                 views: facts.untraceable_view_functions,
             });
         }
-        // A view the dependency walk never reached is one the run cannot
-        // refresh, and an unrefreshed view keeps its pre-scrub rows. Detected by
-        // comparing the ordered list against the flat enumeration rather than by
-        // knowing the walk's depth limit, so it stays true if that limit moves.
-        //
-        // Measured on a 36-deep chain: the run refreshed 33 views, reported
-        // success, left `users` with 0 original addresses — and the deepest view
-        // still held all 200. That is a silent leak, so it is refused instead.
+        // A view the dependency walk never reached is never refreshed and keeps its pre-scrub
+        // rows. Compared against the flat enumeration rather than the walk's depth limit, so
+        // this holds if that limit changes.
         let mut unreachable_views: Vec<String> = facts
             .all_materialized_views
             .iter()
@@ -3478,28 +3429,18 @@ fn classify_and_apply(
             facts: &facts,
         })?;
 
-        // Resolved in the same pass as the classification, and before ANY
-        // target is written, so a graph gap on one shard cannot leave the rest
-        // of the topology sampled.
+        // Resolved before any target is written, so a graph gap on one shard cannot leave the
+        // rest of the topology sampled.
         let sampling = if sources.roots.is_empty() {
             None
         } else {
             Some(build_sample_plan_for(args, sources, &tables, &facts)?)
         };
 
-        // RLS makes an `UPDATE` silently apply to policy-visible rows only,
-        // which is a fail-OPEN in a fail-closed tool — refuse rather than
-        // report a partial scrub as complete.
-        // Purge targets are framework tables, which are excluded from
-        // `plan.tables` — so without them an RLS-protected job/token/sync table
-        // would have its `DELETE` silently apply to policy-visible rows only,
-        // and still be reported emptied.
-        // The sample's tables are the third class of write, and the one a
-        // column-level plan can never cover: a pure join table has no PII
-        // column (PII on a key is refused outright), so it is absent from
-        // `plan.tables` — yet the sample deletes from it, and reads it to
-        // decide what to keep. Under RLS both would see policy-visible rows
-        // only, and the run would report a table emptied that is not.
+        // Under RLS an `UPDATE` or `DELETE` silently reaches only policy-visible rows, and the
+        // run would report a partial scrub as complete. Every kind of write is checked: the
+        // rewrites, the framework-table purges (absent from `plan.tables`), and the sample's
+        // tables (a pure join table has no PII column, yet the sample reads and deletes it).
         let mut rls: Vec<String> = plan
             .tables
             .iter()
@@ -3523,26 +3464,19 @@ fn classify_and_apply(
             return Err(ScrubError::RowLevelSecurity { tables: rls });
         }
 
-        // Before any hazard check that reads `tgenabled` or `ev_enabled`: in
-        // replica mode those columns mean the opposite of what the checks
-        // assume, so their answers cannot be trusted at all.
+        // Before any check that reads `tgenabled` or `ev_enabled`: in replica mode those
+        // columns mean the opposite of what the checks assume.
         if facts.replication_role != "origin" {
             return Err(ScrubError::ReplicaSessionRole {
                 role: facts.replication_role,
             });
         }
 
-        // The emptying pass runs LAST — after every column rewrite — because
-        // that is the only order in which "this table ends up empty" survives a
-        // rewrite trigger re-filling it. The cost is that its own `DELETE`
-        // triggers fire after everything else: an archive trigger on a purged
-        // or `never_include` table can copy the rows it is removing into an
-        // ordinary classified table whose rewrite has already run, and the
-        // verification that follows counts these tables rather than tracing
-        // where their triggers wrote. There is no order that satisfies both —
-        // the trigger graph can be cyclic — and no postcondition to check
-        // instead, because a trigger body can write anywhere. So it is refused
-        // before anything is written.
+        // The emptying pass runs last, so a rewrite trigger cannot re-fill an emptied table.
+        // Its `DELETE` triggers then fire after every rewrite, and an archive trigger on a
+        // purged or `never_include` table can copy the removed rows into an already-scrubbed
+        // table. No order avoids both (the trigger graph can be cyclic) and a trigger body can
+        // write anywhere, so this is refused before anything is written.
         let mut emptying_triggers: Vec<String> =
             purge_statements(&facts.framework_tables, &sources.config)
                 .into_iter()
@@ -3590,12 +3524,8 @@ fn classify_and_apply(
         return Ok(());
     }
     if args.dry_run {
-        // Refuse before printing anything, if any target's boundary cannot be
-        // emitted. The alternative — a comment saying "connect yourself" above
-        // a BEGIN and a page of DELETEs — reads as advice and behaves as a
-        // loaded gun: pasted, it runs against whatever database the session is
-        // already on. Fail closed here, like every other promise in this
-        // command that cannot be arranged safely.
+        // Refuse before printing anything if a target's `\connect` cannot be printed: without
+        // it, a pasted script runs against whatever database the session is already on.
         let unprintable: Vec<String> = plans
             .iter()
             .filter(|(_, url, _, _, _)| password_free_conninfo(url).is_none())
@@ -3606,51 +3536,17 @@ fn classify_and_apply(
                 targets: unprintable,
             });
         }
-        // And refuse, the same way, if any target rewrites an #[encrypted]
-        // column. That rewrite has no SQL form — the replacement is sealed per
-        // row under the target's key — so the script could only be printed with
-        // that one statement missing, and a script missing its rewrites empties
-        // and samples exactly as advertised while leaving every kept row's
-        // production ciphertext in place. Measured: pasting such a script left
-        // `users` sampled 200 -> 100 with every address rewritten AND all 100
-        // kept rows still holding their original ciphertext, committed without
-        // an error.
-        //
-        // A marker in the stream does not close this. A `RAISE EXCEPTION` aborts
-        // its own transaction, and that much works — the deletes below it are
-        // refused. But the `COMMIT` this script prints turns the abort into a
-        // ROLLBACK and clears the state, and measured on psql 16.13 the pasted
-        // lines after it run: the out-of-transaction `VACUUM (FULL)`s, then the
-        // next target's `\connect` and its whole block. On two clusters, a
-        // stopped first target still took the second from 200 comments to 0,
-        // committed. `\quit` is not an answer either: psql exits and the rest
-        // of the paste is read by the shell that launched it, which executed a
-        // trailing `echo` in the same measurement. Fail closed instead, exactly
-        // as above: the plan is still reported in full, only the runnable script
-        // is withheld.
-        // And refuse for a profile this command will not scrub. `writes` is
-        // false for a dry run, so `guard_scrub_target` never ran — harmless
-        // when the dry run only described a plan, and not harmless now that it
-        // prints a paste-ready script whose `\connect` names the protected
-        // target. Measured: `--dry-run --profile production` printed 14
-        // runnable lines, including that `\connect`, for a database the same
-        // command refuses to touch without `--force`.
+        // Refuse a profile this command will not scrub. A dry run skips `guard_scrub_target`,
+        // but the printed script's `\connect` names the protected target.
         guard_scrub_target(profile, args.force).map_err(|_| {
             ScrubError::UnprintableProductionTarget {
                 profile: profile.to_owned(),
             }
         })?;
-        // And refuse a socket target outright, because no value the server
-        // reports identifies the instance behind a socket. Address and port are
-        // NULL there by construction; `system_identifier` is copied by any
-        // physical clone; the configured port is shared by two clusters on
-        // different socket directories; and `data_directory` is server-LOCAL,
-        // so two containers each answering `/var/lib/postgresql/data` match on
-        // it while being different databases. Three narrower guards were each
-        // defeated by the next topology, which is the shape of a value that
-        // does not exist rather than one not yet found. Measured on two
-        // clusters sharing port 5433: the clone's script pasted at its origin,
-        // guard passed, COMMIT, origin 200 users -> 25.
+        // Refuse a socket target: nothing the server reports identifies the instance behind
+        // it. Address and port are NULL, `system_identifier` is copied by physical clones, the
+        // port is shared by clusters on different socket directories, and `data_directory` is
+        // server-local, so two containers can report the same one.
         let mut ambiguous: Vec<String> = plans
             .iter()
             .filter(|(_, _, _, facts, _)| {
@@ -3663,14 +3559,9 @@ fn classify_and_apply(
         if !ambiguous.is_empty() {
             return Err(ScrubError::UnprintableAmbiguousTarget { targets: ambiguous });
         }
-        // And refuse a TCP target whose conninfo leaves the port to libpq. The
-        // reconnect proof pins psql's own `:PORT`, and psql reports the RESOLVED
-        // port — measured, the same host-only URI reports 5433 under
-        // `PGPORT=5433` and 5432 without it. Accepting any port for the host
-        // would drop the discriminator on exactly the pair of servers this proof
-        // exists to tell apart; asserting a port this run computed itself would
-        // mean replicating libpq's resolution, which can read a service file
-        // this command does not. Neither is honest, so it refuses instead.
+        // Refuse a TCP target whose conninfo leaves the port to libpq. The reconnect proof pins
+        // psql's resolved `:PORT`, which follows `PGPORT`. Accepting any port drops the
+        // discriminator; computing it here would mean replicating libpq, service files included.
         let mut portless: Vec<String> = plans
             .iter()
             .filter(|(_, url, _, _, _)| {
@@ -3683,13 +3574,10 @@ fn classify_and_apply(
         if !portless.is_empty() {
             return Err(ScrubError::UnprintablePortlessTarget { targets: portless });
         }
-        // Same reasoning, one parameter over: `hostaddr` picks the endpoint on
-        // its own. Measured, `host=not-a-real-host.example hostaddr=127.0.0.1`
-        // reaches 127.0.0.1 while psql still reports that unresolvable name as
-        // `:HOST`, and there is no `:HOSTADDR` to pin in its place — `\echo
-        // [:HOSTADDR]` prints the name back unexpanded. Two such targets can
-        // therefore agree on every term the proof can state and still be
-        // different servers.
+        // Refuse a target whose endpoint can come from `hostaddr` (in the conninfo, the
+        // environment or a service file): psql still reports `host` as `:HOST` and has no
+        // `:HOSTADDR` to pin, so two such targets can agree on every term the proof states and
+        // still be different servers.
         let mut addressed: Vec<String> = plans
             .iter()
             .filter(|(_, url, _, _, _)| {
@@ -3701,12 +3589,9 @@ fn classify_and_apply(
         if !addressed.is_empty() {
             return Err(ScrubError::UnprintableHostaddrTarget { targets: addressed });
         }
-        // And a target naming more than one endpoint. The sizing connection and
-        // the pasting session are separate draws, so the printed `LIMIT` can be
-        // computed on a different member than the script runs against —
-        // measured, ten dry runs against a two-member URI printed `LIMIT 2` six
-        // times and `LIMIT 0` four times, and `LIMIT 0` makes the delete pass
-        // empty the root instead of sampling it.
+        // Refuse a target naming more than one endpoint. Sizing and pasting connect separately
+        // and can reach different members, so the printed `LIMIT` can be wrong, and `LIMIT 0`
+        // empties the root instead of sampling it.
         let mut multi: Vec<String> = plans
             .iter()
             .filter(|(_, url, _, _, _)| {
@@ -3718,6 +3603,12 @@ fn classify_and_apply(
         if !multi.is_empty() {
             return Err(ScrubError::UnprintableMultiHostTarget { targets: multi });
         }
+        // Refuse if any target rewrites an `#[encrypted]` column. That rewrite is sealed per row
+        // in Rust and has no SQL form, so the script would sample and empty as advertised while
+        // every kept row keeps its production ciphertext. An in-script `RAISE EXCEPTION` does
+        // not help: the printed `COMMIT` turns the abort into a ROLLBACK and psql runs the lines
+        // after it (the `VACUUM`s, the next target's block), and `\quit` hands the rest of the
+        // paste to the shell. The plan is still reported; only the script is withheld.
         let mut encrypted_rewrites: Vec<String> = plans
             .iter()
             .flat_map(|(label, _, plan, _, _)| {
@@ -3735,37 +3626,17 @@ fn classify_and_apply(
                 columns: encrypted_rewrites,
             });
         }
-        // Printed in the order `execute` runs them: purges, then the sample,
-        // then the rewrites — and, like `execute`, holding back the purges the
-        // plan defers until after the sample. The order is load-bearing (a
-        // framework-owned table is emptied before the sample removes the rows
-        // it points at, except where the sample must empty its child first), so
-        // a reader auditing the dry run has to see the real sequence: printing
-        // a deferred purge early would show SQL that fails if it were run.
+        // Printed in the order `execute` runs them: purges, the sample, then the rewrites, with
+        // the purges the plan defers held until after the sample. A deferred purge printed
+        // early would be SQL that fails when run.
         //
-        // The BEGIN/COMMIT is part of that sequence, not decoration. `execute`
-        // runs all of this in one transaction, and the sample's keep-sets are
-        // `CREATE TEMPORARY TABLE ... ON COMMIT DROP`: pasted into psql's
-        // autocommit, each one would be committed and dropped before the seed
-        // INSERT that follows it. Without the envelope the advertised "exact
-        // SQL" is not runnable.
-        // Non-interactive is the supported way to run this, and there a failed
-        // `\connect` already stops processing. This makes every OTHER error stop
-        // it too, which a stream of destructive blocks wants. It does nothing for
-        // an interactive paste — measured, psql ignores it there — which is what
-        // the per-target guard below is for.
-        // Size every sampled target BEFORE printing a line. Sizing opens its own
-        // connection and reads live counts, so it is the one fallible step left
-        // in the emission loop — and a failure on a LATER target used to land
-        // after an EARLIER one's complete block, `COMMIT` included. Measured on
-        // a control plus one shard where the role could read the catalogs but
-        // not `SELECT` the shard's `users`: the run exited 1 with `permission
-        // denied for table users`, having already printed the control's whole
-        // transaction (one `COMMIT`, seven `DELETE FROM`). Saving that output
-        // and running it scrubs the control and leaves the shard untouched —
-        // the half-anonymized topology this function's two passes exist to
-        // prevent, reached through the one fallible call that had not moved
-        // into pass 1.
+        // BEGIN/COMMIT is required: `execute` runs all of this in one transaction, and the
+        // sample's `ON COMMIT DROP` keep-sets would be dropped before use under autocommit.
+        //
+        // Size every sampled target before printing a line. Sizing connects and reads live
+        // counts, so a failure on a later target would otherwise land after an earlier
+        // target's complete block, `COMMIT` included, and running that output would scrub
+        // only part of the topology.
         let mut sized: Vec<Option<BTreeMap<String, i64>>> = Vec::with_capacity(plans.len());
         for (label, url, _, _, sampling) in &plans {
             sized.push(match sampling {
@@ -3779,16 +3650,13 @@ fn classify_and_apply(
                 None => None,
             });
         }
+        // A non-interactive run already stops on a failed `\connect`; this stops it on every
+        // other error too. psql ignores it in an interactive paste, hence the per-target guard.
         eprintln!("  \\set ON_ERROR_STOP on");
-        // One flag for the whole stream: "everything so far succeeded, and the
-        // last block was on the target it named". `execute` returns on the first
-        // target that fails and never touches the rest, so the script must not
-        // either — measured, without this the next target's `\connect` and its
-        // whole destructive block ran after an earlier target rolled back,
-        // leaving a partially scrubbed topology and a stream that ends without
-        // an error. Nested `\if` carries it: a target whose block is skipped
-        // never reaches the `\gset` that would set the flag true again, so one
-        // failure skips every target after it.
+        // One flag for the whole stream: everything so far succeeded on the target it named.
+        // `execute` stops at the first failing target, so the script must too. A skipped block
+        // never reaches the `\gset` that sets the flag again, so one failure skips every later
+        // target.
         eprintln!("  \\set autumn_ok true");
         for (index, (label, url, plan, facts, sampling)) in plans.iter().enumerate() {
             let no_deferral = BTreeSet::new();
@@ -3796,55 +3664,38 @@ fn classify_and_apply(
                 sampling.as_ref().map_or(&no_deferral, |s| &s.purge_after);
             let purges = purge_statements(&facts.framework_tables, &sources.config);
             let phases = emptying_phases(&purges, deferred, sampling.as_ref());
-            // Each target is a DIFFERENT database, and the printed stream is one
-            // file. Without a boundary, pasting it runs every target's
-            // transaction against whichever database the session happens to be
-            // connected to — sampling one of them repeatedly, with row counts
-            // taken from the others, and leaving the rest untouched.
-            // Gate the WHOLE block, `\connect` included: an earlier target
-            // that rolled back must not be followed by this one connecting and
-            // scrubbing anyway.
+            // Each target is a different database in one printed stream, so each block opens
+            // with its own `\connect`. The whole block, `\connect` included, is gated so an
+            // earlier rollback stops it.
             eprintln!("  \\if :autumn_ok");
             for line in psql_connect(label, url) {
                 eprintln!("  {line}");
             }
-            // And prove the reconnect landed where it was aimed, before the
-            // BEGIN below. This reads psql's own view of the connection, which
-            // the server's answers cannot stand in for — see
-            // `psql_connection_assertion`.
+            // Prove the reconnect landed where it was aimed, from psql's own view of the
+            // connection. See `psql_connection_assertion`.
             if let Some(conninfo) = password_free_conninfo(url) {
                 for line in psql_connection_assertion(&conninfo, &facts.endpoint.database) {
                     eprintln!("  {line}");
                 }
             }
-            // Reset per target: a previous target's success must not vouch for
-            // this one. `\gset` leaves a variable untouched when its query
-            // fails, so this explicit `false` is what survives an aborted
-            // transaction.
+            // Reset per target. `\gset` leaves a variable untouched when its query fails, so
+            // this `false` is what survives an aborted transaction.
             eprintln!("  \\set autumn_scrubbed false");
             eprintln!("  BEGIN;");
-            // The same session pins `execute` sets, before anything reads or
-            // writes: without them a role-level `search_path` resolves the
-            // generated calls somewhere else entirely. They come before the
-            // guard for that reason — the guard is `pg_catalog`-qualified too,
-            // but a pin that only lands after the check it protects is not a
-            // pin. `SET LOCAL` writes nothing, so nothing destructive precedes
-            // the proof below.
+            // The session pins `execute` sets, before anything reads or writes: otherwise a
+            // role-level `search_path` resolves the generated calls elsewhere. `SET LOCAL`
+            // writes nothing, so nothing destructive precedes the guard.
             for statement in session_settings() {
                 eprintln!("  {statement};");
             }
-            // The precondition the run refuses to plan without, asserted here
-            // because the pasting session brings its own — see
+            // Asserted again: the pasting session brings its own replication role. See
             // `replication_role_assertion`.
             eprintln!("  {}", replication_role_assertion());
-            // Inside the transaction, so a `\connect` that silently failed
-            // aborts this block instead of running it against the previous
-            // target. Before every destructive statement: nothing may run until
-            // the session has proved it is where this block thinks it is.
+            // Inside the transaction and before every destructive statement, so a `\connect`
+            // that silently failed aborts this block instead of running it on the previous target.
             eprintln!("  {}", target_guard(&facts.endpoint));
-            // The same locks `execute` takes, before any destructive statement:
-            // without them a pasted run lets a concurrent insert land after the
-            // DELETE that was supposed to remove it.
+            // The locks `execute` takes: without them a concurrent insert can land after the
+            // DELETE meant to remove it.
             for statement in lock_statements(plan, &purges, sampling.as_ref()) {
                 eprintln!("  {statement};");
             }
@@ -3864,68 +3715,41 @@ fn classify_and_apply(
                     eprintln!("  {sql};");
                 }
             }
-            // Last, exactly as `execute` runs it: the pass that makes "emptied"
-            // true even if a rewrite trigger just re-filled one of these tables.
+            // Last, as in `execute`, so "emptied" holds even if a rewrite trigger re-filled one.
             for (_, statement) in &phases.final_pass {
                 eprintln!("  {statement};");
             }
-            // The emptying statements above fire triggers, and one can refill a
-            // table an earlier one emptied. `execute` counts them all and rolls
-            // back; the printed sequence has to do the same, or an operator who
-            // runs it commits exactly the rows the real command refuses.
-            // Last inside the transaction, exactly where `execute` runs them: a
-            // materialized view keeps its own physical copy of whatever it
-            // selected, so a script that skips this leaves the view's heap
-            // holding the pre-scrub rows — including the PII just removed from
-            // the base tables it reads. In dependency order, so a view over
-            // another is rebuilt from the refreshed one rather than the stale
-            // one. Inside the envelope like the rest, so a refresh the role may
-            // not run rolls the rewrites back instead of committing base tables
-            // a stale view contradicts.
+            // A materialized view keeps its own copy of the pre-scrub rows, so refresh each, in
+            // dependency order, inside the transaction as `execute` does: a refresh the role may
+            // not run then rolls the rewrites back.
             for view in &facts.materialized_views {
                 eprintln!("  REFRESH MATERIALIZED VIEW {};", qualified_ident(view));
             }
-            // And the same closing pass `execute` runs, in the same position:
-            // every view that had no data when the run probed ends with none,
-            // whether it was populated for a dependent or skipped entirely.
+            // The closing pass `execute` runs: a view unpopulated when probed ends unpopulated.
             for view in &facts.unpopulated_views {
                 eprintln!(
                     "  REFRESH MATERIALIZED VIEW {} WITH NO DATA;",
                     qualified_ident(view)
                 );
             }
-            // And the emptiness proof, after every write in the block — the
-            // refreshes included, because a view's query can call a function
-            // that INSERTs into a table this run promised would be empty.
-            // `execute` checks in exactly this position and rolls back; the
-            // printed sequence has to, or an operator who runs it commits
-            // exactly the rows the real command refuses.
+            // The emptiness proof, after every write including the refreshes: a trigger or a
+            // view's function can refill an emptied table. `execute` checks here and rolls back.
             for (table, _) in &phases.final_pass {
                 eprintln!("  {};", emptiness_assertion(table));
             }
-            // And the sample's own postconditions, in the position
-            // `verify_sample_survived_refreshes` runs in the executed path —
-            // after every write in the block, the refreshes included, because
-            // a view's query can call a function that INSERTs into a sampled
-            // table. The dry run advertised the same "exact SQL" without
-            // this, and a pasted script committed a subset the real command
-            // rolls back. See `sample_postcondition_statements`.
+            // The sample's postconditions, where `verify_sample_survived_refreshes` runs and for
+            // the same reason. See `sample_postcondition_statements`.
             if let Some(sampling) = sampling {
                 for (statement, comment) in sample_postcondition_statements(sampling) {
                     eprintln!("  {statement}; -- {comment}");
                 }
             }
-            // The last statement inside the transaction, and the whole reason
-            // the compaction below can tell a scrubbed target from an aborted
-            // one. In an aborted transaction this SELECT is refused like every
-            // other, so `\gset` assigns nothing and the `false` above stands.
+            // Last in the transaction: an aborted transaction refuses it, so `\gset` assigns
+            // nothing and `autumn_scrubbed` stays false.
             eprintln!("  SELECT true AS autumn_scrubbed \\gset");
             eprintln!("  COMMIT;");
-            // Whether this target actually scrubbed, recorded for the
-            // compaction pass that follows every target's block. Emitted for
-            // EVERY target, not only a sampled one: the flag is also what
-            // carries a failure forward, and a target with nothing to compact
-            // still has to say whether it succeeded.
+            // Emitted for every target, sampled or not: the fence records whether it scrubbed
+            // and carries a failure forward.
             for line in post_commit_fence(&facts.endpoint) {
                 eprintln!("  {line}");
             }
@@ -3934,22 +3758,10 @@ fn classify_and_apply(
             eprintln!("  \\endif");
             eprintln!("  \\endif");
         }
-        // Compaction comes after EVERY target's transaction, never between two
-        // of them, because that is where `classify_and_apply` runs it: it
-        // commits each target in one loop and then compacts in a second, where
-        // a failure is a warning and the next target is compacted anyway.
-        //
-        // Printed inside the per-target block it was neither. Measured on two
-        // TCP targets with `ON_ERROR_STOP on` — the supported non-interactive
-        // way to run this — a `VACUUM (FULL, ANALYZE)` on the first target that
-        // timed out against a concurrent reader ended the script at rc=3: the
-        // first database was scrubbed and sampled (2 users, 0 original
-        // addresses) and the SECOND still held all 200 of its own, from a
-        // failure the command itself only warns about.
-        //
-        // Guarded as a whole on `:autumn_ok`, which matches the executor again:
-        // it propagates the first `execute` failure with `?`, so a later
-        // target's failure means no earlier target is compacted either.
+        // Compaction follows every target's transaction, as in the executor: a failed VACUUM
+        // between two blocks would stop the script under `ON_ERROR_STOP` and leave later
+        // targets unscrubbed. Gated as a whole on `:autumn_ok`, since the executor compacts
+        // nothing once any `execute` fails.
         let sampled: Vec<_> = plans
             .iter()
             .filter_map(|(label, url, _, facts, sampling)| {
@@ -3958,28 +3770,19 @@ fn classify_and_apply(
             .collect();
         if !sampled.is_empty() {
             eprintln!("  \\if :autumn_ok");
-            // Warning-only from here, as in the executor: with `ON_ERROR_STOP`
-            // still on, one target's failed VACUUM would skip every later
-            // target's. Nothing destructive follows — these statements are
-            // outside every transaction and rewrite no rows — and the per-target
-            // guard below is what a failed `\connect` runs into, exactly as it
-            // does above.
+            // Warning-only from here, as in the executor, so one failed VACUUM does not skip
+            // the rest. Nothing below rewrites rows, and a failed `\connect` still hits the
+            // per-target guard.
             eprintln!("  \\set ON_ERROR_STOP off");
             for (label, url, facts, sampling) in sampled {
                 let purges = purge_statements(&facts.framework_tables, &sources.config);
                 for line in psql_connect(label, url) {
                     eprintln!("  {line}");
                 }
-                // The same fail-closed shape the fence uses: false first, so a
-                // `\gset` whose query fails cannot carry the previous target's
-                // answer into this one's VACUUM statements.
-                //
-                // And the SAME psql proof the transaction opens with, not the
-                // endpoint alone: this is a second `\connect`, with the same
-                // retained-connection failure mode, and server-reported identity
-                // cannot tell two clones behind colliding addresses apart. A
-                // `VACUUM (FULL)` on the wrong target takes an ACCESS EXCLUSIVE
-                // lock and rewrites every table it names.
+                // False first, so a failing `\gset` cannot carry the previous target's answer
+                // forward. The full psql proof, not just the endpoint: this is a second
+                // `\connect`, and a `VACUUM (FULL)` on the wrong target locks and rewrites
+                // every table it names.
                 eprintln!("  \\set autumn_here false");
                 eprintln!(
                     "  SELECT ({} AND NOT ({})) AS autumn_here \\gset",
@@ -4002,8 +3805,8 @@ fn classify_and_apply(
         return Ok(());
     }
 
-    // An encrypted rewrite needs the target's key BEFORE anything is written,
-    // so a missing key is a refusal rather than a half-scrubbed database.
+    // Resolve the key before anything is written, so a missing key is a refusal rather than a
+    // half-scrubbed database.
     if plans
         .iter()
         .any(|(_, _, plan, _, _)| plan.tables.iter().any(|t| !t.encrypted.is_empty()))
@@ -4014,9 +3817,8 @@ fn classify_and_apply(
 
     // ── Pass 2: apply ───────────────────────────────────────────────────────
     //
-    // Every failure from here on says which databases are already scrubbed and
-    // which still hold real data — including the post-commit compaction, which
-    // runs after this target has committed.
+    // Every failure from here on says which databases are already scrubbed and which still
+    // hold real data.
     let mut committed: Vec<&str> = Vec::new();
     let warn_committed = |committed: &[&str]| {
         if !committed.is_empty() {
@@ -4028,9 +3830,8 @@ fn classify_and_apply(
             );
         }
     };
-    // The refreshed materialized views ride along beside the purge targets: the
-    // size report has to measure them, though compaction does not touch them
-    // (`REFRESH` already rewrote each one's heap).
+    // The materialized views ride along for the size report; compaction skips them because
+    // `REFRESH` already rewrote each heap.
     let mut pending_compaction: Vec<PendingCompaction<'_>> = Vec::new();
     for (label, url, plan, facts, sampling) in &plans {
         let purges = purge_statements(&facts.framework_tables, &sources.config);
@@ -4066,21 +3867,9 @@ fn classify_and_apply(
         }
     }
 
-    // The artifact is captured BEFORE compaction, not after.
-    //
-    // Every lock is released at commit, so any window between committing and
-    // dumping is one in which a concurrent write can land unscrubbed rows in a
-    // target and have them captured into an artifact advertised as a scrubbed
-    // subset. Compaction is per-table `VACUUM FULL` over the whole schema,
-    // which on a large source is long — running it first would stretch that
-    // window from moments to minutes. It also contributes nothing to the
-    // artifact: `pg_dump` is logical, so a compacted table dumps to exactly the
-    // same bytes as an uncompacted one. Compaction is about the live copy's
-    // disk, so it can wait until the artifact is safely written.
-    //
-    // The remaining window — commit to the dump's own snapshot — is inherent to
-    // dumping a database the scrub has already released, and is why the guide
-    // says to scrub a restored copy rather than something still taking writes.
+    // The artifact is captured before compaction. Locks are released at commit, so a
+    // concurrent write can land unscrubbed rows before the dump; a long `VACUUM FULL` first
+    // would widen that window. `pg_dump` is logical, so compaction does not change the dump.
     if let Some(dir) = &args.output {
         eprintln!("\u{2500}\u{2500} writing a scrubbed artifact \u{2500}\u{2500}");
         super::backup::backup(&super::backup::BackupArgs {
@@ -4093,11 +3882,8 @@ fn classify_and_apply(
         })?;
     }
 
-    // Deleting rows leaves the table files exactly as large as they were, so a
-    // sample that is not compacted still needs the source's disk. This is the
-    // step that makes the live subset actually laptop-sized, and it can only run
-    // after the commit: VACUUM FULL rewrites each table and cannot join a
-    // transaction.
+    // Deleting rows does not shrink the table files, so the sample is compacted here. VACUUM
+    // FULL cannot run inside a transaction, so this follows the commit.
     for (url, label, sampling, purged, refreshed, size_before) in pending_compaction {
         report_reclaimed_size(url, label, sampling, &purged, &refreshed, size_before);
     }
@@ -4114,9 +3900,8 @@ fn build_sample_plan_for(
     tables: &[Table],
     facts: &DatabaseFacts,
 ) -> Result<sample::SamplePlan, ScrubError> {
-    // A partition's rows belong to its parent, which is what the walk and the
-    // deletes address — planning it separately would count and remove them
-    // twice, exactly as `build_plan` skips it for the rewrites.
+    // A partition's rows are addressed through its parent; planning it too would count and
+    // delete them twice. `build_plan` skips it for the same reason.
     let universe: Vec<(String, Vec<String>)> = tables
         .iter()
         .filter(|t| !facts.partitions.contains_key(&t.name))
@@ -4166,11 +3951,8 @@ fn report_sample_plan(label: &str, plan: &sample::SamplePlan) {
 /// statements are shown once with that noted rather than unrolled: how many
 /// passes a schema needs is a property of the data, not of the plan.
 fn report_sample_sql(plan: &sample::SamplePlan, counts: Option<&BTreeMap<String, i64>>) {
-    // The counts are read for EVERY target before this prints anything, so a
-    // target that cannot be sized takes the whole script down before a line of
-    // it exists. They are still live counts read outside the scrub's own
-    // transaction, so a concurrent write can move one between this print and a
-    // later real run — as it can for any dry run against a live database.
+    // Live counts read outside the scrub's transaction: a concurrent write can move one
+    // before the script runs, as with any dry run against a live database.
     let empty = BTreeMap::new();
     let counts = counts.unwrap_or(&empty);
     for statement in plan.setup_statements() {
@@ -4182,12 +3964,9 @@ fn report_sample_sql(plan: &sample::SamplePlan, counts: Option<&BTreeMap<String,
     for statement in plan.index_statements() {
         eprintln!("  {statement};");
     }
-    // The walk as the loop it really is, not the statements plus a comment
-    // saying to repeat them. Within a pass the statements run in list order, so
-    // running them once selects only as deep as the catalog's edge order
-    // happens to reach; the rows below that survive the walk but not the
-    // DELETEs, and nothing catches it, because dropping a descendant leaves
-    // every foreign key satisfied and every assertion below still passes.
+    // The walk as a real loop: one pass reaches only as deep as the catalog's edge order
+    // allows, and the rows it misses are deleted without breaking any foreign key, so no
+    // assertion below would catch it.
     eprintln!("  {};", plan.walk_loop_statement().replace('\n', "\n  "));
     for statement in plan.delete_statements() {
         eprintln!("  {statement};");
@@ -4198,13 +3977,9 @@ fn report_sample_sql(plan: &sample::SamplePlan, counts: Option<&BTreeMap<String,
             integrity_assertion(&statement)
         );
     }
-    // Capture every sampled table's post-sample row count where the executor
-    // captures its own `after` counts — after the deletes and the integrity
-    // checks, and before the rewrites, purges and refreshes that follow in the
-    // printed sequence. The printed half of `verify_sample_survived_refreshes`
-    // asserts against these after the refreshes: the subset is what must
-    // survive, and its size is data-dependent, so it is captured at paste
-    // time rather than baked at print time.
+    // Captured where the executor takes its `after` counts, at paste time because the
+    // subset's size depends on the data. `sample_postcondition_statements` asserts against
+    // them after the refreshes.
     for statement in sample_count_capture_statements(plan) {
         eprintln!("  {statement};");
     }
@@ -4382,13 +4157,10 @@ fn report_reclaimed_size(
         warn_not_compacted(before, &e);
         return;
     }
-    // A full-copy table is never deleted from, so it has nothing to reclaim.
-    // `data_size` still measures it on both sides, which keeps the ratio
-    // comparable.
+    // A full-copy table has nothing to reclaim, but `data_size` measures it on both sides so
+    // the ratio stays comparable.
     for table in compacted_tables(plan, purged) {
-        // Not in a transaction, and deliberately: VACUUM FULL takes an
-        // exclusive lock and rewrites the table, neither of which a transaction
-        // block permits.
+        // VACUUM cannot run inside a transaction block.
         if let Err(e) = sql_query(format!("VACUUM (FULL, ANALYZE) {}", qualified_ident(table)))
             .execute(&mut conn)
         {
@@ -4396,11 +4168,8 @@ fn report_reclaimed_size(
             return;
         }
     }
-    // Measured over the same set as `size_before`: the purge targets AND the
-    // materialized views this run refreshed. Compaction above deliberately
-    // skips the views — REFRESH rewrote each heap already — but leaving them
-    // out of the measurement is what let the report announce a laptop-sized
-    // result for a database a refreshed view still dominated.
+    // Measured over the same set as `size_before`, refreshed views included: they are not
+    // compacted, but leaving them out would understate the result.
     let Ok(after) = sample::data_size(&mut conn, plan, &also_measured(purged, refreshed)) else {
         warn_not_compacted(before, "could not measure the compacted size");
         return;
@@ -5093,13 +4862,9 @@ fn probe_connection(url: &str, label: &str, what: &str) -> Result<PgConnection, 
             parsed_db_name(url)
         ),
     })?;
-    // Pinned here, not only inside the scrub's transaction: `pg_catalog` is
-    // searched implicitly ONLY when the path does not name it, so a target whose
-    // `search_path` is `public, pg_catalog` lets an application object shadow a
-    // built-in — and every question this command asks the catalog is asked over
-    // THIS connection, before any transaction opens. A `public.current_setting`
-    // returning `'origin'` was enough to walk straight past the replica-role
-    // refusal.
+    // Pinned on the probe connection too: every catalog question runs here before any
+    // transaction opens, and a `search_path` naming `pg_catalog` after `public` lets an
+    // application object (a `public.current_setting`, say) shadow a built-in.
     conn.batch_execute("SET search_path = pg_catalog, public")
         .map_err(|e| ScrubError::Introspect {
             label: label.to_owned(),
@@ -5302,8 +5067,7 @@ fn schema_drift(
 }
 
 /// Gather every catalog fact the plan validation needs.
-// One catalog read per fact; splitting it would scatter closely-related SQL
-// across helpers that each need the same connection.
+// One catalog read per fact; splitting it would scatter related SQL across helpers.
 #[allow(clippy::too_many_lines)]
 fn probe_database_facts(
     url: &str,
@@ -5338,9 +5102,8 @@ fn probe_database_facts(
     );
 
     // ── Foreign keys as whole constraints ───────────────────────────────────
-    // The set above answers "may this column be rewritten"; `--sample` asks a
-    // different question — "which rows must travel together" — and that needs
-    // the constraint, in key order, both sides paired.
+    // `--sample` needs whole constraints, in key order with both sides paired, to know which
+    // rows travel together.
     let cloned = if has_catalog_column(&mut conn, "pg_constraint", "conparentid")? {
         "c.conparentid <> 0"
     } else {
@@ -5421,15 +5184,10 @@ fn probe_database_facts(
     };
 
     // ── Uniqueness, the write-side question ─────────────────────────────────
-    // ANY unique index counts (composite and partial included): the IR's
-    // single-column `unique` flag answers a migration-diff question, not
-    // "can this rewrite collide".
-    // `pg_index.indkey` is an `int2vector`, not a real array, so it is matched
-    // with `= ANY(...)` rather than `unnest`. The `[0:indnkeyatts-1]` slice is
-    // the KEY columns only — a covering index's `INCLUDE` columns carry no
-    // uniqueness and must not be treated as constrained.
-    // Covering indexes (`INCLUDE`) arrived with `indnkeyatts` in Postgres 11; on
-    // an older server every `indkey` entry IS a key column.
+    // Any unique index counts, composite and partial included; the IR's `unique` flag is
+    // single-column only. `indkey` is an `int2vector`, so it is matched with `= ANY(...)`.
+    // The `[0:indnkeyatts-1]` slice skips a covering index's `INCLUDE` columns; before
+    // Postgres 11 (no `indnkeyatts`) every `indkey` entry is a key column.
     let key_slice = if has_catalog_column(&mut conn, "pg_index", "indnkeyatts")? {
         "i.indkey[0:i.indnkeyatts-1]"
     } else {
@@ -5449,26 +5207,13 @@ fn probe_database_facts(
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
     );
 
-    // Two kinds of unique index whose real inputs `indkey` does not name:
+    // Columns a unique index reads that `indkey` does not name: an expression index
+    // (`left(email, 1)` collapses every token onto one character) or a partial index's
+    // predicate (rewriting it changes which rows the index covers). No strategy is unique
+    // over an expression, so these get their own set and every strategy is refused.
     //
-    // - an EXPRESSION index (`ON users (left(email, 1))`) stores `0` for the
-    //   expression position, so the join above sees no column at all — and
-    //   uniqueness after an arbitrary expression cannot be preserved by a
-    //   per-row token, since `left(x, 1)` collapses every scrubbed value onto
-    //   one character;
-    // - a PARTIAL index (`ON events (group_id) WHERE active = false`) is keyed
-    //   on `group_id`, but rewriting `active` changes which rows the index
-    //   COVERS — pulling previously-excluded duplicates into it.
-    //
-    // Keep these in their own set, not in `unique_columns`. A strategy that is
-    // unique on the column value says nothing about an expression over it, so
-    // no strategy is allowed.
-    //
-    // `pg_depend` cannot find them: a column that an expression or predicate
-    // reads is an auto dependency, like a plain key column. The stored node
-    // trees name each column as `varattno N`. Match on that, as
-    // `PARTITION_KEY_COLUMNS` does for expression partition keys. `varattno 0`
-    // is a whole-row reference: it reads every column.
+    // `pg_depend` cannot tell these from key columns, so match `varattno N` in the stored
+    // node trees, as `PARTITION_KEY_COLUMNS` does. `varattno 0` is a whole-row reference.
     let unique_expression_columns = pair_set(
         sql_query(
             "SELECT rel.relname AS tbl, att.attname AS col \
@@ -5522,10 +5267,8 @@ fn probe_database_facts(
         .map_err(|e| ScrubError::Sql(e.to_string()))?,
     );
 
-    // `NULLS NOT DISTINCT` (PG15+) makes a second NULL a violation, so the
-    // `null` strategy stops being unique-safe. `indnullsnotdistinct` does not
-    // exist before 15; probe the column's presence first so this stays
-    // compatible with older servers.
+    // `NULLS NOT DISTINCT` (Postgres 15+) makes a second NULL a violation, so `null` is not
+    // unique-safe there.
     let nulls_not_distinct_columns =
         if has_catalog_column(&mut conn, "pg_index", "indnullsnotdistinct")? {
             pair_set(
@@ -5553,10 +5296,8 @@ fn probe_database_facts(
         Ok(rows.into_iter().map(|r| r.name).collect())
     };
 
-    // Each partition mapped to the top-level table it belongs to, not just
-    // named: a key declared on a leaf is unrepresentable in general, but
-    // harmless when the run empties that leaf's whole tree, and only the
-    // mapping can tell the two apart.
+    // Each partition mapped to its top-level table: a key declared on a leaf is harmless
+    // only when the run empties that leaf's whole tree, and only the mapping shows that.
     let partitions: BTreeMap<String, String> =
         if has_catalog_column(&mut conn, "pg_class", "relispartition")? {
             pair_rows(
@@ -5578,10 +5319,8 @@ fn probe_database_facts(
             BTreeMap::new()
         };
 
-    // A constraint declared on a partition alone (a child-only `CHECK`, a local
-    // unique index) still fires when the run's `UPDATE` reaches that partition
-    // through its parent, and the plan only looks at the parent. Fold each
-    // constraint fact onto the root, as the partition keys are below.
+    // A partition-only constraint still fires when the `UPDATE` reaches the partition through
+    // its parent, and the plan only looks at the parent, so fold each fact onto the root.
     let foreign_key_columns = fold_into_parent(foreign_key_columns, &partitions);
     let checked_columns = fold_into_parent(checked_columns, &partitions);
     let unique_columns = fold_into_parent(unique_columns, &partitions);
@@ -5605,9 +5344,8 @@ fn probe_database_facts(
             BTreeSet::new()
         };
 
-    // A declarative partition is also a `pg_inherits` child, so the partition
-    // case is excluded explicitly — those the sample models through the parent
-    // on purpose. What is left is legacy `INHERITS`, which it cannot.
+    // Declarative partitions are `pg_inherits` children too; the sample models them through
+    // the parent. What is left is legacy `INHERITS`, which it cannot model.
     let legacy_inheritance: Vec<String> = {
         let partition_filter = if has_catalog_column(&mut conn, "pg_class", "relispartition")? {
             "AND NOT child.relispartition"
@@ -5634,20 +5372,13 @@ fn probe_database_facts(
         .into_iter()
         .collect();
 
-    // Two questions, one shape: which tables carry a user-defined trigger at
-    // all (the warning), and which carry one that fires on `DELETE` (the
-    // refusal). `triggers_reaching` builds both, so they cannot drift on the
-    // catalog rules they share.
-    // Triggers and rules alike: both run code on a write, and this warning exists
-    // to say "something here can copy a row somewhere this run does not look".
-    // A `DO INSTEAD` rule can also stop the sample's `DELETE` removing anything.
+    // Tables with any user-defined trigger or rule, for the warning: both run code on a write
+    // that can copy a row elsewhere, and a `DO INSTEAD` rule can stop the sample's `DELETE`.
+    // `triggers_reaching` also builds the `DELETE`-only set below, so the two cannot drift.
     let mut triggered_tables: BTreeSet<String> = names(&triggers_reaching(""), &mut conn)?
         .into_iter()
         .collect();
     triggered_tables.extend(names(&rules_reaching(""), &mut conn)?);
-    // `tgtype` bit 3 is the DELETE event. These are the ones that matter for
-    // the run's last write, so the refusal can name exactly the tables that
-    // carry one rather than every table carrying any trigger at all.
     // Read rather than pinned: `session_replication_role` needs privileges an
     // ordinary scrub role does not have — measured, a non-superuser cannot set
     // it even to its own default — so `SET LOCAL` would break every unprivileged
@@ -5660,19 +5391,11 @@ fn probe_database_facts(
     .next()
     .unwrap_or_else(|| "origin".to_owned());
 
-    // The endpoint this connection actually reached, for the dry run's target
-    // guard. Comparing the database name alone is not enough: a sharded fleet
-    // runs the SAME database name on different hosts — the topology in
-    // docs/guide/sharding.md names all three `app` — so a retained connection to
-    // one shard answers `current_database()` exactly as the intended one would.
-    // Measured: two clusters both holding `app`, a failed `\connect`, and the
-    // shard1 block scrubbed shard0 (200 -> 100 users) past a name-only guard.
-    //
-    // Read from the live connection rather than parsed out of the URL, because a
-    // hostname is not what the server reports back — `inet_server_addr()` is an
-    // address, and resolving one at print time is not this command's job. NULL
-    // over a Unix socket, which the guard compares as NULL rather than papering
-    // over.
+    // The endpoint this connection reached, for the dry run's target guard. The database
+    // name alone is not enough: shards often share it, so a retained connection to one shard
+    // answers `current_database()` like the intended one. Read from the server rather than
+    // the URL, since `inet_server_addr()` reports an address, not a hostname. NULL over a
+    // Unix socket.
     let (address, port) = pair_rows(
         "SELECT coalesce(pg_catalog.inet_server_addr()::text, '') AS tbl, \
          coalesce(pg_catalog.inet_server_port()::text, '') AS col",
@@ -5681,10 +5404,8 @@ fn probe_database_facts(
     .into_iter()
     .next()
     .unwrap_or_default();
-    // A value the target may not be able to answer for. `coalesce` to the empty
-    // string rather than letting a NULL fail to deserialize, so "the role may
-    // not read this" and "this connection has no such value" arrive the same
-    // way: as `None`, which the guard compares as NULL.
+    // A value the target may not answer for. Errors and NULLs (coalesced to '') both become
+    // `None`, which the guard compares as NULL.
     let optional = |query: &str, conn: &mut PgConnection| -> Option<String> {
         names(query, conn)
             .ok()
@@ -5713,31 +5434,23 @@ fn probe_database_facts(
             "SELECT pg_catalog.current_setting('port') AS name",
             &mut conn,
         ),
-        // Through `pg_settings`, not `current_setting`: the parameter is
-        // restricted to `pg_read_all_settings`, and `current_setting` raises
-        // `permission denied to examine ...` for a role without it — which
-        // would abort the introspection an ordinary scrub role has to complete.
-        // The view simply omits the row, so the scalar subquery answers NULL and
-        // the guard compares NULL to NULL, losing the discriminator rather than
-        // the run. Verified both ways on PostgreSQL 16.13: as a non-superuser,
-        // `current_setting` errored and this returned empty.
+        // Through `pg_settings`: `current_setting` raises for a role without
+        // `pg_read_all_settings`, while the view just omits the row, so the guard loses this
+        // discriminator rather than the run.
         data_directory: optional(&setting_of("data_directory"), &mut conn),
     };
 
-    // Rules are the other way a `DELETE` runs code the plan never saw. Unlike a
-    // trigger they fire only on the relation the statement NAMES — measured on
-    // PostgreSQL 16: a rule on a leaf partition or an inheritance child does not
-    // fire for `DELETE FROM parent` — so this needs no walk up `pg_inherits`.
-    // `ev_type` `4` is DELETE; `_RETURN` is the SELECT rule every view carries.
+    // Tables where a `DELETE` runs code: `tgtype` bit 3 is the DELETE trigger event, and
+    // `ev_type` `4` a DELETE rule. A rule fires only on the relation the statement names, not
+    // on a partition or inheritance child, so rules need no walk up `pg_inherits`.
     let mut delete_triggered_tables: BTreeSet<String> =
         names(&triggers_reaching("AND (t.tgtype & 8) <> 0 "), &mut conn)?
             .into_iter()
             .collect();
     delete_triggered_tables.extend(names(&rules_reaching("AND r.ev_type = '4' "), &mut conn)?);
 
-    // `m` (materialized views) belongs here as much as the table relkinds do: a
-    // schema holding only `analytics.user_emails AS SELECT … FROM public.users`
-    // keeps its own copy of the PII, and the refresh pass only reaches `public`.
+    // `m` counts too: a materialized view in another schema keeps its own copy of the PII,
+    // and the refresh pass only reaches `public`.
     let other_schemas = names(
         "SELECT DISTINCT ns.nspname AS name FROM pg_class rel \
          JOIN pg_namespace ns ON ns.oid = rel.relnamespace \
@@ -5749,10 +5462,8 @@ fn probe_database_facts(
     .into_iter()
     .collect();
 
-    // Materialized views in dependency order: a view that reads another must be
-    // refreshed after it, or it re-derives from pre-scrub data. Restricted to
-    // the closure `MV_REFRESH_CLOSURE` defines — every populated view, and the
-    // views those read, however deep.
+    // Materialized views in dependency order, so a view is refreshed after the views it
+    // reads. Restricted to the `MV_REFRESH_CLOSURE` closure.
     let materialized_views = names(
         &format!(
             "{MV_REFRESH_CLOSURE}, depth AS ( \
@@ -5769,11 +5480,8 @@ fn probe_database_facts(
         &mut conn,
     )?;
 
-    // The same closure, flat and uncapped: the size report measures over this,
-    // and a view the walk's depth cap dropped still occupies its heap. It has to
-    // be the same set the ordered list is drawn from, because the
-    // unreachable-view refusal compares the two — a view missing from only one
-    // of them would be read as a view the walk could not reach.
+    // The same closure, flat and without the walk's depth cap: the size report measures it,
+    // and the unreachable-view refusal compares it against the ordered list.
     let all_materialized_views = names(
         &format!(
             "{MV_REFRESH_CLOSURE} \
@@ -5783,37 +5491,16 @@ fn probe_database_facts(
         &mut conn,
     )?;
 
-    // The views whose order cannot be derived at all. Deliberately not part of
-    // the closure query: this is a refusal, not an edge.
-    // Over EVERY relation reachable from a materialized view, not just the views
-    // themselves: `reach` walks through ordinary views, so an untracked function
-    // called by one of THOSE is exactly as invisible. Measured on
-    // `a_report -> bridge_view -> bridge_fn() -> z_source`, where only
-    // `bridge_view`'s rule names the function — the earlier `relkind = 'm'`
-    // predicate skipped it, `a_report` refreshed first from a stale `z_source`,
-    // and the run reported success with all 200 original addresses still in
-    // `a_report`.
+    // Views whose order cannot be derived: a refusal, so not part of the closure query.
+    // Checked over every relation reachable from a materialized view, since `reach` walks
+    // through ordinary views and a function they call is just as invisible.
     //
-    // `pg_proc.prosqlbody` holds the PARSED body of a `BEGIN ATOMIC` function
-    // and is NULL for a string literal, `plpgsql` or C — the property itself
-    // rather than a shadow of it. It arrived in PostgreSQL 14 along with
-    // `BEGIN ATOMIC`, so it is probed for like every other version-specific
-    // catalog fact in this file. On an older server the answer is not
-    // "unknown", it is "every one of them": before 14 no SQL body is parsed
-    // into the catalog at all, so no function reached from a view can be
-    // followed, and each one is untraceable by construction.
+    // `prosqlbody` holds the parsed body of a `BEGIN ATOMIC` function and is NULL for a string
+    // literal, `plpgsql` or C. It arrived in PostgreSQL 14; before that no body is parsed into
+    // the catalog, so every reached function is untraceable.
     //
-    // An AGGREGATE is exempt, and only an aggregate. Its `pg_proc` row is a
-    // shell with no body of any kind, so `prosqlbody` is NULL for a perfectly
-    // traceable one and the predicate refused it — measured, an aggregate whose
-    // transition function is a tracked `BEGIN ATOMIC` body was refused as
-    // `a_report via gather`, a valid scrub blocked. Exempting it loses nothing,
-    // because everything an aggregate actually runs is a separate `pg_proc` the
-    // closure already reaches: measured on one with both a transition and a
-    // final function, the shell records `pg_proc -> s_step` AND
-    // `pg_proc -> s_final`, and the opaque final function is still named. A
-    // window function (`prokind = 'w'`) is NOT exempt — it has no body because
-    // it is written in C, which is opacity rather than a shell.
+    // Aggregates are exempt: the row is a bodiless shell, and the functions it runs are
+    // separate `pg_proc` rows the closure already reaches. Window functions are not exempt.
     let opaque_body = if has_catalog_column(&mut conn, "pg_proc", "prosqlbody")? {
         "p.prokind <> 'a' AND p.prosqlbody IS NULL"
     } else {
@@ -5841,11 +5528,9 @@ fn probe_database_facts(
         &mut conn,
     )?;
 
-    // Views that read relations named in a STRING. Not an opaque body — there is
-    // no dependency recorded at all, because the relation is named in text the
-    // server parses at runtime. Detected from the rule's PARSED tree rather than
-    // its SQL text, so a column or literal that merely spells the name cannot
-    // trip it.
+    // Views that read relations named in a string, which records no dependency at all.
+    // Detected from the rule's parsed tree rather than its SQL text, so a column or literal
+    // that merely spells the name does not trip it.
     let views_reading_by_name = names(
         &format!(
             "{MV_REFRESH_CLOSURE}, node AS ( \
@@ -5871,9 +5556,8 @@ fn probe_database_facts(
         &mut conn,
     )?;
 
-    // EVERY unpopulated view, not only the closure members among them, because
-    // this list closes a race as well as restoring a state. See
-    // `DatabaseFacts::unpopulated_views`.
+    // Every unpopulated view, not only closure members: this list closes a race as well as
+    // restoring a state. See `DatabaseFacts::unpopulated_views`.
     let unpopulated_views = names(
         "SELECT rel.relname AS name FROM pg_class rel \
          JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
@@ -5898,9 +5582,8 @@ fn probe_database_facts(
         &mut conn,
     )?;
 
-    // `f` (foreign tables) is deliberately included: introspection reads only
-    // `BASE TABLE`, so a foreign table left pointing at production would be
-    // classified by nothing at all and still report a clean scrub.
+    // `PUBLIC_BASE_TABLES` includes foreign tables: introspection reads only `BASE TABLE`, so
+    // a foreign table pointing at production would otherwise go unclassified.
     let public_base_tables = names(PUBLIC_BASE_TABLES, &mut conn)?.into_iter().collect();
     let public_materialized_views = names(PUBLIC_MATVIEWS, &mut conn)?.into_iter().collect();
     let trigger_identities = names(TRIGGER_IDENTITIES, &mut conn)?.into_iter().collect();
@@ -6112,11 +5795,9 @@ fn compacted_tables<'a>(plan: &'a sample::SamplePlan, purged: &'a [String]) -> V
 fn psql_connect(label: &str, url: &str) -> Vec<String> {
     password_free_conninfo(url).map_or_else(
         || {
-            // Unreachable: the dry run refuses up front when any target's
-            // boundary cannot be printed. Kept, and made to STOP rather than to
-            // advise, because the failure mode if that guard is ever bypassed is
-            // a destructive block running against the previous target. A comment
-            // does not stop a paste; `\quit` does.
+            // Unreachable: the dry run refuses such a target up front. `\quit` rather than a
+            // warning, so a bypassed guard stops the paste instead of running this target's block
+            // against the previous connection.
             vec![
                 format!(
                     "\\echo '{label}: no printable connection string (keyword form) \
@@ -6127,19 +5808,10 @@ fn psql_connect(label: &str, url: &str) -> Vec<String> {
         },
         |conninfo| {
             vec![
-                // Pin the endpoint against the PASTING session's environment.
-                // libpq resolves `PGHOSTADDR` and `PGSERVICE` at connect time,
-                // so a script generated with them unset and pasted where they
-                // are set reaches a different server than the reconnect proof
-                // below asserts — while psql still reports the conninfo's own
-                // host as `:HOST`, so the proof cannot catch it. The
-                // generation-time guard (`endpoint_can_come_from_elsewhere`)
-                // refuses targets whose environment already sets them; this
-                // covers the other half, the session that pastes the script.
-                // `\setenv` with no value unsets the variable. Unsetting is
-                // safe for every printed target: one naming `service=` or
-                // `hostaddr` in its conninfo is refused before printing, so no
-                // printed `\connect` can depend on either variable.
+                // Unset these in the PASTING session: libpq reads `PGHOSTADDR` and `PGSERVICE` at
+                // connect time, so they could reroute the `\connect` while `:HOST` still reports
+                // the conninfo's host and the reconnect proof passes. Unsetting is safe because a
+                // target naming `service=` or `hostaddr` is refused before printing.
                 "\\setenv PGHOSTADDR".to_owned(),
                 "\\setenv PGSERVICE".to_owned(),
                 format!(
@@ -6262,15 +5934,9 @@ fn psql_connection_terms(conninfo: &str, database: &str) -> String {
         )
     };
     let database_is = equals("DBNAME", database);
-    // A conninfo that states no host cannot be proved at all, so the proof is
-    // `false` and the block is skipped. Unreachable today — a URI with an empty
-    // authority (`postgres:///app`, `postgres://user@/app`) fails
-    // `password_free_conninfo`, and the run refuses to print it as an
-    // unprintable target before this is ever reached, measured both ways — but
-    // stated here rather than left to that distant refusal. Omitting the host
-    // term instead would silently drop the one discriminator this proof exists
-    // for, leaving the database name to stand alone against a physical clone
-    // that shares it.
+    // A conninfo that states no host cannot be proved, so the proof is `false` and the block is
+    // skipped. `password_free_conninfo` already refuses such a target; dropping the host term
+    // instead would leave the database name alone against a physical clone that shares it.
     let (Some(host), port) = stated_host_and_port(conninfo) else {
         return "false".to_owned();
     };
@@ -6289,17 +5955,12 @@ fn psql_connection_terms(conninfo: &str, database: &str) -> String {
             .collect::<Vec<_>>()
             .join(" OR ")
     };
-    // libpq pairs a multi-host list with a multi-port list POSITIONALLY, and
-    // broadcasts a single port to every host. Measured on 16.13:
-    // `host=127.0.0.9,127.0.0.1&port=5433,5434` connected to 5434 — the port
-    // belonging to the host it reached, not the first in the list — and
-    // `host=127.0.0.9,127.0.0.1&port=5433` connected to 5433. So `a:5433` is NOT
-    // an endpoint `host=a,b&port=5432,5433` names, and matching host and port
-    // independently would accept a retained connection to one.
+    // libpq pairs a multi-host list with a multi-port list positionally and broadcasts a single
+    // port to every host, so host and port must match as a pair: `a:5433` is not an endpoint of
+    // `host=a,b&port=5432,5433`.
     let endpoint = match (ports.len(), hosts.len()) {
-        // Unreachable: a conninfo stating no port is refused before any line is
-        // printed, for the reason above. Fail closed rather than accept any port
-        // for the host if that refusal is ever relaxed.
+        // Unreachable: a conninfo stating no port is refused before printing. Fail closed if
+        // that refusal is ever relaxed.
         (0, _) => return "false".to_owned(),
         (1, _) => format!("({}) AND {}", any_host(), equals("PORT", ports[0])),
         (p, h) if p == h => hosts
@@ -6308,8 +5969,7 @@ fn psql_connection_terms(conninfo: &str, database: &str) -> String {
             .map(|(host, port)| format!("({} AND {})", equals("HOST", host), equals("PORT", port)))
             .collect::<Vec<_>>()
             .join(" OR "),
-        // libpq refuses this outright — measured, `could not match 3 port
-        // numbers to 2 hosts` — so the run could not have connected either.
+        // libpq refuses a host/port count mismatch, so the run could not have connected either.
         _ => return "false".to_owned(),
     };
     format!("{database_is} AND ({endpoint})")
@@ -6366,12 +6026,9 @@ fn psql_connection_assertion(conninfo: &str, database: &str) -> Vec<String> {
 fn target_guard(endpoint: &ServerEndpoint) -> String {
     let literal =
         |value: Option<&String>| value.map_or_else(|| "NULL".to_owned(), |v| quote_literal(v));
-    // `RAISE` substitutes bare `%` in argument order and has no `%1$s` form.
-    // Writing one named each database as the other and left `2$s` in the text.
-    // Every parameter is read the same way the introspection read it, so a value
-    // the pasting role may not examine answers NULL on BOTH sides rather than
-    // raising inside the guard: `pg_settings` omits a restricted row, where
-    // `current_setting` would raise `permission denied to examine ...`.
+    // `RAISE` substitutes bare `%` in argument order; it has no `%1$s` form.
+    // Settings are read through `pg_settings`, as introspection read them: a restricted row is
+    // omitted there, where `current_setting` would raise inside the guard.
     let setting = |parameter: &str| {
         format!(
             "coalesce((SELECT setting FROM pg_catalog.pg_settings WHERE name = {}), '')",
@@ -6388,11 +6045,9 @@ fn target_guard(endpoint: &ServerEndpoint) -> String {
          pg_catalog.inet_server_port()::text, {sysid_seen}, \
          pg_catalog.current_setting('port'), {datadir_seen}; END IF; END ",
         mismatch = endpoint_mismatch(endpoint),
-        // Report a discriminator the planning role could not read as unknown
-        // rather than calling for it: `pg_control_system()` raises for a role
-        // without EXECUTE, and a RAISE whose own argument raises replaces the
-        // mismatch this block exists to explain with `permission denied for
-        // function pg_control_system`.
+        // A discriminator the planning role could not read is reported as NULL, not queried:
+        // `pg_control_system()` raises without EXECUTE, and that error would replace the
+        // mismatch message.
         sysid_seen = if endpoint.system_identifier.is_some() {
             sysid_call.to_owned()
         } else {
@@ -6459,9 +6114,8 @@ fn replication_role_assertion() -> String {
 fn endpoint_mismatch(endpoint: &ServerEndpoint) -> String {
     let literal =
         |value: Option<&String>| value.map_or_else(|| "NULL".to_owned(), |v| quote_literal(v));
-    // Address and port are compared even when `None`, because there `None` is
-    // the target's REAL answer: both are NULL for every Unix-socket connection,
-    // and pinning that is what stops a socket block running against a TCP one.
+    // Address and port are compared even when `None`: NULL is the real answer over a Unix
+    // socket, and pinning it stops a socket block running against a TCP endpoint.
     let mut terms = vec![
         format!(
             "pg_catalog.current_database() <> {}",
@@ -6480,15 +6134,9 @@ fn endpoint_mismatch(endpoint: &ServerEndpoint) -> String {
             literal(endpoint.server_port.as_ref())
         ),
     ];
-    // These two are different: `None` means the PLANNING role could not read the
-    // value, not that the target has none — every live server has both. A term
-    // comparing against a value we never learned can only be wrong. It refuses a
-    // CORRECT paste whenever the pasting role can read what the planning role
-    // could not, and `pg_control_system()` is worse still: measured, with its
-    // EXECUTE revoked an ordinary role gets `permission denied for function
-    // pg_control_system`, which inside the guard aborts the transaction and
-    // takes the whole paste down. So an unreadable discriminator is dropped
-    // rather than guessed at; the four above still identify the endpoint.
+    // Here `None` means the planning role could not read the value; every server has both.
+    // Comparing against it would refuse a correct paste, and `pg_control_system()` without
+    // EXECUTE raises and aborts the transaction. The four terms above identify the endpoint.
     if let Some(sysid) = endpoint.system_identifier.as_ref() {
         terms.push(format!(
             "(SELECT system_identifier::text FROM pg_catalog.pg_control_system()) \
@@ -6535,13 +6183,12 @@ fn endpoint_mismatch(endpoint: &ServerEndpoint) -> String {
 /// pasting session's path happens to be.
 fn post_commit_fence(endpoint: &ServerEndpoint) -> Vec<String> {
     vec![
-        // FIRST, before any statement runs: a query would reset psql's own
-        // `:ERROR`, and this is the only moment it still describes the `COMMIT`.
-        // `\set` is a meta-command and executes nothing, so it is safe here.
+        // First: any query resets psql's `:ERROR`, so only here does it still describe the
+        // `COMMIT`. `\set` executes nothing.
         "\\set autumn_commit_error :ERROR".to_owned(),
         "SET search_path = pg_catalog, public;".to_owned(),
-        // False FIRST, so a `\\gset` whose query fails leaves it false instead of
-        // carrying the previous target's success forward.
+        // False first, so a failing `\gset` leaves it false instead of carrying the previous
+        // target's success forward.
         "\\set autumn_ok false".to_owned(),
         format!(
             "SELECT (:'autumn_scrubbed'::bool AND NOT :'autumn_commit_error'::bool \
@@ -6650,28 +6297,13 @@ fn password_free_conninfo(url: &str) -> Option<String> {
     // `set_password` returns Err only for a URL that cannot have one
     // (`mailto:` and friends), which a connection string is not.
     parsed.set_password(None).ok()?;
-    // Read and rewrite the query the way libpq does, NOT the way
-    // `url::Url::query_pairs()` does. That method applies
-    // `application/x-www-form-urlencoded` rules, and its `query_pairs_mut()`
-    // counterpart serializes a space back as `+` — while libpq's URI parser
-    // only ever percent-decodes, so it reads that `+` literally. Measured
-    // against psql 16.13: an operator's `?options=-c%20search_path%3Dpg_catalog`
-    // connects and sets the path, and the `+` form this used to print does not
-    // connect at all —
-    //
-    //   FATAL:  unrecognized configuration parameter "+search_path"
-    //
-    // which is the failure mode the target guard exists for. `pg.rs` already
-    // holds both halves of the libpq grammar, with the reasoning; this uses
-    // them rather than keeping a second opinion about encoding here.
+    // Parse and re-encode the query the way libpq does. libpq only percent-decodes, so the `+`
+    // that `url`'s form-urlencoded `query_pairs_mut()` writes for a space is read literally and
+    // the connection fails (`unrecognized configuration parameter "+search_path"`).
     let pairs = crate::pg::parse_raw_query_pairs(parsed.query().unwrap_or(""));
-    // Fail closed on a keyword on neither list: this is the allowlist half —
-    // a parameter this code has never heard of refuses the whole conninfo
-    // rather than being printed. Dropping it instead would be the worse
-    // failure: dropping `hostaddr` reconnects somewhere else, and dropping a
-    // future credential parameter prints a conninfo that cannot do what the
-    // run did. The dry run refuses such a target up front
-    // (`UnprintableTarget`).
+    // Fail closed on a keyword on neither list. Dropping it would be worse: dropping `hostaddr`
+    // reconnects elsewhere, and dropping an unknown parameter prints a conninfo that does not do
+    // what the run did. The dry run refuses such a target up front (`UnprintableTarget`).
     if pairs
         .iter()
         .any(|(key, _)| !is_secret_keyword(key) && !is_printable_keyword(key))
@@ -6745,15 +6377,10 @@ fn session_settings() -> Vec<String> {
     [
         "SET LOCAL search_path = pg_catalog, public",
         "SET LOCAL standard_conforming_strings = on",
-        // The rest pin how a value RENDERS, because the sample's row key is
-        // hashed from `key::text` and `--seed` promises the same seed against
-        // the same source selects the same rows. Measured: the same seed over a
-        // `date` primary key selects a different subset under `DateStyle = ISO,
-        // YMD` than under `Postgres, DMY`. `bytea_output` and
-        // `extra_float_digits` do the same for their types, and `IntervalStyle`
-        // for intervals. (`TimeZone` is pinned by the driver on connect, but
-        // relying on that leaves the guarantee resting on a dependency's
-        // default.)
+        // The rest pin how values render: the sample's row key hashes `key::text`, and `--seed`
+        // must select the same rows from the same source (a `date` key selects differently
+        // under `DateStyle = 'Postgres, DMY'`). `TimeZone` is pinned here rather than relying on
+        // the driver's connect default.
         "SET LOCAL DateStyle = 'ISO, YMD'",
         "SET LOCAL IntervalStyle = 'iso_8601'",
         "SET LOCAL TimeZone = 'UTC'",
@@ -6811,11 +6438,8 @@ fn lock_statements(
 /// because a bare `SELECT count(*)` in a pasted sequence returns a number and
 /// then commits anyway — exactly the run the command refuses.
 fn integrity_assertion(check: &str) -> String {
-    // The tag is chosen from the finished body, never fixed: `check` carries
-    // quoted identifiers, a Postgres identifier may legally contain `$`, and
-    // dollar quoting is lexical — a `$$` inside a column name would close this
-    // block mid-statement and turn the rest into a syntax error in the one
-    // sequence the operator was told to paste.
+    // The dollar-quote tag is derived from the body: `check` holds quoted identifiers, which may
+    // contain `$`, and a `$$` inside one would close a fixed-tag block mid-statement.
     let body = format!(
         "BEGIN IF ({check}) > 0 THEN \
          RAISE EXCEPTION 'a foreign key this run checked does not resolve'; \
@@ -6941,9 +6565,8 @@ fn rewrite_encrypted_column(
         let mut values = Vec::with_capacity(chunk.len());
         for row in chunk {
             let plaintext = encrypted_plaintext(rewrite.shape, &row.token);
-            // A key ring is installed before the apply pass, so this can only
-            // fail on a genuinely broken key — surfaced as a SQL-shaped error so
-            // the transaction rolls back with everything else.
+            // A key ring is installed before the apply pass, so this fails only on a broken key.
+            // It is mapped to a SQL error so the transaction rolls back.
             let envelope = encrypt_text(mode, &plaintext).map_err(|e| {
                 diesel::result::Error::QueryBuilderError(
                     format!(
@@ -7080,20 +6703,13 @@ fn execute(
     // The transaction's error type carries BOTH channels, so a sample refusal
     // rolls back as itself rather than as an opaque database error.
     conn.transaction::<_, sample::SampleFailure, _>(|conn| {
-        // Pin the resolution of every unqualified name and the meaning of every
-        // string literal for the whole transaction, so a role- or
-        // database-level `search_path` (tenant schemas) cannot redirect a write
-        // to a table nothing classified, and `quote_literal`'s doubled quotes
-        // cannot be re-interpreted under `standard_conforming_strings = off`.
+        // Pin name resolution and string-literal meaning: a role- or database-level `search_path`
+        // could redirect a write to an unclassified table, and `quote_literal`'s doubled quotes
+        // change meaning under `standard_conforming_strings = off`.
         conn.batch_execute(&session_settings().join("; "))?;
-        // Hold the tables for the duration: the plan was built from a snapshot
-        // taken on another connection, and a row inserted between the two would
-        // otherwise survive the scrub unnoticed. SHARE ROW EXCLUSIVE blocks
-        // writers while still allowing plain reads.
-        // Every table the transaction writes, including the ones it empties: a
-        // producer inserting into a purged job/sync/token table after that
-        // `DELETE` took its snapshot would otherwise survive a run that reports
-        // the table emptied.
+        // Lock every table the transaction writes or empties: the plan came from another
+        // connection's snapshot, and a row inserted in between would survive the scrub.
+        // SHARE ROW EXCLUSIVE blocks writers but allows plain reads.
         for statement in lock_statements(plan, purges, sampling) {
             sql_query(statement).execute(conn)?;
         }
@@ -7106,16 +6722,10 @@ fn execute(
                 diesel::result::Error::RollbackTransaction,
             ));
         }
-        // Purges run FIRST so a framework-owned table that references a
-        // sampled one is already empty when the sample removes its parents —
-        // except the ones the plan defers, which are the mirror image: a table
-        // the sample empties references them, so they have to wait for it.
-        //
-        // These early passes exist to make the DELETEs possible, not to make the
-        // guarantee true: the authoritative pass is the one after the rewrites,
-        // because a trigger on a scrubbed table can write fresh rows — carrying
-        // the very PII being removed — into a purged table after these run.
-        // Rows removed are accumulated across all passes and reported once.
+        // Purges run first so a framework table referencing a sampled one is empty before the
+        // sample deletes its parents; deferred purges are the reverse case and wait for the
+        // sample. These passes only make the deletes possible: the final pass after the rewrites
+        // is what guarantees emptiness. Rows removed are summed across passes.
         let no_deferral = BTreeSet::new();
         let deferred: &BTreeSet<String> = sampling.map_or(&no_deferral, |s| &s.purge_after);
         let phases = emptying_phases(purges, deferred, sampling);
@@ -7131,10 +6741,8 @@ fn execute(
             outcome = Some(sample::apply(
                 conn,
                 sampling,
-                // The uncapped list: refresh ORDER comes from the walk, but a
-                // view the walk's depth cap dropped still holds its heap, and
-                // measuring only the ordered subset is what let the report
-                // announce a size a large unmeasured view contradicted.
+                // The uncapped list: refresh order comes from the walk, but a view its depth cap
+                // dropped still holds its heap, so the size report must measure it too.
                 &also_measured(&purged_tables(purges), views.all),
             )?);
         }
@@ -7155,13 +6763,9 @@ fn execute(
                 counts.push((format!("{}.{}", table.table, rewrite.column), rows));
             }
         }
-        // The authoritative pass, after every rewrite: every purge again AND the
-        // `never_include` tables. An `UPDATE` trigger on a scrubbed table — or a
-        // `DELETE` trigger fired by the sample — can copy `OLD` values into
-        // either kind, so emptying only beforehand would report a table emptied
-        // while it holds rows carrying the original PII. Both promises are
-        // "this table ends up empty", so both are enforced here, last; the
-        // passes above exist only to order the sample's own deletes.
+        // The authoritative pass, after every rewrite: every purge again plus the `never_include`
+        // tables. An `UPDATE` trigger on a scrubbed table, or a `DELETE` trigger fired by the
+        // sample, can copy `OLD` PII into either kind.
         for (table, statement) in &phases.final_pass {
             let rows = sql_query(statement).execute(conn)?;
             *purged_rows.entry(*table).or_default() += rows;
@@ -7170,18 +6774,8 @@ fn execute(
             counts.push((format!("{table} (emptied)"), rows));
         }
 
-        // Prove the promise instead of ordering for it.
-        //
-        // Each statement in the pass above can fire triggers, and one of those
-        // can insert into a table an EARLIER statement already emptied — an
-        // `ON DELETE` archive trigger between two promised-empty tables does
-        // exactly that. No ordering of the deletes rules that out in general:
-        // the trigger graph decides, and it can be cyclic. So the guarantee is
-        // checked rather than arranged, in the same transaction, the same way
-        // the sample re-counts its foreign keys rather than trusting the walk.
-        // Inside the transaction, so a refresh the role is not allowed to run
-        // rolls the rewrites back rather than committing base tables that a
-        // stale materialized view still contradicts.
+        // Inside the transaction, so a refresh the role may not run rolls the rewrites back
+        // instead of committing base tables a stale materialized view contradicts.
         for view in views.ordered {
             sql_query(format!(
                 "REFRESH MATERIALIZED VIEW {}",
@@ -7190,14 +6784,10 @@ fn execute(
             .execute(conn)?;
             counts.push((format!("{view} (materialized view refreshed)"), 0));
         }
-        // And `WITH NO DATA` for every view that had none when the run probed:
-        // the ones populated only so a dependent could be rebuilt from them, and
-        // the ones skipped entirely — which a concurrent session could have
-        // populated from pre-scrub rows in the meantime, since nothing here
-        // locks a view the run does not refresh. Last, after every refresh,
-        // because emptying a source before its dependent is rebuilt makes that
-        // refresh fail — and safe here, because emptying it afterwards does not
-        // un-populate the dependent already rebuilt from it.
+        // Then `WITH NO DATA` for every view that was unpopulated when probed: those populated
+        // only to rebuild a dependent, and those skipped, which a concurrent session could have
+        // filled from pre-scrub rows. Last, because emptying a source before its dependent is
+        // refreshed makes that refresh fail.
         for view in views.unpopulated {
             sql_query(format!(
                 "REFRESH MATERIALIZED VIEW {} WITH NO DATA",
@@ -7207,24 +6797,10 @@ fn execute(
             counts.push((format!("{view} (materialized view left unpopulated)"), 0));
         }
 
-        // Prove the promise instead of ordering for it — AFTER the refreshes,
-        // which are the last writes in the transaction.
-        //
-        // Each statement in the emptying pass can fire triggers, and one of
-        // those can insert into a table an EARLIER statement already emptied —
-        // an `ON DELETE` archive trigger between two promised-empty tables does
-        // exactly that. No ordering of the deletes rules that out in general:
-        // the trigger graph decides, and it can be cyclic.
-        //
-        // A refresh writes too. A materialized view's query can call a function
-        // whose body INSERTs, and `REFRESH` runs that query — measured on a
-        // tracked `BEGIN ATOMIC` function writing into a `never_include` table,
-        // the run reported `audit_logs: 503 -> 0 row(s)` and `✓ Scrub complete`
-        // while leaving three rows carrying real addresses. Volatility does not
-        // separate those functions out: measured, `CREATE FUNCTION ... STABLE
-        // BEGIN ATOMIC INSERT ...` is accepted, so a `provolatile` test would
-        // miss exactly this one. Checking after every write covers both causes
-        // and needs no guess about which functions can write.
+        // Prove the promise instead of ordering for it, after the refreshes, the last writes. A
+        // trigger fired by the emptying pass can refill a table emptied earlier (the trigger
+        // graph can be cyclic), and a refresh can run a function that INSERTs; volatility does
+        // not rule that out, since `STABLE BEGIN ATOMIC INSERT ...` is accepted.
         let mut refilled = Vec::new();
         for (table, _) in &phases.final_pass {
             let row: RowCount = sql_query(format!(
@@ -7244,9 +6820,8 @@ fn execute(
             ));
         }
 
-        // The sample's own postconditions belong here for the same reason: they
-        // are checked BEFORE the refreshes, which can write. See
-        // `verify_sample_survived_refreshes`.
+        // `sample::apply` checked its postconditions before the refreshes, which can write, so
+        // they are checked again. See `verify_sample_survived_refreshes`.
         if let (Some(settled), Some(plan)) = (outcome.as_ref(), sampling) {
             verify_sample_survived_refreshes(conn, settled, plan)?;
         }
@@ -7348,9 +6923,8 @@ mod tests {
             data_directory: Some("/tmp/pgd3".to_owned()),
         };
         let fence = super::post_commit_fence(&endpoint);
-        // The run's own pins are SET LOCAL, so they belong to the transaction
-        // that just rolled back. Without re-pinning, the operators below resolve
-        // through the pasting session's own search_path.
+        // The run's pins are SET LOCAL and ended with the rolled-back transaction, so the fence
+        // re-pins before its operators resolve.
         assert!(
             fence
                 .iter()
@@ -7363,24 +6937,15 @@ mod tests {
                 .any(|line| line.contains("\\gset") && line.contains("AS autumn_ok")),
             "psql, not the server, has to decide this one: {fence:?}"
         );
-        // The `\if` belongs to the compaction pass, which runs after EVERY
-        // target's transaction rather than inside one. Emitting it here put the
-        // VACUUM statements between two targets: measured on two TCP targets
-        // under `ON_ERROR_STOP on`, a first-target VACUUM that timed out ended
-        // the script at rc=3 with that database scrubbed and the SECOND still
-        // holding all 200 of its original addresses — from a failure the
-        // executor only warns about.
+        // The `\if` belongs to the compaction pass after every target's transaction. Emitted
+        // here, a VACUUM failure on the first target would stop the script before the second
+        // target was scrubbed.
         assert!(
             !fence.iter().any(|line| line == "\\if :autumn_ok"),
             "the fence sets the flag; the compaction pass reads it: {fence:?}"
         );
-        // One flag for the whole stream, not one per target: `execute` returns
-        // on the first target that fails and never touches the rest, and the
-        // script has to match. Measured with two real targets and a non-guard
-        // failure in the first: without it the second target's `\connect` and
-        // its whole destructive block ran anyway, leaving a partially scrubbed
-        // topology and a stream that ends with no error. With it, 90 statements
-        // were skipped and the second target was untouched at 100 rows.
+        // One flag for the whole stream, cleared once before the `\gset`: like `execute`, the
+        // script must not run a later target's `\connect` and block after an earlier one failed.
         assert_eq!(
             fence
                 .iter()
@@ -7389,23 +6954,16 @@ mod tests {
             1,
             "the flag must be cleared before the gset that may not run: {fence:?}"
         );
-        // Being on the right server is not the same as having scrubbed it.
-        // Measured: with a statement inside the transaction failing for a
-        // reason the guard knows nothing about, `COMMIT` returned ROLLBACK and
-        // an endpoint-only probe still ran all six VACUUM (FULL, ANALYZE) —
-        // ACCESS EXCLUSIVE locks and full rewrites on a target whose scrub had
-        // just rolled back. `:ERROR` does not catch it either: measured, psql
-        // reports that ROLLBACK as SUCCESS, so it is false there. Hence the
-        // explicit flag, set as the transaction's last statement.
+        // Being on the right server is not having scrubbed it: a failed statement turns `COMMIT`
+        // into ROLLBACK, which psql reports as success, so `:ERROR` misses it. The transaction
+        // sets `autumn_scrubbed` as its last statement, and the fence requires it.
         assert!(
             fence
                 .iter()
                 .any(|line| line.contains("autumn_scrubbed") && line.contains("::bool")),
             "the fence must require the transaction to have succeeded: {fence:?}"
         );
-        // And `:ERROR` must be captured before anything else runs, because a
-        // statement of any kind resets it — `\set` is a meta-command and
-        // executes nothing, which is why it can come first.
+        // `:ERROR` is captured first because any statement resets it; `\set` executes nothing.
         assert_eq!(
             fence.first().map(String::as_str),
             Some("\\set autumn_commit_error :ERROR"),
@@ -7451,20 +7009,16 @@ mod tests {
                 && guard.contains("pg_catalog.inet_server_port()::text IS DISTINCT FROM '5432'"),
             "the guard must pin the whole endpoint: {guard}"
         );
-        // Address and port are None for EVERY Unix-socket connection, so two
-        // socket clusters holding the same database name are identical by them.
-        // Measured: both reported `<null>/<null>` while their system identifiers
-        // differed (7682669380557907941 vs 7683257673996527196).
+        // Address and port are NULL for every Unix-socket connection, so two socket clusters
+        // holding the same database name match on them; the cluster identifier tells them apart.
         assert!(
             guard.contains("IS DISTINCT FROM '7682669380557907941'"),
             "the cluster identity must be pinned too, or two socket clusters are \
              indistinguishable: {guard}"
         );
-        // And the identifier alone is not identity either: a physical copy —
-        // a replica, or a promoted staging clone — carries the identifier of
-        // the cluster it was cloned from. The configured port answers over a
-        // socket where `inet_server_port()` is NULL, and the data directory is
-        // the value two postmasters on one machine cannot share.
+        // A physical copy (a replica or promoted clone) inherits the cluster identifier, so the
+        // configured port and data directory are pinned too: two postmasters on one machine
+        // cannot share a data directory.
         assert!(
             guard.contains("pg_catalog.current_setting('port') IS DISTINCT FROM '5432'"),
             "the server's configured port must be pinned: {guard}"
@@ -7473,20 +7027,15 @@ mod tests {
             guard.contains("IS DISTINCT FROM '/var/lib/postgresql/16/main'"),
             "the data directory must be pinned, or a clone passes: {guard}"
         );
-        // Read through `pg_settings`, never `current_setting`: the parameter is
-        // restricted to `pg_read_all_settings`, and `current_setting` raises
-        // `permission denied to examine ...` for a role without it — inside the
-        // guard, that failure would abort a CORRECT paste.
+        // Read through `pg_settings`: `current_setting('data_directory')` raises for a role
+        // without `pg_read_all_settings`, which would abort a correct paste.
         assert!(
             !guard.contains("current_setting('data_directory')")
                 && guard.contains("FROM pg_catalog.pg_settings WHERE name = 'data_directory'"),
             "a restricted setting must degrade to NULL, not raise: {guard}"
         );
-        // Unqualified, these resolve through the PASTING session's search_path.
-        // Measured on a database configured `public, pg_catalog`, a shadowing
-        // `public.current_database()` answered `app` while
-        // `pg_catalog.current_database()` answered the truth — so an unqualified
-        // guard consults the shadow and passes.
+        // Unqualified calls resolve through the pasting session's `search_path`, where a
+        // `public.current_database()` could shadow the real one.
         for call in [
             "current_database()",
             "inet_server_addr()",
@@ -7526,14 +7075,9 @@ mod tests {
             "address, port and the configured port are compared even when NULL — \
              for a socket target that IS the answer: {socket}"
         );
-        // The cluster identifier and the data directory are NOT compared when
-        // the planning role could not read them: there, `None` means "unknown",
-        // not "the target has none". A term comparing against a value never
-        // learned refuses a CORRECT paste whenever the pasting role can read
-        // what the planning role could not — and for `pg_control_system()` it
-        // is worse: measured, with EXECUTE revoked an ordinary role gets
-        // `permission denied for function pg_control_system`, which inside the
-        // guard aborts the transaction and takes the whole paste with it.
+        // The cluster identifier and data directory are not compared when the planning role
+        // could not read them: `None` means unknown, and comparing would refuse a correct paste
+        // or, for `pg_control_system()` without EXECUTE, abort it.
         assert!(
             !socket.contains("pg_control_system()) IS DISTINCT FROM")
                 && !socket.contains("'data_directory'), ''), '') IS DISTINCT FROM"),
@@ -7588,8 +7132,7 @@ mod tests {
             .iter()
             .find(|l| l.contains("\\gset"))
             .unwrap_or_else(|| panic!("psql, not the server, has to decide this: {lines:?}"));
-        // The operator's endpoint, which is what `\connect` acted on — NOT the
-        // 5434 the server behind that forward reports for itself.
+        // The operator's endpoint, which `\connect` acted on, not what the server reports.
         assert!(
             probe.contains(":'PORT' OPERATOR(pg_catalog.=) '25433'")
                 && probe.contains(":'HOST' OPERATOR(pg_catalog.=) '127.0.0.1'")
@@ -7652,8 +7195,7 @@ mod tests {
             ),
             "each host must carry its OWN port: {paired}"
         );
-        // A single port applies to every host, which libpq does and this must
-        // not turn into a refusal.
+        // libpq applies a single port to every host; this must not become a refusal.
         let broadcast = super::psql_connection_terms(
             "postgres://postgres@a.example/app?host=a.example,b.example&port=5432",
             "app",
@@ -7664,9 +7206,8 @@ mod tests {
                 && broadcast.matches(":'PORT'").count() == 1,
             "one port must cover every host: {broadcast}"
         );
-        // libpq refuses a length mismatch outright — measured, `could not match
-        // 3 port numbers to 2 hosts` — so the run could not have connected
-        // either. Fail closed rather than invent a pairing.
+        // libpq refuses a host/port count mismatch, so the run could not have connected either.
+        // Fail closed rather than invent a pairing.
         let mismatched = super::psql_connection_terms(
             "postgres://postgres@a.example/app?host=a.example,b.example&port=1,2,3",
             "app",
@@ -7692,11 +7233,9 @@ mod tests {
             "false",
             "the one discriminator this proof exists for cannot be optional"
         );
-        // Nor the port. psql reports the RESOLVED port, and the same host-only
-        // URI resolves to 5433 under `PGPORT=5433` and to 5432 without it —
-        // measured, two different servers. Such a target is refused before
-        // anything is printed; this is the fail-closed answer if that is ever
-        // relaxed.
+        // Nor without a port: psql reports the resolved port, which depends on the pasting
+        // session's `PGPORT`. Such a target is refused before printing; this is the fail-closed
+        // answer if that is ever relaxed.
         assert_eq!(
             super::psql_connection_terms("postgres://db.internal/app", "app"),
             "false",
@@ -7755,18 +7294,14 @@ mod tests {
 
     #[test]
     fn the_connect_boundary_carries_the_whole_endpoint_and_no_password() {
-        // A bare `\\connect dbname` inherits host, port and user, so a fleet whose
-        // shards share a database name on different servers would keep running
-        // against the first one while looking like it had moved.
+        // A bare `\connect dbname` inherits host, port and user, so shards sharing a database
+        // name on different servers would keep running against the first.
         let lines = super::psql_connect(
             "control",
             "postgres://scrubby:hunter2@db1.internal:6543/app",
         );
-        // The boundary pins the endpoint against the PASTING session's
-        // environment first: a libpq `PGHOSTADDR` or `PGSERVICE` set where the
-        // script is pasted would otherwise reroute the `\connect` while the
-        // reconnect proof below still reports the conninfo's own host — and
-        // psql cannot see the difference.
+        // `PGHOSTADDR` or `PGSERVICE` in the pasting session would reroute the `\connect` while
+        // `:HOST` still reports the conninfo's host, so the boundary unsets them first.
         assert_eq!(
             &lines[..2],
             &[r"\setenv PGHOSTADDR", r"\setenv PGSERVICE"],
@@ -7786,10 +7321,8 @@ mod tests {
             "and the endpoint must survive: {line}"
         );
 
-        // The whole string is passed through, not rebuilt from parts: a query
-        // parameter overrides the authority component it duplicates, so an
-        // endpoint reassembled from the URL's own host would name the wrong
-        // database on the header of destructive SQL.
+        // Passed through whole, not rebuilt: a query parameter overrides the authority it
+        // duplicates, so a boundary rebuilt from the URL's host would name the wrong database.
         let overridden = super::psql_connect(
             "control",
             "postgres://authority/app?host=queryhost&dbname=copy",
@@ -7800,21 +7333,9 @@ mod tests {
             "an override must survive into the printed boundary: {overridden}"
         );
 
-        // A query value is re-encoded the way libpq reads one, not the way a
-        // web form does. `url::Url::query_pairs()` applies
-        // `x-www-form-urlencoded` rules and `query_pairs_mut()` writes a space
-        // back as `+`; libpq only ever percent-decodes, so it reads that `+`
-        // literally. Measured against psql 16.13, the operator's own value
-        // connects and the `+` form does not:
-        //
-        //   ?options=-c%20search_path%3Dpg_catalog   -> search_path = pg_catalog
-        //   ?options=-c+search_path%3Dpg_catalog     -> FATAL: unrecognized
-        //                                               configuration parameter
-        //                                               "+search_path"
-        //
-        // A boundary that cannot connect is the exact case the target guard
-        // exists for — psql keeps the PREVIOUS connection — so printing one is
-        // not a cosmetic defect.
+        // libpq only percent-decodes query values, so a space written as `+` (as
+        // `query_pairs_mut()` would) is read literally and the connection fails, leaving psql
+        // on the previous connection.
         let spaced = super::psql_connect(
             "control",
             "postgres://u@h/app?options=-c%20search_path%3Dpg_catalog&password=hunter2",
@@ -7833,11 +7354,8 @@ mod tests {
             "while the credential is still removed: {spaced}"
         );
 
-        // Keyword form is declined outright rather than tokenized. `libpq`
-        // allows whitespace around the `=` and single-quoted values with
-        // backslash escapes, so a whitespace split reads `password = secret` as
-        // three unrelated tokens and prints the credential — which is exactly
-        // what two successive tokenizers here got wrong.
+        // Keyword form is declined rather than tokenized: libpq allows whitespace around `=` and
+        // quoted values with escapes, so a whitespace split would print `password = secret`.
         for keyword in [
             "host=db2.internal dbname=app password=hunter2",
             "host=db2.internal dbname=app password = hunter2",
@@ -7856,20 +7374,16 @@ mod tests {
                 line.contains("control"),
                 "the operator must still be told which target it was: {line}"
             );
-            // And it must STOP the paste, not merely advise. The dry run refuses
-            // before printing anything for such a target, so this branch is
-            // unreachable in practice; if that guard is ever bypassed, a comment
-            // would let a destructive block run against the previous target and
-            // `\quit` will not.
+            // It must stop the paste: the dry run refuses such a target before printing, and if
+            // that is bypassed, a comment would let the block run against the previous target.
             assert!(
                 line.contains("\\quit"),
                 "a boundary that cannot be printed must halt psql: {line}"
             );
         }
 
-        // A URI carries the password two ways, and the query form is the
-        // EFFECTIVE one where both appear — so clearing the userinfo alone
-        // prints the credential that actually authenticates.
+        // The query-string password wins where both appear, so clearing only the userinfo would
+        // print the credential that authenticates.
         let in_query =
             super::psql_connect("control", "postgres://bob@db/app?password=secret2").join("\n");
         assert!(
@@ -8060,9 +7574,8 @@ mod tests {
         })
         .expect("the fixture plan must build");
 
-        // The capture: one temp table holding every sampled table's
-        // post-sample count — the printed half of the executor's `after`
-        // snapshot, taken in the same position.
+        // The capture: one temp table of every sampled table's post-sample count, printed where
+        // the executor takes its `after` snapshot.
         let capture = super::sample_count_capture_statements(&plan);
         assert_eq!(capture.len(), 1, "one capture statement: {capture:?}");
         let capture = &capture[0];
@@ -8153,10 +7666,8 @@ mod tests {
 
     #[test]
     fn the_session_pins_cover_every_rendering_the_row_key_depends_on() {
-        // `--seed` promises the same seed over the same source selects the same
-        // rows, and the key is hashed from `key::text`. Measured: a `date`
-        // primary key selects a different subset under `DateStyle = ISO, YMD`
-        // than under `Postgres, DMY`.
+        // The sample's row key hashes `key::text`, so every setting that changes how a value
+        // renders must be pinned for `--seed` to select the same rows.
         let pinned = super::session_settings().join("; ");
         for setting in [
             "search_path",
@@ -8186,10 +7697,8 @@ mod tests {
     #[test]
     fn rules_are_asked_for_by_the_same_rules_but_without_the_walk() {
         let sql = rules_reaching("AND r.ev_type = '4' ");
-        // Measured on PostgreSQL 16: a rule on a leaf partition or an
-        // inheritance child does NOT fire for a statement naming the parent,
-        // because rewriting happens against the relation the query names. So
-        // this must not grow the ancestry walk its trigger counterpart needs.
+        // A rule on a partition or inheritance child does not fire for a statement naming the
+        // parent (rewriting uses the named relation), so rules need no ancestry walk.
         assert!(
             !sql.contains("pg_inherits"),
             "a rule fires only on the relation named, so no walk: {sql}"
@@ -8215,10 +7724,8 @@ mod tests {
     #[test]
     fn only_row_triggers_propagate_up_the_inheritance_tree() {
         let sql = triggers_reaching("AND (t.tgtype & 8) <> 0 ");
-        // Measured on PostgreSQL 16, both inheritance flavours: `DELETE FROM
-        // parent` fires a child's ROW trigger and not its STATEMENT trigger. A
-        // statement trigger must therefore mark only the table it is on, or the
-        // run refuses over a trigger that cannot execute.
+        // `DELETE FROM parent` fires a child's ROW triggers but not its STATEMENT triggers, so
+        // only row-level triggers propagate up the inheritance tree.
         assert!(
             sql.contains("(t.tgtype & 1) <> 0 AS by_row"),
             "the seed must record whether each trigger is row-level: {sql}"
@@ -8248,10 +7755,8 @@ mod tests {
 
     #[test]
     fn an_assertion_delimiter_cannot_be_closed_by_an_identifier() {
-        // Postgres permits `$` in a quoted identifier, and dollar quoting is
-        // lexical — a fixed `DO $$ ... $$` around a query naming `"us$$ers"`
-        // closes mid-statement, so the sequence the operator was told to paste
-        // is a syntax error rather than the check it advertises.
+        // Postgres permits `$` in a quoted identifier, and a fixed `DO $$ ... $$` around
+        // `"us$$ers"` would close mid-statement.
         let check = r#"SELECT count(*) FROM "public"."us$$ers""#;
         let sql = integrity_assertion(check);
         assert!(
@@ -8486,7 +7991,7 @@ mod tests {
         assert_eq!(parse_config_str("").unwrap(), ScrubConfig::default());
     }
 
-    // ── Fail-closed classification (AC #3) ──────────────────────────────────
+    // ── Fail-closed classification ──────────────────────────────────────────
 
     #[test]
     fn unclassified_columns_are_refused_and_listed() {
@@ -8624,7 +8129,7 @@ mod tests {
         assert!(matches!(err, ScrubError::Contradiction { .. }), "{err:?}");
     }
 
-    // ── Automatic classification (AC #2) ────────────────────────────────────
+    // ── Automatic classification ────────────────────────────────────────────
 
     #[test]
     fn encrypted_columns_are_pii_without_any_declaration() {
@@ -9915,7 +9420,7 @@ mod tests {
         );
     }
 
-    // ── Constraint safety (AC #4)     // ── Constraint safety (AC #4) ───────────────────────────────────────────
+    // ── Constraint safety ───────────────────────────────────────────────────
 
     #[test]
     fn pii_on_a_primary_key_is_refused() {
@@ -10334,7 +9839,7 @@ mod tests {
         );
     }
 
-    // ── Production guard (AC #5) ────────────────────────────────────────────
+    // ── Production guard ────────────────────────────────────────────────────
 
     #[test]
     fn scrub_refuses_a_production_profile_without_force() {
@@ -11532,9 +11037,8 @@ mod tests {
             "#,
         )
         .unwrap();
-        // A partial unique index does not satisfy a model `#[unique]` — but it
-        // absolutely does abort an UPDATE that writes one constant into every
-        // row its predicate matches, which is the only question a writer asks.
+        // A partial unique index does not satisfy `#[unique]`, but it still aborts an UPDATE that
+        // writes one constant into every row its predicate matches.
         let err = plan_for(&[t], &config, &empty_encrypted(), &no_anonymize())
             .expect_err("a partial unique index still constrains the rows it covers");
         assert!(

@@ -301,9 +301,8 @@ fn row_flags(row: &ListRow, app_version: Option<&str>) -> String {
         _ if flagged => {
             flags.push_str("  [incompatible: failed re-verification]");
         }
-        // Name the series that WOULD work, rather than only saying this one
-        // will not: on an older app the bare word "incompatible" leaves the
-        // reader with no next step.
+        // Name the series that would work: on an older app a bare "incompatible"
+        // leaves no next step.
         Compat::Incompatible => {
             let range = match listing {
                 Some(l) if row.origin == Origin::Community => l.autumn_web.clone(),
@@ -1106,7 +1105,7 @@ pub fn run_add(opts: &AddOptions<'_>) -> i32 {
         return 1;
     }
 
-    // The trust review comes first: before any gate, plan or write (AC 6).
+    // The trust review comes first, before any gate, plan or write.
     println!("{}", render_trust(name, &standing));
     if let Standing::Listed(listing) = standing {
         if let Err(err) = gate_listing_in(listing, opts.root) {
@@ -1180,10 +1179,9 @@ pub fn run_add(opts: &AddOptions<'_>) -> i32 {
 
     let report = render_add(name, &outcome, opts.dry_run);
     if matches!(outcome, AddOutcome::Manual { .. }) {
-        // A refusal, not a result: it goes to stderr and exits non-zero so
-        // `autumn plugin add … && cargo build` cannot read "I changed nothing,
-        // do it yourself" as a successful install. `2` rather than `1` so a
-        // script can tell "apply this by hand" apart from a hard error.
+        // A refusal: stderr and a non-zero exit, so `plugin add … && cargo build`
+        // does not read it as an install. `2` lets a script tell "apply this by hand"
+        // from a hard error (`1`).
         eprintln!("{report}");
         return MANUAL_FALLBACK_EXIT_CODE;
     }
@@ -1397,11 +1395,10 @@ pub fn run_remove(opts: &RemoveOptions<'_>) -> i32 {
         }
     };
 
-    // The manual fallback is settled FIRST, before `--drop-data` prints a
-    // statement or asks for a confirmation. The plugin is still wired into the
-    // app on this path, so dropping the tables it is about to read would break
-    // a running app — and confirming a destructive step that then silently does
-    // nothing is worse still. Neither the code nor the database is touched.
+    // Settle the manual fallback before `--drop-data` prints or prompts: the
+    // plugin is still wired here, so dropping its tables would break a running app,
+    // and confirming a drop that then does nothing would mislead. Neither the code
+    // nor the database is touched.
     if let RemoveOutcome::Manual { residue, .. } = &outcome {
         let needs_data_note = opts.drop_data && !residue.is_empty();
         eprintln!("{}", render_remove(opts.name, &outcome, opts.dry_run));
@@ -1414,10 +1411,8 @@ pub fn run_remove(opts: &RemoveOptions<'_>) -> i32 {
         return MANUAL_FALLBACK_EXIT_CODE;
     }
 
-    // `--drop-data` is decided and CONFIRMED before a single file is written.
-    // Asking after the edits are on disk means a declined prompt leaves the app
-    // already unwired while the message says "Aborted" — the one ordering a
-    // destructive flag must not have.
+    // Confirm `--drop-data` before any file is written, so a declined prompt
+    // does not leave the app already unwired.
     let drop_step = match &resolved {
         Resolved::FirstParty(entry) if opts.drop_data => {
             let absent = matches!(outcome, RemoveOutcome::NotInstalled { .. });
@@ -1512,10 +1507,9 @@ fn prepare_drop_data(
             Ok(DropStep::Nothing)
         }
         DropDataDecision::PrintOnly { reason, statements } => {
-            // Exit 2, not 0: the database was NOT changed, and a script reading
-            // `remove --drop-data && echo dropped` must not print "dropped".
-            // Same meaning `plugin add`/`remove` already give 2 — "nothing was
-            // changed automatically; apply the printed lines by hand".
+            // Exit 2, not 0: the database was not changed, so
+            // `remove --drop-data && echo dropped` must not print "dropped". 2 means
+            // "apply the printed lines by hand", as elsewhere in `plugin add`/`remove`.
             eprintln!(
                 "\n--drop-data was not applied — {reason}.\nNothing was changed at all: the database is untouched, and the plugin is still\nwired (re-run without `--drop-data` to unwire just the code). Run these\nyourself, in this order:\n"
             );
@@ -1740,16 +1734,11 @@ pub fn preflight_scaffold_plugins(
             }
         };
         let name = &name.to_owned();
-        // A first-party plugin is released in lockstep with `autumn-web`, so
-        // this can only fail if the scaffold ever stops pinning the CLI's own
-        // series — which is exactly the regression worth catching before a
-        // project exists on disk. A community crate's range is not knowable,
-        // so it is not gated here (`Compat::Unknown` passes).
-        // `None` when the pin is not knowable yet — a `--starter` brings its own
-        // manifest, which does not exist until the starter is fetched. The
-        // version answer then comes from `plan_add` reading the real manifest,
-        // and `wire_scaffold_plugins` reports it as "the app was created, the
-        // plugin was not wired" rather than as a bare failure.
+        // A first-party plugin is released in lockstep with `autumn-web`, so this
+        // catches a scaffold that stops pinning the CLI's series before a project exists
+        // on disk. A community crate's range is not knowable (`Compat::Unknown` passes).
+        // The pin is `None` for a `--starter`, whose manifest does not exist yet;
+        // `plan_add` checks it later and `wire_scaffold_plugins` reports the result.
         if let Some(pinned) = scaffold_autumn_web
             && matches!(resolved, Resolved::FirstParty(_))
             && install::check_compat(pinned, &version) == Compat::Incompatible
@@ -3095,7 +3084,7 @@ mod tests {
         assert!(!out.contains("Removed autumn-admin-plugin"), "{out}");
     }
 
-    // ── AC #3: the dry-run exit-code contract ────────────────────────────────
+    // ── the dry-run exit-code contract ───────────────────────────────────────
 
     #[test]
     fn a_dry_run_with_pending_edits_exits_distinctly() {
@@ -3191,7 +3180,7 @@ mod tests {
         );
     }
 
-    // ── AC #6: `autumn new --with <plugin>` ──────────────────────────────────
+    // ── `autumn new --with <plugin>` ─────────────────────────────────────────
 
     fn no_community(_: &str) -> Option<String> {
         None

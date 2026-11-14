@@ -274,10 +274,8 @@ fn verify_head(
         });
     }
     match &info.checksum_sha256 {
-        // A COMPOSITE checksum (`<hash>-<n>`, echoed by some endpoints for a
-        // multipart object) is a hash-of-part-hashes, NOT the whole-object
-        // sha256, so it must not be compared to `expected_b64` — that would be a
-        // spurious mismatch. Ignore it and fall through to the GET-and-rehash path.
+        // A composite checksum (`<hash>-<n>`, for multipart objects) hashes the part hashes, not
+        // the object, so comparing it would be a spurious mismatch. Fall back to GET-and-rehash.
         Some(remote) if is_composite_checksum(remote) => Ok(false),
         Some(remote) if remote == expected_b64 => Ok(true),
         Some(remote) => Err(S3Error::VerifyFailed {
@@ -381,7 +379,6 @@ const fn multipart_part_count(len: u64, part_size: u64) -> u64 {
 /// target. Floors at S3's 5 MiB minimum, and grows the part size when `len` at the
 /// configured size would exceed S3's 10 000-part limit so the plan always fits.
 fn effective_part_size(len: u64, configured: u64) -> u64 {
-    // Smallest part size that keeps the part count within S3_MAX_PARTS.
     let min_for_parts = len.div_ceil(S3_MAX_PARTS).max(1);
     configured.max(min_for_parts).max(S3_MIN_PART_SIZE)
 }
@@ -503,21 +500,14 @@ impl S3Client {
             validate_endpoint(endpoint)?;
         }
         let builder = reqwest::blocking::Client::builder()
-            // reqwest's blocking default is a 30s TOTAL request timeout, which
-            // would abort a correctly-streaming multi-GB PUT/GET on a slow
-            // offsite link before it finishes. Disable the overall cap so long
-            // transfers aren't bounded by wall-clock…
+            // reqwest's blocking default is a 30s total timeout, which would abort a healthy
+            // multi-GB transfer on a slow link…
             .timeout(None)
-            // …but still fail fast on a dead/unreachable host.
+            // …but still fail fast on an unreachable host.
             .connect_timeout(TRANSFER_CONNECT_TIMEOUT);
-        // Catch a stalled connection at the TCP layer WITHOUT capping total
-        // duration: TCP_USER_TIMEOUT drops the connection when sent data stays
-        // unacknowledged this long. reqwest 0.13's blocking builder has no
-        // per-read `read_timeout`, so this is the closest inactivity guard — but
-        // the option (and reqwest's `tcp_user_timeout` method) are Linux-only, so
-        // it's gated to Linux; other platforms rely on connect_timeout + the
-        // disabled overall timeout. Non-configurable sane constants (a
-        // configurable transfer timeout is a possible follow-up).
+        // reqwest 0.13's blocking builder has no per-read timeout, so TCP_USER_TIMEOUT is the
+        // stall guard: it drops a connection whose sent data stays unacknowledged, without
+        // capping total duration. It exists only on Linux.
         #[cfg(target_os = "linux")]
         let builder = builder.tcp_user_timeout(TRANSFER_STALL_TIMEOUT);
         let http = builder.build().map_err(|e| S3Error::Transport {
@@ -643,7 +633,7 @@ impl S3Client {
         };
         let host = self.host()?;
 
-        // Assemble the signed header set, then sort by lowercase name.
+        // `canonical_request` requires headers sorted by lowercase name.
         let mut headers: Vec<Header> = vec![
             ("host".to_owned(), host),
             ("x-amz-content-sha256".to_owned(), payload_hash.clone()),
@@ -689,9 +679,8 @@ impl S3Client {
         match body {
             RequestBody::Empty => {}
             RequestBody::File { path, .. } => {
-                // Stream the file straight from disk. reqwest's blocking `Body`
-                // derives Content-Length from the file's metadata, so the object
-                // is sent with constant memory regardless of size.
+                // reqwest takes Content-Length from the file's metadata and streams it, so memory
+                // stays constant regardless of size.
                 let file = std::fs::File::open(path).map_err(|e| S3Error::Transport {
                     op,
                     detail: format!("opening {} for upload: {e}", path.display()),
@@ -699,15 +688,14 @@ impl S3Client {
                 req = req.body(file);
             }
             RequestBody::Owned(bytes) => {
-                // Move the buffer into the request body — no extra copy.
+                // Moved into the body, not copied.
                 req = req.body(bytes);
             }
         }
 
         let resp = req.send().map_err(|e| S3Error::Transport {
             op,
-            // reqwest error Display can include the URL (no credentials) but
-            // never the Authorization header, so this is credential-safe.
+            // reqwest's Display may include the URL but never the Authorization header.
             detail: e.to_string(),
         })?;
 
@@ -831,7 +819,7 @@ impl S3Client {
         let mut out = Vec::new();
         let mut continuation: Option<String> = None;
         for _page in 0..MAX_LIST_PAGES {
-            // Canonical query string: keys sorted, both key and value encoded.
+            // SigV4 canonical query: params sorted by key, keys and values URI-encoded.
             let mut params: Vec<(String, String)> = vec![
                 ("list-type".to_owned(), "2".to_owned()),
                 ("prefix".to_owned(), prefix.to_owned()),
@@ -936,9 +924,8 @@ impl S3Client {
     /// exactly like the single-PUT path — never size alone.
     fn put_file_multipart(&self, key: &str, path: &Path, len: u64) -> Result<(), S3Error> {
         let part_size = effective_part_size(len, self.multipart_part_size);
-        // Defensive: effective_part_size grows the part size to keep the plan
-        // within S3's 10 000-part cap, so this should never trip — but fail loud
-        // before starting an upload that can't complete rather than mid-stream.
+        // `effective_part_size` should keep this within the cap; fail before starting an upload
+        // that cannot complete rather than mid-stream.
         let part_count = multipart_part_count(len, part_size);
         if part_count > S3_MAX_PARTS {
             return Err(S3Error::BadResponse {
@@ -952,16 +939,11 @@ impl S3Client {
         let upload_id = self.create_multipart_upload(key)?;
         match self.upload_parts_and_complete(key, path, len, part_size, &upload_id) {
             Ok(whole_b64) => {
-                // Completion succeeded: the object now exists. Do NOT abort.
-                // Verify the assembled object matches the streamed-hash of the
-                // local file (HEAD length + checksum, else GET-and-rehash). On a
-                // verify failure the completed object is deleted (#1760) so a
-                // corrupt object is never left behind.
+                // The object now exists, so do not abort; a verify failure deletes it (#1760).
                 self.verify_or_delete(key, len, &whole_b64)
             }
             Err(err) => {
-                // Best-effort abort; surface the ORIGINAL upload error regardless
-                // of whether the abort itself succeeds.
+                // Best-effort abort; the original upload error is what surfaces.
                 let _ = self.abort_multipart_upload(key, &upload_id);
                 Err(err)
             }
@@ -992,8 +974,7 @@ impl S3Client {
         let mut part_number: u32 = 1;
         let mut uploaded: u64 = 0;
         loop {
-            // Read into a fresh owned buffer so it can be moved straight into the
-            // request body without a second copy (≈ one part in memory at a time).
+            // A fresh owned buffer per part, so it can be moved into the request body uncopied.
             let mut chunk = vec![0u8; cap];
             let n = read_up_to(&mut file, &mut chunk).map_err(|e| S3Error::Transport {
                 op: "upload-part",
@@ -1139,8 +1120,7 @@ impl S3Client {
         if verify_head(expected_len, expected_b64, &info)? {
             return Ok(());
         }
-        // Checksum absent on HEAD: prove equality by streaming the object through
-        // a sha256 hasher (constant memory, never buffering the whole object).
+        // No usable checksum on HEAD (absent or composite): stream the object through a hasher.
         let mut hasher = Sha256Writer::new();
         self.download_object(key, &mut hasher)?;
         let actual_b64 = base64_standard(&hasher.finalize());
@@ -1231,7 +1211,7 @@ mod tests {
         let date = "20130524";
         let amz_date = "20130524T000000Z";
 
-        // Headers sorted by lowercase name, exactly as the example lists them.
+        // Sorted by lowercase name, as the example lists them.
         let headers: Vec<Header> = vec![
             (
                 "host".to_owned(),
@@ -1257,19 +1237,16 @@ mod tests {
         assert_eq!(scope, "20130524/us-east-1/s3/aws4_request");
 
         let signature = compute_signature(secret, date, region, amz_date, &scope, &canonical);
-        // Expected signature for this exact canonical request, cross-checked
-        // against an independent reference implementation of SigV4.
+        // Cross-checked against an independent SigV4 implementation.
         assert_eq!(
             signature,
             "67fe34c8530db585abddc51067328adfedb6e42487d2566dc7d927d6e2722900"
         );
 
-        // And the signed-header list is stable/sorted.
         assert_eq!(
             signed_headers_list(&headers),
             "host;range;x-amz-content-sha256;x-amz-date"
         );
-        // Sanity-check the access key threads through to the auth header shape.
         assert!(format!("Credential={access}/{scope}").contains("AKIDEXAMPLE/20130524"));
     }
 
@@ -1410,16 +1387,14 @@ mod tests {
 
     #[test]
     fn head_request_signs_checksum_mode_header() {
-        // HEAD must ask the endpoint to echo the checksum so verification can
-        // take the cheap HEAD-only path (no full GET+rehash).
+        // HEAD asks the endpoint to echo the checksum, so verification can skip GET-and-rehash.
         let extra = head_extra_headers();
         assert_eq!(
             extra,
             vec![("x-amz-checksum-mode".to_owned(), "ENABLED".to_owned())]
         );
-        // The header must land in the SIGNED set: assemble the base HEAD headers
-        // exactly as `send` does, sort, and confirm it's part of SignedHeaders in
-        // its correct sorted position.
+        // The header must be signed: build the base HEAD headers as `send` does and check its
+        // sorted position in SignedHeaders.
         let mut headers: Vec<Header> = vec![
             ("host".to_owned(), "s3.example.test".to_owned()),
             (
@@ -1468,8 +1443,6 @@ mod tests {
 
     #[test]
     fn client_builds_with_uncapped_transfer_timeouts() {
-        // The transfer client must construct with the overall timeout disabled
-        // (so multi-GB streams aren't capped) plus the connect/stall guards.
         let config = S3Config {
             bucket: "b".to_owned(),
             region: "us-east-1".to_owned(),
@@ -1481,8 +1454,7 @@ mod tests {
             secret_access_key: "s".to_owned(),
         };
         assert!(S3Client::new(config, creds).is_ok());
-        // Sanity-check the guard constants stay sane (fast connect, long stall).
-        // The stall guard is Linux-only (TCP_USER_TIMEOUT).
+        // Fast connect, long stall. The stall guard exists only on Linux.
         #[cfg(target_os = "linux")]
         assert!(TRANSFER_CONNECT_TIMEOUT < TRANSFER_STALL_TIMEOUT);
     }
@@ -1490,8 +1462,6 @@ mod tests {
     #[test]
     fn sha256_writer_matches_one_shot_hash() {
         use std::io::Write as _;
-        // Streaming the object through the Write sink (multiple chunks) yields the
-        // same digest as hashing the whole buffer — this is the rehash-verify path.
         let mut w = Sha256Writer::new();
         w.write_all(b"hello ").unwrap();
         w.write_all(b"streamed ").unwrap();
@@ -1501,8 +1471,7 @@ mod tests {
 
     #[test]
     fn sha256_file_streams_length_and_digest() {
-        // A payload larger than the 64 KiB read buffer spans multiple chunks, so
-        // this exercises the streaming loop (constant memory) used before upload.
+        // Larger than the 64 KiB read buffer, so the loop runs over several chunks.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("blob.bin");
         let data: Vec<u8> = (0..100_000u32)
@@ -1517,8 +1486,6 @@ mod tests {
     #[test]
     fn download_object_streams_response_body_into_writer() {
         use std::io::{Read as _, Write as _};
-        // A one-shot local HTTP server returns a canned body; `download_object`
-        // must stream it straight into the caller's writer.
         let body = b"streamed-object-body-contents".to_vec();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1572,14 +1539,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn put_file_and_verify_deletes_object_on_verify_failure() {
-        // #1760: `put_file_and_verify` WRITES the object BEFORE verifying it, so a
-        // post-upload verify failure must best-effort DELETE the just-written key
-        // — leaving no corrupt/partial object behind. A one-connection local S3
-        // stub accepts the PUT, then answers the verify HEAD with a WRONG
-        // Content-Length (forcing a length-mismatch `VerifyFailed`), and records
-        // that a DELETE for the same key follows. The multipart path funnels
-        // through the same `verify_or_delete` helper, so proving the single-PUT
-        // path proves the shared cleanup.
+        // #1760: the object is written before it is verified, so a verify failure must DELETE it.
+        // The stub accepts the PUT, answers HEAD with a wrong Content-Length, and records the
+        // DELETE. Multipart uses the same `verify_or_delete`, so this covers both paths.
         use std::io::{Read as _, Write as _};
         use std::time::Duration;
 
@@ -1594,17 +1556,14 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let mut methods: Vec<String> = Vec::new();
-            // reqwest's blocking client reuses one keep-alive connection for the
-            // PUT/HEAD/DELETE sequence; the outer loop tolerates a fresh
-            // connection per request too. Read timeouts stop a stray idle
-            // connection from hanging the test.
+            // reqwest usually reuses one keep-alive connection; the outer loop also accepts a
+            // fresh connection per request. Read timeouts stop an idle connection hanging the test.
             'accept: for _conn in 0..8 {
                 let Ok((mut sock, _)) = listener.accept() else {
                     break;
                 };
                 sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
                 loop {
-                    // Read the request head (up to CRLFCRLF).
                     let mut acc: Vec<u8> = Vec::new();
                     let mut buf = [0u8; 1024];
                     let header_end = loop {
@@ -1636,7 +1595,6 @@ mod tests {
                                 .flatten()
                         })
                         .unwrap_or(0);
-                    // Consume any request body (the PUT streams the file).
                     let mut remaining = content_length.saturating_sub(acc.len() - header_end);
                     while remaining > 0 {
                         match sock.read(&mut buf) {
@@ -1647,8 +1605,7 @@ mod tests {
                     methods.push(method.clone());
                     match method.as_str() {
                         "HEAD" => {
-                            // A wrong length forces verify_head's length-mismatch
-                            // VerifyFailed BEFORE any checksum/GET fallback.
+                            // A wrong length fails verification before any checksum/GET fallback.
                             let resp = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
                                 payload_len + 999
@@ -1706,7 +1663,7 @@ mod tests {
         assert_eq!(multipart_part_count(0, 5), 0);
         assert_eq!(multipart_part_count(5, 5), 1);
         assert_eq!(multipart_part_count(6, 5), 2);
-        // ~12 MiB at a 5 MiB part size → 3 parts (the Docker round-trip's shape).
+        // ~12 MiB in 5 MiB parts, the shape of the Docker multipart round-trip.
         let twelve_mib = 12 * 1024 * 1024;
         let five_mib = 5 * 1024 * 1024;
         assert_eq!(multipart_part_count(twelve_mib, five_mib), 3);
@@ -1714,7 +1671,6 @@ mod tests {
 
     #[test]
     fn effective_part_size_floors_at_s3_minimum() {
-        // A tiny configured part size is floored to S3's 5 MiB minimum.
         assert_eq!(
             effective_part_size(100 * 1024 * 1024, 1024),
             S3_MIN_PART_SIZE
@@ -1729,10 +1685,7 @@ mod tests {
 
     #[test]
     fn effective_part_size_grows_to_fit_part_cap() {
-        // A file so large that the configured part size would exceed 10 000 parts
-        // must transparently grow the part size to stay within the cap.
         let configured = S3_MIN_PART_SIZE;
-        // 10 001 parts' worth of bytes at the minimum size.
         let len = (S3_MAX_PARTS + 1) * S3_MIN_PART_SIZE;
         let eff = effective_part_size(len, configured);
         assert!(
@@ -1788,8 +1741,7 @@ mod tests {
 
     #[test]
     fn classify_complete_response_detects_200_with_error_body() {
-        // S3 returns 200 then an <Error> body when assembly fails; we must treat
-        // that as a failure and surface the <Code>.
+        // S3 returns 200 then an <Error> body when assembly fails.
         let err = "<Error><Code>InternalError</Code><Message>oops</Message></Error>";
         assert_eq!(
             classify_complete_response(err).unwrap_err(),
@@ -1807,8 +1759,7 @@ mod tests {
 
     #[test]
     fn classify_complete_response_rejects_error_even_with_result_substring() {
-        // A 200 body that carries BOTH an <Error> and (defensively) the result tag
-        // as a substring must still be treated as a failure — the <Error> wins.
+        // An <Error> wins even when the body also contains the result tag.
         let tricky = "<Error><Code>SlowDown</Code></Error><CompleteMultipartUploadResult/>";
         assert_eq!(classify_complete_response(tricky).unwrap_err(), "SlowDown");
     }
@@ -1817,19 +1768,15 @@ mod tests {
     fn is_composite_checksum_detects_partcount_suffix() {
         assert!(is_composite_checksum("AbCdEf0123456789=-3"));
         assert!(is_composite_checksum("x-10000"));
-        // A whole-object base64 sha256 (no `-<n>` suffix) is NOT composite.
         assert!(!is_composite_checksum(
             "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
         ));
-        // A trailing dash with no digits, or no head, is not a composite marker.
         assert!(!is_composite_checksum("abc-"));
         assert!(!is_composite_checksum("-3"));
     }
 
     #[test]
     fn verify_head_ignores_composite_checksum_and_requests_rehash() {
-        // An endpoint that echoes a COMPOSITE checksum for a multipart object must
-        // NOT trip a spurious mismatch — length matches, so fall through to rehash.
         let expected = sha256_base64(b"hello");
         let info = RemoteObjectInfo {
             content_length: 5,
@@ -1854,7 +1801,6 @@ mod tests {
 
     #[test]
     fn read_up_to_fills_across_short_reads() {
-        // A reader that hands back one byte at a time must still fill the buffer.
         struct DribbleReader<'a> {
             data: &'a [u8],
             pos: usize,
@@ -1883,8 +1829,7 @@ mod tests {
 
     #[test]
     fn with_part_size_overrides_only_part_size_not_threshold() {
-        // Low 3: shrinking the part size must NOT lower the multipart threshold,
-        // so a sub-threshold file is never forced into a multipart upload.
+        // A smaller part size must not push a sub-threshold file into multipart.
         let client = S3Client::new(
             S3Config {
                 bucket: "b".to_owned(),
@@ -1900,7 +1845,6 @@ mod tests {
         .unwrap()
         .with_part_size(5 * 1024 * 1024);
         assert_eq!(client.multipart_part_size, 5 * 1024 * 1024);
-        // Threshold stays at the default — unchanged by a part-size override.
         assert_eq!(client.multipart_threshold, MULTIPART_THRESHOLD);
     }
 
@@ -1923,7 +1867,6 @@ mod tests {
 
     #[test]
     fn aws_virtual_hosted_addressing_is_the_default() {
-        // AWS + force_path_style=false → bucket in the HOST, key-only path.
         let c = client_for("mybucket", None, false);
         assert_eq!(
             c.endpoint_base(),
@@ -1935,14 +1878,11 @@ mod tests {
 
     #[test]
     fn aws_force_path_style_uses_regional_host_and_bucket_in_path() {
-        // P2 #14: AWS + force_path_style=true must NOT be virtual-hosted — the
-        // regional host is bucketless and the bucket goes in the path.
         let c = client_for("mybucket", None, true);
         assert_eq!(c.endpoint_base(), "https://s3.us-west-2.amazonaws.com");
         assert_eq!(c.host().unwrap(), "s3.us-west-2.amazonaws.com");
         assert_eq!(c.canonical_path("db/x.dump"), "/mybucket/db/x.dump");
-        // The signed canonical URI must be the tail of the actually-sent URL
-        // (SigV4 consistency): request_url == endpoint_base + canonical_path.
+        // The signed canonical URI must be the tail of the URL actually sent.
         assert_eq!(
             c.request_url("db/x.dump", ""),
             "https://s3.us-west-2.amazonaws.com/mybucket/db/x.dump"
@@ -1951,8 +1891,7 @@ mod tests {
 
     #[test]
     fn aws_dotted_bucket_with_force_path_style_is_path_style() {
-        // A dotted bucket can't use virtual-hosted TLS; path-style keeps it off
-        // the host entirely.
+        // A dotted bucket cannot match a virtual-hosted TLS certificate.
         let c = client_for("my.dotted.bucket", None, true);
         assert_eq!(c.host().unwrap(), "s3.us-west-2.amazonaws.com");
         assert!(!c.host().unwrap().contains("my.dotted.bucket"));
@@ -1964,11 +1903,9 @@ mod tests {
 
     #[test]
     fn custom_endpoint_addressing_is_unchanged_by_the_aws_fix() {
-        // Custom endpoint + path-style: bucket in path, host verbatim.
         let path = client_for("b", Some("https://minio.example:9000"), true);
         assert_eq!(path.host().unwrap(), "minio.example:9000");
         assert_eq!(path.canonical_path("k"), "/b/k");
-        // Custom endpoint + virtual-hosted: bucket prefixes the custom host.
         let virt = client_for("b", Some("https://minio.example:9000"), false);
         assert_eq!(virt.host().unwrap(), "b.minio.example:9000");
         assert_eq!(virt.canonical_path("k"), "/k");

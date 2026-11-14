@@ -219,9 +219,6 @@ pub fn introspect_postgres_in(
     url: &str,
     schemas: &[String],
 ) -> Result<Vec<Table>, IntrospectError> {
-    // `PgConnection::establish` accepts both URL and libpq key-value DSNs; defer
-    // URL parsing to the error path so a valid key-value string still connects
-    // (host/port are only needed for a credential-safe message). Mirrors db_pull.
     let mut conn = connect_postgres(url)?;
     introspect_postgres_conn_in(&mut conn, schemas)
 }
@@ -232,6 +229,8 @@ pub fn introspect_postgres_in(
 ///
 /// Returns [`IntrospectError::Connection`] if the database is unreachable.
 pub fn connect_postgres(url: &str) -> Result<PgConnection, IntrospectError> {
+    // `establish` accepts URLs and libpq key-value DSNs, so the URL is parsed only on
+    // the error path, for a credential-safe message.
     PgConnection::establish(url).map_err(|_| {
         let (host, port) = parse_host_port(url).unwrap_or_else(|| ("localhost".to_owned(), 5432));
         IntrospectError::Connection { host, port }
@@ -254,8 +253,7 @@ pub fn introspect_postgres_conn_in(
     }
     check_unique_names(&listed)?;
 
-    // Batched catalog reads — a constant number of queries regardless of table
-    // count (never one query per table).
+    // Batched catalog reads: a constant number of queries, never one per table.
     let columns_by_table = fetch_columns(conn, &listed)?;
     let pks_by_table = fetch_primary_keys(conn, &listed)?;
     let indexes_by_table = fetch_indexes(conn, &listed)?;
@@ -429,9 +427,7 @@ struct TablePkRow {
 /// columns (the `indkey` entries `> 0`) in true key order; it is empty for an
 /// index whose keys are all expressions. `definition` is the verbatim
 /// `pg_get_indexdef` statement, preserved for expression/partial indexes.
-// A flat `QueryableByName` catalog-row DTO: each bool maps to one `pg_index`
-// classification column (`indisunique`, `indpred IS NOT NULL`, expression-key,
-// constraint-owned), so they are independent flags, not a state machine.
+// Each bool is an independent `pg_index` flag, not a state machine.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(QueryableByName)]
 struct IndexRow {
@@ -640,31 +636,16 @@ fn fetch_columns(
     conn: &mut PgConnection,
     listed: &[(String, String)],
 ) -> Result<BTreeMap<String, Vec<ColumnRow>>, IntrospectError> {
-    // `numeric_precision`, `numeric_scale`, and `character_maximum_length` are the
-    // `information_schema` `cardinal_number` domain, not a plain `int4`. Decoding that
-    // domain as diesel `Nullable<Integer>` on the wire is unproven — no sibling query
-    // reads them — and if it does not present as `int4` the whole column query would error
-    // and every pull would fail. Cast each to a plain `integer` in SQL, so the output type
-    // is guaranteed `int4` whatever the domain. The `AS <name>` aliases keep the result
-    // column names aligned with the `ColumnRow` field bindings.
+    // `numeric_precision`, `numeric_scale` and `character_maximum_length` are the
+    // `information_schema.cardinal_number` domain. Each is cast to `integer` so it decodes as
+    // `Nullable<Integer>`; one undecodable column would fail the whole query.
     //
-    // `owns_sequence` is an `EXISTS` over `pg_depend` that is true only when the column
-    // owns the same sequence its `nextval(...)` default allocates from — the conventional
-    // `SERIAL`/`BIGSERIAL` shape. It ties two dependencies to one sequence:
-    //   * OWNED BY (`deptype = 'a'`): a `pg_depend` row linking a sequence
-    //     (`pg_class.relkind = 'S'`, as `objid`) to this exact column (`refobjid = <table
-    //     oid>`, `refobjsubid = <column attnum>`).
-    //   * used-by-default (`deptype = 'n'`): a `pg_depend` row from the column's default
-    //     expression (`pg_attrdef`, `classid = 'pg_attrdef'::regclass`) to that same
-    //     sequence (`refobjid = seq.oid`).
-    // Requiring both on the same sequence closes the brownfield hole where a column still
-    // owns an old sequence (`t_id_seq`, `deptype = 'a'`) but its default was repointed to
-    // another (`DEFAULT nextval('global_ids')`): the used-by dependency then targets
-    // `global_ids`, not the owned `t_id_seq`, so `EXISTS` is false, the raw
-    // `nextval('global_ids')` default is preserved verbatim rather than stripped to a
-    // fresh owned `BIGSERIAL`, and the column classifies as `Some(Plain)`. A plain shared
-    // or custom-sequence PK owns nothing and likewise has no `deptype = 'a'` row.
-    // `pg_depend` and `pg_attrdef` exist in every supported Postgres.
+    // `owns_sequence` is true only when the column owns the same sequence its `nextval(...)`
+    // default allocates from (the `SERIAL`/`BIGSERIAL` shape): an OWNED BY dependency
+    // (`deptype = 'a'`, sequence -> column) and a used-by-default dependency (`deptype = 'n'`,
+    // `pg_attrdef` -> sequence) on one sequence. A column that still owns `t_id_seq` but whose
+    // default was repointed to `nextval('global_ids')` reports false, so its default is kept
+    // verbatim instead of becoming a fresh owned `BIGSERIAL`.
     let filter = pair_filter("c.table_schema", "c.table_name", listed);
     let query = format!(
         "SELECT c.table_name, c.column_name, c.udt_name, c.is_nullable, c.column_default, \
@@ -717,9 +698,8 @@ fn fetch_primary_keys(
     conn: &mut PgConnection,
     listed: &[(String, String)],
 ) -> Result<BTreeMap<String, Vec<String>>, IntrospectError> {
-    // `array_position(i.indkey::int2[]::int[], a.attnum::int)` recovers the true
-    // key position. The `int2vector -> text -> int[]` cast chain is the portable
-    // way to turn `indkey` into a subscriptable array for `array_position`.
+    // `string_to_array(i.indkey::text, ' ')::int[]` turns the `int2vector` into an array, so
+    // `array_position` recovers each column's key position.
     let filter = pair_filter("n.nspname", "c.relname", listed);
     let query = format!(
         "SELECT c.relname AS table_name, a.attname AS column_name, \
@@ -734,7 +714,6 @@ fn fetch_primary_keys(
     let rows: Vec<TablePkRow> = sql_query(query)
         .load(conn)
         .map_err(|e| IntrospectError::Query(e.to_string()))?;
-    // Rows arrive ordered by (table, key position), so push preserves key order.
     let mut by_table: BTreeMap<String, Vec<(i32, String)>> = BTreeMap::new();
     for row in rows {
         by_table
@@ -778,10 +757,8 @@ fn fetch_indexes(
     conn: &mut PgConnection,
     listed: &[(String, String)],
 ) -> Result<BTreeMap<String, Vec<IndexRow>>, IntrospectError> {
-    // The `int2vector -> text -> int[]` cast chain (mirroring `fetch_primary_keys`)
-    // turns `indkey` into a subscriptable/unnestable array. The correlated
-    // subquery keeps only `> 0` (ordinary-column) keys and preserves key order
-    // via `WITH ORDINALITY`; an all-expression index yields an empty string.
+    // `indkey` is unnested via the same `int[]` cast as `fetch_primary_keys`. The subquery keeps
+    // only ordinary-column keys (`> 0`) in key order; an all-expression index yields ''.
     let filter = pair_filter("n.nspname", "t.relname", listed);
     let query = format!(
         "SELECT t.relname AS table_name, ic.relname AS index_name, \
@@ -874,8 +851,7 @@ fn fetch_foreign_keys(
     let rows: Vec<ForeignKeyRow> = sql_query(query)
         .load(conn)
         .map_err(|e| IntrospectError::Query(e.to_string()))?;
-    // Refuse an unknown action code. Then `build_table` cannot read it as
-    // `NO ACTION`.
+    // Refuse an unknown action code so `build_table` never reads it as `NO ACTION`.
     for row in &rows {
         for code in [&row.on_delete, &row.on_update] {
             pg_fk_action(code).map_err(|e| {
@@ -953,10 +929,8 @@ fn strip_check_wrapper(definition: &str) -> String {
     if bytes.first() != Some(&b'(') {
         return trimmed.to_owned();
     }
-    // Scan the first balanced `(...)` span, tracking paren depth (ignoring parens
-    // inside single-quoted string literals, where Postgres escapes an embedded
-    // quote by doubling it). The inner predicate is everything between the outer
-    // parens; any trailing suffix after the matching close paren is discarded.
+    // Find the first balanced `(...)`, skipping parens inside single-quoted literals (Postgres
+    // escapes a quote by doubling it). Anything after the matching `)` is discarded.
     let mut depth = 0usize;
     let mut in_string = false;
     let mut i = 0;
@@ -977,8 +951,7 @@ fn strip_check_wrapper(definition: &str) -> String {
                 b')' => {
                     depth -= 1;
                     if depth == 0 {
-                        // `rest[0]` is `(` and `rest[i]` is `)` — both ASCII, so the
-                        // slice boundaries fall on char boundaries.
+                        // Both ends are ASCII, so the slice falls on char boundaries.
                         return rest[1..i].trim().to_owned();
                     }
                 }
@@ -987,7 +960,7 @@ fn strip_check_wrapper(definition: &str) -> String {
         }
         i += 1;
     }
-    // Unbalanced parens — the input never matched the expected shape.
+    // Unbalanced parens.
     trimmed.to_owned()
 }
 
@@ -1008,26 +981,16 @@ fn build_table(
     table.managed = true;
     table.primary_key = primary_key.to_vec();
 
-    // Collapse index rows into IR indexes, keyed by index name (input already
-    // sorted by table, index name, attnum). Also derive the per-column `unique`
-    // flag from single-column unique indexes (mirroring the model IR).
     let (ir_indexes, unique_columns) = collapse_indexes(indexes);
 
-    // Foreign keys by referencing column name (first pair only).
     let fk_by_column: BTreeMap<&str, &ForeignKeyRow> = foreign_keys
         .iter()
         .map(|fk| (fk.column_name.as_str(), fk))
         .collect();
 
     for row in columns {
-        // Fail-closed floor for Postgres DOMAIN columns. When a column is typed on a
-        // domain (`CREATE DOMAIN email_dom AS text CHECK (…)`), `information_schema`
-        // reports the base type in `udt_name` (`text`) while naming the domain in
-        // `domain_name`. Flattening to the base type would silently drop the domain's
-        // identity and validation on recreation, so preserve the domain verbatim as
-        // `Opaque`, schema-qualified when not in `public`. `Opaque`'s `sql_type` emits
-        // `pg_type` unchanged, so the down migration re-references the still-existing
-        // domain type. A non-domain column, with `domain_name` NULL, maps as before.
+        // A DOMAIN column reports its base type in `udt_name`. Keep the domain itself as `Opaque`
+        // (schema-qualified outside `public`) so recreation keeps the domain's validation.
         let ty = row.domain_name.as_ref().map_or_else(
             || {
                 ColumnType::from_pg_introspection(
@@ -1057,12 +1020,7 @@ fn build_table(
             primary_key,
             row.owns_sequence,
         );
-        // Serial-vs-plain marker: a single-column integer PK whose `nextval(...)`
-        // default the column OWNS is a `SERIAL`/`BIGSERIAL` id (distinguished by
-        // int4 vs int8). A plain manually-assigned `INTEGER`/`BIGINT` PK (no owned
-        // sequence) leaves this `None`, so the two are no longer indistinguishable
-        // in the IR. Computed from the RAW default (before `normalize_default`
-        // strips an int8 owned-serial default to `None`).
+        // Reads the raw default: `normalize_default` strips an owned int8 serial's default.
         column.serial = serial_kind_for(
             row.column_default.as_deref(),
             &ty,
@@ -1071,10 +1029,6 @@ fn build_table(
             row.owns_sequence,
             row.is_identity.eq_ignore_ascii_case("YES"),
         );
-        // Identity marker: preserve a `GENERATED { ALWAYS | BY DEFAULT } AS
-        // IDENTITY` column's generation clause verbatim so it round-trips a pull
-        // instead of flattening to a plain integer column. An identity column has
-        // no `column_default`, so it never collides with the serial marker.
         if row.is_identity.eq_ignore_ascii_case("YES") {
             column.identity = Some(
                 row.identity_generation
@@ -1083,12 +1037,8 @@ fn build_table(
             );
         }
         if let Some(fk) = fk_by_column.get(row.column_name.as_str()) {
-            // Fail-closed floor for cross-schema FK targets: a FK to a table
-            // outside `public` (`REFERENCES auth.users(id)`) must be stored
-            // schema-qualified, else `render_column_def` would emit
-            // `REFERENCES users(id)` and point at the wrong (or a nonexistent)
-            // `public.users`. A `public` target stays bare (the common case,
-            // unchanged).
+            // A target outside `public` is stored schema-qualified, else recreation would emit
+            // `REFERENCES users(id)` against `public.users`.
             let foreign_table = if fk.foreign_schema == "public" {
                 fk.foreign_table.clone()
             } else {
@@ -1106,11 +1056,6 @@ fn build_table(
 
     table.indexes = ir_indexes;
 
-    // Preserve real `CHECK` constraints (Fix 4): recording them faithfully so a
-    // pull never silently drops a `CHECK (price >= 0)`. The definition is stripped
-    // to the inner predicate the emitter re-wraps in `CHECK (...)`. Snapshot
-    // canonicalization sorts checks by name, so no explicit ordering is needed
-    // here (the query already orders by `conname`).
     table.checks = checks
         .iter()
         .map(|c| CheckConstraint {
@@ -1170,23 +1115,14 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
             .filter(|c| !c.is_empty())
             .map(str::to_owned)
             .collect();
-        // "Simple" means a single representable column set: not partial, not an
-        // expression, and not a covering `INCLUDE` index, whose key and INCLUDE columns
-        // are indistinguishable in the `indkey`-derived list. A single-column simple
-        // unique index sets the owning column's `unique` flag whether or not it backs a
-        // constraint — the flag is accurate either way and is never diffed. A covering
-        // `INCLUDE` unique index is not simple, so it never sets that flag, since its
-        // uniqueness scope is only its key columns, and is retained verbatim via its
-        // `definition`.
+        // "Simple" means the column list fully describes the index: not partial, not an
+        // expression, not covering (`INCLUDE` columns are mixed into the `indkey` list). A
+        // single-column simple unique index sets the column's `unique` flag even when it backs a
+        // constraint; the flag is never diffed.
         //
-        // A PG15+ `NULLS NOT DISTINCT` unique index enforces stricter uniqueness than a
-        // plain nulls-distinct one, and the model DSL cannot express it.
-        // `pg_get_indexdef` — version-safe on every supported Postgres, never emitting the
-        // clause on PG13/14 — renders `NULLS NOT DISTINCT` into the `definition` text.
-        // Detecting it there, rather than via the PG15-only
-        // `pg_index.indnullsnotdistinct` catalog column that would break introspection on
-        // PG13/14, forces the index to be retained verbatim so the clause round-trips
-        // instead of collapsing to an ordinary unique index that silently drops it.
+        // `NULLS NOT DISTINCT` (PG15+) is not expressible in the model DSL, so such an index is
+        // retained verbatim. It is read from `pg_get_indexdef` because
+        // `pg_index.indnullsnotdistinct` does not exist on PG13/14.
         let nulls_not_distinct = row
             .definition
             .to_ascii_uppercase()
@@ -1196,21 +1132,12 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
         if simple && row.is_unique && key_columns.len() == 1 {
             unique_columns.insert(key_columns[0].clone());
         }
-        // Retain — preserve verbatim, never drop — any index the model DSL cannot
-        // express: an expression, partial, or covering `INCLUDE` index, or a
-        // constraint-owned index (UNIQUE/EXCLUDE) whose backing constraint Postgres will
-        // not let us drop. A plain, non-constraint index keeps `definition: None`, so its
-        // JSON is unchanged and the model round-trip stays clean.
-        //
-        // For a simple index, `Index.columns` stays the ordered key columns — exact
-        // round-trip parity, and the `pg_depend` set equals the key columns anyway. For a
-        // definition-carrying index, `Index.columns` is the exact `pg_depend`
-        // dependent-column set: key, expression-referenced, and predicate columns, the set
-        // the diff engine uses for cascade and dependency detection without a string scan.
+        // An index the model DSL cannot express (expression, partial, covering, `NULLS NOT
+        // DISTINCT` or constraint-owned) is retained verbatim via `definition`, and its `columns`
+        // is the `pg_depend` set the diff uses for cascades. A plain index keeps
+        // `definition: None` and its ordered key columns.
         let (columns, definition, key_cols) = if simple && !row.is_constraint {
-            // A plain simple index's key columns ARE its `columns`, so recording
-            // `key_columns` separately would be redundant JSON noise — leave it empty
-            // and let the diff derive the key set from `columns` for such indexes.
+            // `key_columns` stays empty: the diff derives it from `columns`.
             (key_columns, None, Vec::new())
         } else {
             let dep_columns: Vec<String> = row
@@ -1220,29 +1147,17 @@ fn collapse_indexes(rows: &[IndexRow]) -> (Vec<Index>, std::collections::BTreeSe
                 .map(str::to_owned)
                 .collect();
             if row.is_constraint && row.constraint_type == "x" {
-                // An EXCLUDE constraint (`pg_constraint.contype = 'x'`) is backed by an
-                // index, but the backing `CREATE INDEX` from `pg_get_indexdef` does not
-                // enforce the exclusion: recreating only the plain index on rollback
-                // would silently allow overlapping rows, a data-integrity loss. Retain
-                // the real constraint instead — `pg_get_constraintdef` yields `EXCLUDE
-                // USING <method> (…)`, which the `ALTER TABLE … ADD CONSTRAINT <name> …`
-                // form wraps into a valid, exclusion-enforcing statement, since
-                // `index_sql` emits `definition` verbatim. The table is referenced by its
-                // bare name, matching the rest of the emitter. `key_columns` is left
-                // empty: an EXCLUDE index is not `unique`, so it never participates in
-                // the model `#[unique]` coverage check.
+                // The backing `CREATE INDEX` does not enforce the exclusion, so retain the
+                // constraint itself; `index_sql` emits `definition` verbatim. An EXCLUDE index
+                // is never `unique`, so `key_columns` stays empty.
                 let definition = format!(
                     "ALTER TABLE {} ADD CONSTRAINT {} {}",
                     row.table_name, row.constraint_name, row.constraint_def
                 );
                 (dep_columns, Some(definition), Vec::new())
             } else {
-                // For a `definition`-carrying index (expression / partial / covering /
-                // unique-constraint-owned) the KEY columns are recorded explicitly:
-                // they differ from `columns` (which is the full cascade dependency set
-                // here) and are EMPTY for an expression key, which is exactly the
-                // signal the diff uses to refuse to treat such an index as satisfying a
-                // model `#[unique]`.
+                // Key columns differ from the dependency set in `columns`, and are empty for an
+                // expression key, so the diff never matches such an index to a model `#[unique]`.
                 let key_cols: Vec<String> = row
                     .key_columns
                     .split(',')
@@ -1300,7 +1215,7 @@ fn strip_redundant_default_cast<'a>(raw: &'a str, ty: &ColumnType) -> &'a str {
 /// when `raw` is not exactly one literal followed by one cast.
 fn split_literal_cast(raw: &str) -> Option<(&str, &str)> {
     let (literal, rest) = if raw.starts_with('\'') {
-        // Quoted literal: find the closing quote, honoring `''` escapes.
+        // Quoted literal; `''` is an escaped quote.
         let mut i = 1; // byte index into `raw`, past the opening quote
         let end = loop {
             let rel = raw[i..].find('\'')?;
@@ -1350,8 +1265,6 @@ fn split_literal_cast(raw: &str) -> Option<(&str, &str)> {
 /// `pg_catalog.` qualification is tolerated. A target carrying a typmod
 /// (`character(3)`) never matches — the cast can change the value.
 fn is_own_pg_type(target: &str, ty: &ColumnType) -> bool {
-    // Tolerate an optional `pg_catalog.` qualification, case-insensitively —
-    // compare everything lowercased from here on.
     let lowered = target.to_ascii_lowercase();
     let target = lowered
         .strip_prefix("pg_catalog.")
@@ -1427,18 +1340,9 @@ fn normalize_default(
     if lowered == "now()" || lowered == "current_timestamp" {
         return Some(ColumnDefault::Now);
     }
-    // A serial (`nextval(...)`) default on a single-column integer PK is the
-    // BIGSERIAL id shape ONLY when the column owns its sequence — the model IR
-    // carries no explicit default for it. A shared/custom (non-owned) sequence
-    // default falls through and is preserved verbatim below.
     if normalize_serial_pk_default(&lowered, ty, is_primary_key, primary_key, owns_sequence) {
         return None;
     }
-    // A redundant `::type` cast on a literal default (`'{}'::text` on a TEXT
-    // column) is stripped when the cast names the column's own type, so the
-    // introspected IR agrees with the model parser's bare literal (issue
-    // #2292). Anything load-bearing stays verbatim — see
-    // [`strip_redundant_default_cast`].
     Some(ColumnDefault::Sql(
         strip_redundant_default_cast(raw, ty).to_owned(),
     ))
@@ -1504,11 +1408,8 @@ fn serial_kind_for(
     owns_sequence: bool,
     is_identity: bool,
 ) -> Option<SerialKind> {
-    // The serial-vs-plain distinction only applies to a single-column INTEGER
-    // primary key. A composite/non-PK column, a non-integer PK (e.g. a UUID id), or
-    // a `GENERATED … AS IDENTITY` column (whose id-generation is carried by the
-    // separate `identity` marker) leaves this `None` — "not applicable", which the
-    // diff treats as compatible.
+    // Not applicable (`None`, compatible in the diff): a non-PK or composite-PK column, an
+    // identity column (it has its own marker) or a non-integer type.
     if !is_primary_key
         || primary_key.len() != 1
         || is_identity
@@ -1516,9 +1417,7 @@ fn serial_kind_for(
     {
         return None;
     }
-    // An owned `nextval(...)` default is a `SERIAL`/`BIGSERIAL` id (distinguished by
-    // int4 vs int8). Computed from the RAW default (before `normalize_default`
-    // strips an int8 owned-serial default to `None`).
+    // Reads the raw default: `normalize_default` strips an owned int8 serial's default.
     if owns_sequence
         && raw_default
             .map(|d| d.trim().to_ascii_lowercase())
@@ -1529,68 +1428,41 @@ fn serial_kind_for(
             _ => SerialKind::BigSerial,
         });
     }
-    // A single-column integer PK that owns no sequence is a genuine plain,
-    // manually-assigned id. Emit an EXPLICIT `Plain` marker (never `None`, which is
-    // reserved for legacy/unknown) so a plain-int-PK ↔ serial mismatch surfaces as
-    // drift while a legacy snapshot (marker absent) stays compatible.
+    // `Plain`, not `None`: `None` marks a legacy snapshot and stays compatible, while `Plain`
+    // drifts against a serial model.
     Some(SerialKind::Plain)
 }
 
 // ===========================================================================
-// SQLite introspection (`autumn schema pull` on the sqlite backend-flip)
+// SQLite introspection
 // ===========================================================================
 //
-// Compiled in every build: diesel's SQLite backend is always in the CLI graph (the
-// workspace `diesel` pin), and `autumn db scrub` reads SQLite targets from the
-// default binary. `autumn schema pull` on SQLite still needs the `sqlite` cargo
-// feature. It lifts a
-// live SQLite database into the SAME `autumn_schema_core` snapshot IR as
-// [`introspect_postgres`], reading the SQLite catalog through `sqlite_master` and
-// the table-valued `pragma_*` functions in a constant number of batched queries
-// (one per catalog, joined against `sqlite_master` — never one query per table
-// beyond what a PRAGMA inherently requires).
+// Compiled in every build: diesel's SQLite backend is always in the CLI graph, and
+// `autumn db scrub` reads SQLite targets from the default binary. `autumn schema pull` on
+// SQLite still needs the `sqlite` cargo feature. It reads `sqlite_master` and the
+// `pragma_*` table-valued functions into the same snapshot IR as `introspect_postgres`,
+// in a constant number of batched queries.
 //
-// # Fidelity / fail-closed posture (mirrors the Postgres arm)
+// - Type affinity maps INTEGER to `Int64`, TEXT to `Text`, REAL to `Float64` and BLOB to
+//   `Bytes`. NUMERIC and unmapped declared types are kept verbatim as `Opaque`.
+// - A single-column `INTEGER PRIMARY KEY AUTOINCREMENT` gets `serial: Some(BigSerial)`.
+//   SQLite has one 64-bit rowid, so there is no int4 serial. AUTOINCREMENT is read from
+//   the `CREATE TABLE` SQL because `sqlite_sequence` is empty until the first insert.
+// - A `CURRENT_TIMESTAMP` default (what Autumn emits for a `Timestamp` `#[default]`) is
+//   recovered as `Timestamp` with `ColumnDefault::Now`.
+// - Errors carry only the parsed file path or the SQLite message, never the URL.
 //
-// - **Type mapping is conservative**: SQLite type affinity maps to the IR
-//   [`ColumnType`] only where unambiguous — INTEGER affinity → [`Int64`], TEXT →
-//   [`Text`], REAL → [`Float64`], BLOB → [`Bytes`]. A NUMERIC-affinity (or otherwise
-//   unmapped) declared type is preserved verbatim as [`Opaque`](ColumnType::Opaque),
-//   never dropped, exactly like the Postgres arm's `Opaque` floor.
-// - **Convention recovery** keeps a model↔database round-trip clean: a single-column
-//   `INTEGER PRIMARY KEY AUTOINCREMENT` id maps to an [`Int64`] PK carrying
-//   `serial: Some(BigSerial)` (Autumn's `#[id]` convention; AUTOINCREMENT is detected
-//   from the table's `CREATE TABLE` SQL because `sqlite_sequence` is empty until the
-//   first insert), and a column defaulting to `CURRENT_TIMESTAMP` — the exact DDL
-//   Autumn emits for a `Timestamp` `#[default]` column — is recovered as a
-//   [`Timestamp`](ColumnType::Timestamp) with a [`ColumnDefault::Now`] default.
-// - **Errors are credential-safe**: a connection failure carries only the parsed
-//   file path; a query/PRAGMA failure is an [`IntrospectError::Query`] carrying only
-//   the SQLite message — never the URL, and never a partial result.
+// Not captured:
 //
-// # Deferred (recorded, not silently dropped)
-//
-// - **Table-level `CHECK` constraints**: parsing a `CHECK (...)` predicate out of the
-//   raw `CREATE TABLE` SQL text is deferred (SQLite exposes no catalog view for it,
-//   unlike Postgres `pg_get_constraintdef`); `checks` is left empty for SQLite.
-// - **`SERIAL` vs `BIGSERIAL` distinction**: SQLite has a single 64-bit rowid, so an
-//   AUTOINCREMENT id is always recorded as `BigSerial` (there is no int4 serial).
-// - **FK on-update/on-delete actions, composite FKs, expression/collation index
-//   attributes**: same deferrals as the Postgres arm.
-// - **Composite inline `UNIQUE(a, b)` constraints (#1975)**: a table-level
-//   `UNIQUE(a, b)` produces a `sqlite_autoindex_*` auto-index whose name is
-//   un-creatable (`SQLite` refuses `CREATE … "sqlite_…"`) and un-droppable, and the
-//   IR has no table-level unique-constraint node — so it is skipped entirely (a rare
-//   brownfield shape; the live constraint is untouched). A SINGLE-column inline
-//   `col TEXT UNIQUE` IS modeled (folded into `Column.unique`, rendered inline on
-//   rebuild/rollback so uniqueness is preserved). Deferred narrow edge: an
-//   authoritative diff does not surface a MANUALLY-dropped single-column inline
-//   `UNIQUE` (the fold's `Column.unique` change is not diffed — on Postgres the
-//   equivalent drift is caught via the index diff).
-// - **Generated columns' expressions**: generated columns are PRESERVED (read via
-//   `pragma_table_xinfo`, never dropped), but their `GENERATED ALWAYS AS (...)`
-//   expression is not captured — a generated column round-trips as an ordinary column
-//   of its declared type. Full verbatim re-emission is future work.
+// - Table-level `CHECK` constraints: SQLite has no catalog view for them, so `checks` is
+//   empty.
+// - Composite foreign keys are omitted.
+// - A composite inline `UNIQUE(a, b)` (#1975): its `sqlite_autoindex_*` cannot be created
+//   or dropped by name and the IR has no table-level unique node, so it is skipped. A
+//   single-column inline `UNIQUE` folds into `Column.unique`, which is not diffed, so
+//   dropping one by hand is not reported as drift.
+// - Generated columns are kept, but not their `GENERATED ALWAYS AS (...)` expression:
+//   they round-trip as ordinary columns of their declared type.
 
 /// Resolve a `sqlite:`/`sqlite://`/`file:` URL (or a bare path) to the concrete
 /// target [`diesel::SqliteConnection::establish`] expects, mirroring autumn-web's
@@ -1631,13 +1503,11 @@ pub fn sqlite_existence_check_path(target: &str) -> Option<String> {
         // A bare filesystem path.
         return Some(target.to_owned());
     };
-    // Split off the `?query` (URI parameters like `mode=`, `cache=`).
     let (path_part, query) = rest.split_once('?').unwrap_or((rest, ""));
     // Strip an optional authority: `file://host/path` / `file:///path`.
     let path_part = path_part.strip_prefix("//").map_or(path_part, |after| {
         after.find('/').map_or(after, |idx| &after[idx..])
     });
-    // In-memory forms are exempt (no file to check).
     let is_memory = path_part == ":memory:"
         || query
             .split('&')
@@ -1677,8 +1547,7 @@ mod target_tests {
             sqlite_existence_check_path("/srv/app.db"),
             Some("/srv/app.db".to_owned())
         );
-        // `file:` URI forms → the real path is parsed out (scheme/authority/query
-        // stripped, percent-decoded).
+        // `file:` URIs: scheme, authority and query stripped, then percent-decoded.
         assert_eq!(
             sqlite_existence_check_path("file:/srv/app.db"),
             Some("/srv/app.db".to_owned())
@@ -1722,12 +1591,8 @@ pub fn introspect_sqlite(url: &str) -> Result<Vec<Table>, IntrospectError> {
     use diesel::{Connection as _, SqliteConnection};
 
     let target = sqlite_target(url);
-    // Guard against SQLite's create-if-missing behavior: `establish` on a nonexistent
-    // file SUCCEEDS against a brand-new EMPTY database, so a typo'd or missing DB path
-    // would otherwise pull ZERO tables and (on a non-dry-run pull) silently overwrite
-    // the checked-in snapshot with an empty one. Require a concrete file-backed target
-    // (bare path OR a `file:` URI with a real path) to already exist; genuine
-    // in-memory targets have no file to check and are exempt.
+    // `establish` creates a missing file, so a typo'd path would pull zero tables and overwrite
+    // the snapshot with an empty one. A file-backed target must already exist.
     if let Some(path) = sqlite_existence_check_path(&target)
         && !std::path::Path::new(&path).exists()
     {
@@ -1882,8 +1747,6 @@ mod sqlite {
         let indexes_by_table = fetch_indexes(conn)?;
         let index_columns = fetch_index_columns(conn)?;
         let fks_by_table = fetch_foreign_keys(conn)?;
-        // Each table's single-column primary key (absent for composite / PK-less
-        // tables), used to resolve an implicit `REFERENCES parent` FK target.
         let single_col_pks = single_column_pks(&columns_by_table);
 
         let mut out = Vec::with_capacity(tables.len());
@@ -1943,9 +1806,8 @@ mod sqlite {
         )
         .load(conn)
         .map_err(|e| query_err(&e))?;
-        // Virtual tables (their `sql` starts with `CREATE VIRTUAL TABLE`) are never
-        // model-expressible; collect them, and whether each is FTS5, so the FTS5
-        // shadow tables can be excluded alongside the vtab itself.
+        // Virtual tables are never model-expressible. Record which are FTS5 so their shadow
+        // tables are excluded too.
         let virtual_tables: Vec<(String, bool)> = rows
             .iter()
             .filter_map(|r| {
@@ -2097,8 +1959,7 @@ mod sqlite {
         )
         .load(conn)
         .map_err(|e| query_err(&e))?;
-        // Refuse an unknown action. Then `build_table` cannot read it as
-        // `NO ACTION`.
+        // Refuse an unknown action so `build_table` never reads it as `NO ACTION`.
         for row in &rows {
             for action in [&row.on_delete, &row.on_update] {
                 ForeignKeyAction::from_sql(action).map_err(|e| {
@@ -2181,10 +2042,8 @@ mod sqlite {
             Affinity::Text => ColumnType::Text,
             Affinity::Real => ColumnType::Float64,
             Affinity::Blob => ColumnType::Bytes,
-            // Fail-closed: a NUMERIC-affinity (or otherwise unmapped) declared type is
-            // preserved verbatim rather than guessed, matching the Postgres arm's
-            // `Opaque` floor. An empty declared type is BLOB affinity above, so this
-            // never produces an empty `pg_type`.
+            // NUMERIC or unmapped: kept verbatim. An empty declared type has BLOB affinity, so
+            // `pg_type` is never empty.
             Affinity::Numeric => ColumnType::Opaque {
                 pg_type: decl_type.to_owned(),
             },
@@ -2272,8 +2131,7 @@ mod sqlite {
             out.push(' '); // opening delimiter
             while let Some(n) = chars.next() {
                 if n == close {
-                    // A doubled delimiter is an escape (not for the `[…]` form) — stay
-                    // inside the quote.
+                    // A doubled delimiter is an escape (not for `[…]`).
                     if close != ']' && chars.peek() == Some(&close) {
                         chars.next();
                         out.push(' ');
@@ -2302,7 +2160,6 @@ mod sqlite {
         let mut table = Table::new(name, Backend::Sqlite);
         table.managed = true;
 
-        // Primary key, in key order (`pk` is the 1-based key position).
         let mut pk_cols: Vec<(i32, String)> = columns
             .iter()
             .filter(|c| c.pk > 0)
@@ -2311,10 +2168,8 @@ mod sqlite {
         pk_cols.sort_by_key(|(ord, _)| *ord);
         table.primary_key = pk_cols.into_iter().map(|(_, n)| n).collect();
         let single_pk = table.primary_key.len() == 1;
-        // AUTOINCREMENT lives in the table's CREATE SQL (sqlite_sequence is empty
-        // until the first insert, so it cannot be relied on). Matched as a KEYWORD
-        // token, not a substring, so a table/column name or literal containing the
-        // substring never misclassifies a plain rowid PK as a serial.
+        // `sqlite_sequence` is empty until the first insert, so AUTOINCREMENT is read from the
+        // CREATE SQL, as a keyword token rather than a substring.
         let autoincrement = table_sql_has_autoincrement_keyword(table_sql);
 
         let (ir_indexes, unique_columns) = collapse_indexes(name, indexes, index_columns);
@@ -2324,15 +2179,8 @@ mod sqlite {
             .collect();
 
         for row in columns {
-            // `hidden = 1` is an internal hidden column (virtual-table / rowid
-            // machinery), never a user column — skip it. `hidden = 2` (VIRTUAL) / `3`
-            // (STORED) are GENERATED columns: they are included (via `table_xinfo`) so
-            // they are NEVER silently dropped from the pull. NOTE (DEFERRED): the
-            // generation EXPRESSION is not captured here, so a generated column
-            // round-trips as an ordinary column of its declared type — enough to keep
-            // it in the snapshot (doctor/dry-run see it, a recreate no longer omits
-            // it), but full generated-column fidelity (verbatim `GENERATED ALWAYS AS
-            // (...)` re-emission) is future work.
+            // `hidden = 1` is internal virtual-table machinery. Generated columns (2 VIRTUAL,
+            // 3 STORED) are kept, without their expression.
             if row.hidden == 1 {
                 continue;
             }
@@ -2340,21 +2188,13 @@ mod sqlite {
             let default = sqlite_default(row.dflt_value.as_deref());
             let ty = sqlite_column_type(&row.decl_type, default.as_ref());
             let mut column = Column::new(row.column_name.clone(), ty);
-            // A SQLite PRIMARY KEY column reports notnull=0 for an INTEGER rowid PK,
-            // but is effectively NOT NULL; the model always has non-null PKs, so force
-            // a PK column non-null for a clean round-trip.
+            // SQLite reports notnull=0 for an INTEGER rowid PK, which is still NOT NULL.
             column.nullable = row.not_null == 0 && !is_pk;
             column.primary_key = is_pk;
             column.unique = unique_columns.contains(row.column_name.as_str());
             column.default = default;
-            // Serial marker (three-state): a single-column INTEGER PK of an
-            // AUTOINCREMENT table is the Autumn `BigSerial` id (SQLite has one 64-bit
-            // rowid — always BigSerial), symmetric with what the model parser
-            // records. A single-column INTEGER PK WITHOUT `AUTOINCREMENT` is a
-            // genuine plain, manually-assigned id → an EXPLICIT `Plain` marker (never
-            // `None`, which is reserved for legacy/unknown snapshots) so a
-            // plain-int-PK ↔ `BigSerial`-model mismatch surfaces as drift while a
-            // legacy snapshot stays compatible.
+            // SQLite has one 64-bit rowid, so an AUTOINCREMENT id is `BigSerial`. Without
+            // AUTOINCREMENT the PK is `Plain`, not `None`: `None` marks a legacy snapshot.
             if is_pk && single_pk && matches!(affinity(&row.decl_type), Affinity::Integer) {
                 column.serial = Some(if autoincrement {
                     SerialKind::BigSerial
@@ -2363,12 +2203,9 @@ mod sqlite {
                 });
             }
             if let Some(fk) = fk_by_column.get(row.column_name.as_str()) {
-                // An implicit `REFERENCES parent` (SQLite reports `to = NULL`) targets
-                // the parent's PRIMARY KEY — resolve the parent's actual single-column
-                // PK rather than guessing `id`. A parent with a composite (or no)
-                // single-column PK is unresolvable, so the FK is OMITTED (fail-closed)
-                // rather than recorded with a wrong target that would re-emit wrong on
-                // rebuild/rollback and never drift.
+                // An implicit `REFERENCES parent` (`to = NULL`) targets the parent's PK. When
+                // the parent has no single-column PK, the FK is omitted rather than guessed as
+                // `id`.
                 let foreign_column = fk.foreign_column.clone().or_else(|| {
                     // Implicit target → the parent's actual single-column PK.
                     single_col_pks.get(&fk.foreign_table).cloned()
@@ -2390,8 +2227,7 @@ mod sqlite {
         }
 
         table.indexes = ir_indexes;
-        // Table-level CHECK extraction from the raw CREATE TABLE SQL is deferred (see
-        // the module note), so `checks` is left empty for SQLite.
+        // Table-level CHECKs are not read for SQLite (see the module note).
         table
     }
 
@@ -2425,9 +2261,7 @@ mod sqlite {
             if row.origin == "pk" {
                 continue;
             }
-            // A UNIQUE-constraint auto-index (`origin = 'u'`) is NEVER an Index; a
-            // single-column one folds into the column's `unique` flag, a composite one
-            // is skipped (see the fn note).
+            // A UNIQUE-constraint auto-index is never an `Index` (see the fn doc).
             if row.origin == "u" {
                 let cols = index_columns
                     .get(&(table_name.to_owned(), row.index_name.clone()))
@@ -2454,9 +2288,6 @@ mod sqlite {
             if simple && is_unique && key_columns.len() == 1 {
                 unique_columns.insert(key_columns[0].clone());
             }
-            // A partial, expression or collated/`DESC` index is retained verbatim via
-            // its CREATE INDEX SQL (when present); a plain index is representable by
-            // its columns.
             let definition = if simple { None } else { row.index_sql.clone() };
             // A definition-backed index with only real key columns records them,
             // so the diff can match it to a model `#[unique]`.
@@ -2531,15 +2362,11 @@ mod sqlite {
 
         #[test]
         fn default_bareword_null_is_no_default_but_quoted_null_is_preserved() {
-            // A `DEFAULT NULL` clause surfaces as the bareword keyword `NULL`
-            // (any case, possibly padded), which is semantically "no default" — it
-            // must map to `None` so it never drifts against a model column that has
-            // no default.
+            // A bareword `NULL` (any case, padded) means no default.
             assert_eq!(sqlite_default(Some("NULL")), None);
             assert_eq!(sqlite_default(Some("null")), None);
             assert_eq!(sqlite_default(Some("  Null  ")), None);
-            // A QUOTED `'NULL'` is the real 4-character text value, a genuine string
-            // default — it must survive verbatim.
+            // A quoted `'NULL'` is a real text default.
             assert_eq!(
                 sqlite_default(Some("'NULL'")),
                 Some(ColumnDefault::Sql("'NULL'".to_owned()))
@@ -2616,11 +2443,7 @@ mod sqlite {
 
         #[test]
         fn build_table_plain_integer_pk_is_marked_plain() {
-            // Without AUTOINCREMENT in the table SQL, an INTEGER PK is a plain rowid
-            // alias, not an Autumn BigSerial id → an EXPLICIT `Plain` marker (three-
-            // state: never `None`, which is reserved for legacy/unknown snapshots),
-            // so it drifts against a `BigSerial` model while a legacy snapshot stays
-            // compatible.
+            // Without AUTOINCREMENT an INTEGER PK is a plain rowid alias.
             let columns = vec![col_row("id", "INTEGER", 0, None, 1)];
             let table_sql = "CREATE TABLE posts (id INTEGER PRIMARY KEY)";
             let table = build_table(
@@ -2679,8 +2502,6 @@ mod sqlite {
 
         #[test]
         fn build_table_autoincrement_substring_name_is_plain_not_serial() {
-            // A plain INTEGER PK in a table whose NAME contains the `autoincrement`
-            // substring must be `Some(Plain)`, never mis-flagged BigSerial.
             let columns = vec![col_row("id", "INTEGER", 0, None, 1)];
             let table_sql = "CREATE TABLE autoincrement_events (id INTEGER PRIMARY KEY)";
             let table = build_table(
@@ -2698,9 +2519,6 @@ mod sqlite {
 
         #[test]
         fn build_table_preserves_generated_columns_and_skips_internal_hidden() {
-            // `table_xinfo` surfaces generated columns (hidden 2 = VIRTUAL, 3 =
-            // STORED); they must be PRESERVED (never silently dropped), while a truly
-            // internal hidden column (hidden = 1) is skipped.
             let columns = vec![
                 col_row("id", "INTEGER", 0, None, 1),
                 col_row("first", "TEXT", 1, None, 0),
@@ -2758,8 +2576,7 @@ mod sqlite {
                     on_update: "NO ACTION".to_owned(),
                 },
             ];
-            // `parents` has a single-column PK `code`; `composite_parent` is absent
-            // (composite/unresolvable).
+            // `composite_parent` is absent: it has no single-column PK.
             let mut single_col_pks = BTreeMap::new();
             single_col_pks.insert("parents".to_owned(), "code".to_owned());
             let table = build_table(
@@ -2772,7 +2589,6 @@ mod sqlite {
                 &fks,
                 &single_col_pks,
             );
-            // The implicit FK resolves to the parent's REAL single-column PK, not `id`.
             let parent_code = table
                 .columns
                 .iter()
@@ -2781,7 +2597,6 @@ mod sqlite {
             let fk = parent_code.references.as_ref().expect("FK resolved");
             assert_eq!(fk.table, "parents");
             assert_eq!(fk.column, "code", "resolved to the real PK, not `id`");
-            // The FK to a composite/unresolvable parent is OMITTED (not guessed `id`).
             let orphan = table
                 .columns
                 .iter()
@@ -2944,9 +2759,7 @@ mod sqlite {
 
         #[test]
         fn collapse_indexes_unique_constraint_autoindex_folds_or_skips() {
-            // A `sqlite_autoindex_*` (origin = 'u') is NEVER an Index (un-creatable /
-            // un-droppable name). A SINGLE-column one folds into the column's `unique`
-            // flag; a COMPOSITE one is skipped entirely (no flag either).
+            // A single-column auto-index folds into the `unique` flag; a composite one is skipped.
             for (cols, expect_flag) in [(vec!["email"], Some("email")), (vec!["a", "b"], None)] {
                 let rows = vec![IndexRow {
                     table_name: "t".to_owned(),
@@ -3170,14 +2983,12 @@ mod tests {
             norm("'{}'::text", &ColumnType::Text),
             Some(ColumnDefault::Sql("'{}'".to_owned()))
         );
-        // A hand-written non-translatable text default round-trips the same
-        // way — the fix is the general one, not translatable-specific.
+        // Not specific to translatable columns.
         assert_eq!(
             norm("'draft'::text", &ColumnType::Text),
             Some(ColumnDefault::Sql("'draft'".to_owned()))
         );
-        // The `VARCHAR`-family spellings count as a TEXT column's own type
-        // (the IR does not distinguish TEXT from VARCHAR).
+        // The IR does not distinguish TEXT from VARCHAR.
         assert_eq!(
             norm("'draft'::character varying", &ColumnType::Text),
             Some(ColumnDefault::Sql("'draft'".to_owned()))
@@ -3196,8 +3007,7 @@ mod tests {
             norm("'{}'::PG_CATALOG.TEXT", &ColumnType::Text),
             Some(ColumnDefault::Sql("'{}'".to_owned()))
         );
-        // Escaped quotes inside the literal are honored, not mistaken for the
-        // closing quote.
+        // `''` is an escaped quote, not the closing one.
         assert_eq!(
             norm("'it''s'::text", &ColumnType::Text),
             Some(ColumnDefault::Sql("'it''s'".to_owned()))
@@ -3219,8 +3029,7 @@ mod tests {
             norm("'{}'::text", &ColumnType::Int32),
             Some(ColumnDefault::Sql("'{}'::text".to_owned()))
         );
-        // A cast carrying a typmod can change the value (`character(3)`
-        // truncates) — never stripped.
+        // A typmod cast can change the value (`character(3)` truncates).
         assert_eq!(
             norm("'abcdef'::character(3)", &ColumnType::Text),
             Some(ColumnDefault::Sql("'abcdef'::character(3)".to_owned()))
@@ -3305,8 +3114,6 @@ mod tests {
 
     #[test]
     fn normalize_serial_pk_default_stripped_to_none() {
-        // (a) A `nextval(...)` default on a single-column int8 PK that OWNS its
-        // sequence (the conventional `BIGSERIAL` shape) → None (BIGSERIAL id).
         let pk = vec!["id".to_owned()];
         let d = normalize_default(
             Some("nextval('posts_id_seq'::regclass)"),
@@ -3323,12 +3130,8 @@ mod tests {
 
     #[test]
     fn normalize_int8_serial_pk_shared_sequence_default_is_preserved() {
-        // (b) A `nextval(...)` default on a single-column int8 PK backed by a
-        // SHARED/custom sequence the column does NOT own
-        // (`id BIGINT PRIMARY KEY DEFAULT nextval('global_ids')`) must be PRESERVED
-        // verbatim — stripping it would make recreation mint a fresh owned
-        // `BIGSERIAL` (a new sequence) instead of continuing to allocate from
-        // `global_ids`, silently changing ID-allocation behavior.
+        // Stripping a default over a sequence the column does not own would make recreation mint
+        // a fresh owned `BIGSERIAL` instead of allocating from `global_ids`.
         let pk = vec!["id".to_owned()];
         let d = normalize_default(
             Some("nextval('global_ids'::regclass)"),
@@ -3348,10 +3151,8 @@ mod tests {
 
     #[test]
     fn normalize_int4_serial_pk_default_is_kept() {
-        // (c) A `nextval(...)` default on a single-column int4 PK is a brownfield
-        // `SERIAL PRIMARY KEY` — its default is PRESERVED (not stripped) so the DDL
-        // emitter can reconstruct it as `SERIAL` rather than a plain `INTEGER`. This
-        // holds regardless of ownership (only int8 owned serials are stripped).
+        // The int4 default is kept so the emitter rebuilds it as `SERIAL`; only owned int8
+        // serial defaults are stripped.
         let pk = vec!["id".to_owned()];
         let d = normalize_default(
             Some("nextval('counters_id_seq'::regclass)"),
@@ -3371,8 +3172,6 @@ mod tests {
 
     #[test]
     fn normalize_int4_pk_without_default_stays_none() {
-        // A plain int4 PK with NO default stays default-less → a plain integer PK
-        // (no auto-increment), never mistaken for a SERIAL.
         let pk = vec!["id".to_owned()];
         let d = normalize_default(None, &ColumnType::Int32, true, &pk, false);
         assert_eq!(d, None, "a plain int4 PK carries no default");
@@ -3380,8 +3179,7 @@ mod tests {
 
     #[test]
     fn normalize_serial_default_on_non_pk_is_kept_as_sql() {
-        // A sequence default on a NON-pk column is not the id shape — keep it (even
-        // when the column owns the sequence, i.e. a non-PK `SERIAL` column).
+        // Not the id shape, even when the column owns the sequence.
         let d = normalize_default(
             Some("nextval('counter_seq'::regclass)"),
             &ColumnType::Int64,
@@ -3419,16 +3217,12 @@ mod tests {
             ),
             Some(SerialKind::Serial)
         );
-        // A plain BIGINT PRIMARY KEY (no default, no owned sequence) → the EXPLICIT
-        // `Plain` marker (three-state): it is NOT a BigSerial, and the IR now tells
-        // them apart, while a legacy/unknown snapshot (marker absent) stays `None`.
+        // A plain BIGINT PK → `Plain`; `None` is reserved for legacy snapshots.
         assert_eq!(
             serial_kind_for(None, &ColumnType::Int64, true, &pk, false, false),
             Some(SerialKind::Plain)
         );
-        // A shared/custom (non-owned) sequence default is still a single-column
-        // integer PK with no OWNED sequence → the explicit `Plain` marker (it is not
-        // a conventional owned serial).
+        // A non-owned sequence default is not a serial → `Plain`.
         assert_eq!(
             serial_kind_for(
                 Some("nextval('global_ids'::regclass)"),
@@ -3457,8 +3251,7 @@ mod tests {
             serial_kind_for(None, &ColumnType::Uuid, true, &pk, false, false),
             None
         );
-        // A GENERATED … AS IDENTITY integer PK → None (its id-generation is carried
-        // by the separate `identity` marker, never the serial marker).
+        // An identity PK → None; the `identity` marker carries it.
         assert_eq!(
             serial_kind_for(None, &ColumnType::Int64, true, &pk, false, true),
             None
@@ -3524,9 +3317,6 @@ mod tests {
 
     #[test]
     fn collapse_indexes_nulls_not_distinct_unique_retained_verbatim() {
-        // A PG15+ `NULLS NOT DISTINCT` unique index (a bare CREATE UNIQUE INDEX, no
-        // backing constraint) must be RETAINED via `definition` so the clause
-        // round-trips — never collapsed to an ordinary unique index that drops it.
         let def = "CREATE UNIQUE INDEX u_idx ON public.t USING btree (email) NULLS NOT DISTINCT";
         let rows = vec![index_row(
             "u_idx", true, "email", "email", false, false, def,
@@ -3547,9 +3337,7 @@ mod tests {
 
     #[test]
     fn normalize_uuid_pk_default_is_kept_as_sql() {
-        // (d) A UUID PK keeps its gen_random_uuid() default (the model parser records
-        // the same), so the two agree on a round-trip — unaffected by the ownership
-        // signal (UUID PKs have no sequence).
+        // The model parser records the same `gen_random_uuid()` default.
         let pk = vec!["id".to_owned()];
         let d = normalize_default(
             Some("gen_random_uuid()"),
@@ -3591,9 +3379,8 @@ mod tests {
             constraint_name: String::new(),
             constraint_def: String::new(),
             columns: columns.to_owned(),
-            // Mirror the SQL `key_columns`: empty when any key position is an
-            // expression, otherwise the (non-INCLUDE) key columns — which, for these
-            // `has_include: false` fixtures, are exactly `columns`.
+            // Mirrors the SQL: empty for an expression key, else the key columns, which equal
+            // `columns` without INCLUDE columns.
             key_columns: if has_expression {
                 String::new()
             } else {
@@ -3615,8 +3402,7 @@ mod tests {
     ) -> IndexRow {
         IndexRow {
             is_constraint: true,
-            // A UNIQUE constraint (`contype = 'u'`) — the EXCLUDE (`'x'`) path is
-            // exercised by [`exclude_constraint_index_row`].
+            // UNIQUE; `exclude_constraint_index_row` covers EXCLUDE.
             constraint_type: "u".to_owned(),
             ..index_row(
                 index_name, is_unique, columns, columns, false, false, definition,
@@ -3694,8 +3480,7 @@ mod tests {
 
     #[test]
     fn collapse_indexes_multi_column_unique_only_index_not_column_flag() {
-        // A composite unique index records an Index but does NOT set a per-column
-        // unique flag (the model IR's `unique` flag is single-column only).
+        // The IR `unique` flag is single-column only.
         let rows = vec![index_row(
             "idx_memberships_org_user",
             true,
@@ -3721,9 +3506,6 @@ mod tests {
 
     #[test]
     fn collapse_indexes_expression_index_preserved_not_dropped() {
-        // An expression index (indkey contains 0 → has_expression) must be
-        // preserved verbatim via `definition`, never dropped, and must not set a
-        // column `unique` flag.
         let def = "CREATE INDEX users_lower_email_idx ON public.users USING btree (lower(email))";
         let rows = vec![index_row(
             "users_lower_email_idx",
@@ -3737,9 +3519,7 @@ mod tests {
         let (indexes, unique_cols) = collapse_indexes(&rows);
         assert_eq!(indexes.len(), 1, "expression index preserved, not dropped");
         assert_eq!(indexes[0].name, "users_lower_email_idx");
-        // A definition-carrying index carries its exact `pg_depend` dependent set,
-        // so the expression-referenced `email` column is captured for exact
-        // cascade/dependency detection.
+        // `columns` is the `pg_depend` set, so it includes the expression-referenced `email`.
         assert_eq!(indexes[0].columns, vec!["email".to_owned()]);
         assert_eq!(indexes[0].definition.as_deref(), Some(def));
         assert!(unique_cols.is_empty());
@@ -3747,8 +3527,6 @@ mod tests {
 
     #[test]
     fn collapse_indexes_partial_index_preserves_predicate() {
-        // A partial index over a real column keeps its `WHERE` predicate via the
-        // verbatim definition rather than degrading to a plain column index.
         let def = "CREATE INDEX users_active_idx ON public.users USING btree (email) \
                    WHERE (deleted_at IS NULL)";
         let rows = vec![index_row(
@@ -3762,8 +3540,7 @@ mod tests {
         )];
         let (indexes, unique_cols) = collapse_indexes(&rows);
         assert_eq!(indexes.len(), 1);
-        // A partial index depends on BOTH its key column and its predicate column;
-        // the exact `pg_depend` set (which cascades on `DROP COLUMN`) is captured.
+        // The `pg_depend` set (what `DROP COLUMN` cascades over) includes the predicate column.
         assert_eq!(
             indexes[0].columns,
             vec!["deleted_at".to_owned(), "email".to_owned()]
@@ -3777,11 +3554,8 @@ mod tests {
 
     #[test]
     fn collapse_indexes_constraint_owned_index_retained_via_definition() {
-        // A brownfield column-level `UNIQUE` (e.g. `email TEXT UNIQUE`) auto-creates
-        // a constraint-backed index Postgres names (e.g. `users_email_key`). It must
-        // be RETAINED verbatim via `definition` (never an ordinary droppable index),
-        // so a later model-side diff can't emit a `DROP INDEX` Postgres rejects. Its
-        // single-column `unique` flag is still set (accurate, and not diffed).
+        // A column-level `UNIQUE` creates a constraint-backed index, and Postgres rejects
+        // `DROP INDEX` on it, so it is retained via `definition`, never as a droppable index.
         let def = "CREATE UNIQUE INDEX users_email_key ON public.users USING btree (email)";
         let rows = vec![constraint_index_row("users_email_key", true, "email", def)];
         let (indexes, unique_cols) = collapse_indexes(&rows);
@@ -3802,12 +3576,8 @@ mod tests {
 
     #[test]
     fn collapse_indexes_exclude_constraint_retained_as_real_constraint() {
-        // A range EXCLUDE constraint (`EXCLUDE USING gist (during WITH &&)`) is
-        // backed by a gist index Postgres auto-creates. Retaining ONLY that backing
-        // `CREATE INDEX` would NOT enforce the exclusion on a rollback/recreation
-        // (overlapping rows become possible — a data-integrity loss), so the retained
-        // `definition` must be the REAL constraint recreation: `ALTER TABLE … ADD
-        // CONSTRAINT … EXCLUDE USING …`, not a `CREATE INDEX`.
+        // The backing gist index alone does not enforce the exclusion, so the definition must
+        // recreate the constraint itself.
         let index_def =
             "CREATE INDEX reservations_during_excl ON public.reservations USING gist (during)";
         let constraint_def = "EXCLUDE USING gist (during WITH &&)";
@@ -3836,8 +3606,7 @@ mod tests {
         );
         assert_eq!(
             def,
-            // The fixture's table_name is "t"; the ALTER uses the bare table name
-            // form the emitter uses elsewhere (`index_sql` plain branch / CREATE TABLE).
+            // `index_row` fixtures use table_name "t".
             "ALTER TABLE t ADD CONSTRAINT reservations_during_excl EXCLUDE USING gist (during WITH &&)",
             "the ALTER TABLE must use the bare table name form the emitter uses elsewhere"
         );
@@ -3856,11 +3625,8 @@ mod tests {
 
     #[test]
     fn collapse_indexes_model_style_unique_index_stays_ordinary_droppable() {
-        // The MODEL style: `CREATE UNIQUE INDEX idx_users_email_unique` with NO
-        // backing constraint (`is_constraint == false`) must stay an ORDINARY
-        // `Index { definition: None }` so the migrate-from-models round-trip is
-        // clean — a `#[unique]` field produces a plain unique index, not a
-        // constraint, so it is diffable/droppable as before.
+        // A `#[unique]` field produces a bare `CREATE UNIQUE INDEX` with no constraint; it stays
+        // an ordinary droppable index so the model round-trip is clean.
         let def = "CREATE UNIQUE INDEX idx_users_email_unique ON public.users USING btree (email)";
         let rows = vec![index_row(
             "idx_users_email_unique",
@@ -3884,12 +3650,8 @@ mod tests {
 
     #[test]
     fn collapse_indexes_covering_include_index_retained_via_definition() {
-        // A covering index `CREATE UNIQUE INDEX ... ON t (a) INCLUDE (b)`
-        // (`has_include == true`) must be RETAINED verbatim via `definition`,
-        // never rebuilt as a plain `(a, b)` unique index (which would widen the
-        // uniqueness scope from (a) to (a, b) and drop the covering behavior). It
-        // must NOT set a single-column `unique` column flag, and `columns` carries
-        // the exact `pg_depend` dependent set (key + INCLUDE columns).
+        // Rebuilding `(a) INCLUDE (b)` as a plain `(a, b)` unique index would widen the
+        // uniqueness scope; `columns` is the `pg_depend` set (key + INCLUDE).
         let def = "CREATE UNIQUE INDEX idx_cover ON public.t USING btree (a) INCLUDE (b)";
         let rows = vec![IndexRow {
             has_include: true,
@@ -3930,8 +3692,7 @@ mod tests {
                 character_maximum_length: None,
                 domain_name: None,
                 domain_schema: None,
-                // The conventional BIGSERIAL id owns its sequence, so the nextval
-                // default is stripped to None below.
+                // Owns its sequence, so the nextval default is stripped.
                 owns_sequence: true,
                 is_identity: "NO".to_owned(),
                 identity_generation: None,
@@ -4019,9 +3780,7 @@ mod tests {
 
     #[test]
     fn build_table_preserves_domain_column_as_opaque() {
-        // A column typed on a Postgres DOMAIN reports its base type in `udt_name`
-        // (`text`) but names the domain in `domain_name`. The fail-closed floor
-        // must preserve the domain verbatim as `Opaque`, NOT flatten to `Text`.
+        // The base type is in `udt_name`; the domain must win, not flatten to `Text`.
         let columns = vec![
             ColumnRow {
                 table_name: "contacts".to_owned(),
@@ -4038,7 +3797,7 @@ mod tests {
                 is_identity: "NO".to_owned(),
                 identity_generation: None,
             },
-            // A non-domain column (`domain_name` NULL) maps exactly as before.
+            // A non-domain column maps to its base type.
             ColumnRow {
                 table_name: "contacts".to_owned(),
                 column_name: "note".to_owned(),
@@ -4074,10 +3833,8 @@ mod tests {
 
     #[test]
     fn build_table_preserves_length_limited_char_columns_as_opaque() {
-        // `VARCHAR(32)` / `CHAR(2)` report `udt_name` `varchar` / `bpchar` with a
-        // `character_maximum_length`. The fail-closed floor must preserve the length
-        // verbatim as `Opaque` (`varchar(32)` / `char(2)`), NOT flatten to `Text`
-        // and drop the DB-enforced limit. Unbounded `varchar` / `text` stay `Text`.
+        // A length limit is kept as `Opaque` (`varchar(32)`, `char(2)`), not flattened to `Text`.
+        // Unbounded `varchar` and `text` stay `Text`.
         let columns = vec![
             ColumnRow {
                 table_name: "labels".to_owned(),
@@ -4152,9 +3909,7 @@ mod tests {
 
     #[test]
     fn build_table_domain_precedence_over_length_floor() {
-        // A domain column reports its base type (e.g. `varchar`) in `udt_name` and
-        // can carry a `character_maximum_length`, but the domain floor must win:
-        // the column is preserved as the domain type, not `varchar(n)`.
+        // A domain over `varchar` can carry a `character_maximum_length`; the domain wins.
         let columns = vec![ColumnRow {
             table_name: "labels".to_owned(),
             column_name: "code".to_owned(),
@@ -4183,8 +3938,6 @@ mod tests {
 
     #[test]
     fn build_table_qualifies_non_public_domain_column() {
-        // A domain in a non-`public` schema is schema-qualified so recreation
-        // references the correct domain type.
         let columns = vec![ColumnRow {
             table_name: "contacts".to_owned(),
             column_name: "email".to_owned(),
@@ -4212,9 +3965,6 @@ mod tests {
 
     #[test]
     fn build_table_qualifies_non_public_fk_target() {
-        // A FK referencing a table outside `public` is stored schema-qualified in
-        // `ForeignKey.table` so recreation emits `REFERENCES auth.users(id)`, not
-        // a wrong bare `REFERENCES users(id)`.
         let columns = vec![ColumnRow {
             table_name: "sessions".to_owned(),
             column_name: "account_id".to_owned(),
@@ -4303,7 +4053,6 @@ mod tests {
 
     #[test]
     fn build_table_keeps_public_fk_target_bare() {
-        // The common case — a FK to a `public` table — stays a bare relname.
         let columns = vec![ColumnRow {
             table_name: "comments".to_owned(),
             column_name: "post_id".to_owned(),
@@ -4339,8 +4088,6 @@ mod tests {
 
     #[test]
     fn build_table_populates_check_constraints() {
-        // A fetched CHECK row is preserved as a named CheckConstraint whose
-        // expression is stripped to the inner predicate the emitter re-wraps.
         let columns = vec![ColumnRow {
             table_name: "products".to_owned(),
             column_name: "price".to_owned(),
@@ -4407,9 +4154,7 @@ mod tests {
 
     #[test]
     fn strip_check_wrapper_drops_trailing_suffixes() {
-        // `pg_get_constraintdef` can append `NOT VALID` / `NO INHERIT` after the
-        // predicate; the suffix must be dropped so the emitter's `CHECK ({expr})`
-        // re-wrap stays valid — never left inside the parens.
+        // The emitter re-wraps in `CHECK (...)`, so a suffix left inside would be invalid.
         assert_eq!(
             strip_check_wrapper("CHECK ((price >= 0)) NOT VALID"),
             "(price >= 0)"

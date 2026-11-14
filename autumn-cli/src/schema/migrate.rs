@@ -64,23 +64,16 @@ fn migrate_at(project_root: &Path, profile: Option<&str>) -> Result<(), String> 
     crate::generate::ensure_project_root(project_root)
         .map_err(|_| crate::generate::GenerateError::NotInProject.to_string())?;
 
-    // Resolve the write/primary database URL exactly as `autumn migrate` does,
-    // honoring an explicit `--profile`.
+    // Resolve the primary URL exactly as `autumn migrate` does.
     let url = crate::migrate::resolve_primary_url(profile);
 
-    // The migration backend is derived from the SAME profile-resolved context as
-    // the URL: when a URL is configured its scheme is authoritative, so
-    // `--profile <name>` selects the correct apply path / provider-lock even when
-    // the project's ambient/default backend differs from the selected profile's
-    // (using the ambient `detect_backend` here would pick the wrong apply impl).
-    // With no URL configured we fall back to the profile-aware project default.
-    // This backend also tags the refreshed snapshot below. With `profile == None`
-    // the resolution is byte-identical to the previous ambient detection.
+    // Derive the backend from the same profile-resolved URL, whose scheme is authoritative, so
+    // `--profile` picks the right apply path and provider-lock even when the project's default
+    // backend differs. With no URL, fall back to the profile-aware project default.
     let backend = super::backend_for_url(project_root, profile, url.as_deref());
 
-    // PROVIDER-LOCK: if a snapshot exists, its dialect tag must match the
-    // resolved backend before we apply anything cross-dialect. A missing
-    // snapshot is not fatal here (the DB may be pre-snapshot), but we note it.
+    // Provider lock: an existing snapshot's dialect must match the backend. A missing snapshot is
+    // not fatal (the DB may predate snapshots).
     let snapshot_path = project_root.join(SNAPSHOT_DEFAULT_PATH);
     if !enforce_provider_lock(&snapshot_path, backend)? {
         eprintln!(
@@ -90,18 +83,15 @@ fn migrate_at(project_root: &Path, profile: Option<&str>) -> Result<(), String> 
         );
     }
 
-    // Require the URL now that the provider-lock has been checked.
+    // Checked after the provider lock so a dialect mismatch is reported first.
     let url = url.ok_or_else(|| {
         "no database URL configured — set AUTUMN_DATABASE__URL or DATABASE_URL, or add a \
          [database] primary_url to autumn.toml"
             .to_string()
     })?;
 
-    // The `migrations/` path is handled in three distinct cases: an absent path
-    // or a readable-but-empty directory is a clean success (no DB call); an
-    // unreadable path or a regular file is an ERROR — never silently skipped, so
-    // a deployment can never boot against an outdated schema by treating an
-    // unreadable directory as "nothing to apply".
+    // An unreadable `migrations/` is an error, never "nothing to apply": skipping it would let a
+    // deployment boot against an outdated schema.
     let migrations_dir = project_root.join("migrations");
     match classify_migrations_dir(&migrations_dir) {
         MigrationsDir::Absent | MigrationsDir::Empty => {
@@ -117,11 +107,9 @@ fn migrate_at(project_root: &Path, profile: Option<&str>) -> Result<(), String> 
         MigrationsDir::HasMigrations => {}
     }
 
-    // Apply. The destructive-change guards already ran at diff time; migration
-    // files apply verbatim (`-- autumn-safety:` lines are inert SQL comments). The
-    // snapshot baseline already advanced at `schema diff --write-migration` time,
-    // so nothing is re-snapshotted here.
-    // The same table-lock policy as `autumn migrate` (#3057).
+    // Destructive-change guards ran at diff time and the snapshot advanced at
+    // `schema diff --write-migration`, so files apply verbatim and nothing is re-snapshotted.
+    // Same table-lock policy as `autumn migrate` (#3057).
     let lock_policy = crate::migrate::resolve_migration_lock_policy(profile);
     let result = apply_pending(backend, &url, &migrations_dir, lock_policy)?;
     report_applied(&result);
@@ -257,8 +245,7 @@ fn classify_migrations_dir(migrations_dir: &Path) -> MigrationsDir {
     match migrations_dir.try_exists() {
         Ok(false) => return MigrationsDir::Absent,
         Ok(true) => {}
-        // The path's very existence is unknowable (e.g. a permission error on a
-        // parent) — treat as unreadable, NOT as an absent/empty no-op.
+        // E.g. a permission error on a parent: unreadable, not absent.
         Err(e) => return MigrationsDir::Unreadable(e),
     }
 
@@ -266,8 +253,7 @@ fn classify_migrations_dir(migrations_dir: &Path) -> MigrationsDir {
         Ok(entries) => entries,
         Err(e) => return MigrationsDir::Unreadable(e),
     };
-    // Fully consume the iterator, surfacing any per-entry read error rather than
-    // filtering it out (which would misclassify a mid-scan failure as `Empty`).
+    // Surface a per-entry error rather than filtering it out, which would report `Empty`.
     match entries.collect::<Result<Vec<_>, _>>() {
         Ok(entries) => {
             if entries.iter().any(|e| e.path().is_dir()) {
@@ -296,14 +282,12 @@ fn report_applied(result: &MigrationResult) {
 #[allow(clippy::needless_raw_string_hashes)]
 mod tests {
     use super::*;
-    // The provider-lock tests write a snapshot; the production apply path no
-    // longer touches the snapshot writer, so import it in the test scope only.
+    // Only the provider-lock tests write a snapshot.
     use super::super::snapshot::{SchemaSnapshot, write_snapshot};
 
     #[test]
     fn classify_absent_path_is_a_no_op() {
         let root = tempfile::tempdir().expect("tempdir");
-        // Missing entirely → Absent (clean no-op, no DB call).
         assert!(matches!(
             classify_migrations_dir(&root.path().join("migrations")),
             MigrationsDir::Absent
@@ -314,13 +298,12 @@ mod tests {
     fn classify_readable_empty_dir_is_a_no_op() {
         let root = tempfile::tempdir().expect("tempdir");
         let migrations = root.path().join("migrations");
-        // Present but empty → Empty (clean no-op).
         std::fs::create_dir_all(&migrations).expect("mkdir");
         assert!(matches!(
             classify_migrations_dir(&migrations),
             MigrationsDir::Empty
         ));
-        // A stray file (not a migration dir) still classifies as Empty.
+        // A stray file is not a migration.
         std::fs::write(migrations.join("README.md"), "x").expect("write");
         assert!(matches!(
             classify_migrations_dir(&migrations),
@@ -333,7 +316,6 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let migrations = root.path().join("migrations");
         std::fs::create_dir_all(migrations.join("20260101000000_init")).expect("mkdir");
-        // A real migration subdir → HasMigrations (proceed to apply).
         assert!(matches!(
             classify_migrations_dir(&migrations),
             MigrationsDir::HasMigrations
@@ -343,8 +325,7 @@ mod tests {
     #[test]
     fn classify_regular_file_is_unreadable_error() {
         let root = tempfile::tempdir().expect("tempdir");
-        // `migrations` is a regular FILE, not a directory: `read_dir` errors, so
-        // it must classify as Unreadable (an error) — never as an empty no-op.
+        // A regular file makes `read_dir` fail: an error, not an empty no-op.
         let migrations = root.path().join("migrations");
         std::fs::write(&migrations, "not a directory").expect("write");
         assert!(matches!(
@@ -353,21 +334,14 @@ mod tests {
         ));
     }
 
-    // NOTE: `classify_migrations_dir` also propagates a per-entry iteration `Err`
-    // (a `read_dir` iterator yielding `Err` mid-scan) as `Unreadable`, not `Empty`.
-    // Forcing a per-entry iteration error deterministically and portably is not
-    // feasible (it needs an I/O failure to occur *after* the directory opened
-    // cleanly, which no portable filesystem primitive can inject), so it is not
-    // unit-tested here; the `collect::<Result<Vec<_>, _>>()` in the implementation
-    // is the guard, and the open-error path below covers `read_dir` failing.
+    // A mid-scan per-entry `Err` also classifies as `Unreadable`, but no portable primitive can
+    // inject an I/O failure after the directory opens, so only the open-error path is tested.
     #[cfg(unix)]
     #[test]
     fn classify_unreadable_dir_is_an_error() {
         use std::os::unix::fs::PermissionsExt;
 
-        // A directory with no read permission cannot be listed. Skipped when the
-        // process can bypass the permission bits (e.g. running as root, where
-        // chmod 000 is ignored), which would otherwise make this non-deterministic.
+        // Skipped when the process bypasses permission bits (root ignores chmod 000).
         let root = tempfile::tempdir().expect("tempdir");
         let migrations = root.path().join("migrations");
         std::fs::create_dir_all(&migrations).expect("mkdir");
@@ -376,12 +350,11 @@ mod tests {
 
         let can_still_read = std::fs::read_dir(&migrations).is_ok();
         let classified = classify_migrations_dir(&migrations);
-        // Restore permissions so the tempdir can be cleaned up.
+        // Restore so the tempdir can be cleaned up.
         std::fs::set_permissions(&migrations, std::fs::Permissions::from_mode(0o755))
             .expect("restore chmod");
 
         if can_still_read {
-            // Permission bits were bypassed (root) — the guard cannot be exercised.
             return;
         }
         assert!(matches!(classified, MigrationsDir::Unreadable(_)));
@@ -391,7 +364,6 @@ mod tests {
     fn provider_lock_missing_snapshot_is_not_an_error() {
         let root = tempfile::tempdir().expect("tempdir");
         let path = root.path().join(SNAPSHOT_DEFAULT_PATH);
-        // No snapshot → Ok(false): caller notes it, does not fail.
         assert_eq!(enforce_provider_lock(&path, Backend::Postgres), Ok(false));
     }
 
@@ -401,7 +373,6 @@ mod tests {
         let path = root.path().join(SNAPSHOT_DEFAULT_PATH);
         let snap = SchemaSnapshot::new(Backend::Sqlite, Vec::new());
         write_snapshot(&path, &snap).expect("write snapshot");
-        // Detected Postgres vs a Sqlite-tagged snapshot → refused.
         let err = enforce_provider_lock(&path, Backend::Postgres).unwrap_err();
         assert!(
             err.to_lowercase().contains("backend") && err.contains("does not match"),
@@ -421,7 +392,7 @@ mod tests {
     #[test]
     fn migrate_outside_project_is_friendly_error() {
         let root = tempfile::tempdir().expect("tempdir");
-        // No Cargo.toml → not a project.
+        // No Cargo.toml.
         let err = migrate_at(root.path(), None).unwrap_err();
         assert!(
             err.contains("Autumn project"),
@@ -432,8 +403,8 @@ mod tests {
     #[cfg(not(feature = "sqlite"))]
     #[test]
     fn sqlite_apply_seam_names_the_feature_in_default_build() {
-        // In the default (Postgres-only) build the SQLite apply path is the seam:
-        // it must point the user at `--features sqlite` and never touch the DB.
+        // Without the `sqlite` feature the SQLite apply path names the feature and never touches
+        // the DB.
         let root = tempfile::tempdir().expect("tempdir");
         let err = apply_pending_sqlite("sqlite:///tmp/x.db", &root.path().join("migrations"))
             .unwrap_err();

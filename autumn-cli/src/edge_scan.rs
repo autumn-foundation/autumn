@@ -776,9 +776,8 @@ fn resolve_edge_scan_impl(
     requested_features: &[&str],
     capsule_bin_file: Option<&Path>,
 ) -> EdgeScan {
-    // A missing or unparseable Cargo.toml yields no default features, which is
-    // the safe direction: every `#[cfg(feature = "...")]` then stays
-    // unresolved, and the function it gates stays in the scan.
+    // A missing Cargo.toml enables no features, so every `#[cfg(feature = "...")]` resolves
+    // false; an unparseable one still enables `requested_features`.
     let manifest = std::fs::read_to_string(project_root.join("Cargo.toml")).ok();
     let table = manifest
         .as_deref()
@@ -800,19 +799,9 @@ fn resolve_edge_scan_impl(
     let mut claimed: BTreeSet<PathBuf> = BTreeSet::new();
     let mut capsule_claimed: BTreeSet<PathBuf> = BTreeSet::new();
 
-    // A custom `[lib] path` (e.g. `src/app.rs`, `src/custom/app.rs`, or even
-    // `lib/app.rs` outside `src/` entirely) IS this crate's library root, the
-    // same way a custom `[[bin]] path` is its own bin's root (see
-    // `resolve_edge_scan_with_extra_file`'s doc). Always scanned via
-    // `scan_bin_crate_tree`, regardless of whether it lives inside `src/`:
-    // an in-`src/` root's own out-of-line submodules (`mod routes;` next to
-    // it) still need real Rust module-path resolution relative to the
-    // root's own directory, not `crate_context_from_file`'s
-    // directory-mirrors-module heuristic, which would invent an extra
-    // leading segment from the root's enclosing directory name (`custom`)
-    // that is not a real module at all (Codex review on #2739, round 22,
-    // P2 — round 21's own fix only corrected the root file's own identity,
-    // never its submodules').
+    // A custom `[lib] path` is the library root, inside `src/` or not. It is scanned as a crate
+    // tree so its out-of-line submodules resolve against the root's own directory;
+    // `crate_context_from_file` would add the enclosing directory (`custom`) as a module.
     if let Some(lib_path) = &custom_lib_path {
         let lib_file = project_root.join(lib_path);
         if lib_file.is_file() {
@@ -828,21 +817,10 @@ fn resolve_edge_scan_impl(
         }
     }
 
-    // The capsule's own tree — always scanned this way, even for one of
-    // Cargo's own two `src/bin/` auto-discovery shapes
-    // (`src/bin/<name>.rs`, `src/bin/<name>/main.rs`): those get the right
-    // ROOT identity from `crate_context_from_file`'s own `src/bin/`
-    // handling, but that heuristic cannot tell a real second flat bin file
-    // apart from an out-of-line submodule the first one pulls in via `mod
-    // routes;` from the very same `src/bin/` directory — both look
-    // identical on disk. With `autobins = false` and no separate `[[bin]]`
-    // entry for it, such a file is not a crate root at all, yet the
-    // ordinary walk credited it with a phantom `bin:routes` identity
-    // regardless, so a valid `edge_routes![crate::routes::show]` could never
-    // match it (Codex review on #2739, round 22, P2 — round 21's file-shape
-    // guard only ever bypassed this for a NON-conventional root, never
-    // fixing this conventional-root case since the ordinary walk was
-    // assumed sufficient for it).
+    // The capsule's tree is always scanned this way, even for the conventional
+    // `src/bin/<name>.rs` and `src/bin/<name>/main.rs` roots: `crate_context_from_file` cannot
+    // tell a second flat bin file from a submodule the root loads with `mod routes;` from the
+    // same `src/bin/` directory, so the ordinary walk would misidentify that submodule.
     let mut capsule_aliased: BTreeSet<PathBuf> = BTreeSet::new();
     if let Some(file) = capsule_bin_file {
         let (touched, aliased) = scan_bin_crate_tree(
@@ -860,21 +838,9 @@ fn resolve_edge_scan_impl(
     let mut files = Vec::new();
     collect_rs_files(&project_root.join("src"), &mut files);
 
-    // A custom `[lib] path` REPLACES the conventional `src/lib.rs` as this
-    // crate's library root — Cargo compiles only the custom file, never
-    // `src/lib.rs`, even when the latter still exists on disk with its own
-    // `#[edge]` handlers — verified directly via a real build: a
-    // `compile_error!` placed in an unrelated `src/lib.rs` does not fail a
-    // build whose `[lib] path` points elsewhere. Left in `files`, that dead
-    // `src/lib.rs` was scanned by the ordinary walk below as if it were an
-    // active source, so a stale handler in it could be reported as a real,
-    // uncompiled-but-unregistered route and wrongly fail preflight. Excluded
-    // here whenever the manifest's custom path resolves (after normalizing
-    // any `.`/`..` components the same way `scan_bin_crate_tree`'s own root
-    // does) to a different file than the conventional one — the ordinary
-    // `claimed` exclusion below only ever covers files the custom tree's own
-    // `mod` declarations actually reach, never this now-inactive file
-    // itself (Codex review on #2739, round 46, P2).
+    // A custom `[lib] path` replaces `src/lib.rs`: Cargo never compiles the conventional file,
+    // so a stale handler left in it must not be scanned as a live route. `claimed` covers only
+    // files the custom tree's `mod` declarations reach, never this one.
     if let Some(lib_path) = &custom_lib_path {
         let conventional_lib_file = project_root.join("src/lib.rs");
         let custom_lib_file = lexically_normalize_path(&project_root.join(lib_path));
@@ -886,20 +852,12 @@ fn resolve_edge_scan_impl(
     // across platforms and filesystem orderings.
     files.sort();
 
-    // A `#[path = "..."]` override on an out-of-line `mod name;` redirects
-    // which FILE backs the module without changing the module's own real
-    // name/path — real Rust still resolves `name::show` (never a name
-    // derived from the file), so this scan's ordinary directory-walk guess
-    // (`crate_context_from_file`, which assumes file path mirrors module
-    // path) needs to be corrected for exactly these files (Codex review on
-    // #2739, round 31, P2).
+    // `#[path = "..."] mod name;` changes which file backs `name`, not the module's path, so
+    // the ordinary walk's file-mirrors-module guess is wrong for those files.
     let path_overrides =
         path_attribute_module_paths(project_root, table.as_ref(), &default_features);
 
-    // Read first, scan second, so the filesystem half and the pure half stay
-    // separable: `scan_sources` is the same entry point the unit tests drive
-    // with inline sources. An unreadable file is skipped, like the sibling
-    // scanners do.
+    // An unreadable file is skipped, as the sibling scanners do.
     let sources: Vec<(String, String)> = ordinary_walk_sources(
         &files,
         project_root,
@@ -921,18 +879,9 @@ fn resolve_edge_scan_impl(
     );
     scan.files_scanned += sources.len();
 
-    // A `#[path]` override can redirect to a file OUTSIDE `src/` entirely
-    // (`#[path = "../routes.rs"] mod handlers;` in `src/lib.rs` compiles a
-    // file the ordinary, `src/`-only walk above never reaches) — verified
-    // directly via a real build. `path_attribute_module_paths` already
-    // recorded its identity; scan it, and any of ITS OWN further out-of-line
-    // children (`pub mod child;` inside that same outside file resolves
-    // beside it, never back under `src/`), by reusing `scan_bin_crate_tree`'s
-    // BFS with the already-recorded identity as its starting module path,
-    // once per recorded identity the same way an in-`src/` override target
-    // already is above, since it was never in `files`/`sources` to begin
-    // with (Codex review on #2739, round 40, P1; descendant traversal added
-    // round 45, P1).
+    // A `#[path]` override can point outside `src/` (`#[path = "../routes.rs"] mod handlers;`),
+    // where the walk above never reaches. Scan each such target, and its own out-of-line
+    // children, under the identities `path_attribute_module_paths` recorded for it.
     for (target_rel, identities) in &path_overrides {
         if sources_rel.contains(target_rel.as_str()) {
             continue;
@@ -1137,46 +1086,17 @@ const WASM32_WASIP1_CFG_VALUES: &[(&str, &str)] = &[
 
 impl syn::parse::Parse for TargetCfgPredicate {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        // `syn::Ident`'s own `Parse` impl rejects `true`/`false` outright
-        // (verified directly: `syn::parse_str::<syn::Ident>("false")` fails
-        // with "expected identifier, found keyword `false`", even though
-        // `proc_macro2::Ident` itself has no such restriction) — using
-        // `IdentExt::parse_any` here, which has no keyword restriction,
-        // is what makes the `true`/`false` branch below reachable at all
-        // (Codex review on #2739, round 22, P1 — the P1 fix below was
-        // otherwise dead code).
+        // `parse_any`, because `syn::Ident`'s `Parse` rejects the keywords `true` and `false`.
         let ident: syn::Ident = syn::ext::IdentExt::parse_any(input)?;
-        // `true`/`false` tokenize as a plain `Ident` (verified directly),
-        // and are Cargo's own stable constant cfg predicates — a real
-        // `[target.'cfg(true)'.dependencies]` table applies unconditionally,
-        // to every target including wasm32-wasip1, verified directly against
-        // a real `cargo rustc --target wasm32-wasip1` build. Without this,
-        // the leading-identifier parse above still succeeds (it is a valid
-        // ident), but neither the known-key nor the `not`/`all`/`any`/
-        // `windows`/`unix` branches below recognize it, so it fell through
-        // to the final parse error — "unresolvable", which for this
-        // evaluator means "does not match" — wrongly excluding a dependency
-        // Cargo actually includes (Codex review on #2739, round 22, P1).
+        // `cfg(true)`/`cfg(false)` are Cargo's constant predicates: a `cfg(true)` target table
+        // applies to every target, wasm32-wasip1 included.
         if ident == "true" || ident == "false" {
             return Ok(Self::Leaf(ident == "true"));
         }
-        // Cargo's own dependency-table cfg evaluator does not support
-        // `target_feature` at all — verified directly: a real
-        // `[target.'cfg(target_feature = "crt-static")'.dependencies]` table
-        // pulls in nothing for `--target wasm32-wasip1` even though rustc
-        // reports `crt-static` as one of that target's own default features,
-        // and the `not(...)` form of the SAME predicate pulls the dependency
-        // in unconditionally instead — i.e. Cargo treats every
-        // `target_feature = "..."` leaf here as simply false, never true, no
-        // matter the value or the real target. This scan previously checked
-        // `target_feature` leaves against `WASM32_WASIP1_CFG_VALUES` the
-        // same way as every other key (matching rustc's real reported
-        // values, which IS how `#[cfg(target_feature = "...")]` resolves at
-        // the source-code level, just not in a `[target.'cfg(...)']` table),
-        // so `cfg(not(target_feature = "crt-static"))` was scanned as
-        // excluded when Cargo actually includes it — omitting an active
-        // `#[cfg(feature = "...")]`-gated handler that a real release build
-        // still compiles (Codex review on #2739, round 23, P1).
+        // Cargo's target-table evaluator treats every `target_feature = "..."` leaf as false,
+        // whatever the value: `cfg(target_feature = "crt-static")` pulls in nothing for
+        // wasm32-wasip1 and its `not(...)` always applies, although rustc reports `crt-static` for
+        // that target. Source-level `#[cfg(target_feature = "...")]` does resolve it.
         if ident == "target_feature" && input.peek(syn::Token![=]) {
             input.parse::<syn::Token![=]>()?;
             let _lit: syn::LitStr = input.parse()?;
@@ -1193,17 +1113,9 @@ impl syn::parse::Parse for TargetCfgPredicate {
                     .any(|(key, known_value)| ident == key && value == *known_value);
                 return Ok(Self::Leaf(matches));
             }
-            // The BARE form of a known key (`target_has_atomic`, no
-            // `= "value"`) is a different predicate from any of its valued
-            // forms, and always false: verified directly (a native,
-            // non-wasm target has real `target_has_atomic = "..."` values,
-            // yet `#[cfg(target_has_atomic)]` bare still does not compile
-            // in) — rustc never emits these keys as a bare flag, only as
-            // one or more `key = "value"` pairs. Previously this fell
-            // through to a parse error, which failed the WHOLE enclosing
-            // predicate (not just this leaf) — `not(target_has_atomic)`,
-            // always true, evaluated as unresolvable-so-false instead
-            // (Codex review on #2739, round 19, P1).
+            // A known key with no `= "value"` (bare `target_has_atomic`) is always false:
+            // rustc emits these keys only as `key = "value"` pairs. A leaf, not a parse error,
+            // keeps an enclosing `not(...)` resolvable.
             return Ok(Self::Leaf(false));
         }
         if ident == "not" {
@@ -1224,66 +1136,26 @@ impl syn::parse::Parse for TargetCfgPredicate {
                 Self::Any(parts)
             });
         }
-        // `windows` and `unix` are rustc's own built-in aliases for
-        // `target_family = "windows"` / `target_family = "unix"` — bare
-        // flags, no `= "value"` to parse. wasm32-wasip1's only
-        // `target_family` value is "wasm" (a target has exactly one), so
-        // both are always false for it; leaving them unresolvable (as
-        // opposed to explicitly false) made `not(windows)` — true for this
-        // target, and a real pattern for an optional dependency meant for
-        // every non-Windows target including the capsule — evaluate as
-        // "does not match" instead, filtering out a route Cargo genuinely
-        // compiles (Codex review on #2739, round 18, P1).
+        // `windows` and `unix` are aliases for `target_family = "..."`. wasm32-wasip1's only family
+        // is "wasm", so both are false and `not(windows)` resolves true.
         if ident == "windows" || ident == "unix" {
             return Ok(Self::Leaf(false));
         }
-        // Round 20 concluded `debug_assertions` should stay unresolvable
-        // (hence false) here, reasoning that the capsule always builds
-        // `--release` and `-C debug-assertions=off` makes the flag genuinely
-        // absent for it. That conflated two DIFFERENT Cargo pipelines:
-        // real, direct verification (`cargo build --release --target
-        // wasm32-wasip1 -v` on a manifest with `[target.'cfg(debug_assertions)'.dependencies]`)
-        // shows the dependency compiled into the release build regardless —
-        // Cargo resolves a target-table predicate's `debug_assertions`
-        // using its fixed per-target cfg database (always true, the same
-        // one `rustc --print cfg`'s default dev-profile-shaped query
-        // reports), not the profile's actual `-C debug-assertions=off`/`on`
-        // flag, which only affects how the CRATE'S OWN source-level
-        // `#[cfg(debug_assertions)]` compiles, a later and separate step.
-        // Treating it as unresolvable-so-false was therefore the wrong
-        // direction after all: it filtered out a dependency (and the
-        // `#[cfg(feature = "...")]` route behind it) that a real release
-        // build genuinely includes (Codex review on #2739, round 25, P1).
+        // Cargo resolves a target table's `debug_assertions` from its fixed per-target cfg set,
+        // where it is always true, not from the profile: a
+        // `[target.'cfg(debug_assertions)'.dependencies]` entry is built into a `--release` capsule
+        // too. The profile's `-C debug-assertions` affects only the crate's own source-level cfg.
         if ident == "debug_assertions" {
             return Ok(Self::Leaf(true));
         }
-        // Any OTHER bare identifier (no `= "value"` following) is a custom
-        // or unrecognized cfg flag this scan has no value table for — and
-        // verified directly (`cargo tree --target wasm32-wasip1` on
-        // `[target.'cfg(not(my_custom_flag))'.dependencies]` includes the
-        // dependency; the same manifest with the bare, un-negated
-        // `cfg(my_custom_flag)` does not) that Cargo treats an unknown bare
-        // flag as simply absent — false, not "unparseable." Previously this
-        // fell through to a parse `Err`, which fails the WHOLE enclosing
-        // predicate (not just this leaf): `not(my_custom_flag)`, really
-        // true since Cargo doesn't know an absent flag as anything but
-        // false, evaluated as unresolvable-so-false instead — the same
-        // class of mistake round 19 already fixed for
-        // `target_has_atomic`'s bare form specifically, now generalized to
-        // every OTHER unknown bare flag too (Codex review on #2739, round
-        // 26, P1).
+        // Cargo treats any other bare flag as absent, so it is false rather than a parse error:
+        // `cfg(not(my_custom_flag))` includes the dependency, `cfg(my_custom_flag)` does not. An
+        // error would fail the whole enclosing predicate.
         if !input.peek(syn::Token![=]) {
             return Ok(Self::Leaf(false));
         }
-        // A `key = "value"` pair this scan does not recognize the key for
-        // gets the identical treatment, for the identical reason — verified
-        // directly the same way: `[target.'cfg(not(my_key = "x"))'.…]`
-        // includes the dependency for wasm32-wasip1, the bare, un-negated
-        // form of the same predicate does not. Consume the `= "value"` so
-        // the rest of the enclosing `not`/`all`/`any` still parses, rather
-        // than erroring here and failing the WHOLE predicate the same
-        // wrong way the bare-flag case did before round 26 (Codex review
-        // on #2739, round 28, P1).
+        // An unknown `key = "value"` is false for the same reason. Consume the value so the
+        // enclosing `not`/`all`/`any` still parses.
         input.parse::<syn::Token![=]>()?;
         input.parse::<syn::LitStr>()?;
         Ok(Self::Leaf(false))
@@ -1754,18 +1626,8 @@ pub fn enabled_features_with_defaults(
         .cloned();
     let package_name = table.as_ref().and_then(package_name_from_manifest);
 
-    // `default` is a real feature name — but, verified directly against
-    // `cargo rustc -- --print cfg`, only when the manifest actually declares
-    // `[features] default = [...]`, even an empty list. With no `[features]`
-    // table at all, or one that simply never mentions `default`, Cargo never
-    // emits `feature = "default"`, and a `#[cfg(feature = "default")]` route
-    // is compiled out of an ordinary default build exactly like any other
-    // never-enabled feature name — so seeding it unconditionally made THAT
-    // route look included when Cargo really excludes it, a phantom route
-    // that can spuriously demand a capsule/WASI target
-    // (Codex review on #2739, round 12, P2, correcting round 9's overly
-    // broad fix: `default` is only ever "always on" for a build that already
-    // declares it, never as a feature this scan may assume into existence).
+    // `default` is a feature only when the manifest declares `[features] default = [...]`,
+    // even an empty list. Otherwise Cargo never sets `feature = "default"`.
     let default_members = features_table
         .as_ref()
         .and_then(|features| features.get("default"))
@@ -1798,28 +1660,11 @@ pub fn enabled_features_with_defaults(
             continue;
         }
         if let Some((pkg, _feat)) = name.split_once('/') {
-            // The strong form (`pkg/feat`, no `?`) also activates `pkg`
-            // itself — but only when `pkg` is declared `optional = true`:
-            // Cargo auto-generates a same-named local feature for an
-            // optional dependency, never for a normal one, so a normal
-            // dependency sharing its name with an unrelated local feature
-            // must not have that feature turned on here (Codex review on
-            // #2739, round 7, P2). The weak form (`pkg?/feat`) makes no
-            // such promise either way. That IMPLICIT feature is itself
-            // suppressed crate-wide once any feature entry spells `dep:pkg`
-            // — see `implicit_feature_is_suppressed` (round 13, P2) — but
-            // an EXPLICIT `[features] pkg = [...]` entry is a different
-            // feature that merely happens to share the dependency's name,
-            // and `pkg/feat` still turns it on regardless of `dep:pkg`
-            // appearing elsewhere: verified directly (`cargo rustc --
-            // --print cfg`) that `feature="pkg"` is active for
-            // `default = ["pkg/feat"]` + an explicit `pkg = []` + an
-            // unrelated `other = ["dep:pkg"]`, and is NOT active with the
-            // explicit `pkg = []` entry removed (the round-13 case this
-            // suppression still correctly covers). Checking for an
-            // explicit entry first, before consulting the suppression at
-            // all, is what distinguishes the two (Codex review on #2739,
-            // round 34, P1).
+            // The strong form (`pkg/feat`, no `?`) also enables `pkg` when `pkg` is an optional
+            // dependency, through Cargo's implicit same-named feature; a normal dependency has
+            // none. `dep:pkg` anywhere suppresses that implicit feature, but an explicit
+            // `[features] pkg` entry is a different feature that `pkg/feat` still enables, so it
+            // is checked first.
             if !pkg.ends_with('?')
                 && table
                     .as_ref()
@@ -2014,20 +1859,9 @@ fn crate_context_from_file(file: &str, table: Option<&toml::Table>) -> (String, 
         return (String::new(), Vec::new());
     }
     if let Some(rest) = without_src.strip_prefix("bin/") {
-        // `<name>` alone (the flat `src/bin/<name>.rs` form) has nothing left
-        // once the bin target's own name is dropped — it IS that crate's root
-        // — but only when Cargo actually compiles `<name>` as one: with
-        // `[package] autobins = false` and no `[[bin]]` entry naming it,
-        // Cargo gives it no crate of its own at all, so this file (whether
-        // it's that bin's own root or one of ITS OWN further submodules,
-        // like `src/bin/<name>/routes.rs`) is only ever reachable, if at
-        // all, as an ordinary submodule of whichever crate's own `mod`
-        // declaration actually references it — this per-file directory walk
-        // cannot trace that (the same class of limit as a
-        // `#[path]`-redirected file's own further submodules, round 31).
-        // Falling through to the ordinary library-relative treatment below
-        // at least avoids asserting the definitely-wrong `bin:<name>`
-        // identity for it (Codex review on #2739, round 35, P2).
+        // With `autobins = false` and no `[[bin]]` for `<name>`, the file is no crate root. Some
+        // other target's `mod` may load it, which this per-file walk cannot trace, so it falls
+        // through to the library-relative identity rather than a wrong `bin:<name>`.
         let (name, bin_relative) = rest.split_once('/').unwrap_or((rest, ""));
         if src_bin_target_is_real(table, name) {
             return (
@@ -2037,20 +1871,9 @@ fn crate_context_from_file(file: &str, table: Option<&toml::Table>) -> (String, 
         }
     }
     if without_src == "main" {
-        // The package's own implicit default binary, `src/main.rs` — a
-        // separate crate from the library's `src/lib.rs`, even though both
-        // map to the same empty module path. No real `[[bin]]` can be named
-        // literally "main" while a default `src/main.rs` binary also
-        // exists (Cargo rejects the name collision), so reusing the
-        // `"bin:<name>"` convention here is always unambiguous — but only
-        // when `src/main.rs` is actually compiled as a target at all:
-        // verified directly that `[package] autobins = false` suppresses
-        // Cargo's automatic discovery of `src/main.rs` too, not just
-        // `src/bin/*.rs` (a real build with `autobins = false` and no
-        // `[[bin]]` entry produces no binary whatsoever, `src/main.rs`
-        // included) — the identical mistake `src_bin_target_is_real` exists
-        // to avoid, applied to the one bin name Cargo reserves for this
-        // file specifically (Codex review on #2739, round 35, P2).
+        // `src/main.rs` is the implicit default binary, a crate separate from `src/lib.rs`. Cargo
+        // rejects a `[[bin]]` named "main" beside it, so `bin:main` is unambiguous. `autobins =
+        // false` turns off `src/main.rs` discovery too.
         if src_main_is_real(table) {
             return ("bin:main".to_owned(), Vec::new());
         }
@@ -2214,18 +2037,9 @@ fn scan_items(
             }
             syn::Item::Mod(item_mod) => {
                 if let Some((_, inner)) = &item_mod.content {
-                    // The module's own `#[cfg(...)]` gates everything inside
-                    // it, same as a function's — `edge_fn` only ever sees a
-                    // function's OWN attributes, so a handler under a
-                    // definitely-disabled `#[cfg(feature = "premium")] mod
-                    // routes { ... }` stayed in the scan even though real
-                    // Rust strips the whole module out. That is the
-                    // dangerous direction this cfg support exists to avoid:
-                    // not a missed route, but a phantom one that makes an
-                    // otherwise-default build look like it needs the edge
-                    // capsule / WASI target (Codex review on #2739,
-                    // round 11, P2 — extended to a `cfg_attr`-injected
-                    // exclusion in round 33, P2).
+                    // The module's own `#[cfg(...)]` gates everything inside it, and `edge_fn`
+                    // sees only a function's own attributes. A handler under a disabled module
+                    // would otherwise be a phantom route that makes the build require the capsule.
                     let cfg_excludes = item_mod
                         .attrs
                         .iter()
@@ -2352,12 +2166,8 @@ fn path_attribute_module_paths(
     collect_rs_files(&project_root.join("src"), &mut files);
     files.sort();
     let mut overrides: BTreeMap<String, Vec<(String, Vec<String>)>> = BTreeMap::new();
-    // Every CONVENTIONAL (non-`#[path]`) out-of-line `mod name;`
-    // declaration found across the whole `src/` tree, alongside the real
-    // file it resolves to. Collected in this same pass so a SECOND pass
-    // (below) can find, for each `#[path]`-aliased target already in
-    // `overrides`, any ALSO-conventionally-reachable identity for that
-    // same physical file.
+    // Conventional (non-`#[path]`) `mod name;` declarations and the files they resolve to, used
+    // below to add a conventional identity to a file that is also `#[path]`-aliased.
     let mut conventional_declarations: Vec<(String, String, Vec<String>)> = Vec::new();
     for declaring_file in &files {
         let Ok(src) = std::fs::read_to_string(declaring_file) else {
@@ -2378,35 +2188,11 @@ fn path_attribute_module_paths(
             module_path.extend(inline.iter().cloned());
             module_path.push(name.clone());
             if let Some(path_value) = path_value {
-                // A `#[path]` override nested inside an INLINE module resolves
-                // relative to the DIRECTORY THAT MODULE PATH IMPLIES, not the
-                // declaring file's own physical directory — verified directly:
-                // `mod api { #[path = "actual.rs"] mod handlers; }` in
-                // `src/lib.rs` compiles by finding `src/api/actual.rs`, never
-                // `src/actual.rs`. Same rule an ordinary out-of-line `mod
-                // handlers;` (no `#[path]`) already follows via
-                // `resolve_out_of_line_module_file`'s own `dir_segments`
-                // accumulation — this mirrors it by folding each inline
-                // segment in as a subdirectory before joining the attribute's
-                // own value (Codex review on #2739, round 33, P2).
-                //
-                // Fresh evidence beyond that top-level case is the SAME
-                // shape declared inside an already out-of-line file: for
-                // `src/foo.rs` (reached via a plain, non-aliased `mod foo;`)
-                // containing `mod inline { #[path = "actual.rs"] mod
-                // handlers; }`, rustc loads `src/foo/inline/actual.rs` —
-                // verified directly via a real build — never `src/inline/
-                // actual.rs`. The declaring FILE's own physical parent
-                // directory (`src/`, from `declaring_file.parent()`) is the
-                // wrong base here: `foo.rs`'s own conventional child
-                // directory is `src/foo/`, exactly what `base_module_path`
-                // (the file's own logical module path, already used by the
-                // conventional branch below via `resolve_out_of_line_module_file`)
-                // already names, so folding `base_module_path` then `inline`
-                // onto `src/` directly — instead of the declaring file's own
-                // parent directory — gives the right base for both the
-                // top-level and the nested case alike (Codex review on
-                // #2739, round 46, P2).
+                // A `#[path]` inside an inline module resolves against the directory the module
+                // path implies, not the declaring file's directory:
+                // `mod api { #[path = "actual.rs"] mod handlers; }` loads `src/api/actual.rs`
+                // from `src/lib.rs` and `src/foo/api/actual.rs` from `src/foo.rs`. So the base
+                // is `src/` plus `base_module_path` plus `inline`.
                 let inline_dir = base_module_path
                     .iter()
                     .chain(inline.iter())
@@ -2439,16 +2225,9 @@ fn path_attribute_module_paths(
             }
         }
     }
-    // A file reached both conventionally (`mod handlers;`) AND via a
-    // `#[path]` alias (`#[path = "handlers.rs"] mod alias;`) is compiled
-    // under BOTH names by real Rust — verified directly via a real build.
-    // `overrides` above only ever recorded the alias side; add the
-    // conventional identity too, but ONLY for a target that already has an
-    // alias recorded (this loop, not the one above, is where a plain,
-    // never-aliased file's identity is decided — leaving it to the
-    // ordinary walk's own `crate_context_from_file` guess, unchanged, so
-    // this fix cannot touch the vast majority of files that have nothing
-    // to do with `#[path]` at all) (Codex review on #2739, round 45, P2).
+    // A file reached both conventionally (`mod handlers;`) and through a `#[path]` alias is
+    // compiled under both names. Add the conventional identity, but only to files that already
+    // have an alias; every other file keeps the ordinary walk's identity.
     for (target_rel, crate_root, module_path) in conventional_declarations {
         if let Some(identities) = overrides.get_mut(&target_rel)
             && !identities.contains(&(crate_root.clone(), module_path.clone()))
@@ -2652,58 +2431,23 @@ fn scan_bin_crate_tree(
     default_features: &BTreeSet<String>,
     scan: &mut EdgeScan,
 ) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf>) {
-    // A manifest-specified path (a custom `[lib] path` or `[[bin]] path`)
-    // can spell its root with a `..` component (`"src/sub/../app.rs"`).
-    // Unlike a `.` component, Rust's own `Path`/`PathBuf` equality does NOT
-    // lexically collapse `..` (verified directly: `Path::new("a/../b") !=
-    // Path::new("b")`, and a `BTreeSet<PathBuf>` built from the former does
-    // not recognize the latter as already present) — the caller's `claimed`
-    // filter, built from this function's returned paths, would then fail to
-    // recognize the ordinary `src/` walk's own (naturally `..`-free, since
-    // it comes from a real directory listing) path to the very same file,
-    // scanning it a second time under a different, wrong crate identity
-    // (Codex review on #2739, round 22, P2). Normalizing here, once, up
-    // front is enough: every other path this function builds is joined
-    // from `root_dir` using plain segment names, which can never
-    // (re-)introduce a `..` of their own.
+    // A manifest path may contain `..` (`"src/sub/../app.rs"`), which `PathBuf` equality does not
+    // collapse, so the caller's `claimed` set would miss the walk's `..`-free path to the same
+    // file and scan it again under a wrong identity. Child paths below are either joined from
+    // plain module names or normalized themselves.
     let root_file = lexically_normalize_path(root_file);
     let root_file = root_file.as_path();
     let root_dir = root_file.parent().unwrap_or_else(|| Path::new(""));
-    // Cycle safety here mirrors rustc's own: verified directly via a real
-    // build, `#[path = "b.rs"] mod b;` in `a.rs` and `#[path = "a.rs"] mod
-    // a;` in `b.rs` fails with rustc's own "circular modules: a.rs -> b.rs
-    // -> a.rs" — a file including ITSELF, directly or transitively, never
-    // compiles at all. Two INDEPENDENT aliases of the same file (`#[path =
-    // "shared.rs"] mod a;` and `#[path = "shared.rs"] mod b;`, neither a
-    // descendant of the other) are not a cycle and both compile fine, each
-    // with its own copy of that file's own further submodules — verified
-    // directly too: `shared.rs`'s own `#[path = "child.rs"] mod child;`
-    // compiles as BOTH `a::child` and `b::child`. So cycle detection here
-    // tracks each branch's own ANCESTOR chain (the files from the tree
-    // root down to here) rather than a single global "seen" set: a file
-    // is skipped only when it already appears in ITS OWN branch's
-    // ancestors, never merely because a DIFFERENT branch reached it first.
-    // A single global `visited`-by-file set (round 42's fix, before this)
-    // stopped a shared file's OWN children from ever being (re-)discovered
-    // under its second alias, since the first alias to reach it "used up"
-    // the file for children-discovery purposes entirely (Codex review on
-    // #2739, round 43, P2).
+    // Cycle detection follows each branch's own ancestor chain, not a global visited set: rustc
+    // rejects a file that includes itself ("circular modules"), but two independent aliases of
+    // one file (`#[path = "shared.rs"] mod a;` and `mod b;`) both compile, each with its own
+    // copy of that file's submodules (`a::child` and `b::child`).
     let mut scanned_identities: BTreeSet<(PathBuf, Vec<String>)> = BTreeSet::new();
     let mut aliased: BTreeSet<PathBuf> = BTreeSet::new();
-    // A queued file's `resolution_base` is the directory ITS OWN top-level
-    // (non-inline) out-of-line `mod name;` declarations resolve relative
-    // to — kept as its own PHYSICAL value, separate from `module_path`
-    // (the LOGICAL name accumulator used for registration matching),
-    // because the two diverge the moment any ancestor was `#[path]`d. A
-    // `#[path]`-loaded file resets this to its OWN directory for its own
-    // children (verified directly via a real build: `#[path =
-    // "shared.rs"] mod handlers;` where `shared.rs` has a plain `mod
-    // child;` resolves `child` at `child.rs` beside `shared.rs`, not
-    // `handlers/child.rs` — the logical name `handlers` plays no part).
-    // Reconstructing this from `root_dir` + the full accumulated
-    // `module_path` (this function's previous approach) stayed correct
-    // only up to the first `#[path]` in the chain (Codex review on #2739,
-    // round 43, P1).
+    // `resolution_base` is the directory a queued file's own top-level `mod name;` declarations
+    // resolve against. It is tracked apart from `module_path` because the two diverge after a
+    // `#[path]`: a `#[path]`-loaded file resolves its children beside itself (`child.rs` next
+    // to `shared.rs`), whatever its logical module name.
     let mut queue: std::collections::VecDeque<(PathBuf, Vec<String>, Vec<PathBuf>, PathBuf)> =
         std::collections::VecDeque::new();
     queue.push_back((
@@ -2743,25 +2487,10 @@ fn scan_bin_crate_tree(
         {
             let mut dir_segments = module_path.clone();
             dir_segments.extend(nested.iter().cloned());
-            // A `#[path = "..."]` override resolves relative to the
-            // directory the DECLARING FILE ITSELF physically lives in, not
-            // the directory its full logical module path (`dir_segments`)
-            // would imply — Rust's real rule, verified directly: a custom
-            // capsule root's `mod wiring;` reaching `cmd/wiring.rs`, which
-            // itself has `#[path = "actual.rs"] mod handlers;`, resolves
-            // that override to `cmd/actual.rs` (beside `wiring.rs`), never
-            // `cmd/wiring/actual.rs`. Only `nested` — segments from an
-            // INLINE `mod { ... }` block inside THIS SAME file — still
-            // folds in as a subdirectory relative to `declaring_dir`, the
-            // same rule the ordinary `src/` walk's own
-            // `path_attribute_module_paths` already applies (Codex review on
-            // #2739, round 35, P1, fixed incompletely; round 39, P2, this
-            // fold's own base was still wrong for a non-root declaring
-            // file). The CONVENTIONAL branch resolves relative to
-            // `resolution_base` (this file's own physical anchor,
-            // threaded through the queue) folded with `nested`, never
-            // `root_dir` + the full logical `dir_segments` — those only
-            // coincide up to the first `#[path]` in the chain.
+            // A `#[path]` resolves against the declaring file's own directory plus any inline
+            // `nested` segments, not the directory its logical module path implies: in
+            // `cmd/wiring.rs`, `#[path = "actual.rs"] mod handlers;` loads `cmd/actual.rs`. A
+            // conventional `mod name;` resolves against `resolution_base` plus `nested`.
             let (resolved, child_resolution_base, is_aliased) = path_value.map_or_else(
                 || {
                     let base = nested
@@ -2806,12 +2535,9 @@ fn scan_bin_crate_tree(
         }
     }
 
-    // Every physical file this BFS reached under any identity — the caller
-    // uses this to keep the ordinary `src/` walk from ALSO scanning (and
-    // double-crediting) the same file under its own conventional identity.
-    // `aliased` is the subset reached via an explicit `#[path]` — see
-    // `resolve_edge_scan_impl`'s own use of both for why that subset needs
-    // separate tracking (Codex review on #2739, round 44, P2).
+    // Every file reached under any identity, so the caller's `src/` walk skips it. `aliased` is
+    // the subset reached through an explicit `#[path]`, which the walk still scans for its
+    // separate library identity (see `ordinary_walk_sources`).
     let touched: BTreeSet<PathBuf> = scanned_identities
         .into_iter()
         .map(|(file, _)| file)
@@ -2994,10 +2720,8 @@ fn edge_fn(
     if !names.iter().any(|n| n == "edge") {
         return None;
     }
-    // Several `#[cfg(...)]` attributes on one function are ANDed, like real
-    // Rust: any one of them resolving to definitely false excludes it — and
-    // so does a `cfg(...)` injected by an ACTIVE `cfg_attr(...)` (Codex
-    // review on #2739, round 29, P2).
+    // Several `#[cfg(...)]` are ANDed, as in Rust: one definitely false excludes the function,
+    // as does a `cfg(...)` injected by an active `cfg_attr(...)`.
     let cfg_excludes = attrs
         .iter()
         .any(|attr| attr_cfg_excludes(attr, default_features));
@@ -3263,28 +2987,17 @@ enum CfgPredicate {
 
 impl syn::parse::Parse for CfgPredicate {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        // `syn::Ident`'s own `Parse` impl rejects `true`/`false` outright
-        // (verified directly — see `TargetCfgPredicate::parse`'s own doc
-        // for the exact experiment); `IdentExt::parse_any` has no such
-        // keyword restriction, which is what makes the `true`/`false`
-        // branch below reachable at all (Codex review on #2739, round 22,
-        // P2 — otherwise dead code).
+        // `syn::Ident`'s own `Parse` rejects `true`/`false`; `parse_any` accepts them, which makes
+        // the `true`/`false` branch below reachable.
         let ident: syn::Ident = syn::ext::IdentExt::parse_any(input)?;
         if ident == "feature" {
             input.parse::<syn::Token![=]>()?;
             let lit: syn::LitStr = input.parse()?;
             return Ok(Self::Feature(lit.value()));
         }
-        // `true`/`false` tokenize as a plain `Ident`, not a `syn::Lit`
-        // (verified directly), and are Cargo's own stable constant cfg
-        // predicates — `#[cfg(false)]` unconditionally excludes an item,
-        // `#[cfg(true)]` unconditionally keeps it, same as an empty `cfg()`
-        // wrapped in `all`/`any`. Without recognizing them, a `#[cfg(false)]`
-        // `#[edge]` handler (or a `#[cfg(false)]`-disabled wiring function's
-        // `edge_routes![...]`) fell through to "unresolvable", which this
-        // scan's own safe-direction default treats as "not excluded" —
-        // wrongly crediting a route/registration the real build compiles out
-        // entirely (Codex review on #2739, round 22, P2).
+        // `true`/`false` are Rust's stable constant cfg predicates: `#[cfg(false)]` always excludes
+        // the item. Treating them as unresolvable would fall back to "not excluded" and credit a
+        // route the build compiles out.
         if ident == "true" || ident == "false" {
             return Ok(Self::Bool(ident == "true"));
         }
@@ -3425,13 +3138,8 @@ fn collect_registrations(
             && let Some(TokenTree::Group(group)) = trees.get(index + 2)
             && group.delimiter() == Delimiter::Brace
         {
-            // `#[cfg(feature = "premium")] pub mod wiring { ... }` has
-            // `pub` (or `pub(crate)`/`pub(super)`/`pub(in path)`) between
-            // the attribute and `mod`, same as `fn`/`impl` tolerate via
-            // `skip_back_over_fn_modifiers` — checking immediately before
-            // `mod` alone would see the visibility modifier instead of the
-            // attribute and wrongly conclude nothing excludes it (Codex
-            // review on #2739, round 27, P2).
+            // A visibility (`pub`, `pub(crate)`, ...) can sit between the attribute and `mod`, so
+            // look for the attribute before it.
             let attr_index = skip_back_over_fn_modifiers(&trees, index);
             if !preceding_cfg_excludes(&trees, attr_index, default_features) {
                 module_path.push(name.to_string());
@@ -3451,15 +3159,9 @@ fn collect_registrations(
             && ident == "impl"
             && let Some(body_index) = simple_impl_body_index(&trees, index)
         {
-            // `#[cfg(feature = "premium")] impl Routes { fn wire() {
-            // edge_routes![show]; } }` — the catch-all `Group` branch below
-            // only recognizes a cfg attribute with NOTHING between it and
-            // the group, but an `impl` block's brace is always preceded by
-            // at least the implementing type (`Routes`, or `Trait for
-            // Type`), so that branch never saw the attribute and
-            // unconditionally recursed into a block real Rust strips
-            // entirely with the feature off, crediting an inactive handler
-            // as registered (Codex review on #2739, round 23, P2).
+            // The catch-all `Group` branch below only sees a cfg attribute directly before the
+            // group, but an `impl` body is always preceded by its type, so check the attribute
+            // here.
             let attr_index = skip_back_over_fn_modifiers(&trees, index);
             if let TokenTree::Group(body) = &trees[body_index]
                 && !preceding_cfg_excludes(&trees, attr_index, default_features)
@@ -3479,15 +3181,9 @@ fn collect_registrations(
             && ident == "fn"
             && let Some(body_index) = simple_fn_body_index(&trees, index)
         {
-            // `#[cfg(feature = "premium")] fn wire() { edge_routes![show]; }`
-            // — a cfg'd-out FUNCTION, not just a cfg'd-out `mod { ... }`,
-            // must also exclude its own `edge_routes![]` calls. Only the
-            // simple `fn name(...) [-> plain return type] { ... }` shape is
-            // resolved (no generics, no `where` clause, no nested groups in
-            // the return type) — anything else falls through to the
-            // ordinary walk below rather than risk mis-scanning a LATER,
-            // unrelated item's body as this function's own (Codex review on
-            // #2739, round 16, P2).
+            // A cfg'd-out function excludes its own `edge_routes![]` calls. Only shapes
+            // `simple_fn_body_index` can bound are resolved; anything else falls through to the
+            // ordinary walk rather than risk taking a later item's body as this function's.
             let attr_index = skip_back_over_fn_modifiers(&trees, index);
             if let TokenTree::Group(body) = &trees[body_index]
                 && !preceding_cfg_excludes(&trees, attr_index, default_features)
@@ -3505,12 +3201,9 @@ fn collect_registrations(
         }
         match &trees[index] {
             TokenTree::Group(group) => {
-                // A group with NOTHING between it and a preceding
-                // `#[cfg(...)]` — a bare cfg'd block statement, e.g. — must
-                // honor that cfg the same way the `mod { ... }` case above
-                // does. This does not reach a function's body (there is
-                // always a name and a parenthesized parameter list in
-                // between, handled by the `fn` special case above instead).
+                // A group directly after a `#[cfg(...)]` (a cfg'd block statement) honors that cfg.
+                // A function body never lands here: its name and parameter list sit in between, so
+                // the `fn` case above handles it.
                 if !preceding_cfg_excludes(&trees, index, default_features) {
                     collect_registrations(
                         &group.stream(),
@@ -3529,16 +3222,8 @@ fn collect_registrations(
                 if bang
                     && let Some(TokenTree::Group(group)) = trees.get(index + 2)
                     && group.delimiter() != Delimiter::None
-                    // `#[cfg(feature = "premium")] edge_routes![show];` — a
-                    // cfg attribute directly on the macro invocation
-                    // STATEMENT itself (legal Rust: statement attributes
-                    // apply to a macro-invocation statement same as any
-                    // other), not just on an enclosing `mod {}`/`fn {}` —
-                    // neither of which this specific token position sits
-                    // inside. Without this check, a disabled route's
-                    // registration was still credited, letting a build
-                    // with zero real handlers pass preflight (Codex review
-                    // on #2739, round 22, P2).
+                    // A cfg attribute directly on the `edge_routes![...]` statement excludes it
+                    // too.
                     && !preceding_cfg_excludes(&trees, index, default_features)
                 {
                     scan.registrations += 1;
@@ -3715,69 +3400,22 @@ fn skip_cfg_excluded_statement(
     if matches!(trees.get(attrs_end), Some(TokenTree::Group(_))) {
         return Some(attrs_end + 1);
     }
-    // `if`/`match`/`while`/`loop`/`for`/`unsafe`, a bare anonymous `const {
-    // ... }` block, and a labeled block/loop, used as a whole statement,
-    // never end in `;` — real Rust's grammar simply doesn't require or
-    // allow one there (a trailing `;` after `if cond { .. }` would be an
-    // EXTRA, separate empty statement, not part of it). The generic
-    // scan-to-`;` fallback below cannot see that: given `#[cfg(...)] if
-    // cond { edge_routes![premium] }` immediately followed by an ACTIVE
-    // `edge_routes![show];`, it would keep consuming tokens right through
-    // the excluded `if`'s own closing brace and into the next, unrelated,
-    // still-real statement, stopping only at ITS semicolon — dropping a
-    // genuine registration the real build still compiles in (Codex review
-    // on #2739, round 25, P2, extended in round 28, P2 for `const { ... }`
-    // and labeled blocks/loops, the identical ambiguity in a different
-    // spelling).
+    // Block-like statements (`if`/`match`/`while`/`loop`/`for`/`unsafe`, `const { .. }`, labeled
+    // blocks) end without `;`. Scanning to the next `;` would run past the excluded block into the
+    // next, still-active statement and drop its registration.
     if let Some(block_end) = statement_without_semicolon_end(trees, attrs_end) {
         return Some(block_end + 1);
     }
-    // A cfg'd-out MATCH ARM (`#[cfg(feature = "premium")] true =>
-    // edge_routes![premium],`) is comma-delimited, not semicolon-delimited
-    // — this same function also bounds a match's arms, since
-    // `collect_registrations` recurses into a `match { ... }`'s body brace
-    // the same generic way it does any other block. A top-level (ungrouped)
-    // comma essentially never appears within one ordinary function-body
-    // STATEMENT's own tokens — every legitimate comma-bearing construct
-    // (tuples, call arguments, array/struct literals) is always inside its
-    // own Paren/Bracket/Brace group, invisible at this flat level — so it
-    // unambiguously marks a match arm's own boundary here. Without this,
-    // the scan found no `;` anywhere in the arms' flattened token stream
-    // and consumed every remaining arm, including a later, unrelated,
-    // still-active one's own `edge_routes![show]` (Codex review on #2739,
-    // round 42, P2).
-    // An ungrouped generic-argument comma (`Result<(), ()>`) is ALSO a
-    // top-level, ungrouped comma — angle brackets are plain `<`/`>` Punct
-    // tokens, not their own Group delimiter — so the comma-as-terminator
-    // rule above needs the same angle-bracket-depth tracking every other
-    // generics-aware scan in this file already uses, or it stops
-    // mid-type-argument-list instead of at the statement's real end,
-    // recursing into the excluded statement's own initializer block
-    // (verified directly via a real build: `#[cfg(false)] let _:
-    // Result<(), ()> = { show(); Ok(()) };` drops the whole statement,
-    // `show()` included). Depth is clamped at 0 rather than erroring out on
-    // a negative count (as the narrower generics-only scans elsewhere do):
-    // unlike those, this fallback also runs over ordinary comparison/shift
-    // `>`/`<` operators with no matching partner, and clamping keeps a
-    // later, real top-level comma or semicolon recognized regardless (Codex
-    // review on #2739, round 44, P2).
+    // Otherwise scan to the statement's end. A cfg'd-out match arm (`#[cfg(..)] true =>
+    // edge_routes![x],`) ends at a top-level comma: `collect_registrations` recurses into a match
+    // body like any block. Other comma-bearing constructs (tuples, call arguments, literals) sit
+    // inside their own group and are invisible at this level.
     //
-    // A semicolon always terminates regardless of depth (round 45, P2), but
-    // a comma cannot: a genuine top-level comma DOES legitimately occur
-    // inside a real, still-open generic/turbofish argument list
-    // (`Result<(), ()>`, `foo::<A, B>()`), so comma-termination still needs
-    // real depth tracking. Simply counting every `<`/`>` (as semicolons can
-    // get away with) reintroduces the same eternal-lock bug in the other
-    // direction: an unmatched comparison `<` with no partner anywhere ahead
-    // (`#[cfg(false)] 0 => 1 < 2,`) would raise depth forever and swallow
-    // every following, still-active match arm's own comma — verified
-    // directly via a real build that this arm shape compiles fine and a
-    // following arm remains real Rust. So `<`/`>` only affect `angle_depth`
-    // here when `matched_angle_bracket_positions` confirms they belong to an
-    // actual matched pair somewhere in the remaining tokens; a stray,
-    // never-closed `<` (or a stray `>` with no opener, e.g. from `1 > 2`) is
-    // just an ordinary pass-through token instead (Codex review on #2739,
-    // round 46, P2).
+    // Generic arguments (`Result<(), ()>`, `foo::<A, B>()`) also put commas at this level, since
+    // `<`/`>` are plain puncts, so a comma ends the statement only at angle depth 0. Only the
+    // `<`/`>` that `matched_angle_bracket_positions` pairs up change the depth: an unpaired
+    // comparison (`#[cfg(false)] 0 => 1 < 2,`) would otherwise raise it for good and swallow every
+    // following arm.
     let matched_angles = matched_angle_bracket_positions(trees, attrs_end);
     let mut i = attrs_end;
     let mut angle_depth: u32 = 0;
@@ -3796,20 +3434,8 @@ fn skip_cfg_excluded_statement(
                 angle_depth = angle_depth.saturating_sub(1);
                 i += 1;
             }
-            // A `;` always ends the statement regardless of `angle_depth`,
-            // unlike a comma: a genuine top-level `;` can never actually
-            // occur while a real generic argument list is still open at
-            // this flat scan depth (the only place a semicolon legitimately
-            // appears inside `<...>` is a const-generic block expression,
-            // e.g. `Foo<{ let x = 1; x }>`, and that block's own braces make
-            // it one opaque Group token here, never reached). Without this,
-            // a comparison/shift operator with no matching partner (`1 <
-            // 2`) left `angle_depth` permanently elevated, so the scan ran
-            // straight past the statement's real semicolon into a
-            // following, unrelated, still-active statement — verified
-            // directly via a real build that `#[cfg(false)] let disabled =
-            // 1 < 2;` compiles fine, dropping the whole statement (Codex
-            // review on #2739, round 45, P2).
+            // A `;` ends the statement at any depth: inside `<...>` it can only appear in a
+            // const-generic block (`Foo<{ let x = 1; x }>`), which is one opaque group here.
             TokenTree::Punct(p) if p.as_char() == ';' => {
                 i += 1;
                 break;
@@ -3910,65 +3536,27 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
     loop {
         match trees.get(i) {
             Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace => {
-                // A bare block expression (`if { true } { .. }`, real, valid
-                // Rust — verified directly via a real build, warned as
-                // "unnecessary braces" but not rejected) can stand as the
-                // WHOLE condition or scrutinee itself, with no other tokens
-                // before it: unlike a struct literal, a bare, un-parenthesized
-                // `{ ... }` with no preceding path is not what Rust's
-                // "no struct literal in condition" restriction forbids, so
-                // it's read as the condition/scrutinee expression, and the
-                // real body's own brace follows directly after it. This is
-                // only possible for `if`/`while`/`match`, which always need a
-                // condition/scrutinee before their body; `unsafe`/`loop` have
-                // no condition at all (their body brace comes immediately
-                // after the keyword, so `i == start` there IS the real
-                // body), and `for`'s pattern never starts with a bare `{`.
-                // Without this, the whole cfg'd-out `if { true } {
-                // edge_routes![show]; }` had its condition block mistaken for
-                // the real body, leaving the actual body an ordinary,
-                // unexcluded sibling group that credited `show` (Codex review
-                // on #2739, round 45, P2).
+                // A bare block can be the whole condition (`if { true } { .. }` compiles, with a
+                // warning), so a brace right after `if`/`while`/`match` is the condition and the
+                // body follows. `loop`/`unsafe` have no condition, and a `for` pattern never starts
+                // with `{`.
                 if i == start
                     && matches!(trees.get(start.wrapping_sub(1)), Some(TokenTree::Ident(id)) if matches!(id.to_string().as_str(), "if" | "while" | "match"))
                 {
                     i += 1;
                     continue;
                 }
-                // A brace-delimited macro invocation in the condition or
-                // scrutinee (`match value!{} { .. }`) has its OWN brace
-                // group — the macro's argument list — directly preceded by
-                // `!`, immediately before the real body's own brace arrives
-                // right after it. Verified directly via a real build: the
-                // whole cfg'd-out `match value!{} { _ => show() }` drops
-                // `show()` along with it, so crediting a registration
-                // inside what this loop mistook for the body (the macro's
-                // empty `{}` argument group) is wrong the same way a
-                // struct-pattern brace is. A body's own opening brace is
-                // never itself preceded by `!` in valid Rust grammar (that
-                // only ever precedes a macro invocation's own delimiter),
-                // so this check cannot misfire on a genuine body (Codex
-                // review on #2739, round 44, P2).
+                // A brace-delimited macro call in the condition (`match value!{} { .. }`) has its
+                // argument group preceded by `!`. A body brace never is.
                 if i > 0
                     && matches!(trees.get(i - 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
                 {
                     i += 1;
                     continue;
                 }
-                // An async block used in the condition or scrutinee (`if
-                // async { predicate().await }.await { .. }`, real, valid
-                // Rust — verified directly via a real build) has its OWN
-                // brace group immediately preceded by the `async` keyword
-                // itself, before the real body's own brace arrives later.
-                // A genuine body's own opening brace is never itself
-                // preceded by the literal keyword `async` in valid Rust
-                // grammar (there is no "async if"), so this cannot misfire
-                // on a real body either (Codex review on #2739, round 45,
-                // P2). An `async move { .. }` block (also real, valid Rust,
-                // verified directly) inserts `move` between the keyword and
-                // the brace, so the brace is preceded by `move`, not `async`
-                // directly, and needs the identical two-token lookback
-                // (Codex review on #2739, round 46, P2).
+                // An `async { .. }` or `async move { .. }` block in the condition (`if async {
+                // p().await }.await { .. }`). A body brace is never preceded by `async` or `async
+                // move`.
                 if i > 0 && matches!(trees.get(i - 1), Some(TokenTree::Ident(id)) if id == "async")
                 {
                     i += 1;
@@ -3981,61 +3569,27 @@ fn control_flow_block_end(trees: &[TokenTree], mut i: usize) -> Option<usize> {
                     i += 1;
                     continue;
                 }
-                // An inline `const { .. }` block used in the condition or
-                // scrutinee (`if const { true } { .. }`, real, valid Rust —
-                // verified directly via a real build) has its OWN brace
-                // group immediately preceded by the `const` keyword itself,
-                // the identical shape as the `async`/`async move` cases
-                // above. A genuine body's own opening brace is never itself
-                // preceded by the literal keyword `const` in valid Rust
-                // grammar (there is no "const if"), so this cannot misfire
-                // on a real body either (Codex review on #2739, round 46,
-                // P2).
+                // Same for an inline `const { .. }` block in the condition (`if const { true } { ..
+                // }`).
                 if i > 0 && matches!(trees.get(i - 1), Some(TokenTree::Ident(id)) if id == "const")
                 {
                     i += 1;
                     continue;
                 }
-                // An `unsafe { .. }` block used in the condition or
-                // scrutinee (`if unsafe { true } { .. }`, real, valid Rust —
-                // verified directly via a real build, warned as
-                // "unnecessary `unsafe` block" but not rejected) is the
-                // identical shape as `async`/`const` above, EXCEPT `unsafe`
-                // is also one of the SIX keywords this very function is
-                // itself dispatched for (`statement_without_semicolon_end`
-                // calls `control_flow_block_end(trees, i + 1)` right after
-                // an `unsafe` used as the WHOLE outer statement, which has
-                // no condition at all — its body brace comes immediately
-                // after the keyword). So `i == start` there IS the real
-                // body (the same reasoning the bare-block-condition check
-                // above already excludes `unsafe` for), and only `i >
-                // start` — meaning some condition tokens of an ENCLOSING
-                // if/while/match already came before this nested `unsafe`
-                // block — signals the condition-block shape (Codex review
-                // on #2739, round 47, P2).
+                // Same for `unsafe { .. }` in the condition (`if unsafe { true } { .. }`). This
+                // function is also called right after an outer `unsafe` statement, whose body brace
+                // comes first, so only `i > start` (an enclosing `if`/`while`/`match` condition
+                // came before) marks a condition block.
                 if i > start
                     && matches!(trees.get(i - 1), Some(TokenTree::Ident(id)) if id == "unsafe")
                 {
                     i += 1;
                     continue;
                 }
-                // A struct/tuple-struct PATTERN can itself contain a brace
-                // group — `if let Foo { x } = value() { .. }`, `for Foo { x }
-                // in items { .. }` — so the first Brace reached is not always
-                // the real body: unlike an expression, Rust's grammar does
-                // not forbid an unparenthesized struct pattern in an
-                // if-let/while-let condition or a for-loop's pattern
-                // (verified directly via a real build). A pattern's own
-                // brace is always followed by more of the condition — `=`
-                // for an if-let/while-let, `in` for a for-loop, or `|` before
-                // another alternative in an unparenthesized or-pattern
-                // (`if let Foo { x } | Bar { x } = value() { .. }`, also
-                // verified directly) — before the real body brace arrives;
-                // the real body brace, reached in statement position, is
-                // never followed by any of the three (only possibly `else`,
-                // handled below), so this alone tells them apart without
-                // parsing the pattern itself (Codex review on #2739, round
-                // 38, P2, extended in round 39, P2 for or-patterns).
+                // A struct pattern has its own braces and may be unparenthesized (`if let Foo { x }
+                // = v() { .. }`, `for Foo { x } in items { .. }`, `if let Foo { x } | Bar { x } =
+                // v() { .. }`). A pattern's brace is followed by `=`, `in` or `|`; the body brace
+                // never is.
                 if matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '=')
                     || matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if id == "in")
                     || matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '|')
@@ -4126,19 +3680,9 @@ fn statement_without_semicolon_end(trees: &[TokenTree], i: usize) -> Option<usiz
             }
             _ => {}
         }
-        // ANY OTHER macro invocation statement using brace delimiters
-        // (`configure! { ... }`, not `configure!(...)`/`configure![...]`) —
-        // possibly through a qualified path (`crate::configure! { ... }`,
-        // `self::configure! { ... }`, `a::b::configure! { ... }`, all
-        // verified directly via a real build) — needs no trailing `;`
-        // either. `macro_rules` above is the same rule with an extra
-        // "macro's own name" token between `!` and the group; an ordinary
-        // invocation has nothing between them, so this checks the group
-        // directly, after skipping over any leading `path::segments::`.
-        // None of the specific keywords above can themselves be followed by
-        // `!` or `::` (they're reserved words, never valid path segments),
-        // so there's no overlap with them (Codex review on #2739, round 36,
-        // P2, extended in round 41, P2 for a qualified macro path).
+        // Any other brace-delimited macro statement (`configure! { .. }`, also through a path such
+        // as `crate::configure! { .. }`) takes no `;`. The keywords above are reserved, so they
+        // never start a macro path.
         let path_end = simple_path_end(trees, i);
         if matches!(trees.get(path_end), Some(TokenTree::Punct(p)) if p.as_char() == '!')
             && matches!(trees.get(path_end + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace)
@@ -4169,18 +3713,9 @@ fn statement_without_semicolon_end(trees: &[TokenTree], i: usize) -> Option<usiz
     {
         return braced_or_semicolon_item_end(trees, item_start + 1);
     }
-    // A foreign block (`extern "C" { ... }`, bare `extern { ... }`) or an
-    // async block used as a statement (`async { ... }`) leaves nothing but
-    // the brace itself after its modifiers are skipped — neither has a
-    // name/keyword of its own between the modifiers and the body, unlike
-    // `struct`/`macro_rules`/etc above, and neither ever takes a trailing
-    // `;` — verified directly via a real build. `unsafe extern "C" { ... }`
-    // already reaches its brace correctly through the `"unsafe"` branch at
-    // the top of this function (control_flow_block_end's opaque scan skips
-    // over `extern "ABI"` on the way there); this is specifically for the
-    // modifier combinations that don't start with one of that branch's
-    // keywords, so `extern "C" { ... }` alone still needs it (Codex review
-    // on #2739, round 38, P2).
+    // A foreign block (`extern "C" { .. }`, `extern { .. }`) or an `async { .. }` statement is just
+    // a brace after its modifiers and takes no `;`. `unsafe extern "C" { .. }` already ends through
+    // the `unsafe` branch above.
     if matches!(trees.get(item_start), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace)
     {
         return Some(item_start);
@@ -4263,10 +3798,7 @@ fn simple_impl_body_index(trees: &[TokenTree], impl_index: usize) -> Option<usiz
             Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace && angle_depth == 0 => {
                 return Some(i);
             }
-            // `->` (e.g. a `Fn() -> U` bound in a `where` clause or generic
-            // param) is two Punct tokens, `-` then `>` — see the identical
-            // fix and rationale in `simple_fn_body_index` (Codex review on
-            // #2739, round 25, P2).
+            // `->` is two puncts; its `>` is not a closing angle bracket.
             Some(TokenTree::Punct(p))
                 if p.as_char() == '-'
                     && matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>') =>
@@ -4317,22 +3849,13 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
         return None;
     }
     i += 1;
-    // Tolerate a simple generic-parameter list (`<T, U: Bound<V>>`) between
-    // the function name and its parameter list, the same way the return-type
-    // case below tolerates a simple ungrouped token run (Codex review on
-    // #2739, round 21, P2).
+    // Tolerate a generic parameter list (`<T, U: Bound<V>>`) between the name and the parameters.
     if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '<') {
         let mut depth: i32 = 0;
         loop {
             match trees.get(i) {
-                // `->` (e.g. a `Fn() -> U` bound inside `<T: Fn() -> U>`) is
-                // two Punct tokens, `-` then `>` — the `>` half is not a
-                // closing angle bracket and must not decrement `depth`, or a
-                // legitimate generic bound ends this loop early and leaves
-                // the real closing `>` as an unexpected token the rest of
-                // this function cannot parse, returning `None` for a
-                // perfectly ordinary generic function (Codex review on
-                // #2739, round 25, P2).
+                // `->` (as in `<T: Fn() -> U>`) is two puncts. Its `>` must not close an angle
+                // bracket, or the loop ends early and a plain generic function returns `None`.
                 Some(TokenTree::Punct(p))
                     if p.as_char() == '-'
                         && matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>') =>
@@ -4373,20 +3896,8 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
     if matches!(trees.get(i), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace) {
         return Some(i);
     }
-    // A return type (`-> T`), a `where` clause (`where T: Trait`), or both in
-    // sequence (`-> T where T: Trait`) are all just a flat run of simple
-    // tokens up to the body's own brace group — genuine Rust grammar never
-    // puts a `{ ... }` group inside either shape (bounds and return types
-    // don't use brace groups), so the same tolerant loop the return-type
-    // case already used for a TRAILING `where` clause (it never
-    // distinguished the two, just consumed tokens until a brace) now starts
-    // from either keyword. Previously a function with a `where` clause but
-    // NO return type (`fn routes<T>() where T: Trait { ... }`) hit neither
-    // this branch's `->` check nor the body-brace check above, falling
-    // through to `None` — the unprotected old fallback then scanned the
-    // body of what could be a `#[cfg(...)]`-excluded function, crediting a
-    // registration that does not really exist (Codex review on #2739,
-    // round 22, P2).
+    // A return type (`-> T`), a `where` clause, or both are a token run that ends at the body's
+    // brace.
     let starts_return_type_or_where = matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '-')
         && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '>');
     let starts_where_only = matches!(trees.get(i), Some(TokenTree::Ident(id)) if id == "where");
@@ -4394,19 +3905,8 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
         if starts_return_type_or_where {
             i += 2;
         }
-        // A braced const-generic expression in the return type (stable Rust:
-        // `fn wire() -> R<{ 1 + 2 }>` compiles today) is itself a
-        // Brace-delimited Group nested inside `<...>` — indistinguishable
-        // from the function's own body by delimiter alone. Track angle-
-        // bracket depth (angle brackets are plain `<`/`>` Punct tokens, not
-        // their own Group delimiter) so only a Brace group seen OUTSIDE any
-        // `<...>` ends this loop; previously the first Brace group at any
-        // depth was taken as the body, which for this shape pointed at the
-        // const-generic expression instead — and since the caller then
-        // resumes scanning right after that wrong index, the function's
-        // real body (and its `#[cfg(...)]`-gated `edge_routes![]` call) was
-        // reached via the outer, cfg-blind fallback instead of being
-        // correctly skipped (Codex review on #2739, round 22, P2).
+        // A braced const-generic argument (`fn wire() -> R<{ 1 + 2 }>`) is a brace group inside
+        // `<...>`. Track angle depth so only a brace at depth 0 ends the loop.
         let mut angle_depth: i32 = 0;
         loop {
             match trees.get(i) {
@@ -4415,15 +3915,8 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
                 {
                     return Some(i);
                 }
-                // `->` (a plain function arrow, e.g. inside `impl Fn() ->
-                // T`) is two Punct tokens, `-` then `>` — the `>` half must
-                // not be mistaken for a closing angle bracket, or a
-                // legitimate return type nesting an arrow (any
-                // `Fn`/`FnMut`/`FnOnce` bound) trips the `angle_depth < 0`
-                // guard below and wrongly returns `None`, sending the
-                // caller's `#[cfg(...)]`-excluded function through the
-                // unprotected, cfg-blind fallback instead (Codex review on
-                // #2739, round 25, P2).
+                // `->` (as in `impl Fn() -> T`) is two puncts. Its `>` must not close an angle
+                // bracket, or the `angle_depth < 0` guard returns `None`.
                 Some(TokenTree::Punct(p))
                     if p.as_char() == '-'
                         && matches!(trees.get(i + 1), Some(TokenTree::Punct(p2)) if p2.as_char() == '>') =>
@@ -4441,42 +3934,13 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
                     }
                     i += 1;
                 }
-                // A top-level `;` ends a bodyless declaration (`fn
-                // disabled() -> ();`, legal in a trait) — verified directly
-                // via a real build. Previously this fell into the tolerant
-                // catch-all below, which accepted `;` as ordinary
-                // punctuation and kept scanning past it into a LATER,
-                // unrelated item's own brace (e.g. a trait's own closing
-                // brace, or the next method's body) and returned that as if
-                // it were `disabled`'s body — so the caller resumed scanning
-                // past the real end of the excluded declaration, running
-                // straight through a subsequent active method's own
-                // `edge_routes![]` call along with it (Codex review on
-                // #2739, round 39, P2).
-                // A top-level `;` ends a bodyless declaration (`fn
-                // disabled() -> ();`, legal in a trait) — verified directly
-                // via a real build. Previously this fell into the tolerant
-                // catch-all below, which accepted `;` as ordinary
-                // punctuation and kept scanning past it into a LATER,
-                // unrelated item's own brace (e.g. a trait's own closing
-                // brace, or the next method's body) and returned that as if
-                // it were `disabled`'s body — so the caller resumed scanning
-                // past the real end of the excluded declaration, running
-                // straight through a subsequent active method's own
-                // `edge_routes![]` call along with it (Codex review on
-                // #2739, round 39, P2).
+                // A top-level `;` ends a bodyless declaration (`fn disabled() -> ();` in a trait).
+                // Scanning past it would take a later item's brace as this function's body.
                 Some(TokenTree::Punct(p)) if p.as_char() == ';' && angle_depth == 0 => {
                     return None;
                 }
-                // A non-brace group, or a Brace group nested inside `<...>`,
-                // is legitimate return-type/where-clause syntax — `-> ()`,
-                // `-> Result<(), E>`, `-> [T; N]`, `-> R<{ 1 + 2 }>`, a
-                // parenthesized trait-bound group. Previously only bare
-                // `Ident`/`Punct`/`Literal` tokens were tolerated, so a
-                // grouped return type fell through to `None` and the
-                // unprotected old fallback then scanned the body of what
-                // could be a `#[cfg(...)]`-excluded function (Codex review
-                // on #2739, round 22, P2).
+                // A non-brace group, or a brace inside `<...>`, belongs to the return type or
+                // `where` clause: `-> ()`, `-> [T; N]`, `-> R<{ 1 + 2 }>`.
                 Some(
                     TokenTree::Ident(_)
                     | TokenTree::Punct(_)
@@ -4597,13 +4061,8 @@ fn cfg_attribute_group_is_false(
 /// reference like this reports as an extra false-positive "unregistered"
 /// warning instead.
 fn registration_candidates(entry: &str, module_path: &[String]) -> Vec<String> {
-    // A leading `::` (Rust's "anchor to a crate root" form, `::my_crate::show`)
-    // means the same thing as the unanchored `my_crate::show` — it only rules
-    // out a same-named local item shadowing the crate name. Left in place, it
-    // splits off as a phantom empty leading segment that matches neither the
-    // `crate` nor the crate-name branch below in `is_registered`, so every
-    // absolute-path registration missed its handler even though Cargo
-    // resolves it fine (Codex review on #2739, round 9, P2).
+    // A leading `::` (`::my_crate::show`) means the same as `my_crate::show`. Left in place it
+    // splits off an empty first segment that `is_registered` never matches.
     let entry = entry.strip_prefix("::").unwrap_or(entry);
     let segments: Vec<&str> = entry.split("::").collect();
     let (mut base, rest): (Vec<String>, &[&str]) = match segments.first().copied() {
@@ -4654,14 +4113,8 @@ fn registered_idents(stream: &TokenStream) -> Vec<String> {
 mod tests {
     use super::*;
 
-    // "src/lib.rs", not "src/main.rs": since round 15 gave the package's
-    // implicit `src/main.rs` binary its own distinct crate identity
-    // (`"bin:main"`, separate from the library's `""`), a fixture standing
-    // in for "the crate root" needs to be the library specifically — most
-    // callers only care about self-consistency (same file in, same file
-    // out) and would work with either, but the crate-name-qualified tests
-    // require a REAL library crate root to mean anything (Codex review on
-    // #2739, round 15, P2).
+    // "src/lib.rs", not "src/main.rs": the implicit `src/main.rs` binary has its own crate identity
+    // (`"bin:main"`), and the crate-name-qualified tests need the library crate root (`""`).
     fn scan_one(src: &str) -> EdgeScan {
         scan_sources(&[("src/lib.rs", src)])
     }
@@ -5055,7 +4508,7 @@ mod tests {
         assert_eq!(scan.files_scanned, 0);
     }
 
-    // --- Item 1: safe-direction #[cfg(...)] evaluation ---
+    // --- safe-direction #[cfg(...)] evaluation ---
 
     #[test]
     fn cfg_feature_gated_fn_excluded_when_feature_not_default() {
@@ -7524,7 +6977,7 @@ mod tests {
         assert_eq!(scan.names(), vec!["premium_only"]);
     }
 
-    // --- Item 2: qualified registration matching ---
+    // --- qualified registration matching ---
 
     #[test]
     fn qualified_registration_does_not_match_a_same_named_fn_in_another_module() {

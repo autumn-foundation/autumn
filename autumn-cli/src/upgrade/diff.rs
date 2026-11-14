@@ -20,9 +20,8 @@ pub fn render(original: &str, updated: &str) -> String {
     let after: Vec<&str> = updated.lines().collect();
 
     if before.len() != after.len() {
-        // Not reachable from an identifier rename, which cannot add or remove a
-        // line. Rendered rather than asserted away so a future rewrite kind
-        // that *does* change the shape still previews something honest.
+        // An identifier rename never changes the line count; a rewrite that does still gets a
+        // preview.
         let first = (0..before.len().min(after.len()))
             .find(|&index| before[index] != after[index])
             .unwrap_or_else(|| before.len().min(after.len()));
@@ -115,8 +114,7 @@ mod tests {
 
     #[test]
     fn strips_carriage_returns_from_displayed_lines() {
-        // The file keeps its CRLF; showing a stray `\r` in the terminal does not
-        // help anyone read the diff.
+        // The file keeps its CRLF; only the displayed lines drop the `\r`.
         let out = render("a\r\nb\r\n", "a\r\nB\r\n");
         assert_eq!(out, "@@ line 2 @@\n-b\n+B\n");
     }

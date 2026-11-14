@@ -1724,7 +1724,7 @@ mod tests {
         assert!(text.contains("checked"), "{text}");
     }
 
-    // ── Staleness: re-verification (AC 4) ───────────────────────────────
+    // ── Staleness: re-verification ──────────────────────────────────────
 
     #[test]
     fn a_listing_verified_on_this_release_is_fresh() {

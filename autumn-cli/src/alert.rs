@@ -45,8 +45,7 @@ pub fn run_test(channel_filter: Option<&str>) {
         );
     }
 
-    // Filter to a single channel when requested; a name that is not configured
-    // is an actionable error (issue #1630: unknown/unconfigured provider name).
+    // A channel name that is not configured is an error, not a silent no-op (#1630).
     if let Some(want) = channel_filter {
         let configured: Vec<&'static str> = channels.iter().map(|c| c.name()).collect();
         channels.retain(|c| c.name() == want);

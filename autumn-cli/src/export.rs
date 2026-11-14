@@ -27,7 +27,6 @@ pub fn run_inner(url: &str, output: &str) -> Result<(), String> {
     let tasks = fetch_endpoint(&client, base_url, "/actuator/tasks");
     let loggers = fetch_endpoint(&client, base_url, "/actuator/loggers");
 
-    // If any endpoint returns an error, fail the export
     for (name, val) in [
         ("health", &health),
         ("metrics", &metrics),
@@ -43,7 +42,6 @@ pub fn run_inner(url: &str, output: &str) -> Result<(), String> {
         }
     }
 
-    // Use std::time for a simple timestamp as chrono is not available
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -113,17 +111,9 @@ mod tests {
         let body = body.to_string();
 
         thread::spawn(move || {
-            // Count requests actually served, not accept() attempts: the
-            // original `for _ in 0..num_requests { if let Ok(..) =
-            // listener.accept() { .. } }` spent one of its num_requests
-            // "slots" on every accept() call, success or not, so a single
-            // transient accept() error (observed on windows-latest CI —
-            // loopback connections there are occasionally intercepted by
-            // Defender/firewall and reset before the OS hands them to
-            // accept()) silently starved the client of a response it was
-            // always going to get otherwise, until its own timeout expired.
-            // Retry on a transient accept()/read failure instead of
-            // treating it as one of the num_requests attempts used up.
+            // Count requests served, not accept() calls. On Windows CI, loopback connections are
+            // sometimes reset before accept() returns them; a failed accept or read must not use
+            // up a slot the client is still waiting on.
             let mut served = 0;
             while served < num_requests {
                 let Ok((mut stream, _)) = listener.accept() else {
@@ -173,23 +163,9 @@ mod tests {
 
     #[test]
     fn test_fetch_endpoint_failure() {
-        // Deliberately does NOT bind an ephemeral port and drop it to
-        // "guarantee" the port is closed: every other test in this module
-        // runs concurrently (the default test harness) and independently
-        // calls `TcpListener::bind("127.0.0.1:0")` via `spawn_mock_server`,
-        // so a just-freed ephemeral port can be reallocated by one of
-        // THOSE binds before this test's client connects — observed on
-        // windows-latest CI as this assertion failing because the request
-        // landed on a live, unrelated mock server instead of getting
-        // refused.
-        //
-        // Instead, keep an ephemeral listener bound (and in scope) for the
-        // whole test but never `accept()` on it: that both reserves the
-        // port so nothing else can grab it (no race to lose) and never
-        // answers, so the client's own short timeout below is what fails
-        // the request — deterministic either way, and unlike connecting to
-        // a fixed low port (e.g. 127.0.0.1:1), it makes no assumption
-        // about what else might be listening on the host or CI runner.
+        // Hold a bound listener that never accepts, so the client's timeout fails the request.
+        // Binding and dropping a port instead races the concurrent tests' `spawn_mock_server`
+        // binds: one can reuse the freed port and answer.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -250,7 +226,6 @@ mod tests {
     fn test_run_inner_file_creation_error() {
         let url = spawn_mock_server("HTTP/1.1 200 OK", r#"{"status": "ok"}"#, 4);
 
-        // Use an invalid path that cannot be created
         let result = run_inner(&url, "/invalid/path/that/does/not/exist/diag.json");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Failed to create file"));

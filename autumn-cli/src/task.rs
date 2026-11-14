@@ -44,11 +44,9 @@ pub fn run(opts: &TaskOptions<'_>) {
 /// --dry-run`) can share it instead of re-deriving the same attach-vs-spawn
 /// logic.
 pub fn apply_managed_pg_env(cmd: &mut Command, package: Option<&str>) {
-    // The attach URL is CLI→child plumbing, not an operator knob. Clear any
-    // inherited value up front so a stale/foreign one can't override the data dir
-    // (the provider checks the attach URL first) — including when an explicit
-    // `AUTUMN_MANAGED_PG_DATA_DIR` override makes `managed_pg_env` return `None`.
-    // We re-set it only when we discover a live cluster to attach to.
+    // The attach URL is CLI-to-child plumbing. Clear any inherited value first: the provider
+    // checks it before the data dir, so a stale one would win, even when
+    // `AUTUMN_MANAGED_PG_DATA_DIR` makes `managed_pg_env` return `None`.
     cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
     let Some(env) = crate::serve::managed_pg_env(package) else {
         return;
@@ -155,13 +153,8 @@ mod tests {
 
     #[test]
     fn clear_other_dump_modes_removes_every_mode_var_before_list_tasks() {
-        // Every one of these is dispatched before AUTUMN_LIST_TASKS /
-        // AUTUMN_RUN_TASK in AppBuilder::run's dispatch chain, so any one
-        // left in the CLI's own environment would hijack `autumn task`: the
-        // child would print a manifest where the task listing JSON is
-        // expected, or exit 0 without ever running the task
-        // (AUTUMN_DUMP_CACHE_COHERENCE in particular — issue #2370).
-        // Previously only 4 of these 8 were cleared.
+        // AppBuilder::run dispatches each of these before AUTUMN_LIST_TASKS / AUTUMN_RUN_TASK, so
+        // one left in the environment would hijack `autumn task` (#2370).
         let competing = crate::routes::ALL_DUMP_MODE_ENVS;
         let mut command = Command::new("true");
         for var in competing {

@@ -531,11 +531,8 @@ fn build_headers_dimension(h: &HeadersDump) -> HeadersDimension {
 }
 
 fn header_entry(header: &str, value: String) -> HeaderEntry {
-    // Mirror the runtime security-headers layer, which inserts a header only
-    // when `HeaderValue::from_str(value)` succeeds and otherwise skips it. A
-    // non-empty but invalid value (e.g. one containing a newline) is therefore
-    // NOT emitted — the manifest must expose that misconfiguration, not paper
-    // over it by reporting `emitted: true`.
+    // Mirror the runtime security-headers layer, which skips a value `HeaderValue::from_str`
+    // rejects (e.g. one with a newline): the manifest must report it as not emitted.
     use autumn_web::reexports::http::HeaderValue;
     let emitted = !value.is_empty() && HeaderValue::from_str(&value).is_ok();
     HeaderEntry {
@@ -648,9 +645,7 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
         },
         ExcludedDimension {
             dimension: "serve_path_routers",
-            // Provable once plumbed: these are real mounted routes that
-            // `autumn routes` would enumerate (like the routes dimension) if
-            // the dump path injected them into merge_routers.
+            // Provable once the dump path injects these routes into merge_routers.
             eventual_provenance: Provenance::Provable,
             reason: "opt-in serve-path HTTP surfaces (MCP, inbound-mail, storage, SEO) are \
                      injected only on the serve path, after the dump early-exit, so they are not \
@@ -961,14 +956,12 @@ pub fn run(opts: &AuditOptions<'_>) {
     routes::compile_binary_with(opts.package, opts.bin, &opts.features, &opts.profile);
     let binary = routes::find_binary_in_profile(opts.package, opts.bin, &opts.profile);
 
-    // Capture stderr (rather than inheriting it) so we can detect the app's
-    // omitted-routes marker; forward it verbatim afterwards so warnings stay
-    // visible to the user.
+    // Stderr is captured to read the omitted-routes and security-config markers, then
+    // forwarded below.
     let mut command = Command::new(&binary);
     command.env(routes::DUMP_ENV, "1");
-    // Ask the app to also dump its resolved security config (CSRF + headers)
-    // so we can build the `declared` manifest dimensions. Only `audit` sets
-    // this; plain `autumn routes` leaves the marker off its stderr.
+    // The resolved security config (CSRF + headers) feeds the `declared` dimensions. Plain
+    // `autumn routes` does not set this.
     command.env("AUTUMN_DUMP_SECURITY", "1");
     routes::clear_other_dump_modes(&mut command, routes::DUMP_ENV);
     let output = command
@@ -981,9 +974,7 @@ pub fn run(opts: &AuditOptions<'_>) {
         });
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Forward the child's stderr verbatim, but hide the machine-readable
-    // security-config marker line (it carries a full JSON blob for us, not the
-    // user).
+    // Hide the security-config marker line: it is a JSON blob for us, not the user.
     for line in stderr.lines() {
         if !line.starts_with(SECURITY_CONFIG_MARKER) {
             eprintln!("{line}");
@@ -1044,7 +1035,6 @@ pub fn run(opts: &AuditOptions<'_>) {
         eprint!("\n{}", format_omitted_diagnostic(omitted));
     }
 
-    // Fail the gate on either unclassified routes or omitted (unprovable) ones.
     let failed = omitted > 0 || audit_exit_code(&routes) != 0;
     std::process::exit(i32::from(failed));
 }
@@ -1363,14 +1353,10 @@ mod tests {
             "the authorization_policies dimension must carry a non-empty runtime_caveat"
         );
 
-        // Excluded list is present, ordered, and uses the closed enum values.
         let excluded = json["excluded"].as_array().expect("excluded array");
         assert_eq!(excluded.len(), 9);
         assert_eq!(excluded[0]["dimension"], "repository_policy_bindings");
         assert_eq!(excluded[0]["eventual_provenance"], "provable");
-        // v3: `authorization_policies` graduated out of `excluded` into a real
-        // dimension; leaving a stale excluded entry behind would claim the
-        // manifest still cannot prove what it now proves.
         assert!(
             !excluded
                 .iter()
@@ -1385,9 +1371,8 @@ mod tests {
             .expect("policy_registration excluded");
         assert_eq!(runtime_only["eventual_provenance"], "runtime-only");
 
-        // The serve-path routers (MCP, inbound-mail, storage, SEO) are injected
-        // only on the serve path (after the dump early-exit), so they are
-        // honestly disclosed as excluded rather than silently absent (#1627 AC).
+        // Serve-path routers (MCP, inbound-mail, storage, SEO) mount after the dump exits, so
+        // they are listed as excluded rather than silently absent (#1627).
         let serve_path = excluded
             .iter()
             .find(|e| e["dimension"] == "serve_path_routers")
@@ -1500,9 +1485,8 @@ mod tests {
 
     #[test]
     fn a_trailing_slash_prefix_covers_the_bare_route_like_the_runtime() {
-        // The runtime's `path_matches_any` strips the trailing slash before
-        // matching; reusing the CSRF exemption rule here reported
-        // `mtls_required: false` for a route the live listener protects.
+        // The runtime's `path_matches_any` strips the trailing slash before matching, unlike
+        // the CSRF exemption rule, so `/internal/` covers `/internal`.
         let routes = vec![
             route("GET", "/internal", "index", "gated"),
             route("GET", "/internal/keys", "keys", "gated"),

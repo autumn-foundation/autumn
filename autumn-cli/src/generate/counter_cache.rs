@@ -177,14 +177,10 @@ pub fn add_counter_cache_to_model_source(
         return out;
     }
 
-    // No `belongs_to` on the generated model (the flat scaffold does not emit
-    // one): add the whole attribute right after `#[autumn_web::model]`.
-    // Anchoring on that literal line, rather than "whatever attribute line
-    // sits closest to the struct," is what keeps this correct once other
-    // struct-level attributes (`#[commentable]`, `#[searchable]`,
-    // `#[shard_key]`) are also stacked between it and `pub struct` — a prior
-    // version walked back to the wrong end of that stack and landed the new
-    // attribute above `#[model]` on every real scaffold.
+    // No `belongs_to` yet (the flat scaffold emits none): insert one right after
+    // `#[autumn_web::model]`. Anchor on that line, not on the attribute nearest the struct:
+    // other struct attributes (`#[commentable]`, `#[searchable]`, `#[shard_key]`) may sit
+    // between it and `pub struct`, and the new attribute must stay below `#[model]`.
     let needle = format!("pub struct {pascal_name} ");
     let Some(struct_at) = source.find(&needle) else {
         return source.to_owned();
@@ -220,19 +216,14 @@ fn add_belongs_to_imports(
 ) -> String {
     let schema_import = format!("use crate::schema::{parent_plural};\n");
     let model_import = format!("use crate::models::{parent_snake}::{parent_pascal};\n");
-    // Idempotent: a `--force` re-run over output that already carries these
-    // (e.g. this same model belongs to two parents, or was regenerated)
-    // must not stack duplicate `use` lines.
+    // A `--force` re-run over output that already has these imports must not duplicate them.
     if source.contains(&schema_import) && source.contains(&model_import) {
         return source.to_owned();
     }
     let own_schema_import = "use crate::schema::";
     let Some(own_start) = source.find(own_schema_import) else {
-        // Defensive: `render_model_file` always emits this line, but if a
-        // hand-edited model dropped it, fall back to just above `#[model]`
-        // rather than silently skipping imports the generated code needs.
-        // Guarded the same way as the normal path below, so this stays
-        // idempotent even if only one of the two imports is already there.
+        // `render_model_file` always emits this line; if a hand-edited model dropped it,
+        // insert the imports above `#[model]` instead of skipping them.
         let mut prefix = String::new();
         if !source.contains(&schema_import) {
             prefix.push_str(&schema_import);
@@ -316,7 +307,7 @@ mod tests {
             ours.as_str() < next_second,
             "and before the next second's scaffold"
         );
-        // Including across a carry in the timestamp's minute field.
+        // Also across a carry out of the seconds and minutes fields.
         assert!(next_migration_version("20260427005959").as_str() < "20260427010000");
     }
 

@@ -351,11 +351,8 @@ mod tests {
 
     #[test]
     fn clear_competing_one_shot_env_removes_every_var_checked_before_replay() {
-        // AppBuilder::run checks build, route/job dumps, tasks, migration, and
-        // retention dry-run modes *before* AUTUMN_REPLAY_CAPSULE in its
-        // dispatch chain — any of them left over in the CLI's own environment
-        // would hijack a replay into a completely different (potentially
-        // mutating) mode via Command's default environment inheritance.
+        // AppBuilder::run dispatches each of these before AUTUMN_REPLAY_CAPSULE, so one inherited
+        // from the CLI's environment would turn the replay into another, possibly mutating, mode.
         let competing_vars = [
             "AUTUMN_BUILD_STATIC",
             "AUTUMN_DUMP_ROUTES",
@@ -391,10 +388,8 @@ mod tests {
 
     #[test]
     fn an_inherited_framework_retention_purge_cannot_hijack_a_replay() {
-        // AUTUMN_DB_RETENTION=purge is dispatched *before* AUTUMN_REPLAY_CAPSULE
-        // in AppBuilder::run, so an inherited value would turn `autumn replay`
-        // -- a read-only reproduction of a recorded failure -- into a
-        // destructive sweep of every framework-owned dataset (#1605).
+        // AUTUMN_DB_RETENTION=purge is dispatched before AUTUMN_REPLAY_CAPSULE, so an inherited
+        // value would turn a read-only replay into a purge of framework-owned data (#1605).
         let mut command = Command::new("true");
         command.env("AUTUMN_DB_RETENTION", "purge");
         clear_competing_one_shot_env(&mut command);

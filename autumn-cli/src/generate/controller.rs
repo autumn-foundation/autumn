@@ -119,10 +119,8 @@ fn parse_actions(
             title,
         });
     }
-    // Each action becomes one `pub async fn <fn_name>`; two actions with the
-    // same handler name (e.g. `new:get new:post`, or `home home`) would emit
-    // duplicate functions and fail to compile. A single fn can't bind two
-    // methods, so this is always a user error.
+    // Two actions with the same handler name (`new:get new:post`, `home home`) would emit
+    // duplicate `pub async fn`s that do not compile.
     for (i, action) in parsed.iter().enumerate() {
         if let Some(dup) = parsed[..i].iter().find(|a| a.fn_name == action.fn_name) {
             return Err(GenerateError::InvalidName(
@@ -287,10 +285,8 @@ pub fn plan_controller(
         ))
     })?;
     if !main_existing.contains("routes![") {
-        // `update_main_rs` can only inject entries into an existing
-        // `routes![...]` invocation; without one the handlers are created but
-        // never mounted. Tell the user to wire them by hand rather than
-        // silently emit dead routes.
+        // `update_main_rs` only injects into an existing `routes![...]`; without one the
+        // handlers would never be mounted.
         plan.warn(format!(
             "no `routes![...]` macro found in {} — the generated handlers were \
              not mounted; add them manually, e.g. `routes![{}]`",
@@ -298,14 +294,9 @@ pub fn plan_controller(
             entries.join(", ")
         ));
     }
-    // On a `--force` regeneration with a changed action set, the overwritten
-    // handler file no longer defines the old actions, so any stale
-    // `routes::<controller>::*` entries left in `routes![...]` would reference
-    // functions that no longer exist and break compilation. Strip every
-    // existing entry for THIS controller first, then add the fresh set. A
-    // no-op on first generation (nothing matches the prefix), and scoped to
-    // this controller's `routes::<snake>::` prefix so other controllers' and
-    // unrelated routes are untouched.
+    // A `--force` regeneration drops the old actions from the handler file, so stale
+    // `routes::<controller>::*` entries would break compilation. Remove this controller's
+    // entries before adding the fresh set.
     let pruned =
         remove_routes_entries_with_prefix(&main_existing, &format!("routes::{controller}::"));
     plan.modify(
@@ -438,13 +429,13 @@ mod tests {
         run(&tmp, "pages", &["home"], false, false).unwrap();
         let original = fs::read_to_string(tmp.path().join("src/routes/pages.rs")).unwrap();
 
-        // A second run with different actions must NOT overwrite.
+        // Without --force a second run must not overwrite.
         let err = run(&tmp, "pages", &["home", "about"], false, false).unwrap_err();
         assert!(matches!(err, GenerateError::Collisions(_)), "{err:?}");
         let after = fs::read_to_string(tmp.path().join("src/routes/pages.rs")).unwrap();
         assert_eq!(original, after, "file must be untouched on collision");
 
-        // With --force it succeeds and rewrites.
+        // With --force it rewrites.
         run(&tmp, "pages", &["home", "about"], false, true).unwrap();
         let forced = fs::read_to_string(tmp.path().join("src/routes/pages.rs")).unwrap();
         assert!(forced.contains("#[get(\"/pages/about\")]"), "{forced}");
@@ -485,7 +476,6 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, GenerateError::InvalidName(_, _)), "{err:?}");
 
-        // Plain repeated stem is rejected too.
         let err2 =
             plan_controller(tmp.path(), "pages", &actions(&["home", "home"]), false).unwrap_err();
         assert!(matches!(err2, GenerateError::InvalidName(_, _)), "{err2:?}");
@@ -523,8 +513,7 @@ mod tests {
             "{after_first}"
         );
 
-        // Regenerate with a changed action set (`about` dropped, `contact`
-        // added) using --force.
+        // Regenerate with --force, dropping `about` and adding `contact`.
         run(&tmp, "pages", &["home", "contact"], false, true).unwrap();
         let after_force = fs::read_to_string(&main_path).unwrap();
         assert!(after_force.contains("routes::pages::home"), "{after_force}");
@@ -532,12 +521,10 @@ mod tests {
             after_force.contains("routes::pages::contact"),
             "{after_force}"
         );
-        // The stale entry for the now-removed `about` action must be gone.
         assert!(
             !after_force.contains("routes::pages::about"),
             "stale routes::pages::about should have been pruned:\n{after_force}"
         );
-        // Unrelated entries must be untouched.
         assert!(
             after_force.contains("routes::other::index"),
             "unrelated route entry must survive:\n{after_force}"

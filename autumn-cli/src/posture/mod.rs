@@ -199,10 +199,9 @@ pub fn run_diff(opts: &DiffOptions<'_>) -> i32 {
     };
     let base = match PostureManifest::read(opts.base) {
         Ok(m) => Some(m),
-        // Only a genuinely absent file bootstraps. A base path that exists but
-        // cannot be read — a directory, a permissions problem, an interrupted
-        // `git show` — is a broken run, and reporting it as the benign
-        // "no baseline yet" case would disarm the gate for that run.
+        // Only a missing file bootstraps. A base path that exists but cannot be read (a directory,
+        // permissions, an interrupted `git show`) is a broken run; treating it as "no baseline yet"
+        // would disarm the gate.
         Err(ManifestError::Io { ref source, .. })
             if opts.allow_missing_base && source.kind() == std::io::ErrorKind::NotFound =>
         {
@@ -215,10 +214,8 @@ pub fn run_diff(opts: &DiffOptions<'_>) -> i32 {
         Err(e) => return fail(&e),
     };
 
-    // A head manifest with no routes at all, diffed against a base that had
-    // some, scores as a clean surface-*reducing* change — so a partial or
-    // failed audit that still wrote a well-formed file would sail through.
-    // That is a broken run, not a narrowing.
+    // A head with no routes, diffed against a base that had some, scores as a clean narrowing, so a
+    // failed audit that still wrote a well-formed file would pass. Treat it as a broken run.
     if let Some(base_manifest) = &base
         && !base_manifest.dimensions.routes.entries.is_empty()
         && head.dimensions.routes.entries.is_empty()
@@ -635,8 +632,8 @@ mod tests {
             allow_missing_base: false,
         };
 
-        // The old in-band separator inside a fence is inert text now: it
-        // must not reset the fence and make the marker after it live.
+        // `SOURCE_SEPARATOR` inside a fence is inert text: it must not reset the fence and make the
+        // marker after it live.
         std::fs::write(
             acks.join("1.md"),
             format!(

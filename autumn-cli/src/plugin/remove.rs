@@ -180,18 +180,16 @@ const MOUNT_MARKER: &str = "// added by `autumn plugin add";
 /// the lines to delete are printed.
 fn mount_span(main_rs: &str, entry: &CatalogEntry) -> Option<std::ops::Range<usize>> {
     let masked = crate::rust_source::mask_non_code(main_rs);
-    // `starts_with`, not `contains`: the argument must BE this plugin, not
-    // merely mention it. `.plugin(MyWrapper::new(admin::AdminPlugin::new(), …))`
-    // contains the type path but is the user's wrapper mount, and excising it
-    // would delete their code — and still compile, so nothing would surface
-    // the loss.
+    // `starts_with`, not `contains`: the argument must be this plugin, not merely
+    // mention it. `.plugin(MyWrapper::new(admin::AdminPlugin::new(), …))` is the
+    // user's wrapper mount; excising it would delete their code and still compile.
     if let Some((open, close)) = super::install::mount_call_span(&masked, entry, |argument| {
         argument.trim_start().starts_with(entry.mount_arg)
     }) {
         let call_start = open + 1 - entry.mount_call.len();
         let line_start = masked[..call_start].rfind('\n').map_or(0, |at| at + 1);
-        // Past the closing paren, up to and including the newline that ends
-        // its line — a mount is removed by deleting whole lines.
+        // Through the newline that ends the closing paren's line: a mount is
+        // removed by deleting whole lines.
         let line_end = masked[close..]
             .find('\n')
             .map_or(masked.len(), |at| close + at + 1);
@@ -204,12 +202,10 @@ fn mount_span(main_rs: &str, entry: &CatalogEntry) -> Option<std::ops::Range<usi
         }
         return None;
     }
-    // Not found as `mount_call(mount_arg…)`. The one remaining shape this can
-    // excise is the mount `plugin add` writes VERBATIM — `autumn-storage-s3`'s
-    // is a `.with_blob_store({ … })` block whose argument is a brace expression,
-    // not the type path — and only while it is still byte-identical to what was
-    // written. An edited block is the user's code now, and goes to the manual
-    // fallback rather than being guessed at.
+    // Otherwise only a byte-identical copy of the mount `plugin add` wrote can
+    // be excised (e.g. `autumn-storage-s3`'s `.with_blob_store({ … })` block,
+    // whose argument is not the type path). An edited block goes to the manual
+    // fallback.
     verbatim_mount_span(main_rs, &masked, entry)
 }
 
@@ -258,8 +254,7 @@ fn marker_start(main_rs: &str, line_start: usize, crate_name: &str) -> usize {
     let previous_start = before.rfind('\n').map_or(0, |at| at + 1);
     let previous = main_rs[previous_start..line_start].trim();
     // Byte-exact, not `starts_with`: a marker the user annotated
-    // (`… autumn-admin-plugin` — KEEP, see ticket 42`) is their comment now,
-    // and taking it with the mount would delete a note they left on purpose.
+    // (`… autumn-admin-plugin` -- KEEP: see ticket 42`) is their note now.
     if previous == format!("{MOUNT_MARKER} {crate_name}`") {
         previous_start
     } else {
@@ -307,9 +302,8 @@ fn still_referenced(
     {
         return Some(site);
     }
-    // The SAME marker set the conventional sweep uses — a spelling honoured in
-    // one scan but not the other is a dependency stripped from under a target
-    // that still needs it.
+    // The same marker set as the conventional sweep: a spelling missed by one
+    // scan would strip the dependency from a target that still needs it.
     let markers = crate::generate::emit::crate_reference_markers(crate_name);
     super::install::explicit_target_sources(root)
         .into_iter()
@@ -383,8 +377,6 @@ pub fn plan_remove(root: &Path, entry: &CatalogEntry) -> Result<RemoveOutcome, P
     let has_dependency = super::install::dependency_present(&manifest_src, entry.crate_name);
     let is_mounted = super::install::mount_present(&main_src, entry);
 
-    // AC #5: removing something that was never installed is a no-op that says
-    // so, mirroring `add`'s idempotency in the other direction.
     if !has_dependency && !is_mounted {
         return Ok(RemoveOutcome::NotInstalled { residue });
     }
@@ -392,8 +384,7 @@ pub fn plan_remove(root: &Path, entry: &CatalogEntry) -> Result<RemoveOutcome, P
     let unmounted_src = if is_mounted {
         match remove_mount(&main_src, entry) {
             Some(updated) => Some(updated),
-            // AC #4: the builder chain cannot be edited confidently, so NOTHING
-            // is edited — not even the dependency, whose removal would turn a
+            // Edit nothing, not even the dependency: removing it would turn the
             // mount this command could not reach into a compile error.
             None => {
                 return Ok(RemoveOutcome::Manual {
@@ -413,9 +404,8 @@ pub fn plan_remove(root: &Path, entry: &CatalogEntry) -> Result<RemoveOutcome, P
         None
     };
 
-    // Would stripping the dependency break code the user wrote by hand? The
-    // check runs against the POST-removal `main.rs`, so this command's own
-    // mount never counts as a reason to keep the dependency it is removing.
+    // Check references against the post-removal `main.rs`, so the mount being
+    // removed never counts as a reason to keep the dependency.
     let mut overrides = std::collections::HashMap::new();
     if let Some(updated) = &unmounted_src {
         overrides.insert(main_path.clone(), updated.clone());
@@ -522,8 +512,8 @@ pub fn decide_drop_data(entry: &CatalogEntry, database_url: Option<&str>) -> Dro
     };
     if !is_postgres_url(url) {
         return DropDataDecision::PrintOnly {
-            // Naming the backend, not just refusing: a SQLite app's owner needs
-            // to know this is a "run it yourself" answer, not a broken URL.
+            // Name the backend so a SQLite app's owner reads this as "run it
+            // yourself", not as a broken URL.
             reason: format!(
                 "`--drop-data` drives Postgres only, and this app's database is {}",
                 backend_label(url)
@@ -563,10 +553,9 @@ pub fn execute_drop_data(url: &str, statements: &[String]) -> Result<(), String>
 
     let mut conn = PgConnection::establish(url)
         .map_err(|err| format!("could not connect to the database: {err}"))?;
-    // One transaction for the whole set. Postgres has transactional DDL, so
-    // this costs nothing and removes the state no repair path covers: tables
-    // dropped while `__diesel_schema_migrations` still records their migration
-    // as applied, which makes `diesel migration run` refuse to recreate them.
+    // One transaction (Postgres DDL is transactional). A partial run could drop
+    // tables while `__diesel_schema_migrations` still lists their migrations,
+    // and `diesel migration run` would then never recreate them.
     conn.transaction(|conn| {
         for statement in statements {
             conn.batch_execute(statement).map_err(|err| {
@@ -604,9 +593,8 @@ pub fn plan_remove_community(root: &Path, crate_name: &str) -> Result<RemoveOutc
     let manifest_src = std::fs::read_to_string(&manifest)?;
     if !super::install::dependency_present(&manifest_src, crate_name) {
         return Ok(RemoveOutcome::NotInstalled {
-            // A community crate declares nothing about its schema, so nothing
-            // can be reported here. `run_remove` says as much in prose rather
-            // than letting an empty list read as "owns no data".
+            // A community crate declares nothing about its schema. `run_remove`
+            // says so in prose, so this empty list does not read as "owns no data".
             residue: DataResidue::default(),
         });
     }
@@ -709,14 +697,13 @@ maud = { version = "0.27", features = ["axum"] }
         tmp
     }
 
-    // ── AC #1: remove reverses both wires ────────────────────────────────────
+    // ── Remove reverses both wires ───────────────────────────────────────────
 
     #[test]
     fn the_mount_and_its_marker_comment_are_excised_together() {
         let out = remove_mount(SCAFFOLD_MAIN, admin()).expect("excisable");
         assert!(!out.contains("AdminPlugin"), "{out}");
         assert!(!out.contains("added by `autumn plugin add"), "{out}");
-        // Everything else survives byte-for-byte.
         assert!(out.contains(".routes(routes![index])"), "{out}");
         assert!(out.contains("let app = autumn_web::app()"), "{out}");
         assert!(out.contains(".migrations(MIGRATIONS)"), "{out}");
@@ -749,7 +736,7 @@ maud = { version = "0.27", features = ["axum"] }
         assert!(out.contains(".routes(routes![index]);"), "{out}");
     }
 
-    // ── AC #4: safe degradation ──────────────────────────────────────────────
+    // ── Safe degradation ─────────────────────────────────────────────────────
 
     /// A mount built into a variable is a real mount that this code cannot
     /// excise: the `.plugin(configured)` call does not name the type. Nothing
@@ -776,7 +763,7 @@ maud = { version = "0.27", features = ["axum"] }
         assert!(remove_mount(main, admin()).is_none());
     }
 
-    // ── AC #1 end-to-end planning ────────────────────────────────────────────
+    // ── End-to-end planning ──────────────────────────────────────────────────
 
     #[test]
     fn a_fully_wired_plugin_has_both_wires_removed() {
@@ -793,7 +780,7 @@ maud = { version = "0.27", features = ["axum"] }
         assert!(missing.is_empty(), "{missing:?}");
     }
 
-    // ── AC #5: idempotent no-op ──────────────────────────────────────────────
+    // ── Idempotent no-op ─────────────────────────────────────────────────────
 
     #[test]
     fn removing_a_plugin_that_is_not_installed_is_a_no_op() {
@@ -807,7 +794,7 @@ maud = { version = "0.27", features = ["axum"] }
         ));
     }
 
-    // ── AC #4: partial installs ──────────────────────────────────────────────
+    // ── Partial installs ─────────────────────────────────────────────────────
 
     #[test]
     fn a_dependency_without_a_mount_is_removed_and_the_mount_reported_missing() {
@@ -895,7 +882,7 @@ maud = { version = "0.27", features = ["axum"] }
         );
     }
 
-    // ── AC #2: data safety ───────────────────────────────────────────────────
+    // ── Data safety ──────────────────────────────────────────────────────────
 
     #[test]
     fn a_plugin_that_owns_tables_reports_them_as_residue() {
@@ -941,7 +928,7 @@ maud = { version = "0.27", features = ["axum"] }
         assert!(drop_data_statements(admin()).is_empty());
     }
 
-    // ── AC #2: what `--drop-data` decides, before anything runs ──────────────
+    // ── What `--drop-data` decides, before anything runs ─────────────────────
 
     #[test]
     fn a_plugin_with_no_declared_data_has_nothing_to_drop() {
@@ -1093,7 +1080,7 @@ autumn-plugin-live-feed = "0.3.1"
         );
     }
 
-    // ── Review follow-ups: code this command must NOT delete ─────────────────
+    // ── Code this command must not delete ────────────────────────────────────
 
     /// A plugin wrapped inside ANOTHER plugin's constructor. The type path is
     /// inside the `.plugin(...)` argument, but the argument is not that
@@ -1136,7 +1123,6 @@ autumn-plugin-live-feed = "0.3.1"
             entry.mount, entry.mount
         );
         let out = remove_mount(&main, entry).expect("the live mount is excisable");
-        // The live mount is gone; the commented-out copy is untouched.
         assert!(out.contains("/*\n"), "{out}");
         assert_eq!(
             out.matches("S3BlobStore::from_config(").count(),

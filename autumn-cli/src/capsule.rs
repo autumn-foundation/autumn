@@ -68,17 +68,16 @@ fn generate_inner(opts: &GenerateOptions<'_>) -> Result<String, String> {
             source.display()
         )
     })?;
-    // A capsule replay refuses is not one to commit: the generated test would
-    // fail on every run for a reason that has nothing to do with the code.
+    // A capsule replay refuses would generate a test that fails on every run for a reason
+    // unrelated to the code.
     if let Some(reason) = autumn_web::capsule::refusal_reason(&capsule) {
         return Err(format!(
             "{} cannot be replayed, so it cannot become a regression test: {reason}",
             source.display()
         ));
     }
-    // A job capsule has no request to drive through a router, so the generated
-    // test would fail on every run for a reason that has nothing to do with the
-    // code. `autumn replay` dispatches the job's handler instead.
+    // A job capsule has no request to drive through a router, so its generated test could never
+    // pass. `autumn replay` dispatches the job's handler instead.
     if let Some(job) = capsule.job.as_ref() {
         return Err(format!(
             "{} records a failure inside job {:?}, not a request. Job capsules replay with \
@@ -119,11 +118,8 @@ fn generate_inner(opts: &GenerateOptions<'_>) -> Result<String, String> {
     std::fs::create_dir_all(&suite)
         .map_err(|error| format!("could not create {}: {error}", suite.display()))?;
 
-    // The fixture is the capsule's own bytes, copied verbatim. Nothing is
-    // re-derived, re-read from a live system, or re-serialized: whatever
-    // redaction removed on the way to disk is exactly what stays removed on the
-    // way into the repository, so committing a generated test can never
-    // introduce a secret the capsule did not already hold.
+    // Copy the capsule's bytes verbatim, never re-derived or re-serialized, so whatever redaction
+    // removed on the way to disk stays removed in the repository.
     std::fs::write(&fixture_path, json.as_bytes())
         .map_err(|error| format!("could not write {}: {error}", fixture_path.display()))?;
     std::fs::write(&test_path, generated_test(&slug, &capsule).as_bytes())
@@ -163,9 +159,7 @@ fn generate_inner(opts: &GenerateOptions<'_>) -> Result<String, String> {
             );
         }
         Err(error) => {
-            // Not fatal: the files are written and a developer can add two
-            // `mod` lines. Failing the whole conversion over it would be worse
-            // than saying exactly what is left to do.
+            // Not fatal: the files are written, so report the `mod` lines left to add.
             let _ = writeln!(
                 report,
                 "could not update {}: {error}\n  add these lines yourself:\n    mod \
@@ -249,11 +243,8 @@ fn slugify(id: &str) -> String {
         }
     }
     let trimmed = slug.trim_matches('_').to_owned();
-    // A Rust identifier cannot start with a digit, and a capsule id routinely
-    // does (request ids are often ULIDs). A keyword is prefixed for the same
-    // reason: the slug becomes a module name, a file name *and* a test
-    // function name, and `mod type;` does not compile — a generated test that
-    // cannot build is worse than no generated test.
+    // The slug becomes a module, file and test function name, so it cannot start with a digit
+    // (capsule ids often do) or be a keyword (`mod type;` does not compile).
     if trimmed.starts_with(|c: char| c.is_ascii_digit()) || is_rust_keyword(&trimmed) {
         format!("c{trimmed}")
     } else {
@@ -496,10 +487,8 @@ fn verify_inner(dir: &Path) -> Result<CorpusReport, String> {
     let paths = autumn_web::capsule::regression::RegressionCase::corpus(dir)
         .map_err(|error| format!("could not read the corpus at {}: {error}", dir.display()))?;
     if paths.is_empty() {
-        // An empty corpus must not be a silent pass: "no capsules committed"
-        // and "every capsule passed" are opposite facts, and a corpus that
-        // quietly stopped testing anything is the failure mode this whole
-        // feature exists to prevent.
+        // An empty corpus is not a pass: "no capsules committed" and "every capsule passed" are
+        // opposite facts.
         return Err(format!(
             "no capsules in {} — convert one with `autumn capsule test`",
             dir.display()
@@ -515,10 +504,8 @@ fn verify_inner(dir: &Path) -> Result<CorpusReport, String> {
         .as_ref()
         .and_then(|suite| std::fs::read_to_string(suite.join("mod.rs")).ok())
         .unwrap_or_default();
-    // A registered module still never runs unless some top-level `tests/*.rs`
-    // target declares the suite — Cargo does not descend into subdirectories.
-    // Checked once for the corpus rather than per capsule, because it is one
-    // fact about the project, not about any fixture.
+    // A registered module runs only if a top-level `tests/*.rs` target declares the suite: Cargo
+    // does not descend into subdirectories. That is one fact per project, so it is checked once.
     let harness = tests_dir.is_none_or(|tests| {
         std::fs::read_dir(tests).is_ok_and(|entries| {
             entries.flatten().any(|entry| {
@@ -623,9 +610,7 @@ mod tests {
         assert_eq!(slugify("01JB2K7Q"), "c01jb2k7q");
         assert_eq!(slugify("a//b__c"), "a_b_c");
         assert_eq!(slugify("---"), "");
-        // A slug that lands on a keyword would generate `mod type;`, which does
-        // not compile — and a generated regression test that cannot build is
-        // worse than none.
+        // A keyword slug would generate `mod type;`, which does not compile.
         assert_eq!(slugify("type"), "ctype");
         assert_eq!(slugify("mod"), "cmod");
         assert_eq!(slugify("Self"), "cself");
@@ -633,9 +618,8 @@ mod tests {
 
     #[test]
     fn conversion_writes_the_capsule_bytes_verbatim() {
-        // AC: redaction survives conversion. The fixture must be the capsule's
-        // own bytes — nothing re-derived, nothing re-serialized — so whatever
-        // redaction removed stays removed.
+        // Redaction survives conversion: the fixture is the capsule's own bytes, never
+        // re-serialized.
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("capsule.json");
         let json = fixture_capsule("req-1");
@@ -810,9 +794,7 @@ mod tests {
 
     #[test]
     fn an_empty_corpus_is_a_failure_not_a_vacuous_pass() {
-        // "no capsules committed" and "every capsule passed" are opposite
-        // facts; reporting the first as the second is how a regression corpus
-        // silently stops testing anything.
+        // "no capsules committed" must not be reported as "every capsule passed".
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("capsules")).expect("mkdir");
         let error = verify_inner(&dir.path().join("capsules"))

@@ -273,7 +273,6 @@ impl DashboardState {
             .send()
             && let Ok(m) = resp.json::<MetricsResponse>()
         {
-            // Compute throughput delta
             let delta = m
                 .http
                 .requests_total
@@ -287,7 +286,6 @@ impl DashboardState {
             }
             self.prev_requests_total = m.http.requests_total;
 
-            // Track latency history
             self.latency_p50_history.push_back(m.http.latency_ms.p50);
             if self.latency_p50_history.len() > SPARKLINE_DEPTH {
                 self.latency_p50_history.pop_front();
@@ -337,16 +335,13 @@ impl DashboardState {
 // ── TUI rendering ─────────────────────────────────────────────
 
 pub fn run(url: &str, poll_secs: u64) {
-    // Normalize URL
     let base_url = url.trim_end_matches('/').to_string();
     let poll_interval = Duration::from_secs(poll_secs);
 
     let mut state = DashboardState::new(base_url);
 
-    // Initial poll
     state.poll();
 
-    // Setup terminal
     terminal::enable_raw_mode().expect("failed to enable raw mode");
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, cursor::Hide).expect("failed to setup terminal");
@@ -355,7 +350,6 @@ pub fn run(url: &str, poll_secs: u64) {
 
     let result = run_loop(&mut terminal, &mut state, poll_interval);
 
-    // Restore terminal
     terminal::disable_raw_mode().expect("failed to disable raw mode");
     execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)
         .expect("failed to restore terminal");
@@ -373,7 +367,7 @@ fn run_loop(
     loop {
         terminal.draw(|frame| draw(frame, state))?;
 
-        // Poll for input with short timeout for smooth animations
+        // A short timeout keeps the animation smooth.
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
@@ -408,7 +402,6 @@ fn run_loop(
 
         state.tick += 1;
 
-        // Poll actuator endpoints
         if state.last_poll.elapsed() >= poll_interval {
             state.poll();
         }
@@ -418,7 +411,6 @@ fn run_loop(
 fn draw(frame: &mut ratatui::Frame, state: &DashboardState) {
     let area = frame.area();
 
-    // Main layout: header, body, footer
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -451,7 +443,6 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
         ])
         .split(area);
 
-    // Logo / title
     let status_color = if !state.connected {
         Color::Red
     } else if state.health.status == "ok" {
@@ -477,7 +468,6 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     );
     frame.render_widget(title, chunks[0]);
 
-    // Tabs
     let tab_titles = vec!["Overview", "Routes", "Loggers", "Channels"];
     let tabs = Tabs::new(tab_titles)
         .select(state.active_tab)
@@ -495,7 +485,6 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
         );
     frame.render_widget(tabs, chunks[1]);
 
-    // Connection status
     let (indicator, label) = if !state.connected {
         ("●", "disconnected")
     } else if state.health.status == "ok" {
@@ -528,7 +517,6 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
 }
 
 fn draw_overview_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
-    // Split into top row and bottom row
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -580,7 +568,6 @@ fn draw_stats_cards(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
 
     let m = &state.metrics.http;
 
-    // Card 1: Total Requests
     draw_stat_card(
         frame,
         chunks[0],
@@ -590,7 +577,6 @@ fn draw_stats_cards(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
         format!("{} active", m.requests_active),
     );
 
-    // Card 2: Throughput (req/s)
     let rps = state.throughput_history.back().copied().unwrap_or(0);
     draw_stat_card(
         frame,
@@ -605,7 +591,6 @@ fn draw_stats_cards(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
         "req/s".to_string(),
     );
 
-    // Card 3: p50 Latency
     draw_stat_card(
         frame,
         chunks[2],
@@ -615,7 +600,6 @@ fn draw_stats_cards(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
         "median".to_string(),
     );
 
-    // Card 4: p95 Latency
     draw_stat_card(
         frame,
         chunks[3],
@@ -625,7 +609,6 @@ fn draw_stats_cards(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
         "95th pct".to_string(),
     );
 
-    // Card 5: p99 Latency
     draw_stat_card(
         frame,
         chunks[4],
@@ -642,7 +625,6 @@ fn draw_sparklines(frame: &mut ratatui::Frame, area: Rect, state: &DashboardStat
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    // Throughput sparkline
     let throughput_block = Block::default()
         .title(Span::styled(
             " Throughput (req/s) ",
@@ -659,7 +641,6 @@ fn draw_sparklines(frame: &mut ratatui::Frame, area: Rect, state: &DashboardStat
         .style(Style::default().fg(Color::Green));
     frame.render_widget(throughput_sparkline, chunks[0]);
 
-    // Latency sparkline (p99)
     let latency_block = Block::default()
         .title(Span::styled(
             " Latency p99 (ms) ",
@@ -760,7 +741,6 @@ fn draw_health_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
         info_line("Uptime", &state.health.uptime, Color::White),
     ];
 
-    // DB pool info
     if let Some(db) = &state.metrics.database {
         push_db_pool_lines(
             &mut lines,
@@ -951,7 +931,6 @@ fn draw_loggers_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
     let mut loggers: Vec<_> = state.loggers.loggers.iter().collect();
     loggers.sort_by(|a, b| a.0.cmp(b.0));
 
-    // Also include the root logger
     let mut rows = vec![Row::new(vec![
         Cell::from("ROOT (current)").style(
             Style::default()
@@ -1421,7 +1400,6 @@ mod tests {
     #[test]
     fn make_card_block_has_title() {
         let block = make_card_block("Test");
-        // Verify it doesn't panic and produces a block
         let _ = block;
     }
 
@@ -1433,7 +1411,6 @@ mod tests {
 
     #[test]
     fn test_poll_updates_state() {
-        // Start a mock server
         let listener =
             TcpListener::bind("127.0.0.1:0").expect("failed extracting response component");
         let port = listener
@@ -1451,7 +1428,6 @@ mod tests {
                     continue;
                 }
 
-                // Consume all remaining headers until an empty line is reached
                 loop {
                     let mut header_line = String::new();
                     if reader.read_line(&mut header_line).is_err()
@@ -1484,14 +1460,11 @@ mod tests {
         });
 
         let mut state = DashboardState::new(url);
-        // Initially disconnected and metrics at 0
         assert!(!state.connected);
         assert_eq!(state.metrics.http.requests_total, 0);
 
-        // Run poll
         state.poll();
 
-        // Check if state was updated correctly
         assert!(state.connected);
         assert_eq!(state.health.status, "up");
         assert_eq!(state.metrics.http.requests_total, 42);
@@ -1500,7 +1473,7 @@ mod tests {
 
     #[test]
     fn test_poll_handles_connection_error() {
-        // Use an invalid port to force connection error
+        // Bind and drop a listener to get a port nothing listens on.
         let listener =
             TcpListener::bind("127.0.0.1:0").expect("failed extracting response component");
         let port = listener

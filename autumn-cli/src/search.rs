@@ -161,8 +161,8 @@ pub fn run(opts: &ReindexOptions<'_>) {
     eprintln!("\u{1F342} autumn search reindex\n");
     match opts.profile {
         Some(profile) => eprintln!("  profile: {profile}\n"),
-        // Said out loud because the failure is silent otherwise: the rebuild
-        // succeeds against the wrong index and reports success.
+        // Printed because the failure is otherwise silent: the rebuild succeeds
+        // against the wrong index.
         None => eprintln!(
             "  profile: dev (this builds a debug binary; pass --profile to \
              rebuild another environment's index)\n"
@@ -210,10 +210,8 @@ pub fn run(opts: &ReindexOptions<'_>) {
         }
     });
 
-    // If the app does not install `SearchPlugin`, nothing consumes
-    // `AUTUMN_SEARCH_BACKFILL` and the process falls through to serving HTTP —
-    // forever. Waiting unconditionally would look like a hang, so bound the
-    // wait for the marker (not the backfill itself).
+    // Without `SearchPlugin`, nothing consumes `AUTUMN_SEARCH_BACKFILL` and the
+    // app serves HTTP forever. Bound the wait for the marker, not the backfill.
     if rx.recv_timeout(STARTUP_GRACE).is_err() {
         let _ = child.kill();
         let _ = child.wait();
@@ -269,9 +267,6 @@ mod tests {
             purge: false,
         };
         assert_eq!(opts.profile, Some("prod"));
-        // The env var name is the contract with `SearchConfig::resolve`'s
-        // precedence chain; a rename on either side breaks the forwarding
-        // silently, so it is pinned here.
         assert_eq!(
             autumn_web::config::normalize_profile_name("prod").as_deref(),
             Some("prod"),
@@ -298,13 +293,9 @@ mod tests {
 
     #[test]
     fn clear_competing_one_shot_env_removes_every_var_checked_before_server_startup() {
-        // AppBuilder::run dispatches build, route/job dumps, tasks, migration,
-        // retention dry-run, and capsule replay *before* falling through to
-        // normal server startup, where SearchPlugin consumes
-        // AUTUMN_SEARCH_BACKFILL — any of them left over in the CLI's own
-        // environment would hijack `autumn search reindex` into a completely
-        // different (potentially mutating) mode via Command's default
-        // environment inheritance.
+        // `AppBuilder::run` dispatches each of these before server startup,
+        // where `SearchPlugin` consumes AUTUMN_SEARCH_BACKFILL. An inherited one
+        // would turn the reindex into a different, possibly mutating, mode.
         let competing_vars = [
             "AUTUMN_BUILD_STATIC",
             "AUTUMN_DUMP_ROUTES",
@@ -332,9 +323,8 @@ mod tests {
 
     #[test]
     fn an_inherited_framework_retention_purge_cannot_hijack_a_reindex() {
-        // AUTUMN_DB_RETENTION=purge is dispatched long before SearchPlugin
-        // consumes AUTUMN_SEARCH_BACKFILL at server startup, so an inherited
-        // value would turn `autumn search reindex` into a destructive sweep of
+        // AUTUMN_DB_RETENTION=purge is dispatched before SearchPlugin runs, so
+        // an inherited value would turn the reindex into a destructive sweep of
         // every framework-owned dataset (#1605).
         let mut command = Command::new("true");
         command.env("AUTUMN_DB_RETENTION", "purge");

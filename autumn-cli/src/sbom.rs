@@ -108,13 +108,10 @@ pub enum SbomError {
 // CycloneDX document model
 // ---------------------------------------------------------------------------
 
-// `deny_unknown_fields` throughout is load bearing, not pedantry. `--verify`
-// compares the DESERIALIZED document, so any field this tool does not model
-// would be dropped on read and the comparison would report a match — letting a
-// transported SBOM gain a fabricated `vulnerabilities` array, an injected
-// `metadata.timestamp`, or an extra `dependencies` graph without the gate
-// noticing. Rejecting them is also the honest contract: `--verify` asks "is
-// this the document this tool would generate?", not "is this valid CycloneDX?".
+// `deny_unknown_fields` throughout is load bearing: `--verify` compares the deserialized document,
+// so a field this tool does not model (a fabricated `vulnerabilities` array, an injected
+// `metadata.timestamp`) would be dropped on read and compare equal. `--verify` asks "is this the
+// document this tool would generate?", not "is this valid CycloneDX?".
 /// A `CycloneDX` 1.5 bill of materials.
 ///
 /// Field order here IS the serialized key order, which is part of the
@@ -361,8 +358,8 @@ fn content_serial_number(bom: &Bom) -> String {
         "the serial must be hashed over a document that does not yet carry one"
     );
     let mut hasher = Sha256::new();
-    // Serialization of our own types cannot realistically fail; an empty digest
-    // input would still be deterministic, which is what matters here.
+    // Serializing our own types cannot fail in practice; an empty input would still be
+    // deterministic.
     hasher.update(serde_json::to_vec(bom).unwrap_or_default());
     let d = hasher.finalize();
     let mut b = [0u8; 16];
@@ -528,13 +525,9 @@ pub fn bom_from_cargo_metadata(
             kind: "application".into(),
             ..component_from_package(pkg)?
         },
-        // A virtual workspace has no package of its own, so there is no
-        // crates.io identity to claim. Emitting `pkg:cargo/<name>@<version>`
-        // here would point a scanner at whatever unrelated crate happens to
-        // share the repository's name (autumn's own workspace publishes
-        // `autumn-web`, while `autumn` is somebody else's crate), and would
-        // collide with a member's `bom-ref` in workspaces named after one of
-        // their own crates. Use a scheme that asserts nothing instead.
+        // A virtual workspace has no package, so no crates.io identity. A `pkg:cargo` purl would
+        // point scanners at an unrelated crate sharing the repository's name, and could collide
+        // with a member's `bom-ref`. This scheme asserts nothing.
         None => Component {
             kind: "application".into(),
             bom_ref: Some(format!("workspace:{}@{}", fallback.name, fallback.version)),
@@ -548,9 +541,8 @@ pub fn bom_from_cargo_metadata(
         },
     };
 
-    // Walk the resolve graph so dev-dependencies — resolved but never linked
-    // — stay out of the shipped document. With no resolve graph there is
-    // nothing to walk; fall back to listing every package, as before.
+    // Walk the resolve graph so dev-dependencies (resolved but never linked) stay out. Without a
+    // resolve graph, list every package.
     let seeds: Vec<String> = root_id.as_deref().map_or_else(
         // No root (a virtual workspace without a named member): describe the
         // whole workspace's non-dev closure — every member's, unioned.
@@ -737,9 +729,7 @@ pub fn diff(expected: &Bom, actual: &Bom) -> Vec<String> {
         // from is not the one in the file.
         report.push("  serial number: does not match this document's contents".to_owned());
     }
-    // Compare the WHOLE root component, not just name+version: an edited
-    // `purl`, a forged licence, or a swapped `bom-ref` on the top-level
-    // component is exactly the kind of drift this gate exists to catch.
+    // Compare the whole root component: an edited `purl`, licence or `bom-ref` on it is drift too.
     let (e, a) = (&expected.metadata.component, &actual.metadata.component);
     if e.comparable() != a.comparable() {
         report.push(if e.name == a.name && e.version == a.version {
@@ -787,10 +777,8 @@ pub fn diff(expected: &Bom, actual: &Bom) -> Vec<String> {
         }
     }
 
-    // Indexing by `bom-ref` collapses duplicates, so an SBOM listing the same
-    // component twice would otherwise compare equal to a clean one. Report the
-    // raw length disagreement unconditionally — a doubled entry alongside
-    // other drift is still a doubled entry.
+    // Indexing by `bom-ref` collapses duplicates, so a doubled component would compare equal.
+    // Report the length mismatch even alongside other drift.
     if expected.components.len() != actual.components.len() {
         report.push(format!(
             "  component count: expected {}, found {} (duplicate entries?)",
@@ -1100,10 +1088,8 @@ fn extract_from_elf(bytes: &[u8]) -> Result<&[u8], SbomError> {
 
     for i in 0..shnum {
         let (name_off, off, size) = read_hdr(i)?;
-        // A single garbage `sh_name` (or a stripped binary whose `e_shstrndx`
-        // is SHN_UNDEF, leaving an empty string table) must not mask a
-        // `.dep-v0` section later in the table, nor turn an honest "not built
-        // with cargo-auditable" into "malformed object file".
+        // A garbage `sh_name`, or an empty string table (`e_shstrndx` is SHN_UNDEF), must not
+        // hide a later `.dep-v0` section or turn "no audit data" into "malformed object file".
         if cstr_at(strtab, name_off as usize).is_ok_and(is_dep_section) {
             return r.slice(off, size);
         }
@@ -1112,10 +1098,8 @@ fn extract_from_elf(bytes: &[u8]) -> Result<&[u8], SbomError> {
 }
 
 fn extract_from_macho_thin(bytes: &[u8], base: usize) -> Result<&[u8], SbomError> {
-    // MH_MAGIC(_64) is 0xfeedface / 0xfeedfacf as a NUMBER, so a little-endian
-    // image starts with those bytes reversed. Derive both the word size and the
-    // byte order from the raw bytes rather than assuming little-endian and
-    // rejecting the swapped form as "unsupported".
+    // MH_MAGIC(_64) is 0xfeedface / 0xfeedfacf as a number, so a little-endian image starts with
+    // those bytes reversed. Both word size and byte order come from the raw bytes.
     let (class64, big_endian) = match Reader::new(bytes, false).slice(base, 4)? {
         [0xcf, 0xfa, 0xed, 0xfe] => (true, false),
         [0xce, 0xfa, 0xed, 0xfe] => (false, false),
@@ -1178,13 +1162,9 @@ fn extract_from_macho_fat(bytes: &[u8], fat64: bool) -> Result<&[u8], SbomError>
     let narch = r.u32(4)? as usize;
     let entry = if fat64 { 32usize } else { 20 };
 
-    // Collect EVERY slice that carries audit data rather than returning the
-    // first. Architecture slices can legitimately disagree — a
-    // `cfg(target_arch)` dependency is in one and not another — so describing
-    // the whole binary by whichever came first would silently omit crates that
-    // are really in it. A slice that fails to parse is skipped: an unreadable
-    // one must not mask a readable one, and if none are readable the caller
-    // still gets `NoAuditData`.
+    // Collect every slice with audit data: slices can differ (a `cfg(target_arch)` dependency),
+    // so the first alone could omit linked crates. An unparseable slice is skipped so it cannot
+    // mask a readable one.
     let mut found: Vec<&[u8]> = Vec::new();
     for i in 0..narch {
         let base = i
@@ -1204,8 +1184,7 @@ fn extract_from_macho_fat(bytes: &[u8], fat64: bool) -> Result<&[u8], SbomError>
     match found.len() {
         0 => Err(SbomError::NoAuditData),
         1 => Ok(found[0]),
-        // Identical payloads across slices are not a disagreement — that is
-        // just the same dependency list compiled twice.
+        // Identical payloads are the same dependency list compiled twice, not a disagreement.
         _ if found.iter().all(|s| *s == found[0]) => Ok(found[0]),
         slices => Err(SbomError::AmbiguousUniversalBinary { slices }),
     }
@@ -1601,10 +1580,8 @@ mod tests {
             "SBOM must not carry a wall-clock timestamp: {rendered}"
         );
 
-        // A `serialNumber` IS present — consumers require one, and GitHub's
-        // `actions/attest-sbom` refuses a CycloneDX document without it — but
-        // it is derived from the document's content, not randomly generated,
-        // so it survives `--verify`.
+        // A `serialNumber` is required (GitHub's `actions/attest-sbom` refuses a document
+        // without one), so it is derived from the content and survives `--verify`.
         let serial = serde_json::from_str::<serde_json::Value>(&rendered).unwrap()["serialNumber"]
             .as_str()
             .expect("a CycloneDX serialNumber must be present")
@@ -1628,11 +1605,8 @@ mod tests {
 
     #[test]
     fn the_serial_number_covers_everything_the_document_emits() {
-        // The serial is advertised as content-derived, and consumers use
-        // (serialNumber, version) to identify a BOM revision — so any change
-        // that alters the rendered bytes must alter it, not just the component
-        // list. Hashing a hand-picked subset let a licence or purl edit produce
-        // two different documents claiming the same revision.
+        // Consumers identify a BOM revision by (serialNumber, version), so any change to the
+        // rendered bytes must change the serial, not only a component-list change.
         let serial_of = |bom: &Bom| bom.serial_number.clone().expect("serialNumber");
         let base = bom_of(&[("serde", "1.0.0")]);
 
@@ -1674,9 +1648,7 @@ mod tests {
 
     #[test]
     fn a_platform_filter_reaches_cargo_metadata() {
-        // Without it, an SBOM generated inside a Linux image lists the whole
-        // `windows-*` family — 89 packages in this workspace that cannot be in
-        // that image.
+        // Without it, an SBOM generated inside a Linux image lists the whole `windows-*` family.
         let args = metadata_args(&SbomOptions {
             filter_platform: Some("x86_64-unknown-linux-gnu".into()),
             ..SbomOptions::default()
@@ -1698,10 +1670,8 @@ mod tests {
 
     #[test]
     fn no_default_features_reaches_cargo_metadata() {
-        // An app built with `cargo build --no-default-features` links fewer
-        // crates than the default set; without the flag the SBOM would
-        // describe crates that were never linked. Off by default, like every
-        // other resolution switch.
+        // A `--no-default-features` build links fewer crates; without the flag the SBOM would
+        // list crates that were never linked. Off by default, like every resolution switch.
         let args = metadata_args(&SbomOptions {
             no_default_features: true,
             ..SbomOptions::default()
@@ -1835,9 +1805,8 @@ mod tests {
 
     #[test]
     fn dev_only_dependencies_are_excluded_from_the_component_list() {
-        // Issue #2385, defect 1: `cargo metadata` resolves dev-dependencies
-        // but never links them into the shipped artifact, so the SBOM must
-        // not inventory them (false vulnerability findings otherwise).
+        // `cargo metadata` resolves dev-dependencies but never links them, so the SBOM must not
+        // list them, or scanners report false findings (#2385).
         let root_id = "path+file:///tmp/ws#my-app@1.2.3";
         let serde_id = "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228";
         let memchr_id = "registry+https://github.com/rust-lang/crates.io-index#memchr@2.7.4";
@@ -1915,9 +1884,8 @@ mod tests {
 
     #[test]
     fn manifest_path_selects_the_member_root_of_a_virtual_workspace() {
-        // Issue #2385, defect 2: `cargo metadata --manifest-path m1/Cargo.toml`
-        // on a virtual workspace reports `resolve.root: null`, but the SBOM
-        // must describe the named member, not the whole workspace.
+        // On a virtual workspace, `cargo metadata --manifest-path m1/Cargo.toml` reports
+        // `resolve.root: null`; the SBOM must still describe m1, not the workspace (#2385).
         //
         // The manifest paths must be absolute on the host: `/tmp/...` has no
         // drive letter on Windows, so `manifest_matches` would resolve the
@@ -2056,9 +2024,8 @@ mod tests {
 
     #[test]
     fn the_no_audit_data_error_does_not_recommend_a_broken_remedy() {
-        // A bare RUSTC_WORKSPACE_WRAPPER=cargo-auditable fails the very next
-        // build — this crate's own `build.rs` documents why. Telling a user to
-        // try it is worse than saying nothing.
+        // A bare RUSTC_WORKSPACE_WRAPPER=cargo-auditable fails the next build (see this crate's
+        // `build.rs`), so the message must not suggest it.
         let msg = SbomError::NoAuditData.to_string();
         assert!(msg.contains("cargo auditable build"), "{msg}");
         assert!(
@@ -2162,10 +2129,8 @@ mod tests {
 
     #[test]
     fn verification_rejects_a_document_carrying_fields_this_tool_never_emits() {
-        // Modelling only the fields we write means anything else — an injected
-        // `metadata.timestamp`, a fabricated `vulnerabilities` array, an extra
-        // `dependencies` graph — is silently dropped on read and the comparison
-        // sees a document that matches. Verification has to notice.
+        // An unmodelled field (an injected `metadata.timestamp`, a fabricated `vulnerabilities`
+        // array) would be dropped on read and compare equal. Verification must reject it.
         let mut doc: serde_json::Value =
             serde_json::from_str(&render(&bom_of(&[("serde", "1.0.0")])).unwrap()).unwrap();
         doc["vulnerabilities"] = json!([{ "id": "CVE-0000-0000" }]);
@@ -2195,10 +2160,8 @@ mod tests {
 
     #[test]
     fn a_bom_round_tripped_through_json_still_verifies() {
-        // Regression: `source_id` is `#[serde(skip)]`, so a document read back
-        // from disk has `None` where a freshly generated one has the cargo
-        // package id. Comparing it made every component "differ" and the
-        // release gate failed on its own output.
+        // `source_id` is `#[serde(skip)]`, so a document read from disk has `None` there. The
+        // diff must ignore it, or the gate fails on its own output.
         let fresh = bom_of(&[("serde", "1.0.0"), ("anyhow", "1.0.5")]);
         let from_disk: Bom = serde_json::from_str(&render(&fresh).unwrap()).unwrap();
         assert!(
@@ -2238,9 +2201,8 @@ mod tests {
 
     #[test]
     fn workspace_fallback_reads_the_virtual_manifest_version() {
-        // Regression: `str::parse::<toml::Value>()` parses a bare TOML value,
-        // not a document, so it fails on the first table header and every
-        // virtual-workspace SBOM silently claimed version 0.0.0.
+        // `str::parse::<toml::Value>()` parses a bare TOML value, not a document, so it fails on
+        // the first table header and the version falls back to 0.0.0.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -2347,8 +2309,8 @@ mod tests {
 
     #[test]
     fn does_not_panic_on_an_elf_with_an_absurd_section_table_offset() {
-        // `e_shoff` near usize::MAX previously reached an unchecked `+ 32`
-        // while reading the extended-numbering fields off section header 0.
+        // `e_shoff` near usize::MAX must not overflow the offset math that reads the
+        // extended-numbering fields off section header 0.
         let mut elf = vec![0x7f, b'E', b'L', b'F', 2, 1, 1];
         elf.extend_from_slice(&[0u8; 9]);
         elf.resize(64, 0);
@@ -2373,8 +2335,7 @@ mod tests {
 
     #[test]
     fn diff_reports_root_component_metadata_drift() {
-        // Comparing only name+version let an edited root purl or licence
-        // through — the release gate must reject the whole component.
+        // An edited root purl or licence must fail the gate, not only a name or version change.
         let expected = bom_of(&[("serde", "1.0.0")]);
         let mut actual = expected.clone();
         actual.metadata.component.purl = Some("pkg:cargo/backdoor@0.7.0".into());

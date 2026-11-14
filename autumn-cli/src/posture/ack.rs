@@ -123,22 +123,18 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
 #[must_use]
 pub fn parse_comment(text: &str) -> Vec<Acknowledgment> {
     let mut acks = Vec::new();
-    // The character and length of the fence currently open, if any. Toggling a
-    // bool instead would let the inner ``` of a report quoted inside a ````
-    // block *close* the outer fence, making the quoted marker live — so
-    // quoting an acknowledgment would acknowledge it.
+    // The open fence's character and length. A bool toggle would let the inner
+    // ``` of a report quoted inside a ```` block close the outer fence and make
+    // the quoted marker live.
     let mut fence: Option<(char, usize)> = None;
     // Inside a multi-line `<!-- … -->`, which GitHub renders as nothing.
     let mut html_comment = false;
     // Inside a block-quote paragraph. `CommonMark` continues one across a line
-    // that carries no `>` of its own — a *lazy continuation* — and GitHub
-    // renders that line as quoted too, so a marker there is discussion, not a
-    // decision. Checking only the current line let it count as a grant.
+    // with no `>` of its own (a lazy continuation), and GitHub renders that
+    // line as quoted too, so a marker there is discussion, not a grant.
     let mut quote_paragraph = false;
-    // Inside a raw HTML block whose content GitHub renders literally. Only
-    // these four: a marker inside a `<div>` is plainly *visible*, so it is a
-    // decision like any other, and skipping it would take the escape hatch away
-    // from anyone who formats their comments.
+    // Inside a raw HTML block whose content GitHub renders literally. Other
+    // HTML, such as `<div>`, stays visible, so a marker there still counts.
     let mut raw_html: Option<RawBlock> = None;
     // Inside an HTML tag that has not closed yet. A tag can span lines, and the
     // lines inside it are attribute data — a marker in a `title=` renders as
@@ -149,28 +145,20 @@ pub fn parse_comment(text: &str) -> Vec<Acknowledgment> {
     // inline code — including across a newline.
     let mut code_span: Option<usize> = None;
     for line in text.lines() {
-        // A blank line ends the quoted paragraph, so the lazy continuation
-        // stops here and the rest of the comment is live text again. Read from
-        // the raw line: a line that renders empty because it is all HTML
-        // comment is not a paragraph break.
+        // A blank line ends a quoted paragraph and any open code span. Read
+        // from the raw line: a line that is all HTML comment is not a break.
         if line.trim().is_empty() {
             quote_paragraph = false;
-            // A blank line ends the paragraph, and a code span cannot outlive
-            // the paragraph that opened it.
             code_span = None;
             continue;
         }
-        // An acknowledgment has to be *visible* on the pull request — that is
-        // the whole value of putting it there. Text inside an HTML comment
-        // renders as nothing, so it acknowledges nothing.
+        // An acknowledgment must be visible on the pull request, so text inside
+        // an HTML comment does not count.
         //
-        // Inside a fenced block, though, the text is literal: a line that puts
-        // an HTML comment before a fence run is content, because a closing
-        // fence carries no prefix. Stripping the comment there would uncover
-        // a bare run that closed the block early,
-        // making everything after it live while GitHub still drew it as code.
-        // So strip only outside a fence — and an `<!--` inside one opens
-        // nothing, for the same reason.
+        // Inside a fence the text is literal: stripping a comment there could
+        // uncover a bare fence run that closes the block early while GitHub
+        // still draws it as code. So strip only outside a fence; inside one,
+        // `<!--` opens nothing.
         let visible = if fence.is_some() {
             line.to_owned()
         } else {
@@ -180,9 +168,9 @@ pub fn parse_comment(text: &str) -> Vec<Acknowledgment> {
             continue;
         }
         let line = visible.as_str();
-        // `<pre>` and friends render their content as a preformatted sample,
-        // exactly like a fenced block — so a reviewer showing the marker is not
-        // granting it. Tracked only outside a fence, where such a tag is text.
+        // `<pre>` and friends render as a preformatted sample, like a fenced
+        // block, so a marker there is not a grant. Inside a fence such a tag is
+        // plain text.
         if fence.is_none() {
             if let Some(block) = raw_html {
                 if block.closed_by(line) {
@@ -197,10 +185,8 @@ pub fn parse_comment(text: &str) -> Vec<Acknowledgment> {
                 continue;
             }
         }
-        // Markdown's other code block: four spaces (or a tab) of indentation
-        // renders as code, so a marker written that way is a sample, not a
-        // grant. Skipping is the safe direction — the worst case is a reviewer
-        // re-posting an unindented line, never an acknowledgment nobody meant.
+        // Four spaces or a tab of indentation renders as code. Skipping errs
+        // safe: the worst case is a reviewer re-posting an unindented line.
         if fence.is_none() && is_indented_code(line) {
             continue;
         }
@@ -215,12 +201,9 @@ pub fn parse_comment(text: &str) -> Vec<Acknowledgment> {
         }
         let trimmed = line.trim_start();
         match (fence, fence_run(trimmed)) {
-            // A fence closes only with the same character, at least as long,
-            // nothing after it, and at most three spaces of indentation —
-            // `CommonMark`'s rule. The indent matters: four spaces makes the
-            // line *content* of the block, so GitHub keeps drawing the code
-            // block, and closing there would make every following line live
-            // while the reviewer still sees it as a sample.
+            // `CommonMark`: a fence closes only with the same character, at
+            // least as long, nothing after it, and at most three spaces of
+            // indent. Four or more makes the line content of the block.
             (Some((open_char, open_len)), Some((c, len, bare)))
                 if c == open_char && len >= open_len && bare && indent <= 3 =>
             {
@@ -335,8 +318,6 @@ fn scan_html_tag(line: &str, state: TagState) -> TagState {
     while let Some(c) = chars.next() {
         if open {
             match quote {
-                // A quoted attribute value: only its own delimiter ends it, so
-                // a `>` inside one does not close the tag.
                 Some(q) => {
                     if c == q {
                         quote = None;
@@ -389,8 +370,7 @@ impl RawBlock {
     fn closed_by(self, line: &str) -> bool {
         let line = line.to_ascii_lowercase();
         match self {
-            // The tag has to end where the tag ends: `</prelude>` is not
-            // `</pre>`, and a prefix match closed the block on it.
+            // The tag name must end there: `</prelude>` does not close `<pre>`.
             Self::Tag(tag) => {
                 let close = format!("</{tag}");
                 line.match_indices(&close).any(|(at, _)| {
@@ -478,9 +458,8 @@ fn parse_marker(line: &str) -> Option<Acknowledgment> {
     if !is_digest(&digest) {
         return None;
     }
-    // Optional `ceiling=` token. Reject the marker if the token is bad. A
-    // bare-digest reading would silently change "no wider than" to "exactly
-    // this".
+    // Optional `ceiling=` token. A bad token voids the marker: reading it as a
+    // bare digest would turn "no wider than" into "exactly this".
     let rest = rest.trim_start();
     let (next, after) = split_token(rest);
     let (ceiling, reason) = match next.strip_prefix(CEILING_KEY) {
@@ -1068,11 +1047,9 @@ not a marker: /ack-posture ffffffffffffffff
     #[test]
     fn a_prefix_shorter_than_the_published_marker_never_matches() {
         let digest = ack_digest(&[&finding("route_added_open", "/a")]);
-        // A genuine 8-character prefix of the right digest still does not
-        // acknowledge it: the published marker is 16, and accepting less would
-        // let a shorter, weaker binding through the gate. Parsing it (rather
-        // than dropping it) is what makes the "no acknowledgment matched"
-        // diagnostic able to say so.
+        // A true 8-character prefix still does not match: the published marker
+        // is 16, and less is a weaker binding. It still parses, so the "no
+        // acknowledgment matched" diagnostic can report it.
         let truncated: String = digest.chars().take(8).collect();
         let acks = parse_acks(&format!("/ack-posture {truncated}"));
         assert_eq!(acks.len(), 1, "it parses");

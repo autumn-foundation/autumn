@@ -180,11 +180,9 @@ pub fn run_sim(
             );
         }
         WebhookProvider::Stripe => {
-            // A payload with no top-level "id" used to be a 400
-            // (MissingDeliveryId) here, because Stripe's replay key comes from
-            // that field. `with_fresh_body_delivery_id` above now always sets
-            // one — unless the payload is not a JSON object, which stays the
-            // user's business and is warned about here.
+            // Stripe's replay key is the top-level "id"; without one the receiver answers 400
+            // (MissingDeliveryId). `with_fresh_body_delivery_id` sets it unless the payload is
+            // not a JSON object.
             if fresh_body_id.is_none() {
                 eprintln!(
                     "⚠️  Warning: could not set a delivery ID — the Stripe payload is not a \
@@ -486,9 +484,8 @@ mod tests {
 
     #[test]
     fn header_based_providers_announce_the_requested_event_type() {
-        // Without this the simulator only ever announced `sim.event`, which no
-        // real handler dispatches on — so a simulated delivery fell through to
-        // acknowledge-and-ignore and proved nothing about the user's handler.
+        // No real handler dispatches on the default `sim.event`, so a simulation
+        // without `--event` only reaches acknowledge-and-ignore.
         let request =
             capture_request_with_event("github", r#"{"ref":"refs/heads/main"}"#, Some("push"));
         assert_eq!(header_value(&request, "X-GitHub-Event"), "push");

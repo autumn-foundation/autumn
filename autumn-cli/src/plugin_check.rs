@@ -158,9 +158,8 @@ pub fn run(opts: &PluginCheckOptions<'_>) {
     compile_binary(opts.package, opts.bin);
     let binary = find_binary(opts.package, opts.bin);
 
-    // stderr is PIPED rather than inherited so the plugin-contract marker can be
-    // read off it (issue #1601). Everything the child wrote is relayed verbatim
-    // afterwards, minus the marker line itself, so the operator still sees the
+    // stderr is piped so the plugin-contract marker can be read off it. Every
+    // other line is relayed verbatim afterwards, so the operator still sees the
     // binary's own diagnostics.
     let mut command = Command::new(&binary);
     command.env(routes::DUMP_ENV, "1");
@@ -480,9 +479,8 @@ fn check_plugin_contract(
             };
         }
         ContractDump::Malformed(reason) => {
-            // NOT a skip. The binary answered and the answer was unreadable, so
-            // nothing about this plugin's contract has been verified — saying
-            // "skipped, too old" would be false and would read as green.
+            // Not a skip: the binary answered unreadably, so nothing was
+            // verified, and "skipped, too old" would be false and read as green.
             return CheckResult {
                 name,
                 status: CheckStatus::Fail,
@@ -542,10 +540,9 @@ fn check_plugin_contract(
         };
     };
 
-    // The framework already enforced the real pairing at registration (the
-    // binary would not have got this far otherwise), so what is left to catch
-    // here is a requirement no parser can evaluate — which silently disables
-    // that enforcement.
+    // The framework already enforced the pairing at registration, or the binary
+    // would not have run. What is left is a requirement no parser can evaluate,
+    // which silently disables that enforcement.
     match evaluate(contract, autumn_web::plugin_contract::AUTUMN_WEB_VERSION) {
         ContractVerdict::Unparseable { reason, .. } => CheckResult {
             name,
@@ -580,9 +577,8 @@ fn check_experimental_surface(
 ) -> CheckResult {
     let name = "experimental-surface".to_owned();
 
-    // `--deny-experimental` is a "forbid it" flag, so it fails closed: when the
-    // contract could not be read there is no evidence the plugin is clean, and
-    // a silent Skip would turn the gate into a no-op exactly when it matters.
+    // `--deny-experimental` fails closed: an unread contract is no evidence the
+    // plugin is clean, and a Skip would make the gate a no-op.
     let unevaluated = |message: String| CheckResult {
         name: name.clone(),
         status: if deny {
@@ -618,7 +614,6 @@ fn check_experimental_surface(
         );
     };
 
-    // The library rule, and then `--deny-experimental` on top of it.
     let mut result = rules::check_experimental_surface(Some(contract));
     let count = contract.experimental_surfaces.len();
     if deny && count > 0 && result.status == CheckStatus::Pass {

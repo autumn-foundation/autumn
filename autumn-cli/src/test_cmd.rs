@@ -34,10 +34,8 @@ use crate::migrate;
 pub fn run(reset: bool, cargo_args: &[String]) -> ! {
     eprintln!("\u{1F342} autumn test\n");
 
-    // 1. Resolve the base URL under the `test` profile using the same
-    //    precedence chain as `autumn migrate` (autumn.toml → AUTUMN_DATABASE__*
-    //    → DATABASE_URL). Forcing the `test` profile means an `autumn-test.toml`
-    //    / `[profile.test.database]` overlay is honored automatically.
+    // Resolve under the `test` profile with `autumn migrate`'s precedence, so an
+    // `autumn-test.toml` / `[profile.test.database]` overlay applies.
     let Some(base_url) = migrate::resolve_primary_url(Some("test")) else {
         eprintln!("\u{2717} No test database URL found.");
         eprintln!(
@@ -48,9 +46,8 @@ pub fn run(reset: bool, cargo_args: &[String]) -> ! {
         std::process::exit(1);
     };
 
-    // 2. Derive the test database URL, defaulting the name to `*_test`. This is
-    //    also the guard (AC-6): a URL whose database name cannot be made
-    //    test-shaped is refused here rather than provisioned.
+    // Derive the `*_test` URL. This is also the guard: a URL whose database name cannot be made
+    // test-shaped is refused here.
     let (test_url, db_name) = match derive_test_url(&base_url) {
         Ok(derived) => derived,
         Err(e) => {
@@ -61,27 +58,18 @@ pub fn run(reset: bool, cargo_args: &[String]) -> ! {
     eprintln!("  Test database: {db_name:?}");
     eprintln!("  Profile:       test (AUTUMN_ENV=test)\n");
 
-    // 3. Provision the database, reusing the existing `autumn db` paths by
-    //    self-invoking this same binary with the derived test URL pinned via
-    //    the highest-precedence env var (mirrors `autumn db reset`).
+    // Provision and migrate by self-invoking this binary with the test URL pinned, as
+    // `autumn db reset` does.
     if reset {
-        // Clean slate: drop first (AC-5), then create below. `--force` is
-        // redundant under the test profile (the destructive guard already
-        // allows `test`) but mirrors `db reset` and stays correct even if the
-        // child resolves the profile differently.
+        // `--force` is redundant under the test profile but stays correct if the child resolves
+        // the profile differently.
         run_step("drop", &["db", "drop", "--force"], &test_url);
     }
-    // Create-if-missing; idempotent — without `--reset` an existing database is
-    // left intact (AC-2), and after a `--reset` drop this recreates it fresh.
+    // Create-if-missing: without `--reset` an existing database is left intact.
     run_step("create", &["db", "create"], &test_url);
 
-    // 4. Apply all pending app + framework migrations, reusing `autumn migrate`
-    //    (no separate migration engine).
     run_step("migrate", &["migrate"], &test_url);
 
-    // 5. Shell out to `cargo test` with the test environment exported and the
-    //    trailing args forwarded to the test harness after `--`, then exit with
-    //    its exact code.
     eprintln!("\u{2500}\u{2500} cargo test \u{2500}\u{2500}");
     let status = Command::new("cargo")
         .args(cargo_test_args(cargo_args))
@@ -92,8 +80,7 @@ pub fn run(reset: bool, cargo_args: &[String]) -> ! {
 
     match status {
         Ok(status) => {
-            // Propagate the exact `cargo test` exit code (AC-7). A process
-            // terminated by a signal has no code; treat that as a failure.
+            // Killed by a signal: no code, so report a failure.
             std::process::exit(status.code().unwrap_or(1));
         }
         Err(e) => {
@@ -203,9 +190,7 @@ fn derive_test_url(base_url: &str) -> Result<(String, String), String> {
     } else {
         format!("{name}_test")
     };
-    // Defensive guard — appending `_test` always satisfies the convention, but
-    // assert it explicitly so any future change to the derivation can't silently
-    // target a non-test database.
+    // Always passes today; guards against a future derivation targeting a non-test database.
     ensure_test_db_name(&test_name)?;
 
     parsed.set_path(&format!("/{test_name}"));
@@ -267,12 +252,8 @@ mod tests {
 
     #[test]
     fn decode_percent_matches_db_decode_percent() {
-        // These two decoders are separate, hand-duplicated copies (see both
-        // functions' doc comments) rather than a shared one, because the
-        // `test` command and the `db`/`migrate` commands must derive the
-        // exact same database name from the exact same URL. This is the
-        // drift guard: if either copy changes without the other, one of
-        // these inputs should stop matching.
+        // The two decoders are separate copies that must derive the same database name from the
+        // same URL; this catches one changing without the other.
         for segment in [
             "my_app",
             "my%20app",
@@ -328,7 +309,6 @@ mod tests {
         let (url, name) = derive_test_url("postgres://user:pw@db.example.com:6543/myapp").unwrap();
         assert_eq!(name, "myapp_test");
         assert!(url.ends_with("/myapp_test"), "url: {url}");
-        // Host, port, and credentials are preserved.
         assert!(url.contains("db.example.com:6543"), "url: {url}");
     }
 

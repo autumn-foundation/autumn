@@ -274,14 +274,10 @@ fn backend_fingerprint(root: &Path) -> &'static str {
 
 /// A digest over every generator config file this run could have read.
 fn config_fingerprint(root: &Path, args: &[String]) -> String {
-    // The auto-discovered file first, then every `--config` in the order it was
-    // given. A fixed order rather than a sorted one, and CONTENTS only — no
-    // path: `root` is an absolute path, so naming the sources would tie the
-    // identity to where the project happens to sit on disk, and a manifest
-    // written in `/home/alice/app` would be refused after a clone to
-    // `/work/app`. The later checkout is exactly what this manifest is
-    // committed for. The `--config` path itself is already in the arguments,
-    // which are part of the identity, so nothing is lost by leaving it out.
+    // The auto-discovered file first, then each `--config` in the order given. Contents only, no
+    // paths: `root` is absolute, so naming the sources would refuse the committed manifest after a
+    // clone to another directory. The `--config` paths are already in the arguments, which are
+    // part of the identity.
     let mut sources = vec![root.join(GENERATE_CONFIG_FILENAME)];
     let mut next_is_path = false;
     for arg in args {
@@ -798,9 +794,8 @@ mod tests {
 
     #[test]
     fn the_identity_does_not_depend_on_where_the_project_sits() {
-        // The manifest is committed so a LATER CHECKOUT has a baseline. An
-        // identity that named its absolute config paths would refuse every
-        // clone that landed on a different path (Codex review of PR #2551).
+        // The manifest is committed so a later checkout has a baseline; an identity naming absolute
+        // config paths would refuse every clone at a different path.
         let here = tmp();
         let there = tmp();
         for root in [here.path(), there.path()] {
@@ -819,9 +814,8 @@ mod tests {
 
     #[test]
     fn a_crlf_checkout_of_the_config_is_the_same_input() {
-        // `core.autocrlf` rewrites the committed recipe on checkout. It parses
-        // identically as TOML, so it must not drop the baseline — the same rule
-        // the generated-file digests follow (Codex review of PR #2551).
+        // `core.autocrlf` rewrites the committed recipe on checkout. It parses identically as TOML,
+        // so it must not drop the baseline, the same rule the generated-file digests follow.
         let lf = tmp();
         let crlf = tmp();
         std::fs::write(
@@ -893,10 +887,9 @@ mod tests {
 
     #[test]
     fn the_identity_moves_with_the_database_backend() {
-        // The backend appears in no argument, and it decides the SQL a
-        // migration holds and the `schema.rs` block a `SchemaTable` revert
-        // expects — so a project moved between SQLite and Postgres must lose
-        // its baseline rather than half-destroy (Codex review of PR #2551).
+        // The backend is in no argument, yet it decides a migration's SQL and the `schema.rs` block
+        // a `SchemaTable` revert expects, so moving between SQLite and Postgres must drop the
+        // baseline rather than half-destroy.
         let sqlite = tmp();
         let postgres = tmp();
         std::fs::write(

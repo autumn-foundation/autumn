@@ -48,11 +48,8 @@ use crate::dev_loop_scaling::GeneratedApp;
 /// sleeps `block_ms` before responding. No database, no extra routes — the
 /// framework's built-in `/live` probe is used for readiness polling.
 fn generate_overload_app(block_ms: u64) -> GeneratedApp {
-    // `autumn-web = "*"`: the driver always appends a `[patch.crates-io]`
-    // pointing this dependency at the workspace's local source (see
-    // `scaffold_app`), so the wildcard here just needs to satisfy Cargo's
-    // resolver before the patch redirects it — same convention as
-    // `dev_loop_scaling::generate_synthetic_app`.
+    // `autumn-web = "*"` only has to satisfy Cargo's resolver: `scaffold_app` appends a
+    // `[patch.crates-io]` that points it at the workspace's local source.
     let cargo_toml = "[package]\n\
          name = \"overload_bench_app\"\n\
          version = \"0.1.0\"\n\
@@ -307,10 +304,8 @@ fn measure_one_cycle(
     load_multiplier: u32,
     stats: &mut OverloadStats,
 ) -> bool {
-    // Baseline: offered load == ceiling, no shedding expected. A shed/failed
-    // outcome here would otherwise vanish with no trace, silently corrupting
-    // the "offered load == ceiling never sheds" assumption the baseline p99
-    // depends on — count it instead (see `OverloadStats::baseline_shed_count`).
+    // Baseline: offered load == ceiling, so nothing should shed. Count any shed or failure
+    // instead of dropping it: the baseline p99 assumes none happened.
     let baseline = fire_concurrent(client, url_block, ceiling);
     stats.baseline_samples_ms.extend(
         baseline
@@ -349,7 +344,6 @@ fn measure_one_cycle(
         })
     };
 
-    // Overload: offered load == ceiling * multiplier, fired simultaneously.
     let overload_count = ceiling * load_multiplier as usize;
     let overload = fire_concurrent(client, url_block, overload_count);
 
@@ -409,8 +403,7 @@ fn measure_overload(
 
     let mut cmd = Command::new(&bin);
     cmd.current_dir(tmp.path());
-    // Isolate the child from the surrounding environment — see
-    // `cold_start_driver::measure_cold_start_once` for the full rationale.
+    // Strip inherited `AUTUMN_*` config so the child runs with only what is set here.
     for (key, _) in std::env::vars() {
         if key.starts_with("AUTUMN_") {
             cmd.env_remove(&key);
@@ -473,10 +466,7 @@ fn measure_overload(
 /// In `--dry-run` mode it prints the overload budget/methodology table with
 /// no build or server. Otherwise it scaffolds and measures the live overload
 /// benchmark and emits the report.
-// Mirrors the flag set of `crate::dev_loop_bench::run` plus the
-// overload-only `ceiling`/`block_ms`/`load_multiplier` params; grouping
-// these into a struct would not improve the single CLI call site (same
-// rationale as `run_cold_start`'s identical allow).
+// Mirrors the CLI flags one to one; there is a single call site, so a params struct adds nothing.
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub fn run_overload(
     ceiling: usize,
@@ -523,8 +513,6 @@ pub fn run_overload(
     let report = build_overload_report(ceiling, block_ms, load_multiplier, &stats);
     emit_overload_report(&report, json, output, fail_on_regression)
 }
-
-// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -590,13 +578,11 @@ mod tests {
 
     #[test]
     fn sample_rss_kb_of_current_process_is_plausible_or_unsupported() {
-        // On Linux this should return a positive number for our own PID; on
-        // other platforms it must gracefully return None rather than panic.
+        // Positive on Linux; `None` without panicking on other platforms.
         let pid = std::process::id();
         if let Some(kb) = sample_rss_kb(pid) {
             assert!(kb > 0, "RSS should be positive for a running process");
         }
-        // `None` (unsupported platform) is acceptable — nothing further to assert.
     }
 
     #[test]
@@ -610,10 +596,7 @@ mod tests {
 
     #[test]
     fn fire_concurrent_reports_transport_errors_as_not_admitted() {
-        // Nothing is listening on this reserved-but-unused port, so every
-        // request should fail to connect and be classified as not admitted —
-        // and, specifically, as a transport error rather than a genuine 503
-        // shed (there is no server here to shed anything).
+        // Nothing listens on this port, so every request must be a transport error, not a 503 shed.
         let port = reserve_free_port().expect("reserve a free port");
         let url = format!("http://127.0.0.1:{port}/nope");
         let client = reqwest::blocking::Client::builder()
@@ -631,8 +614,6 @@ mod tests {
              not conflated with a genuine 503 shed"
         );
     }
-
-    // ── live driver (slow: compiles and runs a throwaway project) ──────────
 
     #[test]
     #[ignore = "compiles and runs a throwaway project; run with --ignored"]

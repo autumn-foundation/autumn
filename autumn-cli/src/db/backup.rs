@@ -394,13 +394,11 @@ pub fn run_restore(args: &RestoreArgs) {
 
 pub(super) fn backup(args: &BackupArgs) -> Result<(), BackupError> {
     let targets = resolve_targets(args.profile.as_deref(), &args.target)?;
-    // Include the managed cluster's bundled tools (daemon/cron path, where
-    // AUTUMN_MANAGED_PG_DATA_DIR isn't inherited) so a managed backup needs zero
-    // external tools on PATH (issue #1595).
+    // Include the managed cluster's bundled tools: the daemon/cron path does not inherit
+    // AUTUMN_MANAGED_PG_DATA_DIR, and a managed backup needs no tools on PATH (#1595).
     let tools = PgTools::locate_with_extra(managed_pg_data_dir());
-    // Resolve `pg_dump` only when the run holds a Postgres target (issue #1909).
-    // An all-SQLite app has no client tools and needs none. A mixed run still
-    // fails before any artifact is written.
+    // Only a run with a Postgres target needs `pg_dump` (#1909). A mixed run still fails
+    // here, before any artifact is written.
     let pg_dump = if targets.iter().any(|t| t.backend == TargetBackend::Postgres) {
         Some(tools.require("pg_dump")?)
     } else {
@@ -409,14 +407,10 @@ pub(super) fn backup(args: &BackupArgs) -> Result<(), BackupError> {
 
     let profile = migrate::effective_profile(args.profile.as_deref());
 
-    // Offsite pre-flight (issue #1619). Decide whether to upload with a LIGHT
-    // probe that reads ONLY `[backup.offsite].auto_upload` (real env → `.env.<p>`
-    // → merged TOML), WITHOUT a full `AutumnConfig` load — so a local-only backup
-    // never triggers global config validation or encrypted-credentials
-    // decryption (a cron job may not export AUTUMN_MASTER_KEY). Only when an
-    // upload is actually requested do we do the full, strict resolve (bucket
-    // required, creds env resolved, distinct-destination guard) and build the
-    // client — BEFORE dumping — so a misconfigured offsite fails fast.
+    // The probe reads only `[backup.offsite].auto_upload`, without a full `AutumnConfig`
+    // load, so a local-only backup never validates config or decrypts credentials (a cron
+    // job may not export AUTUMN_MASTER_KEY). An upload resolves strictly and builds the
+    // client before dumping, so a misconfigured offsite fails fast (#1619).
     let should_upload = args.upload || auto_upload_probe(&profile);
     let upload_ctx = if should_upload {
         let offsite = load_offsite(&profile)?
@@ -431,9 +425,8 @@ pub(super) fn backup(args: &BackupArgs) -> Result<(), BackupError> {
     let root = backup_root(args.dir.as_deref(), &profile);
     let run_dir = create_unique_run_dir(&root, &run_dir_name(&now_utc()))?;
 
-    // Everything below writes into `run_dir`. On ANY failure we remove the
-    // whole run directory so a partial/empty artifact is never left behind and
-    // never counted toward retention (AC #1).
+    // On any failure the whole run directory goes, so a partial artifact is never left
+    // behind or counted toward retention.
     let result = backup_into(
         &run_dir,
         &targets,
@@ -454,35 +447,27 @@ pub(super) fn backup(args: &BackupArgs) -> Result<(), BackupError> {
         run_format_note(&targets, args.format),
     );
 
-    // Retention runs only AFTER a verified-successful backup, so a failed run
-    // can never prune good history (AC #6).
+    // Prune only after a verified backup, so a failed run never prunes good history.
     if let Some(keep) = args.keep {
         prune(&root, keep)?;
     }
 
-    // Offsite upload runs LAST, only after local verification + prune. A failure
-    // here is the split outcome (AC #2/#6): the local artifact stays intact and
-    // the command exits non-zero with an unambiguous message.
+    // Upload last. A failed upload keeps the verified local artifact and exits non-zero.
     if let Some((offsite, client)) = upload_ctx {
         let local_run_id = run_dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        // The REMOTE run id gains a globally-unique token (P2 #12) so concurrent
-        // same-second backups of this profile from different hosts never collide
-        // in the bucket; the local run directory keeps its #1595 `<timestamp>`.
+        // The remote run id adds a token so same-second backups from different hosts never
+        // collide in the bucket. The local run directory keeps its plain `<timestamp>`.
         let remote_id = remote_run_id(&local_run_id, &remote_run_token());
-        // Canonicalize the profile for the REMOTE key prefix (P2 #22) so upload,
-        // `db offsite list`, and restore all address the same `<canonical>/…`
-        // location regardless of alias/case spelling — while the LOCAL run dir
-        // keeps its raw #1595 `<profile>/<timestamp>` layout (used above).
+        // The remote prefix uses the canonical profile, so upload, `db offsite list` and
+        // restore agree whatever the alias or case. The local run dir keeps the raw profile.
         let remote_profile = migrate::canonical_profile(&profile);
         if let Err(detail) = upload_run(&offsite, &client, &run_dir, &remote_profile, &remote_id) {
             let local_path = run_dir.display().to_string();
-            // #1743: raise an operator alert so an unattended/cron backup with
-            // [alerts] configured never fails its upload silently. Best-effort —
-            // never changes the exit code; the `?`-equivalent return below still
-            // exits non-zero with the same split-outcome message as before.
+            // Alert so an unattended backup never fails its upload silently (#1743).
+            // Best-effort: the exit code comes from the return below.
             emit_offsite_upload_failure_alert(&local_path, &detail);
             return Err(BackupError::OffsiteUploadFailed { local_path, detail });
         }
@@ -679,14 +664,11 @@ fn split_password(url: &str) -> (String, Option<String>) {
                 .into_owned()
         });
         if password.is_some() {
-            // Clearing the password keeps the username, host, port, db, and
-            // any query parameters intact.
             let _ = parsed.set_password(None);
         }
         return (parsed.to_string(), password);
     }
-    // Not a URL: it may be libpq keyword/value form, where the password would
-    // otherwise ride along on argv.
+    // Not a URL: it may be libpq keyword/value form.
     split_password_kv(url)
 }
 
@@ -907,8 +889,7 @@ fn verify_artifact(
     db: &str,
     tools: &PgTools,
 ) -> Result<(), BackupError> {
-    // A SQLite artifact IS a database: grade it with `PRAGMA integrity_check`
-    // (issue #1909) rather than a Postgres archive reader.
+    // A SQLite artifact is a database: grade it with `PRAGMA integrity_check` (#1909).
     if backend == TargetBackend::Sqlite {
         return sqlite_snapshot::verify(path).map_err(|e| BackupError::IntegrityFailed {
             detail: format!("{db}: {e}"),
@@ -924,11 +905,8 @@ fn verify_artifact(
     }
     match format {
         BackupFormat::Custom => {
-            // Resolve `pg_restore` through the SAME locator the dump/restore step
-            // used (built via `locate_with_extra` with the runtime-discovered
-            // managed data dir). Re-locating with a bare `PgTools::locate()` here
-            // would miss the daemon/cron path's bundled binary and wrongly report
-            // it missing (issue #1595).
+            // Use the caller's locator, which knows the managed data dir. A bare
+            // `PgTools::locate()` misses the daemon/cron path's bundled binary (#1595).
             let pg_restore = tools.require("pg_restore")?;
             verify_custom_archive(&pg_restore, path, db)
         }
@@ -994,9 +972,7 @@ fn verify_custom_archive(pg_restore: &Path, path: &Path, db: &str) -> Result<(),
             ),
         });
     }
-    // A valid-but-empty TOC (no dumpable objects) still lists header comment
-    // lines; require at least one non-comment entry so a truly empty archive is
-    // caught.
+    // An empty archive still lists header comment lines, so require one real entry.
     let listing = String::from_utf8_lossy(&output.stdout);
     if toc_entry_count(&listing) == 0 {
         return Err(BackupError::IntegrityFailed {
@@ -1018,16 +994,14 @@ fn verify_plain_dump(path: &Path, db: &str) -> Result<(), BackupError> {
         .map_err(BackupError::io(format!("stat {}", path.display())))?
         .len();
 
-    // A 0-byte dump can't contain the completion marker: it's truncated/incomplete.
     if len == 0 {
         return Err(BackupError::IntegrityFailed {
             detail: format!("the {db:?} SQL dump is empty (likely truncated)"),
         });
     }
 
-    // The completion marker is on the final line, so only the dump's tail needs to
-    // be read — avoid loading a potentially multi-GB dump into memory. Read the
-    // last ~1 KiB (clamped to the file size for tiny files).
+    // The completion marker is on the final line: read only the last 1 KiB, never the
+    // whole (possibly multi-GB) dump.
     let read_len = len.min(1024);
     let offset = -i64::try_from(read_len).expect("read_len is at most 1024");
     file.seek(SeekFrom::End(offset))
@@ -1053,22 +1027,16 @@ fn verify_plain_dump(path: &Path, db: &str) -> Result<(), BackupError> {
 
 /// Restore an artifact, returning the label of every target it wrote to.
 pub(super) fn restore(args: &RestoreArgs) -> Result<Vec<String>, BackupError> {
-    // Production guard — identical to `autumn db drop` (AC #4). This guards the
-    // RESTORE-TARGET profile (`--profile`), independent of any offsite source.
+    // The same production guard as `autumn db drop`, on the restore-target profile, not
+    // on any offsite source.
     let profile = migrate::effective_profile(args.profile.as_deref());
     super::guard_destructive(&profile, args.force).map_err(|_| BackupError::ProductionRefused {
         profile: profile.clone(),
     })?;
 
-    // Offsite restore (issue #1619): when `--offsite` is set or the artifact is
-    // an `offsite:<profile>/<ts|latest>` reference, download the run to a fresh
-    // temp dir and hand it to the SAME RestorePlan::discover path so the
-    // identical integrity-refusal + guard/`--force` protocol applies unchanged.
     let artifact_str = args.artifact.to_string_lossy();
-    // When offsite is indicated (flag or `offsite:` prefix) we commit to the
-    // offsite path: a malformed reference is an error, never a silent fall
-    // through to a same-named local artifact. `None` means offsite was not
-    // indicated at all, so a normal local restore proceeds.
+    // Once offsite is indicated (flag or `offsite:` prefix), a malformed reference is an
+    // error, never a fall-through to a same-named local artifact (#1619).
     if let Some(oref) = resolve_offsite_ref(args.offsite, &artifact_str) {
         return restore_from_offsite(args, &oref?);
     }
@@ -1085,15 +1053,11 @@ fn apply_restore_plan(plan: &RestorePlan, args: &RestoreArgs) -> Result<Vec<Stri
     let entries = plan.select(args.shard.as_deref())?;
 
     let targets = resolve_targets_for_restore(args.profile.as_deref(), &entries)?;
-    // Same bundled-tool discovery as backup: a managed restore must also work
-    // with zero external tools on PATH (issue #1595).
+    // A managed restore needs no tools on PATH either (#1595).
     let tools = PgTools::locate_with_extra(managed_pg_data_dir());
 
-    // Refuse a backend mismatch before anything else (issue #1909). Each entry's
-    // mechanism comes from the MANIFEST, the database it writes to from the
-    // CONFIG, so restoring a SQLite run into a Postgres environment (or the
-    // reverse) would otherwise fail deep inside a driver with an unrelated
-    // message. Names labels and backends only — never a URL.
+    // The backend comes from the manifest and the target from the config. Refuse a
+    // mismatch up front, or it fails deep inside a driver (#1909). Never print a URL.
     for (entry, url) in &targets {
         let recorded = TargetBackend::from_manifest(&entry.backend);
         let configured = TargetBackend::detect(url);
@@ -1112,8 +1076,8 @@ fn apply_restore_plan(plan: &RestorePlan, args: &RestoreArgs) -> Result<Vec<Stri
         }
     }
 
-    // Verify EVERY artifact before mutating ANY database (AC #4): refuse to
-    // start a destructive restore we can't finish.
+    // Verify every artifact before touching any database, so a destructive restore never
+    // starts that it cannot finish.
     for (entry, _url) in &targets {
         let db = format!("(artifact) {}", entry.label);
         let backend = TargetBackend::from_manifest(&entry.backend);
@@ -1152,8 +1116,7 @@ fn run_restore_one(
     format: BackupFormat,
     db: &str,
 ) -> Result<(), BackupError> {
-    // A SQLite artifact replaces the data file it was taken from; no external
-    // tool, and no `--clean` equivalent needed (issue #1909).
+    // A SQLite artifact replaces the data file it was taken from (#1909).
     if backend == TargetBackend::Sqlite {
         return sqlite_snapshot::restore(artifact, url).map_err(|e| BackupError::SqliteFailed {
             op: "restore",
@@ -1271,10 +1234,8 @@ impl RestorePlan {
             });
         }
         if path.is_file() {
-            // A bare artifact file: infer format from extension, and resolve the
-            // restore target from `--shard` or the filename convention (never
-            // blindly `control`, which would corrupt the control DB with shard
-            // data).
+            // Take the target from `--shard` or the filename, never blindly `control`: a shard
+            // dump restored there would corrupt the control database.
             let (backend, format) =
                 infer_artifact_kind(path).ok_or_else(|| BackupError::BadArtifact {
                     detail: format!(
@@ -1352,9 +1313,8 @@ fn dotenv_env() -> autumn_web::dotenv::DotenvOsEnv {
 /// `autumn db backup --profile test --upload` from a dev/unset shell would miss
 /// `.env.test`-provided offsite settings and credentials.
 pub(super) fn dotenv_env_for_profile(profile: &str) -> autumn_web::dotenv::DotenvOsEnv {
-    // Normalize aliases/case to the app's resolved profile FIRST (P2 #20), so
-    // `--profile development` / `AUTUMN_ENV=PROD` selects `.env.dev` / `.env.prod`
-    // — the same file the running app reads — instead of a literal `.env.development`.
+    // Canonicalize first, so `--profile development` selects `.env.dev`, the file the
+    // running app reads, not a literal `.env.development`.
     let profile = migrate::canonical_profile(profile);
     match autumn_web::dotenv::os_env_with_dotenv_for_profile(&profile) {
         Ok(env) => env,
@@ -1441,7 +1401,6 @@ pub(super) fn artifact_labels(artifact: &Path) -> Option<Vec<String>> {
 /// manifest) or an unreadable/invalid manifest — callers treat absence as
 /// "unknown provenance", never as "safe".
 pub(super) fn artifact_source_profile(artifact: &Path) -> Option<String> {
-    // An offsite reference names its source profile.
     if let Some(Ok(offsite)) = resolve_offsite_ref(false, &artifact.to_string_lossy()) {
         return Some(offsite.profile);
     }
@@ -1458,14 +1417,13 @@ fn resolve_targets(
 ) -> Result<Vec<ResolvedTarget>, BackupError> {
     use autumn_web::config::Env as _;
 
-    // Resolve control AND shards through the SAME `.env`-overlaid environment
-    // that `autumn migrate` uses (issue #1684), so a `.env`-provided shard
-    // override is honored identically. A real env var still wins over `.env`.
+    // Resolve control and shards through the same `.env`-overlaid environment as
+    // `autumn migrate` (#1684). A real env var still wins over `.env`.
     let table =
         migrate::read_autumn_toml_table_with_profile(Some(&migrate::effective_profile(profile)));
     let env = dotenv_env();
-    // Explicit config/env wins; fall back to the managed-pg published URL for
-    // bundled/daemon apps that don't export a DATABASE_URL (issue #1595).
+    // Config/env wins. Bundled/daemon apps that export no DATABASE_URL fall back to the
+    // managed-pg published URL (#1595).
     let control = resolve_control_url(
         migrate::resolve_primary_database_url_from_sources(|k| env.var(k), table.as_ref()),
         managed_pg_fallback_url,
@@ -1535,14 +1493,11 @@ fn resolve_targets_for_restore(
 ) -> Result<Vec<(ManifestTarget, String)>, BackupError> {
     use autumn_web::config::Env as _;
 
-    // Same `.env`-overlaid resolution as `resolve_targets` / `autumn migrate`
-    // so restore writes to the exact databases a backup would have captured.
+    // Resolve exactly as `resolve_targets` does, so restore writes to the databases a
+    // backup captured.
     let table =
         migrate::read_autumn_toml_table_with_profile(Some(&migrate::effective_profile(profile)));
     let env = dotenv_env();
-    // Same precedence as `resolve_targets`: explicit config/env first, then the
-    // managed-pg published URL so a restore into a bundled/daemon app resolves a
-    // live control URL without a manually exported DATABASE_URL (issue #1595).
     let control = resolve_control_url(
         migrate::resolve_primary_database_url_from_sources(|k| env.var(k), table.as_ref()),
         managed_pg_fallback_url,
@@ -1661,7 +1616,6 @@ impl PgTools {
             std::env::var_os(PG_BIN_DIR_ENV).map(PathBuf::from),
             std::env::var_os(MANAGED_PG_DATA_DIR_ENV).map(PathBuf::from),
         );
-        // Reuse the exact bundle-layout derivation for the runtime-discovered dir.
         dirs.extend(candidate_bin_dirs(None, managed_data_dir));
         Self { dirs }
     }
@@ -1684,8 +1638,6 @@ impl PgTools {
     /// when the tool is neither in a candidate dir nor on PATH.
     pub fn require(&self, tool: &str) -> Result<PathBuf, BackupError> {
         let resolved = self.resolve(tool);
-        // If we resolved to a concrete existing path, use it. Otherwise probe
-        // PATH by attempting `--version`; only then decide it's missing.
         if resolved.is_absolute() {
             return Ok(resolved);
         }
@@ -1710,12 +1662,11 @@ fn candidate_bin_dirs(
         dirs.push(dir);
     }
     if let Some(data_dir) = managed_data_dir {
-        // Managed Postgres extracts its binaries to `<data_dir_parent>/postgresql`
-        // (see `autumn_web::managed_pg`); the executables live under its `bin/`.
+        // Managed Postgres extracts its binaries to `<data_dir_parent>/postgresql/bin`
+        // (see `autumn_web::managed_pg`).
         let install = data_dir.parent().unwrap_or(&data_dir).join("postgresql");
         dirs.push(install.join("bin"));
-        // Some bundle layouts nest under a versioned subdirectory; include the
-        // install root so a shallow search can find `*/bin`.
+        // Some bundle layouts nest `bin/` under a version directory.
         dirs.extend(nested_bin_dirs(&install));
     }
     dirs
@@ -1852,8 +1803,7 @@ fn run_dir_name(now: &chrono::DateTime<chrono::Utc>) -> String {
 /// same-second variant shares the `…SSZ` prefix so it all sorts before the next
 /// second's `…S(S+1)Z`.
 fn create_unique_run_dir(root: &Path, base: &str) -> Result<PathBuf, BackupError> {
-    // The exclusive `create_dir` below won't create intermediate directories, so
-    // ensure the profile root exists first.
+    // The exclusive `create_dir` below does not create the parent.
     std::fs::create_dir_all(root)
         .map_err(BackupError::io(format!("creating {}", root.display())))?;
     for attempt in 1..=MAX_RUN_DIR_ATTEMPTS {
@@ -1904,9 +1854,7 @@ fn sanitize_component(s: &str) -> String {
             }
         })
         .collect();
-    // Reject components that would resolve to the current/parent directory (or
-    // nothing at all): joining `"."`/`".."`/`""` onto the backup root enables
-    // directory traversal out of it.
+    // Joining `"."`, `".."` or `""` onto the backup root would escape it.
     if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
         "unnamed".to_owned()
     } else {
@@ -2044,11 +1992,8 @@ impl ResolvedOffsite {
             op: "connect",
             detail: e.to_string(),
         })?;
-        // Ops escape hatch: tune ONLY the multipart part size (bytes). This does
-        // NOT lower the multipart threshold, so shrinking the part size can never
-        // push a normal (sub-threshold) file into a multipart upload — it only
-        // changes how an already-multipart transfer is chunked. The client
-        // re-floors the value to S3's 5 MiB minimum.
+        // Tunes only the part size of an already-multipart upload, never the threshold.
+        // The client floors it to S3's 5 MiB minimum.
         Ok(match self.multipart_part_size_override() {
             Some(bytes) => client.with_part_size(bytes),
             None => client,
@@ -2070,9 +2015,7 @@ impl ResolvedOffsite {
     /// Resolve the access key / secret from the environment variables NAMED by
     /// config. Credential *values* never appear in errors — only the var names.
     fn resolve_credentials(&self) -> Result<S3Credentials, BackupError> {
-        // Read credentials from the SAME profile-specific `.env.<profile>` overlay
-        // the offsite config was resolved under (issue #1619 P2 #6), so a
-        // `.env.<profile>`-provided credential value is honored.
+        // The same `.env.<profile>` overlay the offsite config was resolved under (#1619).
         let env = dotenv_env_for_profile(&self.profile);
         let access_key_id = read_credential_env(&env, self.access_key_id_env.as_deref())?;
         let secret_access_key = read_credential_env(&env, self.secret_access_key_env.as_deref())?;
@@ -2136,8 +2079,7 @@ impl LoadedOffsite {
             .ok_or_else(|| BackupError::OffsiteConfig {
                 detail: "backup.offsite.s3.bucket is required".to_owned(),
             })?;
-        // Region is only meaningful for AWS + SigV4 scope; many S3-compatible
-        // endpoints ignore it. Default to us-east-1 when unset.
+        // Region only matters for AWS SigV4 scope; many S3-compatible endpoints ignore it.
         let region = offsite
             .s3
             .region
@@ -2181,15 +2123,12 @@ impl LoadedOffsite {
 /// `[backup.offsite].auto_upload` (base + `[profile.<p>]` overlay) → `false`.
 fn auto_upload_probe(profile: &str) -> bool {
     use autumn_web::config::Env as _;
-    // Normalize aliases/case to the app's resolved profile (P2 #20) so both the
-    // dotenv overlay and the `[profile.<p>]` selection match what the app reads.
+    // Canonicalize so the `.env.<p>` overlay and `[profile.<p>]` match what the app reads.
     let profile = migrate::canonical_profile(profile);
-    // The profile-aware dotenv overlay covers BOTH the real env and `.env.<p>`
-    // (a real env var wins inside the overlay), matching P2 #6.
+    // Covers the real env and `.env.<p>`; a real env var wins.
     let env = dotenv_env_for_profile(&profile);
-    // Read `autumn.toml` from the config/manifest dir (AUTUMN_MANIFEST_DIR),
-    // matching where the full loader + the dotenv overlay look — so an installed/
-    // daemon launch with a different CWD still sees `auto_upload` (P2 #15).
+    // Read from the config dir (AUTUMN_MANIFEST_DIR), not the CWD, as the full loader does:
+    // an installed/daemon launch runs from elsewhere.
     let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(&profile));
     auto_upload_from_sources(|k| env.var(k).ok(), table.as_ref())
 }
@@ -2238,18 +2177,12 @@ fn parse_bool_flag(raw: &str) -> Option<bool> {
 /// here — that is deferred to [`LoadedOffsite::resolve`] so a local backup is
 /// never blocked by an incomplete offsite section.
 fn load_offsite(profile: &str) -> Result<Option<LoadedOffsite>, BackupError> {
-    // Normalize aliases/case to the app's resolved profile (P2 #20) so the dotenv
-    // overlay, the `[profile.<p>]` selection, and the stored profile (later reused
-    // for credential resolution) all match what the running app reads.
+    // Canonicalize so the `.env.<p>` overlay, `[profile.<p>]` and the stored profile (reused
+    // for credentials) match what the running app reads.
     let profile = migrate::canonical_profile(profile);
-    // Real env + `.env.<profile>` overlay (profile-aware, P2 #6); merged TOML
-    // (base + `[profile.<p>]`) — neither decrypts credentials nor validates.
     let env = dotenv_env_for_profile(&profile);
-    // Read `autumn.toml` from the config/manifest dir (AUTUMN_MANIFEST_DIR),
-    // matching the full loader + dotenv overlay — so an installed/daemon launch
-    // whose CWD differs from the config dir still finds the offsite destination
-    // (and enforces the distinct-bucket guard) instead of reporting it
-    // unconfigured (P2 #15).
+    // Read from the config dir (AUTUMN_MANIFEST_DIR), not the CWD, as the full loader does:
+    // an installed/daemon launch runs from elsewhere.
     let table = migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(&profile));
     resolve_loaded_offsite(table.as_ref(), &env, &profile)
 }
@@ -2264,8 +2197,8 @@ fn resolve_loaded_offsite(
     env: &dyn autumn_web::config::Env,
     profile: &str,
 ) -> Result<Option<LoadedOffsite>, BackupError> {
-    // Deserialize the merged TOML into AutumnConfig — plain `Deserialize`, so no
-    // credential decryption and no `validate()` (those live only in `load*`).
+    // Plain `Deserialize`: no credential decryption and no `validate()`, which live only in
+    // `AutumnConfig::load*`.
     let mut cfg = match table {
         Some(t) => {
             let toml_str = toml::to_string(t).map_err(|e| BackupError::Offsite {
@@ -2281,19 +2214,13 @@ fn resolve_loaded_offsite(
         }
         None => autumn_web::config::AutumnConfig::default(),
     };
-    // Apply `AUTUMN_*` env overrides (incl. backup.offsite + storage.s3). This is
-    // pure field-setting — no decryption, no validation.
     cfg.apply_env_overrides_with_env(env);
 
     let Some(offsite) = cfg.backup.offsite else {
         return Ok(None);
     };
-    // Only treat the `[storage.s3]` bucket as the APP storage destination when the
-    // resolved storage backend is actually S3 (P2 #16). If the app runs on the
-    // local/disabled backend, a leftover `[storage.s3]` bucket is inert — it is
-    // not where the app writes blobs — so it must NOT trip the shared-bucket guard
-    // and force `allow_shared_bucket` for an offsite backup that happens to reuse
-    // that bucket name.
+    // On a non-S3 storage backend a leftover `[storage.s3]` bucket is inert, so it must
+    // not trip the shared-bucket guard.
     let storage_is_s3 = cfg.storage.backend == autumn_web::storage::StorageBackend::S3;
     let (app_storage_bucket, app_storage_endpoint) = if storage_is_s3 {
         (
@@ -2431,9 +2358,8 @@ fn remote_run_token() -> String {
     hasher.update([0]); // domain separator between host and pid
     hasher.update(std::process::id().to_le_bytes());
     hasher.update(nanos.to_le_bytes());
-    // 8 hex chars (4 bytes): with the same-second timestamp already dominating
-    // the run id, a cross-host collision needs the same second AND a 32-bit token
-    // collision — negligible for the handful of hosts sharing one backup prefix.
+    // 8 hex chars: a collision needs the same second and the same 32-bit token, which is
+    // negligible for the few hosts sharing one backup prefix.
     hex::encode(&hasher.finalize()[..4])
 }
 
@@ -2471,10 +2397,8 @@ fn upload_run(
     eprintln!("\u{2500}\u{2500} offsite upload \u{2500}\u{2500}");
     let mut files = list_run_files(run_dir).map_err(|e| e.to_string())?;
     files.sort();
-    // Upload `manifest.json` LAST so the presence of a verified remote manifest
-    // implies the whole run uploaded (completeness marker for `latest`
-    // resolution). A stable sort keeps the artifact files in alphabetical order
-    // and moves the single manifest to the end.
+    // Upload `manifest.json` last: a verified remote manifest marks the run complete for
+    // `latest`. The stable sort keeps the artifacts in alphabetical order.
     files.sort_by_key(|f| f.as_str() == MANIFEST_FILE);
     if files.is_empty() {
         return Err("the completed run directory contains no files to upload".to_owned());
@@ -2483,16 +2407,12 @@ fn upload_run(
     for file in &files {
         let path = run_dir.join(file);
         let key = offsite_object_key(&offsite.prefix, profile, run_id, file);
-        // `put_file_and_verify` now self-cleans the single key it just wrote on a
-        // verify failure (#1760). This run-level cleanup is still needed for the
-        // OTHER keys written EARLIER in the run: record every key up-front, then on
-        // ANY failure best-effort delete everything this run wrote — manifest first
-        // — so a run whose upload was reported FAILED never keeps a remote
-        // `manifest.json` and can't become `latest` or consume a retention slot
-        // (restores the P2 #2 invariant; #21).
+        // Record the key before writing: on any failure every key this run wrote is
+        // deleted, so a failed run never keeps a remote `manifest.json` and cannot become
+        // `latest` or take a retention slot. `put_file_and_verify` cleans only its own key
+        // (#1760).
         written_keys.push(key.clone());
-        // Stream the file straight from disk (hash pre-pass + streamed body):
-        // a multi-GB dump is never read into memory.
+        // Streamed from disk: a multi-GB dump is never read into memory.
         if let Err(e) = client.put_file_and_verify(&key, &path) {
             let detail = format!("{file}: {e}");
             cleanup_failed_upload(client, &written_keys);
@@ -2506,9 +2426,7 @@ fn upload_run(
         offsite_run_prefix(&offsite.prefix, profile, run_id),
     );
 
-    // Remote retention (AC #5): only after the just-uploaded run verified, and
-    // never removing that run. A retention error is loud but non-fatal — the
-    // verified offsite copy already exists.
+    // A retention error is loud but non-fatal: the verified offsite copy already exists.
     if let Some(keep) = offsite.keep
         && let Err(e) = prune_remote(offsite, client, profile, run_id, keep)
     {
@@ -2534,8 +2452,7 @@ fn cleanup_failed_upload(client: &S3Client, written_keys: &[String]) {
 /// their written order. Pure for unit testing.
 fn order_cleanup_keys(written_keys: &[String]) -> Vec<String> {
     let mut keys = written_keys.to_vec();
-    // `false` (manifest) sorts before `true` (everything else); stable sort keeps
-    // the remaining keys in their original order.
+    // `false` (manifest) sorts first; the stable sort keeps the rest in written order.
     keys.sort_by_key(|k| !key_is_manifest(k));
     keys
 }
@@ -2658,7 +2575,7 @@ fn plan_remote_pruning(sorted_run_ids: &[String], keep: usize, keep_run_id: &str
         .collect()
 }
 
-// ─── Offsite list (`autumn db offsite list`, AC #4) ──────────────────────────
+// ─── Offsite list (`autumn db offsite list`) ─────────────────────────────────
 
 /// Entry point for `autumn db offsite list`. Prints a credential-safe message
 /// and exits non-zero on failure.
@@ -2671,8 +2588,7 @@ pub fn run_offsite_list(profile: Option<&str>) {
 }
 
 fn offsite_list(profile: Option<&str>) -> Result<(), BackupError> {
-    // Canonicalize so the list prefix matches the profile the upload wrote under
-    // (P2 #22): `list --profile production` and `--profile prod` both read `prod/`.
+    // Canonicalize like the upload: `--profile production` and `--profile prod` read `prod/`.
     let profile = migrate::canonical_profile(&migrate::effective_profile(profile));
     let offsite = load_offsite(&profile)?
         .ok_or(BackupError::OffsiteNotConfigured)?
@@ -2742,8 +2658,7 @@ fn group_offsite_objects(objects: &[s3::S3Object], list_prefix: &str) -> Vec<Off
 fn format_offsite_listing(runs: &[OffsiteRun]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    // Column shows the FULL remote run id (`<timestamp>-<token>`, P2 #12) so an
-    // operator can copy it verbatim into `restore offsite:<profile>/<run id>`.
+    // The full run id (`<timestamp>-<token>`), to paste into `offsite:<profile>/<run id>`.
     let _ = writeln!(out, "{:<28}  {:>10}  FILES", "RUN ID", "SIZE");
     for run in runs {
         let mut labels: Vec<&str> = run.files.iter().map(|(f, _)| f.as_str()).collect();
@@ -2780,7 +2695,7 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-// ─── Offsite restore (AC #4) ─────────────────────────────────────────────────
+// ─── Offsite restore ─────────────────────────────────────────────────────────
 
 /// A parsed offsite restore reference: which profile's run to pull, and which.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2860,9 +2775,7 @@ fn is_safe_leaf_name(name: &str) -> bool {
 /// via the identical [`RestorePlan::discover`] path (AC #4). The temp dir is
 /// removed when the guard drops (after the restore completes or fails).
 fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<Vec<String>, BackupError> {
-    // Canonicalize the profile so the REMOTE key prefix matches what upload wrote
-    // (P2 #22): `offsite:production/latest` reads the same `prod/…` prefix that
-    // `--profile production` uploaded under.
+    // Canonicalize like the upload: `offsite:production/latest` reads `prod/…`.
     let profile = migrate::canonical_profile(&oref.profile);
     let offsite = load_offsite(&profile)?
         .ok_or(BackupError::OffsiteNotConfigured)?
@@ -2906,8 +2819,7 @@ fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<Vec<Str
                     obj.key
                 ),
             })?;
-        // Stream the object straight to disk (constant memory), so a multi-GB
-        // dump is never buffered while downloading for restore.
+        // Streamed to disk: a multi-GB dump is never buffered in memory.
         let dest = temp.path().join(file);
         let mut out = std::fs::File::create(&dest)
             .map_err(BackupError::io(format!("creating downloaded {file}")))?;
@@ -2920,8 +2832,7 @@ fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<Vec<Str
         eprintln!("  \u{2913} downloaded {file}");
     }
 
-    // Hand the downloaded run to the SAME plan path so the identical
-    // integrity-refusal + restore protocol applies unchanged.
+    // The same verify-then-restore path as a local restore.
     let plan = RestorePlan::discover(temp.path(), args.shard.as_deref())?;
     apply_restore_plan(&plan, args)
     // `temp` is dropped here, removing the downloaded artifacts.
@@ -2997,8 +2908,8 @@ fn resolve_latest_run(
             op: "list",
             detail: e.to_string(),
         })?;
-    // Only consider COMPLETE runs (those with a remote manifest.json), so a
-    // partial/failed upload never shadows the last good backup.
+    // Only complete runs (with a remote manifest.json): a failed upload never shadows the
+    // last good backup.
     complete_remote_run_ids(&objects, &list_prefix)
         .into_iter()
         .next_back() // sorted ascending; newest complete run is last
@@ -3121,10 +3032,8 @@ mod tests {
 
     #[test]
     fn sanitize_component_rejects_traversal_components() {
-        // A normal name is untouched...
         assert_eq!(sanitize_component("shard1"), "shard1");
-        // ...but bare `.`, `..`, and empty (which would join to the current or
-        // parent directory, escaping the backup root) fall back to "unnamed".
+        // `.`, `..` and empty would escape the backup root.
         assert_eq!(sanitize_component("."), "unnamed");
         assert_eq!(sanitize_component(".."), "unnamed");
         assert_eq!(sanitize_component(""), "unnamed");
@@ -3313,12 +3222,9 @@ mod tests {
 
     #[test]
     fn managed_data_dir_candidate_locates_bundled_tools() {
-        // Simulate the managed-daemon layout: the cluster's data dir sits beside
-        // the extracted `postgresql/bin` bundle. In the daemon/cron path
-        // AUTUMN_MANAGED_PG_DATA_DIR isn't set, so the ONLY way to find these
-        // tools is by feeding the runtime-discovered data dir to the locator
-        // (issue #1595). Placing fake `pg_dump`/`pg_restore` there must let the
-        // locator resolve them by concrete path.
+        // The managed-daemon layout: the data dir sits beside the extracted
+        // `postgresql/bin` bundle. The daemon/cron path has no AUTUMN_MANAGED_PG_DATA_DIR,
+        // so the discovered data dir is the only way to find these tools (#1595).
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("pgdata");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -3340,19 +3246,14 @@ mod tests {
     #[test]
     fn verify_artifact_resolves_pg_restore_from_managed_tools() {
         use std::os::unix::fs::PermissionsExt;
-        // Regression for the verify path re-locating with a bare `PgTools::locate()`
-        // instead of the threaded, managed-data-dir-aware tools (issue #1595). In
-        // the daemon/cron layout the bundled `pg_restore` sits in
-        // `<data_dir parent>/postgresql/bin` and is NOT on PATH, so it's reachable
-        // only through the managed-data-dir-derived candidate dirs. If verify still
-        // called `PgTools::locate()`, this archive would be reported as
-        // `pg_restore` missing.
+        // Verify must use the caller's managed-data-dir-aware tools: the bundled
+        // `pg_restore` is not on PATH, so a bare `PgTools::locate()` reports it missing
+        // (#1595).
         let tmp = tempfile::tempdir().unwrap();
         let bundle_bin = tmp.path().join("postgresql").join("bin");
         std::fs::create_dir_all(&bundle_bin).unwrap();
-        // A fake `pg_restore` that prints a one-entry TOC for `--list`; a real or
-        // absent binary would reject this synthetic archive (or be missing), so a
-        // successful verify proves the bundled binary is the one that ran.
+        // A fake `pg_restore` that prints a one-entry TOC. A real or absent binary would
+        // reject this synthetic archive, so a pass proves the bundled one ran.
         let pg_restore = bundle_bin.join("pg_restore");
         std::fs::write(
             &pg_restore,
@@ -3363,9 +3264,7 @@ mod tests {
 
         let data_dir = tmp.path().join("pgdata");
         std::fs::create_dir_all(&data_dir).unwrap();
-        // Build the locator from the managed data dir exactly as `locate_with_extra`
-        // does (via `candidate_bin_dirs`), but without touching process env so the
-        // test is hermetic.
+        // As `locate_with_extra` does, without reading the process env.
         let tools = PgTools::with_dirs(candidate_bin_dirs(None, Some(data_dir)));
 
         let archive = tmp.path().join("control.dump");
@@ -3411,17 +3310,13 @@ mod tests {
     fn verify_plain_dump_reads_only_tail() {
         let tmp = tempfile::tempdir().unwrap();
 
-        // A complete dump whose body is far larger than the 1 KiB tail window
-        // still verifies — the marker is on the final line and only the tail is
-        // read.
+        // A complete dump far larger than the 1 KiB tail window still verifies.
         let complete = tmp.path().join("complete.sql");
         let mut body = "CREATE TABLE x();\n".repeat(4096);
         body.push_str("--\n-- PostgreSQL database dump complete\n--\n");
         std::fs::write(&complete, &body).unwrap();
         assert!(verify_plain_dump(&complete, "db").is_ok());
 
-        // A dump missing the marker is flagged as an integrity failure, even
-        // when the body far exceeds the tail window.
         let truncated = tmp.path().join("truncated.sql");
         std::fs::write(&truncated, "CREATE TABLE x();\n".repeat(4096)).unwrap();
         assert!(matches!(
@@ -3435,7 +3330,6 @@ mod tests {
         std::fs::write(&tiny, "-- PostgreSQL database dump complete\n").unwrap();
         assert!(verify_plain_dump(&tiny, "db").is_ok());
 
-        // A 0-byte dump can't hold the marker: truncated/incomplete.
         let empty = tmp.path().join("empty.sql");
         std::fs::write(&empty, b"").unwrap();
         assert!(matches!(
@@ -3604,8 +3498,7 @@ mod tests {
             "postgres://u:p@h:5432/app",
             "postgresql://h/app",
             "host=db user=app sslmode=require",
-            // An unrecognized target keeps the historical Postgres path rather
-            // than being guessed at, mirroring `autumn migrate`'s rule.
+            // An unrecognized target stays on Postgres, as in `autumn migrate`.
             "/var/lib/app.db",
             "",
         ] {
@@ -3619,9 +3512,7 @@ mod tests {
 
     #[test]
     fn manifest_backend_defaults_to_postgres_for_pre_1909_artifacts() {
-        // A manifest written before #1909 has no `backend` field, so serde fills
-        // an empty string; it must restore through the Postgres path exactly as
-        // it always did.
+        // A manifest from before #1909 has no `backend` field: it restores through Postgres.
         let legacy: Manifest = serde_json::from_str(
             r#"{"autumn_version":"0.6.0","created_at":"2026-07-10T04:05:06+00:00",
                 "profile":"prod","format":"custom",
@@ -3659,8 +3550,8 @@ mod tests {
             TargetBackend::detect(url),
             "the guard's premise: a SQLite artifact against a Postgres URL"
         );
-        // …and a legacy manifest (no backend field) against a Postgres URL must
-        // still agree, so the guard can never refuse an existing restore.
+        // A legacy manifest (no backend field) agrees with a Postgres URL, so the guard never
+        // refuses an existing restore.
         assert_eq!(
             TargetBackend::from_manifest(&entry("").backend),
             TargetBackend::detect(url)
@@ -3696,8 +3587,7 @@ mod tests {
             url: "postgres://h/east".to_owned(),
             backend: TargetBackend::Postgres,
         };
-        // `--format` grades Postgres artifacts only, so an all-SQLite run must not
-        // claim a `custom` format it ignored.
+        // `--format` grades Postgres artifacts only: an all-SQLite run must not claim `custom`.
         assert_eq!(
             run_format_note(std::slice::from_ref(&sqlite), BackupFormat::Custom),
             "SQLite snapshot"
@@ -3813,7 +3703,6 @@ mod tests {
     fn parsed_db_name_is_credential_safe() {
         let name = parsed_db_name("postgres://user:hunter2@db.example.com:6543/my_app");
         assert_eq!(name, "my_app");
-        // Never leaks credentials.
         assert!(!name.contains("hunter2"));
         assert_eq!(parsed_db_name("not a url"), "(database)");
     }
@@ -3822,7 +3711,6 @@ mod tests {
     fn split_password_moves_secret_out_of_url() {
         let (safe, pw) = split_password("postgres://user:hunter2@db.example.com:6543/my_app");
         assert_eq!(pw.as_deref(), Some("hunter2"));
-        // The returned URL keeps everything but the password.
         assert!(!safe.contains("hunter2"));
         assert!(safe.contains("user@db.example.com"));
         assert!(safe.contains("/my_app"));
@@ -3830,10 +3718,8 @@ mod tests {
 
     #[test]
     fn split_password_percent_decodes_for_pgpassword() {
-        // Raw password contains `@`, `:`, `/`, and a space — all of which MUST be
-        // percent-encoded in the URL userinfo. libpq consumes PGPASSWORD as a
-        // literal (no percent-decoding), so `split_password` must hand back the
-        // DECODED bytes or authentication fails.
+        // libpq reads PGPASSWORD literally, so the percent-encoded userinfo must come back
+        // decoded or authentication fails.
         let raw = "p@ss:w/ord x";
         let encoded = "p%40ss%3Aw%2Ford%20x";
         let url = format!("postgres://user:{encoded}@db.example.com:6543/my_app");
@@ -3841,13 +3727,11 @@ mod tests {
         let (safe, pw) = split_password(&url);
         assert_eq!(pw.as_deref(), Some(raw));
 
-        // The password (encoded or decoded) never remains in the argv URL.
         assert!(!safe.contains(encoded));
         assert!(!safe.contains(raw));
-        // The username is preserved (libpq decodes it from the URI itself).
+        // The username stays encoded: libpq decodes it from the URI itself.
         assert!(safe.contains("user@db.example.com"));
         assert!(safe.contains("/my_app"));
-        // The password-free URL is still a VALID URL for `--dbname`.
         assert!(url::Url::parse(&safe).is_ok());
     }
 
@@ -3856,8 +3740,7 @@ mod tests {
         let (safe, pw) = split_password("postgres://user@localhost/app");
         assert_eq!(pw, None);
         assert_eq!(safe, "postgres://user@localhost/app");
-        // A non-URL that isn't keyword/value form (no `keyword=`) degrades to
-        // passing the string through unchanged.
+        // Neither a URL nor keyword/value form: passed through unchanged.
         let (safe, pw) = split_password("not a url");
         assert_eq!(pw, None);
         assert_eq!(safe, "not a url");
@@ -3865,26 +3748,19 @@ mod tests {
 
     #[test]
     fn split_password_strips_keyword_value_password() {
-        // libpq keyword/value form (which Autumn's config validation accepts):
-        // the password must move to PGPASSWORD, never staying on argv where `ps`
-        // could read it.
         let (safe, pw) = split_password("host=db user=app password=secret dbname=app");
         assert_eq!(pw.as_deref(), Some("secret"));
         assert!(!safe.contains("password"));
         assert!(!safe.contains("secret"));
-        // The remaining keywords are preserved for `--dbname`.
         assert!(safe.contains("host=db"));
         assert!(safe.contains("user=app"));
         assert!(safe.contains("dbname=app"));
-        // And the stripped connstring still round-trips through the parser.
         let reparsed = parse_libpq_kv(&safe).unwrap();
         assert!(reparsed.iter().all(|(k, _)| k != "password"));
     }
 
     #[test]
     fn split_password_handles_single_quoted_keyword_value() {
-        // A single-quoted value carries spaces and metacharacters; unquoting must
-        // yield the literal password for PGPASSWORD.
         let (safe, pw) = split_password("host=db password='p a$s' dbname=app");
         assert_eq!(pw.as_deref(), Some("p a$s"));
         assert!(!safe.contains("p a$s"));
@@ -3895,16 +3771,13 @@ mod tests {
 
     #[test]
     fn split_password_handles_escaped_quote_in_keyword_value() {
-        // Backslash escapes inside a quoted value: `\'` is a literal quote and
-        // `\\` a literal backslash.
+        // `\'` is a literal quote and `\\` a literal backslash.
         let (_safe, pw) = split_password(r"host=db password='a\'b\\c'");
         assert_eq!(pw.as_deref(), Some(r"a'b\c"));
     }
 
     #[test]
     fn split_password_keyword_value_without_password_passes_through() {
-        // No `password=` token => the connstring is returned byte-for-byte with
-        // no PGPASSWORD, so nothing changes for password-less managed clusters.
         let input = "host=db user=app dbname=app";
         let (safe, pw) = split_password(input);
         assert_eq!(pw, None);
@@ -3975,7 +3848,6 @@ mod tests {
 
     #[test]
     fn single_file_target_label_infers_from_filename_convention() {
-        // control.* -> control.
         assert_eq!(
             single_file_target_label("control.dump", None).unwrap(),
             "control"
@@ -3984,26 +3856,19 @@ mod tests {
             single_file_target_label("control.sql", None).unwrap(),
             "control"
         );
-        // shard-<name>.* -> that shard (inference is authoritative: a bare shard
-        // dump is NEVER silently treated as control).
         assert_eq!(
             single_file_target_label("shard-east.dump", None).unwrap(),
             "shard:east"
         );
-        // An explicit --shard wins over the filename.
         assert_eq!(
             single_file_target_label("control.dump", Some("west")).unwrap(),
             "shard:west"
         );
-        // A shard-shaped name with no recoverable shard name errors rather than
-        // silently defaulting to control.
         assert!(matches!(
             single_file_target_label("shard-.dump", None),
             Err(BackupError::BadArtifact { .. })
         ));
-        // A user-renamed file (not produced by the backup writer) falls back to
-        // control, preserving the historical single-file behavior without a shard
-        // cross-target hazard.
+        // The backup writer never produces this name, so control carries no shard hazard.
         assert_eq!(
             single_file_target_label("mybackup.dump", None).unwrap(),
             "control"
@@ -4012,9 +3877,7 @@ mod tests {
 
     #[test]
     fn discover_bare_shard_file_resolves_to_shard_not_control() {
-        // Regression: restoring `shard-east.dump` via the single-file path used to
-        // label it `control` unconditionally, silently restoring shard data into
-        // the control database.
+        // A bare shard dump must never restore into the control database.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("shard-east.dump");
         std::fs::write(&path, b"x").unwrap();
@@ -4022,7 +3885,6 @@ mod tests {
         let plan = RestorePlan::discover(&path, None).unwrap();
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].label, "shard:east");
-        // The inferred label still selects cleanly with a matching --shard.
         assert_eq!(plan.select(Some("east")).unwrap()[0].label, "shard:east");
     }
 
@@ -4039,8 +3901,6 @@ mod tests {
     #[test]
     fn discover_bare_file_honors_explicit_shard_flag() {
         let tmp = tempfile::tempdir().unwrap();
-        // Even a control-named bare file is redirected when the operator explicitly
-        // names a shard target.
         let path = tmp.path().join("control.dump");
         std::fs::write(&path, b"x").unwrap();
 
@@ -4113,9 +3973,8 @@ mod tests {
 
     #[test]
     fn offsite_key_prefix_is_canonical_across_profile_spellings() {
-        // P2 #22: alias/case profile spellings must resolve to the SAME remote key
-        // prefix, so upload (`--profile production`), `db offsite list --profile
-        // prod`, and `restore offsite:prod/latest` all address `db/prod/…`.
+        // Every alias/case spelling must address the same remote prefix, so upload, list and
+        // restore agree.
         for spelling in ["prod", "production", "PROD", "Production", "  prod  "] {
             let p = migrate::canonical_profile(spelling);
             assert_eq!(offsite_profile_prefix("db", &p), "db/prod/", "{spelling:?}");
@@ -4130,7 +3989,6 @@ mod tests {
                 "{spelling:?}"
             );
         }
-        // `prod` and `production` yield the identical prefix.
         assert_eq!(
             offsite_profile_prefix("db", &migrate::canonical_profile("prod")),
             offsite_profile_prefix("db", &migrate::canonical_profile("production")),
@@ -4236,7 +4094,6 @@ mod tests {
         };
         let s = e.to_string();
         assert!(s.contains("OFFSITE_SECRET"));
-        // Names the variable, never a value.
         assert!(!s.contains("hunter2"));
     }
 
@@ -4290,9 +4147,6 @@ mod tests {
 
     #[test]
     fn deliver_offsite_upload_alert_reaches_configured_channel() {
-        // Failure-injection: the upload-failure path delivers a
-        // ScheduledTaskFailure alert to every configured channel. A capturing
-        // mock channel records what a failed upload would raise.
         let capture = Arc::new(std::sync::Mutex::new(Vec::new()));
         let channel = Arc::new(CapturingChannel {
             received: Arc::clone(&capture),
@@ -4318,8 +4172,7 @@ mod tests {
 
     #[test]
     fn deliver_offsite_upload_alert_is_noop_without_channels() {
-        // Interactive case (no [alerts] configured → no channels): must be a
-        // no-op so behavior is unchanged. No panic, nothing delivered.
+        // No `[alerts]` configured: a no-op, and no panic.
         deliver_offsite_upload_alert(&[], "/backups/prod/run", "boom");
     }
 
@@ -4348,9 +4201,8 @@ mod tests {
 
     #[test]
     fn local_backup_does_not_validate_incomplete_offsite() {
-        // P2 #1: an incomplete [backup.offsite] (no bucket) must NOT block a plain
-        // local `autumn db backup`. The strict bucket check lives in resolve(),
-        // which the backup path only calls when an upload is actually requested.
+        // An incomplete `[backup.offsite]` must not block a local backup: the bucket check
+        // lives in `resolve()`, which runs only when uploading.
         let offsite = autumn_web::config::OffsiteBackupConfig::default();
         assert!(offsite.s3.bucket.is_none(), "precondition: no bucket set");
         let loaded = LoadedOffsite {
@@ -4359,8 +4211,6 @@ mod tests {
             app_storage_endpoint: None,
             profile: "test".to_owned(),
         };
-        // The strict validation is deferred to resolve() (only reached when
-        // uploading) — proving a local-only backup never hits it.
         assert!(matches!(
             loaded.resolve(),
             Err(BackupError::OffsiteConfig { .. })
@@ -4369,29 +4219,22 @@ mod tests {
 
     #[test]
     fn auto_upload_probe_precedence_and_repro() {
-        // P2 #8: the upload decision reads ONLY `[backup.offsite].auto_upload`
-        // from env / .env / merged TOML — never a full config load / credential
-        // decryption. Pure `auto_upload_from_sources` proves the precedence.
         let no_env = |_: &str| None;
 
-        // (a) REPRO: no offsite section, no env => false => NO upload, and (by
-        // construction) the decision needed no AutumnConfig load / cred decrypt.
+        // No offsite section and no env: no upload.
         assert!(!auto_upload_from_sources(no_env, None));
         let empty: toml::Table = toml::Table::new();
         assert!(!auto_upload_from_sources(no_env, Some(&empty)));
 
-        // (b) auto_upload=true via TOML [backup.offsite] triggers upload.
         let toml_true: toml::Table =
             toml::from_str("[backup.offsite]\nauto_upload = true\n").unwrap();
         assert!(auto_upload_from_sources(no_env, Some(&toml_true)));
 
-        // (b) auto_upload=true via env (real env or .env.<profile>) triggers it,
-        // even with no TOML.
         let env_true =
             |k: &str| (k == "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD").then(|| "true".to_owned());
         assert!(auto_upload_from_sources(env_true, None));
 
-        // Env wins over TOML: env "false" overrides TOML true.
+        // Env wins over TOML.
         let env_false =
             |k: &str| (k == "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD").then(|| "false".to_owned());
         assert!(!auto_upload_from_sources(env_false, Some(&toml_true)));
@@ -4404,11 +4247,8 @@ mod tests {
 
     #[test]
     fn offsite_resolves_from_config_dir_table_not_cwd() {
-        // P2 #15: an installed/daemon launch keeps autumn.toml in the config dir
-        // (a different CWD). Reading from that dir — as the offsite loaders now do
-        // via read_autumn_toml_table_with_profile_from_config_dir — must surface
-        // both auto_upload and the offsite destination. Proven hermetically by
-        // reading a temp config dir directly (this test's CWD has no such file).
+        // An installed/daemon launch keeps autumn.toml in the config dir, not the CWD.
+        // Reading a temp dir directly keeps the test hermetic.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(
             tmp.path().join("autumn.toml"),
@@ -4425,9 +4265,7 @@ mod tests {
         )
         .unwrap();
         let table = migrate::read_autumn_toml_table_with_profile_in(tmp.path(), Some("dev"));
-        // auto_upload is read from the config-dir table (env has nothing).
         assert!(auto_upload_from_sources(|_| None, table.as_ref()));
-        // And the offsite destination resolves from that same table (no CWD file).
         let env = autumn_web::config::MockEnv::new();
         let loaded = resolve_loaded_offsite(table.as_ref(), &env, "dev").unwrap();
         assert!(
@@ -4438,9 +4276,7 @@ mod tests {
 
     #[test]
     fn resolved_offsite_carries_target_profile_for_credentials() {
-        // P2 #6: the target profile threads through resolve() into
-        // ResolvedOffsite so credential resolution reads the SAME
-        // `.env.<profile>` overlay the config was loaded under.
+        // Credentials must read the same `.env.<profile>` overlay the config was loaded under.
         let mut offsite = autumn_web::config::OffsiteBackupConfig::default();
         offsite.s3.bucket = Some("offsite-bucket".to_owned());
         offsite.s3.access_key_id_env = Some("OFFSITE_KEY".to_owned());
@@ -4457,12 +4293,8 @@ mod tests {
 
     #[test]
     fn offsite_resolves_without_app_credential_store() {
-        // P2 #9: offsite destination resolves from TOML + env WITHOUT a full
-        // AutumnConfig::load — so NO credential decryption / AUTUMN_MASTER_KEY is
-        // needed. On current code this path went through load_with_env, which
-        // would fail on a DR box whose config/credentials/<p>.toml.enc can't be
-        // decrypted. `resolve_loaded_offsite` reads only the offsite + storage.s3
-        // config, never the credential store.
+        // A DR box has no AUTUMN_MASTER_KEY: the offsite destination must resolve from TOML
+        // and env alone, never through the encrypted credential store.
         let table: toml::Table = toml::from_str(
             "[backup.offsite]\nprefix = \"db\"\n\
              [backup.offsite.s3]\nbucket = \"dr-bucket\"\nregion = \"us-east-1\"\n\
@@ -4470,8 +4302,6 @@ mod tests {
              access_key_id_env = \"OFFSITE_KEY\"\nsecret_access_key_env = \"OFFSITE_SECRET\"\n",
         )
         .unwrap();
-        // Real env supplies the S3 credential VALUES; crucially there is NO
-        // AUTUMN_MASTER_KEY and no attempt to read a credential store.
         let env = autumn_web::config::MockEnv::new()
             .with("OFFSITE_KEY", "AKIA_DR")
             .with("OFFSITE_SECRET", "shh");
@@ -4482,7 +4312,6 @@ mod tests {
         assert_eq!(resolved.s3.bucket, "dr-bucket");
         assert_eq!(resolved.profile, "prod");
 
-        // Env-only configuration (no TOML at all) also resolves.
         let env2 = autumn_web::config::MockEnv::new()
             .with("AUTUMN_BACKUP__OFFSITE__S3__BUCKET", "env-bucket");
         let loaded2 = resolve_loaded_offsite(None, &env2, "prod")
@@ -4493,9 +4322,8 @@ mod tests {
 
     #[test]
     fn shared_bucket_guard_only_applies_when_storage_backend_is_s3() {
-        // P2 #16: a leftover `[storage.s3]` bucket that equals the offsite bucket
-        // must NOT trip the shared-bucket guard unless the app storage backend is
-        // actually S3. On backend=local/disabled the bucket is inert.
+        // A leftover `[storage.s3]` bucket trips the shared-bucket guard only when the
+        // storage backend is S3.
         let env = autumn_web::config::MockEnv::new();
         let make = |backend: &str| -> LoadedOffsite {
             let table: toml::Table = toml::from_str(&format!(
@@ -4511,8 +4339,6 @@ mod tests {
                 .expect("offsite section present")
         };
 
-        // backend=local: the s3 bucket is NOT the app storage destination, so the
-        // guard input is empty and destinations_conflict cannot fire.
         let local = make("local");
         assert_eq!(local.app_storage_bucket, None);
         assert!(!destinations_conflict(
@@ -4522,11 +4348,8 @@ mod tests {
             local.app_storage_endpoint.as_deref(),
         ));
 
-        // backend=disabled: same — inert `[storage.s3]`.
         assert_eq!(make("disabled").app_storage_bucket, None);
 
-        // backend=s3: the bucket IS the app destination, so the guard fires and
-        // the offsite backup must opt in with allow_shared_bucket.
         let s3 = make("s3");
         assert_eq!(s3.app_storage_bucket.as_deref(), Some("shared"));
         assert!(destinations_conflict(
@@ -4551,9 +4374,8 @@ mod tests {
 
     #[test]
     fn order_cleanup_keys_deletes_manifest_first() {
-        // P2 #21: on a failed upload the run manifest must be removed FIRST so the
-        // completeness marker is gone even if a later delete fails — otherwise a
-        // failed run could still be counted `complete` for latest/retention.
+        // The manifest goes first, so the completeness marker is gone even if a later delete
+        // fails.
         let written = vec![
             "db/prod/r/control.dump".to_owned(),
             "db/prod/r/shard-a.dump".to_owned(),
@@ -4561,7 +4383,6 @@ mod tests {
         ];
         let ordered = order_cleanup_keys(&written);
         assert_eq!(ordered[0], "db/prod/r/manifest.json");
-        // The remaining (non-manifest) keys keep their written order.
         assert_eq!(
             &ordered[1..],
             &[
@@ -4570,8 +4391,7 @@ mod tests {
             ]
         );
 
-        // And downstream: with the manifest deleted, complete_remote_run_ids no
-        // longer counts the run — so the failed run can't become `latest`.
+        // Without the manifest the failed run is not complete, so it cannot become `latest`.
         let list_prefix = "db/prod/";
         let after_cleanup = vec![s3::S3Object {
             key: "db/prod/r/control.dump".to_owned(), // manifest was cleaned up
@@ -4582,8 +4402,7 @@ mod tests {
 
     #[test]
     fn complete_remote_run_ids_only_counts_runs_with_a_manifest() {
-        // P2 #2: a newer PARTIAL run (artifacts but no manifest.json) and an
-        // older COMPLETE run. `latest` must pick the older complete run.
+        // A newer partial run (no manifest.json) must not shadow an older complete one.
         let list_prefix = "db/prod/";
         let objects = vec![
             // Older, complete run.
@@ -4601,15 +4420,12 @@ mod tests {
                 size: 10,
             },
         ];
-        // The raw run ids include the partial newer run...
         assert_eq!(
             remote_run_ids(&objects, list_prefix),
             vec!["20260709T010101Z".to_owned(), "20260710T010101Z".to_owned()]
         );
-        // ...but only the complete (older) run is a candidate.
         let complete = complete_remote_run_ids(&objects, list_prefix);
         assert_eq!(complete, vec!["20260709T010101Z".to_owned()]);
-        // `latest` = newest COMPLETE run = the older run, not the partial newer one.
         assert_eq!(
             complete.into_iter().next_back().as_deref(),
             Some("20260709T010101Z")
@@ -4618,10 +4434,8 @@ mod tests {
 
     #[test]
     fn remote_retention_counts_only_complete_runs() {
-        // P2 #3 (Codex scenario): keep=2 with complete runs A/B, a NEWER partial
-        // run C (no manifest), and the just-uploaded complete run D. Retention
-        // must count only complete runs — keep the newest 2 complete (D, B),
-        // prune the older complete A, and NEVER touch the partial C or D.
+        // keep=2 with complete runs A, B, a newer partial run C and the just-uploaded D:
+        // keep D and B, prune A, never touch C or D.
         let list_prefix = "db/prod/";
         let a = "20260701T000000Z"; // complete, oldest
         let b = "20260702T000000Z"; // complete
@@ -4644,7 +4458,6 @@ mod tests {
                 key: format!("{list_prefix}{b}/manifest.json"),
                 size: 1,
             },
-            // Partial C: artifact only, no manifest.
             s3::S3Object {
                 key: format!("{list_prefix}{c}/control.dump"),
                 size: 1,
@@ -4659,7 +4472,6 @@ mod tests {
             },
         ];
 
-        // Retention input = complete runs only (A, B, D) — the partial C is absent.
         let complete = complete_remote_run_ids(&objects, list_prefix);
         assert_eq!(
             complete,
@@ -4667,20 +4479,16 @@ mod tests {
             "partial run C must not count as a retention slot"
         );
 
-        // keep=2, just-uploaded=D => prune only the oldest complete run A.
         let to_remove = plan_remote_pruning(&complete, 2, d);
         assert_eq!(to_remove, vec![a.to_owned()]);
-        // The partial C is NOT pruned (never a candidate), and D is never pruned.
         assert!(!to_remove.contains(&c.to_owned()));
         assert!(!to_remove.contains(&d.to_owned()));
-        // B survives (it's within the newest-2 complete).
         assert!(!to_remove.contains(&b.to_owned()));
     }
 
     #[test]
     fn upload_orders_manifest_last() {
-        // P2 #2(a): the manifest must upload last so its remote presence marks a
-        // complete run. Mirror upload_run's ordering.
+        // Mirrors `upload_run`: the manifest goes last, so its presence marks a complete run.
         let mut files = vec![
             "manifest.json".to_owned(),
             "shard-east.dump".to_owned(),
@@ -4700,7 +4508,6 @@ mod tests {
 
     #[test]
     fn offsite_listing_flags_incomplete_runs() {
-        // P2 #2: an incomplete run (no manifest) is flagged in `db offsite list`.
         let list_prefix = "db/prod/";
         let objects = vec![s3::S3Object {
             key: "db/prod/20260710T010101Z/control.dump".to_owned(),
@@ -4715,7 +4522,8 @@ mod tests {
 
     #[test]
     fn is_safe_leaf_name_rejects_separators_and_traversal() {
-        // P2 #13: a downloaded offsite object name must be a single plain file.
+        // `\` is a plain filename byte on Unix, but a key from a Windows run can use it to
+        // traverse.
         for good in ["control.dump", "manifest.json", "shard-orders.dump"] {
             assert!(is_safe_leaf_name(good), "{good:?} should be accepted");
         }
@@ -4737,7 +4545,6 @@ mod tests {
 
     #[test]
     fn remote_run_token_is_eight_lowercase_hex() {
-        // P2 #12: the token is 8 hex chars derived from host/pid/time entropy.
         let token = remote_run_token();
         assert_eq!(token.len(), 8, "token was {token:?}");
         assert!(
@@ -4750,8 +4557,7 @@ mod tests {
 
     #[test]
     fn remote_run_id_appends_token_to_local_id() {
-        // P2 #12: remote id = <local timestamp>-<token>; the timestamp still leads
-        // so lexical sort (and thus `latest`) is unchanged.
+        // The timestamp leads, so the lexical sort (and `latest`) is unchanged.
         let id = remote_run_id("20260710T040506Z", "deadbeef");
         assert_eq!(id, "20260710T040506Z-deadbeef");
         assert!(id.starts_with("20260710T040506Z"));
@@ -4759,23 +4565,19 @@ mod tests {
 
     #[test]
     fn match_exact_remote_run_resolves_by_full_id_and_timestamp() {
-        // P2 #12: complete remote run ids carry a token; a selector matches by
-        // full id OR by the bare timestamp when exactly one tokened id begins with it.
+        // A selector matches the full id, or a bare timestamp that prefixes exactly one id.
         let ids: Vec<String> = ["20260709T010101Z-aaaa1111", "20260710T040506Z-bbbb2222"]
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
-        // Full id → itself.
         assert_eq!(
             match_exact_remote_run(&ids, "20260710T040506Z-bbbb2222").unwrap(),
             "20260710T040506Z-bbbb2222"
         );
-        // Bare timestamp uniquely prefixes one run → that run.
         assert_eq!(
             match_exact_remote_run(&ids, "20260710T040506Z").unwrap(),
             "20260710T040506Z-bbbb2222"
         );
-        // A timestamp with no matching run → Err(empty).
         assert_eq!(
             match_exact_remote_run(&ids, "20990101T000000Z").unwrap_err(),
             Vec::<String>::new()
@@ -4784,8 +4586,8 @@ mod tests {
 
     #[test]
     fn match_exact_remote_run_errors_on_ambiguous_same_second() {
-        // Two hosts backed up the SAME second → two tokened ids share the <ts>.
-        // A bare-timestamp selector is ambiguous and must list both candidates.
+        // Two hosts backed up in the same second: a bare timestamp is ambiguous and the
+        // error lists both candidates.
         let ids: Vec<String> = ["20260710T040506Z-aaaa1111", "20260710T040506Z-bbbb2222"]
             .iter()
             .map(|s| (*s).to_owned())
@@ -4794,7 +4596,6 @@ mod tests {
         assert_eq!(err.len(), 2);
         assert!(err.contains(&"20260710T040506Z-aaaa1111".to_owned()));
         assert!(err.contains(&"20260710T040506Z-bbbb2222".to_owned()));
-        // But the full id still resolves unambiguously.
         assert_eq!(
             match_exact_remote_run(&ids, "20260710T040506Z-aaaa1111").unwrap(),
             "20260710T040506Z-aaaa1111"
@@ -4803,8 +4604,7 @@ mod tests {
 
     #[test]
     fn complete_remote_run_ids_sort_newest_last_with_tokens() {
-        // P2 #12: the <ts> dominates the lexical sort, so `latest` (newest) is the
-        // last element regardless of the token tiebreak.
+        // The timestamp dominates the sort, so `latest` is last whatever the token.
         let list_prefix = "db/prod/";
         let objects = vec![
             s3::S3Object {
@@ -4826,23 +4626,20 @@ mod tests {
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
-        // Keep 2 => remove r1, r2, r3 (the 3 oldest). r5 is the just-uploaded.
+        // keep 2 => remove the 3 oldest. r5 is the just-uploaded run.
         assert_eq!(
             plan_remote_pruning(&runs, 2, "r5"),
             vec!["r1".to_owned(), "r2".to_owned(), "r3".to_owned()]
         );
-        // keep >= len => remove nothing.
         assert!(plan_remote_pruning(&runs, 5, "r5").is_empty());
-        // keep 0 clamps to 1 (never wipe everything).
+        // keep 0 clamps to 1.
         assert_eq!(plan_remote_pruning(&runs, 0, "r5").len(), 4);
     }
 
     #[test]
     fn plan_remote_pruning_excludes_just_uploaded_even_if_oldest() {
-        // Pathological: the just-uploaded run id sorts oldest (clock skew). It
-        // must STILL never be pruned.
+        // Clock skew can make the just-uploaded run sort oldest; it is still never pruned.
         let runs: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_owned()).collect();
-        // keep 1 => would remove a, b; but "a" is the just-uploaded => keep it.
         assert_eq!(plan_remote_pruning(&runs, 1, "a"), vec!["b".to_owned()]);
     }
 
@@ -4852,7 +4649,6 @@ mod tests {
         assert_eq!(latest.profile, "prod");
         assert_eq!(latest.selector, OffsiteSelector::Latest);
 
-        // Case-insensitive "latest".
         assert_eq!(
             parse_offsite_ref("prod/LATEST").unwrap().selector,
             OffsiteSelector::Latest
@@ -4865,7 +4661,6 @@ mod tests {
             OffsiteSelector::Exact("20260710T040506Z".to_owned())
         );
 
-        // Missing pieces => None.
         assert!(parse_offsite_ref("offsite:prod").is_none());
         assert!(parse_offsite_ref("offsite:/latest").is_none());
         assert!(parse_offsite_ref("prod/").is_none());
@@ -4873,12 +4668,10 @@ mod tests {
 
     #[test]
     fn resolve_offsite_ref_routes_local_only_when_not_indicated() {
-        // (c) A bare local path with neither flag nor prefix routes to LOCAL
-        // restore (None), unchanged.
+        // Neither the flag nor the prefix: a local restore.
         assert!(resolve_offsite_ref(false, "backups/prod/20260710T040506Z").is_none());
         assert!(resolve_offsite_ref(false, "latest").is_none());
 
-        // (d) Well-formed offsite refs parse (Some(Ok(_))).
         let ok = resolve_offsite_ref(false, "offsite:prod/latest").unwrap();
         assert_eq!(
             ok.unwrap(),
@@ -4908,15 +4701,14 @@ mod tests {
 
     #[test]
     fn resolve_offsite_ref_errors_on_malformed_when_indicated() {
-        // (a) `--offsite` with a malformed ref (no `<profile>/`) must ERROR, not
-        // fall through to a local artifact named `latest`.
+        // A malformed ref errors rather than falling through to a local artifact named
+        // `latest`.
         let err = resolve_offsite_ref(true, "latest").unwrap().unwrap_err();
         assert!(matches!(err, BackupError::InvalidOffsiteRef { .. }));
         let msg = err.to_string();
         assert!(msg.contains("latest"));
         assert!(msg.contains("offsite:<profile>/<timestamp|latest>"));
 
-        // (b) `offsite:` prefix with a malformed body must ERROR too.
         assert!(matches!(
             resolve_offsite_ref(false, "offsite:prod").unwrap(),
             Err(BackupError::InvalidOffsiteRef { .. })
@@ -4925,7 +4717,6 @@ mod tests {
             resolve_offsite_ref(false, "offsite:/latest").unwrap(),
             Err(BackupError::InvalidOffsiteRef { .. })
         ));
-        // Flag set but empty positional => still an offsite error, not local.
         assert!(matches!(
             resolve_offsite_ref(true, "").unwrap(),
             Err(BackupError::InvalidOffsiteRef { .. })
@@ -5003,7 +4794,6 @@ mod tests {
             return;
         };
 
-        // Seed a table with known rows.
         let mut conn = PgConnection::establish(&url).expect("connect");
         conn.batch_execute(
             "DROP TABLE IF EXISTS backup_rt; \
@@ -5012,7 +4802,6 @@ mod tests {
         )
         .expect("seed");
 
-        // Backup (custom format) into a temp dir.
         let tmp = tempfile::tempdir().unwrap();
         let tools = PgTools::locate();
         let pg_dump = tools.require("pg_dump").expect("pg_dump present");
@@ -5041,7 +4830,6 @@ mod tests {
             .unwrap();
         assert_eq!(after_delete.n, 0);
 
-        // Restore.
         let artifact = run_dir.join("control.dump");
         run_restore_one(
             &tools,
@@ -5053,7 +4841,6 @@ mod tests {
         )
         .expect("restore succeeds");
 
-        // Row-level equality.
         let rows: Vec<Rt> = sql_query("SELECT id, name FROM backup_rt ORDER BY id")
             .load(&mut conn)
             .unwrap();

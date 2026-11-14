@@ -1591,7 +1591,7 @@ mod tests {
         assert_eq!(over.len(), 1, "{report:?}");
         assert_eq!(over[0].table, "a.users");
 
-        // Declaring `a.users` (and `public.x` / bare `x` agreeing) clears it.
+        // Declaring `a.users` clears it. A bare `p` declares `public.p`.
         let both = format!(
             "{only_b}\n{}\n{}",
             "diesel::table! { a.users (c0) { c0 -> Text, } }",

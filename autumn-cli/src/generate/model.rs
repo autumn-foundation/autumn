@@ -198,57 +198,36 @@ fn plan_model_with_options_impl(
     let mut fields = parse_fields(field_tokens)?;
     apply_unique_flags(&mut fields, &options.uniques)?;
     validate_field_names(&fields)?;
-    // Issue #1340: the flag spellings of "make this encrypted column
-    // equality-queryable"/"give it a default" only become visible once
-    // `--unique`/`--default` have been folded in, so this runs after
-    // `apply_unique_flags` and before anything is emitted. Generation-only —
-    // see the function's contract for why `destroy` must skip it.
+    // Runs after `apply_unique_flags`: the `--unique`/`--default` spellings of an encrypted
+    // column's constraints only exist once folded in (#1340).
     if !for_revert {
         validate_encrypted_fields(&fields, options)?;
-        // Issue #1384: same reasoning as `validate_encrypted_fields` above —
-        // `--unique`/`--index`/`--searchable`/`--shard-key` are flag spellings
-        // of constraints the `{translatable}` parse-time cross-checks cannot
-        // see, because they are folded in after `parse_fields`.
+        // Same for `{translatable}` (#1384): `--unique`/`--index`/`--searchable`/`--shard-key`
+        // are folded in after `parse_fields`' cross-checks run.
         validate_translatable_fields(&fields, options)?;
     }
     let pascal_name = pascal(name);
     validate_enum_field_collisions(&pascal_name, &fields)?;
-    // Determine the target app's database backend so the emitted DDL / diesel
-    // schema is backend-aware (SQLite foundation, issue #1614). Full-text search
-    // (`--searchable`) is now supported on both backends — Postgres emits a
-    // `tsvector` column + GIN index, SQLite emits an FTS5 virtual table +
-    // triggers (issue #1910) — so it is no longer rejected here.
-    //
-    // Read before the metadata: a `--default` literal is rendered per backend
-    // (issue #1924).
+    // Read before the metadata: a `--default` literal is rendered per backend (#1924).
     let backend = detect_backend(project_root);
     let mut metadata = parse_model_metadata_for(backend, &fields, options)?;
-    // Issue #1367: `#[commentable(by = ...)]` may only name a model that
-    // actually exists in this project — naming a missing one would be a
-    // compile error in a file the author did not write.
+    // `#[commentable(by = …)]` may only name a model that exists, or the generated file does
+    // not compile (#1367).
     metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
 
-    // `comments:commentable` on a UUID-keyed model would plan every file and
-    // then hand back a project that does not compile: the shared table stores
+    // A UUID-keyed commentable model would not compile: the shared table stores
     // `commentable_id BIGINT` and the generated helpers take `parent_id: i64`.
-    // Refused here, before anything is written.
     if options.id_type == IdType::Uuid && fields.iter().any(|f| f.kind.is_commentable()) {
         return Err(super::uuid_pk_commentable_unsupported_error());
     }
-    // Every DSL field kind converts on SQLite as of #1924, so this is a standing
-    // guard rather than an active gate: a NEW kind with no working conversion is
-    // reported here rather than emitted as code that cannot compile (AC #4).
+    // Every DSL field kind converts on SQLite (#1924). This catches a new kind without a
+    // conversion before it is emitted as code that cannot compile.
     if backend == autumn_web::config::DatabaseBackend::Sqlite {
         super::reject_sqlite_unsupported_field_kinds(&fields)?;
     }
-    // Sharding (`--sharded`) emits a `#[shard_key]` model plus (via scaffold)
-    // `ShardedDb` routes/migrations that require a `[[database.shards]]`
-    // topology, which `DatabaseConfig::validate_backend_consistency` rejects for
-    // a SQLite primary — so no valid SQLite config could use the generated
-    // resource. SQLite is single-host/single-writer, so this is a PERMANENT
-    // constraint (Postgres-only), not a deferred slice. Reject at generate time
-    // rather than emit a resource no SQLite app can boot (AC #4). `generate
-    // scaffold --sharded` routes through here too, so this one gate covers both.
+    // `--sharded` needs a `[[database.shards]]` topology, which
+    // `DatabaseConfig::validate_backend_consistency` rejects for a SQLite primary, so no SQLite
+    // app could boot the resource. `generate scaffold --sharded` routes through here too.
     if backend == autumn_web::config::DatabaseBackend::Sqlite && options.sharded {
         return Err(super::sqlite_sharded_unsupported_error());
     }
@@ -256,25 +235,15 @@ fn plan_model_with_options_impl(
     let snake_name = snake(name);
     let table = pluralize(&snake_name);
 
-    // When soft_delete is enabled, append a virtual `deleted_at` field so
-    // the SQL migration and schema.rs block include the nullable column.
     let schema_fields = augment_fields_for_soft_delete(&fields, options.soft_delete)?;
 
-    // #1318: `lock_version` is managed by the database, so it contributes nothing to
-    // `New{Model}`, and neither does any `--default` column. A model whose columns are all
-    // database-managed therefore emits an empty `New{Model}`, whose Diesel `Insertable`
-    // derive does not compile, leaving the generated project dead on arrival.
+    // `lock_version` and every `--default` column are database-managed, so they are left out of
+    // `New{Model}`. If nothing is left, its `Insertable` derive does not compile (#1318).
+    // `metadata.defaults` holds both the `--default` columns and the lock column.
     //
-    // The check is on the effective set rather than the declared token count: `Post
-    // title:String lock_version:i32 --default title=x` declares two columns and leaves
-    // zero. `metadata.defaults` carries both the explicit `--default` columns and, from
-    // `parse_model_metadata`, the lock column.
-    //
-    // Scoped to lock-version models deliberately. A model whose every column is
-    // `--default`ed, or one declared with no fields, has always emitted this same
-    // uncompilable struct; widening the refusal to those pre-existing cases is a separate
-    // change from wiring #1318, and would move a fieldless `generate scaffold Post` from a
-    // compile error to a planning error an existing test pins.
+    // Scoped to lock-version models: an all-`--default` or fieldless model emitted the same
+    // struct before, and an existing test pins a fieldless `generate scaffold Post` failing at
+    // compile time rather than at planning.
     if !for_revert {
         validate_lock_version_field(&fields, &options.defaults)?;
     }
@@ -293,13 +262,8 @@ fn plan_model_with_options_impl(
     }
 
     let mut plan = Plan::new(project_root);
-    // Issue #1318: `lock_version` is a magic column name — declaring it changes
-    // the model's semantics (DB-managed, kept out of `New{Model}`, carried on
-    // `Update{Model}` as the expected version, conflict-checked by the
-    // repository, and hidden from a scaffold's form). That is the whole point
-    // for someone who wanted optimistic locking, and a nasty surprise for
-    // someone who just wanted a counter with that name — so say so out loud
-    // rather than letting the reinterpretation happen silently.
+    // `lock_version` is a magic column name (#1318): it opts into optimistic locking. Say so,
+    // for someone who only wanted a counter with that name.
     if lock_version_field(&fields).is_some() {
         plan.warn(format!(
             "`{LOCK_VERSION_COLUMN}` opts this model into optimistic locking: the column is \
@@ -309,11 +273,8 @@ fn plan_model_with_options_impl(
              Rename the column if you wanted an ordinary integer you set yourself."
         ));
     }
-    // Issue #1340: an encrypted column is inert without key material — the app
-    // boots, but the first read or write of the column fails. Say so with the
-    // exact command and credential paths rather than leaving it to a runtime
-    // error. (Emitted for the `generate scaffold` path too, which delegates
-    // its model plan here.)
+    // An encrypted column without key material boots but fails on first read or write (#1340),
+    // so name the command and credential paths now.
     if let Some(warning) = encryption_key_material_warning(&fields) {
         plan.warn(warning);
     }
@@ -326,15 +287,11 @@ fn plan_model_with_options_impl(
     )?;
 
     // ── Polymorphic comments (issue #1367) ─────────────────────────────────
-    // The `comments:commentable` token also has to bring the shared comments
-    // table, or this model's `#[commentable]` compiles and then fails at
-    // runtime with `relation "comments" does not exist`. `generate scaffold`
-    // reuses this plan, so this is the one place for both commands.
-    // On the destroy path the field tokens are not repeated, so the
-    // declaration is recovered from the model file instead.
+    // `comments:commentable` also brings the shared comments table; without it `#[commentable]`
+    // compiles and then fails at runtime with `relation "comments" does not exist`. On the
+    // destroy path the field tokens are not repeated, so the model file is read instead.
     //
-    // A model whose own table is `comments` collides with the shared table
-    // (#2283): two `CREATE TABLE comments` stop `migrate`.
+    // A model whose own table is `comments` collides with the shared table (#2283).
     if !for_revert
         && table == super::commentable::COMMENTS_TABLE
         && (fields.iter().any(|f| f.kind.is_commentable())
@@ -454,14 +411,9 @@ fn plan_model_with_options_impl(
     } else {
         table_sql
     };
-    // Full-text search (issues #1319, #1910): backend-aware FTS scaffold emitted
-    // in the same create-table migration so `autumn migrate` yields a working
-    // search with zero manual SQL. On Postgres this is the `search_vector`
-    // generated column + GIN index; on SQLite it is an external-content FTS5
-    // virtual table + maintenance triggers (`add_search_up_sql_for`). Neither is
-    // added to the model struct or schema.rs (the macro loads matched rows by id
-    // via raw SQL), so the FTS objects stay outside the model surface on both
-    // backends.
+    // Full-text search (#1319, #1910) goes in the same migration: a `search_vector` generated
+    // column + GIN index on Postgres, an external-content FTS5 table + triggers on SQLite.
+    // Neither touches the model struct or schema.rs: the macro loads matched rows by id.
     let (up_sql, down_sql) = if metadata.searchable().is_empty() {
         (up_sql, drop_table_sql(&table))
     } else {
@@ -473,11 +425,7 @@ fn plan_model_with_options_impl(
             format!("{search_down}{}", drop_table_sql(&table)),
         )
     };
-    // Issue #1358: `position`-field maintenance triggers. Appended after the
-    // (optional) search scaffold, same reasoning as that block — these are
-    // independent DDL objects tied to the table, not the model struct/schema.rs
-    // surface. Empty string (byte-identical output) for the overwhelmingly
-    // common case of no `position` field.
+    // `position`-field maintenance triggers (#1358). Empty when there is no `position` field.
     let position_up = position_triggers_up_sql_for(backend, &table, &schema_fields);
     let position_down = position_triggers_down_sql_for(backend, &table, &schema_fields);
     let up_sql = if position_up.is_empty() {
@@ -490,12 +438,9 @@ fn plan_model_with_options_impl(
     } else {
         format!("{position_down}{down_sql}")
     };
-    // Issue #1367: the cascade a polymorphic foreign key cannot express. The
-    // shared `comments` table is created once and cannot know which models will
-    // later attach to it, so each commentable parent carries its own cleanup
-    // trigger. Without it a deleted parent leaves its thread behind —
-    // unreachable, and worse than unreachable if the id is ever reused, since
-    // the old comments would surface under the new record.
+    // A polymorphic foreign key cannot cascade (#1367), so each commentable parent carries its
+    // own cleanup trigger. Without it a deleted parent's comments would resurface under a new
+    // record that reuses the id.
     let commentable_up = if fields.iter().any(|f| f.kind.is_commentable()) {
         super::commentable::parent_cleanup_sql(backend, &table, &pascal_name)
     } else {
@@ -544,9 +489,8 @@ fn plan_model_with_options_impl(
         ),
     });
 
-    // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
-    // for `diesel`, `serde`, `serde_json`, `chrono`, and supported field crates
-    // such as `uuid`, none of which are in the freshly-`autumn new`-ed project.
+    // (d) `Cargo.toml` deps: `#[autumn_web::model]` expands to code naming `diesel`, `serde`,
+    // `serde_json`, `chrono` and field crates such as `uuid`.
     let mut deps: Vec<(&str, &str)> = model_deps(backend).to_vec();
     if metadata.has_validator_rules() {
         deps.push((
@@ -585,23 +529,12 @@ fn plan_model_with_options_impl(
         plan_autumn_web_feature(&mut plan, project_root, "sqlite");
     }
 
-    // (e) Link the new model (and the `schema` module it reads) into the
-    // standalone `src/bin/seed.rs` binary, when the project was scaffolded
-    // with one (`autumn new --with-seed`). Without this the model's
-    // `#[model]` inventory registration is never compiled into the seed
-    // binary, so `autumn seed --count N --model M` cannot resolve it
-    // (issue #1718; completes AC4 of #1343). `generate scaffold` reuses this
-    // planner, so it inherits the same wiring.
+    // (e) Link the model and `schema` into `src/bin/seed.rs` when the project has one
+    // (`autumn new --with-seed`), so `autumn seed --model M` finds its `#[model]` (#1718).
     plan_seed_bin_linking(&mut plan, project_root);
 
-    // (f) Issue #1384: a `{translatable}` column lowers to
-    // `autumn_web::i18n::Translated`, and `autumn_web::i18n` is behind the
-    // NON-DEFAULT `i18n` feature. Without this the generated model would fail
-    // to compile with `E0433: could not find 'i18n' in 'autumn_web'` across
-    // code the author did not write. `{encrypted}` — the closest precedent —
-    // needs no such wiring because `autumn_web::encryption` is ungated; this is
-    // the first field-DSL modifier that lowers to a gated module. Mirrors what
-    // `generate scaffold --i18n` already does for the view lane.
+    // (f) `{translatable}` lowers to `autumn_web::i18n::Translated`, behind the non-default
+    // `i18n` feature (#1384).
     if schema_fields.iter().any(Field::is_translatable) {
         plan_autumn_web_feature(&mut plan, project_root, "i18n");
     }
@@ -628,13 +561,9 @@ fn plan_autumn_web_feature(plan: &mut Plan, project_root: &Path, feature: &str) 
         plan.actions.retain(|a| a.path() != cargo_path);
         plan.modify(cargo_path, updated);
     }
-    // Register the revert UNCONDITIONALLY, not only when the edit changed
-    // something. `autumn destroy model` recomputes this same plan, and by then
-    // the feature is already present — so a revert pushed inside the `if` above
-    // would never be registered on the path that needs it, and `destroy` would
-    // leave the non-default feature enabled forever. `owner_dir` is
-    // `src/models`, so the feature survives until the LAST model is destroyed
-    // (the same ownership rule the scaffold and channel generators use).
+    // Registered even when the feature was already present: `autumn destroy` recomputes this
+    // plan after generation, when the edit is a no-op. `owner_dir` keeps the feature until the
+    // last model is destroyed.
     plan.push_revert(Revert::CargoAutumnWebFeature {
         path: project_root.join("Cargo.toml"),
         feature: feature.to_owned(),
@@ -657,13 +586,9 @@ fn plan_seed_bin_linking(plan: &mut Plan, project_root: &Path) {
     if linked != existing {
         plan.modify(seed_path.clone(), linked);
     }
-    // Record the destroy-time inverse regardless of whether THIS invocation had
-    // to inject (a later model reuses the same already-linked file): `autumn
-    // destroy` deletes `src/models/mod.rs` + `src/schema.rs` once the last
-    // model's reverts empty them, which would leave these `#[path]` links
-    // dangling at missing files. `owner_dir = src/models` gates the revert so it
-    // fires only when the last model is destroyed (no other model file remains),
-    // keeping the links while sibling models still live (issue #1718).
+    // Recorded even when this run did not inject: `autumn destroy` deletes `src/models/mod.rs`
+    // and `src/schema.rs` with the last model, which would leave these `#[path]` links
+    // dangling. `owner_dir` fires the revert only when the last model is destroyed (#1718).
     if seed_path.exists() {
         plan.push_revert(crate::generate::emit::Revert::SeedBinLinks {
             path: seed_path,
@@ -895,11 +820,8 @@ pub(super) fn model_string_columns(project_root: &Path, base: &str) -> Vec<(Stri
         let Some(ident) = field.ident.as_ref() else {
             continue;
         };
-        // A `richtext` column is a `String` in Rust but must not be offered as
-        // a `references` display label (issue #1255) — see
-        // [`RICH_TEXT_MARKER_DOC`]. This mirrors the self-reference path in
-        // `scaffold::target_string_columns`, which filters on the `FieldKind`
-        // directly because the in-flight columns are still typed there.
+        // A `richtext` column is a `String` but must not be a `references` display label
+        // (#1255). `scaffold::target_string_columns` applies the same filter by `FieldKind`.
         if has_rich_text_marker(field) {
             continue;
         }
@@ -1004,15 +926,10 @@ pub(super) fn check_reference_targets(
                         f.name
                     )));
                 }
-                // Known non-UUID PK: the table is being created right now
-                // with that type, so the self-reference is fine.
+                // Non-UUID PK: the table is being created with that type.
                 Some(_) => continue,
-                // Unknown (`generate migration Add…To…`, altering a table
-                // whose PK type isn't tracked here): unlike `generate model`,
-                // this table may already exist on disk, so still check its
-                // model file for a UUID PK if one is found — but don't warn
-                // "model not found" for a self-reference, since the table
-                // obviously already exists (that's the point of ALTER TABLE).
+                // Unknown PK type (`generate migration Add…To…`): the table already exists, so
+                // check its model file for a UUID PK, but do not warn "model not found".
                 None => {
                     if model_struct_has_uuid_pk(project_root, base) {
                         return Err(GenerateError::Config(format!(
@@ -1184,24 +1101,14 @@ pub(super) fn plan_cargo_deps(
     if updated != existing {
         plan.modify(cargo_toml_path.clone(), updated);
     }
-    // Recorded unconditionally, mirroring every other `push_revert` call in this module,
-    // so `autumn destroy` (#1048) — which recomputes this same plan against the
-    // already-generated Cargo.toml, where these deps are by definition present — still
-    // knows to remove them. Gating on "did the Modify actually change anything" would make
-    // it a no-op at destroy time, since re-running this idempotent transform against
-    // post-generate disk never produces a diff.
+    // Recorded unconditionally: `autumn destroy` (#1048) recomputes this plan against the
+    // generated Cargo.toml, where the deps are already present and the edit is a no-op.
     //
-    // `TEMPLATE_SHIPPED_CARGO_DEPS` names are excluded: `autumn new`'s template already
-    // declares them (see `templates/Cargo.toml.tmpl`), so `ensure_cargo_dependencies`
-    // never adds them for a real project — they are in `MODEL_DEPS`/`SCAFFOLD_EXTRA_DEPS`
-    // only as a safety net for a hand-rolled Cargo.toml missing them. Reverting them
-    // unconditionally would strip a framework dependency the project needs regardless of
-    // any generated resource.
+    // `TEMPLATE_SHIPPED_CARGO_DEPS` are skipped: the `autumn new` template declares them and
+    // the project needs them whatever was generated.
     //
-    // Known limitation, out of scope per #1048: for any other name, if a different
-    // resource's generator also depends on it, destroying this resource still removes it.
-    // Reverting a shared dependency across several generated resources needs the
-    // multi-step undo history the issue explicitly scopes out.
+    // Known limitation (#1048): a dependency a different generator's resource also uses is
+    // still removed when this resource is destroyed.
     let names: Vec<String> = deps
         .iter()
         .map(|(name, _)| *name)
@@ -1233,13 +1140,10 @@ pub(super) const TEMPLATE_SHIPPED_CARGO_DEPS: &[&str] =
 pub fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
     let lines: Vec<&str> = existing.lines().collect();
 
-    // Locate the `[dependencies]` table header. Tolerate trailing whitespace
-    // and `# comments` after the header (`[dependencies] # shared deps`).
     let Some(deps_idx) = lines
         .iter()
         .position(|l| is_table_header(l, "dependencies"))
     else {
-        // No `[dependencies]` section yet — append one with all requested deps.
         use std::fmt::Write as _;
         let mut out = String::with_capacity(existing.len() + 64);
         out.push_str(existing);
@@ -1256,16 +1160,12 @@ pub fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> Strin
         return out;
     };
 
-    // Two concerns are split here:
-    // 1. The scan extent — how far the dependency section reaches when deciding which
-    //    deps are already declared. `[dependencies.<crate>]` subtables are part of
-    //    `[dependencies]`, so they extend the scan until a real boundary such as
-    //    `[dev-dependencies]` or `[[bin]]`.
-    // 2. The insertion point — where to write new shorthand `key = value` entries. This
-    //    stops at the first table header, subtable or not, because TOML attaches
-    //    shorthand keys to whichever section header precedes them: a `chrono = "0.4"`
-    //    placed after a `[dependencies.chrono]` line would become a key inside that
-    //    subtable rather than a sibling shorthand dep.
+    // The scan extent and the insertion point differ:
+    // 1. Scan: `[dependencies.<crate>]` subtables belong to `[dependencies]`, so the scan for
+    //    declared deps runs on to a real boundary such as `[dev-dependencies]` or `[[bin]]`.
+    // 2. Insert: new shorthand entries go before the first header, subtable or not. TOML
+    //    attaches a key to the header above it, so `chrono = "0.4"` after
+    //    `[dependencies.chrono]` would become a key of that subtable.
     let scan_end = lines[deps_idx + 1..]
         .iter()
         .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
@@ -1313,7 +1213,6 @@ pub fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> Strin
         out.push_str(line);
         out.push('\n');
     }
-    // Preserve whether the original file ended with a newline.
     if !existing.ends_with('\n') {
         out.pop();
     }
@@ -1370,13 +1269,8 @@ pub fn remove_cargo_dependencies(existing: &str, names: &[&str]) -> String {
     if !removed_any {
         return existing.to_owned();
     }
-    // If removing these deps emptied the whole `[dependencies]` section
-    // (allowing for a residual blank line — e.g. the separator a later
-    // `[dev-dependencies]` insertion added right after the last real entry),
-    // drop the header, every blank line in its now-empty body, and the
-    // blank separator line before it, if any — restoring the file to what
-    // it looked like before `ensure_cargo_dependencies` ever created this
-    // section from scratch.
+    // If the section is now empty (blank lines aside), drop its header, its body and the
+    // blank separator before it, as before `ensure_cargo_dependencies` created it.
     if lines[deps_idx + 1..scan_end]
         .iter()
         .all(|l| l.trim().is_empty())
@@ -1414,15 +1308,13 @@ fn is_table_header(line: &str, table: &str) -> bool {
 /// `[dependencies]` table when scanning forward.
 fn is_any_table_header(line: &str) -> bool {
     let trimmed = line.trim_start();
-    // Strip one or two opening brackets — `[[…]]` is the array-of-tables form.
     let after_open = trimmed
         .strip_prefix("[[")
         .or_else(|| trimmed.strip_prefix('['));
     let Some(rest) = after_open else {
         return false;
     };
-    // Find the *first* closing bracket. Whether it's `]` or `]]`, the inner
-    // name is everything before that first `]`.
+    // For `]]` too, the name ends at the first `]`.
     let Some(close_idx) = rest.find(']') else {
         return false;
     };
@@ -1464,15 +1356,13 @@ fn is_dep_subtable_boundary_marker(line: &str) -> bool {
 fn dep_section_has(dep_section: &[&str], crate_name: &str) -> bool {
     dep_section.iter().any(|l| {
         let t = l.trim_start();
-        // Strip leading `#` so commented-out lines don't count.
+        // Commented-out lines don't count.
         if t.starts_with('#') {
             return false;
         }
-        // `[dependencies.<crate>]` subtable form.
         if let Some(name) = dep_subtable_crate_name(l) {
             return name == crate_name;
         }
-        // `crate = …` shorthand form.
         t.split_once('=')
             .is_some_and(|(name, _)| name.trim() == crate_name)
     })
@@ -1714,11 +1604,9 @@ fn existing_dep_version_below(
         .map_or(lines.len(), |off| deps_idx + 1 + off);
     let dep_section = &lines[deps_idx + 1..scan_end];
 
-    // Absent (in every shape ensure_cargo_dependencies would skip) → no warn.
     if !dep_section_has(dep_section, crate_name) {
         return false;
     }
-    // Declared: warn unless we can prove the pinned version is new enough.
     existing_dep_version(existing, crate_name)
         .is_none_or(|version| version < (min_major, min_minor))
 }
@@ -1910,9 +1798,8 @@ fn validate_enum_field_collisions(
     Ok(())
 }
 
-// Retained as a Postgres-default convenience wrapper for the test suite; the
-// backend-aware `parse_model_metadata_for` is what production calls. Not doc
-// linked from it: this is `#[cfg(test)]`, so a link would break the doc build.
+// Test-only Postgres wrapper. `parse_model_metadata_for` does not doc-link here: this
+// item is `#[cfg(test)]`, so the link would break the doc build.
 #[cfg(test)]
 pub fn parse_model_metadata(
     fields: &[Field],
@@ -1968,15 +1855,8 @@ pub fn parse_model_metadata_for(
             .push(attr);
     }
 
-    // DSL brace-constraint modifiers (`title:String{min=3,max=120}`,
-    // `contact:String{email}`, `age:i32{min=0,max=130}`) fan out into the
-    // same `#[validate(...)]` pipeline as the `--validate` flag (issue #1388),
-    // so the generated model rejects invalid input server-side through the
-    // existing `Validated`/changeset path (422 + per-field errors) rather than
-    // a 500 or a silent store. Deduped against any `--validate` rule already
-    // recorded for the field, so declaring a constraint both ways doesn't emit
-    // it twice. `has_validator_rules()` then pulls in the `validator` crate
-    // dependency automatically (see `plan_model_with_options`).
+    // DSL brace constraints (`title:String{min=3,max=120}`) feed the same `#[validate(...)]`
+    // attrs as `--validate` (#1388), deduped so a rule declared both ways is emitted once.
     for field in fields {
         if field.constraints.is_empty() {
             continue;
@@ -1996,15 +1876,6 @@ pub fn parse_model_metadata_for(
                 token: default.clone(),
                 reason: format!("unknown field '{field_name}'"),
             })?;
-        // `unique` + `--default` is rejected outright (issue #1032 review
-        // follow-up) rather than half-supported: a scaffold's `--default`
-        // fields are excluded from the generated HTML form (see
-        // `scaffold::plan_scaffold`'s `form_fields` filter), so a defaulted
-        // `unique` column would have no input to show a duplicate-value
-        // error against even if `UNIQUE_CONSTRAINTS` did list it. Worse, a
-        // *constant* default value collides with itself on every insert
-        // after the first, so the combination rarely means what it looks
-        // like it means.
         if field.unique {
             return Err(GenerateError::InvalidField {
                 token: default.clone(),
@@ -2026,19 +1897,11 @@ pub fn parse_model_metadata_for(
         metadata.defaults.insert(field_name.to_owned(), sql);
     }
 
-    // Issue #1318: a `lock_version` column opts the model into the framework's
-    // optimistic-locking primitive. `#[lock_version]` makes the column
-    // DB-managed — it is excluded from `New{Model}`, so the INSERT never names
-    // it and the SQL column needs a `DEFAULT` or every create would fail the
-    // NOT NULL constraint. Recording it as a default here also drops the column
-    // from the scaffold's generated HTML form (`plan_scaffold`'s `form_fields`
-    // filter): the version is machinery the handler carries in a hidden field,
-    // not content the author edits. An explicit `--default lock_version=<n>`
-    // wins, so a project seeding versions from a non-zero base keeps its value.
-    // NOT validated here: `validate_lock_version_field` is a *generation* policy,
-    // and this function also runs while planning a `destroy`, where refusing a
-    // legacy column would strand files the user is trying to remove. The
-    // planning entry points call it themselves when they are generating.
+    // A `lock_version` column (#1318) is excluded from `New{Model}`, so the SQL column needs a
+    // `DEFAULT` or every insert fails NOT NULL. Recording it as a default also drops it from
+    // the scaffold form. An explicit `--default lock_version=<n>` wins.
+    // Not validated here: this also runs when planning a `destroy`, so the generation entry
+    // points call `validate_lock_version_field` themselves.
     if fields.iter().any(is_lock_version_column) {
         metadata
             .defaults
@@ -2046,21 +1909,9 @@ pub fn parse_model_metadata_for(
             .or_insert_with(|| "0".to_owned());
     }
 
-    // Issue #1358: a `position` column is likewise DB-managed and excluded
-    // from `New{Model}`/`Update{Model}` (`#[position]`), so the SQL column
-    // needs a `DEFAULT` too, or every create would fail the NOT NULL
-    // constraint before the repository's insert hook ever runs. `DEFAULT 0`
-    // is a placeholder only — the generated repository's insert hook
-    // overwrites it with the real next-in-scope value inside the same
-    // transaction as the insert (see `autumn-macros`' `position_after_insert`
-    // splice), the same two-step "DB default, then app-managed overwrite"
-    // shape `lock_version` uses above. Recording it here also drops the
-    // column from the scaffold's generated HTML form, same as `lock_version`.
-    //
-    // Issue #1367: a `commentable` counter column is the same shape — DB
-    // managed, `#[default]` on the model, `DEFAULT 0` in SQL — except that the
-    // overwrite comes from the framework's comment write path rather than an
-    // insert hook. `NOT NULL DEFAULT 0` is load-bearing rather than tidy: the
+    // `position` (#1358) and `commentable` counter (#1367) columns are DB-managed too and need
+    // `DEFAULT 0`. For `position` it is a placeholder the repository's insert hook overwrites
+    // in the same transaction. For a counter, `NOT NULL DEFAULT 0` is load-bearing: the
     // maintenance is `SET c = c + 1`, and `NULL + 1` is `NULL`.
     for f in fields {
         if f.kind.is_server_managed() {
@@ -2071,13 +1922,8 @@ pub fn parse_model_metadata_for(
         }
     }
 
-    // Full-text search's generated `search_page` (in the repository macro)
-    // hardcodes an `i64`/`BigInt` primary key: it collects `SearchId { id: i64 }`
-    // rows into a `Vec<i64>`, filters with `id.eq_any(&ids)`, and dedups through
-    // a `HashMap<i64, _>`. A non-`i64` primary key (e.g. `--id uuid`) would make
-    // those `id` operations type-mismatch, so the generated repository would fail
-    // to compile. Reject the combination up front — before any files are written
-    // — rather than emitting broken code.
+    // The repository macro's `search_page` hardcodes an `i64` primary key, so `--searchable`
+    // with any other id type would not compile.
     if !options.searchable.is_empty() && options.id_type != IdType::BigSerial {
         return Err(GenerateError::Config(format!(
             "`--searchable` requires an i64 (bigint) primary key; full-text search does not \
@@ -2087,14 +1933,8 @@ pub fn parse_model_metadata_for(
         )));
     }
 
-    // `search_vector` is the generated FTS column name, hardcoded by the
-    // repository macro (`ADD COLUMN search_vector tsvector` in the appended
-    // migration, and the `search_vector @@ …` queries in `search_page`). If the
-    // model also declares its own field named `search_vector`, the create-table
-    // SQL emits that column first and the FTS migration then fails to add it
-    // (duplicate column) at `autumn migrate`. Reserve the name for searchable
-    // models and reject up front (case-insensitive; only relevant with
-    // `--searchable` — a `search_vector` field is harmless otherwise).
+    // The FTS migration adds a `search_vector` column, so a model field of that name fails
+    // `autumn migrate` with a duplicate column. Matched case-insensitively.
     if !options.searchable.is_empty()
         && let Some(field) = fields
             .iter()
@@ -2109,12 +1949,8 @@ pub fn parse_model_metadata_for(
         )));
     }
 
-    // Full-text search config (issue #1319). Only text (`String`/`Text`) fields
-    // can populate a `tsvector`; a non-text field would emit a model that fails
-    // to compile against the `#[searchable]` macro and a migration Postgres
-    // rejects, so reject it here with an actionable, field-naming error (AC5).
-    // Weights follow the `search_page`/wiki convention: the first field gets the
-    // highest `A` weight, the rest `B`/`C`/`D` (capped), in the order given.
+    // Only `String`/`Text` fields can feed a `tsvector` (#1319). Weights follow field order:
+    // the first gets `A`, the rest `B`/`C`/`D` (capped at `D`).
     for (i, name) in options.searchable.iter().enumerate() {
         let field_name = name.trim();
         let field = field_by_name(fields, field_name).ok_or_else(|| {
@@ -2131,17 +1967,13 @@ pub fn parse_model_metadata_for(
                 field.rust_type()
             )));
         }
-        // NOTE: the `--searchable` + `{encrypted}` refusal deliberately lives in
-        // `validate_encrypted_fields`, not here — this function also runs while
-        // planning a `destroy`, where a generation-only refusal would strand the
-        // files the user is trying to remove (see this function's contract
-        // above, and `plan_model_with_options_for_revert`).
+        // The `--searchable` + `{encrypted}` refusal lives in `validate_encrypted_fields`: this
+        // function also runs when planning a `destroy`, which must not be refused.
         let weight = b"ABCD"[i.min(3)] as char;
         metadata.searchable.push((field_name.to_owned(), weight));
     }
     if !metadata.searchable.is_empty() {
-        // `english` matches the `wiki` example and is the most common default;
-        // the FTS dictionary is otherwise out of scope for this slice.
+        // The FTS dictionary is not configurable yet; `english` is the common default.
         metadata.search_language = Some("english".to_owned());
     }
 
@@ -2219,21 +2051,15 @@ pub fn validate_encrypted_fields(
         if !field.is_encrypted() {
             continue;
         }
-        // AC6, flag spelling: `--unique <col>` reaches the same broken state as
-        // the DSL's `:unique`, so it gets the same refusal and the same fix.
+        // `--unique` gets the same refusal as the DSL's `:unique`.
         if field.is_randomized_encrypted() && field.unique {
             return Err(GenerateError::InvalidField {
                 token: field.name.clone(),
                 reason: randomized_equality_lookup_reason(&field.name, "is `unique`"),
             });
         }
-        // `--index` is the third spelling of "make this column
-        // equality-queryable". A B-tree index over RANDOMIZED ciphertext can
-        // never serve a lookup — every write produces a different key for the
-        // same plaintext — so it is pure write amplification that also
-        // advertises a queryability the column does not have. (On a
-        // deterministic column the index is genuinely useful, which is the
-        // whole point of that mode, so it is allowed.)
+        // An index over randomized ciphertext never serves a lookup: every write encrypts the same
+        // plaintext differently. On a deterministic column the index is useful, so it is allowed.
         if field.is_randomized_encrypted() && options.indexes.iter().any(|i| i.trim() == field.name)
         {
             return Err(GenerateError::InvalidField {
@@ -2241,11 +2067,6 @@ pub fn validate_encrypted_fields(
                 reason: randomized_equality_lookup_reason(&field.name, "has an `--index`"),
             });
         }
-        // The shard key routes a query to a physical shard by hashing the
-        // value the caller supplies. For a randomized column the caller only
-        // ever holds plaintext, whose ciphertext differs on every write, so no
-        // lookup could resolve the shard; for a deterministic one the shard
-        // assignment would leak plaintext equality at the topology level.
         if options.shard_key.as_deref().map(str::trim) == Some(field.name.as_str()) {
             return Err(GenerateError::InvalidField {
                 token: field.name.clone(),
@@ -2259,12 +2080,6 @@ pub fn validate_encrypted_fields(
                 ),
             });
         }
-        // Full-text search builds the stored `search_vector` from the DATABASE
-        // column value, which for an encrypted column is ciphertext — so a
-        // plaintext search would never match, in EITHER mode. The `#[model]`
-        // macro rejects `#[searchable]` + `#[encrypted]` outright; mirror that
-        // here so the failure names the field at generate time instead of
-        // surfacing as a macro error in the generated app.
         if options.searchable.iter().any(|s| s.trim() == field.name) {
             return Err(GenerateError::InvalidField {
                 token: field.name.clone(),
@@ -2278,11 +2093,6 @@ pub fn validate_encrypted_fields(
                 ),
             });
         }
-        // `#[encrypted]` columns must flow through the encrypting `serialize_as`
-        // wrapper on insert; a `#[default]` column is excluded from the insert
-        // entirely, so the row would hold a raw value the decrypting reader then
-        // rejects as a malformed envelope. The `#[model]` macro refuses the
-        // pair — surface it here, where the field name is still in hand.
         if options
             .defaults
             .iter()
@@ -2323,12 +2133,9 @@ pub fn encryption_key_material_warning(fields: &[Field]) -> Option<String> {
     let deterministic = fields
         .iter()
         .any(|f| f.encrypted_mode() == Some(EncryptedMode::Deterministic));
-    // One flowing paragraph, like every other `plan.warn` — `Plan::print_warnings`
-    // prefixes `Warning: ` and does no continuation-line handling, so an
-    // embedded TOML block would hang off that prefix at the wrong indent. The
-    // credentials are named as dotted paths, matching the runtime's own
-    // "Attribute encryption misconfiguration" diagnostic, so the two are
-    // greppable against each other; the guide carries the block to paste.
+    // One paragraph: `Plan::print_warnings` does no continuation-line indenting, so an embedded
+    // TOML block would misalign. The dotted credential paths match the runtime's
+    // misconfiguration diagnostic, so the two can be grepped against each other.
     let extra = if deterministic {
         " and `active_record_encryption.deterministic_key` (required by the \
          deterministic column(s) declared here)"
@@ -2435,12 +2242,8 @@ pub fn validate_lock_version_field(
             ),
         });
     }
-    // `unique` + a defaulted column is already rejected for explicit
-    // `--default` flags above, for the reason that bites hardest here: the lock
-    // column is DB-managed, so EVERY insert takes the same `DEFAULT 0` and the
-    // second row created collides with the first. The check above runs before
-    // the lock column's default is injected, so it never sees this pairing —
-    // catch it here instead of emitting a table that accepts exactly one row.
+    // The `unique` + `--default` check in `parse_model_metadata_for` runs before the lock
+    // column's default is injected, so it never sees this pairing.
     if field.unique {
         return Err(GenerateError::InvalidField {
             token: format!("{}:unique", field.name),
@@ -2451,13 +2254,9 @@ pub fn validate_lock_version_field(
             ),
         });
     }
-    // A seed the counter cannot be incremented from. The generated `UPDATE`
-    // evaluates `lock_version + 1` in SQL, and Postgres raises `integer out of
-    // range` rather than wrapping — so seeding at the column's maximum makes the
-    // FIRST update on every row a 500. Rejecting the seed is the only fix that
-    // keeps the emitted statement simple; see the note on `lock_bump` about why
-    // the generated SQL deliberately does not emulate the repository's
-    // `wrapping_add`.
+    // The generated UPDATE computes `lock_version + 1` in SQL, and Postgres raises `integer out
+    // of range` instead of wrapping, so a seed at the type's maximum fails the first update.
+    // See the scaffold's `lock_bump` for why the SQL does not emulate `wrapping_add`.
     let ceiling = if field.kind == FieldKind::I64 {
         i64::MAX
     } else {
@@ -2523,12 +2322,9 @@ fn validate_known_field(
 
 fn render_validation_attr(field: &Field, rule: &str) -> Result<String, String> {
     if rule == "url" || rule == "email" {
-        // `richtext` is deliberately excluded even though `is_string_like`
-        // accepts it for LENGTH rules: a Markdown body can never satisfy a
-        // single-line format validator, so `#[validate(email)]` on one makes the
-        // field unwritable. The DSL rejects `body:richtext{email}` for the same
-        // reason (issue #1255) — this is the `--validate` flag's matching guard,
-        // so the two spellings agree.
+        // `richtext` passes `is_string_like` for length rules, but a Markdown body never passes
+        // a single-line format validator. Matches the DSL's refusal of `body:richtext{email}`
+        // (#1255).
         if !is_string_like(field) || field.kind.is_rich_text() {
             return Err(format!("{rule} validation requires String or Text fields"));
         }
@@ -2560,10 +2356,8 @@ fn render_validation_attr(field: &Field, rule: &str) -> Result<String, String> {
     if min.is_none() && max.is_none() {
         return Err("length validation needs at least min=N or max=N".to_owned());
     }
-    // A `min` greater than `max` is a self-contradictory rule that no string
-    // can ever satisfy: not a mistake to silently accept and generate an
-    // always-invalid field, one for which the generated smoke test's own
-    // "valid submission" would fail (issue #1124 review).
+    // `min > max` can never be satisfied, and the generated smoke test's valid submission
+    // would fail.
     if let (Some(min), Some(max)) = (min, max)
         && min > max
     {
@@ -2683,24 +2477,14 @@ fn sql_default_literal(
             }
             validate_decimal_default_fits(value, precision, scale)?;
             match backend {
-                // Emitted as the original string, not `parsed.to_string()` —
-                // an unquoted numeric literal is valid Postgres `NUMERIC` SQL
-                // whether or not it round-trips exactly through `f64` (this arm
-                // only used `f64` to reject non-numeric garbage above).
+                // The original string, not `parsed.to_string()`: an unquoted literal is valid
+                // `NUMERIC` SQL even when it does not round-trip through `f64`.
                 DatabaseBackend::Postgres => Ok(value.to_owned()),
-                // On SQLite the column is `TEXT`, so the default has to be a
-                // text literal: unquoted, SQLite evaluates `DEFAULT 0.10`
-                // numerically before applying TEXT affinity and stores `0.1`,
-                // or scientific notation for a wide value, which
-                // `Decimal::from_str` cannot read back at all.
-                //
-                // It also has to be the SAME text `SqliteDecimal` would write,
-                // which is normalized (`db::sqlite_types`). A default of
-                // `0.10` stored verbatim would never equal the `0.1` every
-                // later write produces — a `find_by_…` could not match a row
-                // holding its own default, and a unique index would admit
-                // both. Normalizing through the real `Decimal` rather than by
-                // hand is what guarantees the two agree (issue #1924).
+                // On SQLite the column is `TEXT`, so the default must be a quoted literal:
+                // unquoted, `DEFAULT 0.10` is stored as `0.1`, or in scientific notation for a
+                // wide value, which `Decimal::from_str` cannot read. It must also be the
+                // normalized text `SqliteDecimal` writes, or a `find_by_…` or unique index would
+                // treat `0.10` and `0.1` as different values (#1924).
                 DatabaseBackend::Sqlite => {
                     use autumn_web::reexports::rust_decimal::Decimal;
                     let decimal = value.parse::<Decimal>().map_err(|err| {
@@ -2717,14 +2501,9 @@ fn sql_default_literal(
         FieldKind::Json => {
             serde_json::from_str::<serde_json::Value>(value)
                 .map_err(|err| format!("json default '{value}' is not valid JSON: {err}"))?;
-            // Unlike the plain `String` arm above, the raw value is NOT run
-            // through `unquote_default_value` first — JSON syntax already
-            // carries its own quoting (`"hello"` is a JSON string; `{}`/`[]`/
-            // `42`/`true` are not quoted at all), so stripping a layer here
-            // would corrupt a JSON *string* default (`note:json="hi"`) into
-            // an invalid literal. Postgres implicitly casts a single-quoted
-            // string literal to the column's declared `JSONB` type in a
-            // `DEFAULT` clause, so no explicit `::jsonb` cast is needed.
+            // Not unquoted like the `String` arm: JSON carries its own quoting, so stripping a
+            // layer would corrupt a JSON string default (`note:json="hi"`). Postgres casts a
+            // quoted literal to `JSONB` in a `DEFAULT` clause without an explicit `::jsonb`.
             Ok(format!("'{}'", value.replace('\'', "''")))
         }
         FieldKind::Uuid
@@ -2734,15 +2513,11 @@ fn sql_default_literal(
         | FieldKind::Bytea
         | FieldKind::Attachment
         | FieldKind::References
-        // A slug's value is always auto-derived from its `from` field on
-        // create (issue #1260), never a static default.
+        // A slug is always derived from its `from` field (#1260).
         | FieldKind::Slug
-        // A position's value is always assigned by the repository on insert
-        // (issue #1358), never a static default.
+        // A position is always assigned by the repository on insert (#1358).
         | FieldKind::Position
-        // A commentable counter always starts at 0 and is thereafter moved by
-        // the framework (issue #1367); the migration's own `DEFAULT 0` is the
-        // only default it may have.
+        // A commentable counter has only the migration's own `DEFAULT 0` (#1367).
         | FieldKind::Commentable => Err(format!(
             "defaults for {} fields are not supported by `autumn generate` yet",
             field.rust_type()
@@ -2810,14 +2585,9 @@ fn render_enum_decl(
 
     let mut out = String::new();
 
-    // Always derive `Default`, even without an explicit `--default`. The `#[model]`
-    // macro's generated `UpdateX` patch struct wraps every field in `Patch<T>` and
-    // unconditionally derives `Default` on itself, and `#[derive(Default)]` on a generic
-    // type adds a `T: Default` bound for every type parameter whatever variant is
-    // `#[default]`ed — so every field's Rust type must implement `Default`, a requirement
-    // every other field kind already satisfies via `std`. Absent an explicit `--default
-    // field=variant`, the first declared variant is the unsurprising choice, matching how
-    // other kinds default to a canonical baseline such as `i32::default() == 0`.
+    // Always derive `Default`: `#[model]`'s `UpdateX` wraps every field in `Patch<T>` and
+    // derives `Default`, which adds a `T: Default` bound. Without `--default`, the first
+    // variant is the default.
     let default_raw = default_variant.unwrap_or_else(|| {
         field
             .variants
@@ -2992,8 +2762,7 @@ fn render_model_file(
     soft_delete: bool,
     shard_key: Option<&str>,
     id_type: IdType,
-    // Selects the field Rust types and the generated enum's diesel conversions
-    // (issue #1924). Postgres output is byte-for-byte unchanged.
+    // Selects field Rust types and the enum's diesel conversions (#1924).
     backend: DatabaseBackend,
 ) -> String {
     use std::fmt::Write as _;
@@ -3015,14 +2784,9 @@ fn render_model_file(
             out.push('\n');
         }
     }
-    // Struct-level `#[commentable(...)]` (#1367), emitted by the `comments:commentable`
-    // DSL token. It brings the repository's `add_comment`, `comment_thread`, and
-    // `delete_comment` helpers into existence and registers this model with the
-    // framework's generic comment router. `by = User` is the convention `autumn generate
-    // auth` produces; a project whose author model is named differently changes that one
-    // word. No `author_name` is emitted on purpose: the generated `User` carries an
-    // `email`, and defaulting a public display name to it would leak addresses into every
-    // rendered thread.
+    // `#[commentable(...)]` (#1367) adds the repository's comment helpers and registers the
+    // model with the comment router. No `author_name` is emitted: the generated `User`'s only
+    // candidate is `email`, and a display name defaulting to it would leak addresses.
     if fields.iter().any(|f| f.kind.is_commentable()) {
         out.push_str(
             "// Threaded, polymorphic comments (#1367): one shared `comments` table,\n\
@@ -3042,9 +2806,6 @@ fn render_model_file(
             .map_or_else(String::new, |author| format!("by = {author}, "));
         let _ = writeln!(out, "#[commentable({by}counter_cache = {})]", counter.name);
     }
-    // Struct-level `#[searchable(language = "…")]` (issue #1319) opts the model
-    // into full-text search; the per-field `#[searchable(weight = "…")]` below
-    // declare which columns feed the `search_vector` and at what rank weight.
     if let Some(language) = metadata.search_language() {
         let _ = writeln!(out, "#[searchable(language = \"{language}\")]");
     }
@@ -3066,31 +2827,19 @@ fn render_model_file(
                 let _ = writeln!(out, "    #[validate({validation})]");
             }
         }
-        // Issue #1318: the optimistic-locking column carries `#[lock_version]`
-        // rather than `#[default]`. Both mark the column DB-managed (excluded
-        // from `New{Model}`), but only `#[lock_version]` puts the expected
-        // version on `Update{Model}` and makes `#[repository]`'s update raise
-        // `RepositoryError::Conflict` on a stale write — the whole point of
-        // declaring the column. `parse_model_metadata` records its SQL
-        // `DEFAULT 0` separately, so the migration still backfills the INSERT.
+        // `#[lock_version]` instead of `#[default]` (#1318): both exclude the column from
+        // `New{Model}`, but only `#[lock_version]` makes a stale update raise
+        // `RepositoryError::Conflict`. Its SQL `DEFAULT 0` is recorded in the metadata.
         if is_lock_version_column(f) {
             out.push_str("    #[lock_version]\n");
         } else if f.kind.is_position() {
-            // Issue #1358: `#[position]` marks the column DB-managed
-            // (excluded from `New{Model}`/`Update{Model}`, like
-            // `#[lock_version]`) — the generated repository assigns and
-            // maintains its value entirely; see `excluded_from_new` in
-            // `autumn-macros`.
+            // DB-managed: the generated repository assigns the value (#1358).
             out.push_str("    #[position]\n");
         } else if metadata.defaults.contains_key(&f.name) {
             out.push_str("    #[default]\n");
         }
-        // A `:states(…)` DSL modifier (issue #1326) re-emits as a
-        // `#[state_machine(transitions(…))]` attribute, in the exact grammar the
-        // `autumn_web::model` macro accepts: bare-ident states, an optional
-        // `: "guard"` string. Absent when the field declared no state machine —
-        // that no-op path is what keeps the non-state-machine output
-        // byte-identical to before this feature.
+        // `:states(…)` (#1326) in the grammar `#[model]` accepts: `from -> to`, with an optional
+        // `: "guard"`.
         if let Some(sm) = &f.state_machine {
             let mut inner = String::new();
             for (i, t) in sm.transitions.iter().enumerate() {
@@ -3104,14 +2853,8 @@ fn render_model_file(
             }
             let _ = writeln!(out, "    #[state_machine(transitions({inner}))]");
         }
-        // Issue #1340: a `{encrypted}` / `{encrypted:deterministic}` DSL
-        // modifier re-emits as the `#[encrypted(...)]` attribute the `#[model]`
-        // macro parses, so the column is stored as an opaque base64 ciphertext
-        // envelope while staying a plain `String` in Rust. This is also what
-        // the admin generator's `detect_encrypted_fields` reads back off the
-        // model source to redact the column, so the spelling here is a
-        // contract, not cosmetics. Absent for a plaintext column — that no-op
-        // path is what keeps unencrypted output byte-identical.
+        // `{encrypted}` (#1340). The admin generator's `detect_encrypted_fields` reads this
+        // attribute back from the model source, so the spelling is a contract.
         match f.encrypted_mode() {
             Some(EncryptedMode::Randomized) => out.push_str("    #[encrypted]\n"),
             Some(EncryptedMode::Deterministic) => {
@@ -3119,45 +2862,22 @@ fn render_model_file(
             }
             None => {}
         }
-        // Issue #1384: a `{translatable}` DSL modifier re-emits as the
-        // `#[translatable]` attribute the `#[model]` macro parses. The field's
-        // Rust type (`autumn_web::i18n::Translated`, from `Field::rust_type`)
-        // is what carries the behaviour; the attribute is what registers the
-        // column and emits the `<field>_localized` / `available_locales(..)`
-        // accessors. Absent for a monolingual column — that no-op path is what
-        // keeps non-translatable output byte-identical.
         if f.is_translatable() {
             out.push_str("    #[translatable]\n");
         }
         push_decimal_shape_attr(&mut out, f.kind);
-        // Issue #1255: a `richtext` column renders as a bare `String`, exactly
-        // like `String`/`Text`, so nothing in the emitted source would otherwise
-        // distinguish it. Emit a marker doc comment that (a) tells a human
-        // reading the model that the column holds Markdown source to be rendered
-        // through `render_user_content`, and (b) lets
-        // [`model_string_columns`] skip it when picking a `references` display
-        // label — a whole Markdown body is the worst possible `<select>` option
-        // text. See [`RICH_TEXT_MARKER_DOC`].
+        // `richtext` renders as a bare `String` (#1255). The marker doc tells a reader the column
+        // holds Markdown, and lets `model_string_columns` skip it as a `references` label.
         if f.kind.is_rich_text() {
             let _ = writeln!(out, "    /// {RICH_TEXT_MARKER_DOC}");
         }
         let _ = writeln!(out, "    pub {}: {},", f.name, f.rust_type_for(backend));
     }
     if soft_delete {
-        // `deleted_at` must come before `created_at` here, matching the column
-        // order `create_table_sql_with_metadata_and_id` and
-        // `schema_table_block_with_id` emit: they append the soft-delete field to
-        // the field list, then always append `created_at` last. The repository
-        // macro's generated insert-then-`RETURNING` query loads into this struct
-        // positionally, so a struct field order that does not match the table's
-        // column order produces a Diesel `CompatibleType` mismatch at compile time.
-        //
-        // `deleted_at` is otherwise DB-managed — NULL on insert, set only by the
-        // destroy handler. The migration declares it nullable with no explicit SQL
-        // DEFAULT, so Postgres inserts NULL whenever it is omitted from the INSERT
-        // column list, and `#[default]` excludes it from `NewX`/`UpdateX`
-        // accordingly. Without it the `#[model]` macro treats `deleted_at` as a
-        // required field that neither the create nor the update handler populates.
+        // `deleted_at` precedes `created_at` to match the migration's column order: the
+        // repository's insert-`RETURNING` loads into this struct positionally, so a mismatch is a
+        // Diesel `CompatibleType` error. `#[default]` keeps it out of `NewX`/`UpdateX`: the column
+        // is NULL on insert and set only by the destroy handler.
         out.push_str("    #[default]\n");
         out.push_str("    pub deleted_at: Option<chrono::NaiveDateTime>,\n");
     }
@@ -3168,9 +2888,8 @@ fn render_model_file(
 }
 
 #[cfg(test)]
-// Test inputs like `"email:String{encrypted:deterministic}"` are literal DSL
-// tokens passed to the generators, not format strings — the `{…}` is the
-// scaffold's own constraint-modifier syntax under test.
+// Test inputs like `"email:String{encrypted:deterministic}"` are DSL tokens, not format
+// strings.
 #[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
@@ -3257,12 +2976,8 @@ mod tests {
 
     #[test]
     fn generate_then_destroy_model_round_trips_to_original_project_state() {
-        // Mirrors a real `autumn new` project's Cargo.toml: `[dependencies]`
-        // already exists (autumn-web, diesel_migrations) before any
-        // generator runs — `diesel_migrations` is template-shipped (see
-        // `TEMPLATE_SHIPPED_CARGO_DEPS`) so `Revert::CargoDeps` never
-        // targets it, matching a real project where it always predates
-        // any `generate` call.
+        // Like a real `autumn new` Cargo.toml: `diesel_migrations` is template-shipped, so
+        // `Revert::CargoDeps` never removes it.
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -3282,9 +2997,8 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
         assert!(tmp.path().join("src/models/post.rs").exists());
 
-        // Destroy recomputes the plan from the same params (a fresh
-        // timestamp doesn't matter here since the migration dir is matched
-        // by suffix), then reverts it.
+        // Destroy recomputes the plan; the migration dir is matched by suffix, so the
+        // timestamp does not matter.
         let destroy_plan = plan_model(
             tmp.path(),
             "Post",
@@ -3363,10 +3077,8 @@ mod tests {
 
     #[test]
     fn destroying_last_model_keeps_dep_still_used_by_hand_written_code() {
-        // Codex PR review (issue #1048): a project can hand-add a dependency
-        // for its own reasons, unrelated to any generated resource. Destroy
-        // must not strip it just because the last model that also happened
-        // to need it is gone.
+        // A dependency hand-written code also uses must survive destroying the last model that
+        // needed it (#1048).
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -3441,9 +3153,7 @@ mod tests {
 
     #[test]
     fn plan_rejects_id_or_created_at_as_user_field() {
-        // The model template always emits `id` and `created_at`. Letting the
-        // user re-declare them would produce duplicate struct members and
-        // duplicate SQL columns.
+        // The model template always emits `id` and `created_at`.
         for token in ["id:i64", "created_at:NaiveDateTime"] {
             let tmp = project();
             let err =
@@ -3647,7 +3357,7 @@ mod tests {
             up.contains("title TEXT NOT NULL DEFAULT '{}'"),
             "up.sql: {up}"
         );
-        // AC6: what the generator actually wrote classifies as safe.
+        // What the generator wrote classifies as safe.
         assert!(
             crate::migrate::safety::is_safe(&crate::migrate::safety::classify_sql(&up)),
             "generated migration must classify safe: {up}"
@@ -3819,7 +3529,6 @@ mod tests {
             model.contains("    #[encrypted(deterministic)]\n    pub email: String,"),
             "deterministic column must carry the mode; got:\n{model}"
         );
-        // AC3: a non-encrypted DSL field in the SAME model is unaffected.
         assert!(
             model.contains("    pub username: String,"),
             "plain column must be untouched; got:\n{model}"
@@ -4149,9 +3858,8 @@ mod tests {
 
     #[test]
     fn enum_field_name_colliding_with_generated_companion_type_is_rejected() {
-        // `status:enum{...}` on a `Field` model would generate `pub enum
-        // Field`, colliding with the `#[model]` macro's own `FieldField` enum
-        // (one variant per mutable column, used for audit/CDC payloads).
+        // On model `Field`, `field:enum{a,b}` would generate `pub enum Field`, the model's own
+        // name.
         let tmp = project();
         let err = plan_model(
             tmp.path(),
@@ -4165,11 +3873,8 @@ mod tests {
 
     #[test]
     fn enum_field_name_colliding_with_preload_associations_or_factory_is_rejected() {
-        // The `#[model]` macro always emits `{Pascal}Preload`, `{Pascal}Associations`,
-        // and `{Pascal}Factory` (autumn-macros/src/model.rs), even for a model
-        // with no associations — a field that pascalizes to one of these on
-        // model `Post` must be rejected, not just the shorter, already-covered
-        // companion names.
+        // `#[model]` always emits `{Pascal}Preload`, `{Pascal}Associations` and
+        // `{Pascal}Factory`, even for a model with no associations.
         for field_name in ["post_preload", "post_associations", "post_factory"] {
             let tmp = project();
             let err = plan_model(
@@ -4188,10 +3893,8 @@ mod tests {
 
     #[test]
     fn two_enum_fields_colliding_with_each_other_are_rejected() {
-        // `pascal()` is not injective: `in_review` and `in__review` both
-        // pascalize to `InReview`. Without this check, both fields would
-        // pass (neither collides with a *reserved* name) and the generator
-        // would emit `pub enum InReview` twice in the same model file.
+        // `pascal()` is not injective: `in_review` and `in__review` both give `InReview`, which
+        // would be emitted twice.
         let tmp = project();
         let err = plan_model(
             tmp.path(),
@@ -4220,14 +3923,9 @@ mod tests {
 
     #[test]
     fn enum_field_name_shadowing_prelude_type_is_rejected() {
-        // A field that pascalizes to `String`/`Vec`/`Option`/`Result`/`Box`/`Into`
-        // shadows the prelude import for the entire generated file (and, once
-        // imported into the scaffold's routes file, that file too) — verified
-        // by generating `string:enum{a,b}` and observing `cargo check` fail
-        // with E0308/E0599 far from this token. `into` is included because
-        // `render_enum_decl`'s `FromSql` impl calls the unqualified
-        // `Into::into` — a field named `into` would generate `pub enum Into`,
-        // which shadows that path expression too.
+        // An enum named after a prelude type shadows it in the whole model file, and in the
+        // scaffold routes file that imports it. `into` is listed because `render_enum_decl`'s
+        // `FromSql` impl calls the unqualified `Into::into`.
         for field_name in ["string", "vec", "option", "result", "box", "into"] {
             let tmp = project();
             let err = plan_model(
@@ -4244,7 +3942,7 @@ mod tests {
         }
     }
 
-    // ── decimal field: --default (issue #1038 PR review) ────────────────────
+    // ── decimal field: --default (issue #1038) ─────────────────────────────────
 
     #[test]
     fn decimal_default_within_precision_and_scale_is_accepted() {
@@ -4265,10 +3963,7 @@ mod tests {
 
     #[test]
     fn decimal_default_rejected_when_integer_part_overflows_precision() {
-        // decimal{2,2} has 0 integer digits of budget (precision - scale ==
-        // 0), so any value with magnitude >= 1 must be rejected rather than
-        // generating a migration Postgres fails at apply time with a
-        // "numeric field overflow".
+        // decimal{2,2} leaves no integer digits, so a value >= 1 would overflow at migrate time.
         let fields = parse_fields(&["amount:decimal{2,2}".into()]).unwrap();
         let err = parse_model_metadata(
             &fields,
@@ -4301,9 +3996,7 @@ mod tests {
 
     #[test]
     fn decimal_default_tolerates_insignificant_trailing_zeros() {
-        // "1.500" has one significant fractional digit (5), not three — it
-        // must not be rejected for a scale-2 column just because the source
-        // string happens to have an extra trailing zero.
+        // "1.500" has one significant fractional digit, so a scale-2 column accepts it.
         let fields = parse_fields(&["amount:decimal{4,2}".into()]).unwrap();
         let metadata = parse_model_metadata(
             &fields,
@@ -4717,9 +4410,8 @@ mod tests {
     /// no `CHECK` may appear there.
     #[test]
     fn decimal_field_emits_decimal_shape_attr_for_model_macro() {
-        // Issue #2597: the declared `decimal{p,s}` rides into `#[model]` on a
-        // `#[decimal_shape(precision = p, scale = s)]` field attribute, so the
-        // factory `.fake()` draws values that fit the column by construction.
+        // The declared shape reaches `#[model]` as `#[decimal_shape]`, so the factory's `.fake()`
+        // draws values that fit the column (#2597).
         let fields = parse_fields(&["price:decimal{10,2}".to_owned()]).expect("parse");
         let model = render_model_file_for_test("Invoice", "invoices", &fields);
         assert!(
@@ -4731,8 +4423,7 @@ mod tests {
             "decimal field still renders as rust_decimal::Decimal: {model}"
         );
 
-        // Non-decimal fields are untouched — the no-op path keeps their
-        // output byte-identical (no new attribute appears).
+        // Non-decimal fields get no attribute.
         let plain = parse_fields(&["title:String".to_owned()]).expect("parse");
         let plain_model = render_model_file_for_test("Post", "posts", &plain);
         assert!(
@@ -5505,13 +5196,9 @@ mod tests {
 
     #[test]
     fn decimal_field_warns_when_existing_rust_decimal_dep_lacks_diesel_feature() {
-        // Regression test (PR review, issue #1038): `ensure_cargo_dependencies`
-        // skips a crate that's already declared, regardless of its features —
-        // so a project that already had `rust_decimal = "1"` (e.g. for its own
-        // business logic) before ever using a `decimal` field would silently
-        // keep that feature-less entry, and the generated `#[model]` field's
-        // Diesel `ToSql`/`FromSql` impls (behind `db-diesel2-postgres`) would
-        // be missing, failing to compile with no indication why.
+        // `ensure_cargo_dependencies` skips a crate already declared, whatever its features, so a
+        // feature-less `rust_decimal = "1"` would leave the `decimal` field without its Diesel
+        // `ToSql`/`FromSql` impls (#1038).
         let tmp = project();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -5551,12 +5238,8 @@ mod tests {
 
     #[test]
     fn decimal_field_warns_naming_only_the_missing_feature() {
-        // Regression test (PR review, issue #1038): the earlier version of
-        // this check only verified `db-diesel2-postgres`, missing that the
-        // generated `#[model]` struct also derives Serialize/Deserialize and
-        // so needs `serde` too — a project with `rust_decimal` already
-        // declared with `db-diesel2-postgres` but not `serde` would pass the
-        // old single-feature check and still fail to compile.
+        // The generated struct also derives Serialize/Deserialize, so `serde` is required as well
+        // as `db-diesel2-postgres` (#1038).
         let tmp = project();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -5649,13 +5332,8 @@ mod tests {
 
     #[test]
     fn unique_field_with_default_is_rejected() {
-        // issue #1032 review follow-up: a `--default` field is excluded from
-        // the generated HTML form (see `scaffold::plan_scaffold`'s
-        // `form_fields` filter), so a `unique` column that also has a
-        // `--default` would have no `UNIQUE_CONSTRAINTS` entry (and, even if
-        // it did, no form input to show a duplicate-value error against).
-        // Reject the combination outright instead of silently emitting a
-        // scaffold whose duplicate handling doesn't work for that field.
+        // A defaulted field is left out of the scaffold form, so a `unique` + `--default` column
+        // would have no input to show a duplicate-value error against (#1032).
         let fields = parse_fields(&["email:String:unique".into()]).unwrap();
         let err = parse_model_metadata(
             &fields,
@@ -5673,10 +5351,8 @@ mod tests {
 
     #[test]
     fn unique_flag_field_with_default_is_rejected() {
-        // Same rejection, but for the `--unique FIELD` flag path rather than
-        // the inline `:unique` DSL marker — `apply_unique_flags` must run
-        // before `parse_model_metadata` sees the `--default` token for this
-        // to catch it (it does, in `plan_model_with_options`).
+        // Same, via the `--unique` flag: `apply_unique_flags` runs before
+        // `parse_model_metadata` sees the `--default`.
         let mut fields = parse_fields(&["email:String".into()]).unwrap();
         apply_unique_flags(&mut fields, &["email".to_owned()]).unwrap();
         let err = parse_model_metadata(
@@ -6505,7 +6181,6 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn plan_default_id_type_emits_bigserial_and_i64() {
-        // AC4: the default (BigSerial) must be byte-for-byte identical to today's output.
         let tmp = project();
         let plan = plan_model_with_options(
             tmp.path(),
@@ -6542,7 +6217,7 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn plan_uuid_id_type_emits_uuid_type_in_all_outputs() {
-        // AC1: --id uuid threads through model, migration, and schema.
+        // `--id uuid` threads through model, migration, and schema.
         let tmp = project();
         let plan = plan_model_with_options(
             tmp.path(),
@@ -6621,7 +6296,6 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn uuid_dep_always_present_in_model_deps() {
-        // AC5: the uuid crate is always in MODEL_DEPS regardless of --id.
         let uuid_dep = MODEL_DEPS.iter().find(|(k, _)| *k == "uuid");
         assert!(
             uuid_dep.is_some(),
@@ -6636,7 +6310,7 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn fk_field_uuid_generates_uuid_column() {
-        // AC3: a field like `author_id:Uuid` already works via FieldKind::Uuid.
+        // A field like `author_id:Uuid` already works via `FieldKind::Uuid`.
         let tmp = project();
         let plan = plan_model(
             tmp.path(),
@@ -6795,10 +6469,8 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn references_field_errors_when_target_model_has_uuid_pk() {
-        // `references` only supports the i64/BIGSERIAL PK convention; a FK
-        // column typed BIGINT against a UUID PRIMARY KEY would fail at
-        // `autumn migrate` time with an opaque Postgres error, so this must
-        // fail loudly at generate time instead.
+        // A BIGINT FK against a UUID PRIMARY KEY fails at `autumn migrate` with an opaque
+        // Postgres error, so generation fails first.
         let tmp = project();
         let models_dir = tmp.path().join("src/models");
         fs::create_dir_all(&models_dir).unwrap();
@@ -6846,10 +6518,8 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn references_field_no_warning_when_target_declared_in_single_file_models_rs() {
-        // The single-file `src/models.rs` layout is an equally valid place
-        // for a model to live (see `migration.rs`'s `AddSearch` shape, which
-        // checks both locations) — it must not produce a false-positive
-        // "model not found" warning.
+        // The single-file `src/models.rs` layout is valid too and must not warn "model not
+        // found".
         let tmp = project();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(
@@ -6874,11 +6544,8 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn references_field_no_warning_for_grouped_schema_import_in_single_file_models_rs() {
-        // Multi-model `src/models.rs` files commonly group their schema
-        // imports (e.g. `examples/reddit-clone/src/models.rs`:
-        // `use crate::schema::{comments, posts, subreddits, users, votes};`)
-        // rather than one `use` per table — this must still count as "Post
-        // declared here", not a false "model not found" warning.
+        // Multi-model `src/models.rs` files often group schema imports
+        // (`use crate::schema::{comments, posts, users};`); that still declares Post.
         let tmp = project();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(
@@ -7002,9 +6669,7 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn references_field_not_confused_by_table_name_prefix_in_single_file_models_rs() {
-        // Only `posts_tags`/`PostsTag` is declared — `posts` must not be
-        // treated as found just because it's a string-prefix of
-        // `posts_tags` (regression: word-boundary-unaware substring match).
+        // Only `posts_tags` is declared; `posts` is a string prefix of it and must not match.
         let tmp = project();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(
@@ -7030,10 +6695,8 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn references_field_detects_uuid_pk_even_when_id_field_is_renamed() {
-        // The `#[model]` macro identifies the primary key by the `#[id]`
-        // attribute, not by the field name `id` — a hand-edited model file
-        // (the generator's own doc comment says these are "ordinary user
-        // code" once generated) can legally rename it.
+        // `#[model]` finds the primary key by `#[id]`, not by the name `id`, and a generated
+        // model is ordinary user code that may rename it.
         let tmp = project();
         let models_dir = tmp.path().join("src/models");
         fs::create_dir_all(&models_dir).unwrap();
@@ -7083,9 +6746,7 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn references_field_detects_unqualified_uuid_type() {
-        // A hand-edited model using `use uuid::Uuid;` + `pub id: Uuid,`
-        // (idiomatic, not what the generator itself emits, but a common
-        // hand-edit) must still be detected as a UUID primary key.
+        // `use uuid::Uuid;` + `pub id: Uuid,` is a common hand-edit and is still a UUID PK.
         let tmp = project();
         let models_dir = tmp.path().join("src/models");
         fs::create_dir_all(&models_dir).unwrap();
@@ -7199,9 +6860,7 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn references_field_detects_uuid_pk_regardless_of_attribute_order() {
-        // `#[id]` doesn't have to be the first attribute on the field — a
-        // real parse (unlike a "look at the line after #[id]" scan) handles
-        // any attribute order the same way rustc does.
+        // `#[id]` need not be the first attribute on the field.
         let tmp = project();
         let models_dir = tmp.path().join("src/models");
         fs::create_dir_all(&models_dir).unwrap();
@@ -7241,15 +6900,12 @@ autumn-web = \"0.3\"\n";
         assert!(plan.warnings.is_empty());
     }
 
-    // ── self-referential `references` (issue #1026 follow-up) ──────────────
+    // ── self-referential `references` (issue #1026) ───────────────────────────
 
     #[test]
     fn self_referential_references_errors_when_own_id_is_uuid() {
-        // `Category category:references --id uuid`: the target model
-        // ("Category" itself) doesn't exist on disk yet — this command is
-        // creating it — so a filesystem lookup can never see it. The
-        // self-reference must be checked against the model's own
-        // `--id uuid` directly instead of silently skipping the UUID check.
+        // `Category category:references --id uuid`: the target is the model being created, so it
+        // is not on disk yet; the check must use the model's own `--id uuid`.
         let tmp = project();
         let err = plan_model_with_options(
             tmp.path(),
@@ -7306,10 +6962,7 @@ autumn-web = \"0.3\"\n";
 
     // ── optimistic locking: `lock_version` (issue #1318) ────────────────────
     //
-    // A model opts into optimistic concurrency by declaring a field literally
-    // named `lock_version`. The generator wires the framework's shipped
-    // primitive (`#[lock_version]`, issue #575) rather than leaving it an inert
-    // integer column.
+    // A field named `lock_version` opts the model into `#[lock_version]` (#575).
 
     #[test]
     fn lock_version_field_emits_lock_version_attribute() {
@@ -7457,10 +7110,8 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn a_model_with_no_insertable_columns_is_rejected() {
-        // Every column DB-managed => an empty `NewPost`, whose Diesel
-        // `Insertable` derive does not compile. `generate model` reaches this
-        // as easily as `generate scaffold` did, and the scaffold delegates here,
-        // so the guard belongs on this path.
+        // Every column DB-managed gives an empty `NewPost`, whose `Insertable` derive does not
+        // compile. The scaffold delegates here, so the guard lives on this path.
         let tmp = project();
         let err = plan_model(
             tmp.path(),
@@ -7507,9 +7158,8 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn destroying_a_legacy_lock_version_model_is_never_blocked_by_the_new_checks() {
-        // Same hazard as the scaffold gates: `destroy model` recomputes the plan
-        // it is about to revert, so a generation-only refusal would fire before
-        // `Plan::revert` ever sees `--force`, permanently stranding the files.
+        // `destroy model` recomputes the plan it reverts, so a generation-only refusal would fire
+        // before `Plan::revert` sees `--force` and strand the files.
         for cols in [
             vec!["title:String".to_owned(), "lock_version:String".to_owned()],
             vec![
@@ -7551,10 +7201,8 @@ autumn-web = \"0.3\"\n";
 
     #[test]
     fn a_lock_version_seeded_at_its_ceiling_is_rejected() {
-        // The generated UPDATE increments the column in SQL, and Postgres raises
-        // `integer out of range` rather than wrapping — verified against
-        // Postgres 16 — so seeding at the maximum makes the FIRST save on every
-        // row a 500, not a distant theoretical overflow.
+        // The generated UPDATE increments the column in SQL, and Postgres raises `integer out of
+        // range` instead of wrapping, so a seed at the maximum fails the first save on every row.
         let tmp = project();
         let err = plan_model_with_options(
             tmp.path(),

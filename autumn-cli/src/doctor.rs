@@ -125,10 +125,8 @@ pub struct DoctorDeprecation {
 /// One plugin's wiring state, as `autumn doctor` can see it from the project's
 /// `Cargo.toml`, `src/main.rs`, and (best effort) its migration history.
 /// Input to [`check_plugin_residue_impl`] (issue #1631).
-// Four independent yes/no facts about one plugin, each read from a different
-// place (the manifest, the source tree, the source tree again with a stricter
-// probe, the catalog). Folding them into an enum would mean enumerating the
-// combinations, which is exactly what `check_plugin_residue_impl` does.
+// Four independent facts, each read from a different place; an enum would have to enumerate
+// their combinations.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct PluginWiring {
@@ -165,39 +163,27 @@ pub fn check_plugin_residue_impl(wirings: &[PluginWiring]) -> CheckResult {
     let mut failures: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    // Two independent findings per plugin, not one match: a wiring asymmetry
-    // and an orphaned migration are different residue, and an arm ordering
-    // that reports one can silently drop the other. `check_plugin_residue_impl`
-    // is `pub` and injectable, so the invariant cannot live in its caller.
+    // A plugin can yield both a wiring finding and an orphaned-migration finding: report both.
     for wiring in wirings {
         let name = &wiring.crate_name;
         match (wiring.dependency, wiring.mount) {
-            // A mount with no dependency does not compile. That is not a
-            // matter of taste for `--strict` to decide — but it is only sound
-            // on the QUALIFIED signal: a bare `SearchPlugin::new(` may be the
-            // app's own type, and asserting a compile failure on a substring
-            // collision would be a hard `Fail` this check has not earned.
+            // A mount with no dependency does not compile, but only a qualified mount proves it:
+            // a bare `SearchPlugin::new(` may be the app's own type.
             (false, true) if wiring.mount_qualified => failures.push(format!(
                 "{name} is mounted in the builder chain but not declared in [dependencies] — this app does not compile; run `autumn plugin add {name}`, or delete the mount"
             )),
             (true, false) => warnings.push(format!(
                 "{name} is declared in [dependencies] but never mounted — {}, or run `autumn plugin remove {name}` to take the dependency back",
                 if wiring.community {
-                    // `plugin add` is dependency-only for a community crate BY
-                    // DESIGN — it never writes their mount — so "finish the
-                    // install" is advice that would go nowhere.
                     "`autumn plugin add` writes no mount for a community crate, so add the `.plugin(...)` call from its README".to_owned()
                 } else {
                     format!("run `autumn plugin add {name}` to finish the install")
                 }
             )),
-            // Unqualified evidence only, both wires agreeing, or neither
-            // present: nothing to say about the wiring.
+            // An unqualified mount alone, or both or neither present: nothing to report.
             (false, true | false) | (true, true) => {}
         }
-        // Residue in the database is only residue once the plugin is gone from
-        // the code; while it is installed, applied migrations are just a
-        // working install.
+        // Applied migrations are residue only once the plugin is gone from the code.
         if !wiring.dependency && !wiring.mount && !wiring.orphaned_migrations.is_empty() {
             warnings.push(format!(
                 "{name} is not installed, but migrations it declares are still recorded as applied: {} — the tables they created are still in the database; `autumn plugin remove {name} --drop-data` reverts them",
@@ -223,8 +209,7 @@ pub fn check_plugin_residue_impl(wirings: &[PluginWiring]) -> CheckResult {
             hint: None,
         };
     }
-    // Failures first, then warnings: a non-compiling app is the finding to act
-    // on, and every other finding is still listed alongside it.
+    // Failures first: a non-compiling app is the finding to act on.
     let detail = failures
         .into_iter()
         .chain(warnings)
@@ -352,8 +337,6 @@ fn grade_dependency_findings(
         CheckStatus::Pass
     };
 
-    // Context every reader needs to map this verdict onto the CI gate: the
-    // auditor, the checks the policy activates, and how old the data is.
     let mut context = format!("{auditor}; {}", dependency_checks_phrase(checks));
     if let Some(age) = db_age_days {
         let plural = if age == 1 { "" } else { "s" };
@@ -365,9 +348,8 @@ fn grade_dependency_findings(
     let stale_hint = "`cargo deny fetch db` refreshes the advisory database; the verdict above is only as fresh as that data";
     let finding_hint = "`deny.toml` holds the policy and the waivers; docs/guide/supply-chain.md explains how to fix or waive a finding";
 
-    // Nothing live: one line, whatever the waivers hold. An app scaffolded by
-    // `autumn new` always carries a waiver, so listing waivers here would make
-    // the single-line clean state unreachable for every generated app.
+    // Nothing live: one line. Every `autumn new` app carries a waiver, so listing waivers here
+    // would make the clean single-line state unreachable.
     if live.is_empty() {
         let waived: Vec<&str> = findings.iter().map(|finding| finding.id.as_str()).collect();
         let summary = if waived.is_empty() {
@@ -387,8 +369,8 @@ fn grade_dependency_findings(
         };
     }
 
-    // Blocking findings first, then warnings, then waivers: the reader acts on
-    // what fails CI, and still sees everything else.
+    // Blocking findings first, then warnings, then waivers: what fails CI leads, and the cap
+    // below drops the least urgent.
     let mut ordered: Vec<&crate::deps::Finding> = live.clone();
     ordered.sort_by_key(|finding| !finding.blocking);
     ordered.extend(findings.iter().filter(|finding| finding.waived));
@@ -403,8 +385,7 @@ fn grade_dependency_findings(
         let _ = write!(counts, ", {waived} waived");
     }
 
-    // The summary shares the check's own line; every finding below it is
-    // indented to the same column as doctor's `hint:`.
+    // Findings below the summary line are indented to the column of doctor's `hint:`.
     let mut lines = vec![format!("{counts} — {context}")];
     lines.extend(
         ordered
@@ -423,8 +404,7 @@ fn grade_dependency_findings(
         name: "dependencies",
         status,
         detail: Some(lines.join("\n")),
-        // Stale data explains a verdict the reader may not otherwise trust, so
-        // it outranks the fix-or-waive pointer.
+        // Stale data undermines the verdict, so its hint outranks the fix-or-waive pointer.
         hint: Some(if stale { stale_hint } else { finding_hint }),
     }
 }
@@ -434,8 +414,7 @@ fn grade_dependency_findings(
 /// Collapsed here as well as in the parser: the cap above counts findings, so
 /// a finding that renders as four lines would defeat it.
 fn format_dependency_finding(finding: &crate::deps::Finding) -> String {
-    // A policy violation's id is its code; naming both reads "duplicate low
-    // duplicate aes 0.8.4".
+    // A policy violation's id is its code; printing both reads "duplicate low duplicate aes 0.8.4".
     let identity = if finding.id == finding.code {
         finding.code.clone()
     } else {
@@ -511,13 +490,9 @@ fn resolve_plugin_wirings(
     let Ok(manifest) = std::fs::read_to_string(root.join("Cargo.toml")) else {
         return Vec::new();
     };
-    // The whole `src` tree, not just `main.rs`. An app whose builder lives in
-    // `src/app.rs` — the shape `plugin add`'s manual fallback produces, since it
-    // prints the mount for the user to paste wherever their chain is — is correctly
-    // wired and must not be warned at, or failed under `--strict`. Also every target
-    // the manifest gives an explicit path to (`[[bin]] path = "cmd/server.rs"`),
-    // because a builder chain there is just as real. Same scan `plugin remove` uses
-    // to decide whether a dependency is still needed.
+    // The whole `src` tree plus every explicitly-pathed target, not just `main.rs`: a builder
+    // chain in `src/app.rs` or `[[bin]] path = "cmd/server.rs"` is correctly wired. `plugin
+    // remove` uses the same scan.
     let main_src = read_app_sources(root);
     let masked = crate::rust_source::mask_non_code(&main_src);
 
@@ -536,14 +511,9 @@ fn resolve_plugin_wirings(
         })
         .collect();
 
-    // Reading the migration history costs a `diesel` subprocess and a database
-    // round trip, so it happens ONLY when the answer could change something:
-    // some plugin is absent from the code *and* declares migrations that could
-    // still be applied. Nothing on disk records a past install, so an absent
-    // schema-owning plugin that was never installed is indistinguishable from
-    // a departed one; the read is therefore at most one `diesel migration
-    // list` per run, only with a database configured, and never on a project
-    // that carries every schema-owning first-party plugin.
+    // Reading migration history spawns `diesel` and queries the database, so do it only when a
+    // plugin is absent from the code and declares migrations. Nothing on disk records a past
+    // install, so a never-installed plugin cannot be told apart from a removed one.
     let candidates: Vec<(usize, Vec<String>)> = wirings
         .iter()
         .enumerate()
@@ -578,10 +548,8 @@ fn resolve_plugin_wirings(
         }
     }
 
-    // Community crates: the dependency names them, and the convention names the
-    // struct their mount must build, so the dependency-without-mount half of
-    // the check works for them too. The reverse (a mount with no dependency)
-    // is not detectable — there is nothing to enumerate from.
+    // Community crates: the dependency names the crate and the convention names its mount struct.
+    // A mount without a dependency is not detectable for them: there is nothing to enumerate.
     for crate_name in community_dependencies(&manifest) {
         let Some(struct_name) = crate::plugin::catalog::community_struct_name(&crate_name) else {
             continue;
@@ -589,10 +557,8 @@ fn resolve_plugin_wirings(
         let mount = masked.contains(&struct_name);
         wirings.push(PluginWiring {
             mount,
-            // A community crate has no catalog entry to give a qualified type
-            // path, so there is nothing stronger to check — and with
-            // `dependency: true` always set here, the `Fail` arm is
-            // unreachable for them anyway.
+            // No catalog entry gives a qualified path. `dependency` is always true here, so the
+            // `Fail` arm cannot fire.
             mount_qualified: mount,
             crate_name,
             community: true,
@@ -1282,9 +1248,8 @@ fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
             )),
             hint: None,
         },
-        // Not reachable: the caller matches every non-`Healthy` state itself.
-        // Graded as a warning rather than panicking, so a future state added to
-        // the enum surfaces as "cannot diagnose" instead of taking doctor down.
+        // Unreachable: the caller handles every non-`Healthy` state. A warning rather than a panic,
+        // so a future variant cannot take doctor down.
         _ => CheckResult {
             name: "tls_client_auth",
             status: CheckStatus::Warn,
@@ -1296,9 +1261,8 @@ fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
 
 // ── ACME preflight checks (issue #1608) ──────────────────────────────────────
 //
-// These active checks only run under `autumn doctor --online`, so the default
-// offline `doctor` stays fast and non-flaky. Each grader is a pure function of
-// injected inputs (mirroring `check_tls_impl`) with a thin, bounded I/O wrapper.
+// These run only under `autumn doctor --online`, so offline `doctor` stays fast and non-flaky.
+// Each grader is a pure function of injected inputs with a thin, bounded I/O wrapper.
 
 /// Reachability of a TCP port, as observed by a bounded connect attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1522,12 +1486,9 @@ pub fn check_acme_dns_for_challenge(
 
 // ── DNS-01 / wildcard preflight checks (issue #1620) ─────────────────────────
 //
-// DNS-01 introduces exactly three failure classes HTTP-01 does not have, and
-// each one costs an operator a failed issuance to discover the hard way:
-// a credential the app cannot read, a zone whose `_acme-challenge` name public
-// DNS cannot answer for, and a certificate that does not actually cover the
-// tenant subdomains `tenancy.base_domain` will serve. Each is graded by a pure
-// function of injected inputs, exactly like the #1608 ACME graders above.
+// The three failures DNS-01 adds over HTTP-01: a credential the app cannot read, a zone whose
+// `_acme-challenge` name public DNS cannot answer for, and a certificate that does not cover the
+// tenant subdomains `tenancy.base_domain` serves. Each grader is a pure function of its inputs.
 
 /// What the DNS provider credential lookup found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2346,14 +2307,10 @@ pub fn resolve_custom_domain_dns(
 ) -> CustomDomainDns {
     use autumn_web::custom_domain::{ObservedTarget, VerificationOutcome, grade_dns_verification};
 
-    // A resolver reports the addresses a name ends at and follows CNAMEs
-    // silently, so the ingress hostname is resolved and its addresses ADDED to
-    // whatever was configured explicitly — exactly the union
-    // `CustomDomainTask::effective_ingress` builds at runtime. Resolving it
-    // only when no address was configured would fail the setup the guide
-    // documents: subdomains CNAME to a load balancer while apex domains use
-    // static A/AAAA records, two different address sets, so every correctly
-    // connected subdomain would read as pointing elsewhere.
+    // Resolvers follow CNAMEs silently, so the ingress hostname's addresses are ADDED to the
+    // configured ones: the union `CustomDomainTask::effective_ingress` builds at runtime.
+    // Subdomains CNAME to a load balancer while apex domains use static A/AAAA records, so
+    // both address sets must count.
     let mut expected = ingress.clone();
     if let Some(host) = expected.hostname.clone() {
         for addr in resolve_addresses(&host) {
@@ -2372,11 +2329,8 @@ pub fn resolve_custom_domain_dns(
     if observed.is_empty() {
         return CustomDomainDns::Unresolved;
     }
-    // The VERDICT comes from the runtime grader, so doctor and the app can
-    // never disagree about whether a domain points here. The addresses to SHOW
-    // are recomputed here rather than parsed back out of the grader's message:
-    // reading data out of prose written for a human breaks silently the day
-    // that prose is reworded.
+    // The verdict comes from the runtime grader. The addresses shown are recomputed rather than
+    // parsed out of the grader's message, which is prose and may be reworded.
     let verdict = grade_dns_verification(&ObservedTarget::Addresses(observed.clone()), &expected);
     match verdict {
         // The address grader never returns `OwnershipUnproven`; the TXT token
@@ -2425,9 +2379,8 @@ fn resolve_addresses(host: &str) -> Vec<std::net::IpAddr> {
 pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> CustomDomainRegistryRead {
     let entries = match std::fs::read_dir(store_dir) {
         Ok(entries) => entries,
-        // A directory that is not there yet is not a fault: nothing has been
-        // registered. One that cannot be READ is the fault the runtime hits at
-        // boot, and it must not read as "no domains".
+        // A missing directory means nothing is registered. An unreadable one is the fault the
+        // runtime hits at boot, so it must not read as "no domains".
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return CustomDomainRegistryRead::default();
         }
@@ -2456,8 +2409,7 @@ pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> CustomDomainR
                 domain.status.as_str().to_owned(),
                 domain.verification_token,
             )),
-            // The runtime serves the rest and refuses new domains, so
-            // doctor counts it rather than failing the run over it.
+            // The runtime serves the rest and refuses new domains, so count it rather than fail.
             Err(e) => read.skipped.push(format!("{}: {e}", path.display())),
         }
     }
@@ -2528,11 +2480,8 @@ fn grade_dns_points_here(
     if local_public.is_empty() {
         return DnsPointsHere::LocalIpsUnknown;
     }
-    // Every resolved address the CA might pick must point here — a partial match
-    // still lets the CA hit an address this process does not serve the HTTP-01
-    // token on (a 404). Split the resolved set into addresses that ARE a known
-    // local public IP and those that are not, and grade on the unmatched set
-    // rather than passing as soon as one address matches.
+    // Every resolved address must point here: the CA may pick any of them, and one this process
+    // does not serve the HTTP-01 token on returns a 404.
     let unmatched: Vec<std::net::IpAddr> = resolved
         .iter()
         .copied()
@@ -2835,17 +2784,11 @@ fn alert_disabled_in_production_warning(has_destination: bool) -> CheckResult {
     }
 }
 
-// The independent config booleans — alerting enabled, webhook usable as a signed
-// destination, mail transport usable, production, transport requires a `from`, a
-// native transport configured — plus the resolved `[alerts] email`, `[alerts]
-// webhook_url`, and `[mail] from` strings each gate a distinct branch; grouping them
-// into enums would obscure the destination-resolution logic. The raw `webhook_url`
-// only names a present-but-non-absolute value in its own warning, since
-// `webhook_configured` already folds in absoluteness and the signing secret;
-// `mail_from` likewise names a present-but-invalid sender. A native transport — a
-// PagerDuty routing key, or a Slack or Discord webhook URL — counts as a destination
-// exactly as the runtime's `AlertConfig::has_destination` does, and
-// `check_alert_transports_impl` validates its delivery-worthiness separately.
+// Each boolean gates a distinct branch; enums would obscure the destination logic.
+// `webhook_configured` already requires an absolute URL and a signing secret; the raw
+// `webhook_url` is only named in a warning. A native transport (PagerDuty, Slack, Discord) counts
+// as a destination, as in the runtime's `AlertConfig::has_destination`;
+// `check_alert_transports_impl` validates it separately.
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub fn check_alert_destination_impl(
     alerts_enabled: bool,
@@ -2859,52 +2802,28 @@ pub fn check_alert_destination_impl(
     custom_channel: bool,
     native_transport_configured: bool,
 ) -> CheckResult {
-    // Presence and syntactic validity of the resolved `[alerts] email`. lettre parses
-    // the recipient only at send time (`lettre_message`), not when the alert `Mail` is
-    // built, so a present-but-unparsable address such as `not-an-address` passes every
-    // earlier gate and then fails every delivery with `MailError::InvalidAddress`. An
-    // invalid address therefore is not a usable destination. Validity is checked with
-    // the same lettre parser the runtime uses: `is_valid_alert_mailbox_doctor` runs
-    // `value.parse::<lettre::message::Mailbox>()`, exact parity with
-    // `autumn/src/alerts.rs`. Deliberately not `is_valid_mailto_address_doctor`, which
-    // strips a leading `mailto:` — correct for `List-Unsubscribe`, wrong here. This
-    // accepts everything lettre accepts, including RFC 5322 display-name forms like
-    // `Ops <ops@example.com>`, and rejects what lettre rejects: the runtime hands
-    // `[alerts] email` verbatim to `Mail::builder().to(...)`, so a `mailto:` URI would
-    // fail every delivery and doctor must reject it too.
+    // lettre parses the recipient only at send time, so an unparsable `[alerts] email` passes boot
+    // and then fails every delivery. Validate with the runtime's lettre parser, not
+    // `is_valid_mailto_address_doctor`: the runtime hands the value verbatim to
+    // `Mail::builder().to(...)`, so a `mailto:` URI fails too.
     let email_trimmed = email.trim();
     let email_configured = !email_trimmed.is_empty();
     let email_valid = email_configured && is_valid_alert_mailbox_doctor(email_trimmed);
 
-    // Presence and syntactic validity of the resolved `[mail] from`. For
-    // transports that build a real RFC 5322 message (SMTP), a `from` must be both
-    // present AND a valid lettre mailbox: the runtime parses it at boot
-    // (`MailerBuilder::build` runs `parse_mailbox`), so an unparsable value like
-    // `not-a-mailbox` aborts startup and the alert mail — which sets no
-    // per-message `from` — has no valid default to fall back to. Checked with the
-    // SAME lettre parser the recipient uses (`is_valid_alert_mailbox_doctor`),
-    // exact parity with `autumn/src/mail.rs`'s `parse_mailbox`.
+    // SMTP needs a valid `[mail] from`: the alert mail sets no per-message `from`, and the runtime
+    // parses the default at boot (`MailerBuilder::build`) and aborts on an invalid one.
     let mail_from_trimmed = mail_from.trim();
     let mail_from_present = !mail_from_trimmed.is_empty();
     let mail_from_valid = mail_from_present && is_valid_alert_mailbox_doctor(mail_from_trimmed);
 
-    // Whether a configured email would actually deliver. It needs a valid
-    // address, a usable (non-disabled) transport AND — for transports that build
-    // a real RFC 5322 message (SMTP) — a present, VALID `[mail] from`, because the
-    // runtime's alert mail carries no per-message `from` and falls back to the
-    // mailer default. `log`/`file` deliver without a `from`, so they do not need one.
+    // `log`/`file` transports deliver without a `from`.
     let email_from_ok = mail_from_valid || !transport_requires_from;
     let email_destination = email_valid && mail_transport_usable && email_from_ok;
 
-    // Master off switch: when `[alerts] enabled = false`, the runtime installs no
-    // alerter at all, so a configured destination is inert. Handle this BEFORE
-    // the destination gate — doctor must not pass on the strength of a
-    // configured-but-inert destination.
+    // `enabled = false` installs no alerter, so a configured destination is inert: check this
+    // before the destination gate.
     if !alerts_enabled {
         if is_production {
-            // Name the disabled switch explicitly. Mention the (otherwise valid)
-            // destination when one is configured so the operator understands the
-            // deploy is blind despite it; keep the message accurate otherwise.
             return alert_disabled_in_production_warning(
                 email_destination || webhook_configured || native_transport_configured,
             );
@@ -2920,14 +2839,6 @@ pub fn check_alert_destination_impl(
             hint: None,
         };
     }
-    // `email_destination` above already folds in the usable-transport and `from`
-    // requirements, mirroring the runtime, which skips `MailAlertChannel` when
-    // `mailer.is_disabled()` and whose SMTP send fails without a `from`. A native
-    // transport (PagerDuty, Slack, Discord) counts as a destination exactly as the
-    // runtime's `AlertConfig::has_destination` does — the runtime registers the
-    // channel for a native-only config, so doctor must not warn "no destination".
-    // `check_alert_transports_impl` validates the transports' own delivery-worthiness
-    // (routing-key shape, absolute https URL) separately.
     if email_destination || webhook_configured || native_transport_configured {
         return CheckResult {
             name: "alert_destination",
@@ -2937,21 +2848,10 @@ pub fn check_alert_destination_impl(
         };
     }
     if is_production {
-        // An email is set but is not a syntactically valid address: the runtime
-        // parses the recipient only at send time, so every alert fails in
-        // `lettre_message` with an invalid-address error and nothing is
-        // delivered. Surface a dedicated warning naming the offending value,
-        // distinct from the missing-`from`, disabled-transport, and
-        // no-destination cases. Checked first because a malformed address is
-        // unusable regardless of transport or `from`.
+        // First: a malformed address is unusable whatever the transport or `from`.
         if email_configured && !email_valid {
             return alert_email_invalid_warning(email_trimmed);
         }
-        // An email is set on a usable transport that needs a `from` (SMTP), but
-        // no `[mail] from` is configured: the runtime's alert mail has no
-        // per-message `from`, so `lettre_message` fails with "mail from address
-        // is required" and nothing is delivered. Surface a dedicated warning
-        // distinct from both the disabled-transport and no-destination cases.
         if email_configured
             && mail_transport_usable
             && transport_requires_from
@@ -2959,12 +2859,6 @@ pub fn check_alert_destination_impl(
         {
             return alert_email_from_missing_warning();
         }
-        // An email is set on a usable transport that needs a `from` (SMTP) and a
-        // `[mail] from` IS set but is not a syntactically valid mailbox: the
-        // runtime parses it at boot (`MailerBuilder::build`) and refuses to start,
-        // so it never even reaches a send. Surface a dedicated warning naming the
-        // offending value, distinct from the missing-`from` case (which reads as
-        // "you set nothing" and would mislead here).
         if email_configured
             && mail_transport_usable
             && transport_requires_from
@@ -2973,10 +2867,6 @@ pub fn check_alert_destination_impl(
         {
             return alert_email_from_invalid_warning(mail_from_trimmed);
         }
-        // An email is set but the mail transport is disabled: the runtime
-        // installs no alert channel and delivers nothing. Surface a dedicated
-        // warning that points at the real cause instead of the generic
-        // "no destination" message (which would read as "you set nothing").
         if email_configured && !mail_transport_usable {
             return CheckResult {
                 name: "alert_destination",
@@ -2994,22 +2884,13 @@ pub fn check_alert_destination_impl(
                 ),
             };
         }
-        // A webhook URL is set but is not an absolute http(s) URL: the runtime's
-        // HTTP client dispatches a URL verbatim only when it starts with
-        // `http://`/`https://`, and an alert webhook has no base-url alias to join
-        // a relative value onto — so every signed POST fails to send. Surface a
-        // dedicated warning naming the offending value, distinct from the
-        // missing-secret ("no destination") and email cases. `webhook_configured`
-        // is already false here (it requires an absolute URL), so this only fires
-        // when there is no other working destination.
+        // The HTTP client dispatches only `http://`/`https://` URLs and an alert webhook has no base
+        // URL to join a relative one onto, so every POST would fail.
         let webhook_url_trimmed = webhook_url.trim();
         if !webhook_url_trimmed.is_empty() && !is_absolute_http_url_doctor(webhook_url_trimmed) {
             return alert_webhook_url_invalid_warning(webhook_url_trimmed);
         }
-        // No config destination resolved. Either the operator has DECLARED a
-        // code-registered channel via `[alerts] custom_channel = true` (pass), or
-        // there is genuinely nowhere to deliver (warn). Extracted so this function
-        // stays under the line-count lint.
+        // Passes only if `[alerts] custom_channel = true` declares a code-registered channel.
         alert_no_destination_in_production(custom_channel)
     } else {
         CheckResult {
@@ -3180,8 +3061,7 @@ pub fn check_alert_transports_impl(
 pub fn check_alert_error_rate_threshold_impl(raw: &str, is_production: bool) -> CheckResult {
     const NAME: &str = "alert_error_rate_threshold";
     let trimmed = raw.trim();
-    // Unset (or cleared) -> the runtime uses the valid default (0.05). Nothing to
-    // flag.
+    // Unset or cleared: the runtime uses the default 0.05.
     if trimmed.is_empty() {
         return CheckResult {
             name: NAME,
@@ -3190,9 +3070,7 @@ pub fn check_alert_error_rate_threshold_impl(raw: &str, is_production: bool) -> 
             hint: None,
         };
     }
-    // Valid iff it parses to a finite fraction in (0, 1]. `str::parse::<f64>`
-    // accepts `nan`/`inf`/`-inf` (which `is_finite()` then rejects), matching the
-    // runtime's `f64` config value; an entirely unparsable value is invalid too.
+    // A finite fraction in (0, 1]. `parse::<f64>` accepts `nan`/`inf`, which `is_finite` rejects.
     let valid = trimmed
         .parse::<f64>()
         .is_ok_and(|v| v.is_finite() && v > 0.0 && v <= 1.0);
@@ -3245,11 +3123,9 @@ pub fn check_oauth2_provider_impl(
     client_secret: &str,
     is_production: bool,
 ) -> CheckResult {
-    // Use a static string for the name field to satisfy lifetime constraints.
-    // The name is formatted in the `detail` field instead.
+    // `name` is `&'static str`, so the provider name goes in `detail`.
     let detail_prefix = format!("[auth.oauth2.{provider_name}]");
 
-    // Check client_id first
     if client_id.trim().is_empty() {
         return if is_production {
             CheckResult {
@@ -3275,7 +3151,6 @@ pub fn check_oauth2_provider_impl(
         };
     }
 
-    // Check client_secret next
     if client_secret.trim().is_empty() {
         return if is_production {
             CheckResult {
@@ -3330,14 +3205,8 @@ pub fn check_mail_unsubscribe_config_impl(
     let mailto = mailto.map(str::trim).filter(|s| !s.is_empty());
     let any_set = base_url.is_some() || mailto.is_some();
 
-    // The runtime `MailConfig::validate` runs the following checks at boot
-    // regardless of whether any #[mailer] declares list_unsubscribe or whether
-    // the transport is disabled. Mirror them *before* the usage/transport early
-    // returns so `autumn doctor --strict` never greenlights a deploy that the
-    // runtime would reject at startup.
-
-    // TTL: a non-positive value is rejected in every profile (it would make every
-    // unsubscribe token immediately expired).
+    // `MailConfig::validate` runs these checks at boot whatever the usage or transport, so they
+    // come before the early returns below.
     if token_ttl_days <= 0 {
         return CheckResult {
             name: "mail_unsubscribe",
@@ -3351,8 +3220,8 @@ pub fn check_mail_unsubscribe_config_impl(
         };
     }
 
-    // Destination format: a non-empty but malformed base_url / mailto is rejected
-    // in prod (mailbox providers require HTTPS one-click / a real mailbox).
+    // Production rejects a malformed base_url or mailto: mailbox providers require HTTPS one-click
+    // or a real mailbox.
     if is_production {
         if let Some(url) = base_url
             && !is_valid_https_base_url_doctor(url)
@@ -3395,8 +3264,6 @@ pub fn check_mail_unsubscribe_config_impl(
         };
     }
     if transport_disabled {
-        // Mirrors the runtime guard: a disabled transport emits no list mail, so
-        // unsubscribe destinations aren't required to boot.
         return CheckResult {
             name: "mail_unsubscribe",
             status: CheckStatus::Pass,
@@ -3406,8 +3273,6 @@ pub fn check_mail_unsubscribe_config_impl(
     }
 
     if any_set {
-        // Reached only when a #[mailer] uses list_unsubscribe and the transport is
-        // active (the no-usage / disabled-transport cases returned above).
         return mail_unsubscribe_configured_result(base_url.is_some(), is_production);
     }
     let detail = Some(
@@ -3525,8 +3390,7 @@ fn is_absolute_http_url_doctor(url: &str) -> bool {
 
 /// Mirror of `autumn_web`'s `is_valid_mailto_address` (see above).
 fn is_valid_mailto_address_doctor(value: &str) -> bool {
-    // Reject control characters and RFC 2369 delimiters (`<`/`>`/`,`) anywhere in
-    // the value; mirrors autumn_web's is_valid_mailto_address.
+    // Reject control characters and RFC 2369 delimiters (`<`, `>`, `,`) anywhere in the value.
     if value
         .chars()
         .any(|c| c.is_control() || matches!(c, '<' | '>' | ','))
@@ -3645,21 +3509,15 @@ pub fn check_platform_support_impl(os: &str) -> CheckResult {
 
     CheckResult {
         name: "platform_support",
-        // Pass, not Warn. Windows is a supported development platform and the
-        // Tier 2 journeys are documented with a working answer (WSL2), so
-        // nothing here is a defect. It matters concretely: `exit_code` treats
-        // any warning as a failure under `--strict`, so warning unconditionally
-        // would make `autumn doctor --strict` — itself a Tier 1 command — exit 1
-        // forever on every Windows machine.
+        // Pass, not Warn: Windows is supported and nothing here is a defect. `--strict` fails on any
+        // warning, so a warning would make `autumn doctor --strict` exit 1 on every Windows machine.
         status: CheckStatus::Pass,
         detail: Some(format!(
             "windows: Tier 1 (native) — {tier_one}. Tier 2 (WSL2), run these from a \
              WSL2 shell — {tier_two}. Prerequisites: {prerequisites}. Policy: \
              docs/guide/platform-support.md"
         )),
-        // `format_check_line` prints a hint only on warn/fail, so the pointer to
-        // the policy lives in the detail above rather than being silently
-        // dropped here.
+        // `format_check_line` prints a hint only on warn/fail, so the policy pointer is in `detail`.
         hint: None,
     }
 }
@@ -3714,26 +3572,13 @@ pub fn check_daemon_service_impl(report: &DaemonServiceReport) -> CheckResult {
     }
     CheckResult {
         name: "daemon_service",
-        // **Pass, always.** Every clause here is a normal state, not a defect: a
-        // project that never wants a daemon, a service nobody registered, and —
-        // the one that matters — an ordinary non-elevated shell, which cannot
-        // open the Service Control Manager with `CREATE_SERVICE`.
-        //
-        // That last one is why this is not a warning. `exit_code` treats any
-        // warning as a failure under `--strict`, so warning about elevation
-        // would make `autumn doctor --strict` — itself a Tier 1 command, used in
-        // scripts and pre-commit gates — exit 1 on every unelevated Windows
-        // shell, for a service the user may have no intention of installing.
-        // `platform_support` right above carries the same reasoning for the same
-        // reason; this check reintroduced the failure mode that one was written
-        // to avoid, and must not do it again.
-        //
-        // The prerequisite is still *reported*, in the detail, so a developer
-        // meets it before an access-denied error rather than after.
+        // Always Pass: no daemon, no registered service and a non-elevated shell (which cannot open
+        // the Service Control Manager with `CREATE_SERVICE`) are all normal states. `--strict` fails
+        // on any warning, so warning here would fail `autumn doctor --strict` on every unelevated
+        // Windows shell. Missing prerequisites are still reported in `detail`.
         status: CheckStatus::Pass,
         detail: Some(parts.join(". ")),
-        // `format_check_line` prints a hint only on warn/fail, so the pointer
-        // lives in the detail above rather than being silently dropped here.
+        // `format_check_line` prints a hint only on warn/fail, so the pointer is in `detail`.
         hint: None,
     }
 }
@@ -3747,8 +3592,7 @@ fn resolve_daemon_service_report() -> DaemonServiceReport {
         DaemonServiceReport {
             service_capable: true,
             daemon,
-            // A failed query shows as "no service" here. `doctor` only reports.
-            // `serve restart` treats the same failure as an error.
+            // A failed query reads as "no service": `doctor` only reports, unlike `serve restart`.
             service: crate::service::registered_service_state(&identity)
                 .ok()
                 .flatten(),
@@ -3759,9 +3603,8 @@ fn resolve_daemon_service_report() -> DaemonServiceReport {
     {
         let _ = identity;
         DaemonServiceReport {
-            // Autumn registers OS services only on Windows; on Unix the answer
-            // is a systemd unit or a launchd plist, which is not this tool's to
-            // write, so reporting a missing one would be noise.
+            // Autumn registers OS services only on Windows; on Unix that is a systemd unit or
+            // launchd plist autumn does not write.
             service_capable: false,
             daemon,
             service: None,
@@ -3815,8 +3658,7 @@ mod daemon_service_tests {
 
     #[test]
     fn a_platform_without_os_services_says_nothing_about_them() {
-        // On Linux/macOS the answer is a systemd unit or a launchd plist, which
-        // autumn does not write. Reporting a missing service would be noise.
+        // On Linux/macOS a service is a systemd unit or launchd plist autumn does not write.
         let detail = check_daemon_service_impl(&DaemonServiceReport {
             service_capable: false,
             ..DaemonServiceReport::default()
@@ -3828,26 +3670,21 @@ mod daemon_service_tests {
 
     #[test]
     fn a_missing_prerequisite_is_reported_without_failing_strict() {
-        // `exit_code` treats any warning as a failure under `--strict`, and an
-        // ordinary non-elevated shell ALWAYS lacks the SCM access a service
-        // registration needs. Warning here would make `autumn doctor --strict`
-        // exit 1 on every unelevated Windows machine, for a service the user may
-        // never want — the exact trap `platform_support` documents avoiding.
+        // A non-elevated shell always lacks the SCM access a service needs, and `--strict` fails on
+        // any warning, so a warning would fail every unelevated Windows machine.
         let result = check_daemon_service_impl(&DaemonServiceReport {
             service_capable: true,
             missing_prerequisites: vec!["administrator rights".to_owned()],
             ..DaemonServiceReport::default()
         });
         assert_eq!(result.status, CheckStatus::Pass);
-        // Reported, though — a developer should meet it here, not in an
-        // access-denied error halfway through an install.
+        // Still reported, so a developer meets it before an access-denied error.
         assert!(result.detail.as_deref().unwrap().contains("administrator"));
     }
 
     #[test]
     fn the_check_never_warns_so_strict_cannot_fail_on_it() {
-        // Belt and braces over the case above: no combination of these inputs
-        // may produce a warning, because every one of them is a normal state.
+        // No combination of these inputs may warn: every one is a normal state.
         for service_capable in [true, false] {
             for prerequisites in [vec![], vec!["administrator rights".to_owned()]] {
                 for daemon in [None, Some((42, "tcp:127.0.0.1:3000".to_owned()))] {
@@ -3869,8 +3706,7 @@ mod daemon_service_tests {
 
     #[test]
     fn a_stopped_daemon_is_not_a_failure() {
-        // Plenty of projects never run a daemon, and `doctor --strict` is used
-        // in pre-commit gates — a hard failure here would break them all.
+        // Most projects never run a daemon, and `doctor --strict` runs in pre-commit gates.
         let result = check_daemon_service_impl(&DaemonServiceReport {
             service_capable: true,
             ..DaemonServiceReport::default()
@@ -3897,11 +3733,9 @@ mod platform_support_tests {
         let detail = check_platform_support_impl("windows")
             .detail
             .expect("a detail line");
-        // AC: doctor "reports the platform's tier status".
         assert!(detail.contains("Tier 1"), "{detail}");
         assert!(detail.contains("Tier 2"), "{detail}");
-        // doctor flags the known Windows prerequisites. `--passkeys` needs no
-        // OpenSSL since `webauthn-rs` 0.6.
+        // `--passkeys` needs no OpenSSL, so no vcpkg, since `webauthn-rs` 0.6.
         assert!(!detail.contains("vcpkg"), "{detail}");
         assert!(detail.contains("WSL2"), "{detail}");
         for prerequisite in WINDOWS_PREREQUISITES {
@@ -3957,13 +3791,8 @@ mod platform_support_tests {
 
     #[test]
     fn windows_does_not_fail_doctor_strict() {
-        // Windows is a supported development platform, so `autumn doctor
-        // --strict` must not reject a machine for being a Windows one — and
-        // `doctor` is itself a Tier 1 command in this very policy.
-        //
-        // A `Warn` is not enough: `exit_code` treats ANY warning as a failure
-        // under `--strict`, so an always-warning check makes `--strict` exit 1
-        // forever on Windows. The tier is information, not a defect.
+        // `--strict` fails on any warning, so Windows must Pass outright: it is a supported platform
+        // and `doctor` is itself a Tier 1 command.
         let result = check_platform_support_impl("windows");
         assert_eq!(result.status, CheckStatus::Pass);
         let summary = super::compute_summary(std::slice::from_ref(&result));
@@ -3976,9 +3805,8 @@ mod platform_support_tests {
 
     #[test]
     fn the_windows_detail_carries_the_policy_pointer_itself() {
-        // `format_check_line` prints a check's `hint` only on warn/fail, so a
-        // passing check's pointer to the guide has to live in the detail or it
-        // is never shown at all.
+        // `format_check_line` prints `hint` only on warn/fail, so a passing check's pointer must
+        // be in `detail`.
         let detail = check_platform_support_impl("windows")
             .detail
             .expect("a detail line");
@@ -4112,7 +3940,6 @@ pub fn check_toml_content(content: &str) -> CheckResult {
         let schema = autumn_web::config::AutumnConfig::get_schema_keys();
         let mut errors = Vec::new();
 
-        // 1. Validate base autumn.toml
         let base_errors = validate_toml_content(content, &schema);
         for (path, sug) in base_errors {
             errors.push(format!(
@@ -4122,7 +3949,6 @@ pub fn check_toml_content(content: &str) -> CheckResult {
             ));
         }
 
-        // 2. Validate any autumn-*.toml profile files
         let profile_files = find_all_profile_files();
         for (_, path) in profile_files {
             if let Ok(file_content) = std::fs::read_to_string(&path) {
@@ -4165,7 +3991,6 @@ pub fn check_toml_content(content: &str) -> CheckResult {
 /// a breaking incompatibility (Fail); a patch-only mismatch is a warning.
 pub fn check_version_compat(cli_version: &str, web_version: &str) -> CheckResult {
     let parse = |v: &str| -> Option<(u64, u64, u64)> {
-        // Strip leading `=`, `^`, `~` requirement operators if present.
         let v = v.trim().trim_start_matches(['=', '^', '~', ' ']);
         let parts: Vec<&str> = v.split('.').collect();
         if parts.len() < 2 {
@@ -4319,9 +4144,8 @@ pub fn check_rust_toolchain_impl(current_output: &str, required: &str) -> CheckR
 // ─── IO-dependent checks ──────────────────────────────────────────────────────
 
 fn check_rust_toolchain(msrv: &str) -> CheckResult {
-    // `rustc` is rustup's shim, and doctor runs its checks at the same time. If
-    // the project pins a toolchain this machine lacks, rustup errors instead of
-    // installing it: concurrent installs leave a toolchain half-installed.
+    // `rustc` is rustup's shim and doctor runs checks concurrently. A pinned toolchain this machine
+    // lacks must error rather than install: concurrent installs leave it half-installed.
     let mut rustc = std::process::Command::new("rustc");
     rustc.arg("--version");
     crate::deps::no_toolchain_installs(&mut rustc);
@@ -4496,13 +4320,9 @@ fn tailwind_file_is_executable(_path: &std::path::Path, _metadata: &std::fs::Met
 }
 
 fn check_tailwind_binary() -> CheckResult {
-    // Resolve the SAME `<target_dir>/autumn` directory `autumn setup` writes
-    // to and `autumn dev`/the scaffold's `build.rs` read from (issue #2457):
-    // a `target`-relative literal reports the binary missing whenever
-    // `CARGO_TARGET_DIR` points elsewhere, even though `setup` put it exactly
-    // where `dev` expects it. Tolerant, not `resolve_target_directory`'s
-    // hard-exit form: one unreadable check must not abort every other check
-    // `doctor` still has to report.
+    // The same `<target_dir>/autumn` that `autumn setup` writes and `autumn dev` reads, so
+    // `CARGO_TARGET_DIR` is honoured (#2457). The tolerant resolver, not the hard-exit one: one
+    // failed check must not abort the rest.
     let binary = |target_dir: std::path::PathBuf| {
         target_dir.join("autumn").join(if cfg!(windows) {
             "tailwindcss.exe"
@@ -4612,9 +4432,8 @@ fn check_pg_client_tools_impl(missing: &[&str]) -> CheckResult {
 /// [`check_pending_migrations`]: a soft warning (managed-Postgres apps bundle
 /// these and not every project runs backups), never a hard failure.
 fn check_pg_client_tools() -> CheckResult {
-    // Reuse `db backup`/`restore`'s own locator so doctor honours the exact same
-    // precedence (`AUTUMN_PG_BIN_DIR`, then the managed-Postgres bundle, then
-    // PATH) and never drifts from what those commands actually resolve.
+    // `db backup`/`restore`'s own locator, so the precedence (`AUTUMN_PG_BIN_DIR`, the
+    // managed-Postgres bundle, then PATH) cannot drift.
     check_pg_client_tools_with(&crate::db::backup::PgTools::locate())
 }
 
@@ -4654,7 +4473,6 @@ fn read_msrv() -> Option<String> {
     let content = std::fs::read_to_string("Cargo.toml").ok()?;
     let table: toml::Table = toml::from_str(&content).ok()?;
 
-    // Workspace: [workspace.package] rust-version
     if let Some(ver) = table
         .get("workspace")
         .and_then(|w| w.get("package"))
@@ -4664,7 +4482,6 @@ fn read_msrv() -> Option<String> {
         return Some(ver.to_owned());
     }
 
-    // Plain package: [package] rust-version
     table
         .get("package")
         .and_then(|p| p.get("rust-version"))
@@ -4824,12 +4641,9 @@ pub fn autumn_web_declarations_at(root: &std::path::Path) -> Vec<AutumnWebDepend
         .filter_map(toml::Value::as_table)
         .flat_map(|deps| {
             deps.iter()
-                // Inherited entries come along under *any* key: a member
-                // writing `autumn = { workspace = true }` names neither
-                // `autumn-web` nor a `package`, so whether it is this
-                // dependency can only be answered by the workspace entry it
-                // points at. The caller resolves them and drops the ones that
-                // turn out to be some other crate.
+                // Keep inherited entries under any key: `autumn = { workspace = true }` names
+                // neither `autumn-web` nor a `package`. The caller resolves them against the
+                // workspace and drops other crates.
                 .filter(|(key, entry)| is_autumn_web(key, entry) || is_inherited(entry))
                 .map(|(key, entry)| classify(key, entry))
         })
@@ -5014,9 +4828,8 @@ fn check_split_topology_on_local(
     let backend = jobs_backend.trim();
     let label = role_label(role);
     let role = role.guard_base();
-    // The sqlite queue is shareable only because both processes open the same
-    // FILE. An in-memory target gives each its own database, so the web replica
-    // enqueues where no worker can look (issue #1907).
+    // A split role shares the sqlite queue only through the same FILE. An in-memory target gives
+    // each process its own database, so the web replica enqueues where no worker looks (#1907).
     if autumn_web::config::split_role_requires_file_backed_sqlite(role, backend, database_url) {
         return CheckResult {
             name: "process_role_backend",
@@ -5087,9 +4900,6 @@ fn role_label(role: &Role) -> String {
 /// note and does not evaluate the pin. A preset `pin` replaces `jobs.pin`
 /// (#3543).
 fn check_queue_coverage(role: &Role, configured_queues: &[String], pin: &[String]) -> CheckResult {
-    // A role with no job workers cannot leave a queue uncovered *in this
-    // process*: the check is not applicable. Do not evaluate pin/empty-schedule;
-    // this must never fail `--strict`.
     if !role.capabilities().job_workers {
         let who = if role.base() == ProcessRole::Web {
             "web-only role".to_owned()
@@ -5107,7 +4917,6 @@ fn check_queue_coverage(role: &Role, configured_queues: &[String], pin: &[String
     }
     let pin = role.pin().unwrap_or(pin);
 
-    // Unpinned (empty/absent pin): the process drains every configured queue.
     if pin.is_empty() {
         return CheckResult {
             name: "jobs_queue_coverage",
@@ -5121,18 +4930,9 @@ fn check_queue_coverage(role: &Role, configured_queues: &[String], pin: &[String
         configured_queues.iter().map(String::as_str).collect();
     let pinned: std::collections::HashSet<&str> = pin.iter().map(String::as_str).collect();
 
-    // Informational only. A config-only, per-process `doctor` run structurally cannot
-    // hard-fail on queue coverage, so this check never returns Warn or Fail, and
-    // `--strict` can never promote it:
-    //   * It sees one process and cannot know what sibling worker tiers drain, so a
-    //     subset pin may be a valid multi-tier deployment.
-    //   * It reads only `[jobs.queues]` and cannot see `#[job(queue = "…")]` queues,
-    //     which the runtime appends to the effective schedule and drains, so a pin to
-    //     a queue absent from `[jobs.queues]` is not necessarily an empty schedule.
-    // The authoritative zero-coverage guard is the runtime startup warning
-    // (`warn_pinned_uncovered_queues` in autumn/src/job.rs), which has the job registry
-    // and the real schedule. Here we report only, for operator awareness: configured
-    // queues this pin does not claim, and pinned queues absent from `[jobs.queues]`.
+    // Informational only, never Warn or Fail: one process cannot know what sibling tiers drain,
+    // and `[jobs.queues]` omits `#[job(queue = "…")]` queues the runtime also drains. The runtime
+    // startup warning (`warn_pinned_uncovered_queues`) is the authoritative guard.
     let unclaimed: Vec<&str> = configured_queues
         .iter()
         .map(String::as_str)
@@ -5252,10 +5052,7 @@ fn check_queue_coverage_topology(
     fleet: Option<&FleetTopology>,
     declared_queues_manifest_error: Option<&DeclaredQueuesManifestError>,
 ) -> CheckResult {
-    // A corrupt jobs manifest cannot contribute its declared set: Fail rather
-    // than reason about a silently narrowed one (#2419). The writer (`autumn
-    // jobs manifest`) refuses to emit this shape, so the reader refuses to
-    // trust it.
+    // A corrupt manifest's declared set is unknown: Fail rather than guess a narrower one (#2419).
     if let Some(err) = declared_queues_manifest_error {
         return CheckResult {
             name: "jobs_queue_coverage",
@@ -5272,9 +5069,8 @@ fn check_queue_coverage_topology(
             ),
         };
     }
-    // No topology declared → informational-only, exactly as today. The hard-fail
-    // only activates once the operator supplies the topology that makes coverage
-    // provable, so existing deployments never regress.
+    // A malformed `tiers` fails rather than reading as "no topology". With no topology the check
+    // stays informational: it can hard-fail only once a topology makes coverage provable.
     if let Some(fleet) = fleet.filter(|f| f.malformed) {
         let _ = fleet;
         return CheckResult {
@@ -5294,17 +5090,15 @@ fn check_queue_coverage_topology(
         return check_queue_coverage(role, configured_queues, pin);
     };
 
-    // Needed = configured `[jobs.queues]` ∪ job-declared queues. Declared queues
-    // only ADD to the needed set, so a missing/partial manifest can only shrink
-    // it — never manufacture a gap (keeps the check zero-false-positive).
+    // Declared queues only add to the needed set, so a missing or partial manifest cannot
+    // manufacture a gap.
     let needed: BTreeSet<String> = configured_queues
         .iter()
         .chain(declared_queues.iter())
         .cloned()
         .collect();
 
-    // Covered = union of every tier's pin. An unpinned tier drains everything, so
-    // union coverage is total.
+    // Covered is the union of every tier's pin; an unpinned tier drains everything.
     let gap: Vec<String> = if fleet.has_unpinned_tier() {
         Vec::new()
     } else {
@@ -5529,17 +5323,9 @@ fn check_db_role_connectivity(
     reachable: impl Fn(&str, u16) -> bool,
     sqlite_target_bootable: bool,
 ) -> CheckResult {
-    // A `sqlite://` target is a valid backend (#1614): it names a local file, not a
-    // host:port service, so TCP reachability and the "switch to postgres://" hint do
-    // not apply. The runtime pool that serves such a target is built under the
-    // `sqlite` feature (#1905); doctor only confirms the target here, and must not
-    // mislead a SQLite app into thinking its URL is malformed.
-    //
-    // But SQLite is single-writer and single-host: `DatabaseConfig::validate` rejects
-    // it as a read replica, alongside a Postgres role, or in any mixed-backend
-    // topology (F19). Pass a SQLite target only when it is the bootable lone primary;
-    // otherwise Fail, mirroring `validate`, so `doctor --strict` cannot greenlight a
-    // config that cannot boot.
+    // A `sqlite://` target names a local file (#1614), so TCP reachability does not apply. SQLite
+    // is single-writer: `DatabaseConfig::validate` rejects it as a replica or in a mixed-backend
+    // topology, so it passes only as the bootable lone primary.
     if autumn_web::config::DatabaseBackend::detect(database_url)
         == Some(autumn_web::config::DatabaseBackend::Sqlite)
     {
@@ -5710,15 +5496,13 @@ fn parse_latest_applied_migration_version(output: &str) -> Option<String> {
 
 /// Parse (host, port) from a Postgres connection URL.
 pub fn parse_db_host_port(url: &str) -> Option<(String, u16)> {
-    // Expect: postgres://[user:pass@]host[:port]/db
+    // postgres://[user:pass@]host[:port]/db
     let without_scheme = url
         .strip_prefix("postgres://")
         .or_else(|| url.strip_prefix("postgresql://"))?;
 
-    // Drop everything after the first `/` (the database name).
     let authority = without_scheme.split('/').next()?;
 
-    // Drop user:pass@ prefix if present.
     let host_port = authority
         .rfind('@')
         .map_or(authority, |at| &authority[at + 1..]);
@@ -5965,7 +5749,6 @@ fn resolve_oauth2_providers_from_sources<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    // Load credentials if available
     let credentials =
         autumn_web::credentials::load_credentials(profile, std::path::Path::new(".")).ok();
 
@@ -5998,7 +5781,6 @@ where
                         .to_lowercase();
                     let upper = normalized_name.to_uppercase();
 
-                    // Get values from env vars
                     let env_id_key = format!("AUTUMN_AUTH__OAUTH2__{upper}__CLIENT_ID");
                     if let Some(id) = env_var(&env_id_key) {
                         client_id = id;
@@ -6008,7 +5790,6 @@ where
                         client_secret = sec;
                     }
 
-                    // Get values from credentials
                     if let Some(ref creds) = credentials {
                         let id_key = format!("oauth2_{normalized_name}_client_id");
                         if client_id.is_empty() {
@@ -6048,8 +5829,6 @@ where
 /// attribute (whitespace-insensitive), as opposed to merely calling the
 /// `.list_unsubscribe(...)` builder method or mentioning it in a comment.
 pub fn file_declares_list_unsubscribe(content: &str) -> bool {
-    // Strip line and block comments so a commented-out attribute (`//` or
-    // `/* ... */`) does not trip a false positive.
     let without_comments = strip_rust_comments(content);
     let collapsed: String = without_comments
         .chars()
@@ -6345,11 +6124,9 @@ where
     )
     .or_else(|| first_toml_string(database, &["primary_url", "url"]));
 
-    // The legacy `database.url` role, resolved as its OWN role (not collapsed
-    // into `primary_url` above) so the backend-consistency delegation can see a
-    // `primary_url`/`url` mismatch (finding F26). Mirrors the runtime env
-    // mapping where `AUTUMN_DATABASE__URL` populates `database.url`; the
-    // doctor-only `DATABASE_URL` fallback feeds `primary_url` only.
+    // The legacy `database.url` stays its own role, not folded into `primary_url`, so the
+    // backend-consistency check sees a `primary_url`/`url` mismatch. The doctor-only
+    // `DATABASE_URL` fallback feeds `primary_url` only.
     let legacy_url = first_env(&env_var, &["AUTUMN_DATABASE__URL"])
         .or_else(|| first_toml_string(database, &["url"]));
 
@@ -6942,11 +6719,7 @@ fn check_manifest_roles(table: Option<&toml::Table>, files: &[(String, String)])
 /// `AUTUMN_JOBS__PIN` (comma-separated) overrides the TOML `jobs.pin` array,
 /// mirroring the runtime env override.
 fn resolve_queues_and_pin(table: Option<&toml::Table>) -> (Vec<String>, Vec<String>) {
-    // Do NOT drop empty env values here: a *present but empty* `AUTUMN_JOBS__PIN`
-    // is an explicit override that clears the pin (see the pin-resolution logic
-    // below and #2290). `std::env::var(key).ok()` returns `Some("")` for a
-    // present-but-empty var and `None` for an absent one, mirroring the
-    // runtime's `if let Ok(val) = env.var(...)` presence check.
+    // Keep empty values: a present but empty `AUTUMN_JOBS__PIN` clears the pin (#2290).
     resolve_queues_and_pin_from_sources(|key| std::env::var(key).ok(), table)
 }
 
@@ -6972,21 +6745,14 @@ where
                 toml::Value::Table(map) => map.keys().cloned().collect(),
                 _ => Vec::new(),
             });
-    // When `[jobs.queues]` is omitted the runtime still creates the implicit
-    // `default` queue (`JobQueuesConfig::default()` == a single `"default"`
-    // queue). Mirror that here so the coverage check can flag `default` as
-    // uncovered when a zero-config app is pinned to some other queue — instead
-    // of seeing no configured queues and silently passing (#1623).
+    // With `[jobs.queues]` omitted the runtime still creates the implicit `default` queue, which a
+    // pin to another queue leaves uncovered (#1623).
     if queues.is_empty() {
         queues.push("default".to_owned());
     }
 
-    // A PRESENT `AUTUMN_JOBS__PIN` (even empty) is an explicit override, matching
-    // the runtime's `apply_jobs_env_overrides_with_env`: it does
-    // `if let Ok(val) = env.var("AUTUMN_JOBS__PIN") { self.jobs.pin = val.split(',')…filter(non-empty)… }`,
-    // so an empty string clears the pin entirely (the process becomes unpinned
-    // and drains every queue). Only when the env var is *absent* do we fall back
-    // to the TOML `jobs.pin` (#2290).
+    // A present `AUTUMN_JOBS__PIN`, even empty, overrides the TOML pin as at runtime: empty
+    // unpins the process so it drains every queue. Only an absent var falls back to TOML (#2290).
     let toml_pin = || {
         jobs.and_then(|j| j.get("pin"))
             .and_then(toml::Value::as_array)
@@ -7028,12 +6794,8 @@ fn resolve_fleet_topology_with_pin(
     table: Option<&toml::Table>,
     jobs_pin: Option<&[String]>,
 ) -> Option<FleetTopology> {
-    // A malformed `[jobs.fleet]` must NOT be silently dropped at ANY level.
-    // Every `?` here would otherwise return `None`, which the caller reads as
-    // "no topology declared" and answers with the informational-only report —
-    // quietly switching the AC6 hard-fail off, with nothing reporting it. The
-    // typed `JobFleetConfig` rejects each of these shapes at app boot, so a
-    // pre-deploy gate that passes them has the ordering exactly backwards.
+    // A malformed `[jobs.fleet]` returns `malformed()`, never `None`: the caller reads `None` as
+    // "no topology" and passes, while the app refuses to boot with these shapes.
     let jobs = table
         .and_then(|t| t.get("jobs"))
         .and_then(toml::Value::as_table);
@@ -7051,18 +6813,14 @@ fn resolve_fleet_topology_with_pin(
     let Some(declared) = declared.as_array() else {
         return Some(FleetTopology::malformed());
     };
-    // `tiers = ["critical", "bulk"]` — the flat shape `jobs.pin` uses, sitting a
-    // few lines above it in the same file, so an easy mistake to make.
+    // Each entry must be a list: `tiers = ["critical", "bulk"]` is the flat shape `jobs.pin` uses.
     let mut tiers: Vec<Vec<String>> = Vec::with_capacity(declared.len());
     for entry in declared {
         let Some(tier) = entry.as_array() else {
             return Some(FleetTopology::malformed());
         };
-        // Queue names must be strings. Dropping a non-string with `filter_map`
-        // is the worst variant of the same silent-pass bug: `tiers = [[1]]`
-        // collapses to an EMPTY tier, which `has_unpinned_tier` reads as a tier
-        // that drains everything — so coverage becomes total and the check
-        // passes unconditionally on a document the app refuses to boot with.
+        // Reject non-strings rather than drop them: `tiers = [[1]]` would become an empty tier,
+        // which `has_unpinned_tier` reads as draining everything.
         let mut names = Vec::with_capacity(tier.len());
         for name in tier {
             let Some(name) = name.as_str() else {
@@ -7181,19 +6939,9 @@ where
         return Ok(Vec::new());
     };
 
-    // 1. A jobs manifest the app emits: TOML `queues = [...]`.
-    //
-    // A manifest that reads and parses is authoritative even when its `queues` array
-    // is empty — that is the app stating it declares no `#[job(queue = "…")]` queues
-    // beyond the configured set, a real answer rather than a missing one. Falling
-    // through to `declared_queues` there would let a stale hand-maintained entry
-    // manufacture a coverage failure against ground truth, and would contradict the
-    // documented precedence that the manifest wins when both are set.
-    //
-    // The fall-through is reserved for a manifest that genuinely says nothing: an
-    // absent path, an unreadable file, unparseable TOML, or no `queues` array.
-    // A manifest whose `queues` array is *present but malformed* is corrupt, not
-    // silent — fail loudly (#2419).
+    // 1. The jobs manifest the app emits (`queues = [...]`). A parsed manifest wins even when
+    // `queues` is empty: that is the app's real answer. Only a manifest that says nothing (absent,
+    // unreadable, not TOML, no `queues`) falls through; a malformed `queues` is corrupt (#2419).
     if let Some(path) = fleet.get("manifest").and_then(toml::Value::as_str)
         && let Some(contents) = read_file(path)
     {
@@ -7212,7 +6960,7 @@ where
         }
     }
 
-    // 2. Inline declared-queues list (MVP).
+    // 2. The inline `declared_queues` list.
     Ok(fleet
         .get("declared_queues")
         .and_then(toml::Value::as_array)
@@ -7271,9 +7019,8 @@ fn resolve_active_profiles() -> (String, String, Vec<String>) {
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_default();
     let raw_trimmed = raw_profile.trim().to_owned();
-    // Mirror normalize_profile_name from config.rs: built-in aliases are
-    // matched case-insensitively; custom profile names preserve the original
-    // user-specified case (so AUTUMN_ENV=QA loads [profile.QA], not [profile.qa]).
+    // As the runtime's `normalize_profile_name`: built-in aliases match case-insensitively, custom
+    // names keep their case (AUTUMN_ENV=QA loads [profile.QA], not [profile.qa]).
     let canonical = if raw_trimmed.eq_ignore_ascii_case("production")
         || raw_trimmed.eq_ignore_ascii_case("prod")
     {
@@ -7286,9 +7033,8 @@ fn resolve_active_profiles() -> (String, String, Vec<String>) {
     } else {
         raw_trimmed.clone()
     };
-    // Mirror profile_lookup_names in config.rs: the runtime always loads the
-    // legacy long-form alias first (e.g. "production") then the canonical short
-    // form ("prod"), regardless of which spelling was used in the env var.
+    // As the runtime's `profile_lookup_names`: the long alias ("production") loads first, then the
+    // canonical name ("prod"), whichever spelling the env var used.
     let alias = match canonical.as_str() {
         "prod" => Some("production".to_owned()),
         "dev" => Some("development".to_owned()),
@@ -7302,8 +7048,8 @@ fn resolve_active_profiles() -> (String, String, Vec<String>) {
 }
 
 fn resolve_proxy_conflict_data() -> ProxyConflictData {
-    // Mirror the runtime: load only the first existing override file so a
-    // stale autumn-production.toml doesn't shadow autumn-prod.toml at startup.
+    // As at runtime, only the first existing override file loads, so a stale
+    // autumn-production.toml does not shadow autumn-prod.toml.
     let (canonical, selected, _profiles) = resolve_active_profiles();
     let table = get_merged_toml_table_runtime(&canonical, &selected);
 
@@ -7376,8 +7122,7 @@ fn resolve_deprecations() -> Vec<DoctorDeprecation> {
     use autumn_web::config::{OsEnv, deprecated_config_keys, detect_deprecated_keys_for};
 
     let (canonical, selected, _profiles) = resolve_active_profiles();
-    // Use the same single-file lookup path the runtime uses: only the first
-    // existing autumn-{profile}.toml is loaded, never both alias spellings.
+    // As at runtime, only the first existing autumn-{profile}.toml loads, never both spellings.
     let file_table = get_merged_toml_table_runtime(&canonical, &selected);
 
     detect_deprecated_keys_for(&canonical, &file_table, &OsEnv, deprecated_config_keys())
@@ -7702,24 +7447,16 @@ fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         .and_then(|s| s.get("tls"))
         .and_then(toml::Value::as_table);
 
-    // Read TLS env vars through the profile-aware `.env` overlay — the real OS
-    // env still wins, but `.env`/`.env.<profile>` values now fill keys the OS
-    // env lacks. Fall back to the bare OS env only if the overlay can't be built
-    // (a malformed `.env`), matching `resolve_offsite_backup_data`.
+    // The profile-aware `.env` overlay: the OS env wins and `.env`/`.env.<profile>` fill keys it
+    // lacks. A malformed `.env` falls back to the bare OS env.
     let denv: Box<dyn autumn_web::config::Env> =
         match autumn_web::dotenv::os_env_with_dotenv_for_profile(&canonical) {
             Ok(e) => Box::new(e),
             Err(_) => Box::new(autumn_web::config::OsEnv),
         };
 
-    // `.ok()` deliberately does NOT filter empty values: a set-but-empty env
-    // var is a PRESENT higher-priority override. The runtime materializes it as
-    // an empty `PathBuf` that OVERWRITES any TOML `cert_path`/`key_path`
-    // (`apply_env_overrides_with_env` uses `env.var(...).ok()` with no
-    // empty-filter, then `PathBuf::from(cert)`), so startup fails fast on the
-    // missing file. Dropping the empty override here would let doctor fall back
-    // to the TOML path and pass a config the server rejects — mirror the
-    // runtime's presence rule so doctor resolves to the same empty path.
+    // Keep empty values: the runtime applies a set-but-empty override as an empty `PathBuf` over
+    // the TOML path and fails at startup, so doctor must resolve to the same empty path.
     let env_cert = denv.var("AUTUMN_SERVER__TLS__CERT_PATH").ok();
     let env_key = denv.var("AUTUMN_SERVER__TLS__KEY_PATH").ok();
 
@@ -7732,12 +7469,8 @@ fn resolve_tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
 
-    // Consider TLS configured only when a RECOGNIZED `[server.tls]` env var is
-    // present (through the overlay, which layers the real process env under the
-    // `.env`/`.env.<profile>` values). Restricting to `TLS_ENV_VAR_NAMES` — the
-    // exact set the runtime materializes the table from — avoids treating an
-    // unrelated/mistyped var like `AUTUMN_SERVER__TLS__ENABLED` as configured and
-    // failing `doctor --strict` on a config the server serves as plain HTTP.
+    // Only a recognized `[server.tls]` env var (`TLS_ENV_VAR_NAMES`) counts, so a mistyped one such
+    // as `AUTUMN_SERVER__TLS__ENABLED` does not fail `--strict` on a plain-HTTP config.
     let any_tls_env = any_tls_env_var_set_in(denv.as_ref());
 
     resolve_tls_paths_from_sources(
@@ -7769,15 +7502,9 @@ fn resolve_static_tls_presence() -> (bool, bool) {
         .and_then(toml::Value::as_table)
         .and_then(|s| s.get("tls"))
         .and_then(toml::Value::as_table);
-    // Read the static cert/key env overrides through the same profile-aware dotenv
-    // overlay `resolve_tls_paths()` uses, not the bare process env. The runtime
-    // applies `AUTUMN_SERVER__TLS__CERT_PATH`/`KEY_PATH` from the `.env` and
-    // `.env.<profile>` overlay (`TomlEnvConfigLoader`), so a static cert or key
-    // supplied there alongside `[server.tls.acme]` is a mixed static+ACME config the
-    // runtime rejects at boot. Reading only the process env would miss that override
-    // and let the static-vs-ACME XOR pass `doctor --strict` on a config the server
-    // will not start. Fall back to the bare OS env only if the overlay cannot be
-    // built, from a malformed `.env`.
+    // The same dotenv overlay as `resolve_tls_paths()`: the runtime applies cert/key overrides from
+    // `.env`/`.env.<profile>`, and one alongside `[server.tls.acme]` is a mixed static+ACME config
+    // it rejects at boot. A malformed `.env` falls back to the bare OS env.
     let denv: Box<dyn autumn_web::config::Env> =
         match autumn_web::dotenv::os_env_with_dotenv_for_profile(&canonical) {
             Ok(e) => Box::new(e),
@@ -7870,11 +7597,8 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
     let section = match tls.and_then(|t| t.get("client_auth")) {
         None => return ClientAuthDoctorData::NotConfigured,
         Some(toml::Value::Table(section)) => section,
-        // Present but not a table — `client_auth = "required"`, say. The
-        // generic schema check validates key NAMES, not value types, so
-        // nothing else catches this; the runtime's `Option<ClientAuthConfig>`
-        // refuses to deserialize it and the app does not start. Grading it
-        // NotConfigured would let `--strict` pass an unbootable config.
+        // Present but not a table (`client_auth = "required"`). The schema check validates key
+        // names, not value types, and the runtime refuses to deserialize this, so it must fail.
         Some(other) => {
             return ClientAuthDoctorData::Invalid {
                 detail: format!(
@@ -7885,11 +7609,8 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
         }
     };
 
-    // An absent `mode` defaults to `off`, exactly as serde does. A PRESENT one
-    // that is not a supported string is a config the runtime refuses to
-    // deserialize, so doctor must Fail rather than fall back to `off` and bless
-    // an app that cannot start — `mode = 1` and `mode = "requred"` both land
-    // here.
+    // An absent `mode` defaults to `off`, as serde does. A present but unsupported value
+    // (`mode = 1`, `mode = "requred"`) fails to deserialize at runtime, so it fails here too.
     let mode = match section.get("mode") {
         None => "off".to_owned(),
         Some(value) => match value.as_str() {
@@ -7913,10 +7634,7 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
         .map_or(0, Vec::len);
 
     if mode == "off" {
-        // `ClientAuthConfig::validate` refuses this combination — no
-        // certificate is ever requested, so those routes would reject every
-        // request — and the server exits at boot on it. Grading it Pass would
-        // let `--strict` bless a config that cannot start.
+        // `ClientAuthConfig::validate` refuses required paths with mode off at boot.
         if required_path_count > 0 {
             return ClientAuthDoctorData::Invalid {
                 detail: "[server.tls.client_auth] lists required_paths but mode = \"off\", so no \
@@ -8033,10 +7751,8 @@ fn grade_client_auth_trust_store(
                         };
                     }
                 };
-                // The #2706 coverage gap: a CRL set that covers only some of
-                // the bundle's CAs makes the runtime refuse the clients of the
-                // rest (and refuse to boot). Both files already loaded through
-                // the runtime paths above, so this only compares names.
+                // A CRL set that covers only some of the bundle's CAs makes the runtime refuse to
+                // boot (#2706). Both files already loaded above, so this only compares names.
                 let gaps = match autumn_web::tls::client_auth::crl_coverage_gaps(
                     std::path::Path::new(bundle),
                     path,
@@ -8271,7 +7987,6 @@ fn parse_acme_directory(acme: &toml::Table) -> Result<autumn_web::config::AcmeDi
     acme.get("directory").cloned().map_or_else(
         || Ok(autumn_web::config::AcmeDirectory::default()),
         |value| {
-            // Render the value BEFORE `try_into` consumes it, for the FAIL message.
             let rendered = value.to_string();
             value
                 .try_into::<autumn_web::config::AcmeDirectory>()
@@ -8297,7 +8012,6 @@ fn parse_acme_scalar<T: serde::de::DeserializeOwned>(
     acme.get(key).cloned().map_or_else(
         || Ok(default),
         |value| {
-            // Render the value BEFORE `try_into` consumes it, for the FAIL message.
             let rendered = value.to_string();
             value
                 .try_into::<T>()
@@ -8384,11 +8098,8 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
 
 /// Resolve the keys of a `[server.tls.acme]` table.
 fn resolve_acme_fields(acme: &toml::Table) -> AcmeDoctorConfig {
-    // Collect the domains as the runtime's typed `Vec<String>` deserialization
-    // does — and, unlike a lenient `filter_map`, RECORD any non-string entry
-    // (e.g. `domains = ["app.example.com", 123]`) instead of silently dropping it.
-    // The runtime fails to deserialize such an array and won't boot, so the grader
-    // must FAIL rather than pass on the surviving string names.
+    // Record a non-string entry (`domains = ["app.example.com", 123]`) rather than dropping it:
+    // the runtime's `Vec<String>` refuses the whole array and does not boot.
     let mut domains = Vec::new();
     let mut domains_error = None;
     match acme.get("domains") {
@@ -8416,24 +8127,15 @@ fn resolve_acme_fields(acme: &toml::Table) -> AcmeDoctorConfig {
             Err(bad_value) => (String::new(), Some(bad_value)),
         };
 
-    // Deserialize `http_challenge_port` the way the runtime's typed `AcmeConfig`
-    // does: an absent key defaults to 80, an explicit valid `u16` is preserved
-    // (including `0`, so the acme-config grader FAILs it exactly as
-    // `AcmeConfig::validate()` does), and a value the runtime would reject
-    // pre-boot (out of `u16` range, or a non-integer like a quoted string)
-    // records the bad value so the grader FAILs rather than silently defaulting.
+    // A valid `u16` is kept as is, including `0`, so the grader fails it as
+    // `AcmeConfig::validate()` does. A value serde rejects is recorded, not defaulted.
     let (http_challenge_port, port_error) = match parse_acme_http_challenge_port(acme) {
         Ok(port) => (port, None),
         Err(bad_value) => (80, Some(bad_value)),
     };
 
-    // Deserialize `renew_before_days` the way the runtime's typed `AcmeConfig`
-    // does: an absent key defaults to 30, a valid in-range integer is preserved
-    // (including a >= 90 value, so the acme-config grader FAILs it exactly as
-    // `AcmeConfig::validate()` does), and a value the runtime would reject
-    // pre-boot (negative, out of `u32` range, or a non-integer such as a quoted
-    // string) records the bad value so the grader FAILs rather than silently
-    // defaulting to 30.
+    // A valid `u32` is kept as is, including one >= 90, so the grader fails it as
+    // `AcmeConfig::validate()` does. A value serde rejects is recorded, not defaulted.
     let (renew_before_days, renew_before_days_error) = match parse_acme_renew_before_days(acme) {
         Ok(days) => (days, None),
         Err(bad_value) => (30, Some(bad_value)),
@@ -8445,28 +8147,22 @@ fn resolve_acme_fields(acme: &toml::Table) -> AcmeDoctorConfig {
             Err(bad_value) => (std::path::PathBuf::from("config/acme"), Some(bad_value)),
         };
 
-    // Deserialize `directory` the way the runtime does; on error, record the bad
-    // value so the acme-config grader FAILs (the runtime won't boot on it) rather
-    // than silently defaulting to staging. On success derive the store label.
+    // A bad `directory` is recorded so the grader fails it; the runtime does not boot on it.
     let (directory_label, directory_error) = match parse_acme_directory(acme) {
         Ok(directory) => (acme_directory_label(&directory), None),
         Err(bad_value) => ("staging".to_owned(), Some(bad_value)),
     };
 
-    // Deserialize `ca_root_path` the way the runtime's typed `Option<PathBuf>`
-    // does: absent is unset, a string is the path, and anything else is a value
-    // the runtime rejects pre-boot — recorded so the grader FAILs instead of
-    // reporting the "unset" Pass for a config the server won't start on.
+    // Mirrors the runtime's `Option<PathBuf>`: a non-string value is rejected at boot, so it
+    // is recorded as an error rather than read as unset.
     let (ca_root_path, ca_root_error) = match acme.get("ca_root_path") {
         None => (None, None),
         Some(toml::Value::String(path)) => (Some(std::path::PathBuf::from(path)), None),
         Some(other) => (None, Some(other.to_string())),
     };
 
-    // Deserialize `[server.tls.acme.dns]` the way the runtime's typed
-    // `AcmeDnsConfig` does. Its `deny_unknown_fields` is the point: an operator
-    // who pastes `api_token = "..."` into `autumn.toml` gets a FAIL naming the
-    // key, not a silently-ignored secret sitting in a plaintext file (#1620).
+    // `AcmeDnsConfig` denies unknown fields, so an `api_token = "..."` pasted into
+    // `autumn.toml` fails by name instead of sitting ignored in a plaintext file (#1620).
     let (dns, dns_error) =
         acme.get("dns").map_or((None, None), |value| match value
             .clone()
@@ -8785,10 +8481,8 @@ fn check_acme_domain_entries(domains: &[String], dns_configured: bool) -> Option
                 ));
             }
         }
-        // The two rules above read `trimmed`, but the runtime stores and uses the
-        // entry UNTRIMMED — as the certificate's SAN and as the ACME order's DNS
-        // identifier — so `AcmeConfig::validate()` rejects a padded entry. Mirror
-        // that here, or `doctor --strict` passes a file the server won't boot on.
+        // The runtime uses the entry untrimmed as the SAN and the order's DNS identifier, so
+        // `AcmeConfig::validate()` rejects a padded entry.
         if domain != trimmed {
             return Some(acme_config_fail(
                 format!(
@@ -9198,20 +8892,16 @@ fn resolve_acme_ca_root_data(
         };
     }
     let Some(path) = path else {
-        // A custom directory is served under a root the platform store almost
-        // never carries — the very handshake failure `ca_root_path` exists to
-        // fix. Grading that Pass would let `doctor --strict` bless a config in
-        // which every order dies before an authorization is created. Warn, not
-        // Fail: installing the root host-wide is a legitimate alternative that
-        // doctor cannot see from here.
+        // A custom directory's root is rarely in the platform store, so every order would fail
+        // its handshake. Warn, not fail: the root may be installed host-wide, which doctor
+        // cannot see.
         return if is_custom_directory(directory_label) {
             AcmeCaRootData::MissingForPrivateDirectory
         } else {
             AcmeCaRootData::NotConfigured
         };
     };
-    // Mirror `AcmeConfig::validate()`, which rejects a blank path before boot —
-    // otherwise this reports "cannot be read" with an empty path in the message.
+    // `AcmeConfig::validate()` rejects a blank path at boot.
     if path.to_str().is_none_or(|p| p.trim().is_empty()) {
         return AcmeCaRootData::Blank;
     }
@@ -9260,12 +8950,8 @@ fn resolve_acme_ca_root_data(
         };
     }
 
-    // A private root pinned against a publicly-trusted Let's Encrypt endpoint can
-    // only narrow trust and break issuance. Graded BEFORE the bundle case below,
-    // and deliberately: for a Let's Encrypt directory the remedy is to remove
-    // `ca_root_path` entirely, so reporting "trim the bundle down to its root"
-    // would hand the operator a fix that preserves — and, once the file really
-    // does contain only that unrelated root, guarantees — the failure.
+    // A pinned root against a publicly trusted Let's Encrypt endpoint can only break issuance.
+    // Graded before the bundle case: the fix is to remove `ca_root_path`, not to trim the bundle.
     if !is_custom_directory(directory_label) {
         return AcmeCaRootData::UnneededForPublicDirectory {
             path: rendered,
@@ -9378,15 +9064,9 @@ pub fn check_acme_stored_cert_impl(data: &TlsDoctorData) -> CheckResult {
 /// URL, delivers nothing at runtime. `webhook_configured` already folds in the
 /// URL absoluteness and signing-secret requirements.
 fn resolve_alert_destination() -> (String, bool, String) {
-    // Evaluate the same fully-merged effective config the runtime boots with, not just
-    // the raw base `autumn.toml`. The runtime loader normalizes profile aliases
-    // (`production` → `prod`, `development` → `dev`) and layers the active profile's
-    // inline `[profile.{name}]` section plus its `autumn-{profile}.toml` over the base.
-    // Reading only the base `[alerts]` with a raw lower-cased profile string let doctor
-    // greenlight a prod deploy whose `autumn-prod.toml`, or `[profile.prod.alerts]`,
-    // cleared the destination — installing no alert channel at runtime. Build the
-    // merged table through the runtime-mirroring loader and resolve against its
-    // flattened top-level `[alerts]`; env vars still take highest precedence.
+    // Resolve against the merged config the runtime boots with: profile aliases normalized and
+    // the profile's inline section and `autumn-{profile}.toml` layered over the base, since
+    // either can clear the destination. Env vars still win.
     //
     // Profile selection mirrors `resolve_profile_input`: a blank AUTUMN_ENV is ignored
     // before falling back to AUTUMN_PROFILE, so it cannot downgrade prod to dev.
@@ -9402,22 +9082,16 @@ fn resolve_alert_destination() -> (String, bool, String) {
         .trim()
         .to_owned();
     let normalized_profile = normalize_alert_profile(&selected_input);
-    // The merge flattens the active profile's inline section and override file into
-    // the top-level `[alerts]`, so resolve against an EMPTY profile: `_from_sources`
-    // then reads only the effective top-level `[alerts]` (env vars still override).
-    // Passing the profile here would re-read the STALE raw `[profile.{name}.alerts]`
-    // section and ignore the higher-priority `autumn-{profile}.toml` layer.
+    // The merge flattens the profile into the top-level `[alerts]`, so resolve against an empty
+    // profile. Passing the profile would re-read the raw `[profile.{name}.alerts]` section and
+    // ignore the higher-priority `autumn-{profile}.toml`.
     let merged = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
-    // `.ok()` deliberately does NOT filter empty values: a set-but-empty env
-    // var is a PRESENT higher-priority layer that CLEARS the destination,
-    // distinct from an unset var (which falls through to the TOML layers).
+    // Empty values are not filtered: a set-but-empty env var clears the destination, while an
+    // unset one falls through to the TOML layers.
     let (_email_present, webhook) =
         resolve_alert_destination_from_sources(|key| std::env::var(key).ok(), Some(&merged), "");
-    // Surface the RAW resolved email string (not just presence) so the
-    // destination check can validate its syntax. Mirror the same env > base
-    // precedence `_from_sources` applies to the flattened top-level `[alerts]`:
-    // a PRESENT `AUTUMN_ALERTS__EMAIL` (even empty) wins and is terminal;
-    // otherwise fall through to the merged base `[alerts] email`.
+    // The raw email, so the destination check can validate its syntax. A present env var
+    // wins even when empty.
     let email = std::env::var("AUTUMN_ALERTS__EMAIL").unwrap_or_else(|_| {
         merged
             .get("alerts")
@@ -9426,10 +9100,7 @@ fn resolve_alert_destination() -> (String, bool, String) {
             .unwrap_or("")
             .to_owned()
     });
-    // Surface the RAW resolved webhook URL (not just presence) under the same
-    // env > merged-base precedence, so the destination check can name a
-    // present-but-non-absolute value in its dedicated warning. `webhook` (above)
-    // already gates on this URL being absolute AND the secret resolving.
+    // The raw webhook URL, so the destination check can name a non-absolute value.
     let webhook_url = std::env::var("AUTUMN_ALERTS__WEBHOOK_URL").unwrap_or_else(|_| {
         merged
             .get("alerts")
@@ -9496,23 +9167,18 @@ where
         .and_then(|t| t.get("alerts"))
         .and_then(toml::Value::as_table);
 
-    // Resolve the RAW winning value for a key under the same layer precedence,
-    // stopping at (not falling through) the first PRESENT layer — a present layer
-    // wins even when its value is empty (an explicit clear). Returns an empty
-    // string when no layer sets the key.
+    // The first layer that sets the key wins, even with an empty value (an explicit clear).
+    // Order: env var, `[profile.{profile}.alerts]`, base `[alerts]`.
     let resolve_value = |env_key: &str, key: &str| -> String {
-        // 1. Env var — highest priority. Present (even empty) is terminal.
         if let Some(val) = env_var(env_key) {
             return val;
         }
-        // 2. Profile-specific `[profile.{profile}.alerts].{key}`.
         if let Some(v) = profile_alerts
             .and_then(|t| t.get(key))
             .and_then(toml::Value::as_str)
         {
             return v.to_owned();
         }
-        // 3. Base `[alerts].{key}`.
         if let Some(v) = base_alerts
             .and_then(|t| t.get(key))
             .and_then(toml::Value::as_str)
@@ -9525,17 +9191,9 @@ where
         |env_key: &str, key: &str| -> bool { !resolve_value(env_key, key).trim().is_empty() };
 
     let email = resolve("AUTUMN_ALERTS__EMAIL", "email");
-    // A webhook destination needs both a well-formed URL and a signing secret:
-    //   * `alerts::install_from_config` refuses to register an unsigned webhook
-    //     channel, so a URL with a missing or cleared secret installs no channel.
-    //   * `http_client::Client::build_request` dispatches only a URL starting with
-    //     `http://` or `https://`. A relative value — which an alert webhook can never
-    //     resolve against a base-url alias — fails every signed POST, so a
-    //     present-but-non-absolute URL is not a working destination either.
-    // Count the webhook only when the resolved URL is a non-empty absolute http(s) URL
-    // and the secret resolves non-empty, under the same per-field precedence, so
-    // doctor agrees with the runtime: a URL without a secret, or a relative URL, is
-    // not a destination, and in production with no other destination doctor warns.
+    // A webhook counts only with an absolute http(s) URL and a signing secret:
+    // `alerts::install_from_config` registers no unsigned webhook channel, and
+    // `http_client::Client::build_request` fails every POST to a relative URL.
     let webhook_url = resolve_value("AUTUMN_ALERTS__WEBHOOK_URL", "webhook_url");
     let webhook_secret = resolve("AUTUMN_ALERTS__WEBHOOK_SECRET", "webhook_secret");
     let webhook = is_absolute_http_url_doctor(webhook_url.trim()) && webhook_secret;
@@ -9550,10 +9208,7 @@ where
 /// `enabled = false` prod config delivers NO operator alerts even with an
 /// `email`/signed-`webhook` populated.
 fn resolve_alert_enabled() -> bool {
-    // Mirror `resolve_alert_destination`'s profile selection and merged-table
-    // build so `enabled` resolves against the same effective config the runtime
-    // boots with (profile inline section + `autumn-{profile}.toml` layered in),
-    // env vars still highest priority.
+    // Same profile selection and merged table as `resolve_alert_destination`.
     let selected_input = std::env::var("AUTUMN_ENV")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -9589,8 +9244,7 @@ fn resolve_alert_enabled_from_sources<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    // 1. Env var — highest priority, mirroring runtime `parse_env_bool`. An
-    //    invalid value (not true/false/1/0) is ignored and falls through.
+    // Mirrors runtime `parse_env_bool`: a value other than true/false/1/0 falls through.
     if let Some(val) = env_var("AUTUMN_ALERTS__ENABLED") {
         match val.as_str() {
             "true" | "1" => return true,
@@ -9598,7 +9252,6 @@ where
             _ => {}
         }
     }
-    // 2. Profile-specific `[profile.{profile}.alerts].enabled`.
     if !profile.is_empty()
         && let Some(v) = table
             .and_then(|t| t.get("profile"))
@@ -9611,7 +9264,6 @@ where
     {
         return v;
     }
-    // 3. Base `[alerts].enabled`.
     if let Some(v) = table
         .and_then(|t| t.get("alerts"))
         .and_then(toml::Value::as_table)
@@ -9620,7 +9272,7 @@ where
     {
         return v;
     }
-    // 4. Unset everywhere → alerts enabled (mirrors `AlertConfig::default()`).
+    // Unset everywhere: enabled, as in `AlertConfig::default()`.
     true
 }
 
@@ -9695,9 +9347,7 @@ fn native_alert_transport_configured(
 /// channels regardless of this flag; it exists purely so `autumn doctor --strict`
 /// can pass a validly-configured code-only alert setup.
 fn resolve_alert_custom_channel() -> bool {
-    // Mirror `resolve_alert_enabled`'s profile selection and merged-table build so
-    // `custom_channel` resolves against the same effective config the runtime
-    // boots with, env vars still highest priority.
+    // Same profile selection and merged table as `resolve_alert_enabled`.
     let selected_input = std::env::var("AUTUMN_ENV")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -9734,8 +9384,7 @@ fn resolve_alert_custom_channel_from_sources<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    // 1. Env var — highest priority, mirroring runtime `parse_env_bool`. An
-    //    invalid value (not true/false/1/0) is ignored and falls through.
+    // Mirrors runtime `parse_env_bool`: a value other than true/false/1/0 falls through.
     if let Some(val) = env_var("AUTUMN_ALERTS__CUSTOM_CHANNEL") {
         match val.as_str() {
             "true" | "1" => return true,
@@ -9743,7 +9392,6 @@ where
             _ => {}
         }
     }
-    // 2. Profile-specific `[profile.{profile}.alerts].custom_channel`.
     if !profile.is_empty()
         && let Some(v) = table
             .and_then(|t| t.get("profile"))
@@ -9756,7 +9404,6 @@ where
     {
         return v;
     }
-    // 3. Base `[alerts].custom_channel`.
     if let Some(v) = table
         .and_then(|t| t.get("alerts"))
         .and_then(toml::Value::as_table)
@@ -9765,7 +9412,7 @@ where
     {
         return v;
     }
-    // 4. Unset everywhere → false (mirrors `AlertConfig::default()`).
+    // Unset everywhere: false, as in `AlertConfig::default()`.
     false
 }
 
@@ -9828,11 +9475,10 @@ where
             _ => None,
         }
     };
-    // 1. Env var — highest priority. Present (even empty) is terminal.
+    // A present env var wins, even when empty.
     if let Some(val) = env_var("AUTUMN_ALERTS__ERROR_RATE_THRESHOLD") {
         return val;
     }
-    // 2. Profile-specific `[profile.{profile}.alerts].error_rate_threshold`.
     if !profile.is_empty()
         && let Some(v) = table
             .and_then(|t| t.get("profile"))
@@ -9845,7 +9491,6 @@ where
     {
         return v;
     }
-    // 3. Base `[alerts].error_rate_threshold`.
     if let Some(v) = table
         .and_then(|t| t.get("alerts"))
         .and_then(toml::Value::as_table)
@@ -9854,7 +9499,7 @@ where
     {
         return v;
     }
-    // 4. Unset everywhere → empty (runtime uses the default 0.05).
+    // Unset everywhere: empty; the runtime uses its default of 0.05.
     String::new()
 }
 
@@ -9872,7 +9517,6 @@ fn resolve_is_production() -> bool {
             }
         }
     }
-    // Fall back to build-mode detection: release binary implies prod
     false
 }
 
@@ -9889,9 +9533,7 @@ fn tailwind_enabled() -> bool {
 }
 
 fn resolve_compression_enabled() -> bool {
-    // 1. Env var takes highest precedence. Use the same accepted values as the
-    //    runtime's parse_env_bool ("true"/"1"/"false"/"0") so doctor never
-    //    reports a different state than the app would observe.
+    // Accept the same values as the runtime's `parse_env_bool`; anything else falls through.
     if let Ok(val) = std::env::var("AUTUMN_COMPRESSION__ENABLED") {
         match val.as_str() {
             "true" | "1" => return true,
@@ -9900,9 +9542,7 @@ fn resolve_compression_enabled() -> bool {
         }
     }
 
-    // 2. Read TOML, applying profile-specific override when a profile is active
-    //    (mirrors the five-layer config system so `[profile.prod] compression.enabled`
-    //    doesn't cause a spurious doctor warning in production).
+    // An active profile's `[profile.<name>] compression.enabled` overrides the base value.
     let table = read_autumn_toml_table().unwrap_or_default();
     let profile = std::env::var("AUTUMN_ENV")
         .ok()
@@ -9917,7 +9557,6 @@ fn resolve_compression_enabled() -> bool {
             .and_then(toml::Value::as_bool)
     };
 
-    // Profile-specific section takes precedence over base config.
     if !profile.is_empty()
         && let Some(enabled) = table
             .get("profile")
@@ -10091,11 +9730,8 @@ fn resolve_deploy_doctor_config(
     merged: &toml::Table,
     env: &dyn autumn_web::config::Env,
 ) -> (Option<DeployConfig>, Option<CheckResult>) {
-    // First resolve the merged-profile `[deploy]` table (base autumn.toml +
-    // [profile.<env>] + autumn-<env>.toml). A present-but-malformed table is a
-    // hard fail regardless of env, because `AutumnConfig::load()` also fails to
-    // deserialize it, so `autumn deploy` cannot run — surface it loudly instead
-    // of silently skipping.
+    // A malformed merged `[deploy]` table fails regardless of env: `AutumnConfig::load()`
+    // cannot deserialize it either, so `autumn deploy` cannot run.
     let mut deploy_cfg = match merged.get("deploy").cloned() {
         Some(value) => match value.try_into::<DeployConfig>() {
             Ok(cfg) => Some(cfg),
@@ -10116,14 +9752,9 @@ fn resolve_deploy_doctor_config(
         },
         None => None,
     };
-    // Apply `AUTUMN_DEPLOY__*` env overrides on top of the merged-profile value,
-    // exactly like `AutumnConfig::load()` does before `autumn deploy check`
-    // grades `config.deploy`. This makes doctor grade the SAME deploy target as
-    // `deploy check` for the same env + profile + TOML: an env-only
-    // `AUTUMN_DEPLOY__HOST` materializes `Some(DeployConfig)` (so the preflight
-    // runs instead of being skipped), and env values win over TOML. When no
-    // `[deploy]` TOML and no `AUTUMN_DEPLOY__*` env exist, this stays `None` and
-    // the preflight skips gracefully.
+    // Apply `AUTUMN_DEPLOY__*` overrides as `AutumnConfig::load()` does, so doctor grades the
+    // same target as `autumn deploy check`. An env-only `AUTUMN_DEPLOY__HOST` yields
+    // `Some(DeployConfig)`; with no TOML and no env this stays `None` and the preflight skips.
     autumn_web::config::apply_deploy_env_overrides(&mut deploy_cfg, env);
     // Use the same name check as `autumn deploy`, so doctor does not pass a
     // config that every deploy command refuses.
@@ -10246,16 +9877,10 @@ pub fn run(opts: DoctorOptions) {
     let msrv = read_msrv().unwrap_or_else(|| crate::MSRV.to_owned());
     let web_ver = read_autumn_web_version();
     let toml_result = std::fs::read_to_string("autumn.toml");
-    // Resolve doctor's database topology and process role/jobs backend from the merged
-    // active-profile config — base autumn.toml, `[profile.<env>]`, `autumn-<env>.toml`
-    // — plus the `.env` overlay, the same layering the runtime, `detect_backend`, and
-    // `autumn migrate` use, not the raw top-level `autumn.toml` table. A database URL,
-    // `role`, or `jobs.backend` supplied only by an active profile or by `.env` is
-    // invisible to the raw table, so a raw-table lookup under `AUTUMN_ENV=prod` would
-    // miss a SQLite target and run the Postgres-only pg_dump/pg_restore and
-    // pending-migration checks (F21). Env precedence is preserved: the resolver reads
-    // the `.env`-backed overlay first, then the merged table, mirroring the sibling
-    // deploy DB preflight below.
+    // Resolve the database topology, process role and jobs backend from the merged
+    // active-profile config plus the `.env` overlay, as the runtime and `autumn migrate` do.
+    // A URL or role set only by a profile or `.env` is invisible to the raw table, and missing
+    // a SQLite target would run the Postgres-only checks. Env wins over the merged table.
     let (db_canonical, db_selected, _) = resolve_active_profiles();
     let merged_db_toml = get_merged_toml_table_runtime(&db_canonical, &db_selected);
     let db_denv: Box<dyn autumn_web::config::Env> =
@@ -10289,16 +9914,13 @@ pub fn run(opts: DoctorOptions) {
     // ── Phase 2: build tasks in display order ────────────────────────────────
     let mut tasks: Vec<Task> = Vec::new();
 
-    // 0. Platform support tier (#1616). First, because it frames every check
-    // below: on Windows a developer needs to know which journeys are native
-    // before they read a warning about one that is not.
+    // 0. Platform support tier (#1616). First, because it frames every check below: on
+    // Windows a developer needs to know which journeys are native.
     tasks.push(Box::new(|| {
         check_platform_support_impl(std::env::consts::OS)
     }));
 
-    // 0b. Daemon / OS-service readiness (#1639). Next to the tier report,
-    // because "which journeys are native here" and "is this project's daemon up"
-    // are the same question asked twice.
+    // 0b. Daemon / OS-service readiness (#1639), next to the tier report it complements.
     let daemon_service = resolve_daemon_service_report();
     tasks.push(Box::new(move || check_daemon_service_impl(&daemon_service)));
 
@@ -10340,36 +9962,21 @@ pub fn run(opts: DoctorOptions) {
         )
     }));
 
-    // 4c. Queue pinning zero-coverage guard (#1623): warn if jobs.pin leaves a
-    // configured queue with no worker coverage anywhere in the topology. Build
-    // from the merged active-profile table (base autumn.toml + [profile.<env>]
-    // + autumn-<env>.toml) exactly like the runtime config loader — and like the
-    // sibling profile-aware doctor checks (proxy conflict, mail unsubscribe) —
-    // so profile-specific `jobs.queues` / `jobs.pin` layers are honored instead
-    // of only the top-level `[jobs]` section.
+    // 4c. Queue pinning coverage (#1623): warn if `jobs.pin` leaves a configured queue with no
+    // worker anywhere. Read from the merged active-profile table so profile-specific
+    // `jobs.queues` / `jobs.pin` are honored.
     let (queue_canonical, queue_selected, _) = resolve_active_profiles();
     let merged_jobs_toml = get_merged_toml_table_runtime(&queue_canonical, &queue_selected);
     let (configured_queues, jobs_pin) = resolve_queues_and_pin(Some(&merged_jobs_toml));
-    // Resolve the process role for this check from the same merged active-profile table
-    // the queues and pin come from, not the raw top-level `toml_table` that feeds
-    // `process_role` above. A `role` set only under `[profile.<env>]` or
-    // `autumn-<env>.toml` — a web replica in prod, say — is invisible to the raw table,
-    // so the role would resolve to `Combined`, the web-role skip-gate would never fire,
-    // and `doctor --strict` could wrongly warn or fail on queue coverage for a process
-    // that runs no job workers. Precedence mirrors the runtime exactly (`AUTUMN_ROLE`
-    // env > merged-table `role` > `Combined`), reusing the shared resolver.
-    // An unknown role already fails the `process_role_backend` row. Use the
-    // default here so this row still reports.
+    // Precedence mirrors the runtime: `AUTUMN_ROLE` env, then merged-table `role`, then
+    // `Combined`. An unknown role already fails the `process_role_backend` row, so fall back
+    // to the default here and still report this row.
     let (queue_coverage_role, _) =
         resolve_process_role_and_backend(Some(&merged_jobs_toml), db_denv.as_ref());
     let queue_coverage_role =
         queue_coverage_role.unwrap_or_else(|_| Role::from(ProcessRole::Combined));
-    // Topology/registry inputs (#1756) that let the coverage check restore a
-    // SOUND `--strict` hard-fail: the declared fleet topology (all worker tiers'
-    // pins) and the compiled `#[job(queue)]` set (from a jobs manifest or an
-    // inline list). Absent both, `check_queue_coverage_topology` delegates to the
-    // informational-only per-process report, so existing deployments never
-    // regress.
+    // The declared fleet topology and the compiled `#[job(queue)]` set let `--strict` fail on
+    // coverage (#1756). Absent both, `check_queue_coverage_topology` reports per process only.
     // Derived tiers inherit the `jobs.pin` this process resolves, env included.
     let fleet_topology = resolve_fleet_topology_with_pin(Some(&merged_jobs_toml), Some(&jobs_pin));
     let (declared_queues, declared_queues_manifest_error) =
@@ -10406,23 +10013,13 @@ pub fn run(opts: DoctorOptions) {
         check_manifest_roles(Some(&manifest_roles_toml), &files)
     }));
 
-    // A `sqlite://` primary boots only as the lone, single-backend, unsharded database
-    // role. Pair it with a replica, add `[[database.shards]]`, keep a mismatched legacy
-    // `database.url`, or mix backends, and `DatabaseConfig::validate` rejects it at
-    // boot, so doctor must not Pass it (F19/F23/F26). Rather than re-derive that rule,
-    // the bootability helper delegates to
-    // `autumn_web::config::database_backend_consistency`, the function boot itself
-    // uses, feeding it every resolved role: legacy `url`, `primary_url`, `replica_url`,
-    // and shard presence. A `sqlite://` replica is never bootable, so its connectivity
-    // check always passes `false`. Shard presence resolves through the same
-    // profile-aware `.env` overlay and merged active-profile table as the topology,
-    // reusing the migrate resolver so doctor and the real migration step agree.
+    // A `sqlite://` primary boots only as the lone, single-backend, unsharded role;
+    // `DatabaseConfig::validate` rejects a replica, shards, a mismatched legacy `url` or mixed
+    // backends at boot. Shard presence uses the migrate resolver over the same `.env` overlay
+    // and merged table, so doctor and the migration step agree.
     //
-    // F28: a malformed `[[database.shards]]` entry resolves to `Err`. Collapsing that
-    // to "no shards" let a SQLite primary with a broken shard entry keep the no-host
-    // connectivity Pass, so `autumn doctor --strict` greenlit a config the app cannot
-    // boot. Keep the `Result` so the `Err` surfaces as an authoritative Fail below and
-    // the per-role connectivity Pass is withheld.
+    // Keep the `Result`: a malformed `[[database.shards]]` entry is a boot failure, not
+    // "no shards", and must withhold the connectivity Pass below.
     let shard_resolution = crate::migrate::try_resolve_shard_database_urls_from_sources(
         |key| db_denv.var(key),
         Some(&merged_db_toml),
@@ -10432,18 +10029,10 @@ pub fn run(opts: DoctorOptions) {
         .is_ok_and(|shards| !shards.is_empty());
     let malformed_shard_error = shard_resolution.err();
     let shards_malformed = malformed_shard_error.is_some();
-    // Finding F27: the boot-time backend-consistency rule
-    // (`DatabaseConfig::validate`) must run as an UNCONDITIONAL doctor check,
-    // independent of which backend is the effective primary. The SQLite-only
-    // `sqlite_primary_target_is_bootable` gate below only fires for a SQLite
-    // effective primary, so its mirror image — a Postgres primary with a mismatched
-    // `sqlite://` legacy `database.url` (or a SQLite replica/shard) — slipped
-    // through: with the Postgres primary reachable, the per-role connectivity Pass
-    // greenlit a config the app rejects at boot. Compute the consistency verdict
-    // once, on every resolved role, and make it AUTHORITATIVE: when it Fails, the
-    // per-role connectivity Pass logic is withheld so a reachable primary can't
-    // contradict the mismatch (findings F26 sqlite-primary+pg-legacy AND F27
-    // pg-primary+sqlite-legacy, plus any role mismatch — replica, shards).
+    // The boot-time backend-consistency rule (`DatabaseConfig::validate`) runs whatever the
+    // primary's backend: `sqlite_primary_target_is_bootable` only covers a SQLite primary,
+    // not a Postgres primary with a `sqlite://` legacy URL, replica or shard. When it fails,
+    // the per-role connectivity checks are withheld so a reachable primary cannot contradict it.
     let backend_consistent = autumn_web::config::database_backend_consistency(
         db_topology.legacy_url.as_deref(),
         db_topology.primary_url.as_deref(),
@@ -10451,10 +10040,7 @@ pub fn run(opts: DoctorOptions) {
         db_has_shards,
     )
     .is_ok();
-    // Only surface the check when a database is actually configured — a no-database
-    // app has nothing to be inconsistent about. Any configured role (legacy `url`,
-    // `primary_url`, `replica_url`, or shards) triggers it, so both mismatch
-    // directions and role mismatches are covered.
+    // A no-database app has nothing to be inconsistent about.
     let db_configured = db_topology.primary_url.is_some()
         || db_topology.legacy_url.is_some()
         || db_topology.replica_url.is_some()
@@ -10473,13 +10059,8 @@ pub fn run(opts: DoctorOptions) {
         }));
     }
 
-    // Finding F28: surface a malformed `[[database.shards]]` entry as an
-    // authoritative Fail — the resolver (and runtime/migrate) reject it, so it is
-    // a boot-blocking problem, not "no shards". Emitted independently of
-    // `db_configured`/`backend_consistent` (a shard-only config with a broken
-    // entry resolves no other role) and, like the F27 gate below, it withholds
-    // the per-role connectivity Pass so a "reachable" SQLite primary can't
-    // contradict it.
+    // A malformed `[[database.shards]]` entry blocks boot. Reported independently of
+    // `db_configured`, since a shard-only config with a broken entry resolves no other role.
     if let Some(err) = malformed_shard_error {
         tasks.push(Box::new(move || check_shard_config_resolvable(&err)));
     }
@@ -10490,14 +10071,8 @@ pub fn run(opts: DoctorOptions) {
         db_topology.replica_url.as_deref(),
         db_has_shards,
     );
-    // Withhold per-role connectivity Pass/Fail logic for a backend-inconsistent
-    // config: the unconditional consistency FAIL above is the authoritative signal,
-    // and a reachable primary must not double-report a contradictory "reachable"
-    // Pass (finding F27, part 2). A backend-consistent config runs the ordinary
-    // connectivity/pending-migration probes unchanged. Likewise withhold it when
-    // the shard config is malformed (finding F28): the `db_shard_config` FAIL is
-    // authoritative, so a SQLite primary must not receive a misleading no-host
-    // connectivity Pass for a topology the app cannot boot.
+    // An inconsistent backend or a malformed shard config already fails above; a reachable
+    // primary must not add a contradictory connectivity Pass.
     if backend_consistent && !shards_malformed {
         if let Some(url) = db_topology.primary_url.clone() {
             let primary_for_pending = url.clone();
@@ -10506,13 +10081,8 @@ pub fn run(opts: DoctorOptions) {
             tasks.push(Box::new(move || {
                 check_db_connectivity(&url, sqlite_primary_bootable)
             }));
-            // `check_pending_migrations` shells out to `diesel migration pending` and,
-            // when the CLI is absent, tells users to install `diesel_cli ... --features
-            // postgres` — a Postgres-specific warning / `--strict` failure that doesn't
-            // apply to a SQLite app. SQLite migration tracking is deferred to #1906, so
-            // emit an honest deferred note instead of the Postgres probe (finding F20),
-            // gated off the SAME profile-merged backend detection as the pg_client_tools
-            // skip and the connectivity check.
+            // `check_pending_migrations` is Postgres-specific (it suggests `diesel_cli
+            // --features postgres`). SQLite migration tracking is deferred to #1906.
             if primary_is_sqlite {
                 tasks.push(Box::new(check_pending_migrations_sqlite));
             } else {
@@ -10569,37 +10139,16 @@ pub fn run(opts: DoctorOptions) {
         check_trusted_hosts_impl(&trusted_hosts, is_production)
     }));
 
-    // 8-deploy. Deploy preflight (#1607). Config-gated: it runs only when a
-    // `[deploy]` section is present and skips gracefully otherwise, reusing the exact
-    // graders behind `autumn deploy check`. The offline graders — signing secret,
-    // database URL, migrate check — always run when deploy is configured; the
-    // SSH-reachability probe is gated behind `--online`, so `doctor` stays offline and
-    // non-flaky by default, matching the ACME probes.
+    // 8-deploy. Deploy preflight (#1607), only when `[deploy]` is configured, reusing the
+    // graders behind `autumn deploy check`. The offline graders always run; the SSH probe
+    // needs `--online`, so doctor stays offline and deterministic by default.
     //
-    // Resolve `[deploy]` from the merged active-profile runtime table (base
-    // autumn.toml, `[profile.<env>]`, `autumn-<env>.toml`), like the sibling
-    // profile-aware checks and the runtime loader, not the raw top-level `toml_table`.
-    // A `[deploy]` block supplied only by an active profile is invisible to the raw
-    // table, so a raw-table lookup would skip the preflight entirely — or `--online`
-    // would probe the base host instead of the effective target — grading a deploy
-    // config the runtime never loads.
+    // `[deploy]` comes from the merged active-profile table, so a block set only by a profile
+    // is graded and `--online` probes the effective host.
     let (deploy_canonical, deploy_selected, _) = resolve_active_profiles();
     let merged_deploy_toml = get_merged_toml_table_runtime(&deploy_canonical, &deploy_selected);
-    // Distinguish "[deploy] absent", which skips the preflight gracefully, from
-    // "[deploy] present but malformed". Swallowing the parse error with `.ok()` would
-    // silently drop every deploy check when a field has the wrong type (`ssh_port =
-    // "22"`, `keep_releases = -1`), yet `autumn deploy` loads `AutumnConfig` and fails
-    // on the same table, so `doctor --strict` would greenlight a config the deploy
-    // path cannot parse. Surface a failing `deploy_config` check instead.
-    //
-    // `AUTUMN_DEPLOY__*` env overrides are then applied on top — env wins over TOML,
-    // and an env-only host materializes a deploy config — matching
-    // `AutumnConfig::load()`, so doctor grades the same target as `deploy check` for an
-    // env-only or env-overridden deploy rather than skipping or probing a stale host.
-    // They are read through the profile-aware `.env` overlay, since
-    // `AutumnConfig::load` layers dotenv. Real OS env still wins; fall back to bare OS
-    // env only if the overlay cannot be built from a malformed `.env`, matching the
-    // TLS and offsite-backup checks.
+    // `AUTUMN_DEPLOY__*` overrides are read through the profile-aware `.env` overlay, as
+    // `AutumnConfig::load` layers dotenv. A malformed `.env` falls back to the bare OS env.
     let deploy_denv: Box<dyn autumn_web::config::Env> =
         match autumn_web::dotenv::os_env_with_dotenv_for_profile(&deploy_canonical) {
             Ok(e) => Box::new(e),
@@ -10611,70 +10160,31 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(move || check));
     }
     if let Some(deploy_cfg) = deploy_cfg {
-        // Phase 2 (found via #1966 review): re-derive the value-resolution inputs —
-        // the merged TOML table and the `.env` overlay — under the `[deploy] profile`,
-        // not the ambient CLI runtime profile.
-        //
-        // Phase 1 above resolved `deploy_cfg` and its `.profile` from the `[deploy]`
-        // table under the ambient profile, which is fine: that table decides the target
-        // profile. But the deploy secret and DB values — signing secret, database URL,
-        // shard URLs, db-backed-runtime DB requirement — must resolve under the deploy
-        // profile the uploaded unit boots under. A value supplied only there
-        // (`[profile.prod]`, `.env.prod`) is invisible to the ambient default `dev`
-        // resolution, so grading it there would falsely report it missing or insecure
-        // even though `autumn deploy check` resolves it correctly. Strictness grading
-        // below already keys on the deploy profile.
-        //
-        // This mirrors `load_runtime_config`'s own two-phase reload in `deploy.rs`, the
-        // same chicken-and-egg: learn the profile, then resolve under it. It reuses
-        // `deploy::deploy_profile_env_overlay`, the exact overlay `load_runtime_config`
-        // uses (`.env.<canonical>` selection plus a forced raw `AUTUMN_ENV`), rather
-        // than replicating the layering, so doctor and `deploy check` cannot drift.
-        // `trimmed_deploy_profile` yields the raw spelling exactly as
-        // `ResolvedDeployConfig::resolve` stores it.
+        // The ambient profile decided `deploy_cfg` and its `[deploy] profile`. The secret and
+        // DB values must resolve under that deploy profile, the one the uploaded unit boots
+        // under, as `load_runtime_config` in `deploy.rs` does in its two-phase reload.
         let deploy_profile_raw = crate::deploy::trimmed_deploy_profile(&deploy_cfg.profile);
         let deploy_profile_canonical =
             crate::deploy::canonicalize_deploy_profile(&deploy_profile_raw);
-        // Rebuild the merged TOML under the deploy profile (canonical + raw
-        // selected), matching how `resolve_active_profiles`' (canonical, selected)
-        // tuple feeds `get_merged_toml_table_runtime` above.
         let merged_deploy_toml =
             get_merged_toml_table_runtime(&deploy_profile_canonical, &deploy_profile_raw);
-        // Rebuild the `.env` overlay under the deploy profile via the SAME path as
-        // `load_runtime_config`, so `.env.<deploy>` loads and `AUTUMN_ENV` reads
-        // as the deploy profile. Fall back to bare OS env on a malformed `.env`,
-        // matching the phase-1 fallback above.
+        // The same overlay `load_runtime_config` uses: `.env.<deploy>` loads and `AUTUMN_ENV`
+        // reads as the deploy profile.
         let deploy_denv: Box<dyn autumn_web::config::Env> =
             match crate::deploy::deploy_profile_env_overlay(&deploy_profile_raw) {
                 Ok(e) => Box::new(e),
                 Err(_) => Box::new(autumn_web::config::OsEnv),
             };
-        // Load guard (Codex review): the value graders below build
-        // `merged_deploy_toml` via `get_merged_toml_table_runtime`, whose
-        // profile-override read swallows a parse or IO error with `.ok()`. A malformed
-        // or unreadable `autumn-<profile>.toml` override is therefore dropped silently,
-        // and doctor would grade only the base values and pass `--strict` while `autumn
-        // deploy check`, which loads under the deploy profile, fails on the same file.
-        // Mirror `deploy check`'s load here — the same lenient loader
-        // (`AutumnConfig::load_with_env_lenient_unknown_roots`, #2063) through the same
-        // profile-forced `deploy_denv` overlay — and surface any error as a failing
-        // `deploy_config` check, so the two agree: a plugin-owned top-level root such
-        // as `[media]` that passes `deploy check` no longer fails `doctor --strict`,
-        // while malformed TOML and known-section typos stay fatal in both. On a
-        // deployable config the load succeeds, so this never newly fails a valid
-        // override.
+        // `get_merged_toml_table_runtime` drops a malformed or unreadable
+        // `autumn-<profile>.toml` silently. Run `deploy check`'s own lenient load (#2063) so
+        // that file fails here too, while plugin-owned roots such as `[media]` still pass.
         if let Some(check) =
             deploy_profile_config_load_check(&deploy_profile_raw, deploy_denv.as_ref())
         {
             tasks.push(Box::new(move || check));
         }
-        // Resolve the deploy signing secret from the SAME merged active-profile
-        // table used for `deploy_cfg` and the DB URL (env first, then
-        // `merged_deploy_toml`'s `security.signing_secret.secret`) — NOT the raw
-        // top-level `autumn.toml` that `resolve_optional_signing_secret` reads. A
-        // secret supplied only by the active profile is invisible to the raw
-        // table, so a raw lookup would report it MISSING even though
-        // `AutumnConfig::load()` and `autumn deploy check` see it.
+        // From the merged deploy-profile table, not the raw `autumn.toml` that
+        // `resolve_optional_signing_secret` reads, so a profile-only secret is seen.
         let deploy_signing =
             resolve_deploy_signing_secret(&merged_deploy_toml, deploy_denv.as_ref());
         // Rotation secrets accepted during a grace window are validated at boot
@@ -10682,50 +10192,23 @@ pub fn run(opts: DoctorOptions) {
         // same merged table (no env override exists for `previous_secrets`).
         let deploy_previous_signing_result =
             resolve_deploy_previous_signing_secrets(&merged_deploy_toml);
-        // Derive the deploy DB-URL preflight input from the same merged active-profile
-        // table used for `deploy_cfg`, like the sibling profile-aware checks above, not
-        // the pre-merge `db_topology` built from the raw top-level `toml_table`. A
-        // database URL supplied only by the active profile is invisible to the raw
-        // table, so a raw-table lookup would fail `deploy_database_url` under `--strict`
-        // even though `AutumnConfig::load()` and `autumn deploy check` see it. Env-var
-        // precedence is preserved: `resolve_database_topology_from_sources` reads the
-        // overlay first, then the merged table. Resolving through `deploy_denv`, the
-        // profile-aware `.env` overlay, means a URL set only in `.env`/`.env.<profile>`
-        // is seen by doctor exactly as `AutumnConfig::load()` sees it, rather than the
-        // bare process env.
+        // Resolved under the deploy profile, env overlay first, then the merged table, as
+        // `AutumnConfig::load()` sees it.
         let deploy_db_topology = resolve_database_topology_from_sources(
             |key| deploy_denv.var(key).ok().filter(|value| !value.is_empty()),
             Some(&merged_deploy_toml),
         );
-        // Shard-only apps declare no control `primary_url`/`url` but still have a
-        // usable database: `autumn migrate` targets each `[[database.shards]]` entry
-        // (see `migrate::build_targets`). Resolve the shard URLs through the same
-        // `deploy_denv` overlay and merged active-profile table, reusing the exact
-        // migrate resolver so preflight and the real migration step agree, and fall
-        // back to the first shard's primary URL when no control primary resolves. Only
-        // writable targets count — `database.replica_url` is excluded, because `autumn
-        // migrate` cannot migrate against a replica. The grader never prints the value.
-        //
-        // Use the fallible shard resolver here. The exiting
-        // `resolve_shard_database_urls_from_sources` calls `std::process::exit(1)` on a
-        // malformed `[[database.shards]]` entry, which — running while doctor tasks are
-        // being built — would terminate `autumn doctor --json` before it emits its JSON
-        // result, bypassing normal `CheckResult` reporting. Map an `Err` to a failing
-        // `deploy_database_url` check below instead, so doctor still produces valid
-        // output; `autumn migrate` keeps its print-and-exit behaviour via a thin
-        // wrapper. The resolver is lifted into its own binding so it feeds both the
-        // db-configured flag (shard presence) and the writable URL below.
+        // A shard-only app has no control `primary_url`, so fall back to the first shard's
+        // primary, as `autumn migrate` targets each shard. A replica is not writable and does
+        // not count. The fallible resolver is used because the exiting one would end
+        // `autumn doctor --json` before it prints its result.
         let deploy_shards_result = crate::migrate::try_resolve_shard_database_urls_from_sources(
             |key| deploy_denv.var(key),
             Some(&merged_deploy_toml),
         );
-        // Derive db-configured from resolved URL/shard presence, mirroring
-        // `deploy.rs` `collect_preflight` (`url || primary_url || replica_url ||
-        // has_shards()`) — NOT mere `[database]` table presence, which flips true
-        // on a tuning-only table (e.g. `pool_size`) and would falsely fail
-        // `deploy_database_url` for a config `deploy check` accepts. `primary_url`
-        // here folds `url`+`primary_url`. Computed BEFORE the writable-URL `.map()`
-        // below moves `primary_url` (this only borrows it via `.is_some()`).
+        // Mirrors `collect_preflight` in `deploy.rs`: a resolved URL or shard, not a bare
+        // `[database]` table, which a tuning-only `pool_size` would create. `primary_url`
+        // already folds in the legacy `url`.
         let deploy_db_configured = deploy_db_topology.primary_url.is_some()
             || deploy_db_topology.replica_url.is_some()
             || deploy_shards_result
@@ -10736,43 +10219,24 @@ pub fn run(opts: DoctorOptions) {
                 .primary_url
                 .or_else(|| deploy_shards.into_iter().next().map(|(_, url)| url))
         });
-        // A DB-backed runtime feature (jobs.backend/scheduler.backend = postgres)
-        // requires a configured pool at startup, so a writable DB URL is required
-        // even with no migrations dir and no `[database]` section. Resolved from
-        // the SAME merged active-profile table so `doctor` and `deploy check`
-        // apply the identical DB-required rule.
+        // A postgres jobs or scheduler backend needs a pool at startup, so a writable DB URL
+        // is required even with no migrations dir and no `[database]` section.
         let deploy_db_backed_runtime =
             resolve_deploy_db_backed_runtime(&merged_deploy_toml, deploy_denv.as_ref());
 
-        // Grade deploy-target checks against the resolved `[deploy] profile` (default
-        // `prod`), not the ambient CLI runtime profile — `is_production`, read from
-        // AUTUMN_ENV/AUTUMN_PROFILE, is false on a dev box. Otherwise `autumn doctor
-        // --strict` greenlights a weak deploy signing secret that `autumn deploy
-        // check`/`deploy up` fail, since those grade against the profile the uploaded
-        // unit boots under. Normalize the profile as `deploy check` does, so alias
-        // spellings (`PROD`, `Production`) still grade as production. Ambient
-        // (non-deploy) checks keep using `is_production`.
+        // Deploy checks grade against the `[deploy] profile` (default `prod`), not the ambient
+        // `is_production`, which is false on a dev box. Aliases such as `Production` normalize
+        // as in `deploy check`.
         let deploy_is_production = crate::deploy::is_production_profile(Some(
             &crate::deploy::canonicalize_deploy_profile(&deploy_cfg.profile),
         ));
 
-        // Host presence is validated offline, whenever `[deploy]` is configured: a
-        // `[deploy]` table with a missing or blank `host` makes `autumn deploy check`
-        // fail immediately, so default offline `doctor --strict` must fail on it too
-        // rather than greenlighting a config the deploy path rejects. Only the TCP
-        // connect probe is gated behind `--online`.
+        // Host presence is checked offline; only the TCP probe needs `--online`. The target
+        // list (`host`, or a `hosts` fleet, #1621) goes through the validator `deploy check`
+        // uses, so a malformed spelling fails `deploy_host` here too.
         //
-        // #1621: the target is a list — `[deploy] host`, or `[deploy] hosts` as a fleet
-        // in rollout order — and doctor enumerates it exactly as `deploy check` does,
-        // through the same shared validator, so a fleet config is graded rather than
-        // reported as "no target host configured". A malformed spelling — both keys set,
-        // a blank entry, a duplicate — draws the same hard refusal `deploy check` makes,
-        // surfaced here as a failing `deploy_host`.
-        //
-        // Doctor keeps one check per grader name even for a fleet: `CheckResult.name`
-        // is a `&'static str` and an operator-visible `--json` key, so the per-host
-        // detail rides in the detail text instead of multiplying names. See
-        // `crate::deploy::DOCTOR_PREFLIGHT_GRADERS`.
+        // One check per grader name even for a fleet: the name is a `--json` key, so per-host
+        // detail goes in the detail text. See `crate::deploy::DOCTOR_PREFLIGHT_GRADERS`.
         let deploy_hosts = crate::deploy::deploy_host_list(&deploy_cfg);
         let media_hosts = deploy_hosts.clone();
         tasks.push(Box::new({
@@ -10801,10 +10265,8 @@ pub fn run(opts: DoctorOptions) {
                         std::time::Duration::from_secs(5),
                     ),
                 ),
-                // The spelling itself is broken, so there is no list to probe; the
-                // `deploy_host` check above already names the problem. Report the
-                // reachability check as failing rather than silently omitting it —
-                // omission would change the `--json` key set.
+                // No host list to probe. Still report the check, so the `--json` key set
+                // does not change.
                 Err(message) => CheckResult {
                     name: crate::deploy::DOCTOR_PREFLIGHT_GRADERS[0],
                     status: CheckStatus::Fail,
@@ -10828,13 +10290,8 @@ pub fn run(opts: DoctorOptions) {
                 }));
             }
             Err(msg) => {
-                // A non-array `previous_secrets` or a non-string element: surface
-                // it as a FAILING check on EVERY profile (not gated on
-                // production), because `AutumnConfig::load()` deserializes the
-                // field as `Vec<String>` and hard-fails the same config that
-                // `autumn deploy check` loads. Silently dropping it would let a
-                // strong current secret green-light a config the deploy path
-                // rejects.
+                // Fails on every profile: `AutumnConfig::load()` deserializes the field as
+                // `Vec<String>` and refuses anything else.
                 tasks.push(Box::new(move || CheckResult {
                     name: crate::deploy::DOCTOR_PREFLIGHT_GRADERS[1],
                     status: CheckStatus::Fail,
@@ -10863,9 +10320,8 @@ pub fn run(opts: DoctorOptions) {
                 }));
             }
             Err(msg) => {
-                // A malformed `[[database.shards]]` entry: surface it as a FAILING
-                // check instead of exiting the process, so `autumn doctor --json`
-                // still emits valid JSON with a clear, actionable failure.
+                // A malformed `[[database.shards]]` entry fails the check instead of exiting,
+                // so `autumn doctor --json` still emits valid JSON.
                 tasks.push(Box::new(move || CheckResult {
                     name: crate::deploy::DOCTOR_PREFLIGHT_GRADERS[2],
                     status: CheckStatus::Fail,
@@ -10907,33 +10363,16 @@ pub fn run(opts: DoctorOptions) {
     }
 
     // 8a. Direct-HTTPS certificate readiness (#1603): validate `[server.tls]` cert and
-    // key, warn on near-expiry, fail on expired.
+    // key, warn on near-expiry, fail on expired. Skipped for ACME-only deployments; see
+    // `should_run_static_tls_check`.
     //
-    // Skip this static-cert check for an ACME-only deployment — acme configured with
-    // no static cert or key. The runtime's `TlsConfig::validate()` accepts ACME-only,
-    // but `resolve_tls_paths()` sees the enclosing `[server.tls]` table and reports
-    // empty paths, so `check_tls_impl` would emit a spurious "must set both cert_path
-    // and key_path" Fail for every ACME deployment. The acme checks below grade that
-    // mode instead.
-    //
-    // Resolve the ACME config from the merged active-profile runtime table, exactly as
-    // `resolve_tls_paths()` does, not the raw top-level `toml_table`. A
-    // `[server.tls.acme]` supplied only by an active profile or override file is
-    // invisible to the raw table, so a raw-table lookup would leave `acme_configured`
-    // false while `resolve_tls_paths()` still sees the enclosing `[server.tls]` with no
-    // static paths — wrongly running, and failing, the static TLS check on a valid
-    // profile-scoped ACME deployment.
+    // ACME is read from the merged active-profile table, as `resolve_tls_paths()` reads
+    // the static paths, so a profile-only `[server.tls.acme]` is not mistaken for static TLS.
     let (acme_canonical, acme_selected, _) = resolve_active_profiles();
     let merged_acme_toml = get_merged_toml_table_runtime(&acme_canonical, &acme_selected);
     let acme_config = resolve_acme_doctor_config(Some(&merged_acme_toml));
-    // The profile whose encrypted credentials file the runtime would read, and the
-    // tenancy base domain tenant subdomains resolve against — both read from the same
-    // merged, profile-layered view the ACME config comes from, so the DNS-01 checks
-    // below grade exactly what the app will see (#1620). Use the canonical profile,
-    // not the raw environment variable: the runtime maps `production` → `prod` before
-    // loading `config/credentials/<profile>.toml.enc` (`normalize_profile_name`), so
-    // grading the raw spelling would read a different file than the server does, and
-    // report "no credential found" for a correct deployment, or the reverse.
+    // The canonical profile, not the raw env value: the runtime maps `production` to `prod`
+    // before loading `config/credentials/<profile>.toml.enc` (#1620).
     let acme_credentials_profile = if acme_canonical.trim().is_empty() {
         "dev".to_owned()
     } else {
@@ -10946,34 +10385,18 @@ pub fn run(opts: DoctorOptions) {
         .and_then(toml::Value::as_str)
         .map(str::to_owned);
 
-    // XOR inputs mirror `TlsConfig::validate`, which keys static-mode on
-    // `cert_path.is_some()` / `key_path.is_some()`: base them on whether the
-    // `cert_path`/`key_path` KEY is PRESENT (TOML or env override), independent of
-    // an empty value. An explicitly-present-but-empty path is `Some("")` at
-    // runtime, so `[server.tls.acme]` + `cert_path = ""` is a mixed static+ACME
-    // config the runtime rejects — doctor must Fail it, not collapse the empty
-    // path to "absent" and pass it as ACME-only.
+    // Key presence, not value: `TlsConfig::validate` keys static mode on `is_some()`, so
+    // `cert_path = ""` alongside `[server.tls.acme]` is a mixed config the runtime rejects.
     let (has_static_cert, has_static_key) = resolve_static_tls_presence();
 
-    // Whether a genuine (non-empty) static cert/key PAIR exists — value-based,
-    // gating the static-cert INSPECTION below. A present-but-empty path is not a
-    // runnable static cert, so it stays absent here: an empty pure-static config
-    // still Fails via the static check's "must set both" path, and an empty path
-    // alongside acme skips the (now redundant) static inspection because the
-    // mixed-mode Fail already fired.
+    // A non-empty pair, gating the inspection below. An empty path alongside ACME skips it,
+    // since the mixed-mode Fail already fired.
     let (has_cert_path, has_key_path) = resolve_tls_paths()
         .map_or((false, false), |(cert, key)| {
             (!cert.as_os_str().is_empty(), !key.as_os_str().is_empty())
         });
     let static_cert_key_present = has_cert_path && has_key_path;
 
-    // Mirror `TlsConfig::validate()`'s static-vs-ACME XOR + half-pair rules so
-    // doctor FAILS exactly the combinations the runtime refuses to boot: static
-    // cert/key AND [server.tls.acme] together (mutually exclusive), or only one
-    // of cert_path/key_path (half pair). Without this, a config with BOTH a valid
-    // static cert/key AND acme could PASS `--strict`, and a config with a single
-    // static path plus acme would silently skip the static check — blessing a
-    // config the app won't start.
     if let Some(mode_fail) =
         check_tls_mode_impl(has_static_cert, has_static_key, acme_config.is_some())
     {
@@ -10985,12 +10408,9 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(move || check_tls_impl(&tls_data)));
     }
 
-    // 8a-ter. Mutual TLS (#1640): grade the client-CA bundle and CRL offline.
-    // Read from the SAME merged, profile-layered table the ACME check above
-    // uses, so a `[server.tls.client_auth]` supplied only by an active profile
-    // is graded rather than reported as absent. Runs in BOTH static-cert and
-    // ACME modes — client auth is orthogonal to how the server's own
-    // certificate is provisioned.
+    // 8a-ter. Mutual TLS (#1640): grade the client-CA bundle and CRL offline, from the merged
+    // table. Runs in both static and ACME modes: client auth is independent of how the
+    // server's own certificate is provisioned.
     let client_auth_data = resolve_client_auth_doctor_data(
         merged_acme_toml
             .get("server")
@@ -11004,20 +10424,13 @@ pub fn run(opts: DoctorOptions) {
     // is configured: always inspect the stored certificate offline (expiry), and
     // — only under --online — actively probe port reachability and DNS.
     if let Some(acme) = acme_config {
-        // Mirror the runtime's ACME boot invariants FIRST: it refuses to boot an
-        // ACME config with an invalid `directory` (deserialize failure), no
-        // domains, a blank contact_email, or a wildcard domain. Without this,
-        // doctor silently defaulted a bad directory to staging, and its
-        // empty-domains path reported
-        // `acme_stored_cert` as Pass with no probes, blessing a config that exits
-        // at boot. Emit the FAIL and SKIP the misleading stored-cert / online
-        // probes when the config is invalid (there is nothing valid to inspect).
+        // An ACME config the runtime refuses to boot fails here, and the stored-cert and
+        // online probes are skipped: there is nothing valid to inspect.
         if let Some(config_fail) = check_acme_config_impl(&acme) {
             tasks.push(Box::new(move || config_fail));
         } else {
-            // Offline: stored certificate expiry (reuses the #1603 inspect path).
-            // Scan ONLY the configured directory namespace the runtime store loads
-            // from ({cache_dir}/{directory_label}/), never sibling namespaces.
+            // Offline: stored certificate expiry. Only the namespace the runtime loads from,
+            // `{cache_dir}/{directory_label}/`, never a sibling one.
             let stored = resolve_acme_stored_cert_data(
                 &acme.cache_dir,
                 &acme.directory_label,
@@ -11035,14 +10448,9 @@ pub fn run(opts: DoctorOptions) {
             );
             tasks.push(Box::new(move || check_acme_ca_root_impl(&ca_root)));
 
-            // Offline: the DNS-01 provider credential (issue #1620). Read the
-            // same way the runtime reads it — encrypted credentials store,
-            // overlaid with AUTUMN_ACME_DNS_* — so a Pass here means the app
-            // will find the same credential at boot.
-            // Reading the credential needs the runtime's own resolution +
-            // validation, which live behind autumn-web's `acme` feature (pulled
-            // in by this crate's `tls` feature). Without it the check reports a
-            // Warn rather than silently passing an unverified credential.
+            // Offline: the DNS-01 provider credential (#1620), read as the runtime reads it:
+            // the encrypted credentials store overlaid with AUTUMN_ACME_DNS_*. That needs
+            // autumn-web's `acme` feature, pulled in by `tls`; without it the check warns.
             #[cfg(feature = "tls")]
             {
                 let credential = resolve_acme_dns_credential(
@@ -11094,10 +10502,8 @@ pub fn run(opts: DoctorOptions) {
                 .as_ref()
                 .filter(|cd| cd.enabled)
                 .map(autumn_web::config::CustomDomainsConfig::ingress);
-            // Every ingress target a tenant can be pointed at: the CNAME
-            // hostname for a subdomain, the A/AAAA addresses for an apex, which
-            // cannot carry a CNAME. Each is a separate path into the
-            // deployment, so each is probed by name.
+            // Every ingress target a tenant can point at: the CNAME hostname for a subdomain,
+            // the A/AAAA addresses for an apex, which cannot carry a CNAME. Each is probed.
             let http01_targets: Vec<String> = cd_ingress.as_ref().map_or_else(Vec::new, |ing| {
                 ing.hostname
                     .iter()
@@ -11132,11 +10538,8 @@ pub fn run(opts: DoctorOptions) {
                 })
             }));
 
-            // Online: does each registered domain still point here? A domain
-            // that reached `active` and has since moved away is serving a
-            // certificate nobody can reach and will fail its next renewal —
-            // AC8's "flag registered domains whose DNS no longer points at the
-            // deployment". Bounded, and the bound is reported.
+            // Online: does each registered domain still point here? An active domain that has
+            // moved away will fail its next renewal. Bounded, and the bound is reported.
             if opts.online {
                 let registered = registered.domains;
                 let total = registered.len();
@@ -11193,11 +10596,8 @@ pub fn run(opts: DoctorOptions) {
                 }
             }
 
-            // Tenant certificates are always HTTP-01, so port 80 must be open
-            // at the ingress even when this deployment's own certificate uses
-            // DNS-01 — the acme_ports check calls a closed port 80 optional in
-            // that mode, which is right for the deployment and wrong for every
-            // tenant domain.
+            // Tenant certificates are always HTTP-01, so port 80 must be open at the ingress
+            // even when the deployment's own certificate uses DNS-01.
             if opts.online {
                 for target in http01_targets {
                     tasks.push(Box::new(move || {
@@ -11207,10 +10607,8 @@ pub fn run(opts: DoctorOptions) {
                 }
             }
 
-            // Probe EVERY configured domain. Issuance orders an authorization
-            // for each one, so a probe of the first name alone can pass while
-            // issuance fails. One port check and one DNS check per host. Each
-            // detail names its host. Bounded, and gated behind --online.
+            // Probe every configured domain: issuance orders an authorization for each, so
+            // probing the first alone can pass while issuance fails.
             if opts.online {
                 let dns01 = acme.dns.is_some();
                 for host in acme_online_reachability_hosts(&acme) {
@@ -11272,12 +10670,8 @@ pub fn run(opts: DoctorOptions) {
     }
 
     // 9b. List-Unsubscribe wiring: fail closed in prod when a `#[mailer]` declares
-    // `list_unsubscribe` but no unsubscribe destination is configured. Layer the
-    // profile sources exactly as the runtime config loader does — alias-aware inline
-    // precedence with the canonical spelling winning, and a single override file
-    // preferring the selected spelling — so doctor evaluates what the app will boot
-    // with rather than a stale legacy spelling. Profile selection mirrors
-    // `resolve_profile_input`: a blank AUTUMN_ENV is ignored before falling back to
+    // `list_unsubscribe` but no unsubscribe destination is configured. Profile selection
+    // mirrors `resolve_profile_input`: a blank AUTUMN_ENV is ignored before falling back to
     // AUTUMN_PROFILE, so it cannot downgrade a prod selection to dev.
     let raw_mail_profile = std::env::var("AUTUMN_ENV")
         .ok()
@@ -11296,11 +10690,8 @@ pub fn run(opts: DoctorOptions) {
     };
     let merged_mail_toml = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
     let (unsub_base_url, unsub_mailto) = resolve_mail_unsubscribe(Some(&merged_mail_toml));
-    // Resolve the effective transport the same way the runtime does: a *valid* env
-    // override (trimmed, case-insensitive) wins, then explicit `[mail].transport`,
-    // then the profile smart-default (only `dev` defaults to `log`; every other
-    // profile defaults to `disabled`). An invalid/whitespace env value is ignored,
-    // matching `Transport::from_env_value`.
+    // As the runtime: a valid env override wins, then `[mail].transport`, then the profile
+    // default (`log` for `dev`, `disabled` otherwise).
     let effective_transport = resolve_effective_mail_transport(
         std::env::var("AUTUMN_MAIL__TRANSPORT").ok(),
         merged_mail_toml
@@ -11316,9 +10707,8 @@ pub fn run(opts: DoctorOptions) {
     let unsub_dest_toml_type_invalid = unsubscribe_dest_toml_type_invalid(Some(&merged_mail_toml));
     let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
     tasks.push(Box::new(move || {
-        // A present-but-non-string destination fails the runtime's typed config
-        // load (Option<String>) before boot; doctor reads an untyped table, so a
-        // non-string value would otherwise look absent. Flag it like the TTL guard.
+        // A non-string destination fails the runtime's typed load; in the untyped table it
+        // would look absent.
         if unsub_dest_toml_type_invalid {
             return CheckResult {
                 name: "mail_unsubscribe",
@@ -11334,9 +10724,8 @@ pub fn run(opts: DoctorOptions) {
                 ),
             };
         }
-        // A present-but-non-integer TOML TTL fails the runtime's typed config load
-        // before boot; doctor reads an untyped table, so flag it here rather than
-        // letting it silently default in `resolve_unsubscribe_token_ttl_days`.
+        // A non-integer TTL fails the runtime's typed load; `resolve_unsubscribe_token_ttl_days`
+        // would default it silently.
         if unsub_ttl_toml_type_invalid {
             return CheckResult {
                 name: "mail_unsubscribe",
@@ -11374,27 +10763,15 @@ pub fn run(opts: DoctorOptions) {
     }));
 
     // 12a. Operator alerts (warn in production when no destination configured).
-    //      Gate the email destination on a usable mail transport, reusing the
-    //      SAME `mail_transport_disabled` the mail-unsubscribe check resolved
-    //      from the merged config above (a `Copy` bool, still readable after it
-    //      was moved into the mail closure). This mirrors runtime
-    //      `mailer.is_disabled()`: an email with a disabled transport installs
-    //      no alert channel, so it must not count toward a valid destination.
+    //      An email with a disabled transport installs no alert channel, as runtime
+    //      `mailer.is_disabled()` decides, so it does not count as a destination.
     let mail_transport_usable = !mail_transport_disabled;
-    // Also gate the email destination on a resolved, VALID `[mail] from` for
-    // transports that require one (SMTP): the runtime's alert mail sets no
-    // per-message `from`, so an SMTP email with no `[mail] from` — or a
-    // present-but-unparsable one, which aborts boot in `MailerBuilder::build` —
-    // fails to deliver. Pass the effective value (empty when unset) so the check
-    // can both gate on validity and name a bad value. Reuse the SAME merged config
-    // / effective transport the mail checks above resolved.
+    // SMTP also needs a valid `[mail] from`: alert mail sets no per-message `from`, and an
+    // unparsable value aborts boot in `MailerBuilder::build`. Empty when unset.
     let mail_from = resolve_mail_from(Some(&merged_mail_toml)).unwrap_or_default();
     let transport_requires_from = mail_transport_requires_from(&effective_transport);
-    // A native transport (PagerDuty / Slack / Discord) counts as a configured
-    // destination exactly as the runtime's `AlertConfig::has_destination` does, so
-    // a native-only config does not trip the "no operator alert destination"
-    // warning that would fail `autumn doctor --strict` while the runtime happily
-    // registers the channel.
+    // A native transport (PagerDuty / Slack / Discord) counts as a destination, as in
+    // `AlertConfig::has_destination`.
     let alert_native_configured = native_alert_transport_configured(
         &alert_pd_routing_key,
         &alert_slack_url,
@@ -11422,11 +10799,8 @@ pub fn run(opts: DoctorOptions) {
         check_alert_error_rate_threshold_impl(&alert_error_rate_threshold, is_production)
     }));
 
-    // 12a3. Native alert transports (issue #1630): a configured PagerDuty /
-    //       Slack / Discord destination must carry the values it needs to
-    //       deliver (a well-formed routing key, an absolute pagerduty_url, an
-    //       absolute https Slack/Discord webhook URL). Warn in production so a
-    //       transport that *looks* configured actually pages.
+    // 12a3. Native alert transports (#1630): a configured PagerDuty / Slack / Discord
+    //       destination needs a well-formed routing key or absolute URL. Warns in production.
     tasks.push(Box::new(move || {
         check_alert_transports_impl(
             &alert_pd_routing_key,
@@ -11473,18 +10847,13 @@ pub fn run(opts: DoctorOptions) {
         check_model_private_columns_impl(&found)
     }));
 
-    // 16-17 shared (issue #2244): a virtual workspace root (`[workspace]`
-    // with no `[package]`) has no sources of its own — real sources live
-    // under a member crate. Read the manifest once here so both edge checks
-    // below can warn instead of scanning the wrong directory and silently
-    // passing.
+    // A virtual workspace root has no sources of its own, so the edge checks warn instead of
+    // scanning the wrong directory and passing (#2244).
     let edge_virtual_workspace_root =
         edge_manifest_is_virtual_workspace_root(std::path::Path::new("."));
 
-    // 16. Edge capsule toolchain (issue #1790): a project with `#[edge]` routes
-    //     needs the wasm32-wasip1 std library installed or `autumn build` cannot
-    //     emit the capsule. Both the source scan and the toolchain probe run
-    //     inside the task so they overlap with the other checks.
+    // 16. Edge capsule toolchain (#1790): `#[edge]` routes need the wasm32-wasip1 std
+    //     library, or `autumn build` cannot emit the capsule.
     tasks.push(Box::new(move || {
         if edge_virtual_workspace_root {
             return edge_virtual_workspace_warn("edge_target");
@@ -11501,12 +10870,9 @@ pub fn run(opts: DoctorOptions) {
         check_edge_target_impl(&scan, installed)
     }));
 
-    // 17. Edge route wiring (issue #1790): an `#[edge]` handler that also
-    //     carries an auth guard fails the build, an unregistered one is never
-    //     served at the edge, and a missing edge-capsule bin leaves nothing to
-    //     compile. The resolved capsule bin is also scanned when it lives
-    //     outside `src/` (a custom `[[bin]] path`), so a registration written
-    //     only there is not misreported as missing (issue #2244).
+    // 17. Edge route wiring (#1790): an `#[edge]` handler with an auth guard fails the build,
+    //     an unregistered one is never served, and a missing capsule bin leaves nothing to
+    //     compile. A capsule bin outside `src/` is scanned too (#2244).
     tasks.push(Box::new(move || {
         if edge_virtual_workspace_root {
             return edge_virtual_workspace_warn("edge_routes");
@@ -11521,8 +10887,8 @@ pub fn run(opts: DoctorOptions) {
         check_edge_routes_impl(&scan, capsule_bin_exists)
     }));
 
-    // 17b. Edge capabilities (issue #1790 AC-5): name each `#[edge]` route
-    //      that needs something the edge cannot provide (a warning).
+    // 17b. Edge capabilities (#1790): warn on each `#[edge]` route that needs something
+    //      the edge cannot provide.
     tasks.push(Box::new(move || {
         if edge_virtual_workspace_root {
             return edge_virtual_workspace_warn("edge_capabilities");
@@ -11536,14 +10902,11 @@ pub fn run(opts: DoctorOptions) {
         check_edge_capabilities_impl(&scan)
     }));
 
-    // 18. Orphaned plugin residue (issue #1631): a dependency with no mount, a
-    //     mount with no dependency, or migrations still applied for a plugin
-    //     that is no longer in the app. The migration half is best effort —
-    //     `__diesel_schema_migrations` has no source column, so the only way to
-    //     attribute a version to a plugin is the plugin's own declared list,
-    //     and reading the history at all needs a configured database plus the
-    //     `diesel` CLI. Without either, the check still reports the two static
-    //     findings and simply never raises the third.
+    // 18. Orphaned plugin residue (#1631): a dependency with no mount, a mount with no
+    //     dependency, or migrations still applied for a removed plugin. The migration half is
+    //     best effort: `__diesel_schema_migrations` has no source column, so versions are
+    //     attributed only through each plugin's declared list, and reading the history needs a
+    //     database and the `diesel` CLI. Without them only the two static findings report.
     let residue_database_url = db_topology.primary_url.clone().or(db_topology.legacy_url);
     tasks.push(Box::new(move || {
         let wirings = resolve_plugin_wirings(std::path::Path::new("."), || {
@@ -11554,13 +10917,9 @@ pub fn run(opts: DoctorOptions) {
         check_plugin_residue_impl(&wirings)
     }));
 
-    // 19. Dependency advisories and policy (issue #1633): the app's lockfile
-    //     graded against its own `deny.toml` — the same policy file, waiver
-    //     store and auditor that #1600's CI gate runs, so this verdict predicts
-    //     that gate. Always offline — the advisory database is never fetched
-    //     here — and bounded, so a `cargo metadata` waiting on Cargo's
-    //     package-cache lock reports no verdict rather than hanging doctor.
-    //     See `crate::deps` for what parity does and does not cover.
+    // 19. Dependency advisories and policy (#1633): the lockfile graded against `deny.toml`
+    //     with the same auditor as the #1600 CI gate. Offline and bounded, so a `cargo
+    //     metadata` stuck on Cargo's package-cache lock reports no verdict instead of hanging.
     tasks.push(Box::new(|| {
         check_dependencies_impl(&crate::deps::evaluate_within(
             std::path::Path::new("."),
@@ -11949,7 +11308,7 @@ fn run_doctor_tasks(tasks: Vec<Box<dyn FnOnce() -> CheckResult + Send>>, opts: D
     let handles: Vec<std::thread::JoinHandle<CheckResult>> =
         tasks.into_iter().map(std::thread::spawn).collect();
 
-    // ── Phase 4: join in order (preserves display ordering) ──────────────────
+    // Join in spawn order so results print in check order.
     let results: Vec<CheckResult> = handles
         .into_iter()
         .map(|h| {
@@ -12140,11 +11499,9 @@ fn resolve_offsite_backup_data() -> OffsiteBackupData {
     let Some(offsite) = cfg.backup.offsite else {
         return OffsiteBackupData::default();
     };
-    // Check credential presence through the SAME dotenv-aware, profile-aware
-    // env `resolve_credentials` uses at runtime — real env layered with
-    // `.env`/`.env.<profile>` — so a credential supplied via `.env.<profile>`
-    // isn't a false "not ready" (issue #1619 P2 #10). Falls back to the plain
-    // OS env only if the `.env` overlay can't be built (a malformed `.env`).
+    // Check credentials through the same profile-aware `.env` overlay `resolve_credentials`
+    // uses at runtime, so a credential set only in `.env.<profile>` counts as ready (#1619).
+    // A malformed `.env` falls back to the plain OS env.
     let profile = cfg.profile.clone().unwrap_or_else(|| "dev".to_owned());
     let denv: Box<dyn autumn_web::config::Env> =
         match autumn_web::dotenv::os_env_with_dotenv_for_profile(&profile) {
@@ -12152,11 +11509,9 @@ fn resolve_offsite_backup_data() -> OffsiteBackupData {
             Err(_) => Box::new(autumn_web::config::OsEnv),
         };
     let bucket = offsite.s3.bucket.clone();
-    // Evaluate the shared-bucket conflict with EXACTLY the runtime guard so doctor
-    // and the CLI never disagree: the app `[storage.s3]` bucket counts only when
-    // the resolved backend is actually S3 (P2 #16/#17), and buckets/endpoints are
-    // compared through backup.rs `destinations_conflict` + `canonical_authority`
-    // (P2 #19) — which collapses `None` and explicit `*.amazonaws.com` spellings.
+    // Match the runtime's shared-bucket guard so doctor and the CLI agree: the app
+    // `[storage.s3]` bucket counts only when the backend is S3, and `destinations_conflict`
+    // (via `canonical_authority`) treats a `None` endpoint and explicit `*.amazonaws.com` as equal.
     let storage_is_s3 = cfg.storage.backend == autumn_web::storage::StorageBackend::S3;
     let shares_app_bucket = offsite_shares_active_app_bucket(
         storage_is_s3,
@@ -12271,17 +11626,13 @@ fn present_secret_dotenv_files(dir: &std::path::Path) -> Vec<String> {
 /// A non-local `.env.<profile>` (e.g. `.env.dev`) is committable by convention
 /// and returns `false`, as does the `.env.example` template.
 fn is_secret_dotenv_filename(name: &str) -> bool {
-    // Everything after the mandatory `.env` prefix.
     let Some(rest) = name.strip_prefix(".env") else {
         return false;
     };
     match rest {
-        // Bare `.env` and the root `.env.local` are always secret.
         "" | ".local" => true,
-        // `.env.<profile>.local` — a per-profile local override. `rest` here is
-        // `.<profile>.local`; require a leading `.`, a `local` final segment,
-        // and at least two `.` separators so `<profile>` is a real segment
-        // (excludes committable non-local `.env.<profile>` files).
+        // `.env.<profile>.local`: `rest` is `.<profile>.local`, so require a `local` last segment
+        // and at least two dots, which excludes a committable `.env.<profile>`.
         _ => {
             rest.starts_with('.')
                 && rest.rsplit('.').next() == Some("local")
@@ -12314,7 +11665,6 @@ fn gitignore_covers(contents: &str, filename: &str) -> bool {
         if entry.is_empty() || entry.starts_with('#') {
             continue;
         }
-        // A leading `!` re-includes (un-ignores) a matching file.
         let (negation, body) = entry
             .strip_prefix('!')
             .map_or((false, entry), |rest| (true, rest));
@@ -12324,8 +11674,6 @@ fn gitignore_covers(contents: &str, filename: &str) -> bool {
             continue;
         }
         if glob_matches_basename(pattern, filename) {
-            // Last match wins: a normal pattern ignores, a `!` negation
-            // re-includes.
             ignored = !negation;
         }
     }
@@ -12380,10 +11728,8 @@ pub fn check_dotenv_impl(
     has_env: bool,
     uncovered_secret_files: &[String],
 ) -> CheckResult {
-    // Security first: an ungitignored always-secret dotenv file risks committing
-    // secrets and must never be hidden behind the copy-the-template hint, so
-    // check it before the `.env.example`-without-`.env` case. When both apply,
-    // lead with the security issue and still mention copying the template.
+    // Check unignored secret files first so the copy-the-template hint never hides them.
+    // When both apply, lead with the secret and still mention the template.
     if !uncovered_secret_files.is_empty() {
         let mut detail = format!(
             "{} present but not gitignored — you risk committing secrets",
@@ -12514,10 +11860,8 @@ fn cargo_toml_features_has_key(cargo_toml: &str, key: &str) -> bool {
 pub fn check_system_test_browser() -> CheckResult {
     let candidates = browser_candidate_paths();
     for path in &candidates {
-        // No `is_file()` pre-check: `probe_browser_version` owns that
-        // decision, and on Windows "the file exists" *is* the answer — a
-        // GUI-subsystem `chrome.exe` can never report a version, so gating on
-        // one here is what produced the false "no browser installed" (#1456).
+        // No `is_file()` pre-check: `probe_browser_version` decides. On Windows a GUI-subsystem
+        // `chrome.exe` never reports a version, so the file existing is the answer (#1456).
         if let Some(version) = probe_browser_version(path) {
             return CheckResult {
                 name: "system_test_browser",
@@ -12571,18 +11915,15 @@ fn resolve_gdpr_unregistered_tables() -> Vec<String> {
         return Vec::new();
     };
 
-    // Collect table names declared as `diesel::table! { <name> (id) { ... } }`.
     let mut declared_tables: Vec<String> = Vec::new();
     for line in schema.lines() {
         let trimmed = line.trim();
-        // Match lines like `diesel::table! {` followed by the table name on the next line,
-        // or inline `pub table_name (id) {` patterns.  Use a simple prefix scan.
+        // A `diesel::table! {` opener carries no name; the name line follows it.
         if let Some(rest) = trimmed
             .strip_prefix("diesel::table!")
             .map(str::trim)
             .filter(|r| r.starts_with('{'))
         {
-            // table name is on the same line or will appear shortly; skip for now
             let _ = rest;
         }
         // Diesel schema emits bare identifiers like `    table_name (pk) {`
@@ -12601,7 +11942,6 @@ fn resolve_gdpr_unregistered_tables() -> Vec<String> {
         return Vec::new();
     }
 
-    // Check which tables appear to be registered via GdprRegistry in the project.
     let registered_tables = collect_gdpr_registered_tables_from_source();
 
     declared_tables
@@ -12634,7 +11974,6 @@ fn scan_source_for_gdpr_registrations(
     for (i, line) in lines.iter().enumerate() {
         if let Some(idx) = line.find("ModelRegistration::") {
             let rest = &line[idx..];
-            // Try the same line first, then the next 3 lines for multi-line calls.
             if extract_quoted_table_name(rest, found) {
                 continue;
             }
@@ -12809,8 +12148,6 @@ fn attr_line_is_model(line: &str) -> bool {
     let Some(rest) = line.trim_start().strip_prefix("#[") else {
         return false;
     };
-    // The attribute path runs up to the first argument list, close bracket,
-    // whitespace, or comma (e.g. `autumn_web::model` in `#[autumn_web::model(...)]`).
     let path = rest
         .split(|c: char| c == '(' || c == ']' || c == ',' || c.is_whitespace())
         .next()
@@ -12829,7 +12166,6 @@ fn scan_source_for_unprivate_sensitive_columns(
             i += 1;
             continue;
         }
-        // Find the struct name (the `struct X` line) and the opening brace.
         let mut j = i + 1;
         let mut model_name: Option<String> = None;
         while j < lines.len() {
@@ -12851,7 +12187,6 @@ fn scan_source_for_unprivate_sensitive_columns(
             i += 1;
             continue;
         };
-        // Walk the struct body until the matching closing brace at column 0-ish.
         let mut k = j + 1;
         let mut field_is_private = false;
         while k < lines.len() {
@@ -12870,7 +12205,7 @@ fn scan_source_for_unprivate_sensitive_columns(
                         column: field,
                     });
                 }
-                // Reset the attribute flag after consuming a field line.
+                // An attribute applies only to the field right after it.
                 field_is_private = false;
             }
             k += 1;
@@ -12914,9 +12249,8 @@ fn edge_manifest_is_virtual_workspace_root(root: &std::path::Path) -> bool {
     let Ok(table) = toml::from_str::<toml::Table>(&content) else {
         return false;
     };
-    // Parsed keys, not a text search: a comment or string mentioning
-    // "[package]" (e.g. "# each member has a [package] table") must not
-    // read as a real one (Codex review on #2739).
+    // Parsed keys, not a text search: a comment or string mentioning "[package]" must not
+    // read as a real one.
     table.contains_key("workspace") && !table.contains_key("package")
 }
 
@@ -12954,16 +12288,9 @@ pub fn resolve_edge_capsule_bin(root: &std::path::Path) -> Option<std::path::Pat
     let content = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let table = toml::from_str::<toml::Table>(&content).ok()?;
 
-    // A package literally named "edge-capsule" gets an implicit `src/main.rs`
-    // bin target of that same name — Cargo's own rule that the default
-    // binary's name is the package name, verified directly via `cargo
-    // metadata`. The SAME rule governs a pathless *explicit* `[[bin]] name =
-    // "edge-capsule"` entry when it names the package itself: `cargo
-    // metadata` on such a manifest (only `src/main.rs` present, no `path`
-    // field on the entry) also resolves it to `src/main.rs`, not
-    // `conventional_edge_capsule_bin`'s `src/bin/` shapes — so this target
-    // must be tried both when no `[[bin]]` entry exists at all AND when one
-    // exists but omits `path` (Codex review on #2739, round 22, P2).
+    // Cargo names the implicit `src/main.rs` bin after the package, so a package named
+    // "edge-capsule" builds its capsule from there. A pathless `[[bin]] name = "edge-capsule"`
+    // entry in that package resolves there too, so try it whether or not such an entry exists.
     let package_name_is_edge_capsule = table
         .get("package")
         .and_then(|package| package.get("name"))
@@ -12991,11 +12318,8 @@ pub fn resolve_edge_capsule_bin(root: &std::path::Path) -> Option<std::path::Pat
         }
     }
 
-    // `autobins = false` only turns off Cargo's automatic `src/bin/*.rs`
-    // discovery for a package with no `[[bin]]` entries at all — it has no
-    // effect on an explicitly declared `[[bin]]` entry (handled above), so
-    // it must gate only this implicit-discovery fallback, not the explicit
-    // one above.
+    // `autobins = false` disables only implicit `src/bin/` discovery; an explicit `[[bin]]`
+    // entry (handled above) still builds.
     let autobins_disabled = table
         .get("package")
         .and_then(|package| package.get("autobins"))
@@ -13605,9 +12929,8 @@ mod tests {
 
     #[test]
     fn virtual_workspace_root_false_for_workspace_with_own_package() {
-        // A crate that is both the workspace root and a package (it has its
-        // own [package] table) has sources of its own, unlike a bare
-        // workspace root. Not the shape this check guards against.
+        // A workspace root with its own [package] has sources of its own, so it is not a
+        // virtual root.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -13838,9 +13161,8 @@ mod tests {
 
     #[test]
     fn doctor_shared_bucket_matches_runtime_guard() {
-        // P2 #16/#17 backend gate: a stale [storage.s3] bucket equal to the offsite
-        // bucket must NOT flag shared unless the backend is S3 — otherwise
-        // `autumn doctor --strict` false-fails on a local/disabled app.
+        // A stale [storage.s3] bucket equal to the offsite bucket is shared only when the
+        // backend is S3; otherwise `--strict` would false-fail a local or disabled app.
         assert!(!offsite_shares_active_app_bucket(
             false,
             Some("shared"),
@@ -13863,10 +13185,8 @@ mod tests {
             CheckStatus::Fail
         );
 
-        // P2 #19: doctor must match the runtime `canonical_authority` guard — the
-        // app storage endpoint left None (AWS default) vs the offsite naming the
-        // SAME AWS bucket with an explicit AWS regional endpoint canonicalize equal,
-        // so doctor DETECTS the shared bucket (the CLI would `SharedBucketRefused`).
+        // An app endpoint left `None` (AWS default) and an explicit AWS regional endpoint
+        // canonicalize equal, so the same bucket is shared, as the runtime guard decides.
         assert!(offsite_shares_active_app_bucket(
             true,
             Some("shared"),
@@ -13938,10 +13258,8 @@ mod tests {
 
     #[test]
     fn cred_env_present_honors_dotenv_supplied_creds() {
-        // P2 #10: readiness is checked through the profile-aware env overlay
-        // (real env + `.env.<profile>`), so a credential supplied ONLY via
-        // `.env.prod` (here simulated by the overlay surfacing the value) counts
-        // as ready — a bare `std::env::var` check would report a false negative.
+        // Readiness reads the profile-aware overlay (real env + `.env.<profile>`), so a
+        // credential set only in `.env.prod` counts as ready.
         let overlay = autumn_web::config::MockEnv::new().with("OFF_SECRET", "from-dot-env-prod");
         assert!(cred_env_present(&overlay, Some("OFF_SECRET")));
         // Absent / unnamed / blank-name / empty-value => not present.
@@ -14059,9 +13377,8 @@ pub struct User {
 
     #[test]
     fn scan_terminates_struct_on_brace_with_trailing_tokens() {
-        // The closing brace may be followed by a trailing comment (`} // User`)
-        // or a semicolon (`};`); the scan must still stop at the struct end and
-        // not swallow following declarations.
+        // A closing brace followed by a trailing comment or `;` still ends the struct, so the
+        // scan does not swallow the next declaration.
         for closing in ["} // User", "};", "}  // trailing"] {
             let src = format!(
                 "#[model]\npub struct User {{\n    #[id]\n    pub id: i64,\n    pub password_hash: String,\n{closing}\npub struct Other {{\n    pub api_secret: String,\n}}\n"
@@ -14099,9 +13416,8 @@ pub struct Vault {
 
     #[test]
     fn scan_matches_path_qualified_model_attributes() {
-        // Path-qualified forms (`#[autumn_web::model]`, `#[macros::model]`) must
-        // be scanned like the bare `#[model]` — otherwise the privacy heuristic
-        // silently does nothing for files that use them.
+        // Path-qualified `#[model]` forms must be scanned too, or the privacy check silently
+        // skips files that use them.
         for attr in [
             "#[autumn_web::model]",
             "#[macros::model]",
@@ -14120,7 +13436,7 @@ pub struct Vault {
             assert_eq!(found[0].column, "password_hash");
         }
 
-        // A helper self-check: only attributes whose last segment is `model`.
+        // Only an attribute whose last path segment is `model` matches.
         assert!(attr_line_is_model("#[autumn_web::model(table = \"x\")]"));
         assert!(attr_line_is_model("  #[macros::model]"));
         assert!(attr_line_is_model("#[model]"));
@@ -14280,9 +13596,8 @@ pub struct Vault {
             "vendored dependency sources must be skipped"
         );
 
-        // Integration-test and example fixtures are not compiled into the app
-        // binary, so the runtime inventory never registers them — they must be
-        // skipped too.
+        // tests/ and examples/ are not compiled into the app binary, so the runtime never
+        // registers their mailers.
         for tree in ["tests", "examples"] {
             let dir = root.path().join(tree);
             std::fs::create_dir_all(&dir).expect("create test/example dir");
@@ -14437,19 +13752,16 @@ pub struct Vault {
 
     #[test]
     fn is_absolute_http_url_doctor_matches_runtime_absoluteness() {
-        // Runtime (`http_client::Client::build_request`) treats a URL as absolute
-        // iff it starts with `http://` or `https://`. Accept BOTH schemes — the
-        // runtime does not require TLS for a webhook, so neither may doctor
-        // (rejecting `http://` would be a false-positive warning).
+        // The runtime treats a URL as absolute iff it starts with `http://` or `https://`, and
+        // a webhook needs no TLS, so doctor accepts both schemes.
         assert!(is_absolute_http_url_doctor(
             "https://alerts.example.com/hooks"
         ));
         assert!(is_absolute_http_url_doctor(
             "http://alerts.example.com/hooks"
         ));
-        // A query string / userinfo / non-standard port is fine: the runtime posts
-        // the URL verbatim, so doctor must not reject what delivers (unlike the
-        // stricter https-base-url validator).
+        // The runtime posts the URL verbatim, so userinfo, query and port are fine (unlike
+        // the stricter https-base-url validator).
         assert!(is_absolute_http_url_doctor(
             "https://user@h.example.com/x?a=1"
         ));
@@ -14468,25 +13780,19 @@ pub struct Vault {
         assert!(!is_absolute_http_url_doctor("http://"));
     }
 
-    // Exercises the lettre-backed parser + its runtime parity, so it is gated to
-    // the default (Postgres) build where the `mail` re-export is compiled. The
-    // sqlite-build fallback (a coarse syntactic check) is deliberately not held to
-    // lettre parity.
+    // Gated to the Postgres build, where the `mail` re-export (lettre) is compiled. The sqlite
+    // fallback is a coarse syntactic check and is not held to lettre parity.
     #[cfg(feature = "postgres")]
     #[test]
     fn is_valid_alert_mailbox_matches_lettre_and_accepts_display_name() {
-        // Bare recipient mailboxes are accepted (this is what lettre parses at
-        // send time for `[alerts] email`).
+        // Bare mailboxes, as lettre parses `[alerts] email` at send time.
         assert!(is_valid_alert_mailbox_doctor("oncall@example.com"));
         assert!(is_valid_alert_mailbox_doctor("a+b@sub.example.co"));
-        // RFC 5322 display-name form is ACCEPTED — the runtime's lettre parser
-        // accepts it and registers + delivers to it fine, so doctor must not
-        // reject it (the regression this fix addresses: a false `--strict`
-        // failure on a valid config).
+        // The RFC 5322 display-name form is accepted: lettre parses and delivers to it, so
+        // rejecting it would false-fail `--strict`.
         assert!(is_valid_alert_mailbox_doctor("Ops <ops@example.com>"));
-        // The `mailto:` URI form is REJECTED (unlike the unsubscribe-mailto
-        // validator): the runtime passes it verbatim to lettre, which rejects it
-        // as a recipient. Doctor must not pass a config that can't deliver.
+        // `mailto:` is rejected (unlike the unsubscribe-mailto validator): the runtime hands it
+        // to lettre verbatim, which rejects it as a recipient.
         assert!(!is_valid_alert_mailbox_doctor("mailto:oncall@example.com"));
         // Other scheme/URI forms and malformed values stay rejected.
         assert!(!is_valid_alert_mailbox_doctor("https://oncall@example.com"));
@@ -14494,10 +13800,8 @@ pub struct Vault {
         assert!(!is_valid_alert_mailbox_doctor("oncall example.com"));
         assert!(!is_valid_alert_mailbox_doctor(""));
 
-        // Exact parity with the runtime: doctor's check must agree with the very
-        // parser `autumn/src/alerts.rs`'s `is_valid_alert_mailbox` runs, for every
-        // case above. This is what keeps doctor from being stricter (or looser)
-        // than the SMTP send path.
+        // Doctor must agree with the lettre parser behind the runtime's `is_valid_alert_mailbox`,
+        // so it is neither stricter nor looser than the SMTP send path.
         for case in [
             "oncall@example.com",
             "a+b@sub.example.co",
@@ -15071,10 +14375,8 @@ pub struct Vault {
         assert!(r.hint.is_some());
     }
 
-    // A not-yet-valid leaf (notBefore in the future) fails every handshake until
-    // its window opens, so the runtime rejects it at startup — doctor must grade
-    // it a Fail, symmetric to the expired path (#1603, Codex review). The
-    // not_yet_valid flag wins even when the expiry fields would otherwise Pass.
+    // A not-yet-valid leaf fails every handshake until its window opens, so the runtime rejects
+    // it at startup and doctor grades it a Fail, even when the expiry fields would Pass (#1603).
     #[test]
     fn tls_fail_when_not_yet_valid() {
         let r = check_tls_impl(&TlsDoctorData::Healthy {
@@ -15120,10 +14422,9 @@ pub struct Vault {
         assert!(r.hint.is_none());
     }
 
-    // A certificate that expired less than 24h ago truncates to `0` days but
-    // must grade as a FAIL, not a near-expiry WARN — the runtime rejects it at
-    // startup (issue #1603, Codex review). We grade off the injected notAfter
-    // via `LeafInspection::is_expired`, so no time-dependent fixture is needed.
+    // A certificate that expired under 24h ago truncates to `0` days but must grade a Fail, not
+    // a near-expiry Warn (#1603). Grading uses `LeafInspection::is_expired` on the injected
+    // notAfter, so no time-dependent fixture is needed.
     #[cfg(feature = "tls")]
     #[test]
     fn tls_grades_from_raw_timestamp_not_day_bucket() {
@@ -15218,12 +14519,10 @@ pub struct Vault {
         assert!(r.hint.is_some());
     }
 
-    // Regression (#1603, Codex): a tuning-only TLS env deployment — e.g. only
-    // `AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS` set, no cert/key — makes the
-    // runtime materialize `[server.tls]` and fail fast. Doctor must treat it as
-    // configured (Some with empty paths) so it emits the actionable "must set
-    // both" Fail, not a false Pass/NotConfigured. Tested via the pure sources
-    // helper to avoid mutating the process-global environment.
+    // A tuning-only TLS env (e.g. only `AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS`, no cert/key)
+    // makes the runtime materialize `[server.tls]` and fail fast (#1603). Doctor must resolve it
+    // as configured with empty paths so it reports the "must set both" Fail. Tested through the
+    // pure sources helper so the process environment is not mutated.
     #[test]
     fn tls_tuning_only_env_resolves_as_incomplete_config() {
         let resolved = resolve_tls_paths_from_sources(
@@ -15254,13 +14553,9 @@ pub struct Vault {
         assert!(r.detail.as_deref().unwrap().contains("must set both"));
     }
 
-    // Regression (#1603, Codex): the runtime prefers `AUTUMN_MANIFEST_DIR` for
-    // `autumn.toml`, so a `[server.tls]` section present ONLY in the manifest-dir
-    // config must be graded — not reported NotConfigured because doctor read the
-    // CWD. `resolve_tls_paths` resolves the merged table through
-    // `resolve_config_path_manifest_aware`; here we inject the manifest dir
-    // directly (no process-env mutation) by pointing `resolve_path` at a temp dir
-    // and confirm the section flows through `resolve_tls_paths_from_sources`.
+    // The runtime reads `autumn.toml` from `AUTUMN_MANIFEST_DIR` first, so a `[server.tls]`
+    // section only in the manifest-dir config must be graded, not reported NotConfigured (#1603).
+    // The manifest dir is injected through `resolve_path` so the process env is not mutated.
     #[test]
     fn tls_section_in_manifest_dir_config_is_detected() {
         let dir = tempfile::tempdir().unwrap();
@@ -15301,7 +14596,7 @@ pub struct Vault {
         assert_eq!(key, std::path::PathBuf::from("/etc/tls/key.pem"));
     }
 
-    // Complementary: with no section and NO TLS env var, TLS is unconfigured.
+    // With no section and no TLS env var, TLS is unconfigured.
     #[test]
     fn tls_paths_none_when_unconfigured() {
         assert!(
@@ -15310,13 +14605,10 @@ pub struct Vault {
         );
     }
 
-    // Regression (#1603, Codex): detection must be limited to the FOUR recognized
-    // `TLS_ENV_VAR_NAMES` — the exact set the runtime materializes `[server.tls]`
-    // from. An unrelated/mistyped var sharing the prefix, e.g.
-    // `AUTUMN_SERVER__TLS__ENABLED=false`, must NOT mark TLS configured: the
-    // server serves plain HTTP for it, so treating it as configured would make
-    // `doctor --strict` fail on a missing cert/key for a config the server
-    // accepts. A recognized tuning var (`HANDSHAKE_TIMEOUT_SECS`) must still count.
+    // Only `TLS_ENV_VAR_NAMES` mark TLS configured: the runtime builds `[server.tls]` from exactly
+    // that set (#1603). An unrecognized var such as `AUTUMN_SERVER__TLS__ENABLED=false` leaves the
+    // server on plain HTTP, so counting it would make `doctor --strict` fail a config the server
+    // accepts.
     #[test]
     fn unrecognized_tls_env_var_is_not_detected() {
         use autumn_web::config::MockEnv;
@@ -15364,25 +14656,17 @@ pub struct Vault {
         assert_eq!(resolved.1, std::path::PathBuf::from("/env/k.pem"));
     }
 
-    // Regression (#1603, Codex): a PRESENT-but-EMPTY `AUTUMN_SERVER__TLS__CERT_PATH`
-    // (e.g. a deployment that exports `AUTUMN_SERVER__TLS__CERT_PATH=`) is a
-    // higher-priority override the runtime materializes as an empty `PathBuf`,
-    // OVERWRITING the valid TOML cert path and failing fast on the missing file.
-    // Doctor must read env vars with `.ok()` (no empty-filter) so it resolves to
-    // the SAME empty path and grades a Fail — not silently fall back to the TOML
-    // path and pass a config the server rejects. Extract exactly as
-    // `resolve_tls_paths` now does (`env.var(...).ok()`) from a map-backed `Env`.
+    // A present-but-empty `AUTUMN_SERVER__TLS__CERT_PATH=` overrides the TOML cert path with an
+    // empty `PathBuf`, and the runtime fails fast on it (#1603). Doctor reads env vars with
+    // `.ok()` and no empty filter so it resolves the same empty path and grades a Fail.
     #[test]
     fn tls_empty_env_override_clears_toml_path() {
         use autumn_web::config::{Env, MockEnv};
 
-        // TOML has a valid cert/key pair, but the deployment exports an EMPTY
-        // CERT_PATH override. The runtime overwrites cert_path with an empty
-        // PathBuf; doctor must mirror that presence-vs-empty rule.
+        // TOML has a valid pair, but the deployment exports an empty CERT_PATH.
         let env = MockEnv::new().with("AUTUMN_SERVER__TLS__CERT_PATH", "");
-        // Mirror `resolve_tls_paths`: `.ok()` with NO `.filter(non-empty)`, so a
-        // present-but-empty var is `Some("")` (a clearing override), while an
-        // unset var stays `None` (falls through to TOML).
+        // As in `resolve_tls_paths`: a present-but-empty var is `Some("")` (a clearing
+        // override); an unset var is `None` and falls through to TOML.
         let env_cert = env.var("AUTUMN_SERVER__TLS__CERT_PATH").ok();
         let env_key = env.var("AUTUMN_SERVER__TLS__KEY_PATH").ok();
         assert_eq!(
@@ -15413,27 +14697,22 @@ pub struct Vault {
             "the unset KEY_PATH keeps the TOML value"
         );
 
-        // Empty cert path is exactly what `resolve_tls_doctor_data` maps to the
-        // incomplete-config Invalid, which grades a Fail — same failure the
-        // server surfaces at startup.
+        // An empty cert path is what `resolve_tls_doctor_data` maps to the incomplete-config
+        // Invalid, the same failure the server reports at startup.
         let r = check_tls_impl(&TlsDoctorData::Invalid {
             detail: "[server.tls] must set both cert_path and key_path".to_owned(),
         });
         assert!(matches!(r.status, CheckStatus::Fail));
     }
 
-    // Regression (#1603, Codex): TLS vars supplied through the `.env`/
-    // `.env.<profile>` overlay the runtime loads (not the process env) must be
-    // visible to doctor. `resolve_tls_paths` now reads them through the same
-    // profile-aware `Env` overlay the sibling checks use; feed that overlay a
-    // `MockEnv` (a map-backed `Env`) with TLS vars set and prove detection.
+    // TLS vars supplied through the `.env`/`.env.<profile>` overlay (not the process env) must be
+    // visible to doctor (#1603). `resolve_tls_paths` reads them through the profile-aware `Env`
+    // overlay; a map-backed `MockEnv` stands in for it here.
     #[test]
     fn dotenv_supplied_tls_var_is_detected() {
         use autumn_web::config::{Env, MockEnv};
 
-        // A cert/key pair visible ONLY through the overlay (never the process
-        // env) must resolve as configured — this is exactly the source
-        // `resolve_tls_paths` now reads the `AUTUMN_SERVER__TLS__*` vars from.
+        // A cert/key pair visible only through the overlay resolves as configured.
         let env = MockEnv::new()
             .with("AUTUMN_SERVER__TLS__CERT_PATH", "/dotenv/cert.pem")
             .with("AUTUMN_SERVER__TLS__KEY_PATH", "/dotenv/key.pem");
@@ -15461,9 +14740,8 @@ pub struct Vault {
         assert_eq!(resolved.0, std::path::PathBuf::from("/dotenv/cert.pem"));
         assert_eq!(resolved.1, std::path::PathBuf::from("/dotenv/key.pem"));
 
-        // A tuning-only dotenv var (no cert/key) is otherwise invisible, yet
-        // must still mark TLS configured so doctor emits the actionable "must
-        // set both" Fail instead of a false Pass.
+        // A tuning-only var (no cert/key) still marks TLS configured, so doctor emits the
+        // "must set both" Fail instead of a false Pass.
         let tuning_only = MockEnv::new().with("AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS", "30");
         assert!(
             any_tls_env_var_set_in(&tuning_only),
@@ -15560,11 +14838,9 @@ pub struct Vault {
         }
     }
 
-    // Regression (#1608, Codex): in NAT/container deployments the discovered local
-    // source IP is private/CGNAT/link-local while the domain resolves to a public
-    // LB/elastic IP. Comparing those must NOT report `ResolvesElsewhere` (which
-    // fails `--online --strict`); with no PUBLIC local IP the result is the
-    // inconclusive `LocalIpsUnknown`.
+    // In NAT/container deployments the local source IP is private/CGNAT/link-local while the
+    // domain resolves to a public LB IP. With no public local IP the result is the inconclusive
+    // `LocalIpsUnknown`, not `ResolvesElsewhere` (which fails `--online --strict`).
     #[test]
     fn dns_private_local_ips_are_inconclusive_not_elsewhere() {
         let resolved: Vec<std::net::IpAddr> = vec!["203.0.113.10".parse().unwrap()];
@@ -15596,8 +14872,7 @@ pub struct Vault {
     #[test]
     fn dns_public_local_ip_not_in_result_resolves_elsewhere() {
         let resolved: Vec<std::net::IpAddr> = vec!["203.0.113.10".parse().unwrap()];
-        // A genuine PUBLIC local IP that does not appear in the DNS result is a
-        // real mismatch.
+        // A public local IP absent from the DNS result is a real mismatch.
         let local: Vec<std::net::IpAddr> = vec!["198.51.100.7".parse().unwrap()];
         assert_eq!(
             grade_dns_points_here(&resolved, &local),
@@ -15616,19 +14891,16 @@ pub struct Vault {
         );
     }
 
-    // Regression (#1608, Codex P2): the domain resolves to TWO public addresses,
-    // only one of which is this host. HTTP-01's challenge token is per-process, so
-    // the CA validating against the unmatched address would 404 — a partial match
-    // must NOT grade as a clean Pass; it reports the unmatched address as a Warn.
+    // The domain resolves to two public addresses, only one of them this host. HTTP-01's
+    // challenge token is per-process, so a CA validating against the other address gets a 404:
+    // a partial match is a Warn naming the unmatched address, not a Pass.
     #[test]
     fn dns_partial_match_flags_unmatched_address() {
         let here: std::net::IpAddr = "203.0.113.10".parse().unwrap();
         let elsewhere: std::net::IpAddr = "198.51.100.7".parse().unwrap();
-        // Two resolved public addresses; only `here` is a local public IP.
         let resolved: Vec<std::net::IpAddr> = vec![here, elsewhere];
         let local: Vec<std::net::IpAddr> = vec![here];
 
-        // The grader must not collapse to Matches just because one address matched.
         assert_eq!(
             grade_dns_points_here(&resolved, &local),
             DnsPointsHere::PartialMatch {
@@ -15637,8 +14909,6 @@ pub struct Vault {
             "an unmatched resolved address must not be swallowed by a first-match Pass"
         );
 
-        // And the check grades a partial match as a Warn that names the stray
-        // address — not a clean Pass.
         let outcome = grade_dns_points_here(&resolved, &local);
         let r = check_acme_dns_for_challenge("app.example.com", &outcome, false);
         assert!(
@@ -15689,10 +14959,8 @@ pub struct Vault {
 
     #[test]
     fn acme_ca_root_unset_against_a_custom_directory_warns() {
-        // The symmetric case to `acme_ca_root_with_a_public_directory_warns`:
-        // a private directory whose root is not configured (and not installed
-        // host-wide) fails every order at the TLS handshake, so grading it Pass
-        // would let `doctor --strict` bless a dead deployment.
+        // A private directory whose root is neither configured nor installed host-wide fails
+        // every order at the TLS handshake, so `doctor --strict` must not grade it Pass.
         let r = check_acme_ca_root_impl(&AcmeCaRootData::MissingForPrivateDirectory);
         assert_eq!(r.status, CheckStatus::Warn);
         assert_eq!(r.name, "acme_ca_root");
@@ -15782,13 +15050,11 @@ pub struct Vault {
     fn acme_ca_root_resolver_matches_what_the_runtime_accepts() {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        // Unset against a BUILT-IN directory is the correct, quiet default.
         assert_eq!(
             resolve_acme_ca_root_data(None, None, "production"),
             AcmeCaRootData::NotConfigured
         );
-        // Unset against a CUSTOM directory is the failure this whole feature
-        // exists to prevent, so it must not grade Pass.
+        // Unset against a custom directory is the failure this check exists to catch.
         assert_eq!(
             resolve_acme_ca_root_data(None, None, "custom-abc"),
             AcmeCaRootData::MissingForPrivateDirectory
@@ -15817,8 +15083,8 @@ pub struct Vault {
             AcmeCaRootData::NotACertificate { .. }
         ));
 
-        // A well-formed PEM block wrapping non-DER gets past the PEM decoder but
-        // not past `RootCertStore::add` — exactly where the runtime fails.
+        // A PEM block wrapping non-DER passes the PEM decoder but not `RootCertStore::add`,
+        // which is where the runtime fails.
         let bogus = dir.path().join("bogus.pem");
         std::fs::write(
             &bogus,
@@ -15833,7 +15099,6 @@ pub struct Vault {
             "a PEM block holding junk must not pass; the runtime rejects it"
         );
 
-        // A real self-signed root is usable.
         let (root_pem, _) = self_signed_root_pem();
         let root = dir.path().join("root.pem");
         std::fs::write(&root, &root_pem).expect("write");
@@ -15859,10 +15124,8 @@ pub struct Vault {
             }
         ));
 
-        // A bundle AND a public directory: the public-directory case wins. The
-        // bundle remedy ("trim it to the root alone") would leave ca_root_path
-        // set against Let's Encrypt, which is the actual failure — so the more
-        // actionable "remove ca_root_path" must be what the operator is told.
+        // A bundle against a public directory reports the public-directory case: trimming the
+        // bundle would still leave ca_root_path set against Let's Encrypt, the real failure.
         assert!(
             matches!(
                 resolve_acme_ca_root_data(Some(&bundle), None, "production"),
@@ -15904,9 +15167,8 @@ pub struct Vault {
 
     #[test]
     fn acme_stored_cert_fail_when_not_yet_valid() {
-        // Mirrors check_tls_impl: a stored cert whose notBefore is in the future
-        // fails every handshake until its window opens, so grade it a Fail even
-        // when the expiry fields would otherwise Pass.
+        // As in check_tls_impl: a cert whose notBefore is in the future fails every handshake
+        // until its window opens, so it is a Fail even when the expiry fields would Pass.
         let r = check_acme_stored_cert_impl(&TlsDoctorData::Healthy {
             not_yet_valid: true,
             expired: false,
@@ -16020,8 +15282,7 @@ pub struct Vault {
         assert_eq!(on.status, CheckStatus::Pass);
         assert!(on.detail.unwrap().contains('3'));
 
-        // Enabled with nowhere for tenants to point: the same Fail the runtime
-        // exits on at boot.
+        // Enabled with no ingress: the same Fail the runtime exits on at boot.
         let no_ingress = autumn_web::config::CustomDomainsConfig {
             enabled: true,
             ingress_hostname: None,
@@ -16042,8 +15303,7 @@ pub struct Vault {
             CheckStatus::Fail
         );
 
-        // More registered than the cap allows: a Warn, since the stored domains
-        // still serve.
+        // Over the cap is a Warn: the stored domains still serve.
         let mut capped = custom_domains_config(true);
         capped.max_domains = 2;
         assert_eq!(
@@ -16144,8 +15404,7 @@ pub struct Vault {
 
     #[test]
     fn the_probe_names_only_the_addresses_that_are_not_the_ingress() {
-        // The addresses shown are computed, not parsed back out of the
-        // grader's human-readable message.
+        // The addresses shown are computed, not parsed back out of the grader's message.
         let ingress = autumn_web::custom_domain::ExpectedIngress {
             hostname: None,
             ipv4: vec!["203.0.113.10".parse().unwrap()],
@@ -16154,9 +15413,8 @@ pub struct Vault {
         assert!(ingress_contains(&ingress, "203.0.113.10".parse().unwrap()));
         assert!(!ingress_contains(&ingress, "198.51.100.7".parse().unwrap()));
 
-        // An ingress that resolves to nothing is inconclusive, never a failure:
-        // doctor must not fail a correctly connected domain just because it
-        // cannot see the ingress from where it runs.
+        // An ingress that resolves to nothing is inconclusive, not a failure: doctor may not see
+        // the ingress from where it runs.
         let empty = autumn_web::custom_domain::ExpectedIngress::default();
         assert_eq!(
             resolve_custom_domain_dns("no-such-host.invalid", &empty),
@@ -16217,12 +15475,10 @@ pub struct Vault {
 
     #[test]
     fn the_ingress_hostname_is_resolved_alongside_the_configured_addresses() {
-        // The documented mixed setup: tenant subdomains CNAME to a load
-        // balancer while apex domains use static A/AAAA records. Those are two
-        // different address sets, and the runtime grades against their UNION
-        // (`CustomDomainTask::effective_ingress`). Resolving the hostname only
-        // when no address was configured made doctor fail every correctly
-        // connected subdomain — and disagree with the app about it.
+        // Mixed setup: tenant subdomains CNAME to a load balancer while apex domains use static
+        // A/AAAA records. The runtime grades against the union of both
+        // (`CustomDomainTask::effective_ingress`), so the hostname is resolved even when
+        // addresses are configured.
         let ingress = autumn_web::custom_domain::ExpectedIngress {
             // Resolvable without a network, and not one of the apex addresses.
             hostname: Some("localhost".to_owned()),
@@ -16236,8 +15492,7 @@ pub struct Vault {
              apex addresses are configured too"
         );
 
-        // A domain at neither is still elsewhere, and the address it does
-        // resolve to is named.
+        // A domain at neither the hostname nor the addresses is elsewhere.
         let apex_only = autumn_web::custom_domain::ExpectedIngress {
             hostname: Some("no-such-ingress.invalid".to_owned()),
             ipv4: vec!["203.0.113.10".parse().unwrap()],
@@ -16251,10 +15506,8 @@ pub struct Vault {
 
     #[test]
     fn a_registry_doctor_cannot_read_is_a_failure_not_an_empty_one() {
-        // The runtime's `load()` fails on an unreadable directory, which since
-        // #1635's hydration guard also stops every new registration. Doctor
-        // reporting "0 registered, Pass" would hide exactly the condition an
-        // operator is running it to find.
+        // The runtime's `load()` fails on an unreadable directory, which also stops every new
+        // registration (#1635), so doctor must not report it as "0 registered, Pass".
         let unreadable = CustomDomainRegistryRead {
             unreadable: Some("/var/lib/autumn/custom-domains: permission denied".to_owned()),
             ..CustomDomainRegistryRead::default()
@@ -16306,11 +15559,9 @@ pub struct Vault {
 
     #[test]
     fn port_80_is_required_for_custom_domains_whatever_the_deployment_uses() {
-        // The deployment's own certificate may be issued over DNS-01, under
-        // which a closed port 80 is merely optional. A tenant's zone is the
-        // tenant's, so no tenant certificate can ever use DNS-01: they are all
-        // HTTP-01, and a firewall that drops inbound TCP/80 fails every one of
-        // them while `acme_ports` reports the deployment healthy.
+        // The deployment's own cert may use DNS-01, under which a closed port 80 is optional.
+        // Tenant zones belong to tenants, so every tenant cert is HTTP-01 and a closed port 80
+        // fails them all while `acme_ports` reports the deployment healthy.
         let optional_for_the_deployment = check_acme_ports_for_challenge(
             "myapp.com",
             PortReachability::Refused,
@@ -16354,10 +15605,9 @@ pub struct Vault {
 
     #[test]
     fn one_unreachable_address_behind_the_ingress_fails_the_http01_check() {
-        // A load balancer published as several A/AAAA records is reached at
-        // whichever address the CA's resolver hands back, so one member that
-        // drops port 80 fails HTTP-01 for whatever share of tenants lands on
-        // it. Probing only the first address reported that as a clean pass.
+        // A load balancer published as several A/AAAA records is reached at whichever address
+        // the CA's resolver returns, so one member that drops port 80 fails HTTP-01 for the
+        // tenants that land on it. Every address is probed.
         let mixed = check_custom_domain_http01_impl(
             "ingress.myapp.com",
             &[
@@ -16390,8 +15640,8 @@ pub struct Vault {
         assert_eq!(unresolvable.status, CheckStatus::Fail);
         assert!(unresolvable.detail.unwrap().contains("does not resolve"));
 
-        // And the probe itself walks every resolved address: `localhost`
-        // resolves without a network, and nothing is listening on this port.
+        // The probe walks every resolved address. `localhost` resolves without a network, and
+        // nothing listens on port 1.
         let probed = probe_port_every_address("localhost", 1);
         assert!(!probed.is_empty());
         assert!(
@@ -16505,9 +15755,8 @@ pub struct Vault {
         );
     }
 
-    // AC7: "`autumn doctor` diagnoses … missing or invalid provider credential".
-    // A Fail, not a Warn: without it every issuance and renewal fails, and
-    // nothing about the running app reveals that until expiry.
+    // A missing DNS provider credential is a Fail, not a Warn: every issuance and renewal fails,
+    // and nothing about the running app shows it until the cert expires.
     #[test]
     fn a_missing_dns_credential_fails_and_says_where_to_put_it() {
         let outcome = DnsCredentialOutcome::Unusable(
@@ -16523,9 +15772,8 @@ pub struct Vault {
         assert!(detail.contains("autumn credentials edit"), "got: {detail}");
     }
 
-    // The runtime refuses to boot on a `[server.tls.acme.dns]` that does not
-    // deserialize — most usefully, one carrying an inline `api_token`. Doctor
-    // must FAIL that rather than report "no DNS provider configured".
+    // The runtime refuses to boot on a `[server.tls.acme.dns]` that does not deserialize (such
+    // as one with an inline `api_token`), so doctor fails it rather than report no provider.
     #[test]
     fn a_malformed_dns_section_fails_and_names_the_problem() {
         let result = check_acme_dns_credential_impl(&DnsCredentialOutcome::Malformed(
@@ -16548,8 +15796,7 @@ pub struct Vault {
         assert!(detail.contains("acme_dns"), "got: {detail}");
     }
 
-    // AC7: "challenge TXT record not visible in public DNS". A name the resolvers
-    // cannot answer for at all defeats a correctly-written record, so it is a
+    // A challenge name the resolvers cannot answer for defeats a correct TXT record, so it is a
     // Fail; leftover records are only a Warn.
     #[test]
     fn challenge_dns_visibility_grades_answerability_then_leftovers() {
@@ -16579,9 +15826,8 @@ pub struct Vault {
         assert!(detail.contains("SERVFAIL"), "got: {detail}");
     }
 
-    // AC7: "a `tenancy.base_domain` that the configured certificate domain does
-    // not cover" — the check that catches a subdomain-per-tenant deployment with
-    // a single-hostname certificate, where every tenant serves a name mismatch.
+    // A subdomain-per-tenant deployment whose certificate does not cover `tenancy.base_domain`'s
+    // subdomains serves a name mismatch to every tenant.
     #[test]
     fn tenancy_base_domain_must_be_covered_by_the_certificate() {
         let single = vec!["myapp.com".to_owned()];
@@ -16618,17 +15864,15 @@ pub struct Vault {
     fn one_explicit_tenant_san_is_not_subdomain_coverage() {
         let explicit = vec!["myapp.com".to_owned(), "tenant1.myapp.com".to_owned()];
         assert!(!acme_covers_tenant_subdomains("myapp.com", &explicit));
-        // …and a wildcard for a DIFFERENT zone is not coverage either.
+        // A wildcard for a different zone is not coverage either.
         assert!(!acme_covers_tenant_subdomains(
             "myapp.com",
             &["*.other.com".to_owned()]
         ));
     }
 
-    // Regression (Codex, #1620): the port check was softened for DNS-01 but the
-    // address check was not, so a wildcard deployment behind a load balancer —
-    // the normal shape for this feature — still failed `--online --strict` on a
-    // rule that is HTTP-01-specific by construction.
+    // The address check is HTTP-01-specific: a DNS-01 wildcard deployment behind a load balancer
+    // must not fail `--online --strict` because its name resolves elsewhere (#1620).
     #[test]
     fn resolving_elsewhere_is_not_a_failure_under_dns01() {
         let elsewhere = DnsPointsHere::ResolvesElsewhere {
@@ -16719,10 +15963,8 @@ pub struct Vault {
         }
     }
 
-    // A `*.myapp.com` entry has no address record of its own: probing it
-    // literally would report a permanent, meaningless Warn on every wildcard
-    // deployment. It is probed as the base domain it covers, deduplicated
-    // against an explicitly-listed apex.
+    // A `*.myapp.com` entry has no address record of its own, so it is probed as the base domain
+    // it covers, deduplicated against an explicit apex.
     #[test]
     fn wildcard_domains_are_probed_as_their_base_domain() {
         let mut cfg = acme_doctor_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
@@ -16784,9 +16026,7 @@ pub struct Vault {
         );
     }
 
-    // Regression (#1608, Codex): doctor must mirror AcmeConfig::validate(). An
-    // ACME config with no/empty `domains` is REJECTED by the runtime at boot, so
-    // doctor must FAIL it rather than silently pass acme_stored_cert.
+    // Doctor mirrors `AcmeConfig::validate()`, which rejects empty `domains` at boot.
     #[test]
     fn acme_config_fail_when_domains_empty() {
         let r = check_acme_config_impl(&acme_doctor_cfg(&[], "ops@example.com"))
@@ -16812,8 +16052,7 @@ pub struct Vault {
         assert!(detail.contains("[server.tls.acme.dns]"), "got: {detail}");
         assert!(detail.contains("DNS-01"), "got: {detail}");
 
-        // …and with the section present the same config is accepted, because
-        // DNS-01 is exactly what makes a wildcard issuable (#1620).
+        // With the section present the config is accepted: DNS-01 makes a wildcard issuable.
         let mut cfg = acme_doctor_cfg(&["*.example.com"], "ops@example.com");
         cfg.dns = Some(acme_dns_cfg(
             autumn_web::config::AcmeDnsProvider::Cloudflare,
@@ -16826,7 +16065,6 @@ pub struct Vault {
 
     #[test]
     fn acme_config_ok_when_valid() {
-        // A valid ACME config produces no acme_config failure.
         assert!(
             check_acme_config_impl(&acme_doctor_cfg(&["app.example.com"], "ops@example.com"))
                 .is_none(),
@@ -16834,10 +16072,8 @@ pub struct Vault {
         );
     }
 
-    // Regression (#1608, Codex P2): mirror `AcmeConfig::validate()` rejecting a
-    // blank/whitespace-only domain entry. `domains = [""]` passes the empty-list
-    // check (length 1) but the runtime then orders a cert for an empty DNS
-    // identifier, so doctor must FAIL it rather than pass acme_stored_cert.
+    // `domains = [""]` passes the empty-list check, but the runtime would order a cert for an
+    // empty identifier. `AcmeConfig::validate()` rejects blank entries, and so does doctor.
     #[test]
     fn acme_config_fail_when_domain_entry_blank() {
         let r = check_acme_config_impl(&acme_doctor_cfg(&[""], "ops@example.com"))
@@ -16856,10 +16092,8 @@ pub struct Vault {
         assert!(matches!(r.status, CheckStatus::Fail));
     }
 
-    // Regression (#1608, Codex P2): mirror `AcmeConfig::validate()` rejecting
-    // `http_challenge_port = 0`. Port 0 binds an ephemeral OS port the HTTP-01
-    // validator (always port 80) can never reach, so every issuance fails while
-    // the process stays up — doctor must FAIL it.
+    // Port 0 binds an ephemeral port the HTTP-01 validator (always port 80) never reaches, so
+    // every issuance fails while the process stays up. `AcmeConfig::validate()` rejects it too.
     #[test]
     fn acme_config_fail_when_http_challenge_port_zero() {
         let mut cfg = acme_doctor_cfg(&["app.example.com"], "ops@example.com");
@@ -16884,7 +16118,7 @@ pub struct Vault {
         check_acme_config_impl(&acme).expect("config must FAIL")
     }
 
-    // #2413 item 1: a non-string `cache_dir` must FAIL, not default.
+    // A non-string `cache_dir` fails rather than defaulting (#2413).
     #[test]
     fn acme_config_fail_when_cache_dir_not_a_string() {
         for bad in ["42", "true", "[\"config/acme\"]", "{ x = 1 }"] {
@@ -16914,7 +16148,7 @@ pub struct Vault {
         assert_eq!(acme.cache_dir, std::path::PathBuf::from("config/acme"));
     }
 
-    // #2413 item 2: a non-table `acme` key must not skip the ACME checks.
+    // A non-table `acme` key must not skip the ACME checks (#2413).
     #[test]
     fn acme_config_fail_when_acme_section_not_a_table() {
         for bad in ["\"yes\"", "true", "7", "[1]"] {
@@ -16930,7 +16164,7 @@ pub struct Vault {
         }
     }
 
-    // #2413 item 3: name the type error, not a downstream symptom.
+    // A wrong type is named as such, not as a downstream symptom (#2413).
     #[test]
     fn acme_config_names_type_error_for_contact_email_and_domains() {
         let r = grade_acme_toml(
@@ -17001,16 +16235,10 @@ pub struct Vault {
         }
     }
 
-    // Regression (#1608, Codex P2): a malformed `http_challenge_port` must FAIL,
-    // not silently fall back to 80. The runtime's typed `AcmeConfig` deserializes
-    // the field as a `u16`, so an out-of-range value like `70000` or a non-integer
-    // like a quoted string is rejected before boot; doctor previously swallowed the
-    // parse error (`as_integer().map_or(80, |v| try_from(v).unwrap_or(80))`) and
-    // graded a config the server won't start. `resolve_acme_doctor_config` now
-    // records the bad value and `check_acme_config_impl` surfaces it as a FAIL.
+    // The runtime deserializes `http_challenge_port` as a `u16`, so an out-of-range or
+    // non-integer value stops boot. Doctor fails it rather than defaulting to 80.
     #[test]
     fn acme_config_fail_when_http_challenge_port_malformed() {
-        // Out-of-`u16`-range integer.
         let raw: toml::Table = toml::from_str(
             "\
 [server.tls.acme]
@@ -17056,7 +16284,6 @@ http_challenge_port = \"80\"
         assert_eq!(r.name, "acme_config");
     }
 
-    // A valid explicit `http_challenge_port` records no error and does not FAIL.
     #[test]
     fn acme_config_ok_when_http_challenge_port_valid() {
         let raw: toml::Table = toml::from_str(
@@ -17077,11 +16304,9 @@ http_challenge_port = 8080
         );
     }
 
-    // Regression (#1608, Codex P2): a `renew_before_days` >= the issued cert's
-    // lifetime (~90 days for a public CA) keeps a freshly-issued cert perpetually
-    // "due", so the renewal loop re-orders every tick and burns CA rate limits.
-    // The runtime `AcmeConfig::validate()` rejects it, so doctor must mirror that
-    // as an `acme_config` FAIL rather than silently defaulting.
+    // A `renew_before_days` at or above the cert lifetime (~90 days for a public CA) keeps a
+    // fresh cert always due, so renewal re-orders every tick and burns CA rate limits.
+    // `AcmeConfig::validate()` rejects it, and so does doctor.
     #[test]
     fn acme_config_fail_when_renew_before_days_at_or_above_cert_lifetime() {
         let raw: toml::Table = toml::from_str(
@@ -17104,7 +16329,6 @@ renew_before_days = 100
             "detail must name the bad renew_before_days value: {detail}"
         );
 
-        // A sane sub-lifetime value must NOT FAIL.
         let raw: toml::Table = toml::from_str(
             "\
 [server.tls.acme]
@@ -17122,17 +16346,14 @@ renew_before_days = 30
         );
     }
 
-    // Regression (#1874, item 1): a `renew_before_days` the runtime's typed
-    // `AcmeConfig` cannot deserialize as a `u32` — a quoted string, a float, a
-    // bool, a negative, or an out-of-`u32`-range integer — must FAIL, not silently
-    // default to 30. Doctor's `as_integer()` chain treated a non-integer as
-    // ABSENT, so `renew_before_days = "30"` graded Pass while the server exits at
-    // boot on the same file.
+    // The runtime deserializes `renew_before_days` as a `u32`, so a quoted string, float, bool,
+    // negative or out-of-range value stops boot (#1874). Doctor fails it rather than defaulting
+    // to 30.
     #[test]
     fn acme_config_fail_when_renew_before_days_malformed() {
         for (bad_line, needle) in [
-            // The QUOTING is the bug here, so the FAIL must echo it: a wrong fix
-            // that reused the `>= 90` detail would still contain a bare `30`.
+            // The quoting is the fault, so the detail must echo it: a bare `30` would also
+            // appear in a `>= 90` message.
             ("renew_before_days = \"30\"", "\"30\""),
             ("renew_before_days = 30.5", "30.5"),
             ("renew_before_days = true", "true"),
@@ -17172,8 +16393,6 @@ contact_email = \"ops@example.com\"
         }
     }
 
-    // Companion: a valid explicit `renew_before_days` records no error, and an
-    // absent key still falls back to the runtime default (30) with no FAIL.
     #[test]
     fn acme_config_ok_when_renew_before_days_valid_or_absent() {
         let raw: toml::Table = toml::from_str(
@@ -17207,10 +16426,7 @@ contact_email = \"ops@example.com\"
         assert!(check_acme_config_impl(&acme).is_none());
     }
 
-    // Regression (#1874, item 2): doctor must mirror `AcmeConfig::validate()`'s
-    // rejection of a whitespace-padded domain. Without this, `doctor --strict`
-    // passes a config the runtime refuses to boot on — the same parity gap in the
-    // opposite direction.
+    // `AcmeConfig::validate()` rejects a whitespace-padded domain (#1874), so doctor fails it too.
     #[test]
     fn acme_config_fail_when_domain_entry_whitespace_padded() {
         let raw: toml::Table = toml::from_str(
@@ -17302,14 +16518,10 @@ contact_email = \"ops@example.com\"
         }
     }
 
-    // The doctor grader is a hand-copy of `AcmeConfig::validate()`, and the two have
-    // drifted three times (#1608, and both items of #1874). Every other test here pins
-    // one side against a hard-coded expectation; this one pins the two sides against
-    // each other, so the next divergence fails a test instead of shipping. Verdicts
-    // only — the messages deliberately differ in shape, since doctor splits the
-    // runtime's closing advice into a separate `hint`. `ca_root_path` is excluded on
-    // purpose: `validate()` grades a blank one, but doctor routes that whole story
-    // through `check_acme_ca_root_impl` (see `check_acme_config_impl`'s docs).
+    // The doctor grader is a hand-copy of `AcmeConfig::validate()` and has drifted from it
+    // before (#1608, #1874), so this pins the two against each other. It compares verdicts only:
+    // doctor splits the runtime's closing advice into a `hint`. `ca_root_path` is left out
+    // because doctor grades it in `check_acme_ca_root_impl`.
     #[test]
     fn acme_config_grader_agrees_with_runtime_validate() {
         let cases: &[(&[&str], &str, u16, u32)] = &[
@@ -17320,7 +16532,7 @@ contact_email = \"ops@example.com\"
                 8080,
                 89,
             ),
-            // Item 2 (#1874) and its neighbours: padded, wildcard, blank.
+            // Padded (#1874), wildcard and blank entries.
             (&[" app.example.com "], "ops@example.com", 80, 30),
             (&["app.example.com\t"], "ops@example.com", 80, 30),
             (&["\u{a0}app.example.com"], "ops@example.com", 80, 30),
@@ -17332,30 +16544,26 @@ contact_email = \"ops@example.com\"
                 80,
                 30,
             ),
-            // The pre-existing invariants.
             (&[], "ops@example.com", 80, 30),
             (&["app.example.com"], "  ", 80, 30),
             (&["app.example.com"], "ops@example.com", 0, 30),
             (&["app.example.com"], "ops@example.com", 80, 0),
             (&["app.example.com"], "ops@example.com", 80, 90),
             (&["app.example.com"], "ops@example.com", 80, 100),
-            // Whitespace INSIDE a name is out of scope for both sides today; this
-            // row records that they agree about it rather than that it is allowed.
+            // Whitespace inside a name is checked by neither side; this row records that they
+            // agree, not that it is allowed.
             (&["app .example.com"], "ops@example.com", 80, 30),
         ];
 
-        // Every case is run BOTH with and without a `[server.tls.acme.dns]`
-        // section, because since #1620 the section is what decides whether a
-        // wildcard entry is valid — so a doctor that ignored it would pass a
-        // wildcard config the server refuses (or fail one it accepts).
+        // Each case runs with and without a `[server.tls.acme.dns]` section, which decides
+        // whether a wildcard entry is valid (#1620).
         for (domains, contact_email, http_challenge_port, renew_before_days) in cases {
             for dns in [
                 None,
                 Some(acme_dns_cfg(
                     autumn_web::config::AcmeDnsProvider::Cloudflare,
                 )),
-                // A DNS section the runtime itself rejects: `exec` with no
-                // command. Doctor must fail it too.
+                // A DNS section the runtime rejects: `exec` with no command.
                 Some(
                     toml::from_str::<autumn_web::config::AcmeDnsConfig>("provider = \"exec\"\n")
                         .expect("parses; validate() is what rejects it"),
@@ -17375,9 +16583,8 @@ contact_email = \"ops@example.com\"
                     renew_before_days: *renew_before_days,
                     ca_root_path: None,
                     dns: dns.clone(),
-                    // Tenant custom domains are graded by their own
-                    // `custom_domains` check, not by `acme_config`, so this
-                    // parity case holds them absent on both sides.
+                    // Tenant custom domains are graded by the `custom_domains` check, not
+                    // `acme_config`.
                     custom_domains: None,
                 };
 
@@ -17394,8 +16601,8 @@ contact_email = \"ops@example.com\"
         }
     }
 
-    // #1620's own rows for the parity test above: a wildcard is valid exactly
-    // when a DNS-01 provider is configured, and a malformed one never is.
+    // A wildcard is valid exactly when a DNS-01 provider is configured, and a malformed one
+    // never is (#1620).
     #[test]
     fn wildcard_domain_parity_depends_on_the_dns_section() {
         let wildcard_cases: &[&[&str]] = &[
@@ -17425,9 +16632,8 @@ contact_email = \"ops@example.com\"
                     renew_before_days: 30,
                     ca_root_path: None,
                     dns: dns.clone(),
-                    // Tenant custom domains are graded by their own
-                    // `custom_domains` check, not by `acme_config`, so this
-                    // parity case holds them absent on both sides.
+                    // Tenant custom domains are graded by the `custom_domains` check, not
+                    // `acme_config`.
                     custom_domains: None,
                 };
                 assert_eq!(
@@ -17442,11 +16648,8 @@ contact_email = \"ops@example.com\"
         }
     }
 
-    // Regression (#1608, Codex P2): a NON-STRING entry in the `domains` array
-    // (`domains = ["app.example.com", 123]`) fails the runtime's typed
-    // `Vec<String>` deserialization and the server won't boot, but doctor
-    // previously `filter_map`ped it away — keeping the valid name and passing.
-    // `resolve_acme_doctor_config` now records the bad entry and the grader FAILs.
+    // A non-string entry in `domains` fails the runtime's `Vec<String>` deserialization, so
+    // doctor fails it rather than dropping it and passing the valid names.
     #[test]
     fn acme_config_fail_when_domain_entry_not_a_string() {
         let raw: toml::Table = toml::from_str(
@@ -17473,13 +16676,8 @@ contact_email = \"ops@example.com\"
         );
     }
 
-    // Regression (#1608, Codex P2): a malformed/typo `acme.directory` must FAIL,
-    // not silently default to staging. `resolve_acme_doctor_config` deserializes
-    // `directory` the way the runtime does; the runtime FAILS TO BOOT on a value
-    // that does not deserialize as `AcmeDirectory`, while doctor previously
-    // swallowed the error (`.ok().unwrap_or_default()`) and blessed the config by
-    // inspecting the (wrong) staging cache. Now the bad value surfaces as an
-    // `acme_config` FAIL, folded into the same grader as the other ACME invariants.
+    // The runtime fails to boot on a `directory` that does not deserialize as `AcmeDirectory`,
+    // so doctor fails it rather than defaulting to staging and inspecting the wrong cache.
     #[test]
     fn acme_config_fail_when_directory_invalid() {
         let raw: toml::Table = toml::from_str(
@@ -17492,7 +16690,6 @@ directory = \"prod\"
         )
         .unwrap();
         let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
-        // The bad value is recorded (not silently defaulted to staging).
         assert!(
             acme.directory_error.is_some(),
             "a malformed `directory` must be recorded as an error, not defaulted"
@@ -17501,7 +16698,6 @@ directory = \"prod\"
             .expect("an invalid `directory` must be a FAIL, not silently staging");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "acme_config");
-        // The FAIL names the offending value so the operator can fix it.
         let detail = r.detail.as_deref().unwrap_or_default();
         assert!(
             detail.contains("prod"),
@@ -17513,9 +16709,6 @@ directory = \"prod\"
         );
     }
 
-    // Companion to the above: valid `directory` values (staging, production, a
-    // custom directory table, and an absent key defaulting to staging) must NOT
-    // raise the invalid-directory FAIL.
     #[test]
     fn acme_config_ok_for_valid_directories() {
         let cases = [
@@ -17566,53 +16759,41 @@ contact_email = \"ops@example.com\"
         assert_eq!(acme.directory_label, "staging");
     }
 
-    // Regression (#1608, Codex): an ACME-only deployment ([server.tls.acme]
-    // configured, no static cert_path/key_path) must NOT run the static
-    // [server.tls] cert/key check. resolve_tls_paths() sees the enclosing
-    // [server.tls] table and reports empty paths, which check_tls_impl grades
-    // as a "must set both cert_path and key_path" Fail — a false positive for
-    // every ACME deployment, since TlsConfig::validate() accepts ACME-only.
+    // An ACME-only deployment has an enclosing `[server.tls]` with empty cert/key paths, which
+    // check_tls_impl would grade as "must set both". TlsConfig::validate() accepts ACME-only, so
+    // the static check is skipped.
     #[test]
     fn acme_only_config_skips_static_tls_check() {
-        // acme configured, no static cert/key present → skip the static check,
-        // so the spurious "must set both" failure is never produced.
         assert!(
             !should_run_static_tls_check(true, false),
             "ACME-only deployment must skip the static [server.tls] cert/key check"
         );
 
-        // Genuine static-TLS mode (cert/key present) is still checked, even when
-        // acme is also configured.
+        // Static TLS (cert/key present) is still checked, even alongside acme.
         assert!(should_run_static_tls_check(true, true));
         assert!(should_run_static_tls_check(false, true));
 
-        // No acme, no static cert/key: run the static check so the incomplete
-        // static-TLS config still surfaces the actionable "must set both" Fail.
+        // Neither: run the static check so an incomplete config gets the "must set both" Fail.
         assert!(should_run_static_tls_check(false, false));
     }
 
-    // Regression (#1608, Codex): doctor must mirror `TlsConfig::validate`'s
-    // static-vs-ACME XOR + half-pair rules so it FAILS exactly the combinations
-    // the runtime refuses to boot, instead of blessing them under `--strict`.
+    // Doctor mirrors `TlsConfig::validate`: static TLS and ACME are mutually exclusive, and the
+    // static cert/key must be set as a pair.
     #[test]
     fn tls_mode_fails_static_and_acme_together() {
-        // Both a static cert/key AND acme configured → mutually exclusive Fail,
-        // even though both static paths are present (would otherwise pass).
+        // Fails even though the static pair alone would pass.
         let r = check_tls_mode_impl(true, true, true).expect("both modes must Fail");
         assert!(matches!(r.status, CheckStatus::Fail));
         assert_eq!(r.name, "tls_mode");
         assert!(r.detail.as_deref().unwrap().contains("[server.tls.acme]"));
 
-        // A single static path plus acme is still the mutually-exclusive case
-        // (any static path counts as static-configured), and previously the
-        // static check was silently SKIPPED, hiding it.
+        // Any single static path counts as static-configured, so it plus acme is mixed mode.
         assert!(check_tls_mode_impl(true, false, true).is_some());
         assert!(check_tls_mode_impl(false, true, true).is_some());
     }
 
     #[test]
     fn tls_mode_fails_half_static_pair_without_acme() {
-        // Exactly one of cert_path/key_path set, no acme → "must set both" Fail.
         for (has_cert, has_key) in [(true, false), (false, true)] {
             let r = check_tls_mode_impl(has_cert, has_key, false)
                 .unwrap_or_else(|| panic!("half pair ({has_cert},{has_key}) must Fail"));
@@ -17628,28 +16809,21 @@ contact_email = \"ops@example.com\"
 
     #[test]
     fn tls_mode_passes_valid_single_mode_configs() {
-        // Valid ACME-only: no static paths, acme configured → no mode Fail (the
-        // dedicated acme checks grade it).
+        // ACME-only is graded by the dedicated acme checks.
         assert!(
             check_tls_mode_impl(false, false, true).is_none(),
             "ACME-only is a valid single mode"
         );
-        // Valid static-only: both paths, no acme → no mode Fail.
         assert!(
             check_tls_mode_impl(true, true, false).is_none(),
             "static-only with both paths is a valid single mode"
         );
-        // Neither configured: TLS is optional → no mode Fail.
+        // Neither configured: TLS is optional.
         assert!(check_tls_mode_impl(false, false, false).is_none());
     }
 
-    // Regression (#1608, Codex P2): the static-vs-ACME XOR must key on static-path
-    // PRESENCE, not non-emptiness. The runtime keys `TlsConfig::validate` on
-    // `cert_path.is_some()`, so `[server.tls.acme]` + `cert_path = ""` is a mixed
-    // static+ACME config it rejects at boot. Doctor previously collapsed the empty
-    // path to "absent", treated the config as ACME-only, skipped the static check,
-    // and could pass `--strict`. `static_tls_presence_from` now reports a
-    // present-but-empty path as PRESENT, so the mixed-mode FAIL fires.
+    // The runtime keys `TlsConfig::validate` on `cert_path.is_some()`, so `cert_path = ""` next
+    // to `[server.tls.acme]` is mixed mode it rejects at boot. Doctor keys on presence too.
     #[test]
     fn empty_static_path_with_acme_is_mixed_mode_not_acme_only() {
         let raw: toml::Table = toml::from_str(
@@ -17669,7 +16843,6 @@ contact_email = \"ops@example.com\"
             .and_then(|s| s.get("tls"))
             .and_then(toml::Value::as_table);
 
-        // The present-but-empty `cert_path` KEY counts as static-mode present.
         let (has_static_cert, has_static_key) = static_tls_presence_from(tls, false, false);
         assert!(
             has_static_cert,
@@ -17677,8 +16850,6 @@ contact_email = \"ops@example.com\"
         );
         assert!(!has_static_key, "no `key_path` key is set");
 
-        // acme is configured, so this is a mixed static+ACME config → FAIL, exactly
-        // as `TlsConfig::validate` rejects it (NOT skipped as ACME-only).
         let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
         let r = check_tls_mode_impl(has_static_cert, has_static_key, true)
             .expect("mixed static+ACME (present-but-empty cert_path) must FAIL");
@@ -17691,12 +16862,10 @@ contact_email = \"ops@example.com\"
                 .contains("[server.tls.acme]"),
             "the FAIL must name the mutually-exclusive [server.tls.acme]"
         );
-        // Sanity: acme itself resolves (the domains/email are valid).
+        // The acme section itself resolves, with its configured domain.
         assert_eq!(acme.domains, ["app.example.com"]);
     }
 
-    // Companion: an ACME-only deployment with NO `cert_path`/`key_path` key at all
-    // is a valid single mode — neither static key present → no mixed-mode FAIL.
     #[test]
     fn acme_only_without_static_keys_is_valid() {
         let raw: toml::Table = toml::from_str(
@@ -17724,21 +16893,15 @@ contact_email = \"ops@example.com\"
         );
     }
 
-    // Regression (#1608, Codex P2): the static-vs-ACME XOR must read the static
-    // cert/key env overrides through the SAME profile-aware dotenv overlay the
-    // sibling `resolve_tls_paths()` uses — not the bare process env. A cert/key
-    // supplied via `.env`/`.env.<profile>` alongside `[server.tls.acme]` is a mixed
-    // static+ACME config the runtime rejects at boot; reading only the process env
-    // would miss it and pass `doctor --strict`. `static_tls_env_presence_in` reads
-    // the overlay (fed a `MockEnv` here, standing in for the dotenv overlay), so
-    // the dotenv-supplied cert/key are seen as present and the mixed-mode FAIL fires.
+    // The static cert/key env overrides are read through the profile-aware dotenv overlay, as in
+    // `resolve_tls_paths()`: a cert/key from `.env`/`.env.<profile>` next to `[server.tls.acme]`
+    // is mixed mode the runtime rejects. A `MockEnv` stands in for the overlay.
     #[test]
     fn tls_mode_fails_when_dotenv_overlay_supplies_cert_key_with_acme() {
         use autumn_web::config::MockEnv;
 
-        // cert/key present ONLY through the overlay (never TOML), one of them an
-        // empty clearing override — both must count as PRESENT, mirroring the
-        // runtime's `env.var(..).ok()`.
+        // Overlay-only cert/key, one an empty clearing override: both count as present, as the
+        // runtime's `env.var(..).ok()` does.
         let env = MockEnv::new()
             .with("AUTUMN_SERVER__TLS__CERT_PATH", "/dotenv/cert.pem")
             .with("AUTUMN_SERVER__TLS__KEY_PATH", "");
@@ -17752,9 +16915,6 @@ contact_email = \"ops@example.com\"
             "a present-but-empty dotenv KEY_PATH override is still present"
         );
 
-        // With no static cert/key in TOML but both supplied via the overlay, the
-        // static keys are present — combined with acme, that is the mixed mode the
-        // runtime rejects, so the tls_mode grader FAILs.
         let (has_static_cert, has_static_key) = static_tls_presence_from(None, cert_env, key_env);
         assert!(has_static_cert && has_static_key);
         let r = check_tls_mode_impl(has_static_cert, has_static_key, true)
@@ -17769,8 +16929,6 @@ contact_email = \"ops@example.com\"
             "the FAIL must name the mutually-exclusive [server.tls.acme]"
         );
 
-        // Sanity: with the overlay reporting NO TLS env vars, the same TOML-less
-        // config is a valid ACME-only deployment (no mixed-mode FAIL).
         let empty = MockEnv::new();
         let (c, k) = static_tls_env_presence_in(&empty);
         let (hc, hk) = static_tls_presence_from(None, c, k);
@@ -17780,9 +16938,8 @@ contact_email = \"ops@example.com\"
         );
     }
 
-    // An env override for `cert_path` — even an empty one — counts as static-mode
-    // present, mirroring the runtime applying `AUTUMN_SERVER__TLS__CERT_PATH` as
-    // `Some("")`.
+    // An env override for `cert_path`, even an empty one, counts as static-mode present: the
+    // runtime applies an empty `AUTUMN_SERVER__TLS__CERT_PATH` as `Some("")`.
     #[test]
     fn static_presence_counts_empty_env_override() {
         // No [server.tls] table at all, but the cert env override is set.
@@ -17794,18 +16951,13 @@ contact_email = \"ops@example.com\"
         assert!(!has_static_key);
     }
 
-    // `[server.tls.acme]` supplied only by an active profile (`[profile.prod]`,
-    // `autumn-prod.toml`) must be detected by doctor (#1608). A raw top-level table
-    // misses it, so `resolve_tls_paths()` would still see the enclosing,
-    // static-path-less `[server.tls]` and the static TLS check would spuriously fail a
-    // valid ACME deployment. The merged runtime table sees the acme config, so doctor
-    // skips the static check. This mirrors `get_merged_toml_table_runtime`'s profile
-    // merge — a deep merge of `[profile.<env>]` onto the base top-level — feeding the
-    // testable `resolve_acme_doctor_config` helper.
+    // `[server.tls.acme]` set only by an active profile (`[profile.prod]`, `autumn-prod.toml`)
+    // must be detected (#1608), or the static TLS check fails a valid ACME deployment on its
+    // static-path-less `[server.tls]`. The raw top-level table misses it; the merged runtime
+    // table finds it.
     #[test]
     fn profile_only_acme_skips_static_tls_check() {
-        // [server.tls.acme] appears ONLY under [profile.prod]; the base top-level
-        // [server.tls] carries no acme and no static cert/key.
+        // acme appears only under [profile.prod]; the base [server.tls] has no acme or cert/key.
         let raw: toml::Table = toml::from_str(
             "\
 [server.tls]
@@ -17817,16 +16969,12 @@ directory = \"production\"
         )
         .unwrap();
 
-        // The raw top-level lookup (the buggy source) does NOT see the
-        // profile-scoped acme, so it would leave the static TLS check running.
         assert!(
             resolve_acme_doctor_config(Some(&raw)).is_none(),
             "raw top-level table must miss profile-scoped [server.tls.acme]"
         );
 
-        // Build the MERGED runtime table exactly as get_merged_toml_table_runtime
-        // does for the active profile: base top-level, then deep_merge
-        // [profile.prod].
+        // Merge as get_merged_toml_table_runtime does: base top-level, then [profile.prod].
         let mut merged = toml::Table::new();
         deep_merge(&mut merged, &raw);
         let prof = raw
@@ -17837,16 +16985,11 @@ directory = \"production\"
             .expect("[profile.prod] table");
         deep_merge(&mut merged, prof);
 
-        // The merged table (what resolve_tls_paths and the fixed doctor path use)
-        // DOES surface the acme config.
         let acme = resolve_acme_doctor_config(Some(&merged))
             .expect("merged/profile table must surface [server.tls.acme]");
         assert_eq!(acme.domains, ["app.example.com"]);
         assert_eq!(acme.directory_label, "production");
 
-        // With acme detected and NO static cert/key present, the static
-        // [server.tls] check is skipped — no spurious "must set both cert_path and
-        // key_path" Fail for the profile-scoped ACME deployment.
         assert!(
             !should_run_static_tls_check(
                 resolve_acme_doctor_config(Some(&merged)).is_some(),
@@ -17856,16 +16999,13 @@ directory = \"production\"
         );
     }
 
-    // Regression (#1608, Codex): --online must probe EVERY configured ACME
-    // domain, not just the first. Issuance orders an authorization for each name,
-    // so probing only the first can pass doctor while issuance fails on an
-    // unprobed domain. A 2-domain config must yield a port + DNS check per domain.
+    // Issuance orders an authorization for every domain, so `--online` probes each one, not just
+    // the first.
     #[test]
     fn online_probes_every_configured_domain() {
         let mut config = acme_doctor_cfg(&["ok.example.com", "bad.example.com"], "ops@example.com");
         config.directory_label = "production".to_owned();
 
-        // Every configured domain is scheduled for probing, not just the first.
         let domains = acme_online_reachability_hosts(&config);
         assert_eq!(
             domains,
@@ -17873,8 +17013,7 @@ directory = \"production\"
             "every configured domain must be probed, not just the first"
         );
 
-        // Each domain flows through the pure graders to a domain-labeled check,
-        // mirroring the port + DNS tasks run() enqueues per domain.
+        // Each domain gets its own labeled port and DNS check, as run() enqueues them.
         let mut ports_checks = Vec::new();
         let mut dns_checks = Vec::new();
         for domain in &domains {
@@ -17932,12 +17071,9 @@ directory = \"production\"
         assert!(label.starts_with("custom-"), "got {label}");
     }
 
-    // Regression (#1608, Codex): doctor must inspect the cert id derived from the
-    // ACTIVE `acme.domains` (what `build_acme_tls_listener` loads), NOT whichever
-    // `*.chain.pem` is newest. If `domains` changed and old cert files remain, an
-    // old cert for other domains must not be reported as the stored cert, and an
-    // absent configured cert is a benign first-run state — not a "healthy old
-    // cert" or an expired-old-cert `--strict` failure.
+    // Doctor inspects the cert id derived from the active `acme.domains` (what
+    // `build_acme_tls_listener` loads), not the newest `*.chain.pem`. A leftover cert for other
+    // domains is not the stored cert.
     #[test]
     fn acme_scan_inspects_configured_domain_cert() {
         let dir = tempfile::tempdir().unwrap();
@@ -17956,16 +17092,13 @@ directory = \"production\"
             std::fs::write(cert_dir.join(format!("{id}.key.pem")), b"key").unwrap();
         };
 
-        // Only the OLD (different-domains) cert present: the configured-domains
-        // lookup finds nothing, so the old cert is NOT reported as the stored one.
         write_pair(&old_id);
         assert!(
             configured_acme_cert_pair(dir.path(), label, &configured).is_none(),
             "a cert for different domains must not be reported as the stored cert"
         );
 
-        // Now add the configured-domains cert alongside the old one: the lookup
-        // targets EXACTLY the configured id, ignoring the old file.
+        // With both present, the lookup picks exactly the configured id.
         write_pair(&configured_id);
         let picked = configured_acme_cert_pair(dir.path(), label, &configured)
             .expect("configured-domains cert must be found");
@@ -17981,8 +17114,8 @@ directory = \"production\"
         );
     }
 
-    // A missing configured-domains cert (only a partial pair, or nothing) reads as
-    // "not stored yet" — a benign first-run state, never a hard scan miss.
+    // A missing configured-domains cert (nothing, or a partial pair) is the benign first-run
+    // state "not stored yet".
     #[test]
     fn acme_scan_absent_configured_cert_is_not_stored() {
         let dir = tempfile::tempdir().unwrap();
@@ -17995,23 +17128,18 @@ directory = \"production\"
         // Nothing stored yet.
         assert!(configured_acme_cert_pair(dir.path(), label, &domains).is_none());
 
-        // Only the chain (no key) — mirrors FsAcmeStore treating a partial pair as
-        // absent.
+        // Only the chain, no key: FsAcmeStore treats a partial pair as absent.
         std::fs::write(cert_dir.join(format!("{id}.chain.pem")), b"chain").unwrap();
         assert!(configured_acme_cert_pair(dir.path(), label, &domains).is_none());
 
-        // The graded result for an absent cert is the benign "not configured yet".
         assert_eq!(
             resolve_acme_stored_cert_data(dir.path(), label, &domains),
             TlsDoctorData::NotConfigured
         );
     }
 
-    // Codex review (#1864): a directory (or any other non-regular node)
-    // occupying a cert path is a genuinely broken cache, not an absent one.
-    // It must grade as Invalid (a --strict FAIL), never the benign
-    // NotConfigured Pass — otherwise doctor blesses a cache that will fail to
-    // load at boot.
+    // A directory (or other non-regular node) at a cert path is a broken cache, not an absent
+    // one (#1864): the runtime fails to load it at boot, so it grades Invalid, not NotConfigured.
     #[cfg(feature = "tls")]
     #[test]
     fn acme_scan_occupied_directory_is_invalid_not_not_configured() {
@@ -18021,8 +17149,7 @@ directory = \"production\"
         let domains = vec!["app.example.com".to_owned()];
         let id = acme_cert_id(&domains);
 
-        // The chain path is occupied by a directory instead of a file; the
-        // key path is a normal (if bogus) file.
+        // The chain path is a directory; the key path is an ordinary file.
         std::fs::create_dir_all(cert_dir.join(format!("{id}.chain.pem"))).unwrap();
         std::fs::write(cert_dir.join(format!("{id}.key.pem")), b"key").unwrap();
 
@@ -18039,12 +17166,9 @@ directory = \"production\"
         );
     }
 
-    // Drift guard (#1608, Codex): the doctor's feature-less replica of the cert-id
-    // hashing MUST stay byte-for-byte equal to the store's
-    // `CertId::from_domains`. Only compiled with this crate's `tls` feature
-    // (on by default — it pulls in `autumn_web::acme`; this crate's own,
-    // separate `acme` feature is not what gates it, see #1864), so the two
-    // derivations are compared directly.
+    // Doctor's feature-less replica of the cert-id hashing must match the store's
+    // `CertId::from_domains` byte for byte. Gated on this crate's `tls` feature (on by default),
+    // which pulls in `autumn_web::acme`; the separate `acme` feature does not gate it (#1864).
     #[cfg(feature = "tls")]
     #[test]
     fn doctor_cert_id_matches_store() {
@@ -18087,12 +17211,9 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_passes_in_production_with_native_transport_only() {
-        // A native transport (PagerDuty routing key, or a Slack/Discord webhook)
-        // is a valid destination: the runtime registers the channel and
-        // `has_destination()` returns true, so doctor must NOT warn "no operator
-        // alert destination" — otherwise a native-only prod config fails
-        // `--strict` while it delivers fine at runtime. The only destination here
-        // is the native transport (email/webhook/custom all absent).
+        // A native transport (PagerDuty routing key, Slack/Discord webhook) is a valid
+        // destination: the runtime's `has_destination()` returns true for it. It is the only
+        // destination configured here.
         let r = check_alert_destination_impl(
             true,  // alerts_enabled
             "",    // email
@@ -18116,8 +17237,7 @@ directory = \"production\"
                 .contains("no operator alert destination"),
             "must not warn about a missing destination when a native transport is configured"
         );
-        // Sanity: with the native flag off and nothing else configured, the same
-        // production config DOES warn — proving the flag is what flips the gate.
+        // With the native flag off, the same config warns.
         let off = check_alert_destination_impl(
             true,
             "",
@@ -18135,8 +17255,7 @@ directory = \"production\"
 
     #[test]
     fn native_alert_transport_configured_matches_runtime_predicate() {
-        // Mirrors AlertConfig::has_destination for native transports: any of the
-        // three configs present (non-empty after trim) counts.
+        // Mirrors AlertConfig::has_destination: any native config non-empty after trim counts.
         assert!(!native_alert_transport_configured("", "", ""));
         assert!(!native_alert_transport_configured("  ", "\t", " "));
         assert!(native_alert_transport_configured("R0UT1NGKEY", "", ""));
@@ -18204,22 +17323,17 @@ directory = \"production\"
     }
 
     // ── email destination requires a usable mail transport (issue #1610) ──────
-    // Runtime `alerts::install_from_config` skips `MailAlertChannel` when
-    // `mailer.is_disabled()` (the disabled transport, which is the default
-    // outside dev), so doctor must not count an email against a disabled
-    // transport. These wire `resolve_effective_mail_transport` (the exact helper
-    // the doctor mail check uses) to the destination check, mirroring `run()`.
+    // `alerts::install_from_config` skips `MailAlertChannel` when the mailer is disabled (the
+    // default outside dev), so doctor does not count an email against a disabled transport.
 
     #[test]
     fn alert_destination_email_only_with_disabled_transport_warns_in_prod() {
-        // `[alerts] email` is set, but there is no `[mail] transport` — in a prod
-        // profile that resolves to the `disabled` default, so the runtime installs
-        // NO email alert channel. Doctor must NOT count the email and must warn.
+        // With no `[mail] transport`, a prod profile resolves to `disabled`, so the runtime
+        // installs no email channel.
         let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(email, "the [alerts] email itself resolves as present");
         assert!(!webhook);
-        // No env override, no `[mail] transport`, prod profile → "disabled".
         let transport = resolve_effective_mail_transport(None, None, "prod");
         assert_eq!(transport, "disabled");
         let usable = transport != "disabled";
@@ -18249,14 +17363,12 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_email_with_usable_transport_passes_in_prod() {
-        // Same email, but `[mail] transport = "smtp"` (a real, usable backend) →
-        // the runtime installs the channel, so doctor counts the email and passes.
         let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(email, "the [alerts] email resolves as present");
         let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
         assert_eq!(transport, "smtp");
-        // SMTP requires a `from`; this happy path has one set, so it still passes.
+        // SMTP requires a `from`; one is set here.
         let requires_from = mail_transport_requires_from(&transport);
         let r = check_alert_destination_impl(
             true,
@@ -18288,17 +17400,12 @@ directory = \"production\"
     }
 
     // ── email destination requires a mail `from` for SMTP (issue #1610) ───────
-    // The runtime's `MailAlertChannel` builds alert mail with NO per-message
-    // `from`, so it falls back to the mailer default (`[mail] from`). Under
-    // `transport = "smtp"` with no `[mail] from`, delivery fails in
-    // autumn-web's `lettre_message` with "mail from address is required". Doctor
-    // mirrors this: an SMTP email with no `from` is not a working destination.
-    // `log`/`file` deliver without a `from`, so they must NOT be over-gated.
+    // `MailAlertChannel` sets no per-message `from`, so alert mail uses `[mail] from`. Under SMTP
+    // with none set, `lettre_message` fails with "mail from address is required". `log`/`file`
+    // deliver without a `from`.
 
     #[test]
     fn alert_destination_email_smtp_with_from_passes_in_prod() {
-        // (a) email + smtp + a `[mail] from` set → the runtime installs a channel
-        // that can send, so doctor counts the email and passes in prod.
         let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
         assert_eq!(transport, "smtp");
         let requires_from = mail_transport_requires_from(&transport);
@@ -18324,10 +17431,8 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_email_smtp_without_from_warns_in_prod() {
-        // (b) email + smtp + NO `[mail] from` → SMTP delivery fails with "mail
-        // from address is required", so doctor must NOT count the email and must
-        // warn with the dedicated `from` message (distinct from the
-        // disabled-transport and no-destination warnings).
+        // The warning names the missing `from`, distinct from the disabled-transport and
+        // no-destination warnings.
         let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
         let requires_from = mail_transport_requires_from(&transport);
         let mail_from = "";
@@ -18357,9 +17462,6 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_email_log_transport_without_from_still_passes() {
-        // (c) email + `log` transport + NO `[mail] from` → the log transport
-        // renders `from` only when present and delivers without it, so a missing
-        // `from` must NOT down-grade the destination. Do not over-gate.
         let transport = resolve_effective_mail_transport(None, Some("log"), "prod");
         assert_eq!(transport, "log");
         let requires_from = mail_transport_requires_from(&transport);
@@ -18387,13 +17489,9 @@ directory = \"production\"
     }
 
     // ── invalid `[mail] from` for SMTP (issue #1610 follow-up) ────────────────
-    // A present-but-unparsable `[mail] from` on an SMTP transport makes the
-    // runtime ABORT boot (`MailerBuilder::build` runs `parse_mailbox`), and the
-    // alert mail — which carries no per-message `from` — has no valid default to
-    // fall back to. Doctor must catch this PRE-deploy: NOT count the email and
-    // surface a dedicated warning naming the value, distinct from the
-    // missing-`from` case. Valid display-name senders must NOT be over-rejected,
-    // and non-SMTP transports (which never parse `from`) stay lenient.
+    // An unparsable `[mail] from` on SMTP aborts boot (`MailerBuilder::build` runs
+    // `parse_mailbox`) and leaves alert mail with no valid sender. Non-SMTP transports never
+    // parse `from`.
 
     #[test]
     fn alert_destination_email_smtp_with_invalid_from_warns_in_prod() {
@@ -18427,9 +17525,7 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_email_smtp_with_display_name_from_passes_in_prod() {
-        // A valid RFC 5322 display-name `from` (`Ops <ops@example.com>`) is what
-        // the runtime's `parse_mailbox` accepts, so doctor must accept it too and
-        // still count the email destination — no over-rejection.
+        // The runtime's `parse_mailbox` accepts an RFC 5322 display-name `from`.
         let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
         let requires_from = mail_transport_requires_from(&transport);
         let r = check_alert_destination_impl(
@@ -18452,8 +17548,6 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_email_smtp_with_invalid_from_is_lenient_in_dev() {
-        // Dev-mode leniency mirrors the rest of the check: an invalid `[mail] from`
-        // is not a hard problem locally, so it must NOT warn outside production.
         let transport = resolve_effective_mail_transport(None, Some("smtp"), "prod");
         let requires_from = mail_transport_requires_from(&transport);
         let r = check_alert_destination_impl(
@@ -18476,9 +17570,6 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_email_log_transport_with_invalid_from_still_passes() {
-        // A `log` transport never parses `[mail] from`, so even a garbage value
-        // must NOT down-grade the destination. Do not over-gate non-SMTP
-        // transports (parity with the runtime, which requires a from only for smtp).
         let transport = resolve_effective_mail_transport(None, Some("log"), "prod");
         assert_eq!(transport, "log");
         let requires_from = mail_transport_requires_from(&transport);
@@ -18502,17 +17593,12 @@ directory = \"production\"
     }
 
     // ── invalid `[alerts] email` (issue #1610 follow-up) ──────────────────────
-    // lettre parses the recipient only at SEND time (`lettre_message`), not when
-    // the alert `Mail` is built, so a present-but-unparsable address passes every
-    // earlier gate yet fails EVERY delivery at runtime with
-    // `MailError::InvalidAddress`. Doctor must count such an email as no usable
-    // destination and surface a dedicated warning naming the bad value.
+    // lettre parses the recipient only at send time (`lettre_message`), so an unparsable address
+    // passes every earlier gate yet fails every delivery with `MailError::InvalidAddress`.
 
     #[test]
     fn alert_destination_invalid_email_warns_in_prod() {
-        // A non-empty but syntactically invalid address on an otherwise-usable
-        // SMTP transport with a `[mail] from` set: without this gate doctor would
-        // PASS, yet every runtime send fails with an invalid-address error.
+        // Usable SMTP transport with a `[mail] from` set: only the address is wrong.
         let r = check_alert_destination_impl(
             true,
             "not-an-address",
@@ -18545,8 +17631,6 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_invalid_email_is_lenient_in_dev() {
-        // Dev-mode leniency mirrors the rest of the check: an invalid email is not
-        // a hard problem locally, so it must NOT warn outside production.
         let r = check_alert_destination_impl(
             true,
             "not-an-address",
@@ -18567,8 +17651,6 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_valid_plus_addressing_passes_in_prod() {
-        // A perfectly valid address using `+` sub-addressing and a multi-label
-        // domain must NOT be rejected — the validity check must not over-reject.
         let r = check_alert_destination_impl(
             true,
             "a+b@sub.example.co",
@@ -18589,12 +17671,9 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_mailto_uri_email_warns_in_prod() {
-        // `[alerts] email = "mailto:oncall@example.com"` is handed verbatim to
-        // lettre, which rejects the `mailto:` URI as a bare recipient — so every
-        // send fails at runtime. A prior fix used the unsubscribe-mailto validator
-        // (which strips `mailto:` and returned true), letting doctor PASS a config
-        // that can never deliver. The bare-mailbox check must reject it and surface
-        // the dedicated invalid-email warning.
+        // lettre rejects a `mailto:` URI as a bare recipient, so every send fails. The unsubscribe
+        // `mailto` validator strips the prefix and would accept it; this needs the bare-mailbox
+        // check.
         let r = check_alert_destination_impl(
             true,
             "mailto:oncall@example.com",
@@ -18627,8 +17706,6 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_invalid_email_not_a_destination_when_alerts_disabled() {
-        // With alerting disabled, an invalid email is not a (real) destination, so
-        // the disabled-switch warning must NOT claim a destination is configured.
         let r = check_alert_destination_impl(
             false, // alerting disabled
             "not-an-address",
@@ -18653,9 +17730,8 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_webhook_survives_disabled_transport() {
-        // The prod profile clears the email, but a signed webhook is present. The
-        // webhook path is independent of the mailer, so a disabled mail transport
-        // must not down-grade an otherwise-valid webhook destination.
+        // The webhook path does not use the mailer, so a disabled mail transport does not
+        // affect it.
         let table: toml::Table = toml::from_str(
             "[alerts]\nemail = \"ops@example.com\"\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n[profile.prod.alerts]\nemail = \"\"\n",
         )
@@ -18663,7 +17739,6 @@ directory = \"production\"
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
         assert!(!email, "the prod profile cleared the email");
         assert!(webhook, "the signed webhook remains configured");
-        // Mail transport disabled — irrelevant to the webhook path.
         let r = check_alert_destination_impl(
             true,
             "",
@@ -18698,8 +17773,6 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_prod_profile_clears_base_email() {
-        // Base sets an email; the prod profile explicitly clears it with an empty
-        // string. A production run must resolve to "no destination" so doctor warns.
         let table: toml::Table = toml::from_str(
             "[alerts]\nemail = \"dev@example.com\"\n[profile.prod.alerts]\nemail = \"\"\n",
         )
@@ -18711,7 +17784,6 @@ directory = \"production\"
             "an empty prod-profile override must CLEAR the base email, not OR it back in"
         );
 
-        // And the surfaced doctor check warns in production for this config.
         let r = check_alert_destination_impl(
             true,
             "",
@@ -18729,8 +17801,7 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_dev_profile_does_not_clear_base_for_prod_run() {
-        // A dev-profile override must not affect a prod run: only the active
-        // profile's layer participates.
+        // Only the active profile's layer participates.
         let table: toml::Table = toml::from_str(
             "[alerts]\nemail = \"dev@example.com\"\n[profile.dev.alerts]\nemail = \"\"\n",
         )
@@ -18742,10 +17813,8 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_empty_env_clears_base_email() {
-        // An explicitly-empty AUTUMN_ALERTS__EMAIL is the highest-priority layer
-        // and must CLEAR a base value; an unset webhook var falls through to base.
-        // The base carries BOTH a webhook_url and a webhook_secret so the webhook
-        // is a real (signed) destination.
+        // An empty AUTUMN_ALERTS__EMAIL is the highest-priority layer and clears the base value;
+        // the unset webhook vars fall through to the base's signed webhook.
         let table: toml::Table = toml::from_str(
             "[alerts]\nemail = \"dev@example.com\"\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
         )
@@ -18761,8 +17830,6 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_nonempty_env_wins_over_absent_toml() {
-        // Env supplies both the webhook URL and its signing secret, so the webhook
-        // resolves as a real signed destination with no TOML present.
         let env = |key: &str| match key {
             "AUTUMN_ALERTS__WEBHOOK_URL" => Some("https://hooks.example/y".to_owned()),
             "AUTUMN_ALERTS__WEBHOOK_SECRET" => Some("s3cr3t".to_owned()),
@@ -18778,8 +17845,6 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_webhook_requires_secret() {
-        // (a) URL + secret both set at base → webhook is a real destination and a
-        // production run passes.
         let table: toml::Table = toml::from_str(
             "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
         )
@@ -18807,8 +17872,7 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_webhook_url_without_secret_is_not_configured() {
-        // (b) URL set but secret MISSING → runtime installs no (unsigned) channel,
-        // so doctor must NOT count it and must warn in production.
+        // The runtime installs no unsigned webhook channel.
         let table: toml::Table =
             toml::from_str("[alerts]\nwebhook_url = \"https://hooks.example/x\"\n").unwrap();
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&table), "prod");
@@ -18837,9 +17901,6 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_prod_profile_clears_webhook_secret() {
-        // (c) URL + secret set at base, but the prod profile CLEARS the secret with
-        // an empty string → the higher (profile) layer wins, so the webhook is not
-        // a signed destination and doctor warns in production.
         let table: toml::Table = toml::from_str(
             "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n[profile.prod.alerts]\nwebhook_secret = \"\"\n",
         )
@@ -18864,7 +17925,7 @@ directory = \"production\"
         );
         assert!(matches!(r.status, CheckStatus::Warn));
 
-        // And an empty AUTUMN_ALERTS__WEBHOOK_SECRET env var clears it just the same.
+        // An empty AUTUMN_ALERTS__WEBHOOK_SECRET clears it too.
         let env = |key: &str| (key == "AUTUMN_ALERTS__WEBHOOK_SECRET").then(String::new);
         let (_email, webhook_env) =
             resolve_alert_destination_from_sources(env, Some(&table), "prod");
@@ -18876,8 +17937,6 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_absolute_webhook_url_with_secret_passes() {
-        // An absolute https URL + secret is a real destination: the runtime's HTTP
-        // client dispatches it and the signed POST is deliverable → prod passes.
         let table: toml::Table = toml::from_str(
             "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
         )
@@ -18902,8 +17961,7 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_absolute_http_webhook_url_with_secret_passes() {
-        // Runtime treats `http://…` as absolute too (it does not require TLS), so
-        // doctor must accept it — rejecting it would be a false-positive warning.
+        // The runtime treats `http://` as absolute too; it does not require TLS.
         let table: toml::Table = toml::from_str(
             "[alerts]\nwebhook_url = \"http://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
         )
@@ -18931,11 +17989,9 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_relative_webhook_url_is_not_configured_and_warns() {
-        // A relative `webhook_url` (no scheme) + secret: the runtime's HTTP client
-        // only dispatches URLs starting with http(s)://, and an alert webhook has
-        // no base-url alias to resolve a relative value against, so EVERY signed
-        // POST fails. doctor must NOT count it and must emit its DEDICATED warning
-        // naming the value in production — not the generic "no destination" one.
+        // The runtime's HTTP client dispatches only http(s):// URLs, and an alert webhook has no
+        // base URL to resolve a relative value against, so every signed POST fails. Production
+        // gets a warning naming the value, not the generic "no destination" one.
         let table: toml::Table = toml::from_str(
             "[alerts]\nwebhook_url = \"hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
         )
@@ -18971,8 +18027,6 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_relative_webhook_url_is_lenient_in_dev() {
-        // Outside production the check stays lenient — a malformed webhook URL is
-        // not fatal locally, so it passes quietly like the rest of this check.
         let r = check_alert_destination_impl(
             true,
             "",
@@ -18989,13 +18043,10 @@ directory = \"production\"
     }
 
     // ── merged-config view (issue #1610) ──────────────────────────────────────
-    // The wrapper now resolves against the fully-merged effective config the
-    // runtime boots with — base `autumn.toml` layered with `[profile.{name}]` and
-    // the `autumn-{profile}.toml` override file, alias-normalized — reading the
-    // flattened top-level `[alerts]` with an EMPTY profile. These tests build the
-    // merged table with the same `deep_merge` the runtime loader uses (the doctor
-    // bin deliberately avoids process-global cwd mutation, so the file merge is
-    // exercised through its merge primitive rather than real on-disk files).
+    // Doctor resolves `[alerts]` from the fully merged config (base `autumn.toml` +
+    // `[profile.{name}]` + `autumn-{profile}.toml`, alias-normalized) with an empty profile.
+    // These tests build that table with `deep_merge` instead of on-disk files, because the
+    // doctor bin does not change the process cwd.
 
     #[test]
     fn normalize_alert_profile_resolves_aliases() {
@@ -19006,7 +18057,6 @@ directory = \"production\"
         assert_eq!(normalize_alert_profile("  prod "), "prod");
         assert_eq!(normalize_alert_profile("development"), "dev");
         assert_eq!(normalize_alert_profile("DEV"), "dev");
-        // Custom profiles keep their operator-specified spelling; blank stays blank.
         assert_eq!(normalize_alert_profile("staging"), "staging");
         assert_eq!(normalize_alert_profile(""), "");
         assert_eq!(normalize_alert_profile("   "), "");
@@ -19014,11 +18064,8 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_merged_override_file_clears_base_email() {
-        // Base `autumn.toml` sets the only alert channel; an `autumn-prod.toml`
-        // override file CLEARS it with an empty string. `deep_merge` flattens the
-        // override over the base into the top-level `[alerts]`, exactly as
-        // `get_merged_toml_table_runtime` produces. Resolving against this flattened
-        // view with an EMPTY profile must see NO destination → doctor warns in prod.
+        // `autumn-prod.toml` clears the only alert channel. `deep_merge` flattens it onto the
+        // top-level `[alerts]`, so resolving with an empty profile must see no destination.
         let mut merged: toml::Table =
             toml::from_str("[alerts]\nemail = \"dev@example.com\"\n").unwrap();
         let override_file: toml::Table = toml::from_str("[alerts]\nemail = \"\"\n").unwrap();
@@ -19049,17 +18096,13 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_merged_ignores_stale_profile_section() {
-        // The merged table still carries the ORIGINAL raw `[profile.prod.alerts]`
-        // (the base is deep-merged wholesale), but the override file already
-        // flattened the effective value onto the top-level `[alerts]`. Resolving
-        // with an EMPTY profile must read the flattened top-level, NOT the stale
-        // `[profile.prod.alerts]` — otherwise a non-empty stale section would
-        // spuriously mask a file-cleared destination and re-open the #1610 hole.
+        // The merged table still carries the raw `[profile.prod.alerts]`, but the override file
+        // already flattened the effective value onto the top-level `[alerts]`. Resolution must
+        // read the top level, or a stale profile section would mask a cleared destination.
         let mut merged: toml::Table = toml::from_str(
             "[alerts]\nemail = \"dev@example.com\"\n[profile.prod.alerts]\nemail = \"ops@example.com\"\n",
         )
         .unwrap();
-        // autumn-prod.toml clears email; deep_merge flattens it onto top-level [alerts].
         let override_file: toml::Table = toml::from_str("[alerts]\nemail = \"\"\n").unwrap();
         deep_merge(&mut merged, &override_file);
 
@@ -19072,8 +18115,6 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_merged_base_email_survives_without_override() {
-        // No override / profile clear: the base email flows through the merged view
-        // and a production run passes.
         let merged: toml::Table =
             toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
         let (email, webhook) = resolve_alert_destination_from_sources(no_env, Some(&merged), "");
@@ -19096,9 +18137,8 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_destination_merged_webhook_requires_both_url_and_secret() {
-        // Base configures a signed webhook (url + secret); the override file clears
-        // the SECRET. Through the flattened merged view the webhook is no longer a
-        // signed destination, so doctor must not count it and must warn in prod.
+        // The override file clears the webhook secret, so the webhook is no longer a signed
+        // destination and must not count.
         let mut merged: toml::Table = toml::from_str(
             "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
         )
@@ -19127,7 +18167,6 @@ directory = \"production\"
         );
         assert!(matches!(r.status, CheckStatus::Warn));
 
-        // With both left intact through the merged view, the webhook still counts.
         let intact: toml::Table = toml::from_str(
             "[alerts]\nwebhook_url = \"https://hooks.example/x\"\nwebhook_secret = \"s3cr3t\"\n",
         )
@@ -19140,18 +18179,14 @@ directory = \"production\"
     }
 
     // ── [alerts] enabled master switch (issue #1610 follow-up) ────────────────
-    // The runtime `alerts::install_from_config` returns BEFORE installing any
-    // Alerter when `config.enabled` is false, so a prod deploy with alerting
-    // disabled delivers nothing even with a destination configured. Doctor must
-    // honour the same master switch (env > profile > base > default `true`).
+    // The runtime installs no alerter when `enabled` is false, so a configured destination
+    // delivers nothing. Doctor honours the same switch (env > profile > base > default `true`).
 
     #[test]
     fn resolve_alert_enabled_defaults_true_when_unset() {
-        // No `enabled` key anywhere → the runtime default (`true`) applies.
         let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
         let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
         assert!(enabled);
-        // Nothing configured at all still defaults to enabled.
         assert!(resolve_alert_enabled_from_sources(no_env, None, "prod"));
     }
 
@@ -19177,8 +18212,7 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_enabled_invalid_env_falls_through_to_toml() {
-        // A non-boolean env value is ignored (mirrors runtime), so the base
-        // `enabled = false` still wins.
+        // A non-boolean env value is ignored, as at runtime.
         let env = |k: &str| (k == "AUTUMN_ALERTS__ENABLED").then(|| "yes".to_owned());
         let table: toml::Table = toml::from_str("[alerts]\nenabled = false\n").unwrap();
         let enabled = resolve_alert_enabled_from_sources(env, Some(&table), "prod");
@@ -19187,8 +18221,6 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_enabled_profile_false_overrides_base_true() {
-        // A profile-specific `enabled = false` disables under that profile while
-        // the base (empty-profile resolution) stays enabled.
         let table: toml::Table = toml::from_str(
             "[alerts]\nemail = \"ops@example.com\"\n[profile.prod.alerts]\nenabled = false\n",
         )
@@ -19201,7 +18233,6 @@ directory = \"production\"
 
     #[test]
     fn alert_disabled_at_base_in_prod_with_email_warns() {
-        // (a) `[alerts] enabled = false` at base, email set, production run → warn.
         let table: toml::Table =
             toml::from_str("[alerts]\nenabled = false\nemail = \"ops@example.com\"\n").unwrap();
         let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
@@ -19232,8 +18263,6 @@ directory = \"production\"
 
     #[test]
     fn alert_disabled_via_env_in_prod_warns() {
-        // (b) `AUTUMN_ALERTS__ENABLED=false` env override in production → warn,
-        // even though the base leaves alerting enabled with an email set.
         let env = |k: &str| (k == "AUTUMN_ALERTS__ENABLED").then(|| "false".to_owned());
         let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
         let enabled = resolve_alert_enabled_from_sources(env, Some(&table), "prod");
@@ -19257,8 +18286,6 @@ directory = \"production\"
 
     #[test]
     fn alert_enabled_default_true_preserves_existing_prod_pass() {
-        // (c) `enabled` unset → defaults true; a configured email + usable
-        // transport in prod still passes exactly as before this change.
         let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
         let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "prod");
         let (_email, webhook) =
@@ -19281,7 +18308,6 @@ directory = \"production\"
 
     #[test]
     fn alert_disabled_in_dev_does_not_warn() {
-        // (d) Disabled in DEV stays lenient (no warning) like the rest of the check.
         let table: toml::Table =
             toml::from_str("[alerts]\nenabled = false\nemail = \"ops@example.com\"\n").unwrap();
         let enabled = resolve_alert_enabled_from_sources(no_env, Some(&table), "dev");
@@ -19306,16 +18332,13 @@ directory = \"production\"
     }
 
     // ── [alerts] custom_channel declaration (issue #1610 follow-up) ───────────
-    // An app that delivers alerts ONLY via `AppBuilder::with_alert_channel`
-    // (code, not config) still triggered doctor's no-destination Warn, which
-    // `--strict` turns into exit 1. `[alerts] custom_channel = true` lets the
-    // operator DECLARE the code-registered channel so the pure no-destination
-    // fall-through passes — while a *broken configured* destination still warns.
+    // `custom_channel = true` declares an alert channel registered in code
+    // (`AppBuilder::with_alert_channel`), so the no-destination fall-through passes. A broken
+    // configured destination still warns.
 
     #[test]
     fn alert_destination_custom_channel_passes_in_prod_without_destination() {
-        // custom_channel = true + no email/webhook in prod → PASS (not Warn), so
-        // `autumn doctor --strict` succeeds for a code-only alert setup.
+        // Passing keeps `autumn doctor --strict` green for a code-only alert setup.
         let r = check_alert_destination_impl(
             true,
             "",
@@ -19342,8 +18365,6 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_without_custom_channel_still_warns_in_prod() {
-        // custom_channel = false (default) + no destination in prod → still Warn,
-        // preserving the pre-existing behavior; the warning now points at the flag.
         let r = check_alert_destination_impl(
             true,
             "",
@@ -19367,9 +18388,8 @@ directory = \"production\"
 
     #[test]
     fn alert_destination_custom_channel_does_not_mask_broken_webhook() {
-        // custom_channel = true but a CONFIGURED webhook_url is relative/invalid →
-        // STILL warns about the broken value. custom_channel only suppresses the
-        // pure "no destination configured" fall-through, never a misconfigured one.
+        // `custom_channel` suppresses only the "no destination" fall-through, never a
+        // misconfigured destination.
         let r = check_alert_destination_impl(
             true,
             "",
@@ -19436,8 +18456,6 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_custom_channel_env_resolves_and_passes() {
-        // End-to-end at the resolver + check boundary: env sets the flag true, and
-        // with no configured destination in prod the check passes.
         let table: toml::Table = toml::from_str("[alerts]\nemail = \"ops@example.com\"\n").unwrap();
         let env = |k: &str| (k == "AUTUMN_ALERTS__CUSTOM_CHANNEL").then(|| "true".to_owned());
         let custom = resolve_alert_custom_channel_from_sources(env, Some(&table), "prod");
@@ -19479,10 +18497,9 @@ directory = \"production\"
     }
 
     // ── check_alert_error_rate_threshold_impl (issue #1610) ──────────────────
-    // The threshold is compared against a FRACTION in [0, 1] (rate = err/req), so
-    // only (0, 1] is meaningful. A non-finite value or one > 1 makes the 5xx alert
-    // never fire; a value <= 0 makes it fire on 0%-error windows. In production
-    // doctor warns; outside production it passes quietly (alerts are optional).
+    // The threshold is compared against a fraction (err/req), so only (0, 1] is meaningful:
+    // above 1 or non-finite never fires, and <= 0 fires on error-free windows. Production
+    // warns; dev passes quietly.
 
     #[test]
     fn alert_threshold_unset_passes() {
@@ -19535,7 +18552,6 @@ directory = \"production\"
 
     #[test]
     fn alert_threshold_invalid_is_lenient_outside_prod() {
-        // Dev leniency, consistent with the other alert checks: still pass.
         for v in ["nan", "1.5", "0", "-0.1"] {
             let r = check_alert_error_rate_threshold_impl(v, false);
             assert!(
@@ -19556,7 +18572,6 @@ directory = \"production\"
 
     #[test]
     fn resolve_alert_error_rate_threshold_out_of_range_float_warns() {
-        // A present, out-of-range float resolves and the check warns in prod.
         let table: toml::Table = toml::from_str("[alerts]\nerror_rate_threshold = 1.5\n").unwrap();
         let raw = resolve_alert_error_rate_threshold_from_sources(no_env, Some(&table), "prod");
         assert_eq!(raw, "1.5");
@@ -19602,10 +18617,8 @@ directory = \"production\"
     }
 
     // ── check_alert_transports_impl (issue #1630) ────────────────────────────
-    // A configured native transport (PagerDuty / Slack / Discord) must carry the
-    // values it needs to deliver. Production warns on a malformed routing key, a
-    // non-absolute pagerduty_url, or a non-absolute-https Slack/Discord URL; dev
-    // passes quietly (these transports are optional locally).
+    // A configured PagerDuty / Slack / Discord transport must carry what it needs to deliver.
+    // Production warns on a malformed routing key or URL; dev passes quietly.
 
     #[test]
     fn alert_transports_none_configured_passes() {
@@ -19692,7 +18705,6 @@ directory = \"production\"
 
     #[test]
     fn alert_transports_invalid_is_lenient_outside_prod() {
-        // Every invalid case passes quietly in dev, like the other alert checks.
         let r = check_alert_transports_impl(
             "bad key",
             "not-a-url",
@@ -19983,10 +18995,8 @@ foo = "bar"
         assert_eq!(r.status, CheckStatus::Pass);
     }
 
-    // `KNOWN_TOML_SECTIONS` lists `mail`, but autumn-web's config schema
-    // (`get_schema_keys`) drops the `[mail]` section under the sqlite backend-flip
-    // build (mail feature off), so this static-list-vs-runtime-schema parity check
-    // is gated to the default (Postgres) build where `[mail]` is compiled in.
+    // autumn-web's schema drops `[mail]` when the mail feature is off (the sqlite build), but
+    // `KNOWN_TOML_SECTIONS` always lists it, so this parity check runs on Postgres only.
     #[cfg(feature = "postgres")]
     #[test]
     fn check_toml_content_all_known_sections_pass() {
@@ -20083,12 +19093,9 @@ foo = "bar"
 
     #[test]
     fn doctor_checks_never_make_rustup_install_a_toolchain() {
-        // Regression, caught by the Windows Tier 1 journey: doctor runs its
-        // checks at the same time, and `rustc`/`cargo` there are rustup's shims,
-        // which install the project's pinned toolchain on first use. Several
-        // checks installing it at once left it half-installed, and the next
-        // `cargo` failed with "the 'cargo.exe' binary ... is not applicable to
-        // the '1.88.0' toolchain". A check must not install anything.
+        // Doctor runs its checks concurrently, and on Windows `rustc`/`cargo` are rustup shims
+        // that install the pinned toolchain on first use. Concurrent installs left it
+        // half-installed and broke the next `cargo`. A check must never install anything.
         let doctor = include_str!("doctor.rs");
         assert!(
             fn_body(doctor, "fn check_rust_toolchain(msrv").contains("no_toolchain_installs(&mut"),
@@ -20361,9 +19368,8 @@ foo = "bar"
 
     #[test]
     fn split_topology_fails_on_web_role_with_backend_typo() {
-        // A typo like `postgresql` is not a recognized durable backend: it falls
-        // through to the in-process local runtime, so a split role must be
-        // rejected exactly as it is for the literal `local`.
+        // An unrecognized backend such as `postgresql` falls through to the in-process local
+        // runtime, so a split role is rejected as for `local`.
         let result = check_split_topology_on_local(&ProcessRole::Web.into(), "postgresql", None);
         assert_eq!(result.status, CheckStatus::Fail);
         let detail = result.detail.unwrap_or_default();
@@ -20430,10 +19436,8 @@ foo = "bar"
 
     #[test]
     fn queue_coverage_passes_for_valid_subset_pin() {
-        // REVISED for the queue-coverage redesign (#1461): a subset pin that
-        // still claims at least one known queue is a legitimate multi-tier
-        // deployment, not a failure. It passes and reports the unclaimed queues
-        // as informational detail (must NOT fail `--strict`).
+        // #1461: a subset pin that claims at least one known queue is a legitimate multi-tier
+        // deployment. It passes and lists the unclaimed queues.
         let queues = vec!["critical".to_string(), "low".to_string()];
         let pin = vec!["critical".to_string()];
         let result = check_queue_coverage(&ProcessRole::Combined.into(), &queues, &pin);
@@ -20443,16 +19447,11 @@ foo = "bar"
 
     #[test]
     fn queue_coverage_passes_for_web_role_even_with_failing_pin() {
-        // A web-only replica (`AUTUMN_ROLE=web` / `role = "web"`) runs ZERO job
-        // workers, so queue-pinning coverage is irrelevant to it: doctor must not
-        // fail `--strict` on queue coverage for a web tier. Use a pin that would
-        // otherwise Warn on a worker-bearing role — an empty effective schedule
-        // (pin references only unknown queues). The web role has no
-        // `job_workers` capability, so it passes regardless.
+        // A web-only role runs no job workers, so queue coverage does not apply to it. The pin
+        // names only unknown queues, the worst case for a worker-bearing role.
         let queues = vec!["default".to_string()];
         let pin = vec!["critical".to_string()]; // matches no known queue → would Warn on a worker
 
-        // Web role: coverage is not applicable → Pass, and `--strict` stays green.
         let web = check_queue_coverage(&ProcessRole::Web.into(), &queues, &pin);
         assert_eq!(web.status, CheckStatus::Pass);
         assert!(
@@ -20470,10 +19469,9 @@ foo = "bar"
         };
         assert_eq!(exit_code(&web_summary, true), 0);
 
-        // Sanity: the SAME pin on a worker-bearing role is now INFORMATIONAL-ONLY
-        // — it Passes and never fails `--strict`. doctor is config-only and
-        // per-process, so it cannot prove a genuine zero-coverage gap; the
-        // authoritative check is the runtime startup warning.
+        // On a worker-bearing role the same pin is informational only: doctor reads one
+        // process's config and cannot prove a coverage gap. The runtime startup warning is the
+        // authoritative check.
         let worker = check_queue_coverage(&ProcessRole::Worker.into(), &queues, &pin);
         assert_eq!(worker.status, CheckStatus::Pass);
         let worker_summary = Summary {
@@ -20502,27 +19500,19 @@ foo = "bar"
 
     #[test]
     fn queue_coverage_reports_default_when_zero_config_app_is_pinned_elsewhere() {
-        // A zero-config app's only configured queue is the implicit `default`. Pinning
-        // to `critical`, absent from `[jobs.queues]`, is informational only: doctor is
-        // config-only and cannot know whether `critical` is a `#[job(queue =
-        // "critical")]`-declared queue the runtime appends to the effective schedule
-        // and drains, nor whether a sibling worker tier covers `default`. So the check
-        // passes, never failing `--strict`, and reports both facts. The authoritative
-        // zero-coverage guard is the runtime startup warning
-        // (`warn_pinned_uncovered_queues`). Before this change the case warned and
-        // failed `--strict`.
+        // `critical` is absent from `[jobs.queues]`, but it may be a `#[job(queue = "critical")]`
+        // queue the runtime drains, and a sibling tier may cover `default`. Doctor cannot see
+        // either, so the check passes and reports both. The runtime's
+        // `warn_pinned_uncovered_queues` is the authoritative guard.
         let table: toml::Table = toml::from_str("[jobs]\npin = [\"critical\"]\n").expect("parse");
         let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
         let result = check_queue_coverage(&ProcessRole::Combined.into(), &queues, &pin);
         assert_eq!(result.status, CheckStatus::Pass);
         let detail = result.detail.unwrap();
-        // Reports that configured `default` is not claimed by this pin...
         assert!(
             detail.contains("default"),
             "detail should name the unclaimed configured queue: {detail}"
         );
-        // ...and that pinned `critical` is not in [jobs.queues] and may be
-        // job-declared / drained by the runtime.
         assert!(
             detail.contains("critical"),
             "detail should name the config-unknown pinned queue: {detail}"
@@ -20531,7 +19521,6 @@ foo = "bar"
             detail.contains("job(queue"),
             "detail should note the pinned queue may be #[job(queue=…)]-declared: {detail}"
         );
-        // Informational only → `--strict` stays green.
         let summary = Summary {
             passed: 1,
             warned: 0,
@@ -20542,7 +19531,6 @@ foo = "bar"
 
     #[test]
     fn queue_coverage_passes_for_zero_config_app_without_pin() {
-        // No pin on a zero-config app: `default` is drained, no false positive.
         let table: toml::Table = toml::from_str("").expect("parse");
         let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
         assert_eq!(queues, vec!["default"]);
@@ -20555,23 +19543,16 @@ foo = "bar"
 
     #[test]
     fn queue_coverage_honors_profile_layer_jobs_config() {
-        // Regression for the #1623 review finding: when queue config is
-        // profile-specific, the coverage check must read the merged
-        // active-profile table (base + `[profile.<env>]` + `autumn-<env>.toml`)
-        // exactly like the runtime — not just the raw top-level `[jobs]`.
-        //
-        // Scenario: base `autumn.toml` has no top-level `[jobs]`; the prod
-        // profile pins `critical` while declaring `critical` + `bulk` queues,
-        // leaving `bulk` uncovered.
+        // #1623: queue config set only under a profile must be read from the merged
+        // active-profile table (base + `[profile.<env>]` + `autumn-<env>.toml`), as the runtime
+        // does. Here the prod profile pins `critical` and leaves `bulk` uncovered.
         let base: toml::Table = toml::from_str(
             "[profile.prod.jobs]\npin = [\"critical\"]\nqueues = [\"critical\", \"bulk\"]\n",
         )
         .expect("parse toml");
 
-        // Resolving from the raw top-level table sees no `[jobs]` at all, so it
-        // falls back to the implicit `default` queue with no pin — proving that
-        // WITHOUT merging the profile layer doctor never observes the profile's
-        // `jobs.pin`/`jobs.queues`.
+        // The raw top-level table has no `[jobs]`, so it falls back to the implicit `default`
+        // queue with no pin.
         let (raw_queues, raw_pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&base));
         assert_eq!(raw_queues, vec!["default"]);
         assert!(raw_pin.is_empty());
@@ -20580,14 +19561,9 @@ foo = "bar"
             CheckStatus::Pass
         );
 
-        // Merge the active `[profile.prod]` layer the same way
-        // `get_merged_toml_table_runtime` does, then resolve: the prod
-        // `jobs.queues` / `jobs.pin` are now honored. Under the queue-coverage
-        // redesign (#1461) pinning `critical` (a KNOWN queue) is a valid,
-        // non-empty subset schedule, so the check PASSES and reports the
-        // unclaimed `bulk` as informational detail (never fails `--strict`).
-        // Asserting the detail names `bulk` proves the profile layer's queues
-        // were actually merged and read.
+        // Merged as `get_merged_toml_table_runtime` does, the profile's queues and pin apply.
+        // Pinning the known `critical` is a valid subset (#1461); the detail naming `bulk` proves
+        // the profile's queues were read.
         let mut merged = toml::Table::new();
         deep_merge(&mut merged, &base);
         for profile_name in inline_profile_lookup_names("prod") {
@@ -20606,7 +19582,6 @@ foo = "bar"
         let result = check_queue_coverage(&ProcessRole::Combined.into(), &queues, &pin);
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(result.detail.unwrap().contains("bulk"));
-        // A valid subset pin must NOT fail `--strict`.
         let summary = Summary {
             passed: 1,
             warned: 0,
@@ -20617,37 +19592,25 @@ foo = "bar"
 
     #[test]
     fn queue_coverage_resolves_web_role_from_profile_layer() {
-        // Regression for the doctor.rs P2: the queue-coverage check reads
-        // `jobs.queues`/`jobs.pin` from the merged active-profile table, but the `role`
-        // it was gated on came from the raw top-level table. A `role` declared only
-        // under `[profile.prod]`, with AUTUMN_ENV=prod, was missed, so a web replica
-        // was treated as `Combined`: the web-role skip-gate never fired and a pin
-        // matching no known queue wrongly warned or failed `--strict`. The fix resolves
-        // the role from the same merged table. Scenario: base `autumn.toml` has no
-        // top-level `role`; the prod profile sets `role = "web"` and pins a queue
-        // matching nothing configured.
+        // The role must come from the same merged active-profile table as `jobs.queues` and
+        // `jobs.pin`. Here `role = "web"` is set only under `[profile.prod]`, with a pin that
+        // matches no configured queue.
         let base: toml::Table = toml::from_str(
             "[profile.prod]\nrole = \"web\"\n[profile.prod.jobs]\npin = [\"ghost\"]\nqueues = [\"critical\"]\n",
         )
         .expect("parse toml");
 
-        // BEFORE (bug): resolving the role from the RAW top-level table sees no
-        // `role`, so it defaults to `Combined`. A worker-bearing role with a pin
-        // that matches no known queue Warns → `--strict` fails. This is exactly
-        // the false failure the fix eliminates.
+        // The raw top-level table has no `role`, so it defaults to `Combined`, which runs
+        // workers.
         let (raw_role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&base));
         let raw_role = raw_role.expect("valid role");
         assert_eq!(raw_role, ProcessRole::Combined);
         let (raw_queues, raw_pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&base));
         let raw_result = check_queue_coverage(&raw_role, &raw_queues, &raw_pin);
-        // (raw table also misses the profile's queues/pin, but the load-bearing
-        // point is the role: Combined runs workers, so the gate does not skip.)
         assert!(raw_role.runs_workers());
         let _ = raw_result;
 
-        // AFTER (fix): merge the active `[profile.prod]` layer the same way
-        // `get_merged_toml_table_runtime` does, then resolve the role from the
-        // merged table. The prod `role = "web"` is now honored.
+        // Merged as `get_merged_toml_table_runtime` does, the prod `role = "web"` applies.
         let mut merged = toml::Table::new();
         deep_merge(&mut merged, &base);
         for profile_name in inline_profile_lookup_names("prod") {
@@ -20670,8 +19633,7 @@ foo = "bar"
         );
         assert!(!merged_role.runs_workers());
 
-        // The web role runs no workers, so the coverage check skips the pin
-        // evaluation entirely and PASSES even though the pin matches no queue.
+        // The web role runs no workers, so coverage is skipped although the pin matches no queue.
         let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&merged));
         let result = check_queue_coverage(&merged_role, &queues, &pin);
         assert_eq!(result.status, CheckStatus::Pass);
@@ -20691,10 +19653,8 @@ foo = "bar"
         };
         assert_eq!(exit_code(&summary, true), 0);
 
-        // AUTUMN_ROLE env still wins over the merged-table role (runtime
-        // precedence): a `worker` override on the same config runs workers. The
-        // pin matching no configured queue is now INFORMATIONAL-ONLY → Pass; the
-        // runtime startup warning is the authoritative coverage check.
+        // `AUTUMN_ROLE` still wins over the merged role. A worker with an unmatched pin passes:
+        // the check is informational, and the runtime startup warning is authoritative.
         let (env_role, _) = resolve_process_role_and_backend_from_sources(
             |key| (key == "AUTUMN_ROLE").then(|| "worker".to_owned()),
             Some(&merged),
@@ -20709,9 +19669,6 @@ foo = "bar"
 
     #[test]
     fn queue_coverage_web_role_from_top_level_role_still_passes() {
-        // No-regression companion: a top-level (non-profile) `role = "web"` must
-        // still resolve to `Web` and skip the coverage check — the profile-aware
-        // fix must not break the common flat-config case.
         let table: toml::Table =
             toml::from_str("role = \"web\"\n[jobs]\npin = [\"ghost\"]\nqueues = [\"critical\"]\n")
                 .expect("parse toml");
@@ -20731,11 +19688,8 @@ foo = "bar"
 
     #[test]
     fn queue_coverage_worker_role_from_profile_with_empty_schedule_is_informational() {
-        // A prod `role = "worker"` (worker-bearing) resolved from the profile
-        // layer, with a pin matching no queue in [jobs.queues], is now
-        // INFORMATIONAL-ONLY: doctor cannot see `#[job(queue=…)]`-declared queues
-        // or sibling tiers, so it PASSES (never fails `--strict`) and reports the
-        // gap. The authoritative guard is the runtime startup warning.
+        // Doctor cannot see `#[job(queue = …)]` queues or sibling tiers, so a pin matching no
+        // configured queue is informational: the check passes.
         let base: toml::Table = toml::from_str(
             "[profile.prod]\nrole = \"worker\"\n[profile.prod.jobs]\npin = [\"ghost\"]\nqueues = [\"critical\"]\n",
         )
@@ -20768,18 +19722,15 @@ foo = "bar"
 
     #[test]
     fn queue_coverage_passes_for_multi_tier_subset_pins() {
-        // #1461: a multi-tier deployment intentionally splits queues across
-        // worker tiers (e.g. one process pins `critical`, another pins
-        // `bulk,default`). Each tier's subset pin is legitimate and must NOT
-        // fail `--strict`, and a single doctor run cannot see sibling tiers.
+        // #1461: a multi-tier deployment splits queues across worker tiers. Each tier's subset
+        // pin is legitimate, and one doctor run cannot see the sibling tiers.
         let queues = vec![
             "critical".to_string(),
             "bulk".to_string(),
             "default".to_string(),
         ];
 
-        // Critical tier: pins only `critical`; the other queues are covered by
-        // another tier. Passes, and the informational detail names them.
+        // Critical tier: the detail names the queues left to other tiers.
         let critical_tier = check_queue_coverage(
             &ProcessRole::Combined.into(),
             &queues,
@@ -20793,7 +19744,6 @@ foo = "bar"
             "detail should list default: {detail}"
         );
 
-        // Bulk tier: pins `bulk,default`; also a valid subset → Pass.
         let bulk_tier = check_queue_coverage(
             &ProcessRole::Combined.into(),
             &queues,
@@ -20801,7 +19751,6 @@ foo = "bar"
         );
         assert_eq!(bulk_tier.status, CheckStatus::Pass);
 
-        // Neither tier warns, so `--strict` stays green.
         let summary = Summary {
             passed: 1,
             warned: 0,
@@ -20814,9 +19763,7 @@ foo = "bar"
 
     #[test]
     fn topology_absent_delegates_to_informational_pass() {
-        // Regression guard: with NO fleet topology declared the topology-aware
-        // check must behave exactly like the informational-only per-process
-        // report — a subset pin Passes and never fails `--strict`.
+        // Without a fleet topology the check matches the informational per-process report.
         let queues = vec!["critical".to_string(), "bulk".to_string()];
         let pin = vec!["critical".to_string()];
         let result = check_queue_coverage_topology(
@@ -20828,7 +19775,6 @@ foo = "bar"
             None, // no manifest error
         );
         assert_eq!(result.status, CheckStatus::Pass);
-        // Same detail the informational-only path produces (names the unclaimed).
         assert!(result.detail.unwrap().contains("bulk"));
         let summary = Summary {
             passed: 1,
@@ -20840,7 +19786,6 @@ foo = "bar"
 
     #[test]
     fn topology_with_full_union_coverage_passes() {
-        // The union of all declared tiers covers every needed queue → Pass.
         let queues = vec![
             "critical".to_string(),
             "bulk".to_string(),
@@ -20873,10 +19818,8 @@ foo = "bar"
 
     #[test]
     fn topology_valid_multi_tier_subset_split_does_not_fail() {
-        // The #1746 false-positive case: two tiers split the queues between them.
-        // A single process sees only its own pin (`critical`), which looks like a
-        // gap — but with the fleet topology declared the union covers everything,
-        // so `--strict` must NOT fail.
+        // #1746: one process sees only its own pin, which looks like a gap, but the declared
+        // fleet's union covers every queue.
         let queues = vec![
             "critical".to_string(),
             "bulk".to_string(),
@@ -20890,7 +19833,7 @@ foo = "bar"
             malformed: false,
             derived: false,
         };
-        // Run doctor as the critical tier (pin = critical): still Pass.
+        // Doctor runs as the critical tier.
         let result = check_queue_coverage_topology(
             &ProcessRole::Worker.into(),
             &queues,
@@ -20910,8 +19853,7 @@ foo = "bar"
 
     #[test]
     fn topology_with_genuine_gap_fails_strict() {
-        // A configured queue drained by NO declared tier is a provable gap → Fail,
-        // which `--strict` promotes to exit 1.
+        // A configured queue no tier drains is a provable gap; `--strict` turns it into exit 1.
         let queues = vec![
             "critical".to_string(),
             "bulk".to_string(),
@@ -20947,8 +19889,7 @@ foo = "bar"
 
     #[test]
     fn topology_unpinned_tier_covers_everything() {
-        // An unpinned tier (empty pin) drains every queue, so union coverage is
-        // total even when other tiers are narrow subsets → Pass.
+        // An unpinned tier drains every queue, so coverage is total.
         let queues = vec!["critical".to_string(), "bulk".to_string()];
         let fleet = FleetTopology {
             tiers: vec![
@@ -20971,11 +19912,8 @@ foo = "bar"
 
     #[test]
     fn topology_job_declared_queue_pinned_but_absent_from_config_passes() {
-        // The #1756 blindspot RESOLVED, not failed: a queue named in a tier's pin
-        // that is a `#[job(queue = "email")]`-declared queue (absent from
-        // [jobs.queues]) must Pass. With the declared set surfaced, `email` is in
-        // the needed set AND covered by the pinning tier → no gap; even without
-        // the declared set it is simply not needed → no gap.
+        // `email` is a `#[job(queue = "email")]` queue absent from `[jobs.queues]`. With the
+        // declared set known, it is needed and covered by the pinning tier.
         let queues = vec!["default".to_string()];
         let declared = vec!["email".to_string()];
         let fleet = FleetTopology {
@@ -20993,8 +19931,7 @@ foo = "bar"
         );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
 
-        // And with the declared set UNKNOWN (empty), still Pass — the job-declared
-        // pin never manufactures a gap.
+        // With the declared set unknown, a job-declared pin still makes no gap.
         let result_no_manifest = check_queue_coverage_topology(
             &ProcessRole::Worker.into(),
             &queues,
@@ -21024,14 +19961,11 @@ foo = "bar"
     #[test]
     fn documented_fleet_topology_examples_pass_the_coverage_check() {
         const GUIDE: &str = include_str!("../../docs/guide/jobs.md");
-        // The same example is mirrored in the `JobFleetConfig` rustdoc, where it
-        // is just as copy-pasteable; scan both so they cannot drift apart.
+        // The `JobFleetConfig` rustdoc mirrors the example; scan both so they cannot drift.
         const CONFIG_RS: &str = include_str!("../../autumn/src/config.rs");
 
-        // The sources interleave `[jobs.queues]` and `[jobs.fleet]`; a block may
-        // carry either or both. Only blocks that declare a topology are checked
-        // — the rest have nothing for this check to act on. Rustdoc fences carry
-        // a `/// ` prefix on every line, so strip it.
+        // Check only the blocks that declare a topology. Rustdoc fences carry a `/// ` prefix
+        // on every line, so strip it.
         let mut blocks: Vec<String> = GUIDE
             .split("```toml")
             .skip(1)
@@ -21111,9 +20045,7 @@ foo = "bar"
 
     #[test]
     fn topology_declared_gap_on_job_declared_queue_fails() {
-        // Once the declared set is known, a job-declared queue that NO tier drains
-        // is a provable gap the runtime would strand → Fail. This is the blindspot
-        // being *resolved* (surfaced as a real gap), not a false positive.
+        // Once the declared set is known, a job-declared queue no tier drains is a provable gap.
         let queues = vec!["default".to_string()];
         let declared = vec!["email".to_string()];
         let fleet = FleetTopology {
@@ -21136,8 +20068,6 @@ foo = "bar"
 
     #[test]
     fn topology_empty_tiers_stays_informational() {
-        // A `[jobs.fleet]` with no tiers declares nothing coverable, so it must
-        // not fail — it falls back to informational Pass.
         let queues = vec!["critical".to_string(), "bulk".to_string()];
         let fleet = FleetTopology {
             tiers: Vec::new(),
@@ -21224,10 +20154,7 @@ foo = "bar"
     /// the ordering exactly backwards.
     #[test]
     fn a_malformed_tiers_fails_instead_of_silently_disabling_the_check() {
-        // Every shape the app's typed `JobFleetConfig` rejects at boot. Each one
-        // must be reported here, not read as "no topology declared" — that would
-        // fall through to the informational-only report and pass, switching the
-        // AC6 hard-fail off with nothing saying so.
+        // Every shape the app's typed `JobFleetConfig` rejects at boot.
         for doc in [
             // The flat shape `jobs.pin` uses a few lines above it.
             "[jobs.fleet]\ntiers = [\"critical\", \"bulk\"]\n",
@@ -21236,9 +20163,8 @@ foo = "bar"
             "[jobs.fleet]\ntiers = 3\n",
             // Mixed: one well-formed tier and one that is not.
             "[jobs.fleet]\ntiers = [[\"critical\"], \"bulk\"]\n",
-            // A non-string queue name. `[[1]]` is the dangerous one: dropping
-            // the entry leaves an EMPTY tier, which reads as "drains
-            // everything" and would make the check pass unconditionally.
+            // A non-string queue name. Dropping it from `[[1]]` would leave an empty tier,
+            // which means "drains everything" and passes unconditionally.
             "[jobs.fleet]\ntiers = [[1]]\n",
             "[jobs.fleet]\ntiers = [[\"critical\", 1]]\n",
             "[jobs.fleet]\ntiers = [[\"critical\"], [[\"bulk\"]]]\n",
@@ -21281,12 +20207,8 @@ foo = "bar"
             );
         }
 
-        // The specific hazard for `[[1]]`: silently dropping the non-string
-        // leaves an empty tier, and an empty tier is a *legitimate* declaration
-        // meaning "unpinned, drains everything" — so the check would have
-        // reported total coverage and passed. Pin that an empty tier really does
-        // mean that, which is why the non-string case can never be allowed to
-        // decay into one.
+        // An empty tier legitimately means "unpinned, drains everything", so a malformed tier
+        // must never collapse into one.
         let unpinned = FleetTopology {
             tiers: vec![Vec::new()],
             malformed: false,
@@ -21336,7 +20258,7 @@ foo = "bar"
 
     #[test]
     fn resolve_declared_queues_reads_inline_list_and_manifest() {
-        // Inline list (MVP).
+        // Inline list.
         let inline: toml::Table = toml::from_str(
             "[jobs.fleet]\ntiers = [[\"default\"]]\ndeclared_queues = [\"email\", \"sms\"]\n",
         )
@@ -21363,11 +20285,8 @@ foo = "bar"
             vec!["critical".to_string(), "email".to_string()]
         );
 
-        // An EMPTY manifest array is the app answering "no job-declared queues",
-        // not failing to answer, so it wins over a stale inline list. Falling
-        // through here would let that stale entry manufacture a coverage failure
-        // against the ground truth — and would contradict the documented
-        // precedence.
+        // An empty manifest array means "no job-declared queues", so it wins over a stale
+        // inline list instead of letting that list manufacture a coverage failure.
         let empty_manifest = resolve_declared_queues_from_sources(
             |path| (path == "target/jobs-manifest.toml").then(|| "queues = []\n".to_string()),
             Some(&with_manifest),
@@ -21432,7 +20351,6 @@ foo = "bar"
                 err.manifest_path, "target/jobs-manifest.toml",
                 "the failure must name the manifest ({label})"
             );
-            // …and must NOT fall through to the stale inline list.
             assert!(
                 !err.detail.is_empty(),
                 "the failure must say what was wrong ({label})"
@@ -21474,10 +20392,9 @@ foo = "bar"
 
     // ── Jobs manifest emit → consume loop (#1756) ──────────────────────────
     //
-    // These prove the full round trip: the manifest string `autumn jobs manifest`
-    // emits (verified byte-for-byte by autumn-web's `jobs_manifest_renders_*`
-    // test) is written to disk, read back through `[jobs.fleet] manifest = ...`,
-    // and drives the topology-aware coverage verdict.
+    // The manifest `autumn jobs manifest` emits (pinned by autumn-web's
+    // `jobs_manifest_renders_*` tests) is written to disk, read back through
+    // `[jobs.fleet] manifest = ...`, and drives the coverage verdict.
 
     /// The exact bytes `render_jobs_manifest` emits for a `[jobs.queues] =
     /// ["critical"]` app carrying one `#[job(queue = "email")]`.
@@ -21485,9 +20402,8 @@ foo = "bar"
 
     #[test]
     fn manifest_emit_consume_loop_fails_on_genuine_gap() {
-        // Emit → write to disk → doctor reads it back and PROVES a gap: the
-        // manifest surfaces the job-declared `email`, which no tier drains, so a
-        // topology-aware `--strict` run turns it into a hard Fail (exit 1).
+        // The manifest surfaces the job-declared `email`, which no tier drains, so the check
+        // fails and `--strict` exits 1.
         let temp = tempfile::tempdir().expect("temp dir");
         let manifest_path = temp.path().join("jobs-manifest.toml");
         std::fs::write(&manifest_path, EMITTED_MANIFEST).expect("write manifest");
@@ -21498,7 +20414,6 @@ foo = "bar"
         ))
         .expect("parse toml");
 
-        // Doctor reads the emitted manifest, not the stale inline list.
         let declared =
             resolve_declared_queues(Some(&table)).expect("the emitted manifest is well-formed");
         assert_eq!(
@@ -21531,8 +20446,7 @@ foo = "bar"
 
     #[test]
     fn manifest_emit_consume_loop_passes_on_full_coverage() {
-        // Same emitted manifest, but now a dedicated tier drains `email` too →
-        // union coverage is total → Pass, with no false negative.
+        // A dedicated tier drains `email`, so coverage is total.
         let temp = tempfile::tempdir().expect("temp dir");
         let manifest_path = temp.path().join("jobs-manifest.toml");
         std::fs::write(&manifest_path, EMITTED_MANIFEST).expect("write manifest");
@@ -21559,10 +20473,8 @@ foo = "bar"
 
     #[test]
     fn resolve_queues_empty_pin_env_overrides_toml_pin() {
-        // #2290: a PRESENT but empty `AUTUMN_JOBS__PIN` is an explicit override
-        // that clears the pin (process unpinned, drains every queue), mirroring
-        // the runtime's `if let Ok(val) = env.var("AUTUMN_JOBS__PIN")` semantics.
-        // Doctor must NOT fall back to the TOML `jobs.pin` in that case.
+        // #2290: a present but empty `AUTUMN_JOBS__PIN` clears the pin, as at runtime, so doctor
+        // must not fall back to the TOML `jobs.pin`.
         let table: toml::Table = toml::from_str("[jobs]\npin = [\"critical\"]\n").expect("parse");
         let (queues, pin) = resolve_queues_and_pin_from_sources(
             |key| (key == "AUTUMN_JOBS__PIN").then(String::new),
@@ -21572,8 +20484,6 @@ foo = "bar"
         assert!(pin.is_empty(), "empty env pin must clear the TOML pin");
         let result = check_queue_coverage(&ProcessRole::Combined.into(), &queues, &pin);
         assert_eq!(result.status, CheckStatus::Pass);
-        // Previously this false-failed (fell back to `pin=[critical]` →
-        // empty-schedule Warn); now it passes cleanly under `--strict`.
         let summary = Summary {
             passed: 1,
             warned: 0,
@@ -22393,7 +21303,6 @@ mount = ["service"]
     #[test]
     fn sqlite_primary_bootable_only_as_single_role() {
         // Signature: (legacy_url, primary_url, replica_url, has_shards).
-        // SQLite primary, no legacy url, no replica, no shards → bootable.
         assert!(sqlite_primary_target_is_bootable(
             None,
             Some("sqlite://app.db"),
@@ -22478,16 +21387,14 @@ mount = ["service"]
             None,
             false
         ));
-        // A clean sqlite:// primary with a redundant sqlite:// legacy url of the
-        // same backend still Passes (no mismatch).
+        // A redundant sqlite:// legacy url of the same backend is not a mismatch.
         assert!(sqlite_primary_target_is_bootable(
             Some("sqlite://app.db"),
             Some("sqlite://app.db"),
             None,
             false
         ));
-        // A clean lone sqlite:// primary (no legacy url, replica, or shards)
-        // still Passes.
+        // A lone sqlite:// primary stays bootable.
         assert!(sqlite_primary_target_is_bootable(
             None,
             Some("sqlite://app.db"),
@@ -22511,8 +21418,7 @@ mount = ["service"]
         assert!(!bootable, "mismatched legacy url must not be bootable");
         let r = check_db_connectivity("sqlite://app.db", bootable);
         assert_eq!(r.status, CheckStatus::Fail);
-        // The real boot-time message names the mismatched legacy role and
-        // backend; doctor and boot must agree on rejecting it.
+        // Boot rejects the same config, naming the mismatched legacy role and backend.
         assert_eq!(
             autumn_web::config::database_backend_consistency(
                 Some("postgres://db:5432/app"),
@@ -22536,9 +21442,8 @@ mount = ["service"]
     fn backend_consistency_check_catches_mismatch_for_any_primary() {
         // Signature: (legacy_url, primary_url, replica_url, has_shards).
 
-        // F27: Postgres primary + SQLite legacy `database.url` → mixed backends.
-        // The SQLite-only bootability gate never fires (primary is Postgres), so
-        // this unconditional check is what catches it.
+        // Postgres primary + SQLite legacy `database.url`. The SQLite-only bootability gate
+        // never fires for a Postgres primary, so only this check catches it.
         let r = check_database_backend_consistency(
             Some("sqlite://app.db"),
             Some("postgres://db:5432/app"),
@@ -22555,7 +21460,7 @@ mount = ["service"]
             "the FAIL detail must explain the backend mismatch"
         );
 
-        // F26 (mirror image): SQLite primary + Postgres legacy `database.url`.
+        // Mirror image: SQLite primary + Postgres legacy `database.url`.
         let r = check_database_backend_consistency(
             Some("postgres://db:5432/app"),
             Some("sqlite://app.db"),
@@ -22671,8 +21576,7 @@ mount = ["service"]
     fn sqlite_primary_in_active_profile_is_detected_as_sqlite() {
         use autumn_web::config::DatabaseBackend;
         let dir = tempfile::tempdir().unwrap();
-        // Base autumn.toml has NO [database]; the URL lives only under the prod
-        // profile overlay — exactly the config the raw-table lookup would miss.
+        // The URL lives only under the prod profile, so a raw-table lookup would miss it.
         std::fs::write(
             dir.path().join("autumn.toml"),
             "[profile.prod.database]\nprimary_url = \"sqlite://app.db\"\n",
@@ -22807,8 +21711,8 @@ mount = ["service"]
             "the legacy database.url must be resolved separately for the mismatch check"
         );
 
-        // The SQLite-only bootability gate does NOT fire (effective primary is
-        // Postgres) — this is exactly why F27 needs the unconditional check.
+        // The SQLite-only bootability gate does not fire for a Postgres primary, which is why
+        // the consistency check must be unconditional.
         assert!(!sqlite_primary_target_is_bootable(
             topology.legacy_url.as_deref(),
             topology.primary_url.as_deref(),
@@ -22816,7 +21720,6 @@ mount = ["service"]
             false,
         ));
 
-        // The unconditional consistency check catches it.
         let r = check_database_backend_consistency(
             topology.legacy_url.as_deref(),
             topology.primary_url.as_deref(),
@@ -22862,8 +21765,8 @@ mount = ["service"]
             "the resolver error must name the missing field: {err}"
         );
 
-        // The bug: collapsed to `has_shards = false`, the SQLite primary looks like
-        // a bootable lone primary — so doctor MUST instead Fail on the shard config.
+        // With the malformed entry dropped, the SQLite primary would read as a bootable lone
+        // primary, so doctor must fail on the shard config instead.
         assert!(
             sqlite_primary_target_is_bootable(None, Some("sqlite://app.db"), None, false),
             "demonstrates the F28 trap: with the malformed entry dropped, the SQLite \
@@ -23108,7 +22011,7 @@ mount = ["service"]
         assert!(r.detail.as_deref().unwrap_or("").contains("broken symlink"));
     }
 
-    // ── check_signing_secret_impl (RED phase) ────────────────────────────────
+    // ── check_signing_secret_impl ────────────────────────────────────────────
 
     #[test]
     fn check_signing_secret_impl_name_is_signing_secret() {
@@ -23212,7 +22115,6 @@ mount = ["service"]
         }];
         let summary = compute_summary(&results);
         let json = to_json_output(&results, &summary);
-        // Should parse as valid JSON
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
     }
 
@@ -23276,7 +22178,6 @@ mount = ["service"]
 
     #[test]
     fn check_maintenance_mode_passes_when_off() {
-        // No flag file in the test dir → maintenance is off → Pass
         let result = check_maintenance_mode();
         // In CI there should be no flag file; if there is, accept Warn too.
         assert!(
@@ -23286,7 +22187,7 @@ mount = ["service"]
         );
     }
 
-    // ── check_oauth2 (RED phase) ──────────────────────────────────────────────
+    // ── check_oauth2 ─────────────────────────────────────────────────────────
 
     #[test]
     fn check_oauth2_empty_client_id_in_production_fails() {
@@ -23468,10 +22369,8 @@ redirect_uri = "http://localhost/callback"
 
     #[test]
     fn dotenv_uncovered_secret_takes_priority_over_missing_env() {
-        // Combined case: `.env.example` present, no root `.env`, and a present
-        // `.env.local` that is NOT gitignored. The ungitignored-secret warning
-        // must win (naming the file) rather than being hidden behind the
-        // copy-the-template hint.
+        // With `.env.example` present and an ungitignored `.env.local`, the secret warning wins
+        // over the copy-the-template hint.
         let result = check_dotenv_impl(true, false, &[".env.local".to_owned()]);
         assert_eq!(result.name, "dotenv");
         assert!(
@@ -23513,7 +22412,6 @@ redirect_uri = "http://localhost/callback"
 
     #[test]
     fn dotenv_passes_when_all_present_secret_files_gitignored() {
-        // No uncovered secret files → Pass, even with a root `.env` present.
         let result = check_dotenv_impl(true, true, &[]);
         assert_eq!(result.name, "dotenv");
         assert!(
@@ -23673,10 +22571,9 @@ redirect_uri = "http://localhost/callback"
 
     #[test]
     fn browser_check_not_found_is_warn_not_fail() {
-        // Simulate: no browser in an empty candidate list.  The check must
-        // return Warn so projects that don't use system tests aren't penalized.
+        // A missing browser warns rather than fails, so projects without system tests are not
+        // penalized. This runs the real host check, so Pass is accepted when Chrome is installed.
         let result = check_system_test_browser();
-        // Accept Pass (if Chrome is on the host) or Warn (if not).
         assert!(
             result.status == CheckStatus::Pass || result.status == CheckStatus::Warn,
             "browser check must be Pass or Warn, got {:?}",
@@ -23942,8 +22839,6 @@ redirect_uri = "http://localhost/callback"
     #[test]
     fn deploy_doctor_config_absent_is_skipped() {
         use autumn_web::config::MockEnv;
-        // No [deploy] table and no AUTUMN_DEPLOY__* env → no config parsed, no
-        // failing check (graceful skip).
         let table: toml::Table = "".parse().unwrap();
         let (cfg, check) = resolve_deploy_doctor_config(&table, &MockEnv::new());
         assert!(cfg.is_none(), "absent [deploy] must not yield a config");
@@ -23984,10 +22879,8 @@ redirect_uri = "http://localhost/callback"
     #[test]
     fn deploy_doctor_config_env_only_host_materializes_config() {
         use autumn_web::config::MockEnv;
-        // No [deploy] in TOML, but AUTUMN_DEPLOY__HOST is set: doctor must
-        // materialize a deploy config (Some) so the preflight runs against that
-        // host instead of being skipped — matching `autumn deploy check`, which
-        // grades `AutumnConfig::load().deploy` (env applied).
+        // An env-only host still materializes a config so the preflight runs, as
+        // `autumn deploy check` grades `AutumnConfig::load().deploy` with env applied.
         let table: toml::Table = "".parse().unwrap();
         let env = MockEnv::new()
             .with("AUTUMN_DEPLOY__HOST", "203.0.113.99")
@@ -24005,8 +22898,7 @@ redirect_uri = "http://localhost/callback"
     #[test]
     fn deploy_doctor_config_env_overrides_toml_host() {
         use autumn_web::config::MockEnv;
-        // A TOML host is present, but AUTUMN_DEPLOY__HOST wins — doctor grades
-        // the same effective target as `autumn deploy check`.
+        // The env host wins, matching the target `autumn deploy check` grades.
         let table: toml::Table = "[deploy]\nhost = \"toml.example\"\nssh_port = 22\n"
             .parse()
             .unwrap();
@@ -24026,8 +22918,7 @@ redirect_uri = "http://localhost/callback"
     #[test]
     fn deploy_doctor_config_bad_type_fails_not_skipped() {
         use autumn_web::config::MockEnv;
-        // `ssh_port` as a string is a present-but-invalid table: the old `.ok()`
-        // path silently skipped ALL deploy checks; now it must FAIL loudly.
+        // A present but invalid `[deploy]` must fail loudly, not skip every deploy check.
         let table: toml::Table = "[deploy]\nhost = \"h\"\nssh_port = \"22\"\n"
             .parse()
             .unwrap();
@@ -24057,8 +22948,8 @@ redirect_uri = "http://localhost/callback"
     fn deploy_signing_secret_in_deploy_profile_is_resolved_under_that_profile() {
         use autumn_web::config::MockEnv;
         let dir = tempfile::tempdir().unwrap();
-        // Base declares `[deploy] profile = "prod"`; the signing secret lives ONLY
-        // under `[profile.prod]` — exactly the value the ambient (dev) lookup misses.
+        // The signing secret lives only under `[profile.prod]`, which the ambient (dev) lookup
+        // misses.
         std::fs::write(
             dir.path().join("autumn.toml"),
             "[deploy]\nhost = \"deploy.example.com\"\nprofile = \"prod\"\n\
@@ -24068,8 +22959,8 @@ redirect_uri = "http://localhost/callback"
         .unwrap();
         let base = dir.path().to_path_buf();
 
-        // PHASE 1 (unchanged): learn the deploy target profile from the `[deploy]`
-        // table resolved under the AMBIENT (dev) merged table, as `run()` does.
+        // Phase 1: learn the deploy profile from `[deploy]` in the ambient (dev) table, as
+        // `run()` does.
         let base_dev = base.clone();
         let ambient_merged =
             get_merged_toml_table_runtime_with("dev", "dev", move |f| base_dev.join(f));
@@ -24086,17 +22977,14 @@ redirect_uri = "http://localhost/callback"
             "deploy target profile is learned from the ambient [deploy] table"
         );
 
-        // Regression guard (the BUG): resolving the secret under the ambient (dev)
-        // merged table does NOT see the prod-only secret — this is what falsely
-        // reported it missing before the fix.
+        // The ambient (dev) table does not see the prod-only secret.
         assert_eq!(
             resolve_deploy_signing_secret(&ambient_merged, &MockEnv::new()),
             None,
             "prod-only secret is invisible under the ambient dev profile (the bug)"
         );
 
-        // PHASE 2 (the FIX): re-derive the merged table under the `[deploy] profile`
-        // and resolve the secret there — the exact re-derivation `run()` now does.
+        // Phase 2: re-derive the merged table under the `[deploy] profile`, as `run()` does.
         let deploy_profile_raw = crate::deploy::trimmed_deploy_profile(&deploy_cfg.profile);
         let deploy_profile_canonical =
             crate::deploy::canonicalize_deploy_profile(&deploy_profile_raw);
@@ -24130,14 +23018,14 @@ redirect_uri = "http://localhost/callback"
         .unwrap();
         let base = dir.path().to_path_buf();
 
-        // PHASE 1: learn the deploy profile from the ambient `[deploy]` table.
+        // Phase 1: learn the deploy profile from the ambient `[deploy]` table.
         let base_dev = base.clone();
         let ambient_merged =
             get_merged_toml_table_runtime_with("dev", "dev", move |f| base_dev.join(f));
         let (deploy_cfg, _) = resolve_deploy_doctor_config(&ambient_merged, &MockEnv::new());
         let deploy_cfg = deploy_cfg.expect("[deploy] present");
 
-        // Bug parity: the prod-only DB URL is invisible under the ambient dev merge.
+        // The prod-only DB URL is invisible under the ambient dev merge.
         let ambient_topology =
             resolve_database_topology_from_sources(|_| None, Some(&ambient_merged));
         assert_eq!(
@@ -24145,7 +23033,7 @@ redirect_uri = "http://localhost/callback"
             "prod-only DB URL is invisible under the ambient dev profile (the bug)"
         );
 
-        // PHASE 2 (the FIX): resolve the DB topology under the `[deploy] profile`.
+        // Phase 2: resolve the DB topology under the `[deploy] profile`.
         let deploy_profile_raw = crate::deploy::trimmed_deploy_profile(&deploy_cfg.profile);
         let deploy_profile_canonical =
             crate::deploy::canonicalize_deploy_profile(&deploy_profile_raw);
@@ -24181,8 +23069,6 @@ redirect_uri = "http://localhost/callback"
         .unwrap();
         let base = dir.path().to_path_buf();
 
-        // The deploy grade resolves under the `[deploy] profile` (prod), so the
-        // dev-only secret is NOT seen — the deploy grade reflects prod config only.
         let deploy_merged =
             get_merged_toml_table_runtime_with("prod", "prod", move |f| base.join(f));
         assert_eq!(
@@ -24206,9 +23092,8 @@ redirect_uri = "http://localhost/callback"
     fn malformed_deploy_profile_override_fails_deploy_config_load_check() {
         use autumn_web::config::MockEnv;
         let dir = tempfile::tempdir().unwrap();
-        // `[deploy] profile = "prod"`, ambient = dev. The prod override file is
-        // present but MALFORMED (invalid TOML) — exactly the case
-        // `get_merged_toml_table_runtime`'s `.ok()` merge silently drops.
+        // The prod override file is invalid TOML, which the `.ok()` merge in
+        // `get_merged_toml_table_runtime` silently drops.
         std::fs::write(
             dir.path().join("autumn.toml"),
             "[deploy]\nhost = \"deploy.example.com\"\nprofile = \"prod\"\n",
@@ -24220,10 +23105,8 @@ redirect_uri = "http://localhost/callback"
         )
         .unwrap();
 
-        // Resolve config files from the temp dir under the prod (deploy) profile
-        // without mutating the process env — the same mechanism the runtime's
-        // config tests use (`AUTUMN_MANIFEST_DIR` selects the dir, `AUTUMN_ENV`
-        // selects the profile that pulls in `autumn-prod.toml`).
+        // `AUTUMN_MANIFEST_DIR` selects the temp dir and `AUTUMN_ENV` pulls in
+        // `autumn-prod.toml`, without mutating the process env.
         let env = MockEnv::new()
             .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap())
             .with("AUTUMN_ENV", "prod");
@@ -24245,9 +23128,7 @@ redirect_uri = "http://localhost/callback"
             "the failure surfaces the load error: {detail}"
         );
 
-        // Companion: a WELL-FORMED prod override under the same layout does NOT
-        // trigger this new failure — the normal case still passes (mirroring how
-        // `autumn deploy check` loads it without error).
+        // A well-formed prod override passes, as it does under `autumn deploy check`.
         std::fs::write(
             dir.path().join("autumn-prod.toml"),
             "[server]\nport = 8443\n",
@@ -24274,9 +23155,7 @@ redirect_uri = "http://localhost/callback"
     fn plugin_owned_root_does_not_fail_deploy_config_load_check_but_known_typo_does() {
         use autumn_web::config::MockEnv;
         let dir = tempfile::tempdir().unwrap();
-        // `[deploy] profile = "prod"`, `strict_config` on, plus a plugin-owned
-        // `[media]` top-level root the CLI cannot know about — exactly the case
-        // #2067 made lenient for `autumn deploy check`.
+        // `[media]` is a plugin-owned top-level root the CLI cannot know about (#2067).
         std::fs::write(
             dir.path().join("autumn.toml"),
             "[server]\nstrict_config = true\n\n\
@@ -24288,16 +23167,14 @@ redirect_uri = "http://localhost/callback"
             .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap())
             .with("AUTUMN_ENV", "prod");
 
-        // The plugin root must NOT fail the doctor deploy-config guard — this is
-        // the config `autumn deploy check` passes, so `doctor --strict` must agree.
         assert!(
             deploy_profile_config_load_check("prod", &env).is_none(),
             "a plugin-owned [media] top-level root under strict_config must not fail \
              the deploy_config load check (it passes `autumn deploy check`)"
         );
 
-        // But a typo INSIDE a known/core section stays fatal in the lenient loader,
-        // so the doctor guard still FAILS it — exactly as `autumn deploy check` does.
+        // A typo inside a known section stays fatal in the lenient loader, as under
+        // `autumn deploy check`.
         std::fs::write(
             dir.path().join("autumn.toml"),
             "[server]\nstrict_config = true\n\n\
@@ -24316,8 +23193,8 @@ redirect_uri = "http://localhost/callback"
 
     #[test]
     fn deploy_previous_secrets_non_string_element_is_malformed() {
-        // `previous_secrets = [123]` deserializes as `Vec<String>` failing in
-        // `AutumnConfig::load()`; doctor must treat it as malformed, not drop it.
+        // `AutumnConfig::load()` fails on `previous_secrets = [123]`, so doctor treats it as
+        // malformed rather than dropping it.
         let table: toml::Table = "[security.signing_secret]\nprevious_secrets = [123]\n"
             .parse()
             .unwrap();
@@ -24696,7 +23573,6 @@ redirect_uri = "http://localhost/callback"
 
         #[test]
         fn a_clean_tree_is_exactly_one_passing_line() {
-            // Noise discipline is falsifiable: a clean tree costs one line.
             let result = check_dependencies_impl(&audited(Vec::new(), Some(2)));
             assert_eq!(result.name, "dependencies");
             assert_eq!(result.status, CheckStatus::Pass);
@@ -24847,8 +23723,8 @@ redirect_uri = "http://localhost/callback"
 
         #[test]
         fn an_unfetched_database_does_not_fail_doctor_strict_either() {
-            // Same reasoning: the database is only populated by an explicit
-            // `cargo deny fetch db`.
+            // The advisory database is populated only by an explicit `cargo deny fetch db`, so its
+            // absence must not fail `--strict`.
             let result = check_dependencies_impl(&Evaluation::DatabaseMissing {
                 checks: vec!["advisories".to_owned()],
             });

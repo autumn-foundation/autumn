@@ -48,14 +48,9 @@ pub const MIN_SCHEMA_VERSION: u32 = 3;
 /// manifest has no per-entry `provenance`, and every guard in it was proven.
 pub const MAX_SCHEMA_VERSION: u32 = 6;
 
-// Deliberately a literal, not `MANIFEST_SCHEMA_VERSION`. Tracking the emitter
-// would auto-widen what this differ accepts on the very bump whose doc comment
-// says to re-read the rules — the compile error below is the point.
-//
-// Equality, not `<=`: the comment above promises a compile error when the
-// *emitter* is bumped, and `<=` only caught the opposite mistake. A CLI that
-// emitted v4 while refusing to parse anything above v3 would have compiled
-// cleanly and broken every generated gate at run time instead.
+// A literal, not `MANIFEST_SCHEMA_VERSION`: tracking the emitter would silently widen what this
+// differ accepts on a bump that requires re-reading the rules. Equality, not `<=`, so bumping
+// either side alone fails to compile.
 const _: () = assert!(
     MAX_SCHEMA_VERSION == MANIFEST_SCHEMA_VERSION,
     "bump both: this differ reads exactly the schema this CLI emits, and a bump means re-reading `projection`"
@@ -469,9 +464,8 @@ impl RouteEntry {
 /// direction: it over-reports rather than missing a widening.
 #[must_use]
 pub fn is_open(classification: &str) -> bool {
-    // An empty or unknown classification is treated as open on purpose: it is
-    // what `routes audit` calls `unclassified`, and the safe reading of "we
-    // could not prove a guard" is "there is no guard".
+    // Empty or unknown is open on purpose: `routes audit` calls it `unclassified`, and "could not
+    // prove a guard" must read as "no guard".
     !matches!(classification, "gated" | "framework")
 }
 
@@ -606,11 +600,9 @@ impl PostureManifest {
                 escape_field(&a.resource)
             ));
         }
-        // mTLS (#1640). Only the *required* rows are projected, so a v3
-        // manifest (no `mtls` dimension) and a v4 manifest of the same app with
-        // client auth off hash identically — the schema bump alone is not a
-        // posture change. The mode and prefixes are projected only when the
-        // listener actually requests certificates, for the same reason.
+        // mTLS (#1640): the mode and prefixes are projected only when the listener requests
+        // certificates, and only required rows are projected, so a v3 manifest (no `mtls`) and a v4
+        // manifest with client auth off hash identically.
         if self.dimensions.mtls.requests_certificate() {
             lines.push(format!(
                 "mtls-mode\t{}",
@@ -918,7 +910,7 @@ mod tests {
             assert_eq!(m.dimensions.routes.entries[0].classification, "public");
             assert_eq!(m.dimensions.mtls.entries.len(), 1);
         }
-        // The fixed emitter never writes it, so v5 stays strict.
+        // The v5+ emitter never writes the duplicate probe row, so v5 stays strict.
         assert!(PostureManifest::parse(&doc(5), "m.json").is_err());
     }
 

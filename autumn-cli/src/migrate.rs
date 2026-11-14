@@ -259,11 +259,8 @@ pub fn run(
 
     match action {
         MigrateAction::Check => {
-            // `check` is an offline, SQL-only preflight that needs no database
-            // URL, so it must NOT parse `.env`. Resolving the overlay here would
-            // let a malformed/unreadable local `.env` abort the check (breaking
-            // offline / CI safety checks), so the `.env` overlay is built lazily
-            // only in the database-backed paths below.
+            // `check` is an offline, SQL-only preflight: it must not parse `.env`, so a
+            // malformed local `.env` cannot break offline / CI safety checks.
             let migrations_dir = resolve_migrations_dir_with(true);
             run_safety_check(&migrations_dir, profile);
             return;
@@ -279,41 +276,32 @@ pub fn run(
         _ => {}
     }
 
-    // Overlay a project-root `.env` UNDER the real environment for DB-URL
-    // resolution, without mutating the process environment. A real env var of
-    // the same key always wins; a malformed `.env` fails loudly here. Built only
-    // now — after the non-DB early returns — so `migrate check` never reads it.
+    // Overlay a project-root `.env` under the real environment (a real env var wins) without
+    // mutating the process environment. Built after the non-DB early returns so `migrate check`
+    // never reads it.
     let env = os_env_with_dotenv_or_exit();
 
-    // 1. Resolve migration target databases from autumn.toml (+ profile
-    //    overlay) + env.  The merged config table is returned so that
-    //    resolve_startup_wait can reuse it without a second filesystem read.
     let (targets, config_table) = resolve_targets(target, profile, &env);
 
-    // 2. Resolve the migrations directory and the topology.
     let only_database = control_is_only_database(
         |key| autumn_web::config::Env::var(&env, key),
         config_table.as_ref(),
     );
     let migrations_dir = resolve_run_migrations_dir(action, &targets, only_database);
 
-    // 3. Check that diesel CLI is available — but only when a target actually
-    //    needs the `diesel` subprocess. The SQLite apply path uses the in-process
-    //    harness (issue #2058), so an all-SQLite run must not demand a
-    //    Postgres-oriented `diesel` CLI on PATH.
+    // The SQLite apply path uses the in-process harness (#2058), so an all-SQLite run must not
+    // demand the `diesel` CLI on PATH.
     if !all_targets_sqlite(&targets) {
         check_diesel_cli();
     }
 
-    // 4. Enable maintenance mode if requested
     if with_maintenance && *action == MigrateAction::Run {
         enable_maintenance_for_migrate();
     }
 
-    // 5. Execute the appropriate diesel command per target
     match action {
         MigrateAction::Run => {
-            // Resolve the effective startup wait (--wait flag > config > 0).
+            // Precedence: `--wait` flag, then config, then 0.
             let wait = resolve_startup_wait(wait_override, config_table.as_ref());
             // Same env as target resolution: the real env over the `.env` overlay.
             let lock_policy = resolve_migration_lock_policy_from_sources(
@@ -330,13 +318,9 @@ pub fn run(
             );
         }
         MigrateAction::Status => {
-            // `show_status` shells out to `diesel migration list`, and the
-            // rollback/framework status readers use the Postgres migration
-            // connection — none of which is wired for the SQLite backend (the
-            // #2058 port covers `migrate` up/down only). A `sqlite://` target
-            // therefore gets a clear provider-appropriate message here instead of
-            // reaching the `diesel` subprocess and dying with a raw OS error (the
-            // `diesel` CLI preflight was deliberately skipped for all-SQLite runs).
+            // `status` shells out to `diesel migration list` and reads through the Postgres
+            // connection, neither wired for SQLite (#2058 covers up/down only). Report that
+            // instead of failing on a missing `diesel`, whose preflight all-SQLite runs skip.
             let mut sqlite_unsupported = false;
             let mut collision_seen = false;
             for (label, url) in &targets {
@@ -418,31 +402,17 @@ fn resolve_targets(
     profile: Option<&str>,
     env: &dyn autumn_web::config::Env,
 ) -> (Vec<(String, String)>, Option<toml::Table>) {
-    // Read autumn.toml once, deep-merging the `autumn-<profile>.toml` overlay
-    // when a profile is selected, so control and shard URLs both resolve from
-    // the same effective configuration. Environment overrides still win over
-    // the merged file (handled inside the `_from_sources` helpers).
-    //
-    // When no profile is given explicitly (via `--profile` / `AUTUMN_PROFILE`),
-    // fall back to `AUTUMN_ENV` — the framework's preferred profile selector —
-    // so `autumn migrate` resolves the same overlay the app itself would use.
-    //
-    // `env` overlays a project-root `.env` under the real environment, so a
-    // `.env`-provided DB URL is honored while a real env var still wins.
+    // Read autumn.toml once, merged with the profile overlay, so control and shard URLs resolve
+    // from the same config; env overrides (and `.env`) still win. `effective_profile` picks the
+    // profile the app itself would use (`AUTUMN_ENV` first).
     let effective = effective_profile(profile);
     let config_table = read_autumn_toml_table_with_profile(Some(&effective));
     let control =
         resolve_primary_database_url_from_sources(|key| env.var(key), config_table.as_ref());
     let shards =
         resolve_shard_database_urls_from_sources(|key| env.var(key), config_table.as_ref());
-    // Fail closed BEFORE building targets or applying anything: SQLite anywhere
-    // in a sharded topology is rejected at boot by the runtime guards
-    // (`autumn/src/config.rs` `database_backend_consistency` + shard-URL
-    // Postgres-only validation, and `autumn/src/app.rs`
-    // `sqlite_sharding_unsupported_guard`). Without this the new per-target
-    // SQLite apply/revert path would create + migrate the control file and/or a
-    // SQLite shard file and report success for an app that cannot boot (issue
-    // #2058). Mirror the runtime guard's wording.
+    // Fail closed before applying anything: boot rejects SQLite anywhere in a sharded
+    // topology, so migrating it would report success for an app that cannot boot (#2058).
     if let Err(message) = reject_sqlite_sharding_topology(control.as_deref(), &shards) {
         eprintln!("{message}");
         std::process::exit(1);
@@ -774,9 +744,8 @@ fn run_all_targets(
     let mut completed: Vec<&str> = Vec::new();
     for (label, url) in targets {
         eprintln!("\u{2500}\u{2500} Migrating {label} \u{2500}\u{2500}");
-        // Labels starting with "shard:" are shard targets; they receive only
-        // the shard-required framework migrations (version history + commit
-        // hook queue), not the full control-plane schema.
+        // Shard targets receive only the shard-required framework migrations, not the full
+        // control-plane schema.
         let is_shard = label.starts_with("shard:");
         if run_single_target(
             url,
@@ -871,11 +840,8 @@ fn run_single_target(
 ) -> bool {
     use autumn_web::migrate::{DEFAULT_LOCK_WAIT_TIMEOUT, hold_migration_lock, wait_for_database};
 
-    // SQLite (issue #2058): a single-writer local database has no advisory lock,
-    // no `diesel` subprocess, no Postgres content-checksum table, and no
-    // control-plane framework migrations — the unlocked harness applies the user
-    // migrations directly (mirrors `autumn schema migrate`, #1999/#2036). The
-    // Postgres path below is unchanged.
+    // SQLite (#2058) is single-writer: no advisory lock, no `diesel` subprocess and no
+    // checksum table. The unlocked harness applies the migrations directly.
     if is_sqlite_target(database_url) {
         let dirs = control_migration_dirs(migrations_base(migrations_dir), only_database);
         return run_single_target_sqlite(database_url, &dirs);
@@ -886,9 +852,7 @@ fn run_single_target(
         return false;
     }
 
-    // Startup wait — only when enabled (startup_wait_secs > 0 or --wait N).
-    // When wait == Duration::ZERO we skip entirely so the existing fail-fast
-    // path is preserved byte-for-byte (AC #6).
+    // A zero wait skips this entirely and keeps the fail-fast path.
     if wait > std::time::Duration::ZERO {
         eprintln!(
             "  Waiting up to {}s for database to become reachable…",
@@ -909,11 +873,9 @@ fn run_single_target(
         }
     }
 
-    // A version an app migration shares with a framework migration lets
-    // whichever side runs first mask the other, and the `diesel` CLI below
-    // tracks a migration under its directory's version only, so unlike the
-    // SQLite path this one cannot carry the app migration under a substitute.
-    // Stop before anything runs, with the rename to make.
+    // An app migration sharing a framework version lets whichever runs first mask the other.
+    // The `diesel` CLI tracks a migration only by its directory's version, so unlike the SQLite
+    // path this one cannot substitute a version. Stop before anything runs, naming the rename.
     if let Some(message) =
         framework_version_collision_error(std::path::Path::new(migrations_dir), is_shard)
     {
@@ -921,24 +883,14 @@ fn run_single_target(
         return false;
     }
 
-    // Acquire this target database's Postgres advisory lock before reading
-    // the pending-migration list. This serializes concurrent callers
-    // (rolling-deploy replicas or parallel `autumn migrate run`
-    // invocations): only one process runs migrations against a given
-    // database at a time; the rest wait and then find no pending work.
-    // The lock is released when `_lock_guard` drops (end of this function
-    // or process exit — both are safe because PostgreSQL releases
-    // session-level advisory locks on connection close).
+    // Take the advisory lock before reading the pending list, so concurrent callers (deploy
+    // replicas, parallel `autumn migrate`) run one at a time; the rest then find no pending
+    // work. Postgres releases the session lock when the connection closes.
     //
-    // Known limitation: the advisory lock lives on the parent process's
-    // connection, not inside the child `diesel` subprocess. If the parent is
-    // killed (SIGKILL or SIGTERM) while the child is still running, Postgres
-    // releases the session lock and a second caller can acquire it before the
-    // child finishes. SIGKILL is not fixable at the Rust level (no destructors
-    // run); for SIGTERM a kill-on-drop child guard would close the window but
-    // could abort an in-progress transaction. In practice most orchestrators
-    // kill the whole cgroup, and Postgres's transaction isolation prevents
-    // concurrent dirty writes either way.
+    // Known limitation: the lock lives on this process's connection, not the child `diesel`
+    // subprocess. If this process is killed while the child runs, another caller can take the
+    // lock before the child finishes. SIGKILL runs no destructors, and a kill-on-drop child guard
+    // for SIGTERM could abort an in-progress transaction.
     let _lock_guard = match hold_migration_lock(database_url, DEFAULT_LOCK_WAIT_TIMEOUT) {
         Ok(guard) => guard,
         Err(e) => {
@@ -947,12 +899,8 @@ fn run_single_target(
         }
     };
 
-    // Content-checksum guard (issue #1203): before applying any pending
-    // migrations, validate that every already-applied migration's recorded
-    // hash still matches its on-disk `up.sql`. A mismatch means the migration
-    // was edited after being applied — the schema in this database silently
-    // forks from what a fresh build would produce. Fail fast rather than
-    // compounding the drift.
+    // A recorded hash that no longer matches its `up.sql` means an applied migration was
+    // edited, so this schema has forked from a fresh build (#1203). Fail before adding drift.
     let dir = std::path::Path::new(migrations_dir);
     if !validate_checksums_before_apply(database_url, dir, lock_policy) {
         return false;
@@ -962,18 +910,9 @@ fn run_single_target(
         return false;
     }
 
-    // Record the USER-migration checksums NOW — immediately after the user
-    // `diesel migration run` succeeded and BEFORE the framework / shard
-    // framework migrations run (issue #1203 review, P2-B). Those later steps
-    // can fail and early-return; if we deferred recording until after them, the
-    // just-applied user versions would be left with no stored hash. On the next
-    // retry they would classify as `Unrecorded`, so an edit to a user `up.sql`
-    // made while fixing the framework failure would be silently accepted as the
-    // baseline instead of tripping the drift guard. `record_checksums_from_dir`
-    // resolves against the user `dir`, so it only ever records user versions
-    // (framework versions live in the embedded set and are recorded by
-    // `run_pending`); it is idempotent (ON CONFLICT DO NOTHING), so recording
-    // again after the framework step below is harmless.
+    // Record user checksums before the framework step, which can fail. Otherwise the new user
+    // versions would have no hash, and an edit to their `up.sql` made while fixing that failure
+    // would be accepted as the baseline on retry instead of tripping the drift guard.
     record_checksums_after_apply(database_url, dir, lock_policy);
 
     let framework_ok = if is_shard {
@@ -1102,8 +1041,7 @@ fn record_checksums_after_apply(
 /// so a concurrent `autumn migrate down` cannot revert a version between the
 /// read and the write (issue #1203 review).
 fn run_baseline(args: &BaselineArgs, target: &MigrateTarget, profile: Option<&str>) {
-    // Overlay `.env` under the real environment only now that we are about to
-    // resolve a DB URL (a malformed `.env` fails loudly here).
+    // Read `.env` only now that a DB URL is about to be resolved.
     let env = os_env_with_dotenv_or_exit();
     let (targets, _) = resolve_targets(target, profile, &env);
     let migrations_dir = resolve_migrations_dir();
@@ -1158,10 +1096,9 @@ fn print_findings(label: &str, name: &str, findings: &[safety::SafetyFinding]) {
 /// Prints a human-readable report to stderr and exits with code 1 if any
 /// unsafe or potentially-blocking operations are detected in either direction.
 fn run_safety_check(migrations_dir: &str, profile: Option<&str>) {
-    // The app's own backend decides the dialect (issue #1906): a SQLite app must
-    // not be told to use `CREATE INDEX CONCURRENTLY`. `detect_backend_offline`
-    // honors `--profile`, reads no `.env`, and never exits, so `check` stays the
-    // offline, URL-free preflight documented above.
+    // The app's backend picks the dialect (#1906): a SQLite app must not be told to use
+    // `CREATE INDEX CONCURRENTLY`. `detect_backend_offline` reads no `.env` and never exits,
+    // so `check` stays an offline preflight.
     let backend = crate::generate::detect_backend_offline(Path::new("."), profile);
     let (reports, scanned) =
         match safety_reports(backend, &safety_check_dirs(migrations_base(migrations_dir))) {
@@ -1265,7 +1202,7 @@ pub fn check_migrations_in_dir_for(
         .filter(|entry| entry.path().is_dir())
         .collect();
 
-    // Sort by directory name (which starts with a timestamp) for stable output.
+    // Directory names start with a timestamp, so this gives stable, apply-order output.
     entries.sort_by_key(std::fs::DirEntry::file_name);
 
     let mut results = Vec::new();
@@ -1539,10 +1476,9 @@ pub fn read_autumn_toml_table_with_profile_in(
     dir: &Path,
     profile: Option<&str>,
 ) -> Option<toml::Table> {
-    // An absent file is a no-op (fall back to the next layer), but a file that
-    // EXISTS yet can't be read or parsed is a hard error — silently ignoring it
-    // would resolve different URLs than the running app (which the runtime
-    // loader rejects), risking migrations/row-moves against the wrong database.
+    // An absent file falls through to the next layer. One that exists but cannot be read or
+    // parsed is a hard error: the runtime rejects it, and ignoring it could resolve a
+    // different database than the app.
     read_autumn_toml_table_with_profile_in_using(dir, profile, |path| {
         if !path.exists() {
             return None;
@@ -1586,12 +1522,8 @@ pub fn read_autumn_toml_table_with_profile_in_using(
         return base;
     };
 
-    // Probe overlay files across canonical alias spellings (e.g. the operator
-    // sets `AUTUMN_ENV=production` but the file is the common `autumn-prod.toml`)
-    // and load the first that exists. File lookup prefers the *selected* spelling
-    // (mirroring the runtime `profile_override_file_lookup_names`), so a repo with
-    // both `autumn-prod.toml` and `autumn-production.toml` resolves the file the
-    // app would under the same profile.
+    // Probe alias spellings (`AUTUMN_ENV=production` with `autumn-prod.toml`) and load the
+    // first overlay that exists, selected spelling first, as the runtime does.
     let lookup_names = profile_lookup_names(profile);
     let overlay = profile_file_lookup_names(profile)
         .iter()
@@ -1601,10 +1533,7 @@ pub fn read_autumn_toml_table_with_profile_in_using(
     }
     let mut merged = base.unwrap_or_default();
 
-    // Layer the inline `[profile.<name>]` section(s) from autumn.toml on top of
-    // the base, matching the runtime loader's precedence. Co-located profile
-    // config (e.g. `[profile.prod.database]`) must be honored, not just a
-    // separate `autumn-<profile>.toml` file.
+    // Inline `[profile.<name>]` sections layer over the base, as at runtime.
     for name in &lookup_names {
         if let Some(inline) = merged
             .get("profile")
@@ -1617,7 +1546,7 @@ pub fn read_autumn_toml_table_with_profile_in_using(
         }
     }
 
-    // Finally, the legacy `autumn-<profile>.toml` overlay wins over both.
+    // The `autumn-<profile>.toml` overlay wins over both.
     if let Some(overlay) = overlay {
         deep_merge_toml(&mut merged, overlay);
     }
@@ -1666,12 +1595,7 @@ pub fn resolve_primary_url(profile: Option<&str>) -> Option<String> {
 
     let effective = effective_profile(profile);
     let config_table = read_autumn_toml_table_with_profile(Some(&effective));
-    // Overlay a project-root `.env` UNDER the real environment so a
-    // `.env`-provided AUTUMN_DATABASE__* / DATABASE_URL is honored for the
-    // `autumn db` lifecycle commands (create/drop/reset) and `db pull`, exactly
-    // as `autumn migrate` resolves its target URLs via `resolve_targets`. A real
-    // env var of the same key still wins; a malformed `.env` fails loudly here
-    // (with a `path:line` location), where a DB URL is actually needed.
+    // Honor a `.env`-provided URL, as `resolve_targets` does; a real env var still wins.
     let env = os_env_with_dotenv_or_exit();
     resolve_primary_database_url_from_sources(|key| env.var(key), config_table.as_ref())
 }
@@ -1722,12 +1646,8 @@ pub fn resolve_shard_database_urls_from_sources<F>(
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
-    // Thin wrapper over the fallible core: preserve the historical
-    // print-and-exit behavior for command paths (`autumn migrate`, `db backup`,
-    // …) that expect a `Vec` and abort on a malformed shard. Callers that must
-    // NOT exit the process (e.g. `autumn doctor`, which needs to emit a JSON
-    // `CheckResult` instead) call `try_resolve_shard_database_urls_from_sources`
-    // directly and map the `Err` to a failing check.
+    // Exits on a malformed shard. Callers that must not exit (`autumn doctor`) use
+    // `try_resolve_shard_database_urls_from_sources`.
     try_resolve_shard_database_urls_from_sources(env_var, table).unwrap_or_else(|msg| {
         eprintln!("\u{2717} {msg}");
         std::process::exit(1);
@@ -1759,10 +1679,8 @@ where
         .and_then(|database| database.get("shards"))
         .and_then(toml::Value::as_array)
     {
-        // Fail on a malformed `[[database.shards]]` entry rather than silently
-        // dropping it: the runtime config loader rejects the same config, so
-        // skipping a misspelled shard here would let `autumn migrate` "succeed"
-        // while leaving that shard unmigrated.
+        // Fail on a malformed entry rather than drop it: the runtime rejects the same config,
+        // and skipping it would report success with that shard unmigrated.
         for (i, entry) in entries.iter().enumerate() {
             let shard = entry
                 .as_table()
@@ -1804,9 +1722,8 @@ where
         }
     }
 
-    // Reject duplicate shard names (the runtime config validator does too), so
-    // `--shard foo` / `move-slot --from foo` can't silently resolve only the
-    // first of two entries and target a different shard set than the app.
+    // Reject duplicate names, as the runtime does, so `--shard foo` cannot silently resolve
+    // only the first of two entries.
     let mut seen = std::collections::HashSet::new();
     for (name, _) in &shards {
         if !seen.insert(name.as_str()) {
@@ -2724,9 +2641,6 @@ where
 /// signal (`AUTUMN_IS_DEBUG=0`). Pass `None` to test the env/build-mode signals
 /// alone.
 fn is_production_profile(explicit: Option<&str>) -> bool {
-    // Delegate to the shared effective-profile resolution (env precedence +
-    // explicit `--profile` + build-mode signal) so the rollback guard and config
-    // resolution agree on which profile (and thus which databases) is targeted.
     is_production_profile_name(&effective_profile(explicit))
 }
 
@@ -2804,11 +2718,8 @@ fn run_down(
     target: &MigrateTarget,
     profile: Option<&str>,
 ) {
-    // 1. Production guard. Derive prod-ness from the SAME effective profile the
-    //    rollback will target (env precedence + build-mode + explicit flag), so
-    //    e.g. an `AUTUMN_ENV=prod` overlay still trips the guard even when an
-    //    explicit `--profile dev` is passed, and the guard can't be bypassed by
-    //    resolving prod URLs without `--yes-i-mean-prod`.
+    // Judge prod from the same effective profile the rollback targets, so `AUTUMN_ENV=prod`
+    // trips the guard even with an explicit `--profile dev`.
     let is_prod = is_production_profile(profile);
     if is_prod && !args.yes_i_mean_prod {
         eprintln!("\u{2717} Production profile detected.");
@@ -2817,11 +2728,7 @@ fn run_down(
         std::process::exit(1);
     }
 
-    // 2. Resolve target databases (control + shards / a single shard /
-    //    control-only) and the migrations dir. `down` honors --shard /
-    //    --control-only exactly like `migrate run`. Overlay `.env` under the
-    //    real environment only now that we are about to resolve a DB URL (a
-    //    malformed `.env` fails loudly here).
+    // Read `.env` only now that a DB URL is about to be resolved.
     let env = os_env_with_dotenv_or_exit();
     let (targets, _) = resolve_targets(target, profile, &env);
     let migrations_dir = resolve_migrations_dir();
@@ -2831,12 +2738,9 @@ fn run_down(
         std::process::exit(1);
     }
 
-    // Preflight EVERY target before mutating any of them: build and validate
-    // each target's rollback plan (down.sql present, CONCURRENTLY opt-out) up
-    // front, so a divergent shard whose plan can't be reverted fails before the
-    // control DB (or an earlier shard) has already been rolled back — which
-    // would leave control and shards at different schema versions. Each target
-    // re-validates under its own lock in run_down_target as well.
+    // Preflight every target before mutating any, so a shard whose plan cannot be reverted
+    // fails before control has rolled back and left the two at different schema versions.
+    // `run_down_target` re-validates each under its own lock.
     let plans: Vec<(String, Vec<String>)> = targets
         .iter()
         .map(|(label, url)| {
@@ -2847,20 +2751,12 @@ fn run_down(
         })
         .collect();
 
-    // A multi-target `down` must revert the SAME version list on every target.
-    // If they diverge (e.g. a shard lagged behind control after a partial
-    // migrate), refuse rather than roll back different versions per target.
-    // Scoping with --shard / --control-only resolves to a single target, so this
-    // never blocks an intentional single-target rollback.
+    // Every target must revert the same versions. `--shard` / `--control-only` resolve to one
+    // target, so this never blocks a scoped rollback.
     reject_divergent_rollback_plans(&plans);
 
-    // Targets are reverted in order; each plans + executes under its own
-    // advisory lock. To roll a single database back in isolation, scope the
-    // command with --shard / --control-only.
-    //
-    // Maintenance mode is a global flag, so enable it at most once (the first
-    // time any target actually has work) and disable it after all targets
-    // complete. Tracked across targets so an empty plan never toggles it.
+    // Maintenance mode is a global flag: enable it once, when the first target has work, and
+    // disable it after all targets complete. An empty plan never toggles it.
     let mut maintenance_enabled = false;
     let mut total_reverted = 0usize;
     let multi = targets.len() > 1;
@@ -3050,19 +2946,13 @@ fn run_down_target(
 ) -> Result<usize, autumn_web::migrate::MigrationError> {
     use autumn_web::migrate::MigrationError;
 
-    // The plan/execute closures are backend-agnostic; only the revert engine
-    // differs — Postgres runs under the advisory lock, SQLite through the
-    // unlocked harness (issue #2058, single-writer #1999). The plan is still
-    // rebuilt and re-validated under the same connection in both.
+    // Only the revert engine differs by backend. Both rebuild and re-validate the plan on the
+    // connection that reverts it.
     let plan = |applied: &[AppliedUserMigration]| -> Result<Vec<String>, MigrationError> {
         let plan = build_rollback_plan(args, applied);
 
-        // Recheck under the lock that this target's plan still matches what
-        // preflight saw (and verified uniform across targets). A concurrent
-        // migrate/down may have changed the applied history in the window
-        // between preflight and acquiring this lock; rolling back a now-
-        // different version list would diverge this target from the ones
-        // already reverted.
+        // A concurrent migrate/down may have changed the history since preflight. Reverting a
+        // different list here would diverge this target from the ones already reverted.
         if plan != preflighted_plan {
             return Err(MigrationError::Migration(format!(
                 "rollback plan for this target changed under the lock since preflight \
@@ -3079,13 +2969,9 @@ fn run_down_target(
             return Ok(plan);
         }
 
-        // Re-validate under the lock (defense-in-depth against the plan
-        // going stale between the up-front preflight and here).
+        // Re-validate under the lock: the `down.sql` files may have changed since preflight.
         check_rollback_plan_revertable(applied, &plan, target_backend(database_url));
 
-        // Preflight passed: enable maintenance mode (if requested and not
-        // already enabled for an earlier target) before we mutate schema,
-        // then stream the rollback.
         if with_maintenance && !*maintenance_enabled {
             enable_maintenance_for_migrate();
             *maintenance_enabled = true;
@@ -3104,9 +2990,8 @@ fn run_down_target(
     if is_sqlite_target(database_url) {
         revert_user_migrations_sqlite_cli(database_url, dir, plan, on_reverted)
     } else {
-        // Rollback plans by version too and excludes framework versions from
-        // the plan, so a colliding app migration would be skipped as
-        // framework-owned: the same refusal as the apply path.
+        // Rollback also plans by version and leaves out framework versions, so a colliding app
+        // migration would be skipped as framework-owned. Refuse it, as the apply path does.
         if let Some(message) = framework_version_collision_error(dir, is_shard) {
             return Err(MigrationError::Migration(format!(
                 "migration version collision: {message}"
@@ -3321,8 +3206,7 @@ fn show_checksum_status(database_url: &str, migrations_dir: &Path) {
 fn show_framework_status(database_url: &str, is_shard: bool) {
     eprintln!("  Checking Autumn framework migration status...\n");
 
-    // Shard targets require only the shard framework migrations (version
-    // history + commit-hook queue); the control plane requires the full set.
+    // Shard targets require only the shard framework migrations.
     let pending = if is_shard {
         autumn_web::migrate::pending_shard_framework_migrations(database_url)
     } else {
@@ -3356,7 +3240,6 @@ where
 }
 
 fn show_diesel_migration_status(database_url: &str, migrations_dir: &Path) {
-    // `diesel migration list` shows all migrations and their status
     let status = Command::new("diesel")
         .args(["migration", "list", "--migration-dir"])
         .arg(migrations_dir)
@@ -3416,8 +3299,6 @@ mod tests {
         );
     }
 
-    // ── Existing tests ────────────────────────────────────────────────────
-
     #[test]
     fn migrate_action_eq() {
         assert_eq!(MigrateAction::Run, MigrateAction::Run);
@@ -3431,9 +3312,7 @@ mod tests {
 
     #[test]
     fn baseline_action_default_records_all_unrecorded() {
-        // No force_version → additive baseline (backfill hashes for legacy
-        // applied migrations only). This is the safe default and must never
-        // silently overwrite an existing recorded hash.
+        // No `force_version` is the additive default, which never overwrites a recorded hash.
         let action = MigrateAction::Baseline(BaselineArgs {
             force_version: None,
         });
@@ -3447,8 +3326,7 @@ mod tests {
 
     #[test]
     fn baseline_action_force_targets_one_version() {
-        // With force_version → escape hatch that overwrites a single stored
-        // hash. Must carry the explicit version.
+        // The escape hatch overwrites one stored hash, so it carries the explicit version.
         let action = MigrateAction::Baseline(BaselineArgs {
             force_version: Some("20260101000000".to_owned()),
         });
@@ -3786,8 +3664,7 @@ mod tests {
                 ("AUTUMN_IS_DEBUG", None),
             ],
             || {
-                // AUTUMN_ENV wins over a stale legacy AUTUMN_PROFILE and an
-                // explicit --profile flag, mirroring the runtime loader.
+                // As in the runtime loader, AUTUMN_ENV beats AUTUMN_PROFILE and `--profile`.
                 assert_eq!(effective_profile(Some("staging")), "prod");
             },
         );
@@ -3830,8 +3707,7 @@ mod tests {
                 ("AUTUMN_IS_DEBUG", None),
             ],
             || {
-                // No env, no flag, debug build → dev (the runtime default), so the
-                // CLI applies the same [profile.dev]/autumn-dev.toml overlay.
+                // `dev` is the runtime default, so the CLI applies the same dev overlay.
                 assert_eq!(effective_profile(None), "dev");
             },
         );
@@ -3853,8 +3729,8 @@ mod tests {
 
     #[test]
     fn canonical_profile_normalizes_aliases_and_case() {
-        // P2 #20: offsite `.env.<profile>` selection must use the app's canonical
-        // profile, so alias/case spellings collapse the same way the loader does.
+        // Offsite `.env.<profile>` selection uses the app's canonical profile, so alias and case
+        // spellings collapse as in the loader.
         for input in ["development", "Development", "DEV", "dev", "  dev  "] {
             assert_eq!(canonical_profile(input), "dev", "{input:?}");
         }
@@ -3868,7 +3744,6 @@ mod tests {
 
     #[test]
     fn profile_file_lookup_prefers_selected_spelling() {
-        // Overlay file probe order prefers the spelling the operator selected.
         assert_eq!(
             profile_file_lookup_names("prod"),
             vec!["prod", "production"]
@@ -4477,13 +4352,10 @@ mod tests {
         );
     }
 
-    // ── Shard-specific framework migrations (§5a) ──────────────────────────────
+    // ── Shard-specific framework migrations ────────────────────────────────────
     //
-    // Shards hold tenant data and need only the version-history and
-    // commit-hook queue tables — not the full control-plane schema (API tokens,
-    // sessions, jobs, …).  `run_shard_framework_migrations_inner` is the
-    // testable core; in production it delegates to
-    // `autumn_web::migrate::run_pending_shard_framework_migrations`.
+    // Shards need only the version-history and commit-hook queue tables, not the control-plane
+    // schema. `run_shard_framework_migrations_inner` is the testable core.
 
     #[test]
     fn shard_target_applies_only_shard_framework_migrations() {
@@ -4573,7 +4445,6 @@ mod tests {
 
     #[test]
     fn resolve_database_url_from_env() {
-        // AUTUMN_DATABASE__URL takes priority
         let env_var = |key: &str| -> Result<String, std::env::VarError> {
             if key == "AUTUMN_DATABASE__URL" {
                 Ok("postgres://test:5432/mydb".to_string())
@@ -4587,7 +4458,6 @@ mod tests {
 
     #[test]
     fn resolve_database_url_from_database_url_env() {
-        // Make sure AUTUMN_DATABASE__URL is not set, but DATABASE_URL is
         let env_var = |key: &str| -> Result<String, std::env::VarError> {
             if key == "DATABASE_URL" {
                 Ok("postgres://fallback:5432/db".to_string())
@@ -4637,9 +4507,8 @@ replica_url = "postgres://replica:5432/app"
 
     #[test]
     fn resolve_primary_url_reads_env_for_active_profile() {
-        // `resolve_primary_url` is the convenience entry the `autumn db`
-        // commands use; it must resolve the same primary URL `autumn migrate`
-        // would for the active profile. The env var wins over any file layer.
+        // The `autumn db` commands must resolve the primary URL `autumn migrate` would for the
+        // active profile. The env var wins over any file layer.
         temp_env::with_vars(
             [
                 ("AUTUMN_ENV", Some("dev")),
@@ -4659,8 +4528,7 @@ replica_url = "postgres://replica:5432/app"
 
     #[test]
     fn resolve_primary_url_none_when_unset() {
-        // No env URL and no autumn.toml in the test's working directory → None,
-        // leaving the caller to report the missing-URL error.
+        // No env URL and no autumn.toml in the working directory: the caller reports it.
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -4715,8 +4583,7 @@ replica_url = "postgres://replica:5432/app"
 
     #[test]
     fn reject_sqlite_sharding_rejects_sqlite_control_and_shards() {
-        // SQLite control + shard entries is a boot-invalid topology (sharding is
-        // Postgres-only); the guard mirrors the runtime guard's wording (#1614).
+        // A SQLite control with shards cannot boot: sharding is Postgres-only.
         let err = reject_sqlite_sharding_topology(Some("sqlite:///tmp/app.db"), &two_shards())
             .unwrap_err();
         assert!(
@@ -4727,9 +4594,7 @@ replica_url = "postgres://replica:5432/app"
 
     #[test]
     fn reject_sqlite_sharding_rejects_postgres_control_with_sqlite_shard() {
-        // The sibling case: a Postgres (or any non-sqlite) control with a shard
-        // whose primary_url is sqlite:// — the shard loop would migrate that
-        // sqlite file. Must be rejected regardless of the control backend.
+        // A SQLite shard is rejected whatever the control backend.
         let err = reject_sqlite_sharding_topology(Some("postgres://control/app"), &sqlite_shard())
             .unwrap_err();
         assert!(
@@ -4742,8 +4607,6 @@ replica_url = "postgres://replica:5432/app"
 
     #[test]
     fn reject_sqlite_sharding_rejects_no_control_with_sqlite_shard() {
-        // No control role, but a sqlite shard target: still rejected (the shard
-        // loop would route it through the Postgres-only harness).
         let err = reject_sqlite_sharding_topology(None, &sqlite_shard()).unwrap_err();
         assert!(
             err.contains("do not support sharding") && err.contains("#1614"),
@@ -4753,7 +4616,6 @@ replica_url = "postgres://replica:5432/app"
 
     #[test]
     fn reject_sqlite_sharding_allows_sqlite_without_shards() {
-        // A plain SQLite deployment (no shards) is the normal, supported case.
         assert_eq!(
             reject_sqlite_sharding_topology(Some("sqlite:///tmp/app.db"), &[]),
             Ok(())
@@ -4762,8 +4624,6 @@ replica_url = "postgres://replica:5432/app"
 
     #[test]
     fn reject_sqlite_sharding_allows_postgres_with_postgres_shards() {
-        // Postgres control + all-Postgres shards is the intended sharded topology
-        // — never rejected.
         assert_eq!(
             reject_sqlite_sharding_topology(Some("postgres://control/app"), &two_shards()),
             Ok(())
@@ -4772,19 +4632,13 @@ replica_url = "postgres://replica:5432/app"
 
     #[test]
     fn reject_sqlite_sharding_allows_no_control_no_shards() {
-        // No primary role and no shards: nothing to reject.
         assert_eq!(reject_sqlite_sharding_topology(None, &[]), Ok(()));
     }
 
     #[test]
     fn framework_migrations_backend_mismatch_rejects_non_sqlite_targets_under_a_sqlite_build() {
-        // `FRAMEWORK_MIGRATIONS` is chosen once, at compile time, by the `sqlite`
-        // cargo feature (autumn/src/migrate.rs) — never per target at runtime.
-        // Compiled with `sqlite`, this build's embedded set is the SQLite fork
-        // for the WHOLE binary, so a non-SQLite target must be rejected here
-        // rather than silently applying the wrong DDL. The default build has no
-        // such mismatch to reject. `cfg!` makes this assertion track whichever
-        // build actually compiled it, so the test is meaningful either way.
+        // The `sqlite` feature picks the embedded framework set at compile time, so only a
+        // `sqlite` build has a mismatch to reject. `cfg!` makes the test hold in either build.
         let is_mismatch = framework_migrations_backend_mismatch("postgres://control/app").is_err();
         assert_eq!(
             is_mismatch,
@@ -4795,8 +4649,6 @@ replica_url = "postgres://replica:5432/app"
 
     #[test]
     fn framework_migrations_backend_mismatch_allows_sqlite_targets_in_any_build() {
-        // A genuine `sqlite://` target is never a backend mismatch, regardless
-        // of which backend this CLI was compiled for.
         assert_eq!(
             framework_migrations_backend_mismatch("sqlite:///tmp/app.db"),
             Ok(())
@@ -4930,8 +4782,6 @@ primary_url = "postgres://shard0:5432/app"
 "#,
         )
         .unwrap();
-        // The fallible core returns the same successful result the exiting wrapper
-        // does, so command paths keep identical behavior.
         assert_eq!(
             try_resolve_shard_database_urls_from_sources(no_env, Some(&table)).unwrap(),
             vec![("shard0".to_owned(), "postgres://shard0:5432/app".to_owned())],
@@ -4940,10 +4790,8 @@ primary_url = "postgres://shard0:5432/app"
 
     #[test]
     fn try_shard_urls_missing_primary_url_returns_err_not_exit() {
-        // A malformed `[[database.shards]]` entry (missing `primary_url`) makes the
-        // exiting variant `std::process::exit(1)`. The fallible core must instead
-        // return `Err` so `autumn doctor` can render a failing check rather than
-        // terminating before emitting JSON.
+        // `autumn doctor` must render a malformed shard as a failing check, not exit before
+        // emitting JSON.
         let table = toml::from_str::<toml::Table>(
             r#"
 [[database.shards]]
@@ -5007,12 +4855,11 @@ primary_url = "postgres://prod:5432/app"
             .get("database")
             .and_then(toml::Value::as_table)
             .unwrap();
-        // Overlay scalar replaces the base value...
         assert_eq!(
             database.get("primary_url").and_then(toml::Value::as_str),
             Some("postgres://prod:5432/app")
         );
-        // ...while base-only keys in the same table are preserved.
+        // Base-only keys in the same table are preserved.
         assert_eq!(
             database.get("pool_size").and_then(toml::Value::as_integer),
             Some(5)
@@ -5021,8 +4868,7 @@ primary_url = "postgres://prod:5432/app"
 
     #[test]
     fn deep_merge_toml_arrays_replaced_wholesale() {
-        // Shard arrays must be replaced, not concatenated, so a profile can
-        // point at an entirely different set of shard databases.
+        // Replacing, not concatenating, lets a profile point at a different set of shards.
         let mut base = toml::from_str::<toml::Table>(
             r#"
 [[database.shards]]
@@ -5051,8 +4897,6 @@ primary_url = "postgres://prod-s0:5432/app"
 
     #[test]
     fn profile_overlay_overrides_shard_url() {
-        // End-to-end through the file loader: a base autumn.toml plus an
-        // autumn-prod.toml overlay; --profile prod resolves the prod URLs.
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("autumn.toml"),
@@ -5102,8 +4946,7 @@ primary_url = "postgres://prod-s0:5432/app"
 
     #[test]
     fn autumn_toml_base_dir_prefers_manifest_dir_with_config() {
-        // P2 #15: when AUTUMN_MANIFEST_DIR holds an autumn.toml, offsite TOML
-        // reads must resolve from THAT directory (like the full loader), not CWD.
+        // Like the full loader, offsite TOML reads resolve from the manifest dir, not CWD.
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("autumn.toml"), "[backup.offsite]\n").unwrap();
         assert_eq!(
@@ -5114,7 +4957,6 @@ primary_url = "postgres://prod-s0:5432/app"
 
     #[test]
     fn autumn_toml_base_dir_falls_back_to_cwd() {
-        // No manifest dir, or a manifest dir WITHOUT an autumn.toml → CWD (".").
         assert_eq!(
             autumn_toml_base_dir_from(None),
             std::path::PathBuf::from(".")
@@ -5132,9 +4974,6 @@ primary_url = "postgres://prod-s0:5432/app"
 
     #[test]
     fn config_dir_read_surfaces_offsite_section() {
-        // The manifest-dir read must carry the [backup.offsite] section (with the
-        // profile overlay applied) so offsite resolution + auto_upload work when
-        // the config lives outside CWD.
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("autumn.toml"),
@@ -5153,9 +4992,7 @@ primary_url = "postgres://prod-s0:5432/app"
 
     #[test]
     fn overlay_file_resolved_via_profile_alias() {
-        // Operator selects `production`, but the overlay file uses the common
-        // `autumn-prod.toml` spelling — the alias must still resolve it, just
-        // like the runtime loader.
+        // `production` is selected, but the overlay file is spelled `autumn-prod.toml`.
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("autumn.toml"),
@@ -5178,10 +5015,8 @@ primary_url = "postgres://prod-s0:5432/app"
 
     #[test]
     fn inline_profile_section_overrides_base_url() {
-        // A deployment that keeps prod URLs in an inline `[profile.prod.*]`
-        // section of autumn.toml (no separate autumn-prod.toml) must still
-        // resolve the prod URLs under `--profile prod`, matching the runtime
-        // loader. `production` is honored as an alias for `prod`.
+        // No `autumn-prod.toml`: the prod URLs come from an inline `[profile.production.*]`
+        // section, which `prod` reaches as an alias.
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join("autumn.toml"),
@@ -5346,8 +5181,7 @@ primary_url = "postgres://prod-s0:5432/app"
         let migration_dir = tmp.path().join("20260104000000_add_index");
         std::fs::create_dir_all(&migration_dir).unwrap();
 
-        // The concurrent index is only mentioned in a comment; the actual
-        // statement is a plain (non-concurrent) CREATE INDEX.
+        // CONCURRENTLY appears only in a SQL comment; the statement is a plain CREATE INDEX.
         let sql = "-- TODO: switch to CREATE INDEX CONCURRENTLY once traffic drops\n\
                    CREATE INDEX idx_posts_title ON posts (title);";
         let mut findings = Vec::new();
@@ -5432,7 +5266,7 @@ primary_url = "postgres://prod-s0:5432/app"
         );
     }
 
-    // ── startup wait resolver (red phase) ────────────────────────────────────
+    // ── startup wait resolver ────────────────────────────────────────────────
 
     #[test]
     fn resolve_startup_wait_secs_defaults_to_zero() {
