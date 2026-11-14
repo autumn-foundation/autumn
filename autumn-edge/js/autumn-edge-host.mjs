@@ -34,9 +34,9 @@ export const WIRE_VERSION = 1;
 /// The response header a handler sets to decline (never reaches a client).
 export const FALLTHROUGH_SENTINEL = "x-autumn-edge-fallthrough";
 
-/// The only request headers that reach a capsule. An allowlist: identity-aware
-/// proxies add bearer assertions under names no denylist can know. Same list
-/// as `autumn_edge::wire::ALLOWED_REQUEST_HEADERS`.
+/// The only request headers that reach a capsule. This is an allowlist.
+/// Identity-aware proxies add bearer assertions under names that a denylist
+/// cannot know. Same list as `autumn_edge::wire::ALLOWED_REQUEST_HEADERS`.
 export const ALLOWED_REQUEST_HEADERS = Object.freeze([
   "accept",
   "accept-charset",
@@ -863,8 +863,8 @@ export class EdgeGateway {
     const pairs = allowedRequestHeaders([...headers]);
     // A non-ASCII value may be bytes the Fetch API decoded as Latin-1: it
     // cannot cross the wire as the UTF-8 the capsule expects, so only the
-    // origin answers it — the gateway's rule for a non-UTF-8 value. Only a
-    // header the capsule gets is checked.
+    // origin answers it — the gateway's rule for a non-UTF-8 value. The
+    // gateway checks only the headers that go to the capsule.
     if (pairs.some(([, value]) => /[^\x00-\x7f]/.test(value))) {
       return this.toOrigin(request, target, headers, "origin_only", null);
     }

@@ -112,9 +112,8 @@ pub async fn count() -> usize {
 ///
 /// Only allowlisted request headers reach an edge handler. The wire keeps
 /// them before the capsule dispatches, and the `#[edge]` macro gives the
-/// *origin* mount the same filter. Thus this handler renders the same answer
-/// on both substrates, also when the request has credentials or proxy
-/// assertions.
+/// *origin* mount the same filter. Thus this handler gives the same answer on
+/// both lanes, even when the request has credentials or proxy assertions.
 #[get("/whoami")]
 #[edge]
 pub async fn whoami(headers: HeaderMap) -> String {

@@ -395,8 +395,8 @@ web-standard). The conformance suite runs both and requires the same outcome.
   credentials. An identity-aware proxy adds its own bearer assertion, for
   example `cf-access-jwt-assertion`, `x-amzn-oidc-data`,
   `x-ms-client-principal` or `x-goog-iap-jwt-assertion`. A denylist cannot
-  name all of them. A capsule can echo a header it gets, so a header that is
-  not on the list never gets to the capsule.
+  name all of them. A capsule can echo each header that it gets. Thus a header
+  that is not on the list must not get to the capsule.
 - **No session, no auth, no CSRF, no database.** Not "discouraged": absent from
   the dependency graph. A route that needs any of them cannot compile as an
   `#[edge]` route.
@@ -673,7 +673,8 @@ What it does:
   unchanged. The fallthrough detail does not reach the client.
 - It sends a write, an `upgrade` handshake (WebSocket), or a request with a
   header value that is not UTF-8, to the origin. It does not ask the
-  capsule. Only a header that the capsule gets is checked for UTF-8.
+  capsule. The gateway checks for UTF-8 only in the headers that go to the
+  capsule.
 - It does not trust the capsule. A status outside 200-599, `set-cookie`, the
   fallthrough header, a hop-by-hop header, a body on 204/205/304, or a
   `content-length` that does not match the body is a `capsule_error`

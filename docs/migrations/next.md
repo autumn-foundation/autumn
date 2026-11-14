@@ -823,9 +823,10 @@ The old denylist did not name these headers, so a capsule got them and could
 echo them. Now only `autumn_edge::wire::ALLOWED_REQUEST_HEADERS` cross: content
 negotiation, conditional requests, `cache-control` and `user-agent`.
 
-**You are affected if** your code names `SENSITIVE_HEADERS` or
-`strip_sensitive_headers`, or an `#[edge]` handler reads another header
-(for example `host`, `x-request-id` or a custom header) through `HeaderMap`.
+**You are affected if** your code names `SENSITIVE_HEADERS` (from
+`autumn_edge` or `autumn_edge::wire`) or `strip_sensitive_headers`, or an
+`#[edge]` handler reads a header that is not on the list (for example `host`,
+`x-request-id` or a custom header) through `HeaderMap`.
 Both lanes now drop that header. The origin middleware still sees it.
 
 **Before (`{X.Y}`):**

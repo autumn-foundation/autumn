@@ -60,17 +60,17 @@ pub const FALLTHROUGH_SENTINEL: &str = "x-autumn-edge-fallthrough";
 
 /// The only request headers that reach a capsule.
 ///
-/// An allowlist, not a denylist. Identity-aware proxies add bearer assertions
-/// under their own names (`cf-access-jwt-assertion`, `x-amzn-oidc-data`,
-/// `x-ms-client-principal`, `x-goog-iap-jwt-assertion`), and no denylist can
-/// name all of them. An edge handler needs only content negotiation and
-/// conditional-request headers.
+/// This list is an allowlist, not a denylist. Identity-aware proxies add
+/// bearer assertions under their own names (`cf-access-jwt-assertion`,
+/// `x-amzn-oidc-data`, `x-ms-client-principal`, `x-goog-iap-jwt-assertion`),
+/// and no denylist can name all of them. An edge handler needs only content
+/// negotiation and conditional-request headers.
 ///
 /// The host filters before it sends the request frame. The guest filters
 /// again when it receives the frame, because it cannot audit its host. The
 /// native mount of an `#[edge]` route uses the same list, so both lanes give
 /// a handler the same headers. [`FALLTHROUGH_SENTINEL`] is not on the list,
-/// so a request cannot set it. Sorted.
+/// so a request cannot set it. The list is sorted.
 pub const ALLOWED_REQUEST_HEADERS: &[&str] = &[
     "accept",
     "accept-charset",
@@ -87,7 +87,7 @@ pub const ALLOWED_REQUEST_HEADERS: &[&str] = &[
 ];
 
 /// Whether a request header of this name may reach a capsule.
-/// Case-insensitive, and with no allocation.
+/// The match is case-insensitive and does not allocate.
 #[must_use]
 pub fn request_header_allowed(name: &str) -> bool {
     ALLOWED_REQUEST_HEADERS

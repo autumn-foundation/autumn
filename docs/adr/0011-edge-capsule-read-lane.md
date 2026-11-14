@@ -144,8 +144,8 @@ unfiltered CI job.
   `ALLOWED_REQUEST_HEADERS` cross the wire: content negotiation, conditional
   requests, `cache-control` and `user-agent`. The host filters before it sends,
   and the guest filters again when it receives. The native mount uses the same
-  list. An allowlist, not a denylist, because identity-aware proxies add bearer
-  assertions under names that no list can predict.
+  list. We use an allowlist, not a denylist. Identity-aware proxies add bearer
+  assertions under names that no denylist can predict.
 - **The sandbox is the import list.** The reference host implements the smallest
   WASI surface a capsule needs and no `path_open`, no resolving `fd_prestat_*`
   and no socket import; the conformance suite asserts the artifact's imports

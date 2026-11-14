@@ -112,9 +112,9 @@ flowchart LR
    - The edge-conformance CI job runs the generated bundle in **workerd**
      (`wrangler dev`), Cloudflare's open-source runtime. It runs against the
      real origin binary with a seeded KV namespace.
-   - Unit tests in `autumn_edge::js` read the JS constants (the request-header allowlist,
-     hop-by-hop headers, budgets, the import list) back out of the source and
-     compare them with the Rust ones.
+   - Unit tests in `autumn_edge::js` read the JS constants (the request-header
+     allowlist, hop-by-hop headers, budgets, the import list) back out of the
+     source and compare them with the Rust ones.
 
 ## Design Details
 
@@ -146,7 +146,7 @@ flowchart LR
 - Deploying an edge app to Cloudflare is `autumn build`,
   `autumn edge bundle --origin …`, `wrangler deploy`. The author writes no
   JavaScript.
-- Every guarantee ADR-0011 makes (determinism, credential stripping, the
+- Every guarantee ADR-0011 makes (determinism, the request-header allowlist, the
   response checks, transparent fallthrough) now holds on a real CDN, and CI
   proves it in the CDN's own runtime.
 - The same host module runs on Deno, Bun, Vercel and Netlify edge functions

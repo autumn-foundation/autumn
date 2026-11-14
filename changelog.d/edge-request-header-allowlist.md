@@ -2,9 +2,10 @@
 
 - **edge:** only allowlisted request headers reach an edge capsule. Before,
   the hosts removed only `cookie`, `authorization` and `proxy-authorization`.
-  An identity-aware proxy assertion, for example `cf-access-jwt-assertion`,
-  `x-amzn-oidc-data`, `x-ms-client-principal` or `x-goog-iap-jwt-assertion`,
-  got to the capsule, and the capsule could echo it. Now the Rust gateway,
+  An identity-aware proxy adds its own bearer assertion, for example
+  `cf-access-jwt-assertion`, `x-amzn-oidc-data`, `x-ms-client-principal` or
+  `x-goog-iap-jwt-assertion`. That header got to the capsule, and the capsule
+  could echo it. Now the Rust gateway,
   the JS host, the guest runtime and the native `#[edge]` mount keep only
   `ALLOWED_REQUEST_HEADERS`: content negotiation, conditional requests,
   `cache-control` and `user-agent`. The origin still gets all headers.

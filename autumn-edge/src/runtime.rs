@@ -290,7 +290,8 @@ fn render_capabilities(capabilities: &[EdgeCapability]) -> String {
 /// `map_request(strip_request_credentials)`. Thus a handler sees the same
 /// headers on both lanes, and a credential or proxy assertion is not visible
 /// to it on either lane. Route-local: the app's middleware wraps the router
-/// above this layer and still sees the original request.
+/// above this layer and still sees the original request. The name is
+/// historical: the function removes every header that is not on the list.
 pub async fn strip_request_credentials(
     mut request: axum::extract::Request,
 ) -> axum::extract::Request {
