@@ -140,9 +140,12 @@ unfiltered CI job.
   `#[diagnostic::on_unimplemented]` message that names the fix. The macro adds
   the combinations a bound cannot express: non-GET, auth/rate guards,
   `#[static_get]`.
-- **Credentials never reach a capsule.** `cookie`, `authorization` and
-  `proxy-authorization` are stripped by the host before sending and again by the
-  guest on receipt.
+- **Credentials never reach a capsule.** Only the request headers in
+  `ALLOWED_REQUEST_HEADERS` cross the wire: content negotiation, conditional
+  requests, `cache-control` and `user-agent`. The host filters before it sends,
+  and the guest filters again when it receives. The native mount uses the same
+  list. We use an allowlist, not a denylist. Identity-aware proxies add bearer
+  assertions under names that no denylist can predict.
 - **The sandbox is the import list.** The reference host implements the smallest
   WASI surface a capsule needs and no `path_open`, no resolving `fd_prestat_*`
   and no socket import; the conformance suite asserts the artifact's imports
