@@ -992,11 +992,27 @@ fn trybuild_shards_run_from_the_workspace_nextest_archive() {
         "every nextest archive must carry `target/debug/.fingerprint` and fail without it; \
          got {includes:?}"
     );
+}
 
-    // trybuild's cross-process lock is a lock file that another process breaks
-    // after 1.5 s without a touch. nextest runs each test in its own process, so
-    // only a one-slot test group keeps two trybuild runs out of one fixture
-    // directory on a loaded runner.
+/// trybuild's cross-process lock is a lock file that another process breaks
+/// after 1.5 s without a touch. nextest runs each test in its own process, so
+/// only a one-slot test group keeps two trybuild runs out of one fixture
+/// directory on a loaded runner.
+#[test]
+fn trybuild_tests_share_one_nextest_slot() {
+    let root = workspace_root();
+    let config_path = root.join(".config/nextest.toml");
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(&config_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", config_path.display())),
+    )
+    .expect(".config/nextest.toml parses");
+    let field = |entry: &toml::Value, key: &str| {
+        entry
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
     let group_threads = config
         .get("test-groups")
         .and_then(|g| g.get("trybuild"))
