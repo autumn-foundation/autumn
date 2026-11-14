@@ -994,15 +994,15 @@ fn ses_dispatch_handler(
 }
 
 #[cfg(feature = "inbound-ses")]
-#[tokio::test]
-async fn ses_subscription_confirmation_fetch_failure_returns_500() {
+const SES_TOPIC: &str = "arn:aws:sns:us-east-1:123456789012:test-topic";
+
+/// Posts a `SubscriptionConfirmation` with `subscribe_url` and returns the status.
+#[cfg(feature = "inbound-ses")]
+async fn ses_subscription_status(subscribe_url: &str) -> u16 {
     set_skip_sns_verification();
 
     let router = InboundMailRouter::new()
-        .endpoint(
-            InboundMailEndpointConfig::ses("/inbound/ses")
-                .with_topic_arn("arn:aws:sns:us-east-1:123456789012:test-topic"),
-        )
+        .endpoint(InboundMailEndpointConfig::ses("/inbound/ses").with_topic_arn(SES_TOPIC))
         .handler(InboundMailHandlerInfo {
             name: "ses",
             pattern: RecipientPattern::Any,
@@ -1017,7 +1017,8 @@ async fn ses_subscription_confirmation_fetch_failure_returns_500() {
 
     let body = serde_json::json!({
         "Type": "SubscriptionConfirmation",
-        "SubscribeURL": "https://sns.example.com/confirm?token=abc123"
+        "TopicArn": SES_TOPIC,
+        "SubscribeURL": subscribe_url,
     })
     .to_string();
 
@@ -1028,9 +1029,33 @@ async fn ses_subscription_confirmation_fetch_failure_returns_500() {
         .body(body)
         .send()
         .await
-        // The SubscribeURL is unreachable in tests, so the handler returns 500 and SNS
-        // will retry the SubscriptionConfirmation delivery.
-        .assert_status(500);
+        .status
+        .as_u16()
+}
+
+/// A `SubscribeURL` outside SNS is refused before any fetch (no blind SSRF).
+#[cfg(feature = "inbound-ses")]
+#[tokio::test]
+async fn ses_subscription_confirmation_rejects_non_sns_subscribe_urls() {
+    let confirm = format!("?Action=ConfirmSubscription&TopicArn={SES_TOPIC}&Token=t");
+    for url in [
+        format!("https://sns.example.com/{confirm}"),
+        format!("https://sns.us-east-1.amazonaws.com@attacker.example/{confirm}"),
+        format!("https://sns.us-east-1.amazonaws.com:8443/{confirm}"),
+        format!("http://sns.us-east-1.amazonaws.com/{confirm}"),
+        format!("https://169.254.169.254/latest/meta-data/{confirm}"),
+        "https://sns.us-east-1.amazonaws.com/?Action=Publish&Token=t".to_string(),
+        format!(
+            "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription\
+             &TopicArn=arn:aws:sns:us-east-1:999999999999:other&Token=t"
+        ),
+    ] {
+        assert_eq!(
+            ses_subscription_status(&url).await,
+            400,
+            "must reject {url}"
+        );
+    }
 }
 
 #[cfg(feature = "inbound-ses")]

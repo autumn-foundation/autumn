@@ -506,6 +506,16 @@ A notification carrying any other `TopicArn` is rejected with `401`. SNS
 subscription confirmation is handled for you — Autumn fetches the `SubscribeURL`
 and answers `500` if that fetch fails, so SNS retries.
 
+Autumn fetches only from SNS. Both URLs must be
+`https://sns.<region>.amazonaws.com/…` (`.amazonaws.com.cn` for a `cn-`
+region), with no user info and no port:
+
+- `SigningCertURL` must name one `.pem` file. Any other URL gets `401`. The
+  certificate fetch does not follow redirects. It needs a `Content-Length` of
+  16 KiB or less. Other responses get `502`.
+- `SubscribeURL` must be `/?Action=ConfirmSubscription` with your `TopicArn`.
+  Any other URL gets `400` and Autumn does not fetch it.
+
 The SES adapter also needs the `inbound-ses` feature specifically: with only
 `inbound-mail` enabled the SNS signature verifier is not compiled in, and rather
 than accept unauthenticated notifications the endpoint answers `503` to all of
