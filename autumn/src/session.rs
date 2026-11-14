@@ -237,6 +237,17 @@ impl Session {
         self.inner.read().await.data.get(key).cloned()
     }
 
+    /// Apply `check` to the value of `key` without a copy. `false` when the
+    /// key is absent.
+    pub(crate) async fn value_matches(&self, key: &str, check: impl FnOnce(&str) -> bool) -> bool {
+        self.inner
+            .read()
+            .await
+            .data
+            .get(key)
+            .is_some_and(|value| check(value))
+    }
+
     /// Insert a key-value pair into the session.
     pub async fn insert(&self, key: impl Into<String>, value: impl Into<String>) {
         let mut inner = self.inner.write().await;

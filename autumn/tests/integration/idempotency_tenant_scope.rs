@@ -47,6 +47,7 @@ fn tenancy_config(source: &str) -> AutumnConfig {
     let mut config = AutumnConfig::default();
     config.tenancy.enabled = true;
     source.clone_into(&mut config.tenancy.source);
+    config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
     "x-tenant-id".clone_into(&mut config.tenancy.header_name);
     config.tenancy.base_domain = Some("example.test".to_owned());
     // Subdomain tenancy resolves the tenant from `Host`, so both tenant hosts

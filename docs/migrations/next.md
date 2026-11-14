@@ -813,6 +813,71 @@ host = "0.0.0.0"
 
 **Automation:** `manual` — give each field its name.
 
+### Tenancy: the tenant header needs `header_trust`
+
+**Why:** with `source = "header"`, any client could select its tenant. A
+user of tenant A could send `x-tenant-id: B` and get tenant B's rows and
+shard.
+
+**You are affected if `[tenancy] enabled = true` and one of these is true:**
+you do not set `source`; you set `source = "header"`; or the session holds
+`tenancy.session_key` (default `tenant_id`) with a source other than
+`session`.
+
+- The default `source` is now `"session"`. An app that used the default
+  header gets `401`, or the login redirect, until it sets `source` or
+  writes the tenant to the session.
+- `source = "header"` needs `header_trust`. Without it, the app does not
+  start, and a router built without `run` returns `500`.
+- `header_trust = "trusted_proxy"` accepts the header only from a peer
+  address in `security.trusted_proxies.ranges`. `trusted_hops` does not
+  count. The boot fails when no range is valid. The proxy must set the
+  header and remove the client's copy.
+- `header_trust = "any_client"` accepts the header from any client. It is
+  unsafe. Use it only when the app checks tenant membership itself.
+- With `source = "header"`, two header values get `400`.
+- For every source except `session`: when the session holds
+  `tenancy.session_key`, the resolved tenant must be equal to it, with the
+  same case, or the request gets `403`. An empty value does not bind. An app
+  that keeps another form of the id under that key (for example, a number
+  for a slug subdomain) must move it to another key.
+- A `TenancyConfig` struct literal needs `header_trust`, or
+  `..Default::default()`.
+
+**Before (`{X.Y}`):**
+
+```toml
+[tenancy]
+enabled = true
+```
+
+**After (`{(X+1).0}`):**
+
+Recommended: the tenant comes from the signed-in session.
+
+```toml
+[tenancy]
+enabled = true
+source = "session"
+session_key = "tenant_id"
+```
+
+Or: a gateway sets the header after it authenticates the user.
+
+```toml
+[tenancy]
+enabled = true
+source = "header"
+header_trust = "trusted_proxy"
+
+[security.trusted_proxies]
+trust_forwarded_headers = true
+ranges = ["10.0.0.0/8"]
+```
+
+**Automation:** `manual` — select the tenant source. A codemod cannot know
+which source is correct for the app.
+
 ---
 
 ### Edge: handlers see only allowlisted request headers
@@ -940,6 +1005,11 @@ single most valuable section of the guide — keep it factual and short.
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
 
 ## Configuration changes
+
+- New key `[tenancy] header_trust` (`"trusted_proxy"` or `"any_client"`, no
+  default), and its variable `AUTUMN_TENANCY__HEADER_TRUST`. The default of
+  `[tenancy] source` is now `"session"`. See
+  [Tenancy: the tenant header needs `header_trust`](#tenancy-the-tenant-header-needs-header_trust).
 
 - New key `[database.fleet] max_resident_bytes` (default `0`, no budget),
   and its variable `AUTUMN_DATABASE__FLEET__MAX_RESIDENT_BYTES`.

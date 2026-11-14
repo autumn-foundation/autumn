@@ -195,8 +195,8 @@ impl ProxyResolver {
     ///
     /// - `trust_forwarded_headers = false`: never.
     /// - `trusted_hops = N`: only when the `X-Forwarded-For` chain has more
-    ///   than `N` valid entries, as for the forwarded host. A direct client
-    ///   cannot satisfy the count.
+    ///   than `N` valid entries, as for the forwarded host. A client that
+    ///   connects directly can forge the chain.
     /// - Ranges set: the peer IP must be in a range.
     /// - Neither set: every peer.
     pub(crate) fn is_trusted_peer<B>(&self, req: &Request<B>) -> bool {
