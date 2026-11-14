@@ -286,6 +286,7 @@ dependencies = [
  "ed25519-dalek",
  "fd-lock",
  "flate2",
+ "foldhash 0.2.0",
  "futures",
  "getrandom 0.4.3",
  "hex",
