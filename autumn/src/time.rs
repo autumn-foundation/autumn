@@ -1088,12 +1088,18 @@ mod tests {
         drop(guard);
 
         // The system clock is behind the 90 s the timeline gave out. A second
-        // timeline still starts after them: the mark holds it.
-        let second = TickingClock::starting_at(epoch);
-        let _guard = install_ambient(Arc::new(second));
+        // timeline on a new thread has no instants of its own to stay ahead
+        // of, so only the process-wide mark can start it after them.
+        let on_a_new_thread = std::thread::spawn(move || {
+            let second = TickingClock::starting_at(epoch);
+            let _guard = install_ambient(Arc::new(second));
+            ambient_instant()
+        })
+        .join()
+        .unwrap();
         assert!(
-            ambient_instant() >= stored,
-            "the mark keeps timelines forward"
+            on_a_new_thread >= stored,
+            "the mark keeps a later timeline forward on any thread"
         );
     }
 

@@ -1235,16 +1235,20 @@ mod tests {
     }
 
     #[test]
-    fn vegas_step_is_the_step_of_the_current_limit() {
+    fn vegas_with_a_kept_step_moves_as_vegas_that_computes_each_step() {
         // Small bounds pin the limit at each end for many samples, and the
         // stream moves it between them: drops, queues, and quiet samples.
+        // The twin forgets its step before every sample, so it computes each
+        // one. The two must give the same limit, bit for bit, at every step.
+        let mut reused = 0_u32;
         for (min, max, initial) in [
             (1, 1000, 20),
             (10, 100, 100),
             (1, 10, 1),
             (5, 100_000, 99_990),
         ] {
-            let mut v = Vegas::new(bounds(min, max, initial));
+            let mut kept = Vegas::new(bounds(min, max, initial));
+            let mut computed = kept.clone();
             let mut bits: u64 = 0x2545_F491_4F6C_DD1D;
             let mut limit = initial;
             for _ in 0..20_000 {
@@ -1253,11 +1257,20 @@ mod tests {
                 bits ^= bits << 17;
                 let mut s = sample(1 + bits % 60, limit);
                 s.dropped = bits.is_multiple_of(11);
-                limit = v.update(s);
-                let fresh = Vegas::log10_root(v.estimated);
-                assert_eq!(v.step().to_bits(), fresh.to_bits(), "limit {}", v.estimated);
+                if kept.step_of.0.to_bits() == kept.estimated.to_bits() {
+                    reused += 1;
+                }
+                computed.step_of = (f64::NAN, 1.0);
+                limit = kept.update(s);
+                assert_eq!(computed.update(s), limit);
+                assert_eq!(kept.estimated.to_bits(), computed.estimated.to_bits());
+                assert_eq!(kept.rtt_noload.to_bits(), computed.rtt_noload.to_bits());
+                assert_eq!(kept.probe_count, computed.probe_count);
             }
         }
+        // Some bounds never hold a limit still. Across them all, the kept
+        // step is used for many samples, so the comparison above covers it.
+        assert!(reused > 1_000, "kept steps reused: {reused}");
     }
 
     // ── AdaptiveThrottle (Google SRE) ─────────────────────────────────────

@@ -340,34 +340,45 @@ mod tests {
     }
 
     #[test]
-    fn the_flag_and_the_config_agree_after_concurrent_changes() {
+    fn each_change_is_seen_at_once_while_readers_race_it() {
+        use std::sync::atomic::AtomicBool;
+
         let state = MaintenanceState::new();
-        let writers: Vec<_> = (0..4)
-            .map(|n| {
-                let state = state.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        // Readers: a config they get is always a whole one the writer stored.
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (state, stop) = (state.clone(), Arc::clone(&stop));
                 std::thread::spawn(move || {
-                    for i in 0..2_000 {
-                        if (i + n) % 2 == 0 {
-                            state.enable(MaintenanceConfig::default());
-                        } else {
-                            state.disable();
+                    let mut seen = 0_u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Some(config) = state.get() {
+                            assert_eq!(config.message.as_deref(), Some("on"));
+                            seen += 1;
                         }
-                        // A reader never sees "on" with a config that a
-                        // later state could not hold: `get` is `Some` only
-                        // while a config is stored.
-                        let _ = state.get();
+                        let _ = state.is_active();
                     }
+                    seen
                 })
             })
             .collect();
-        for writer in writers {
-            writer.join().unwrap();
+        // One writer: what it wrote is what it reads back, on every change,
+        // whatever the readers do.
+        for _ in 0..4_000 {
+            state.enable(MaintenanceConfig {
+                message: Some("on".to_owned()),
+                ..Default::default()
+            });
+            assert!(state.is_active(), "on as soon as `enable` returns");
+            assert!(state.get().is_some());
+            state.disable();
+            assert!(!state.is_active(), "off as soon as `disable` returns");
+            assert!(state.get().is_none());
         }
-        assert_eq!(state.is_active(), state.get().is_some());
-        state.enable(MaintenanceConfig::default());
-        assert!(state.is_active() && state.get().is_some());
-        state.disable();
-        assert!(!state.is_active() && state.get().is_none());
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            reader.join().unwrap();
+        }
     }
 
     #[test]
