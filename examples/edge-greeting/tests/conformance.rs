@@ -107,6 +107,20 @@ const CORPUS: &[ConformanceCase] = &[
         expect: Expectation::Served,
     },
     ConformanceCase {
+        name: "proxy identity assertions are invisible in both lanes",
+        method: "GET",
+        uri: "/whoami",
+        headers: &[
+            ("cf-access-jwt-assertion", "ey.super-secret"),
+            ("x-amzn-oidc-data", "ey.super-secret"),
+            ("x-ms-client-principal", "ey.super-secret"),
+            ("x-goog-iap-jwt-assertion", "ey.super-secret"),
+            ("x-forwarded-user", "super-secret"),
+        ],
+        provided_capabilities: &[],
+        expect: Expectation::Served,
+    },
+    ConformanceCase {
         name: "kv hit",
         method: "GET",
         uri: "/note/greeting",
@@ -1235,6 +1249,8 @@ impl Generator {
             ("cookie", "session=super-secret"),
             ("authorization", "Bearer super-secret"),
             ("proxy-authorization", "Basic super-secret"),
+            ("cf-access-jwt-assertion", "ey.super-secret"),
+            ("x-goog-iap-jwt-assertion", "ey.super-secret"),
         ];
         let count = self.below(4);
         (0..count)

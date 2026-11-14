@@ -15,14 +15,13 @@
 //! - **The capsule never gets a body.** An edge handler cannot read one (no
 //!   body extractor is on the `EdgeHandler` list). The gateway does not buffer
 //!   the body; it keeps it for the origin.
-//! - **Credentials go to the origin only.** [`EdgeArtifact::run`] strips
-//!   [`SENSITIVE_HEADERS`] from the capsule's copy. The forwarded request
-//!   keeps them.
+//! - **Credentials go to the origin only.** The capsule's copy keeps only
+//!   [`ALLOWED_REQUEST_HEADERS`]. The forwarded request keeps all headers.
 //! - **Writes skip the capsule.** A method other than `GET`/`HEAD` goes
 //!   directly to the origin, with the same reason the capsule would give.
-//! - **A request the wire cannot carry skips the capsule.** A header value
-//!   that is not UTF-8, or an `upgrade` handshake (WebSocket), goes to the
-//!   origin as [`Lane::OriginOnly`].
+//! - **A request the wire cannot carry skips the capsule.** An allowed header
+//!   value that is not UTF-8, or an `upgrade` handshake (WebSocket), goes to
+//!   the origin as [`Lane::OriginOnly`].
 //! - **The gateway does not trust the capsule.** A status outside 200-599, an
 //!   invalid header, `set-cookie`, [`FALLTHROUGH_SENTINEL`], a hop-by-hop
 //!   header, a body on 204/205/304, or a `content-length` that does not match
@@ -35,6 +34,8 @@
 //! returns. Thus a `tower::timeout` layer around the gateway cannot stop it;
 //! only the fuel budget does. This is a reference host. A production shim
 //! runs the capsule off the request thread and sets a time limit.
+//!
+//! [`ALLOWED_REQUEST_HEADERS`]: crate::wire::ALLOWED_REQUEST_HEADERS
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -51,7 +52,7 @@ use crate::kv::{EdgeKv, EmptyEdgeKv};
 use crate::route::EdgeCapability;
 use crate::wire::{
     EdgeOutcome, EdgeRequest, EdgeResponse, FALLTHROUGH_SENTINEL, FallthroughReason,
-    SENSITIVE_HEADERS,
+    request_header_allowed,
 };
 
 /// The lane that answered a request. Stored in the response extensions.
@@ -250,12 +251,15 @@ fn is_edge_method(method: &str) -> bool {
     method == "GET" || method == "HEAD"
 }
 
-/// The capsule's view of `request`: no body and no credentials. `None` when a
-/// header value is not UTF-8 and so cannot cross the wire.
+/// The capsule's view of `request`: no body, and only
+/// [`ALLOWED_REQUEST_HEADERS`]. `None` when an allowed header value is not
+/// UTF-8 and so cannot cross the wire.
+///
+/// [`ALLOWED_REQUEST_HEADERS`]: crate::wire::ALLOWED_REQUEST_HEADERS
 fn edge_request<B>(request: &Request<B>) -> Option<EdgeRequest> {
-    let mut headers = Vec::with_capacity(request.headers().len());
+    let mut headers = Vec::new();
     for (name, value) in request.headers() {
-        if SENSITIVE_HEADERS.contains(&name.as_str()) {
+        if !request_header_allowed(name.as_str()) {
             continue;
         }
         let value = std::str::from_utf8(value.as_bytes()).ok()?;
@@ -372,4 +376,66 @@ const fn content_length_fits(status: u16, head: bool, declared: usize, body_len:
 fn with_lane(mut response: Response<Body>, lane: Lane) -> Response<Body> {
     response.extensions_mut().insert(lane);
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(request: &EdgeRequest) -> Vec<&str> {
+        request
+            .headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn the_capsule_copy_drops_proxy_identity_assertions() {
+        let request = Request::get("/x")
+            .header("cf-access-jwt-assertion", "ey.cf")
+            .header("x-amzn-oidc-data", "ey.alb")
+            .header("x-amzn-oidc-accesstoken", "ey.alb-access")
+            .header("x-ms-client-principal", "ey.azure")
+            .header("x-goog-iap-jwt-assertion", "ey.iap")
+            .header("x-forwarded-user", "ada")
+            .header("host", "internal.example")
+            .header("accept", "text/html")
+            .header("if-none-match", "\"v1\"")
+            .body(())
+            .expect("valid request");
+
+        let capsule = edge_request(&request).expect("UTF-8 headers");
+
+        assert_eq!(names(&capsule), ["accept", "if-none-match"]);
+    }
+
+    #[test]
+    fn a_bad_value_on_a_dropped_header_does_not_block_the_capsule() {
+        let request = Request::get("/x")
+            .header(
+                "x-latin1",
+                HeaderValue::from_bytes(b"caf\xe9").expect("opaque"),
+            )
+            .header("accept", "text/html")
+            .body(())
+            .expect("valid request");
+
+        let capsule = edge_request(&request).expect("the bad value is dropped");
+
+        assert_eq!(names(&capsule), ["accept"]);
+    }
+
+    #[test]
+    fn a_bad_value_on_a_kept_header_skips_the_capsule() {
+        let request = Request::get("/x")
+            .header(
+                "accept-language",
+                HeaderValue::from_bytes(b"caf\xe9").expect("opaque"),
+            )
+            .body(())
+            .expect("valid request");
+
+        assert!(edge_request(&request).is_none());
+    }
 }

@@ -63,6 +63,15 @@ async fn credential_blind(headers: axum::http::HeaderMap) -> String {
     }
 }
 
+/// Echo the request header names a handler sees, sorted.
+#[get("/edge/header-names")]
+#[edge]
+async fn header_names(headers: axum::http::HeaderMap) -> String {
+    let mut names: Vec<&str> = headers.keys().map(axum::http::HeaderName::as_str).collect();
+    names.sort_unstable();
+    names.join(",")
+}
+
 /// A cache pre-filled the way an origin app fills it: through the normal
 /// serde-aware `insert_cached` path, with no knowledge of the edge lane.
 fn seeded_cache() -> Arc<dyn Cache> {
@@ -142,6 +151,26 @@ async fn the_origin_mount_strips_credentials_exactly_like_the_wire_does() {
         .await
         .assert_ok()
         .assert_body_eq("no credentials visible");
+}
+
+#[tokio::test]
+async fn the_origin_mount_drops_proxy_assertions_exactly_like_the_wire_does() {
+    let client = TestApp::new().routes(routes![header_names]).build();
+
+    client
+        .get("/edge/header-names")
+        .header("cf-access-jwt-assertion", "ey.cf")
+        .header("x-amzn-oidc-data", "ey.alb")
+        .header("x-ms-client-principal", "ey.azure")
+        .header("x-goog-iap-jwt-assertion", "ey.iap")
+        .header("x-forwarded-user", "ada")
+        .header("accept", "text/html")
+        .header("if-none-match", "\"v1\"")
+        .header("range", "bytes=0-9")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_eq("accept,if-none-match,range");
 }
 
 #[tokio::test]
