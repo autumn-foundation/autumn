@@ -562,7 +562,8 @@ fn scaffold_vendor_assets(project_dir: &Path) -> Result<(), NewError> {
         crate::assets::VendorAsset {
             version: htmx_version.to_owned(),
             source: htmx_source,
-            file: htmx_file.to_owned(),
+            file: crate::assets::AssetPath::new(htmx_file)
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
             integrity,
         },
     );
@@ -571,7 +572,8 @@ fn scaffold_vendor_assets(project_dir: &Path) -> Result<(), NewError> {
         crate::assets::VendorAsset {
             version: "2.2.2".to_owned(),
             source: sse_source,
-            file: sse_file.to_owned(),
+            file: crate::assets::AssetPath::new(sse_file)
+                .map_err(|e| std::io::Error::other(e.to_string()))?,
             integrity: sse_integrity,
         },
     );
