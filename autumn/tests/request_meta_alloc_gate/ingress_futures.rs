@@ -20,15 +20,16 @@
 //! | `SessionService`                | no cookie       |      7 |     3 |
 //! | `MethodOverrideService`         | GET, JSON POST  |      1 |     0 |
 //! | `IdempotencyReplayService`      | no replay       |      1 |     0 |
-//! | `SubmitTokenLayer` service      | GET             |      5 |     4 |
-//! | `SubmitTokenLayer` service      | JSON POST       |      6 |     4 |
+//! | `SubmitTokenLayer` service      | GET             |      5 |     3 |
+//! | `SubmitTokenLayer` service      | JSON POST       |      6 |     3 |
 //!
 //! The 2 blocks of `LogContextService` are its two scopes: the log context
 //! and the actor scope. The 3 blocks of `SessionService` are the session id,
-//! the session state, and the session extension. The 4 blocks of the
-//! submit-token service are the new token, a copy of the field name, and the
-//! two request extensions. Before, a JSON POST also had a boxed future and
-//! a parse of its content type.
+//! the session state, and the session extension. The 3 blocks of the
+//! submit-token service are a copy of the field name and the two request
+//! extensions. The token's value is drawn when a handler reads it, so a
+//! request that renders no form allocates none. Before, a JSON POST also had
+//! a boxed future and a parse of its content type.
 //!
 //! If this test fails, do not increase a count. Measure again and find the
 //! new allocation.
@@ -172,9 +173,9 @@ fn submit_token_future_is_not_boxed_without_a_form() {
         let per_call = allocations_per_call(&mut svc, build);
         println!("submit token, {name}: {per_call} allocations per call");
         assert_eq!(
-            per_call, 4,
-            "a {name} has no token to read: the layer must allocate only its \
-             new token, the field name and two request extensions"
+            per_call, 3,
+            "a {name} has no token to read: the layer must allocate only the \
+             field name and two request extensions, and draw no token"
         );
     }
 }
