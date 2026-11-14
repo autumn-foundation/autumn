@@ -27,6 +27,7 @@ fn metered_config() -> AutumnConfig {
     config.actuator.sensitive = true;
     config.tenancy.enabled = true;
     "header".clone_into(&mut config.tenancy.source);
+    config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
     "x-tenant-id".clone_into(&mut config.tenancy.header_name);
     config
 }

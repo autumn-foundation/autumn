@@ -6488,6 +6488,20 @@ const PUSH_ENV_KEYS: &[(&str, &str)] = &[
 pub(crate) const JWT_FEATURE_MISSING: &str = "tenancy.source = \"jwt\" but this binary was built \
      without the `jwt` feature; rebuild with `--features jwt`, or choose another tenancy source";
 
+/// The error for `tenancy.source = "header"` with no `tenancy.header_trust`.
+/// The boot reports it, and so does tenant resolution on a router built
+/// without `run`.
+pub(crate) const TENANT_HEADER_TRUST_MISSING: &str = "tenancy.source = \"header\" lets the \
+     client select its tenant. Set tenancy.header_trust to \"trusted_proxy\" or \"any_client\" \
+     (unsafe). Or use source = \"session\" or \"jwt\".";
+
+/// The error for `tenancy.header_trust = "trusted_proxy"` when no proxy range
+/// is trusted.
+pub(crate) const TENANT_HEADER_PROXY_UNTRUSTED: &str = "tenancy.header_trust = \
+     \"trusted_proxy\" needs a trusted proxy. Set \
+     security.trusted_proxies.trust_forwarded_headers = true and a valid range in \
+     security.trusted_proxies.ranges. trusted_hops does not count.";
+
 impl AutumnConfig {
     /// Resolve [`role`](Self::role) against [`roles`](Self::roles).
     ///
@@ -6569,21 +6583,51 @@ impl AutumnConfig {
     /// behind the `jwt` feature. Without it, every request would fail tenant
     /// resolution, so the boot fails instead.
     ///
+    /// `tenancy.source = "header"` lets the sender select the tenant, so it
+    /// needs `tenancy.header_trust`. `"trusted_proxy"` also needs a trusted
+    /// proxy range, or every request fails.
+    ///
     /// # Errors
     ///
-    /// [`ConfigError::Validation`] when tenancy is enabled with
-    /// `source = "jwt"` and the `jwt` feature is off.
-    #[allow(
-        clippy::unused_self,
-        clippy::missing_const_for_fn,
-        reason = "reads `self` only when the `jwt` feature is off"
-    )]
+    /// [`ConfigError::Validation`] when tenancy is enabled and:
+    /// - `source = "jwt"` and the `jwt` feature is off;
+    /// - `source = "header"` and `header_trust` is not set;
+    /// - `header_trust = "trusted_proxy"` and no proxy range is trusted.
     pub fn validate_tenancy_source(&self) -> Result<(), ConfigError> {
+        if !self.tenancy.enabled {
+            return Ok(());
+        }
         #[cfg(not(feature = "jwt"))]
-        if self.tenancy.enabled && self.tenancy.source == "jwt" {
+        if self.tenancy.source == "jwt" {
             return Err(ConfigError::Validation(JWT_FEATURE_MISSING.to_owned()));
         }
+        if self.tenancy.source == "header" {
+            match self.tenancy.header_trust {
+                None => {
+                    return Err(ConfigError::Validation(
+                        TENANT_HEADER_TRUST_MISSING.to_owned(),
+                    ));
+                }
+                Some(TenantHeaderTrust::TrustedProxy) if !self.has_tenant_header_proxy() => {
+                    return Err(ConfigError::Validation(
+                        TENANT_HEADER_PROXY_UNTRUSTED.to_owned(),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
         Ok(())
+    }
+
+    /// True when `[security.trusted_proxies]` names a proxy that can set the
+    /// tenant header: forwarding trust is on and a range is valid.
+    fn has_tenant_header_proxy(&self) -> bool {
+        let proxies = &self.security.trusted_proxies;
+        proxies.trust_forwarded_headers
+            && proxies
+                .ranges
+                .iter()
+                .any(|range| crate::security::trusted_proxies::CidrRange::parse(range).is_some())
     }
 
     /// The load-shedding ceiling the profile supplies when
@@ -7914,6 +7958,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_TENANCY__HEADER_NAME",
             &mut self.tenancy.header_name,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_TENANCY__HEADER_TRUST",
+            &mut self.tenancy.header_trust,
         );
         parse_env_string(
             env,
@@ -14938,14 +14987,20 @@ pub struct TenancyConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Source configuration from which the tenant ID is extracted.
-    /// Values can be "header" (default), "subdomain", "session", "jwt".
+    /// Where the tenant ID comes from: `"session"` (default), `"jwt"`,
+    /// `"subdomain"` or `"header"`. `"header"` needs
+    /// [`header_trust`](Self::header_trust).
     #[serde(default = "default_tenancy_source")]
     pub source: String,
 
     /// Header name to lookup if source is "header". Default: "x-tenant-id".
     #[serde(default = "default_tenancy_header_name")]
     pub header_name: String,
+
+    /// Who can set the tenant header when `source = "header"`. No default:
+    /// `"header"` without it does not start. See [`TenantHeaderTrust`].
+    #[serde(default)]
+    pub header_trust: Option<TenantHeaderTrust>,
 
     /// Session key to lookup if source is "session". Default: "`tenant_id`".
     #[serde(default = "default_tenancy_session_key")]
@@ -15024,7 +15079,37 @@ pub struct TenancyConfig {
 }
 
 fn default_tenancy_source() -> String {
-    "header".to_string()
+    "session".to_string()
+}
+
+/// Who can set the tenant header (`tenancy.header_trust`).
+///
+/// The header lets the sender select the tenant. The app must name the
+/// senders it trusts.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TenantHeaderTrust {
+    /// Accept the header only from a peer address in
+    /// `security.trusted_proxies.ranges`. Other peers get `403`.
+    /// `trusted_hops` does not count. The proxy must authenticate the user,
+    /// set the header, and remove the client's copy.
+    TrustedProxy,
+    /// Accept the header from any client. **Unsafe:** the client selects its
+    /// tenant. Use it only when the app checks tenant membership itself.
+    AnyClient,
+}
+
+impl std::str::FromStr for TenantHeaderTrust {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "trusted_proxy" => Ok(Self::TrustedProxy),
+            "any_client" => Ok(Self::AnyClient),
+            _ => Err(()),
+        }
+    }
 }
 
 fn default_tenancy_header_name() -> String {
@@ -15045,6 +15130,7 @@ impl Default for TenancyConfig {
             enabled: false,
             source: default_tenancy_source(),
             header_name: default_tenancy_header_name(),
+            header_trust: None,
             session_key: default_tenancy_session_key(),
             jwt_claim: default_tenancy_jwt_claim(),
             jwt_secret: None,
@@ -19775,6 +19861,55 @@ path = "/healthz"
         assert_eq!(
             config.tenancy.public_paths,
             vec!["/login", "/signup", "/assets"]
+        );
+    }
+
+    #[test]
+    fn env_override_tenancy_header_trust() {
+        let mut config = AutumnConfig::default();
+        assert_eq!(config.tenancy.header_trust, None);
+        config.apply_env_overrides_with_env(
+            &MockEnv::new().with("AUTUMN_TENANCY__HEADER_TRUST", "trusted_proxy"),
+        );
+        assert_eq!(
+            config.tenancy.header_trust,
+            Some(TenantHeaderTrust::TrustedProxy)
+        );
+        config.apply_env_overrides_with_env(
+            &MockEnv::new().with("AUTUMN_TENANCY__HEADER_TRUST", "Any_Client"),
+        );
+        assert_eq!(
+            config.tenancy.header_trust,
+            Some(TenantHeaderTrust::AnyClient)
+        );
+        // An unknown value keeps the old value.
+        config.apply_env_overrides_with_env(
+            &MockEnv::new().with("AUTUMN_TENANCY__HEADER_TRUST", "everyone"),
+        );
+        assert_eq!(
+            config.tenancy.header_trust,
+            Some(TenantHeaderTrust::AnyClient)
+        );
+        config
+            .apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_TENANCY__HEADER_TRUST", ""));
+        assert_eq!(config.tenancy.header_trust, None);
+    }
+
+    #[test]
+    fn tenancy_defaults_to_the_session_source_with_no_header_trust() {
+        let config: AutumnConfig = toml::from_str("[tenancy]\nenabled = true\n").expect("parses");
+        assert_eq!(config.tenancy.source, "session");
+        assert_eq!(config.tenancy.header_trust, None);
+        let config: AutumnConfig =
+            toml::from_str("[tenancy]\nsource = \"header\"\nheader_trust = \"trusted_proxy\"\n")
+                .expect("parses");
+        assert_eq!(
+            config.tenancy.header_trust,
+            Some(TenantHeaderTrust::TrustedProxy)
+        );
+        assert!(
+            toml::from_str::<AutumnConfig>("[tenancy]\nheader_trust = \"everyone\"\n").is_err(),
+            "an unknown header_trust must not parse"
         );
     }
 

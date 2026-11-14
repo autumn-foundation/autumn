@@ -3374,6 +3374,11 @@ async fn build_report() -> AutumnResult<String> {
   (idle eviction) — both `0` by default, both enforced lazily on cell insert.
   The quota is stored atomically and refreshed on every access (retune-ready;
   no config-reload path exists yet).
+- `[tenancy] source` defaults to `"session"`. `source = "header"` needs
+  `header_trust = "trusted_proxy"` (a gateway sets the header) or
+  `"any_client"` (unsafe), or the app does not start. A session that holds
+  `session_key` binds the tenant: a header, host or token for another tenant
+  gets `403`. See `docs/guide/tenant-cells.md` "Tenant sources".
 - The whole `[tenancy]` section is settable from the environment via
   `AUTUMN_TENANCY__*` (e.g. `AUTUMN_TENANCY__QUOTA_BYTES`,
   `AUTUMN_TENANCY__MAX_CELLS`, `AUTUMN_TENANCY__IDLE_TTL_SECS`).

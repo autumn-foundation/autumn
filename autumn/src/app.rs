@@ -12921,8 +12921,9 @@ async fn try_load_config(
         }
     }?;
 
-    // A build without `jwt` cannot verify a tenant token. Checked on the app's boot path, for every
-    // loader, not in config loading: the CLI loads the same config without `jwt`.
+    // A build without `jwt` cannot verify a tenant token, and a header source needs a named
+    // trust. Checked on the app's boot path, for every loader, not in config loading: the CLI
+    // loads the same config without `jwt`.
     config.validate_tenancy_source()?;
 
     // `autumn serve --daemon` probes the app by socket path. A custom loader can drop the
@@ -22243,6 +22244,7 @@ mount = ["service"]
             let mut config = AutumnConfig::default();
             config.tenancy.enabled = true;
             config.tenancy.source = source.to_owned();
+            config.tenancy.header_trust = Some(crate::config::TenantHeaderTrust::AnyClient);
             // A public path skips `tenancy_middleware`, so the request reaches the handler
             // and this exercises the `Tenant` extractor's own fallback. (`#[public]` would
             // not do: it only marks the route for the audit.)
@@ -22343,6 +22345,7 @@ mount = ["service"]
         let mut config = AutumnConfig::default();
         config.tenancy.enabled = true;
         config.tenancy.source = "header".to_owned();
+        config.tenancy.header_trust = Some(crate::config::TenantHeaderTrust::AnyClient);
         config.tenancy.public_paths = vec!["/storefront".to_owned()];
 
         let state = AppState::for_test();
