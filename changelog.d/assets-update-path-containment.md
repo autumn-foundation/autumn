@@ -8,8 +8,9 @@
   - `add --url` rejects a URL whose file name is not a safe path.
   - A symlink below `static/` must point into `static/`. `static/` itself
     cannot be a symlink. A symlinked manifest does not load.
-  - `update` downloads only from `https` sources. To keep an `http` source,
-    add the asset again with `add --url`. `add --url` still accepts `http`.
+  - `update` downloads only from `https` sources, and it refuses a redirect
+    to `http`. To keep an `http` source, add the asset again with
+    `add --url`. `add --url` still accepts `http`.
   - The CLI checks every asset before the first download. It prints the
     source of each download.
   - Vendored files keep their mode. New files get mode `0644`.

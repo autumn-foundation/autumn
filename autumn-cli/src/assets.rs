@@ -471,10 +471,19 @@ pub fn save_manifest(path: &Path, manifest: &VendorManifest) -> Result<(), Asset
 // Download helper
 // ---------------------------------------------------------------------------
 
-/// Download `url` and return the bytes.  Delegates to [`crate::http::fetch_bytes`]
-/// so progress-bar logic is shared with `autumn setup`.
-pub fn download_bytes(url: &str) -> Result<Vec<u8>, AssetsError> {
-    Ok(crate::http::fetch_bytes(url)?)
+/// Download `url` and return the bytes.
+///
+/// With [`SourcePolicy::HttpsOnly`], the download also refuses a redirect to
+/// `http`.
+///
+/// # Errors
+///
+/// [`AssetsError::Download`] when the download fails.
+pub fn download_bytes(url: &str, policy: SourcePolicy) -> Result<Vec<u8>, AssetsError> {
+    Ok(match policy {
+        SourcePolicy::HttpsOnly => crate::http::fetch_bytes_https_only(url)?,
+        SourcePolicy::HttpOrHttps => crate::http::fetch_bytes(url)?,
+    })
 }
 
 /// How [`asset_dest`] handles a directory that does not exist.
@@ -719,17 +728,19 @@ fn execute_add_with(
     url_override: Option<&str>,
     manifest_path: &Path,
     static_dir: &Path,
-    fetch: impl Fn(&str) -> Result<Vec<u8>, AssetsError>,
+    fetch: impl Fn(&str, SourcePolicy) -> Result<Vec<u8>, AssetsError>,
 ) -> Result<(), AssetsError> {
     let (name, version) = parse_spec(spec)?;
     let (source, file) = resolve_source(&name, &version, url_override)?;
     let file = AssetPath::new(file)?;
-    check_source(&source, SourcePolicy::HttpOrHttps)?;
+    // The user gives an `add --url` URL. Thus `http` is permitted.
+    let policy = SourcePolicy::HttpOrHttps;
+    check_source(&source, policy)?;
     let mut manifest = load_manifest(manifest_path)?;
     asset_dest(static_dir, &file, MissingDir::Stop)?;
 
     println!("Downloading {name} {version} from {source}...");
-    let bytes = fetch(&source)?;
+    let bytes = fetch(&source, policy)?;
     let sri = compute_sri(&bytes);
     write_asset(static_dir, &file, &bytes)?;
 
@@ -814,7 +825,7 @@ fn execute_update_with_manifest(
     name_spec: Option<&str>,
     manifest_path: &Path,
     static_dir: &Path,
-    fetch: impl Fn(&str) -> Result<Vec<u8>, AssetsError>,
+    fetch: impl Fn(&str, SourcePolicy) -> Result<Vec<u8>, AssetsError>,
 ) -> Result<(), AssetsError> {
     let mut manifest = load_manifest(manifest_path)?;
 
@@ -857,8 +868,10 @@ fn execute_update_with_manifest(
         return Ok(());
     }
 
+    // A manifest source is project data. Thus only `https` is permitted.
+    let policy = SourcePolicy::HttpsOnly;
     for item in &pending {
-        check_source(&item.source, SourcePolicy::HttpsOnly)?;
+        check_source(&item.source, policy)?;
         asset_dest(static_dir, &item.file, MissingDir::Stop)?;
     }
 
@@ -868,7 +881,7 @@ fn execute_update_with_manifest(
             "Updating {} → {} from {}...",
             item.name, item.version, item.source
         );
-        let bytes = fetch(&item.source)?;
+        let bytes = fetch(&item.source, policy)?;
         downloads.push((item, bytes));
     }
 
@@ -1220,13 +1233,13 @@ mod tests {
     // --- Path and source containment ---
 
     /// This fetch fails the test. The command must stop before a download.
-    fn no_network(url: &str) -> Result<Vec<u8>, AssetsError> {
+    fn no_network(url: &str, _policy: SourcePolicy) -> Result<Vec<u8>, AssetsError> {
         panic!("unexpected download of {url}");
     }
 
     /// This fetch returns bytes made from the URL.
     #[expect(clippy::unnecessary_wraps)]
-    fn fake_fetch(url: &str) -> Result<Vec<u8>, AssetsError> {
+    fn fake_fetch(url: &str, _policy: SourcePolicy) -> Result<Vec<u8>, AssetsError> {
         Ok(format!("// from {url}\n").into_bytes())
     }
 
@@ -1481,7 +1494,7 @@ mod tests {
         execute_update_with_manifest(None, &p.manifest, &p.static_dir, fake_fetch).unwrap();
 
         let bytes = fs::read(p.static_dir.join("js/htmx.min.js")).unwrap();
-        assert_eq!(bytes, fake_fetch(source).unwrap());
+        assert_eq!(bytes, fake_fetch(source, SourcePolicy::HttpsOnly).unwrap());
         let manifest = load_manifest(&p.manifest).unwrap();
         let asset = &manifest.assets["htmx"];
         assert_eq!(asset.source, source);
@@ -1513,6 +1526,46 @@ mod tests {
         assert_dir_empty(&p.static_dir);
     }
 
+    /// A fetch that records each policy it gets.
+    fn recording_fetch(
+        seen: &std::cell::RefCell<Vec<SourcePolicy>>,
+    ) -> impl Fn(&str, SourcePolicy) -> Result<Vec<u8>, AssetsError> + '_ {
+        move |url, policy| {
+            seen.borrow_mut().push(policy);
+            fake_fetch(url, policy)
+        }
+    }
+
+    #[test]
+    fn update_downloads_with_https_only_policy() {
+        // The policy also refuses an `http` redirect target.
+        let p = project();
+        write_raw_manifest(
+            &p.manifest,
+            &[("htmx", "https://example.com/x.js", "js/x.js")],
+        );
+        let seen = std::cell::RefCell::new(Vec::new());
+        execute_update_with_manifest(None, &p.manifest, &p.static_dir, recording_fetch(&seen))
+            .unwrap();
+        assert_eq!(*seen.borrow(), [SourcePolicy::HttpsOnly]);
+    }
+
+    #[test]
+    fn add_downloads_with_http_or_https_policy() {
+        let p = project();
+        let url = "http://localhost:8080/my-lib.js";
+        let seen = std::cell::RefCell::new(Vec::new());
+        execute_add_with(
+            "my-lib@1.0.0",
+            Some(url),
+            &p.manifest,
+            &p.static_dir,
+            recording_fetch(&seen),
+        )
+        .unwrap();
+        assert_eq!(*seen.borrow(), [SourcePolicy::HttpOrHttps]);
+    }
+
     #[test]
     fn add_writes_under_static_and_records_asset() {
         let p = project();
@@ -1526,7 +1579,7 @@ mod tests {
         )
         .unwrap();
         let bytes = fs::read(p.static_dir.join("js/my-lib.min.js")).unwrap();
-        assert_eq!(bytes, fake_fetch(url).unwrap());
+        assert_eq!(bytes, fake_fetch(url, SourcePolicy::HttpOrHttps).unwrap());
         let manifest = load_manifest(&p.manifest).unwrap();
         let asset = &manifest.assets["my-lib"];
         assert_eq!(asset.source, url);
