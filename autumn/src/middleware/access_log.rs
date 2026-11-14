@@ -190,6 +190,7 @@ pub struct AccessLogService<S> {
 }
 
 /// Request facts captured before the inner service consumes the request.
+///
 /// `None` when the request path is excluded from access logging; an excluded
 /// request then takes no clock reading and carries no sentinel, since neither
 /// would be read.
