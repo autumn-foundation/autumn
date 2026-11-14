@@ -27,7 +27,7 @@
 //! | `/note/{key}` | the mediated KV seam — hit and miss, `#[edge(needs(kv))]` |
 //! | `/stats` | repeated query keys and float formatting |
 //! | `/stats/count` | a primitive (`usize`) return value |
-//! | `/whoami` | credential invisibility: both lanes strip the same headers |
+//! | `/whoami` | credential invisibility: both lanes keep the same allowlisted headers |
 //! | `/link/{name}` | a typed path helper and `with_query`, the same source on both lanes |
 //! | `/boom` | a panic: a trap at the edge, a 500 at the origin |
 
@@ -110,18 +110,27 @@ pub async fn count() -> usize {
 
 /// `GET /whoami` — proof that neither lane lets a handler see credentials.
 ///
-/// The wire strips `cookie`/`authorization`/`proxy-authorization` before the
-/// capsule dispatches, and the `#[edge]` macro gives the *origin* mount the
-/// same strip — so this handler renders the same answer on both substrates
-/// even when the client sent credentials. Without that mirror, a handler
-/// branching on these headers would be a silent lane divergence.
+/// Only allowlisted request headers reach an edge handler. The wire keeps
+/// them before the capsule dispatches, and the `#[edge]` macro gives the
+/// *origin* mount the same filter. Thus this handler renders the same answer
+/// on both substrates, also when the request has credentials or proxy
+/// assertions.
 #[get("/whoami")]
 #[edge]
 pub async fn whoami(headers: HeaderMap) -> String {
-    let visible: Vec<&str> = ["cookie", "authorization", "proxy-authorization"]
-        .into_iter()
-        .filter(|name| headers.contains_key(*name))
-        .collect();
+    let visible: Vec<&str> = [
+        "cookie",
+        "authorization",
+        "proxy-authorization",
+        "cf-access-jwt-assertion",
+        "x-amzn-oidc-data",
+        "x-ms-client-principal",
+        "x-goog-iap-jwt-assertion",
+        "x-forwarded-user",
+    ]
+    .into_iter()
+    .filter(|name| headers.contains_key(*name))
+    .collect();
     if visible.is_empty() {
         "anonymous at this lane (credentials are origin-middleware business)\n".to_owned()
     } else {

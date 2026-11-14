@@ -813,6 +813,42 @@ host = "0.0.0.0"
 
 **Automation:** `manual` — give each field its name.
 
+---
+
+### Edge: handlers see only allowlisted request headers
+
+**Why:** an identity-aware proxy adds a bearer assertion under its own header
+name, for example `cf-access-jwt-assertion` or `x-goog-iap-jwt-assertion`.
+The old denylist did not name these headers, so a capsule got them and could
+echo them. Now only `autumn_edge::wire::ALLOWED_REQUEST_HEADERS` cross: content
+negotiation, conditional requests, `cache-control` and `user-agent`.
+
+**You are affected if** your code names `SENSITIVE_HEADERS` or
+`strip_sensitive_headers`, or an `#[edge]` handler reads another header
+(for example `host`, `x-request-id` or a custom header) through `HeaderMap`.
+Both lanes now drop that header. The origin middleware still sees it.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_edge::wire::{strip_sensitive_headers, SENSITIVE_HEADERS};
+
+let safe = strip_sensitive_headers(&headers);
+assert!(!SENSITIVE_HEADERS.contains(&"accept"));
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_edge::wire::{allowed_request_headers, request_header_allowed};
+
+let safe = allowed_request_headers(&headers);
+assert!(request_header_allowed("accept"));
+```
+
+**Automation:** `manual` — a codemod cannot know which header a handler
+needs. Move a handler that needs another header to an origin-only route.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**

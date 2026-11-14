@@ -34,12 +34,22 @@ export const WIRE_VERSION = 1;
 /// The response header a handler sets to decline (never reaches a client).
 export const FALLTHROUGH_SENTINEL = "x-autumn-edge-fallthrough";
 
-/// Request headers that never reach a capsule.
-export const SENSITIVE_HEADERS = Object.freeze([
-  "cookie",
-  "authorization",
-  "proxy-authorization",
-  FALLTHROUGH_SENTINEL,
+/// The only request headers that reach a capsule. An allowlist: identity-aware
+/// proxies add bearer assertions under names no denylist can know. Same list
+/// as `autumn_edge::wire::ALLOWED_REQUEST_HEADERS`.
+export const ALLOWED_REQUEST_HEADERS = Object.freeze([
+  "accept",
+  "accept-charset",
+  "accept-encoding",
+  "accept-language",
+  "cache-control",
+  "if-match",
+  "if-modified-since",
+  "if-none-match",
+  "if-range",
+  "if-unmodified-since",
+  "range",
+  "user-agent",
 ]);
 
 /// Headers that describe one connection or hop (RFC 9110 7.6.1 and 11.7).
@@ -144,8 +154,14 @@ export function canonicalizeHeaders(pairs) {
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 }
 
-export function stripSensitiveHeaders(pairs) {
-  return pairs.filter(([name]) => !SENSITIVE_HEADERS.includes(String(name).toLowerCase()));
+/// Whether a request header of this name may reach a capsule. Case-insensitive.
+export function requestHeaderAllowed(name) {
+  return ALLOWED_REQUEST_HEADERS.includes(String(name).toLowerCase());
+}
+
+/// Keep only `ALLOWED_REQUEST_HEADERS`. The order does not change.
+export function allowedRequestHeaders(pairs) {
+  return pairs.filter(([name]) => requestHeaderAllowed(name));
 }
 
 /// The host → guest `request` frame. `request` is
@@ -157,7 +173,7 @@ export function requestFrame(request, capabilities = []) {
     provided_capabilities: [...capabilities],
     method: request.method,
     uri: request.uri,
-    headers: canonicalizeHeaders(stripSensitiveHeaders(request.headers || [])),
+    headers: canonicalizeHeaders(allowedRequestHeaders(request.headers || [])),
     body_b64: encodeBase64(request.body || new Uint8Array(0)),
   };
   if (request.identity) {
@@ -844,10 +860,11 @@ export class EdgeGateway {
     if (method !== "GET" && method !== "HEAD") {
       return this.toOrigin(request, target, headers, "fallthrough", "method_not_edge_eligible");
     }
-    const pairs = [...headers];
+    const pairs = allowedRequestHeaders([...headers]);
     // A non-ASCII value may be bytes the Fetch API decoded as Latin-1: it
     // cannot cross the wire as the UTF-8 the capsule expects, so only the
-    // origin answers it — the gateway's rule for a non-UTF-8 value.
+    // origin answers it — the gateway's rule for a non-UTF-8 value. Only a
+    // header the capsule gets is checked.
     if (pairs.some(([, value]) => /[^\x00-\x7f]/.test(value))) {
       return this.toOrigin(request, target, headers, "origin_only", null);
     }

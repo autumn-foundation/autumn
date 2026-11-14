@@ -382,10 +382,21 @@ web-standard). The conformance suite runs both and requires the same outcome.
 
 ## Security posture
 
-- **These credentials never reach a capsule:** `cookie`, `authorization` and
-  `proxy-authorization`. They are stripped by the host before the request frame is
-  sent, and stripped again by the guest on receipt — a defensive double-strip,
-  because a capsule cannot audit the host it runs under.
+- **Only allowlisted request headers reach a capsule.** The list is
+  `autumn_edge::wire::ALLOWED_REQUEST_HEADERS`: content negotiation
+  (`accept`, `accept-charset`, `accept-encoding`, `accept-language`),
+  conditional requests (`if-match`, `if-none-match`, `if-modified-since`,
+  `if-unmodified-since`, `if-range`, `range`), `cache-control` and
+  `user-agent`. The host removes all other headers before it sends the request
+  frame. The guest removes them again when it gets the frame, because a
+  capsule cannot audit its host. The native mount of an `#[edge]` route uses
+  the same list, so a `HeaderMap` handler sees the same headers on both lanes.
+- **Why an allowlist.** `cookie` and `authorization` are not the only
+  credentials. An identity-aware proxy adds its own bearer assertion, for
+  example `cf-access-jwt-assertion`, `x-amzn-oidc-data`,
+  `x-ms-client-principal` or `x-goog-iap-jwt-assertion`. A denylist cannot
+  name all of them. A capsule can echo a header it gets, so a header that is
+  not on the list never gets to the capsule.
 - **No session, no auth, no CSRF, no database.** Not "discouraged": absent from
   the dependency graph. A route that needs any of them cannot compile as an
   `#[edge]` route.
@@ -653,7 +664,8 @@ let lane = response.extensions().get::<Lane>(); // Edge, Fallthrough(reason), Or
 What it does:
 
 - It offers each `GET`/`HEAD` request to the capsule. The capsule gets no
-  body and no `cookie`, `authorization` or `proxy-authorization` header.
+  body, and only the headers in `ALLOWED_REQUEST_HEADERS`. Credentials and
+  proxy assertions stay with the origin.
 - When the capsule serves the request, it returns those bytes and does not
   ask the origin.
 - When the capsule declines, it sends the **original** request (body and
@@ -661,7 +673,7 @@ What it does:
   unchanged. The fallthrough detail does not reach the client.
 - It sends a write, an `upgrade` handshake (WebSocket), or a request with a
   header value that is not UTF-8, to the origin. It does not ask the
-  capsule.
+  capsule. Only a header that the capsule gets is checked for UTF-8.
 - It does not trust the capsule. A status outside 200-599, `set-cookie`, the
   fallthrough header, a hop-by-hop header, a body on 204/205/304, or a
   `content-length` that does not match the body is a `capsule_error`

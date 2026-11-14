@@ -478,6 +478,38 @@ fn the_request_frame_and_kv_values_are_the_same_bytes() {
 }
 
 #[test]
+fn both_hosts_send_only_allowlisted_request_headers() {
+    // The guest echoes the request frame to stderr, then traps. Both hosts
+    // must drop every proxy assertion and keep the negotiation headers.
+    let wasm = scripted(&[Op::Read, Op::EchoToStderr, Op::Trap]);
+    let mut case = Case::get("/proxied");
+    case.request = case
+        .request
+        .with_header("Cf-Access-Jwt-Assertion", "ey.cf")
+        .with_header("X-Amzn-Oidc-Data", "ey.alb")
+        .with_header("X-Ms-Client-Principal", "ey.azure")
+        .with_header("X-Goog-Iap-Jwt-Assertion", "ey.iap")
+        .with_header("X-Forwarded-User", "ada")
+        .with_header("If-None-Match", "\"v1\"");
+    let Some(js) = run_js(&wasm, std::slice::from_ref(&case)) else {
+        return;
+    };
+    let reference = run_reference(&wasm, &case);
+    assert_same_failure(&reference, &js[0].sync, "(stderr: ");
+    assert_same_failure(&reference, &js[0].replay, "(stderr: ");
+    let EdgeOutcome::Fallthrough { detail, .. } = &js[0].sync else {
+        panic!("a trap");
+    };
+    for leaked in ["ey.", "ada", "x-forwarded-user"] {
+        assert!(!detail.contains(leaked), "{leaked} leaked: {detail}");
+    }
+    assert!(
+        detail.contains(r#""headers":[["accept","text/plain"],["if-none-match","\"v1\""]]"#),
+        "{detail}"
+    );
+}
+
+#[test]
 fn replay_on_miss_reads_each_key_once_and_only_with_the_capability() {
     let wasm = scripted(&[
         Op::Read,

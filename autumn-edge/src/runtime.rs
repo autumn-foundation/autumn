@@ -67,7 +67,7 @@ use crate::route::{EdgeCapability, EdgeRoute};
 use crate::router::{CapabilityProbe, build_edge_router};
 use crate::wire::{
     EdgeOutcome, EdgeRequest, EdgeResponse, FallthroughReason, GuestFrame, HostFrame, WIRE_VERSION,
-    canonicalize_headers, from_line, strip_sensitive_headers, strip_sentinel, to_line,
+    allowed_request_headers, canonicalize_headers, from_line, strip_sentinel, to_line,
 };
 
 /// Cap on a single response body collected from a dispatched handler, in
@@ -283,22 +283,29 @@ fn render_capabilities(capabilities: &[EdgeCapability]) -> String {
 
 // ── dispatch ─────────────────────────────────────────────────────────
 
-/// Strip the request headers a capsule never sees — for the *origin* mount.
+/// Keep only [`crate::wire::ALLOWED_REQUEST_HEADERS`] — for the *origin*
+/// mount.
 ///
 /// The `#[edge]` macro wraps every native mount of an edge route in
-/// `map_request(strip_request_credentials)`, so a handler observes the same
-/// header set on both substrates. Without this, a handler that branches on
-/// `cookie`/`authorization` would serve different bytes at the origin than at
-/// the edge — the guest-side strip alone equalizes what the *capsule* sees,
-/// not what the handler sees natively. Route-local by construction: the app's
-/// own middleware (sessions, guards on other routes) wraps the router above
-/// this layer and still sees the original request.
+/// `map_request(strip_request_credentials)`. Thus a handler sees the same
+/// headers on both lanes, and a credential or proxy assertion is not visible
+/// to it on either lane. Route-local: the app's middleware wraps the router
+/// above this layer and still sees the original request.
 pub async fn strip_request_credentials(
     mut request: axum::extract::Request,
 ) -> axum::extract::Request {
-    for name in crate::wire::SENSITIVE_HEADERS {
-        request.headers_mut().remove(*name);
+    let headers = std::mem::take(request.headers_mut());
+    let mut kept = http::HeaderMap::new();
+    let mut current = None;
+    for (name, value) in headers {
+        if let Some(name) = name {
+            current = crate::wire::request_header_allowed(name.as_str()).then_some(name);
+        }
+        if let Some(name) = &current {
+            kept.append(name.clone(), value);
+        }
     }
+    *request.headers_mut() = kept;
     request
 }
 
@@ -317,9 +324,8 @@ where
     let identity = request.identity.clone();
 
     let mut builder = http::Request::builder().method(method).uri(&request.uri);
-    // Defensive second strip: the host is supposed to have done this, but a
-    // capsule cannot audit the host it runs under.
-    for (name, value) in strip_sensitive_headers(&request.headers) {
+    // The guest filters again: it cannot audit its host.
+    for (name, value) in allowed_request_headers(&request.headers) {
         builder = builder.header(name, value);
     }
 

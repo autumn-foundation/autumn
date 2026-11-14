@@ -112,7 +112,7 @@ flowchart LR
    - The edge-conformance CI job runs the generated bundle in **workerd**
      (`wrangler dev`), Cloudflare's open-source runtime. It runs against the
      real origin binary with a seeded KV namespace.
-   - Unit tests in `autumn_edge::js` read the JS constants (sensitive headers,
+   - Unit tests in `autumn_edge::js` read the JS constants (the request-header allowlist,
      hop-by-hop headers, budgets, the import list) back out of the source and
      compare them with the Rust ones.
 
