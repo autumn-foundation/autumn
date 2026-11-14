@@ -992,6 +992,39 @@ fn trybuild_shards_run_from_the_workspace_nextest_archive() {
         "every nextest archive must carry `target/debug/.fingerprint` and fail without it; \
          got {includes:?}"
     );
+
+    // trybuild's cross-process lock is a lock file that another process breaks
+    // after 1.5 s without a touch. nextest runs each test in its own process, so
+    // only a one-slot test group keeps two trybuild runs out of one fixture
+    // directory on a loaded runner.
+    let group_threads = config
+        .get("test-groups")
+        .and_then(|g| g.get("trybuild"))
+        .and_then(|g| g.get("max-threads"))
+        .and_then(toml::Value::as_integer);
+    assert_eq!(
+        group_threads,
+        Some(1),
+        "`[test-groups.trybuild]` must exist with `max-threads = 1`"
+    );
+    let overrides = config
+        .get("profile")
+        .and_then(|p| p.get("default"))
+        .and_then(|p| p.get("overrides"))
+        .and_then(toml::Value::as_array)
+        .expect("`[[profile.default.overrides]]` must exist");
+    assert!(
+        overrides.iter().any(|entry| {
+            field(entry, "test-group").as_deref() == Some("trybuild")
+                && field(entry, "filter").is_some_and(|filter| {
+                    filter.contains("binary_id(autumn-web::integration_tests)")
+                        && filter.contains("test(compile_fail::)")
+                })
+        }),
+        "every `compile_fail::` test of the consolidated binary must run in the \
+         `trybuild` group, on the default profile so that every profile inherits it; \
+         got {overrides:?}"
+    );
 }
 
 /// The `{ os, shard }` entries of the `test` job's matrix, grouped by OS.

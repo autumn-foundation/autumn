@@ -24,3 +24,20 @@ fail-fast = false
 # Print a failure's output when it happens and again in the summary at the end,
 # so it is not lost in a long log.
 failure-output = "immediate-final"
+
+# trybuild compiles every case of a run in one fixture directory,
+# `target/tests/trybuild/<crate>`, and names the binaries it builds there
+# `trybuild000`, `trybuild001`, … per run. It serialises its runs with a mutex,
+# which holds only inside one process, and a lock file, which another process
+# breaks once the file has not been touched for 1.5 s. nextest runs each test
+# in a process of its own, so on a loaded runner two runs can share the
+# directory: one runs the other's binaries, and a compile-fail case "compiles"
+# because its source was replaced. One slot for the group makes nextest wait,
+# as trybuild means to. It costs no time: the lock already serialises the runs
+# whenever it holds.
+[test-groups.trybuild]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary_id(autumn-web::integration_tests) & test(compile_fail::)'
+test-group = 'trybuild'
