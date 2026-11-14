@@ -123,6 +123,14 @@ dhat_n = 10000
 
 [[workload]]
 package = "autumn-web"
+bench = "metrics_per_call"
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 10000
+dhat_n = 10000
+
+[[workload]]
+package = "autumn-web"
 bench = "pdf_render"
 features = ["pdf"]
 mode = "marginal"

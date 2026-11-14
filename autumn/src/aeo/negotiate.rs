@@ -108,7 +108,8 @@ where
             is_head: !is_get && readable,
         };
         // The `Accept` to rank the response by, kept when Markdown may win.
-        let accept = (self.config.markdown && readable)
+        // Most requests do not name Markdown: those are not parsed or copied.
+        let accept = (self.config.markdown && readable && names_markdown(req.headers()))
             .then(|| accept_values(req.headers()))
             .filter(|accept| markdown_possible(accept));
         // A Markdown request's validators are checked here, against the
@@ -443,7 +444,36 @@ fn markdown_etag(headers: &mut HeaderMap) {
 /// own type can show. The response's type then decides.
 #[must_use]
 pub fn prefers_markdown(headers: &HeaderMap) -> bool {
-    markdown_possible(&accept_values(headers))
+    names_markdown(headers) && markdown_possible(&accept_values(headers))
+}
+
+/// `true` when an `Accept` value has the bytes `text/markdown`, in any ASCII
+/// case. Markdown wins only when a range names it, and a range that names it
+/// has those bytes. So `false` here means [`markdown_possible`] is `false`,
+/// and the header needs no parse. `true` decides nothing: the parse does.
+fn names_markdown(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::ACCEPT)
+        .iter()
+        .any(|value| has_markdown_type(value.as_bytes()))
+}
+
+/// See [`names_markdown`]. A media type has one `/`, so the search looks at
+/// each `/` and compares the bytes on both sides of it.
+fn has_markdown_type(value: &[u8]) -> bool {
+    const TYPE: &[u8] = b"text";
+    const SUBTYPE: &[u8] = b"markdown";
+    value.iter().enumerate().any(|(slash, &byte)| {
+        byte == b'/'
+            && slash
+                .checked_sub(TYPE.len())
+                .and_then(|start| value.get(start..slash))
+                .is_some_and(|before| before.eq_ignore_ascii_case(TYPE))
+            && value
+                .get(slash.saturating_add(1)..)
+                .and_then(|after| after.get(..SUBTYPE.len()))
+                .is_some_and(|after| after.eq_ignore_ascii_case(SUBTYPE))
+    })
 }
 
 /// The request's `Accept` values.
@@ -628,30 +658,50 @@ fn accept_weight<'a>(params: impl Iterator<Item = &'a str>) -> f32 {
 /// and not signed. An RFC 9421 signature can cover the body's digest or its
 /// type, and the Markdown would carry a signature that no longer verifies.
 fn is_negotiable(res: &Response) -> bool {
+    /// The RFC 9421 names, parsed once: a lookup by `&str` parses and
+    /// lowercases the name on each call.
+    static SIGNATURE: axum::http::HeaderName = axum::http::HeaderName::from_static("signature");
+    static SIGNATURE_INPUT: axum::http::HeaderName =
+        axum::http::HeaderName::from_static("signature-input");
+
     let headers = res.headers();
+    // The type is tested first: every `GET` and `HEAD` response comes here,
+    // and most that are not HTML (JSON, an image, a script) stop at it.
     res.status() == StatusCode::OK
-        && !headers.contains_key("signature")
-        && !headers.contains_key("signature-input")
         && headers
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .is_some_and(utf8_html)
+        && !headers.contains_key(&SIGNATURE)
+        && !headers.contains_key(&SIGNATURE_INPUT)
         && !headers.contains_key(CONTENT_ENCODING)
         && !headers.contains_key(CONTENT_RANGE)
         && !headers
             .get(CONTENT_DISPOSITION)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| {
+                const ATTACHMENT: &[u8] = b"attachment";
                 v.trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with("attachment")
+                    .as_bytes()
+                    .get(..ATTACHMENT.len())
+                    .is_some_and(|start| start.eq_ignore_ascii_case(ATTACHMENT))
             })
 }
 
 /// `text/html` whose bytes read as UTF-8: no charset, or `utf-8` or
 /// `us-ascii`. The converter reads UTF-8, and the Markdown says UTF-8.
 fn utf8_html(content_type: &str) -> bool {
-    let mut parts = split_unquoted(content_type, ';').into_iter();
+    // With no quote in the value, a split at each `;` is the quoted-string
+    // split, and it builds no list. Few types quote a parameter.
+    if content_type.contains('"') {
+        utf8_html_parts(split_unquoted(content_type, ';').into_iter())
+    } else {
+        utf8_html_parts(content_type.split(';'))
+    }
+}
+
+/// See [`utf8_html`]: the media type, then its parameters.
+fn utf8_html_parts<'a>(mut parts: impl Iterator<Item = &'a str>) -> bool {
     let html = parts
         .next()
         .is_some_and(|m| m.trim().eq_ignore_ascii_case("text/html"));
@@ -990,6 +1040,203 @@ mod tests {
         assert!(!utf8(&accept(
             "text/html;q=0.9, text/markdown;q=0.5, */*;q=0.1"
         )));
+    }
+
+    proptest::proptest! {
+        /// A type with no quote takes the split that builds no list. Its
+        /// answer is the answer of the quoted-string split, for any value.
+        #[test]
+        fn utf8_html_is_the_same_with_and_without_the_list(
+            value in "(text/html|TEXT/HTML| text/html |text/plain|text/htmlx)?[ ;=a-zA-Z0-9\\\\\"-]{0,24}",
+        ) {
+            let by_list = utf8_html_parts(split_unquoted(&value, ';').into_iter());
+            proptest::prop_assert_eq!(utf8_html(&value), by_list, "{:?}", value);
+            if !value.contains('"') {
+                let split: Vec<&str> = value.split(';').collect();
+                proptest::prop_assert_eq!(split, split_unquoted(&value, ';'));
+            }
+        }
+    }
+
+    #[test]
+    fn a_download_is_found_in_any_case_and_after_spaces() {
+        let html = |disposition: &str| {
+            let mut res = Response::new(Body::empty());
+            res.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            res.headers_mut().insert(
+                CONTENT_DISPOSITION,
+                HeaderValue::from_str(disposition).unwrap(),
+            );
+            res
+        };
+        for download in [
+            "attachment",
+            "Attachment; filename=a.html",
+            "  ATTACHMENT",
+            "attachments",
+        ] {
+            assert!(!is_negotiable(&html(download)), "{download}");
+        }
+        for inline in [
+            "inline",
+            "",
+            "attach",
+            "x-attachment",
+            "inline; filename=attachment",
+        ] {
+            assert!(is_negotiable(&html(inline)), "{inline}");
+        }
+    }
+
+    fn accepts(values: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append(
+                axum::http::header::ACCEPT,
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn names_markdown_finds_the_type_in_any_case_and_any_value() {
+        for named in [
+            "text/markdown",
+            "TEXT/MARKDOWN;q=0.5",
+            "Text/MarkDown",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8, text/markdown",
+            "  text/markdown  ",
+            "a/b/text/markdown",
+        ] {
+            assert!(names_markdown(&accept(named)), "{named}");
+        }
+        // A later `Accept` line counts as much as the first.
+        assert!(names_markdown(&accepts(&["text/html", "text/markdown"])));
+
+        for unnamed in [
+            "",
+            "*/*",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "text/*",
+            "text/",
+            "/markdown",
+            "text/markdow",
+            "ext/markdown",
+            "text /markdown",
+            "text/ markdown",
+            "markdown/text",
+            "/",
+            "////",
+        ] {
+            assert!(!names_markdown(&accept(unnamed)), "{unnamed}");
+        }
+        assert!(!names_markdown(&HeaderMap::new()));
+        // A value that is not visible ASCII is skipped by the parse. The
+        // byte search must not panic on it, and may say either.
+        let mut opaque = HeaderMap::new();
+        opaque.insert(
+            axum::http::header::ACCEPT,
+            HeaderValue::from_bytes(b"\xfftext/\xff").unwrap(),
+        );
+        assert!(!names_markdown(&opaque));
+    }
+
+    #[test]
+    fn a_request_that_does_not_name_markdown_keeps_no_accept() {
+        // The search runs before the parse, and both agree on these.
+        for (header, expected) in [
+            ("text/markdown", true),
+            ("TEXT/Markdown, text/html;q=0.9", true),
+            ("text/html, text/markdown;q=0.5", false),
+            ("text/markdownx", false),
+            ("xtext/markdown", false),
+            ("*/*", false),
+            ("text/html;level=1, */*", false),
+        ] {
+            let headers = accept(header);
+            assert_eq!(
+                prefers_markdown(&headers),
+                markdown_possible(&accept_values(&headers)),
+                "{header}"
+            );
+            assert_eq!(prefers_markdown(&headers), expected, "{header}");
+        }
+    }
+
+    /// One media range from a pool that holds Markdown in several spellings,
+    /// near misses of it, the HTML ranges, and wildcards.
+    fn range_strategy() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        let media = prop_oneof![
+            Just("text/markdown"),
+            Just("TEXT/MARKDOWN"),
+            Just("Text/Markdown"),
+            Just("text/markdownx"),
+            Just("xtext/markdown"),
+            Just("text /markdown"),
+            Just("text/html"),
+            Just("text/*"),
+            Just("*/*"),
+            Just("application/json"),
+            Just("text/plain"),
+            Just(""),
+        ];
+        let param = prop_oneof![
+            Just(""),
+            Just(";q=0"),
+            Just(";q=0.5"),
+            Just("; q=1"),
+            Just(";Q=0.9"),
+            Just(";q=abc"),
+            Just(";charset=utf-8"),
+            Just(";charset=us-ascii"),
+            Just(";charset=latin1"),
+            Just(";variant=GFM"),
+            Just(";variant=CommonMark"),
+            Just(";level=1"),
+            Just(";profile=\"a,b;c\""),
+            Just(";"),
+        ];
+        (media, param.clone(), param, " {0,2}")
+            .prop_map(|(media, a, b, pad)| format!("{pad}{media}{a}{b}{pad}"))
+    }
+
+    proptest::proptest! {
+        /// The search is a necessary condition of the parse: Markdown is
+        /// never possible for a request the search turns away. So the public
+        /// answer is the parse's answer, for any ranges on any number of
+        /// `Accept` lines.
+        #[test]
+        fn the_markdown_search_never_hides_a_markdown_request(
+            lines in proptest::collection::vec(
+                proptest::collection::vec(range_strategy(), 1..5),
+                0..4,
+            ),
+        ) {
+            let lines: Vec<String> = lines.iter().map(|ranges| ranges.join(",")).collect();
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            let headers = accepts(&lines);
+            let parsed = markdown_possible(&accept_values(&headers));
+            proptest::prop_assert!(!parsed || names_markdown(&headers), "{lines:?}");
+            proptest::prop_assert_eq!(prefers_markdown(&headers), parsed, "{:?}", lines);
+        }
+
+        /// The same, for any printable header value at all.
+        #[test]
+        fn the_markdown_search_agrees_with_the_parse_on_any_value(
+            value in "[ -~]{0,48}",
+            prefix in proptest::bool::ANY,
+        ) {
+            let value = if prefix { format!("{value}text/markdown") } else { value };
+            let headers = accept(&value);
+            let parsed = markdown_possible(&accept_values(&headers));
+            proptest::prop_assert!(!parsed || names_markdown(&headers), "{value}");
+            proptest::prop_assert_eq!(prefers_markdown(&headers), parsed, "{}", value);
+        }
     }
 
     /// Codex review (P2): an HTML range matches the charset the page

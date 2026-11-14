@@ -397,11 +397,15 @@ fn format_panic_payload(payload: &(dyn Any + Send)) -> String {
 
 /// Per-request context captured before the inner service runs, so it is still
 /// available if the handler panics.
+///
+/// The method, route and id keep the types the request has them in. They
+/// become text when an event is built, which is for a `5xx` or a panic only:
+/// a copy to three `String`s on every request served no other response.
 #[derive(Clone)]
 struct RequestContext {
-    method: String,
-    route: Option<String>,
-    request_id: Option<String>,
+    method: axum::http::Method,
+    route: Option<MatchedPath>,
+    request_id: Option<RequestId>,
     /// Handle to the request's capsule buffer, snapshotted here for the same
     /// reason the rest of this struct is: it must survive a handler unwind.
     capture: Option<capture::Handle>,
@@ -476,15 +480,9 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let method = req.method().as_str().to_owned();
-        let route = req
-            .extensions()
-            .get::<MatchedPath>()
-            .map(|m| m.as_str().to_owned());
-        let request_id = req
-            .extensions()
-            .get::<RequestId>()
-            .map(std::string::ToString::to_string);
+        let method = req.method().clone();
+        let route = req.extensions().get::<MatchedPath>().cloned();
+        let request_id = req.extensions().get::<RequestId>().cloned();
         let capture = capture::handle_of(&req);
         let context = Some(RequestContext {
             method,
@@ -656,9 +654,12 @@ fn report_response(response: &mut Response, context: RequestContext, chain: &Arc
             status: response.status(),
             message,
             problem_type,
-            request_id: context.request_id,
-            route: context.route,
-            method: Some(context.method),
+            request_id: context.request_id.as_ref().map(ToString::to_string),
+            route: context
+                .route
+                .as_ref()
+                .map(|route| route.as_str().to_owned()),
+            method: Some(context.method.as_str().to_owned()),
             panic: None,
             capsule: None,
         },
@@ -684,9 +685,12 @@ fn handle_panic(
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 message: message.clone(),
                 problem_type: None,
-                request_id: context.request_id,
-                route: context.route,
-                method: Some(context.method),
+                request_id: context.request_id.as_ref().map(ToString::to_string),
+                route: context
+                    .route
+                    .as_ref()
+                    .map(|route| route.as_str().to_owned()),
+                method: Some(context.method.as_str().to_owned()),
                 panic: Some(PanicInfo {
                     payload: message,
                     backtrace,

@@ -50,6 +50,25 @@ const ASSET_MANIFEST_FILE: &str = ".autumn-manifest.json";
 #[derive(Debug, serde::Deserialize)]
 struct AssetManifest {
     files: HashMap<String, String>,
+    /// Every value of `files`, so membership is one lookup rather than a
+    /// scan of the whole manifest on each `/static/` request.
+    #[serde(skip)]
+    fingerprinted: std::collections::HashSet<String>,
+}
+
+#[cfg(any(not(debug_assertions), feature = "embed-assets"))]
+impl AssetManifest {
+    /// Parse the manifest JSON; `None` when it is not a valid manifest.
+    fn parse(json: &str) -> Option<Self> {
+        let mut manifest: Self = serde_json::from_str(json).ok()?;
+        manifest.fingerprinted = manifest.files.values().cloned().collect();
+        Some(manifest)
+    }
+
+    /// `true` if `rel_path` is exactly one of the fingerprinted paths.
+    fn is_fingerprinted(&self, rel_path: &str) -> bool {
+        self.fingerprinted.contains(rel_path)
+    }
 }
 
 #[cfg(not(debug_assertions))]
@@ -61,7 +80,7 @@ fn load_manifest() -> &'static Option<AssetManifest> {
         let manifest_path =
             crate::app::project_dir("static", &crate::config::OsEnv).join(ASSET_MANIFEST_FILE);
         let contents = std::fs::read_to_string(manifest_path).ok()?;
-        serde_json::from_str(&contents).ok()
+        AssetManifest::parse(&contents)
     })
 }
 
@@ -251,7 +270,7 @@ pub fn register_embedded_static(dir: EmbeddedStaticDir) {
         dir.0
             .get_file(ASSET_MANIFEST_FILE)
             .and_then(include_dir::File::contents_utf8)
-            .and_then(|s| serde_json::from_str::<AssetManifest>(s).ok()),
+            .and_then(AssetManifest::parse),
     );
 }
 
@@ -275,7 +294,7 @@ fn embedded_is_manifest_asset(rel_path: &str) -> bool {
     EMBEDDED_MANIFEST
         .get()
         .and_then(Option::as_ref)
-        .is_some_and(|m| m.files.values().any(|v| v == rel_path))
+        .is_some_and(|m| m.is_fingerprinted(rel_path))
 }
 
 /// Return the URL for a static asset, fingerprinted in release builds.
@@ -372,7 +391,7 @@ pub(crate) fn is_manifest_asset(rel_path: &str) -> bool {
     {
         load_manifest()
             .as_ref()
-            .is_some_and(|m| m.files.values().any(|v| v == rel_path))
+            .is_some_and(|m| m.is_fingerprinted(rel_path))
     }
     #[cfg(debug_assertions)]
     {
@@ -730,12 +749,15 @@ fn embedded_response(rel_path: &str, req_headers: &http::HeaderMap) -> axum::res
 }
 
 /// Axum handler serving `/static/{*path}` from the embedded tree.
+///
+/// Takes the request and borrows its headers: the `HeaderMap` extractor would
+/// clone every header just to be read here.
 #[cfg(feature = "embed-assets")]
 pub(crate) async fn serve_embedded(
     axum::extract::Path(path): axum::extract::Path<String>,
-    headers: http::HeaderMap,
+    request: axum::extract::Request,
 ) -> axum::response::Response {
-    embedded_response(&path, &headers)
+    embedded_response(&path, request.headers())
 }
 
 /// A standalone router that serves `/static/*` from the registered embedded
@@ -751,9 +773,105 @@ pub fn embedded_static_router() -> axum::Router {
         .layer(AssetCacheControlLayer)
 }
 
+/// Test support: tells whether a handler held a second copy of the request's
+/// header values while it ran.
+///
+/// A request from [`request`](header_probe::request) carries one header whose
+/// value shares a reference-counted buffer with a probe kept in the request's
+/// extensions. The probe is dropped with the request, after the request's own
+/// header map (`http` declares `headers` before `extensions`), and records
+/// whether its handle on the buffer was the last one. A handler that took the
+/// header map by value still holds its copy at that moment, so the buffer is
+/// still shared; a handler that borrowed the request's map leaves none.
+#[cfg(test)]
+mod header_probe {
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use axum::body::Body;
+
+    /// What the probes of one request saw, in drop order.
+    #[derive(Clone, Default)]
+    pub(super) struct Observed(Arc<Mutex<Vec<bool>>>);
+
+    impl Observed {
+        /// One entry per dropped request: `true` when nothing but the request
+        /// itself held the probed header value.
+        pub(super) fn take(&self) -> Vec<bool> {
+            std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+    }
+
+    #[derive(Clone)]
+    struct Probe {
+        value: bytes::Bytes,
+        observed: Observed,
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.observed
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(self.value.is_unique());
+        }
+    }
+
+    /// A bodyless `GET uri` carrying the probed header.
+    pub(super) fn request(uri: &str) -> (http::Request<Body>, Observed) {
+        let observed = Observed::default();
+        let value = bytes::Bytes::copy_from_slice(b"probe");
+        let header =
+            http::HeaderValue::from_maybe_shared(value.clone()).expect("a valid header value");
+        let mut request = http::Request::builder()
+            .uri(uri)
+            .header("x-header-probe", header)
+            .body(Body::empty())
+            .expect("request builds");
+        request.extensions_mut().insert(Probe {
+            value,
+            observed: observed.clone(),
+        });
+        (request, observed)
+    }
+
+    #[test]
+    fn a_request_dropped_whole_held_the_only_copy() {
+        let (request, observed) = request("/");
+        drop(request);
+        assert_eq!(observed.take(), [true]);
+    }
+
+    #[test]
+    fn a_header_map_that_outlives_the_request_is_seen() {
+        let (request, observed) = request("/");
+        let copy = request.headers().clone();
+        drop(request);
+        assert_eq!(observed.take(), [false]);
+        drop(copy);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The embedded handler reads the request's own header map; it does not
+    /// take a copy of every header to do so. Whether a tree is registered is
+    /// process-wide state, so the status is not asserted: the handler runs
+    /// for this path either way.
+    #[cfg(feature = "embed-assets")]
+    #[tokio::test]
+    async fn the_embedded_handler_does_not_copy_the_request_headers() {
+        use tower::ServiceExt as _;
+
+        let (request, observed) = header_probe::request("/static/css/app.css");
+        let _response = embedded_static_router()
+            .oneshot(request)
+            .await
+            .expect("infallible");
+        assert_eq!(observed.take(), [true]);
+    }
 
     #[test]
     fn asset_url_returns_static_prefix() {
@@ -862,6 +980,61 @@ mod tests {
         assert_eq!(content_type_for("favicon.ico"), "image/x-icon");
         assert_eq!(content_type_for("data.bin"), "application/octet-stream");
         assert_eq!(content_type_for("LICENSE"), "application/octet-stream");
+    }
+
+    /// Manifest membership is exact byte equality against a fingerprinted
+    /// value: logical keys, prefixes, case and normalisation variants do not
+    /// count unless they are themselves a value.
+    #[cfg(any(not(debug_assertions), feature = "embed-assets"))]
+    #[test]
+    fn manifest_membership_is_exact_value_equality() {
+        let manifest = AssetManifest::parse(
+            r#"{"files": {
+                "css/app.css": "css/app.0123abcd.css",
+                "css/dup.css": "css/app.0123abcd.css",
+                "js/café.js": "js/café.89abcdef.js",
+                "blank": ""
+            }, "fingerprinted": ["js/injected.js"]}"#,
+        )
+        .expect("a valid manifest");
+        assert!(manifest.is_fingerprinted("css/app.0123abcd.css"));
+        assert!(manifest.is_fingerprinted("js/caf\u{e9}.89abcdef.js"));
+        assert!(manifest.is_fingerprinted(""));
+        assert!(!manifest.is_fingerprinted("css/app.css"));
+        assert!(!manifest.is_fingerprinted("css/app.0123abcd"));
+        assert!(!manifest.is_fingerprinted("CSS/app.0123abcd.css"));
+        assert!(!manifest.is_fingerprinted("js/cafe\u{301}.89abcdef.js"));
+        assert!(!manifest.is_fingerprinted("/css/app.0123abcd.css"));
+        // The set is built from the file map, never read from the JSON.
+        assert!(!manifest.is_fingerprinted("js/injected.js"));
+
+        assert!(AssetManifest::parse("").is_none());
+        assert!(AssetManifest::parse("{}").is_none());
+        assert!(AssetManifest::parse(r#"{"files": ["a"]}"#).is_none());
+        let empty = AssetManifest::parse(r#"{"files": {}}"#).expect("a valid manifest");
+        assert!(!empty.is_fingerprinted(""));
+    }
+
+    #[cfg(any(not(debug_assertions), feature = "embed-assets"))]
+    proptest::proptest! {
+        /// A parsed manifest answers membership exactly as a scan of its
+        /// values does, for any manifest and any probe, including probes
+        /// drawn from its own keys and values.
+        #[test]
+        fn manifest_membership_matches_a_scan_of_the_values(
+            files in proptest::collection::hash_map("[a-c\u{e9}/.]{0,4}", "[a-c\u{e9}/.]{0,4}", 0..12),
+            probes in proptest::collection::vec("[a-c\u{e9}/.]{0,4}", 0..12),
+        ) {
+            let json = serde_json::json!({ "files": &files }).to_string();
+            let manifest = AssetManifest::parse(&json).expect("a valid manifest");
+            for probe in probes.iter().chain(files.keys()).chain(files.values()) {
+                proptest::prop_assert_eq!(
+                    manifest.is_fingerprinted(probe),
+                    files.values().any(|value| value == probe),
+                    "{:?}", probe
+                );
+            }
+        }
     }
 }
 

@@ -99,8 +99,9 @@ pub struct ResponseRoute(pub String);
 
 /// Shared sentinel coordinating the primary and fallback access-log layers.
 ///
-/// The fallback inserts it into the **request** extensions on the way in, and
-/// the primary flips it once it emits, so the fallback only logs requests
+/// The fallback inserts it into the **request** extensions on the way in (for
+/// requests whose path it does not exclude), and the primary flips it once it
+/// emits, so the fallback only logs requests
 /// that short-circuited before reaching the primary. It rides the request
 /// (not the response) because error-page/exception filters may rebuild the
 /// response entirely, which would drop a response-side marker.
@@ -189,7 +190,10 @@ pub struct AccessLogService<S> {
 }
 
 /// Request facts captured before the inner service consumes the request.
-/// `None` when the request path is excluded from access logging.
+///
+/// `None` when the request path is excluded from access logging; an excluded
+/// request then takes no clock reading and carries no sentinel, since neither
+/// would be read.
 ///
 /// The route and id are kept as the shared values the request already
 /// carries, not copied to text: `MatchedPath` is an `Arc<str>` (a clone is a
@@ -199,6 +203,8 @@ struct RequestMeta {
     method: Method,
     route: Option<MatchedPath>,
     request_id: Option<crate::middleware::RequestId>,
+    /// The fallback's own planted sentinel, or the one the primary found.
+    sentinel: Option<AccessLogEmitted>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for AccessLogService<S>
@@ -218,6 +224,16 @@ where
         let meta = if is_excluded(req.uri().path(), &self.exclude) {
             None
         } else {
+            // The fallback plants the sentinel for the primary to flip. Bare setups with only
+            // the primary layer have none. An excluded path needs none: neither layer logs it,
+            // and the primary only flips the sentinel after it logs.
+            let sentinel = if self.fallback {
+                let sentinel = AccessLogEmitted::default();
+                req.extensions_mut().insert(sentinel.clone());
+                Some(sentinel)
+            } else {
+                req.extensions().get::<AccessLogEmitted>().cloned()
+            };
             Some(RequestMeta {
                 method: req.method().clone(),
                 route: req.extensions().get::<MatchedPath>().cloned(),
@@ -227,25 +243,18 @@ where
                     .extensions()
                     .get::<crate::middleware::RequestId>()
                     .cloned(),
+                sentinel,
             })
         };
 
-        // The fallback plants the sentinel for the primary to flip. Bare setups with only the
-        // primary layer have none.
-        let sentinel = if self.fallback {
-            let sentinel = AccessLogEmitted::default();
-            req.extensions_mut().insert(sentinel.clone());
-            Some(sentinel)
-        } else {
-            req.extensions().get::<AccessLogEmitted>().cloned()
-        };
-
+        let inner = self.inner.call(req);
+        // The clock is read once the inner service has been called, and only for a request
+        // that may be logged.
+        let meta = meta.map(|meta| (meta, crate::time::ambient_instant()));
         AccessLogFuture {
-            inner: self.inner.call(req),
+            inner,
             meta,
-            start: crate::time::ambient_instant(),
             fallback: self.fallback,
-            sentinel,
         }
     }
 }
@@ -266,10 +275,8 @@ pin_project! {
     pub struct AccessLogFuture<F> {
         #[pin]
         inner: F,
-        meta: Option<RequestMeta>,
-        start: Instant,
+        meta: Option<(RequestMeta, Instant)>,
         fallback: bool,
-        sentinel: Option<AccessLogEmitted>,
     }
 }
 
@@ -283,16 +290,15 @@ where
         let this = self.project();
         match this.inner.poll(cx) {
             Poll::Ready(Ok(response)) => {
-                let already_emitted = *this.fallback
-                    && this
-                        .sentinel
-                        .as_ref()
-                        .is_some_and(AccessLogEmitted::is_marked);
-                if let Some(meta) = this.meta.take()
-                    && !already_emitted
+                if let Some((meta, start)) = this.meta.take()
+                    && !(*this.fallback
+                        && meta
+                            .sentinel
+                            .as_ref()
+                            .is_some_and(AccessLogEmitted::is_marked))
                 {
                     let duration_ms = crate::time::ambient_instant()
-                        .saturating_duration_since(*this.start)
+                        .saturating_duration_since(start)
                         .as_secs_f64()
                         * 1000.0;
                     // A short-circuit seen only by the fallback may never have run
@@ -329,7 +335,7 @@ where
                         "request served"
                     );
                     if !*this.fallback
-                        && let Some(sentinel) = this.sentinel.as_ref()
+                        && let Some(sentinel) = meta.sentinel.as_ref()
                     {
                         sentinel.mark();
                     }
@@ -548,5 +554,166 @@ mod tests {
             out.contains(&format!(r#"request_id="{header_id}""#)),
             "{out}"
         );
+    }
+
+    /// A handler that records whether the request reached it carrying an
+    /// [`AccessLogEmitted`] sentinel.
+    fn sentinel_probe(
+        saw_sentinel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl Service<
+        Request<axum::body::Body>,
+        Response = Response<axum::body::Body>,
+        Error = std::convert::Infallible,
+        Future = impl Send,
+    > + Clone {
+        tower::service_fn(move |request: Request<axum::body::Body>| {
+            saw_sentinel.store(
+                request.extensions().get::<AccessLogEmitted>().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            async { Ok::<_, std::convert::Infallible>(Response::new(axum::body::Body::empty())) }
+        })
+    }
+
+    /// Sends one request to `path` through `service` and returns how many
+    /// access-log lines it produced.
+    async fn lines_logged<S>(service: S, path: &str) -> usize
+    where
+        S: Service<
+                Request<axum::body::Body>,
+                Response = Response<axum::body::Body>,
+                Error = std::convert::Infallible,
+            >,
+    {
+        use tower::ServiceExt as _;
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let request = Request::builder()
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .expect("request");
+        service.oneshot(request).await.expect("infallible");
+
+        let out = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+        out.matches("request served").count()
+    }
+
+    /// The fallback plants its sentinel only for a request it may log: an
+    /// excluded path reaches the inner service without one, a logged path
+    /// with one.
+    #[tokio::test]
+    async fn the_fallback_plants_a_sentinel_only_for_paths_it_logs() {
+        let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fallback = AccessLogLayer::fallback(vec!["/health".to_owned(), "/static/".to_owned()]);
+
+        for (path, logged) in [
+            ("/health", false),
+            ("/static/app.css", false),
+            ("/static", false),
+            ("/healthz", true),
+            ("/users/1", true),
+            ("/", true),
+        ] {
+            saw.store(!logged, std::sync::atomic::Ordering::SeqCst);
+            let service = fallback.layer(sentinel_probe(Arc::clone(&saw)));
+            assert_eq!(
+                lines_logged(service, path).await,
+                usize::from(logged),
+                "{path}"
+            );
+            assert_eq!(
+                saw.load(std::sync::atomic::Ordering::SeqCst),
+                logged,
+                "sentinel presence for {path}"
+            );
+        }
+    }
+
+    /// The fallback and primary together log each request exactly once,
+    /// whichever layer excludes the path and whether or not the request
+    /// reaches the primary. The two layers disagree when the path seen by the
+    /// primary differs from the one seen by the fallback, or their lists do.
+    #[tokio::test]
+    async fn the_fallback_and_primary_log_once_whichever_layer_excludes() {
+        let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let health = || vec!["/health".to_owned()];
+
+        // (fallback excludes, primary excludes, reaches primary, expected lines)
+        let cases: [(bool, bool, bool, usize); 6] = [
+            (true, true, true, 0),
+            (true, false, true, 1),
+            (false, true, true, 1),
+            (false, false, true, 1),
+            (true, false, false, 0),
+            (false, false, false, 1),
+        ];
+        for (fallback_excludes, primary_excludes, reaches_primary, expected) in cases {
+            let fallback = AccessLogLayer::fallback(if fallback_excludes {
+                health()
+            } else {
+                Vec::new()
+            });
+            let primary = AccessLogLayer::new(if primary_excludes {
+                health()
+            } else {
+                Vec::new()
+            });
+            let lines = if reaches_primary {
+                let service = fallback.layer(primary.layer(sentinel_probe(Arc::clone(&saw))));
+                lines_logged(service, "/health/deep").await
+            } else {
+                let service = fallback.layer(sentinel_probe(Arc::clone(&saw)));
+                lines_logged(service, "/health/deep").await
+            };
+            assert_eq!(
+                lines, expected,
+                "fallback excludes {fallback_excludes}, primary excludes {primary_excludes}, \
+                 reaches primary {reaches_primary}"
+            );
+        }
+    }
+
+    /// A clock that counts its monotonic readings.
+    struct CountingClock(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl crate::time::ClockSource for CountingClock {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+        }
+
+        fn monotonic(&self) -> crate::time::MonotonicInstant {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            crate::time::MonotonicInstant::ORIGIN
+        }
+    }
+
+    /// An excluded request takes no clock reading in either layer; a logged
+    /// one still reads the clock at the start and at the end.
+    #[tokio::test]
+    async fn an_excluded_request_does_not_read_the_clock() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _clock = crate::time::install_ambient(Arc::new(CountingClock(Arc::clone(&reads))));
+        let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stack = || {
+            AccessLogLayer::fallback(vec!["/health".to_owned()]).layer(
+                AccessLogLayer::new(vec!["/health".to_owned()])
+                    .layer(sentinel_probe(Arc::clone(&saw))),
+            )
+        };
+
+        let before = reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(lines_logged(stack(), "/health/live").await, 0);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), before);
+
+        let before = reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(lines_logged(stack(), "/users/1").await, 1);
+        // Primary: start and end. Fallback: start only, since it stays silent.
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), before + 3);
     }
 }

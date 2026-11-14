@@ -2,8 +2,8 @@
 package = "autumn-web"
 bench = "csrf_verify"
 mode = "marginal"
-date = "2026-10-30"
-commit = "b77d54e34935"
+date = "2026-11-14"
+commit = "6a27e408e8ed"
 rustc = "rustc 1.97.0 (2d8144b78 2026-07-07)"
 valgrind = "valgrind-3.22.0"
 source_sha256 = "bee4f324b91a3a9ccc9a833cba2fbb0ca5ba065f3db9530cd2c52d5645ab02c4"
@@ -13,15 +13,15 @@ dhat = "valgrind --tool=dhat --dhat-out-file=dhat-run.json \"$BIN\" --iterations
 
 [totals]
 unit = "per iteration (N-iteration run minus zero-iteration run, divided by N)"
-instructions = 365227
-alloc_bytes = 100223
-alloc_blocks = 477
-peak_live_bytes = 518157
+instructions = 255441
+alloc_bytes = 42504
+alloc_blocks = 324
+peak_live_bytes = 455921
 callgrind_n = 1000
 dhat_n = 200
-instructions_base = 18490585
-instructions_run = 383717108
-alloc_bytes_base = 2429788
-alloc_bytes_run = 22474461
+instructions_base = 20477966
+instructions_run = 275918511
+alloc_bytes_base = 1368549
+alloc_bytes_run = 9869358
 top_function = "__memcpy_avx_unaligned_erms"
-top_function_share = 16.9
+top_function_share = 12.1

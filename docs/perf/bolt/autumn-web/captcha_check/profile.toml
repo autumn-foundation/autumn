@@ -2,8 +2,8 @@
 package = "autumn-web"
 bench = "captcha_check"
 mode = "marginal"
-date = "2026-10-30"
-commit = "b77d54e34935"
+date = "2026-11-14"
+commit = "6a27e408e8ed"
 rustc = "rustc 1.97.0 (2d8144b78 2026-07-07)"
 valgrind = "valgrind-3.22.0"
 source_sha256 = "fe3e563995b22d2309b7078bf1ce847f7962e5d677215074f3fe3bc32c75fc18"
@@ -13,15 +13,15 @@ dhat = "valgrind --tool=dhat --dhat-out-file=dhat-run.json \"$BIN\" --iterations
 
 [totals]
 unit = "per iteration (N-iteration run minus zero-iteration run, divided by N)"
-instructions = 98326
-alloc_bytes = 29730
-alloc_blocks = 137
-peak_live_bytes = 429502
+instructions = 60378
+alloc_bytes = 12153
+alloc_blocks = 89
+peak_live_bytes = 370068
 callgrind_n = 1000
 dhat_n = 200
-instructions_base = 16951117
-instructions_run = 115277390
-alloc_bytes_base = 2096627
-alloc_bytes_run = 8042672
+instructions_base = 19055739
+instructions_run = 79434156
+alloc_bytes_base = 1146205
+alloc_bytes_run = 3576825
 top_function = "__memcpy_avx_unaligned_erms"
-top_function_share = 20.7
+top_function_share = 15.8

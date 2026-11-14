@@ -199,18 +199,18 @@ where
             .is_some();
 
         // Fields are declared up front (Empty) so `set_user_id` / `set_tenant_id` can record
-        // them later; tracing only records fields a span declared at creation.
+        // them later; tracing only records fields a span declared at creation. The request id
+        // is known now, so the span is created with it: a `record` after creation is a second
+        // pass through every subscriber layer, and the JSON formatter parses and writes the
+        // span's fields again for it. `None` records nothing, as `Empty` does.
         let span = tracing::info_span!(
             "request",
-            request_id = tracing::field::Empty,
+            request_id = request_id.as_ref().map(tracing::field::display),
             user_id = tracing::field::Empty,
             tenant_id = tracing::field::Empty,
             trace_id = tracing::field::Empty,
             span_id = tracing::field::Empty,
         );
-        if let Some(ref rid) = request_id {
-            span.record("request_id", tracing::field::display(rid));
-        }
 
         // Attach the request span so `set_user_id` / `set_tenant_id` record onto
         // it directly, rather than whatever child span happens to be current.
@@ -274,10 +274,11 @@ impl<B: HttpBody> HttpBody for LogContextBody<B> {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
-        let ctx = this.ctx.clone();
-        let span = ctx.span();
-        let _entered = span.enter();
-        context::sync_scope(ctx, || this.inner.poll_frame(cx))
+        // The body owns its context, so the span is entered where it is: a
+        // span clone goes through every subscriber layer, on each frame. The
+        // scope takes a context by value, so that one clone stays.
+        let _entered = this.ctx.span_ref().enter();
+        context::sync_scope(this.ctx.clone(), || this.inner.poll_frame(cx))
     }
 
     fn is_end_stream(&self) -> bool {
