@@ -11,6 +11,16 @@
 //! - `autumn assets list`            — print pinned deps.
 //! - `autumn assets update [name]`   — re-pin to recorded or new version.
 //! - `autumn assets verify`          — recompute hashes and compare.
+//!
+//! # Safety
+//!
+//! The manifest is project data. A contributor can change it. Thus:
+//!
+//! - Each `file` is an [`AssetPath`]. It cannot point outside `static/`.
+//! - Reads and writes do not follow a symlink out of `static/`.
+//! - `update` downloads only from `https` sources. `add --url` also accepts
+//!   `http`, because the user gives that URL.
+//! - The CLI prints the source of each download.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -53,6 +63,21 @@ pub enum AssetsError {
 
     #[error("update failed: {0}")]
     UpdateFailed(String),
+
+    /// An asset `file` is not a safe path under `static/`.
+    #[error("unsafe asset path `{path}`: {reason}")]
+    UnsafePath { path: String, reason: &'static str },
+
+    /// The manifest file is not a regular file.
+    #[error("unsafe manifest `{path}`: {reason}")]
+    UnsafeManifest { path: String, reason: &'static str },
+
+    /// An asset `source` is not a permitted URL.
+    #[error("unsafe asset source `{source_url}`: {reason}")]
+    UnsafeSource {
+        source_url: String,
+        reason: &'static str,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +216,177 @@ pub fn compute_sri(bytes: &[u8]) -> String {
 // Manifest
 // ---------------------------------------------------------------------------
 
+/// A file path relative to `static/`. It cannot point outside `static/`.
+///
+/// The path uses `/` as the separator. Each part is a normal file name. The
+/// check is the same on all platforms, because the manifest is committed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AssetPath(String);
+
+impl AssetPath {
+    /// Check `raw` and wrap it.
+    ///
+    /// # Errors
+    ///
+    /// [`AssetsError::UnsafePath`] when `raw` is not a safe path under
+    /// `static/`. This includes Windows device names such as `con.js`.
+    pub fn new(raw: impl Into<String>) -> Result<Self, AssetsError> {
+        let raw = raw.into();
+        match unsafe_reason(&raw) {
+            None => Ok(Self(raw)),
+            Some(reason) => Err(AssetsError::UnsafePath { path: raw, reason }),
+        }
+    }
+
+    /// The path as written in the manifest.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn unsafe_path(&self, reason: &'static str) -> AssetsError {
+        AssetsError::UnsafePath {
+            path: self.0.clone(),
+            reason,
+        }
+    }
+}
+
+/// Windows device names. A file with this stem opens the device.
+const WINDOWS_DEVICE_NAMES: &[&str] = &[
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CLOCK$",
+    "CONIN$",
+    "CONOUT$",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
+];
+
+/// The reason `raw` is not a safe path under `static/`, or `None`.
+fn unsafe_reason(raw: &str) -> Option<&'static str> {
+    if raw.is_empty() {
+        return Some("path is empty");
+    }
+    if raw.starts_with('/') {
+        return Some("path is absolute");
+    }
+    if raw.contains('\\') {
+        return Some("path contains `\\`");
+    }
+    if raw.contains(':') {
+        return Some("path contains `:`");
+    }
+    if raw.chars().any(char::is_control) {
+        return Some("path contains a control character");
+    }
+    for part in raw.split('/') {
+        if part.is_empty() {
+            return Some("path has an empty part");
+        }
+        if part == "." || part == ".." {
+            return Some("path has a `.` or `..` part");
+        }
+        // Windows removes a trailing dot or space. Thus `.. ` opens `..`.
+        if part.ends_with('.') || part.ends_with(' ') {
+            return Some("a part ends with `.` or a space");
+        }
+        let stem = part.split('.').next().unwrap_or(part).trim_end_matches(' ');
+        if WINDOWS_DEVICE_NAMES
+            .iter()
+            .any(|device| stem.eq_ignore_ascii_case(device))
+        {
+            return Some("a part is a Windows device name");
+        }
+    }
+    None
+}
+
+impl TryFrom<String> for AssetPath {
+    type Error = AssetsError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        Self::new(raw)
+    }
+}
+
+impl AsRef<Path> for AssetPath {
+    fn as_ref(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+impl From<AssetPath> for String {
+    fn from(path: AssetPath) -> Self {
+        path.0
+    }
+}
+
+impl std::fmt::Display for AssetPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The URL schemes that [`check_source`] accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePolicy {
+    /// Accept only `https`. Use this for a URL from the manifest.
+    HttpsOnly,
+    /// Accept `http` and `https`. Use this for a URL that the user gives.
+    HttpOrHttps,
+}
+
+/// Check that `policy` accepts the scheme of `url`.
+///
+/// # Errors
+///
+/// [`AssetsError::UnsafeSource`] when `url` is not a valid URL, or when
+/// `policy` does not accept its scheme.
+pub fn check_source(url: &str, policy: SourcePolicy) -> Result<(), AssetsError> {
+    let reject = |reason| {
+        Err(AssetsError::UnsafeSource {
+            source_url: url.to_owned(),
+            reason,
+        })
+    };
+    let Ok(parsed) = ::url::Url::parse(url) else {
+        return reject("not a valid URL");
+    };
+    match (parsed.scheme(), policy) {
+        ("https", _) | ("http", SourcePolicy::HttpOrHttps) => Ok(()),
+        ("http", SourcePolicy::HttpsOnly) => {
+            reject("a manifest source must use `https`; re-add the asset with `--url`")
+        }
+        _ => reject("only `http` and `https` are permitted"),
+    }
+}
+
 /// Path of the vendor manifest relative to the project root.
 pub const VENDOR_MANIFEST_PATH: &str = "static/.autumn-assets.json";
 
@@ -206,7 +402,7 @@ pub struct VendorManifest {
 pub struct VendorAsset {
     pub version: String,
     pub source: String,
-    pub file: String,
+    pub file: AssetPath,
     pub integrity: String,
 }
 
@@ -225,48 +421,219 @@ impl Default for VendorManifest {
 /// propagates a parse error when the file exists with invalid JSON — otherwise
 /// a corrupt manifest (e.g. from a merge conflict) would silently become empty
 /// and the next `save_manifest` would overwrite every other pinned asset.
+///
+/// # Errors
+///
+/// [`AssetsError::UnsafeManifest`] when `path` is a symlink or is not a
+/// regular file. [`AssetsError::Parse`] when an entry is not valid, for
+/// example a `file` that is not an [`AssetPath`].
 pub fn load_manifest(path: &Path) -> Result<VendorManifest, AssetsError> {
-    if !path.exists() {
-        return Ok(VendorManifest::default());
+    let unsafe_manifest = |reason| AssetsError::UnsafeManifest {
+        path: path.display().to_string(),
+        reason,
+    };
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(VendorManifest::default());
+        }
+        Err(e) => return Err(e.into()),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(unsafe_manifest("the manifest is a symlink"));
+        }
+        Ok(meta) if !meta.is_file() => {
+            return Err(unsafe_manifest("the manifest is not a regular file"));
+        }
+        Ok(_) => {}
     }
     let s = fs::read_to_string(path)?;
     serde_json::from_str(&s).map_err(|e| AssetsError::Parse(e.to_string()))
 }
 
+/// Save `manifest` to `path`.
+///
+/// The write replaces `path`. It does not follow a symlink at `path`.
+///
+/// # Errors
+///
+/// [`AssetsError::Io`] for I/O errors.
 pub fn save_manifest(path: &Path, manifest: &VendorManifest) -> Result<(), AssetsError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(dir)?;
     let json =
         serde_json::to_string_pretty(manifest).map_err(|e| AssetsError::Parse(e.to_string()))?;
-    fs::write(path, json + "\n")?;
-    Ok(())
+    replace_file(dir, path, (json + "\n").as_bytes())
 }
 
 // ---------------------------------------------------------------------------
 // Download helper
 // ---------------------------------------------------------------------------
 
-/// Download `url` and return the bytes.  Delegates to [`crate::http::fetch_bytes`]
-/// so progress-bar logic is shared with `autumn setup`.
-pub fn download_bytes(url: &str) -> Result<Vec<u8>, AssetsError> {
-    Ok(crate::http::fetch_bytes(url)?)
+/// Download `url` and return the bytes.
+///
+/// With [`SourcePolicy::HttpsOnly`], the download also refuses a redirect to
+/// `http`.
+///
+/// # Errors
+///
+/// [`AssetsError::Download`] when the download fails.
+pub fn download_bytes(url: &str, policy: SourcePolicy) -> Result<Vec<u8>, AssetsError> {
+    Ok(match policy {
+        SourcePolicy::HttpsOnly => crate::http::fetch_bytes_https_only(url)?,
+        SourcePolicy::HttpOrHttps => crate::http::fetch_bytes(url)?,
+    })
 }
 
-/// Write `bytes` to `dest` atomically via a temp file so a failed write never
-/// leaves a corrupt or partial file in place.
-pub fn write_atomic(bytes: &[u8], dest: &Path) -> Result<(), AssetsError> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+/// How [`asset_dest`] handles a directory that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MissingDir {
+    /// Make the directory.
+    Create,
+    /// Stop and return `None`.
+    Stop,
+}
+
+/// Find the full path of `file` under `static_dir`.
+///
+/// The function examines one part of the path at a time. A symlink is
+/// permitted only when its target is in `static_dir`. `static_dir` itself
+/// cannot be a symlink: `static -> .` would put `build.rs` in the project
+/// root. Returns `None` when a directory does not exist and `missing` is
+/// [`MissingDir::Stop`].
+fn asset_dest(
+    static_dir: &Path,
+    file: &AssetPath,
+    missing: MissingDir,
+) -> Result<Option<PathBuf>, AssetsError> {
+    match fs::symlink_metadata(static_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(file.unsafe_path("the static directory is a symlink"));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(file.unsafe_path("the static directory is not a directory"));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match missing {
+            MissingDir::Create => fs::create_dir_all(static_dir)?,
+            MissingDir::Stop => return Ok(None),
+        },
+        Err(e) => return Err(e.into()),
     }
-    let tmp = dest.with_extension("tmp");
+    let root = fs::canonicalize(static_dir)?;
+
+    let (parents, name) = file
+        .as_str()
+        .rsplit_once('/')
+        .unwrap_or(("", file.as_str()));
+    let mut dir = root.clone();
+    for part in parents.split('/').filter(|part| !part.is_empty()) {
+        let next = dir.join(part);
+        match fs::symlink_metadata(&next) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match missing {
+                MissingDir::Create => {
+                    fs::create_dir(&next)?;
+                    dir = next;
+                }
+                MissingDir::Stop => return Ok(None),
+            },
+            Err(e) => return Err(e.into()),
+            Ok(_) => {
+                let real = fs::canonicalize(&next)?;
+                if !real.starts_with(&root) {
+                    return Err(file.unsafe_path("a symlink points outside `static/`"));
+                }
+                if !real.is_dir() {
+                    return Err(file.unsafe_path("a part of the path is not a directory"));
+                }
+                dir = real;
+            }
+        }
+    }
+
+    let dest = dir.join(name);
+    match fs::symlink_metadata(&dest) {
+        Ok(meta) if meta.is_dir() => Err(file.unsafe_path("the path is a directory")),
+        Ok(_) => Ok(Some(dest)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(dest)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Write `bytes` to `file` under `static_dir` and return the full path.
+///
+/// The write stays in `static_dir`. A symlink in the path must point into
+/// `static_dir`. A symlink at the file is replaced. The write does not follow
+/// it. On Unix, a new file gets mode `0644`, and an old file keeps its mode.
+///
+/// # Errors
+///
+/// [`AssetsError::UnsafePath`] when `static_dir` is a symlink, when a symlink
+/// points outside `static_dir`, or when a part of the path has the wrong
+/// type. [`AssetsError::Io`] for I/O errors.
+pub fn write_asset(
+    static_dir: &Path,
+    file: &AssetPath,
+    bytes: &[u8],
+) -> Result<PathBuf, AssetsError> {
+    let dest = asset_dest(static_dir, file, MissingDir::Create)?
+        .ok_or_else(|| file.unsafe_path("a directory does not exist"))?;
+    let dir = dest
+        .parent()
+        .ok_or_else(|| file.unsafe_path("the path has no directory"))?;
+    replace_file(dir, &dest, bytes)?;
+    Ok(dest)
+}
+
+/// Replace `dest` with `bytes`, through a new temp file in `dir`.
+///
+/// The temp file has a random name and is made with `O_EXCL`. Thus a planted
+/// symlink cannot catch the write. The rename replaces a symlink at `dest`.
+/// It does not follow it. A failed write keeps the old file.
+fn replace_file(dir: &Path, dest: &Path, bytes: &[u8]) -> Result<(), AssetsError> {
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    #[cfg(unix)]
     {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.flush()?;
+        use std::os::unix::fs::PermissionsExt as _;
+        // The temp file has mode 0600. A web server user cannot read that.
+        let mode = fs::symlink_metadata(dest)
+            .ok()
+            .filter(fs::Metadata::is_file)
+            .map_or(0o644, |meta| meta.permissions().mode() & 0o777);
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(mode))?;
     }
-    fs::rename(&tmp, dest)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(dest).map_err(|e| e.error)?;
     Ok(())
+}
+
+/// Find `file` under `static_dir` for a read.
+///
+/// Returns `None` when the file does not exist.
+///
+/// # Errors
+///
+/// [`AssetsError::UnsafePath`] when the path leaves `static_dir`, or when
+/// the file is not a regular file.
+fn asset_for_read(static_dir: &Path, file: &AssetPath) -> Result<Option<PathBuf>, AssetsError> {
+    let Some(dest) = asset_dest(static_dir, file, MissingDir::Stop)? else {
+        return Ok(None);
+    };
+    let real = match fs::canonicalize(&dest) {
+        Ok(real) => real,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if !real.starts_with(fs::canonicalize(static_dir)?) {
+        return Err(file.unsafe_path("a symlink points outside `static/`"));
+    }
+    if !fs::metadata(&real)?.is_file() {
+        return Err(file.unsafe_path("the asset is not a regular file"));
+    }
+    Ok(Some(real))
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +660,17 @@ pub fn verify_all(manifest_path: &Path, static_dir: &Path) -> Result<(), AssetsE
     let mut ok = true;
     for (name, asset) in &manifest.assets {
         let file_path = static_dir.join(&asset.file);
-        match fs::read(&file_path) {
+        let read = asset_for_read(static_dir, &asset.file).and_then(|found| {
+            found.map_or_else(
+                || Err(std::io::Error::from(std::io::ErrorKind::NotFound).into()),
+                |path| Ok(fs::read(path)?),
+            )
+        });
+        match read {
+            Err(e @ AssetsError::UnsafePath { .. }) => {
+                eprintln!("  UNSAFE   {name} — {e}");
+                ok = false;
+            }
             Err(e) => {
                 eprintln!("  MISSING  {name} — {}: {e}", file_path.display());
                 ok = false;
@@ -334,28 +711,49 @@ pub fn run_add(spec: &str, url_override: Option<&str>) {
 }
 
 fn execute_add(spec: &str, url_override: Option<&str>) -> Result<(), AssetsError> {
+    execute_add_with(
+        spec,
+        url_override,
+        Path::new(VENDOR_MANIFEST_PATH),
+        Path::new("static"),
+        download_bytes,
+    )
+}
+
+/// Testable core of `run_add`. Tests give a temp directory and a fake `fetch`.
+///
+/// All checks run before the download.
+fn execute_add_with(
+    spec: &str,
+    url_override: Option<&str>,
+    manifest_path: &Path,
+    static_dir: &Path,
+    fetch: impl Fn(&str, SourcePolicy) -> Result<Vec<u8>, AssetsError>,
+) -> Result<(), AssetsError> {
     let (name, version) = parse_spec(spec)?;
-    let (source_url, file_rel) = resolve_source(&name, &version, url_override)?;
+    let (source, file) = resolve_source(&name, &version, url_override)?;
+    let file = AssetPath::new(file)?;
+    // The user gives an `add --url` URL. Thus `http` is permitted.
+    let policy = SourcePolicy::HttpOrHttps;
+    check_source(&source, policy)?;
+    let mut manifest = load_manifest(manifest_path)?;
+    asset_dest(static_dir, &file, MissingDir::Stop)?;
 
-    println!("Downloading {name} {version}...");
-    let bytes = download_bytes(&source_url)?;
+    println!("Downloading {name} {version} from {source}...");
+    let bytes = fetch(&source, policy)?;
     let sri = compute_sri(&bytes);
+    write_asset(static_dir, &file, &bytes)?;
 
-    let dest = PathBuf::from("static").join(&file_rel);
-    write_atomic(&bytes, &dest)?;
-
-    let manifest_path = PathBuf::from(VENDOR_MANIFEST_PATH);
-    let mut manifest = load_manifest(&manifest_path)?;
     manifest.assets.insert(
         name.clone(),
         VendorAsset {
             version: version.clone(),
-            source: source_url,
-            file: file_rel,
+            source,
+            file,
             integrity: sri.clone(),
         },
     );
-    save_manifest(&manifest_path, &manifest)?;
+    save_manifest(manifest_path, &manifest)?;
 
     println!("  Added {name} {version}");
     println!("  Integrity: {sri}");
@@ -392,88 +790,123 @@ pub fn run_update(name: Option<&str>) {
 
 fn execute_update(name_spec: Option<&str>) -> Result<(), AssetsError> {
     let manifest_path = PathBuf::from(VENDOR_MANIFEST_PATH);
-    execute_update_with_manifest(name_spec, &manifest_path, Path::new("static"))
+    execute_update_with_manifest(
+        name_spec,
+        &manifest_path,
+        Path::new("static"),
+        download_bytes,
+    )
+}
+
+/// One asset that `update` will download.
+struct PendingUpdate {
+    name: String,
+    version: String,
+    source: String,
+    file: AssetPath,
+}
+
+impl PendingUpdate {
+    fn from_manifest(name: &str, asset: &VendorAsset) -> Self {
+        Self {
+            name: name.to_owned(),
+            version: asset.version.clone(),
+            source: asset.source.clone(),
+            file: asset.file.clone(),
+        }
+    }
 }
 
 /// Testable core of `run_update`: resolves, downloads, and re-pins assets.
 ///
-/// Separated from [`execute_update`] so tests can point at a temp directory
-/// without touching the real `static/` tree.
+/// Tests give a temp directory and a fake `fetch`. All checks run before the
+/// first download. All downloads finish before the first write.
 fn execute_update_with_manifest(
     name_spec: Option<&str>,
     manifest_path: &Path,
     static_dir: &Path,
+    fetch: impl Fn(&str, SourcePolicy) -> Result<Vec<u8>, AssetsError>,
 ) -> Result<(), AssetsError> {
     let mut manifest = load_manifest(manifest_path)?;
 
-    let to_update: Vec<(String, String, String, String)> = match name_spec {
-        None => {
-            // Update all.
-            manifest
-                .assets
-                .iter()
-                .map(|(n, a)| {
-                    (
-                        n.clone(),
-                        a.version.clone(),
-                        a.source.clone(),
-                        a.file.clone(),
-                    )
-                })
-                .collect()
+    let pending: Vec<PendingUpdate> = match name_spec {
+        None => manifest
+            .assets
+            .iter()
+            .map(|(name, asset)| PendingUpdate::from_manifest(name, asset))
+            .collect(),
+        Some(spec) if spec.contains('@') => {
+            // Re-pin to a different version.
+            let (name, version) = parse_spec(spec)?;
+            if !registry().iter().any(|(k, _)| *k == name.as_str()) {
+                // We cannot find the URL of a new version of a `--url` asset.
+                return Err(AssetsError::UpdateFailed(format!(
+                    "{name} was added with --url and is not in the built-in registry; \
+                     re-pin with `autumn assets add {name}@{version} --url <url>`"
+                )));
+            }
+            let (source, file) = resolve_source(&name, &version, None)?;
+            vec![PendingUpdate {
+                name,
+                version,
+                source,
+                file: AssetPath::new(file)?,
+            }]
         }
         Some(spec) => {
-            if spec.contains('@') {
-                // Re-pin to a different version.
-                let (name, version) = parse_spec(spec)?;
-                let in_registry = registry().iter().any(|(k, _)| *k == name.as_str());
-                let (source_url, file_rel) = if in_registry {
-                    resolve_source(&name, &version, None)?
-                } else {
-                    // Added with `--url`: there is no way to derive the new version's URL.
-                    return Err(AssetsError::UpdateFailed(format!(
-                        "{name} was added with --url and is not in the built-in registry; \
-                         re-pin with `autumn assets add {name}@{version} --url <url>`"
-                    )));
-                };
-                vec![(name, version, source_url, file_rel)]
-            } else {
-                // Refresh the existing pinned version.
-                let asset = manifest
-                    .assets
-                    .get(spec)
-                    .ok_or_else(|| AssetsError::UnknownPackage(spec.to_owned()))?;
-                vec![(
-                    spec.to_owned(),
-                    asset.version.clone(),
-                    asset.source.clone(),
-                    asset.file.clone(),
-                )]
-            }
+            // Refresh the pinned version.
+            let asset = manifest
+                .assets
+                .get(spec)
+                .ok_or_else(|| AssetsError::UnknownPackage(spec.to_owned()))?;
+            vec![PendingUpdate::from_manifest(spec, asset)]
         }
     };
 
-    for (name, version, source_url, file_rel) in to_update {
-        println!("Updating {name} → {version}...");
-        let bytes = download_bytes(&source_url)?;
+    if pending.is_empty() {
+        println!("No vendored assets to update.");
+        return Ok(());
+    }
+
+    // A manifest source is project data. Thus only `https` is permitted.
+    let policy = SourcePolicy::HttpsOnly;
+    for item in &pending {
+        check_source(&item.source, policy)?;
+        asset_dest(static_dir, &item.file, MissingDir::Stop)?;
+    }
+
+    let mut downloads = Vec::with_capacity(pending.len());
+    for item in pending {
+        println!(
+            "Updating {} → {} from {}...",
+            item.name, item.version, item.source
+        );
+        let bytes = fetch(&item.source, policy)?;
+        downloads.push((item, bytes));
+    }
+
+    for (item, bytes) in downloads {
         let sri = compute_sri(&bytes);
-        let dest = static_dir.join(&file_rel);
-        write_atomic(&bytes, &dest)?;
+        write_asset(static_dir, &item.file, &bytes)?;
+        println!("  Updated {} {}  {sri}", item.name, item.version);
         manifest.assets.insert(
-            name.clone(),
+            item.name,
             VendorAsset {
-                version: version.clone(),
-                source: source_url,
-                file: file_rel,
-                integrity: sri.clone(),
+                version: item.version,
+                source: item.source,
+                file: item.file,
+                integrity: sri,
             },
         );
-        println!("  Updated {name} {version}  {sri}");
     }
 
     save_manifest(manifest_path, &manifest)?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -579,19 +1012,22 @@ mod tests {
 
     #[test]
     fn manifest_json_round_trip() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
+        // `save_manifest` replaces the file. Windows cannot replace an open
+        // file, so use a path that no handle holds open.
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join(".autumn-assets.json");
         let mut manifest = VendorManifest::default();
         manifest.assets.insert(
             "htmx".into(),
             VendorAsset {
                 version: "2.0.4".into(),
                 source: "https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js".into(),
-                file: "js/htmx.min.js".into(),
+                file: AssetPath::new("js/htmx.min.js").unwrap(),
                 integrity: "sha384-abc".into(),
             },
         );
-        save_manifest(tmp.path(), &manifest).unwrap();
-        let loaded = load_manifest(tmp.path()).unwrap();
+        save_manifest(&path, &manifest).unwrap();
+        let loaded = load_manifest(&path).unwrap();
         assert_eq!(loaded.assets.len(), 1);
         let htmx = loaded.assets.get("htmx").unwrap();
         assert_eq!(htmx.version, "2.0.4");
@@ -643,10 +1079,12 @@ mod tests {
         let js_dir = static_dir.join("js");
         fs::create_dir_all(&js_dir).unwrap();
 
+        // Write a file with known content.
         let original = b"console.log('htmx');";
         let good_sri = compute_sri(original);
         fs::write(js_dir.join("htmx.min.js"), original).unwrap();
 
+        // Record the good hash in the manifest.
         let manifest_path = static_dir.join(".autumn-assets.json");
         let mut manifest = VendorManifest::default();
         manifest.assets.insert(
@@ -654,14 +1092,16 @@ mod tests {
             VendorAsset {
                 version: "2.0.4".into(),
                 source: "https://example.com".into(),
-                file: "js/htmx.min.js".into(),
+                file: AssetPath::new("js/htmx.min.js").unwrap(),
                 integrity: good_sri,
             },
         );
         save_manifest(&manifest_path, &manifest).unwrap();
 
+        // Tamper the file.
         fs::write(js_dir.join("htmx.min.js"), b"console.log('evil');").unwrap();
 
+        // Verify should fail.
         let result = verify_all(&manifest_path, &static_dir);
         assert!(result.is_err(), "expected verify to fail after tampering");
     }
@@ -684,7 +1124,7 @@ mod tests {
             VendorAsset {
                 version: "2.0.4".into(),
                 source: "https://example.com".into(),
-                file: "js/htmx.min.js".into(),
+                file: AssetPath::new("js/htmx.min.js").unwrap(),
                 integrity: sri,
             },
         );
@@ -694,17 +1134,7 @@ mod tests {
         assert!(result.is_ok(), "expected verify to pass");
     }
 
-    #[test]
-    fn write_atomic_does_not_leave_partial_on_rename() {
-        let tmp_dir = tempfile::TempDir::new().unwrap();
-        let dest = tmp_dir.path().join("out.js");
-        write_atomic(b"data", &dest).unwrap();
-        assert_eq!(fs::read(&dest).unwrap(), b"data");
-        // No leftover .tmp file.
-        assert!(!dest.with_extension("tmp").exists());
-    }
-
-    // --- execute_update for --url packages ---
+    // --- Update of --url packages ---
 
     #[test]
     fn execute_update_with_version_for_url_package_errors_with_hint() {
@@ -719,14 +1149,19 @@ mod tests {
             VendorAsset {
                 version: "1.0.0".into(),
                 source: "https://example.com/my-custom-lib.min.js".into(),
-                file: "js/my-custom-lib.min.js".into(),
+                file: AssetPath::new("js/my-custom-lib.min.js").unwrap(),
                 integrity: "sha384-abc".into(),
             },
         );
         save_manifest(&manifest_path, &manifest).unwrap();
 
-        let result =
-            execute_update_with_manifest(Some("my-custom-lib@2.0.0"), &manifest_path, &static_dir);
+        // Attempting to re-pin with @version should fail with a clear message.
+        let result = execute_update_with_manifest(
+            Some("my-custom-lib@2.0.0"),
+            &manifest_path,
+            &static_dir,
+            no_network,
+        );
         let err = result.expect_err("expected error for --url package re-pin");
         assert!(
             matches!(err, AssetsError::UpdateFailed(_)),
@@ -740,7 +1175,7 @@ mod tests {
         );
     }
 
-    // --- URL→filename sanitization ---
+    // --- File name from URL ---
 
     #[test]
     fn resolve_url_with_query_string_strips_it() {
@@ -762,7 +1197,7 @@ mod tests {
         );
     }
 
-    // --- Schema identity: CLI types ↔ framework types ---
+    // --- CLI and framework schemas match ---
 
     #[test]
     fn cli_and_web_vendor_manifest_schemas_are_compatible() {
@@ -778,10 +1213,12 @@ mod tests {
             }
         }"#;
 
+        // Must parse as CLI type.
         let cli: VendorManifest = serde_json::from_str(json).unwrap();
         assert_eq!(cli.assets["htmx"].version, "2.0.4");
         assert_eq!(cli.assets["htmx"].integrity, "sha384-abc");
 
+        // Must also parse as the framework type.
         let fw: autumn_web::assets::VendorManifest = serde_json::from_str(json).unwrap();
         assert_eq!(fw.assets["htmx"].version, "2.0.4");
         assert_eq!(fw.assets["htmx"].file, "js/htmx.min.js");
@@ -791,5 +1228,618 @@ mod tests {
         let fw2: autumn_web::assets::VendorManifest = serde_json::from_str(&serialized).unwrap();
         assert_eq!(fw2.assets["htmx"].integrity, "sha384-abc");
         assert_eq!(fw2.assets["htmx"].source, "https://example.com");
+    }
+
+    // --- Path and source containment ---
+
+    /// This fetch fails the test. The command must stop before a download.
+    fn no_network(url: &str, _policy: SourcePolicy) -> Result<Vec<u8>, AssetsError> {
+        panic!("unexpected download of {url}");
+    }
+
+    /// This fetch returns bytes made from the URL.
+    #[expect(clippy::unnecessary_wraps)]
+    fn fake_fetch(url: &str, _policy: SourcePolicy) -> Result<Vec<u8>, AssetsError> {
+        Ok(format!("// from {url}\n").into_bytes())
+    }
+
+    /// A project root with an empty `static/` and a sibling `outside/`.
+    struct Project {
+        root: tempfile::TempDir,
+        static_dir: PathBuf,
+        outside: PathBuf,
+        manifest: PathBuf,
+    }
+
+    fn project() -> Project {
+        let root = tempfile::TempDir::new().unwrap();
+        let static_dir = root.path().join("static");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&static_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let manifest = static_dir.join(".autumn-assets.json");
+        Project {
+            root,
+            static_dir,
+            outside,
+            manifest,
+        }
+    }
+
+    /// Write a manifest with no check on `source` or `file`.
+    /// Each entry is `(name, source, file)`.
+    fn write_raw_manifest(path: &Path, entries: &[(&str, &str, &str)]) {
+        let assets: serde_json::Map<String, serde_json::Value> = entries
+            .iter()
+            .map(|(name, source, file)| {
+                let asset = serde_json::json!({
+                    "version": "1.0.0",
+                    "source": source,
+                    "file": file,
+                    "integrity": "sha384-abc",
+                });
+                ((*name).to_owned(), asset)
+            })
+            .collect();
+        let json = serde_json::json!({ "version": "1", "assets": assets });
+        fs::write(path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    }
+
+    fn assert_dir_empty(dir: &Path) {
+        let entries: Vec<_> = fs::read_dir(dir).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "{} must stay empty: {entries:?}",
+            dir.display()
+        );
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    const SAFE_PATHS: &[&str] = &[
+        "htmx.min.js",
+        "js/htmx.min.js",
+        "js/vendor/alpine.min.js",
+        "css/site.css",
+        ".well-known/x.js",
+        "js/v1.2.3/lib.js",
+        "js/console.js",
+        "js/null.js",
+    ];
+
+    const ESCAPING_PATHS: &[&str] = &[
+        "",
+        "/etc/passwd",
+        "//server/share/x.js",
+        "../x.js",
+        "..",
+        ".",
+        "js/../../x.js",
+        "js/..",
+        "./js/x.js",
+        "js/./x.js",
+        "js//x.js",
+        "js/",
+        "C:\\Windows\\x.js",
+        "C:/Windows/x.js",
+        "C:x.js",
+        "\\\\server\\share\\x.js",
+        "\\\\?\\C:\\x.js",
+        "\\x.js",
+        "js\\..\\..\\x.js",
+        "js/x.js:stream",
+        "js/x\0.js",
+        "js/\n.js",
+        "js/.. /x.js",
+        "js/... /x.js",
+        "js/x.",
+        "js/x ",
+        "NUL",
+        "js/con.js",
+        "js/CON .js",
+        "js/COM1",
+        "js/com\u{b9}.js",
+        "js/lpt9.txt",
+        "js/CONIN$",
+        "js/conout$.js",
+        "js/clock$",
+    ];
+
+    #[test]
+    fn asset_path_accepts_normal_relative_paths() {
+        for raw in SAFE_PATHS {
+            let path = AssetPath::new(*raw).unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+            assert_eq!(path.as_str(), *raw);
+        }
+    }
+
+    #[test]
+    fn asset_path_rejects_paths_that_can_escape() {
+        for raw in ESCAPING_PATHS {
+            let err = AssetPath::new(*raw).expect_err(&format!("{raw:?} must be rejected"));
+            assert!(
+                matches!(err, AssetsError::UnsafePath { .. }),
+                "{raw:?}: wrong error {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn asset_path_rejects_host_absolute_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let abs = tmp.path().join("pwn.js");
+        let raw = abs.to_str().unwrap();
+        assert!(AssetPath::new(raw).is_err(), "{raw:?} must be rejected");
+    }
+
+    #[test]
+    fn asset_path_serializes_as_a_plain_string() {
+        let path = AssetPath::new("js/htmx.min.js").unwrap();
+        assert_eq!(serde_json::to_string(&path).unwrap(), "\"js/htmx.min.js\"");
+        let back: AssetPath = serde_json::from_str("\"js/htmx.min.js\"").unwrap();
+        assert_eq!(back, path);
+    }
+
+    #[test]
+    fn load_manifest_rejects_escaping_file() {
+        let p = project();
+        let entry = ("evil", "https://example.com/x.js", "../outside/x.js");
+        write_raw_manifest(&p.manifest, &[entry]);
+        let err = load_manifest(&p.manifest).expect_err("escaping file must not load");
+        assert!(matches!(err, AssetsError::Parse(_)), "{err:?}");
+        assert!(err.to_string().contains("unsafe asset path"), "{err}");
+    }
+
+    #[test]
+    fn verify_rejects_escaping_file() {
+        let p = project();
+        let entry = ("evil", "https://example.com/x.js", "../outside/x.js");
+        write_raw_manifest(&p.manifest, &[entry]);
+        let err = verify_all(&p.manifest, &p.static_dir).expect_err("must fail");
+        assert!(matches!(err, AssetsError::Parse(_)), "{err:?}");
+    }
+
+    #[test]
+    fn update_all_rejects_escaping_file_before_download() {
+        let p = project();
+        let abs = p.outside.join("pwn.js");
+        let abs = abs.to_str().unwrap().to_owned();
+        for file in ["../outside/pwn.js", "js/../../outside/pwn.js", abs.as_str()] {
+            write_raw_manifest(
+                &p.manifest,
+                &[("evil", "https://attacker.example/x.js", file)],
+            );
+            let before = fs::read(&p.manifest).unwrap();
+            let err = execute_update_with_manifest(None, &p.manifest, &p.static_dir, no_network)
+                .expect_err(&format!("{file:?} must be rejected"));
+            assert!(
+                err.to_string().contains("unsafe asset path"),
+                "{file:?}: {err}"
+            );
+            assert_dir_empty(&p.outside);
+            assert_eq!(fs::read(&p.manifest).unwrap(), before, "manifest changed");
+        }
+    }
+
+    #[test]
+    fn named_refresh_rejects_escaping_file_before_download() {
+        let p = project();
+        let entry = ("evil", "https://attacker.example/x.js", "../outside/pwn.js");
+        write_raw_manifest(&p.manifest, &[entry]);
+        let err =
+            execute_update_with_manifest(Some("evil"), &p.manifest, &p.static_dir, no_network)
+                .expect_err("escaping file must be rejected");
+        assert!(err.to_string().contains("unsafe asset path"), "{err}");
+        assert_dir_empty(&p.outside);
+    }
+
+    #[test]
+    fn check_source_accepts_https_and_explicit_http() {
+        let cdn = "https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js";
+        check_source(cdn, SourcePolicy::HttpsOnly).unwrap();
+        check_source(cdn, SourcePolicy::HttpOrHttps).unwrap();
+        check_source("http://localhost:8080/lib.js", SourcePolicy::HttpOrHttps).unwrap();
+    }
+
+    #[test]
+    fn check_source_rejects_other_schemes() {
+        for url in [
+            "file:///etc/passwd",
+            "ftp://example.com/x.js",
+            "data:text/javascript,alert(1)",
+            "not a url",
+            "",
+        ] {
+            for policy in [SourcePolicy::HttpsOnly, SourcePolicy::HttpOrHttps] {
+                let err = check_source(url, policy).expect_err(&format!("{url:?} must fail"));
+                assert!(
+                    matches!(err, AssetsError::UnsafeSource { .. }),
+                    "{url:?}: {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn check_source_https_only_rejects_http() {
+        let url = "http://169.254.169.254/latest/meta-data/";
+        let err = check_source(url, SourcePolicy::HttpsOnly).expect_err("http must fail");
+        assert!(matches!(err, AssetsError::UnsafeSource { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn update_rejects_bad_source_before_download() {
+        let p = project();
+        for source in [
+            "file:///etc/passwd",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            write_raw_manifest(&p.manifest, &[("evil", source, "js/evil.js")]);
+            let err = execute_update_with_manifest(None, &p.manifest, &p.static_dir, no_network)
+                .expect_err(&format!("{source:?} must be rejected"));
+            assert!(matches!(err, AssetsError::UnsafeSource { .. }), "{err:?}");
+            assert!(!p.static_dir.join("js").exists());
+        }
+    }
+
+    #[test]
+    fn update_all_writes_under_static_and_keeps_source() {
+        let p = project();
+        let source = "https://example.com/htmx.js";
+        write_raw_manifest(&p.manifest, &[("htmx", source, "js/htmx.min.js")]);
+        execute_update_with_manifest(None, &p.manifest, &p.static_dir, fake_fetch).unwrap();
+
+        let bytes = fs::read(p.static_dir.join("js/htmx.min.js")).unwrap();
+        assert_eq!(bytes, fake_fetch(source, SourcePolicy::HttpsOnly).unwrap());
+        let manifest = load_manifest(&p.manifest).unwrap();
+        let asset = &manifest.assets["htmx"];
+        assert_eq!(asset.source, source);
+        assert_eq!(asset.file.as_str(), "js/htmx.min.js");
+        assert_eq!(asset.integrity, compute_sri(&bytes));
+        assert_dir_empty(&p.outside);
+    }
+
+    #[test]
+    fn named_repin_uses_registry_source_and_path() {
+        let p = project();
+        let entry = ("htmx", "https://example.com/old.js", "js/htmx.min.js");
+        write_raw_manifest(&p.manifest, &[entry]);
+        execute_update_with_manifest(Some("htmx@2.0.5"), &p.manifest, &p.static_dir, fake_fetch)
+            .unwrap();
+        let manifest = load_manifest(&p.manifest).unwrap();
+        let asset = &manifest.assets["htmx"];
+        assert!(asset.source.contains("htmx.org@2.0.5"), "{}", asset.source);
+        assert_eq!(asset.file.as_str(), "js/htmx.min.js");
+        assert!(p.static_dir.join("js/htmx.min.js").is_file());
+        assert_dir_empty(&p.outside);
+    }
+
+    #[test]
+    fn update_with_no_assets_writes_nothing() {
+        let p = project();
+        execute_update_with_manifest(None, &p.manifest, &p.static_dir, no_network).unwrap();
+        assert!(!p.manifest.exists(), "update must not make a manifest");
+        assert_dir_empty(&p.static_dir);
+    }
+
+    /// A fetch that records each policy it gets.
+    fn recording_fetch(
+        seen: &std::cell::RefCell<Vec<SourcePolicy>>,
+    ) -> impl Fn(&str, SourcePolicy) -> Result<Vec<u8>, AssetsError> + '_ {
+        move |url, policy| {
+            seen.borrow_mut().push(policy);
+            fake_fetch(url, policy)
+        }
+    }
+
+    #[test]
+    fn update_downloads_with_https_only_policy() {
+        // The policy also refuses an `http` redirect target.
+        let p = project();
+        write_raw_manifest(
+            &p.manifest,
+            &[("htmx", "https://example.com/x.js", "js/x.js")],
+        );
+        let seen = std::cell::RefCell::new(Vec::new());
+        execute_update_with_manifest(None, &p.manifest, &p.static_dir, recording_fetch(&seen))
+            .unwrap();
+        assert_eq!(*seen.borrow(), [SourcePolicy::HttpsOnly]);
+    }
+
+    #[test]
+    fn add_downloads_with_http_or_https_policy() {
+        let p = project();
+        let url = "http://localhost:8080/my-lib.js";
+        let seen = std::cell::RefCell::new(Vec::new());
+        execute_add_with(
+            "my-lib@1.0.0",
+            Some(url),
+            &p.manifest,
+            &p.static_dir,
+            recording_fetch(&seen),
+        )
+        .unwrap();
+        assert_eq!(*seen.borrow(), [SourcePolicy::HttpOrHttps]);
+    }
+
+    #[test]
+    fn add_writes_under_static_and_records_asset() {
+        let p = project();
+        let url = "https://example.com/dist/my-lib.min.js";
+        execute_add_with(
+            "my-lib@1.0.0",
+            Some(url),
+            &p.manifest,
+            &p.static_dir,
+            fake_fetch,
+        )
+        .unwrap();
+        let bytes = fs::read(p.static_dir.join("js/my-lib.min.js")).unwrap();
+        assert_eq!(bytes, fake_fetch(url, SourcePolicy::HttpOrHttps).unwrap());
+        let manifest = load_manifest(&p.manifest).unwrap();
+        let asset = &manifest.assets["my-lib"];
+        assert_eq!(asset.source, url);
+        assert_eq!(asset.file.as_str(), "js/my-lib.min.js");
+        assert_eq!(asset.integrity, compute_sri(&bytes));
+    }
+
+    #[test]
+    fn add_accepts_explicit_http_url() {
+        let p = project();
+        let url = "http://localhost:8080/my-lib.js";
+        execute_add_with(
+            "my-lib@1.0.0",
+            Some(url),
+            &p.manifest,
+            &p.static_dir,
+            fake_fetch,
+        )
+        .unwrap();
+        assert!(p.static_dir.join("js/my-lib.js").is_file());
+    }
+
+    #[test]
+    fn add_checks_manifest_before_download() {
+        let p = project();
+        let entry = ("evil", "https://example.com/x.js", "../outside/x.js");
+        write_raw_manifest(&p.manifest, &[entry]);
+        let err = execute_add_with("htmx@2.0.4", None, &p.manifest, &p.static_dir, no_network)
+            .expect_err("bad manifest must stop add");
+        assert!(err.to_string().contains("unsafe asset path"), "{err}");
+        assert!(!p.static_dir.join("js").exists());
+    }
+
+    #[test]
+    fn add_rejects_unsafe_url_basename_before_download() {
+        let p = project();
+        let url = "https://example.com/con.js";
+        let err = execute_add_with(
+            "lib@1.0.0",
+            Some(url),
+            &p.manifest,
+            &p.static_dir,
+            no_network,
+        )
+        .expect_err("device name must be rejected");
+        assert!(matches!(err, AssetsError::UnsafePath { .. }), "{err:?}");
+        let err = execute_add_with(
+            "lib@1.0.0",
+            Some("file:///etc/x.js"),
+            &p.manifest,
+            &p.static_dir,
+            no_network,
+        )
+        .expect_err("file: URL must be rejected");
+        assert!(matches!(err, AssetsError::UnsafeSource { .. }), "{err:?}");
+        assert!(!p.manifest.exists());
+    }
+
+    #[test]
+    fn write_asset_leaves_no_temp_file() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let file = AssetPath::new("out.js").unwrap();
+        let dest = write_asset(tmp_dir.path(), &file, b"data").unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"data");
+        let entries: Vec<_> = fs::read_dir(tmp_dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "only the asset stays: {entries:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_asset_gives_new_file_mode_0644() {
+        let p = project();
+        let file = AssetPath::new("js/htmx.min.js").unwrap();
+        let dest = write_asset(&p.static_dir, &file, b"x").unwrap();
+        assert_eq!(mode(&dest), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_asset_keeps_mode_of_old_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let p = project();
+        let dest = p.static_dir.join("htmx.min.js");
+        fs::write(&dest, b"old").unwrap();
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o640)).unwrap();
+        let file = AssetPath::new("htmx.min.js").unwrap();
+        write_asset(&p.static_dir, &file, b"new").unwrap();
+        assert_eq!(mode(&dest), 0o640);
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_asset_rejects_symlink_out_of_static() {
+        let p = project();
+        std::os::unix::fs::symlink(&p.outside, p.static_dir.join("js")).unwrap();
+        for raw in ["js/htmx.min.js", "js/new/dir/htmx.min.js"] {
+            let file = AssetPath::new(raw).unwrap();
+            let err = write_asset(&p.static_dir, &file, b"evil").expect_err(raw);
+            assert!(matches!(err, AssetsError::UnsafePath { .. }), "{err:?}");
+            assert_dir_empty(&p.outside);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_asset_rejects_symlinked_static_root() {
+        // `static -> .` would let `build.rs` land in the project root.
+        let p = project();
+        let link = p.root.path().join("static-link");
+        std::os::unix::fs::symlink(p.root.path(), &link).unwrap();
+        let file = AssetPath::new("build.rs").unwrap();
+        let err = write_asset(&link, &file, b"evil").expect_err("symlinked root");
+        assert!(matches!(err, AssetsError::UnsafePath { .. }), "{err:?}");
+        assert!(!p.root.path().join("build.rs").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_asset_follows_symlink_that_stays_in_static() {
+        let p = project();
+        fs::create_dir_all(p.static_dir.join("vendor")).unwrap();
+        std::os::unix::fs::symlink("vendor", p.static_dir.join("js")).unwrap();
+        let file = AssetPath::new("js/htmx.min.js").unwrap();
+        write_asset(&p.static_dir, &file, b"ok").unwrap();
+        assert_eq!(
+            fs::read(p.static_dir.join("vendor/htmx.min.js")).unwrap(),
+            b"ok"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_asset_replaces_symlinked_file_and_does_not_follow_it() {
+        let p = project();
+        let victim = p.outside.join("victim");
+        fs::write(&victim, b"original").unwrap();
+        fs::create_dir_all(p.static_dir.join("js")).unwrap();
+        let dest = p.static_dir.join("js/htmx.min.js");
+        std::os::unix::fs::symlink(&victim, &dest).unwrap();
+        let file = AssetPath::new("js/htmx.min.js").unwrap();
+        write_asset(&p.static_dir, &file, b"new").unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"original");
+        assert!(
+            !fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_asset_does_not_write_through_planted_temp_symlink() {
+        // A fixed temp name next to the asset can be a planted symlink.
+        let p = project();
+        let victim = p.outside.join("victim");
+        fs::write(&victim, b"original").unwrap();
+        fs::create_dir_all(p.static_dir.join("js")).unwrap();
+        std::os::unix::fs::symlink(&victim, p.static_dir.join("js/htmx.min.tmp")).unwrap();
+        let file = AssetPath::new("js/htmx.min.js").unwrap();
+        write_asset(&p.static_dir, &file, b"new").unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"original");
+        assert_eq!(
+            fs::read(p.static_dir.join("js/htmx.min.js")).unwrap(),
+            b"new"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_checks_every_path_before_download() {
+        // The second asset is unsafe. The first must not change.
+        let p = project();
+        std::os::unix::fs::symlink(&p.outside, p.static_dir.join("evil")).unwrap();
+        write_raw_manifest(
+            &p.manifest,
+            &[
+                ("a", "https://example.com/a.js", "js/a.js"),
+                ("b", "https://example.com/b.js", "evil/b.js"),
+            ],
+        );
+        let before = fs::read(&p.manifest).unwrap();
+        let err = execute_update_with_manifest(None, &p.manifest, &p.static_dir, no_network)
+            .expect_err("symlinked dir must be rejected");
+        assert!(matches!(err, AssetsError::UnsafePath { .. }), "{err:?}");
+        assert!(!p.static_dir.join("js").exists());
+        assert_dir_empty(&p.outside);
+        assert_eq!(fs::read(&p.manifest).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_symlink_is_not_read_or_written() {
+        let p = project();
+        let target = p.outside.join("pwned.toml");
+        std::os::unix::fs::symlink(&target, &p.manifest).unwrap();
+        let err = execute_update_with_manifest(None, &p.manifest, &p.static_dir, no_network)
+            .expect_err("symlinked manifest must be rejected");
+        assert!(matches!(err, AssetsError::UnsafeManifest { .. }), "{err:?}");
+        assert!(!target.exists());
+        assert!(verify_all(&p.manifest, &p.static_dir).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_manifest_replaces_symlink_and_does_not_follow_it() {
+        let p = project();
+        let target = p.outside.join("victim.json");
+        fs::write(&target, b"original").unwrap();
+        std::os::unix::fs::symlink(&target, &p.manifest).unwrap();
+        save_manifest(&p.manifest, &VendorManifest::default()).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+        assert!(
+            !fs::symlink_metadata(&p.manifest)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_does_not_read_through_symlink_out_of_static() {
+        let p = project();
+        let secret = p.outside.join("id_rsa");
+        fs::write(&secret, b"secret").unwrap();
+        fs::create_dir_all(p.static_dir.join("js")).unwrap();
+        std::os::unix::fs::symlink(&secret, p.static_dir.join("js/htmx.min.js")).unwrap();
+        let mut manifest = VendorManifest::default();
+        manifest.assets.insert(
+            "htmx".into(),
+            VendorAsset {
+                version: "2.0.4".into(),
+                source: "https://example.com".into(),
+                file: AssetPath::new("js/htmx.min.js").unwrap(),
+                integrity: compute_sri(b"secret"),
+            },
+        );
+        save_manifest(&p.manifest, &manifest).unwrap();
+        // The hash matches the secret. A read through the link reports OK.
+        assert!(verify_all(&p.manifest, &p.static_dir).is_err());
+    }
+
+    proptest::proptest! {
+        /// Every accepted path joins to a path under the root.
+        #[test]
+        fn accepted_paths_stay_under_root(raw in "[a-zA-Z0-9._ :/\\\\$-]{0,24}") {
+            if let Ok(path) = AssetPath::new(raw.as_str()) {
+                let root = Path::new("root");
+                let joined = root.join(&path);
+                proptest::prop_assert!(joined.starts_with(root));
+                for part in joined.components() {
+                    proptest::prop_assert!(
+                        matches!(part, std::path::Component::Normal(_)),
+                        "{raw:?} gives {part:?}"
+                    );
+                }
+            }
+        }
     }
 }

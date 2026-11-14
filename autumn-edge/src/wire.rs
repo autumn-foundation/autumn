@@ -29,10 +29,10 @@
 //! wire base64-encoded so a binary response survives a line-oriented,
 //! text-shaped protocol unharmed.
 //!
-//! The host strips [`SENSITIVE_HEADERS`] before sending, and the guest strips
-//! them again on receipt. The edge lane has no session, no auth, and no
-//! credential store, so a credential reaching a capsule could only ever be a
-//! liability.
+//! Only [`ALLOWED_REQUEST_HEADERS`] cross. The host filters before it sends,
+//! and the guest filters again when it receives. The edge lane has no session,
+//! no auth and no credential store, so a credential in a capsule is only a
+//! risk.
 
 use std::fmt;
 use std::str::FromStr;
@@ -58,19 +58,42 @@ pub const WIRE_VERSION: u32 = 1;
 /// lets the header reach the wire; see [`strip_sentinel`].
 pub const FALLTHROUGH_SENTINEL: &str = "x-autumn-edge-fallthrough";
 
-/// Request headers that never reach a capsule.
+/// The only request headers that reach a capsule.
 ///
-/// Stripped by the host before the request frame is sent and again by the
-/// guest on receipt — a defensive double-strip, because the guest cannot audit
-/// the host it is running under. The [`FALLTHROUGH_SENTINEL`] is in the list
-/// because it is an internal control channel: an inbound request must not be
-/// able to pre-set it and confuse a handler that echoes request headers.
-pub const SENSITIVE_HEADERS: &[&str] = &[
-    "cookie",
-    "authorization",
-    "proxy-authorization",
-    FALLTHROUGH_SENTINEL,
+/// This list is an allowlist, not a denylist. Identity-aware proxies add
+/// bearer assertions under their own names (`cf-access-jwt-assertion`,
+/// `x-amzn-oidc-data`, `x-ms-client-principal`, `x-goog-iap-jwt-assertion`),
+/// and no denylist can name all of them. An edge handler needs only content
+/// negotiation and conditional-request headers.
+///
+/// The host filters before it sends the request frame. The guest filters
+/// again when it receives the frame, because it cannot audit its host. The
+/// native mount of an `#[edge]` route uses the same list, so both lanes give
+/// a handler the same headers. [`FALLTHROUGH_SENTINEL`] is not on the list,
+/// so a request cannot set it. The list is sorted.
+pub const ALLOWED_REQUEST_HEADERS: &[&str] = &[
+    "accept",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "range",
+    "user-agent",
 ];
+
+/// Whether a request header of this name may reach a capsule.
+/// The match is case-insensitive and does not allocate.
+#[must_use]
+pub fn request_header_allowed(name: &str) -> bool {
+    ALLOWED_REQUEST_HEADERS
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+}
 
 // ── Errors ───────────────────────────────────────────────────────────
 
@@ -203,16 +226,13 @@ pub fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String, String
     out
 }
 
-/// Drop every header named in [`SENSITIVE_HEADERS`], case-insensitively,
-/// preserving the order of everything else.
+/// Keep only the headers in [`ALLOWED_REQUEST_HEADERS`], case-insensitively.
+/// The order of the kept headers does not change.
 #[must_use]
-pub fn strip_sensitive_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+pub fn allowed_request_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     headers
         .iter()
-        .filter(|(name, _)| {
-            let name = name.to_ascii_lowercase();
-            !SENSITIVE_HEADERS.contains(&name.as_str())
-        })
+        .filter(|(name, _)| request_header_allowed(name))
         .cloned()
         .collect()
 }
@@ -286,11 +306,11 @@ impl EdgeRequest {
         self
     }
 
-    /// Wrap this request into the frame a host sends to a capsule, stripping
-    /// [`SENSITIVE_HEADERS`] and canonicalizing what is left.
+    /// Wrap this request into the frame a host sends to a capsule. Keeps only
+    /// [`ALLOWED_REQUEST_HEADERS`], in canonical form.
     #[must_use]
     pub fn into_host_frame(self, provided_capabilities: &[EdgeCapability]) -> HostFrame {
-        let headers = canonicalize_headers(&strip_sensitive_headers(&self.headers));
+        let headers = canonicalize_headers(&allowed_request_headers(&self.headers));
         HostFrame::Request {
             wire_version: WIRE_VERSION,
             provided_capabilities: provided_capabilities.to_vec(),
@@ -535,23 +555,45 @@ mod tests {
     }
 
     #[test]
-    fn strip_sensitive_removes_credentials_case_insensitively() {
+    fn allowed_request_headers_drops_credentials_case_insensitively() {
         let input = owned(&[
             ("Cookie", "sid=1"),
-            ("accept", "text/html"),
+            ("ACCEPT", "text/html"),
             ("AUTHORIZATION", "Bearer x"),
             ("Proxy-Authorization", "Basic y"),
-            ("x-keep", "yes"),
+            ("x-custom", "no"),
+            ("If-None-Match", "\"v1\""),
         ]);
 
         assert_eq!(
-            strip_sensitive_headers(&input),
-            owned(&[("accept", "text/html"), ("x-keep", "yes")])
+            allowed_request_headers(&input),
+            owned(&[("ACCEPT", "text/html"), ("If-None-Match", "\"v1\"")])
         );
     }
 
     #[test]
-    fn strip_sensitive_removes_an_inbound_fallthrough_sentinel() {
+    fn the_allowlist_is_sorted_lowercase_and_unique() {
+        let mut sorted = ALLOWED_REQUEST_HEADERS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, ALLOWED_REQUEST_HEADERS);
+        for name in ALLOWED_REQUEST_HEADERS {
+            assert_eq!(*name, name.to_ascii_lowercase());
+            assert_eq!(http::HeaderName::from_static(name).as_str(), *name);
+        }
+    }
+
+    #[test]
+    fn request_header_allowed_ignores_case_and_rejects_near_misses() {
+        assert!(request_header_allowed("Accept"));
+        assert!(request_header_allowed("IF-NONE-MATCH"));
+        for name in ["accept ", "accepts", "", "x-accept", "cookie", "host"] {
+            assert!(!request_header_allowed(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn allowed_request_headers_drops_an_inbound_fallthrough_sentinel() {
         // The sentinel is an internal control channel: an inbound request must
         // not be able to pre-set it and confuse a handler that echoes request
         // headers (or a host that scans them).
@@ -561,7 +603,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            strip_sensitive_headers(&input),
+            allowed_request_headers(&input),
             owned(&[("accept", "text/html")])
         );
     }
@@ -646,6 +688,80 @@ mod tests {
             panic!("expected a request frame");
         };
         assert_eq!(request.headers, owned(&[("accept", "text/html")]));
+    }
+
+    /// Identity-aware proxies send these bearer assertions.
+    const PROXY_ASSERTIONS: &[(&str, &str)] = &[
+        ("Cf-Access-Jwt-Assertion", "ey.cf"),
+        ("Cf-Access-Client-Secret", "cf-secret"),
+        ("X-Amzn-Oidc-Data", "ey.alb"),
+        ("X-Amzn-Oidc-Accesstoken", "ey.alb-access"),
+        ("X-Amzn-Oidc-Identity", "alb-sub"),
+        ("X-Ms-Client-Principal", "ey.azure"),
+        ("X-Ms-Token-Aad-Id-Token", "ey.aad"),
+        ("X-Goog-Iap-Jwt-Assertion", "ey.iap"),
+        ("X-Forwarded-User", "ada"),
+        ("X-Forwarded-Access-Token", "ey.oauth2-proxy"),
+        ("X-Auth-Request-Access-Token", "ey.oauth2-proxy-2"),
+    ];
+
+    /// Content-negotiation and conditional headers an edge handler needs.
+    const NEGOTIATION: &[(&str, &str)] = &[
+        ("accept", "text/html"),
+        ("accept-charset", "utf-8"),
+        ("accept-encoding", "gzip"),
+        ("accept-language", "en"),
+        ("cache-control", "no-cache"),
+        ("if-match", "\"a\""),
+        ("if-modified-since", "Sat, 14 Nov 2026 00:00:00 GMT"),
+        ("if-none-match", "\"b\""),
+        ("if-range", "\"c\""),
+        ("if-unmodified-since", "Sat, 14 Nov 2026 00:00:00 GMT"),
+        ("range", "bytes=0-9"),
+        ("user-agent", "curl/8"),
+    ];
+
+    fn frame_headers(request: EdgeRequest) -> Vec<(String, String)> {
+        let HostFrame::Request { request, .. } = request.into_host_frame(&[]) else {
+            panic!("expected a request frame");
+        };
+        request.headers
+    }
+
+    #[test]
+    fn request_frame_drops_proxy_identity_assertions() {
+        let request = PROXY_ASSERTIONS
+            .iter()
+            .fold(EdgeRequest::get("/x"), |request, (name, value)| {
+                request.with_header(*name, *value)
+            })
+            .with_header("Accept", "text/html");
+
+        assert_eq!(frame_headers(request), owned(&[("accept", "text/html")]));
+    }
+
+    #[test]
+    fn request_frame_drops_unlisted_headers_of_any_case() {
+        let request = EdgeRequest::get("/x")
+            .with_header("X-Custom-Token", "t")
+            .with_header("HOST", "internal.example")
+            .with_header("If-None-Match", "\"v1\"");
+
+        assert_eq!(
+            frame_headers(request),
+            owned(&[("if-none-match", "\"v1\"")])
+        );
+    }
+
+    #[test]
+    fn request_frame_keeps_negotiation_and_conditional_headers() {
+        let request = NEGOTIATION
+            .iter()
+            .fold(EdgeRequest::get("/x"), |request, (name, value)| {
+                request.with_header(*name, *value)
+            });
+
+        assert_eq!(frame_headers(request), owned(NEGOTIATION));
     }
 
     #[test]

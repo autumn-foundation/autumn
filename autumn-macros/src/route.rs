@@ -197,12 +197,10 @@ pub fn route_macro(
         !body_guarded_replay && !intercepted_route,
     );
     if edge.is_some() {
-        // The wire runtime strips SENSITIVE_HEADERS before the capsule
-        // dispatches, so the native mount must strip the same set before the
-        // handler: otherwise a handler that reads `cookie`/`authorization`
-        // through `HeaderMap` would serve different bytes at the origin than
-        // at the edge. Route-local — middleware above the router still sees
-        // the original request.
+        // The wire keeps only ALLOWED_REQUEST_HEADERS before the capsule
+        // dispatches. The native mount keeps the same set, so a `HeaderMap`
+        // handler sees the same headers on both lanes. Route-local:
+        // middleware above the router still sees the original request.
         handler_expr = quote! {
             #handler_expr.layer(::autumn_edge::reexports::axum::middleware::map_request(
                 ::autumn_edge::strip_request_credentials,
@@ -2744,9 +2742,8 @@ mod tests {
 
     #[test]
     fn route_macro_edge_native_mount_strips_request_credentials() {
-        // The wire runtime strips SENSITIVE_HEADERS before capsule dispatch;
-        // the native mount must strip the same set so a HeaderMap-reading
-        // handler observes identical headers on both substrates.
+        // The wire keeps only ALLOWED_REQUEST_HEADERS before capsule
+        // dispatch. The native mount must keep the same set.
         let generated = route_macro(
             "GET",
             "get",

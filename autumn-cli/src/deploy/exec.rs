@@ -539,6 +539,12 @@ pub fn slot_unit_name(service: &str, slot: &str) -> String {
     format!("{service}-{slot}")
 }
 
+/// `<unit>.service` as one shell word, for a remote `systemctl` line.
+#[must_use]
+pub fn unit_service_word(unit: &str) -> String {
+    shell_quote(&format!("{unit}.service"))
+}
+
 /// Remote marker file recording which slot currently serves live traffic, so the
 /// next redeploy can pick the OTHER slot for the candidate.
 fn live_slot_marker(cfg: &ResolvedDeployConfig) -> String {
@@ -880,7 +886,8 @@ pub fn first_deploy_ops(
         DeployOp::Run(RemoteCommand::new(
             "enable-now",
             format!(
-                "systemctl enable {unit_name}.service && systemctl restart {unit_name}.service"
+                "systemctl enable {unit} && systemctl restart {unit}",
+                unit = unit_service_word(&unit_name)
             ),
         )),
         DeployOp::Run(record_live_slot(
@@ -1032,8 +1039,8 @@ pub fn cutover_ops(
         DeployOp::Run(RemoteCommand::new(
             "start-candidate",
             format!(
-                "systemctl enable {candidate_unit}.service && \
-                 systemctl restart {candidate_unit}.service"
+                "systemctl enable {unit} && systemctl restart {unit}",
+                unit = unit_service_word(&candidate_unit)
             ),
         )),
     ]);
@@ -1077,7 +1084,7 @@ pub fn cutover_ops(
         DeployOp::Run(record_proxy_options(cfg, &proxy.proxy_service_options())),
         DeployOp::Run(RemoteCommand::new(
             "drain-old",
-            format!("systemctl disable --now {live_unit}.service"),
+            format!("systemctl disable --now {}", unit_service_word(&live_unit)),
         )),
         DeployOp::Run(RemoteCommand::new(
             "prune",
@@ -1119,7 +1126,10 @@ pub fn candidate_teardown_ops(
     vec![
         DeployOp::Run(RemoteCommand::new(
             "teardown-candidate-unit",
-            format!("systemctl disable --now {candidate_unit}.service || true"),
+            format!(
+                "systemctl disable --now {} || true",
+                unit_service_word(&candidate_unit)
+            ),
         )),
         DeployOp::Run(RemoteCommand::new(
             "teardown-candidate-dir",
@@ -1359,8 +1369,8 @@ pub fn rollback_ops(
         DeployOp::Run(RemoteCommand::new(
             "restart-previous",
             format!(
-                "systemctl enable {previous_unit}.service && \
-                 systemctl restart {previous_unit}.service"
+                "systemctl enable {unit} && systemctl restart {unit}",
+                unit = unit_service_word(&previous_unit)
             ),
         )),
         // Health-gated: the previous unit must pass /ready before the proxy swaps traffic to it.
@@ -1388,7 +1398,10 @@ pub fn rollback_ops(
         // cutover's `drain-old`.
         DeployOp::Run(RemoteCommand::new(
             "drain-rolled-back-slot",
-            format!("systemctl disable --now {rolled_back_unit}.service"),
+            format!(
+                "systemctl disable --now {}",
+                unit_service_word(&rolled_back_unit)
+            ),
         )),
     ]);
     ops
@@ -1416,7 +1429,10 @@ pub fn rollback_teardown_ops(cfg: &ResolvedDeployConfig, target: &RollbackTarget
     let restarted_unit = slot_unit_name(&cfg.service_name, target.slot);
     vec![DeployOp::Run(RemoteCommand::new(
         "teardown-rollback-slot",
-        format!("systemctl disable --now {restarted_unit}.service || true"),
+        format!(
+            "systemctl disable --now {} || true",
+            unit_service_word(&restarted_unit)
+        ),
     ))]
 }
 
@@ -1669,10 +1685,10 @@ fn release_migrate_command(cfg: &ResolvedDeployConfig, release_dir: &str) -> Rem
     RemoteCommand::new(
         "migrate",
         format!(
-            "systemd-run --wait --collect --quiet --unit={service}-migrate-{release_id} \
+            "systemd-run --wait --collect --quiet --unit={unit} \
              --working-directory={workdir} --property=EnvironmentFile={env} \
              --setenv=AUTUMN_MIGRATE=1 --setenv=AUTUMN_MANIFEST_DIR={manifest} {bin}",
-            service = cfg.service_name,
+            unit = shell_quote(&format!("{}-migrate-{release_id}", cfg.service_name)),
             workdir = shell_quote(release_dir),
             env = shell_quote(&cfg.env_file()),
             manifest = shell_quote(release_dir),
@@ -1876,8 +1892,8 @@ enum MoveSource {
 /// database next to the name the deploy expects rather than at it leaves the next
 /// deploy creating an empty one.
 fn adoption_recovery(service: &str, current: &str, shared: &str, source: MoveSource) -> String {
-    let blue_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_BLUE)));
-    let green_q = shell_quote(&format!("{}.service", slot_unit_name(service, SLOT_GREEN)));
+    let blue_q = unit_service_word(&slot_unit_name(service, SLOT_BLUE));
+    let green_q = unit_service_word(&slot_unit_name(service, SLOT_GREEN));
     let current_q = shell_quote(current);
     let shared_q = shell_quote(shared);
     // The database to move, as one shell word. For a symlink it is resolved
@@ -2927,10 +2943,7 @@ pub fn retry_drain_old(
     live_slot: &str,
     exec: &impl DeployExecutor,
 ) -> Result<OldSlotState, DeployExecError> {
-    let unit = shell_quote(&format!(
-        "{}.service",
-        slot_unit_name(&cfg.service_name, live_slot)
-    ));
+    let unit = unit_service_word(&slot_unit_name(&cfg.service_name, live_slot));
     let shell = format!(
         "unit={unit}; \
          systemctl disable --now \"$unit\" >/dev/null 2>&1; \
@@ -3718,6 +3731,37 @@ pub struct SshExecutor {
     target: SshTarget,
 }
 
+/// Maximum length of a remote upload path.
+const REMOTE_PATH_MAX_LEN: usize = 4096;
+
+/// Refuse an upload path that a remote shell can read as code.
+///
+/// Old `scp` (OpenSSH before 9.0, or `scp -O`) gives the remote path to the
+/// remote shell without quotes. Parts of the path come from the project, for
+/// example a manifest name or a media path.
+///
+/// # Errors
+///
+/// Returns [`DeployExecError::UploadFailed`] when the path is not absolute or
+/// has a character outside ASCII letters, digits, `/`, `_`, `.`, `-`, `+`, `@`
+/// or `:`.
+pub fn check_remote_path(remote_path: &str) -> Result<(), DeployExecError> {
+    if super::is_safe_word(
+        remote_path,
+        REMOTE_PATH_MAX_LEN,
+        |c| c == '/',
+        super::is_dir_char,
+    ) {
+        return Ok(());
+    }
+    Err(DeployExecError::UploadFailed {
+        remote_path: remote_path.to_owned(),
+        message: "the path is not safe for scp: use an absolute path of ASCII letters, \
+                  digits, `/`, `_`, `.`, `-`, `+`, `@` or `:`"
+            .to_owned(),
+    })
+}
+
 impl SshExecutor {
     /// Build an executor for the given SSH target.
     #[must_use]
@@ -3766,6 +3810,7 @@ impl DeployExecutor for SshExecutor {
         remote_path: &str,
         mode: Option<u32>,
     ) -> Result<(), DeployExecError> {
+        check_remote_path(remote_path)?;
         let argv = scp_argv(&self.target, local, remote_path);
         let output =
             Command::new("scp")
@@ -4320,8 +4365,8 @@ mod tests {
         // The start relaunches the new unit with `enable` + `restart`, never `enable --now`, so a
         // slot left active by drift does not keep serving a stale process.
         assert!(
-            enable.contains("systemctl enable myapp-blue.service")
-                && enable.contains("systemctl restart myapp-blue.service"),
+            enable.contains("systemctl enable 'myapp-blue.service'")
+                && enable.contains("systemctl restart 'myapp-blue.service'"),
             "first-deploy start must force a restart, not `enable --now`: {enable}"
         );
         assert!(
@@ -4404,6 +4449,150 @@ mod tests {
                 && shell.contains("/srv/autumn/myapp/releases/20260714T120000Z/myapp"),
             "the first deploy runs the real migrate one-shot from the release dir: {shell}"
         );
+    }
+
+    /// Every remote shell line that names a slot or migrate unit.
+    fn unit_naming_shells() -> Vec<(String, &'static str, String)> {
+        let env = || Secret::new("AUTUMN_SECURITY__SIGNING_SECRET=x\n");
+        let cfg = resolved();
+        let first = SlotPlan::first(3000);
+        let redeploy = SlotPlan::redeploy(3000, SLOT_BLUE);
+        let target = RollbackTarget {
+            release_dir: "/srv/autumn/myapp/releases/20260713T090000Z".to_owned(),
+            slot: SLOT_BLUE,
+            port: 3001,
+        };
+        let groups: [(&str, Vec<DeployOp>); 7] = [
+            ("first deploy", sample_ops(env())),
+            ("cutover", sample_cutover_ops(env())),
+            ("rollback", rollback_ops(&cfg, &proxy(), &target)),
+            ("rollback teardown", rollback_teardown_ops(&cfg, &target)),
+            (
+                "candidate teardown",
+                candidate_teardown_ops(&cfg, RELEASE_ID, &redeploy),
+            ),
+            (
+                "first-deploy teardown",
+                first_deploy_teardown_ops(&cfg, RELEASE_ID, &first),
+            ),
+            (
+                "sqlite first deploy",
+                first_deploy_ops(
+                    &resolved_sqlite(),
+                    &proxy(),
+                    "",
+                    env(),
+                    Path::new("/local/target/release/myapp"),
+                    &[],
+                    RELEASE_ID,
+                    &first,
+                    MigrateStep::Run,
+                ),
+            ),
+        ];
+        groups
+            .into_iter()
+            .flat_map(|(group, ops)| {
+                ops.into_iter().filter_map(move |op| match op {
+                    DeployOp::Run(cmd) if cmd.shell.contains("myapp-") => {
+                        Some((group.to_owned(), cmd.label, cmd.shell))
+                    }
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    /// A unit operand is one shell word, also if a name slips past `resolve`.
+    #[test]
+    fn every_unit_operand_is_shell_quoted() {
+        let shells = unit_naming_shells();
+        // Each sink that names a unit. A sink that leaves the sweep fails here.
+        for (group, label) in [
+            ("first deploy", "enable-now"),
+            ("first deploy", "migrate"),
+            ("cutover", "start-candidate"),
+            ("cutover", "migrate"),
+            ("cutover", "drain-old"),
+            ("rollback", "restart-previous"),
+            ("rollback", "drain-rolled-back-slot"),
+            ("rollback teardown", "teardown-rollback-slot"),
+            ("candidate teardown", "teardown-candidate-unit"),
+            ("first-deploy teardown", "teardown-candidate-unit"),
+            ("sqlite first deploy", "link-data"),
+        ] {
+            assert!(
+                shells.iter().any(|(g, l, _)| g == group && *l == label),
+                "{group} op `{label}` does not name a unit: the sweep misses a sink"
+            );
+        }
+        for (group, label, shell) in &shells {
+            // Each unit name opens a quoted word, and the word is the whole
+            // unit: `'myapp'-blue.service` fails here too.
+            assert!(!shell.contains("'myapp'-"), "{group} `{label}`: {shell}");
+            for (at, _) in shell.match_indices("myapp-") {
+                assert!(
+                    shell[..at].ends_with('\''),
+                    "{group} op `{label}` names a unit outside single quotes: {shell}"
+                );
+                let word = shell[at..].split('\'').next().unwrap_or_default();
+                assert!(
+                    word.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.')),
+                    "{group} op `{label}` quotes more than the unit: {word:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn check_remote_path_refuses_what_a_remote_shell_reads_as_code() {
+        for hostile in [
+            "/srv/myapp/releases/1/c;touch${IFS}/tmp/pwned;",
+            "/srv/myapp/releases/1/autumn-x$(id).toml",
+            "/srv/a b",
+            "/srv/a\nb",
+            "/srv/`id`",
+            "/srv/a'b",
+            "relative/path",
+            "-x",
+        ] {
+            let err = check_remote_path(hostile).expect_err(hostile);
+            assert!(
+                matches!(&err, DeployExecError::UploadFailed { remote_path, .. } if remote_path == hostile),
+                "{hostile:?}: {err:?}"
+            );
+        }
+        for safe in [
+            "/srv/autumn/myapp/releases/20260714T120000Z/autumn-prod.toml",
+            "/etc/systemd/system/myapp-blue.service",
+            "/etc/systemd/system/mediamtx.service.autumn-new",
+            "/srv/a:b/c+d@e",
+        ] {
+            check_remote_path(safe).unwrap_or_else(|e| panic!("{safe:?}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn ssh_upload_refuses_a_hostile_path_before_it_runs_scp() {
+        let exec = SshExecutor::new(SshTarget {
+            host: "203.0.113.10".to_owned(),
+            user: "root".to_owned(),
+            port: 22,
+        });
+        // The local file does not exist, so a spawned `scp` would fail with a
+        // different message.
+        let err = exec
+            .upload(
+                Path::new("/nonexistent/local"),
+                "/srv/myapp/releases/1/c;id;",
+                None,
+            )
+            .expect_err("must refuse");
+        let DeployExecError::UploadFailed { message, .. } = err else {
+            panic!("expected UploadFailed, got {err:?}");
+        };
+        assert!(message.contains("not safe for scp"), "{message}");
     }
 
     /// The migrate one-shot must resolve its configuration and its RELATIVE paths
@@ -4546,7 +4735,7 @@ mod tests {
         // The old (blue) release is drained.
         let drain = exec.shell_for("drain-old").expect("drain ran");
         assert!(
-            drain.contains("disable --now myapp-blue.service"),
+            drain.contains("disable --now 'myapp-blue.service'"),
             "{drain}"
         );
 
@@ -4625,8 +4814,8 @@ mod tests {
             .shell_for("start-candidate")
             .expect("start-candidate ran");
         assert!(
-            start_candidate.contains("systemctl enable myapp-green.service")
-                && start_candidate.contains("systemctl restart myapp-green.service"),
+            start_candidate.contains("systemctl enable 'myapp-green.service'")
+                && start_candidate.contains("systemctl restart 'myapp-green.service'"),
             "candidate start must force a restart, not `enable --now`: {start_candidate}"
         );
         assert!(
@@ -4833,7 +5022,7 @@ mod tests {
             .shell_for("teardown-candidate-unit")
             .expect("teardown-candidate-unit ran");
         assert!(
-            td_unit.contains("disable --now myapp-green.service"),
+            td_unit.contains("disable --now 'myapp-green.service'"),
             "teardown stops+disables the candidate (green) slot unit: {td_unit}"
         );
         let td_dir = exec
@@ -4886,7 +5075,7 @@ mod tests {
             .shell_for("teardown-candidate-unit")
             .expect("teardown-candidate-unit ran");
         assert!(
-            td_unit.contains("disable --now myapp-green.service"),
+            td_unit.contains("disable --now 'myapp-green.service'"),
             "teardown stops+disables the candidate (green) slot unit: {td_unit}"
         );
         let td_dir = exec
@@ -5058,8 +5247,8 @@ mod tests {
         // `rollback_rerenders_target_unit_before_restart`.
         let restart = exec.shell_for("restart-previous").expect("restart ran");
         assert!(
-            restart.contains("systemctl enable myapp-blue.service")
-                && restart.contains("systemctl restart myapp-blue.service"),
+            restart.contains("systemctl enable 'myapp-blue.service'")
+                && restart.contains("systemctl restart 'myapp-blue.service'"),
             "rollback force-relaunches the previous (blue) slot unit: {restart}"
         );
         assert!(
@@ -5096,7 +5285,7 @@ mod tests {
         // healthy — never the slot we rolled back to (blue).
         let drain = exec.shell_for("drain-rolled-back-slot").expect("drain ran");
         assert!(
-            drain.contains("disable --now myapp-green.service"),
+            drain.contains("disable --now 'myapp-green.service'"),
             "rollback drains the former-live (green) slot: {drain}"
         );
         assert!(
@@ -5292,7 +5481,7 @@ mod tests {
 
         let drain = exec.shell_for("drain-rolled-back-slot").expect("drain ran");
         assert!(
-            drain.contains("disable --now myapp-blue.service"),
+            drain.contains("disable --now 'myapp-blue.service'"),
             "drain targets other_slot(previous) = the former-live blue slot: {drain}"
         );
         assert!(
@@ -5356,7 +5545,7 @@ mod tests {
             .shell_for("teardown-rollback-slot")
             .expect("teardown-rollback-slot ran");
         assert!(
-            td.contains("disable --now myapp-blue.service"),
+            td.contains("disable --now 'myapp-blue.service'"),
             "teardown disables the slot the rollback restarted: {td}"
         );
         // The target's release dir is a retained release, not a half-written candidate:
@@ -5409,7 +5598,7 @@ mod tests {
             .shell_for("teardown-rollback-slot")
             .expect("teardown-rollback-slot ran");
         assert!(
-            td.contains("disable --now myapp-blue.service"),
+            td.contains("disable --now 'myapp-blue.service'"),
             "teardown disables the slot the rollback restarted: {td}"
         );
         assert!(
@@ -5740,8 +5929,8 @@ mod tests {
         );
         let restart = exec.shell_for("restart-previous").expect("restart ran");
         assert!(
-            restart.contains("systemctl enable myapp-blue.service")
-                && restart.contains("systemctl restart myapp-blue.service"),
+            restart.contains("systemctl enable 'myapp-blue.service'")
+                && restart.contains("systemctl restart 'myapp-blue.service'"),
             "restart force-relaunches the previous slot unit: {restart}"
         );
     }
@@ -5813,7 +6002,7 @@ mod tests {
             .shell_for("teardown-candidate-unit")
             .expect("teardown-candidate-unit ran");
         assert!(
-            td_unit.contains("disable --now myapp-blue.service"),
+            td_unit.contains("disable --now 'myapp-blue.service'"),
             "teardown stops+disables the first-deploy (blue) slot unit: {td_unit}"
         );
     }

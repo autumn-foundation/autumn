@@ -2760,17 +2760,21 @@ mod tests {
     fn unmatched_end_tags_past_the_depth_limit_parse_in_linear_time() {
         // The growth rate, not a wall-clock budget: a debug build on a busy
         // runner is slow, but four times the input must take about four
-        // times as long (a quadratic parse takes sixteen). Best of three
-        // runs keeps a scheduler hiccup out of it.
+        // times as long (a quadratic parse takes sixteen). The two sizes run
+        // in turn, so load on the runner slows both alike. The best of five
+        // runs of each counts.
         let time = |html: &str| {
-            (0..3)
-                .map(|_| {
-                    let started = std::time::Instant::now();
-                    let _ = md(html);
-                    started.elapsed()
-                })
-                .min()
-                .unwrap()
+            let started = std::time::Instant::now();
+            let _ = md(html);
+            started.elapsed()
+        };
+        let best_of_five = |small_html: &str, large_html: &str| {
+            let (mut small, mut large) = (std::time::Duration::MAX, std::time::Duration::MAX);
+            for _ in 0..5 {
+                small = small.min(time(small_html));
+                large = large.min(time(large_html));
+            }
+            (small, large)
         };
         let cases: [fn(usize) -> String; 2] = [
             // Many dropped start tags, then many end tags that match none.
@@ -2793,8 +2797,7 @@ mod tests {
             },
         ];
         for case in cases {
-            let small = time(&case(5_000));
-            let large = time(&case(20_000));
+            let (small, large) = best_of_five(&case(5_000), &case(20_000));
             assert!(large < small * 10, "{small:?} -> {large:?}");
         }
     }

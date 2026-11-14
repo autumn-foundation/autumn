@@ -839,9 +839,9 @@ impl MediaMtxController {
         let cfg_new = super::exec::shell_quote(&config_tmp);
         let unit_live = super::exec::shell_quote(&unit_path);
         let unit_new = super::exec::shell_quote(&unit_tmp);
-        // `unit_name` is config-derived; quoted so whitespace or special chars cannot
-        // split the `systemctl` arguments.
-        let unit_service = super::exec::shell_quote(&format!("{unit}.service"));
+        // `unit_name` comes from config, so `<unit>.service` is one quoted word
+        // (issue #2051).
+        let unit_service = super::exec::unit_service_word(&unit);
         // A missing live file or a real diff copies the staged file over and sets
         // `changed`. Restart only on a change or when the unit is not active, so an
         // app-only redeploy never interrupts live sessions.
@@ -1211,8 +1211,9 @@ fn managed_process_name(cfg: &MediaMtxHostConfig) -> &str {
 /// at most once per check and the result reused.
 #[must_use]
 fn unit_is_active(exec: &impl DeployExecutor, unit_name: &str) -> bool {
-    // `unit_name` is config-derived, so it is shell-quoted.
-    let unit_service = super::exec::shell_quote(&format!("{unit_name}.service"));
+    // `unit_name` comes from config, so `<unit>.service` is one quoted word
+    // (issue #2051).
+    let unit_service = super::exec::unit_service_word(unit_name);
     let cmd = RemoteCommand::new(
         "media-unit-active",
         format!("systemctl is-active --quiet {unit_service}"),

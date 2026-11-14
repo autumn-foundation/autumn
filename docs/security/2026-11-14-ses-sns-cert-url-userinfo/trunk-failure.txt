@@ -1,0 +1,37 @@
+test inbound_mail::tests::sns_rsa_signature::version_1_accepts_an_openssl_sha1_signature ... ok
+test inbound_mail::tests::sns_rsa_signature::version_2_accepts_an_openssl_sha256_signature ... ok
+test inbound_mail::tests::sns_url_policy::accepts_documented_sns_cert_urls ... ok
+test inbound_mail::tests::sns_url_policy::rejects_cert_urls_that_are_not_one_pem_file ... FAILED
+test inbound_mail::tests::sns_url_policy::rejects_encoded_or_alternate_delimiters_in_cert_url ... FAILED
+test inbound_mail::tests::sns_url_policy::rejects_explicit_port_in_cert_url ... ok
+test inbound_mail::tests::sns_url_policy::rejects_non_sns_hosts_in_cert_url ... FAILED
+test inbound_mail::tests::sns_url_policy::rejects_userinfo_in_cert_url ... FAILED
+test inbound_mail::tests::sns_rsa_signature::a_changed_message_is_rejected ... ok
+test inbound_mail::tests::sns_verify_key_source::wrong_topic_is_rejected_without_a_fetch ... FAILED
+test inbound_mail::tests::sns_verify_key_source::userinfo_cert_url_is_rejected_without_a_fetch ... FAILED
+test inbound_mail::tests::sns_rsa_signature::a_signature_for_the_other_hash_is_rejected ... ok
+thread 'inbound_mail::tests::sns_url_policy::rejects_cert_urls_that_are_not_one_pem_file' (9271) panicked at autumn/src/inbound_mail.rs:3138:17:
+must reject https://sns.us-east-1.amazonaws.com/
+thread 'inbound_mail::tests::sns_url_policy::rejects_encoded_or_alternate_delimiters_in_cert_url' (9272) panicked at autumn/src/inbound_mail.rs:3088:17:
+must reject "https://sns.us-east-1.amazonaws.com%40attacker.s3.amazonaws.com/cert.pem"
+thread 'inbound_mail::tests::sns_url_policy::rejects_non_sns_hosts_in_cert_url' (9274) panicked at autumn/src/inbound_mail.rs:3124:17:
+must reject https://sns.amazonaws.com/cert.pem
+thread 'inbound_mail::tests::sns_url_policy::rejects_userinfo_in_cert_url' (9275) panicked at autumn/src/inbound_mail.rs:3071:17:
+must reject https://sns.us-east-1.amazonaws.com@attacker.s3.amazonaws.com/cert.pem
+thread 'inbound_mail::tests::sns_verify_key_source::wrong_topic_is_rejected_without_a_fetch' (9277) panicked at autumn/src/inbound_mail.rs:3218:13:
+  left: Err(502)
+ right: Err(401)
+thread 'inbound_mail::tests::sns_verify_key_source::userinfo_cert_url_is_rejected_without_a_fetch' (9276) panicked at autumn/src/inbound_mail.rs:3205:13:
+  left: Err(502)
+ right: Err(401)
+test result: FAILED. 6 passed; 6 failed; 0 ignored; 0 measured; 8830 filtered out
+test integration::inbound_mail_integration::ses_endpoint_config_constructor ... ok
+test integration::inbound_mail_integration::ses_bad_json_returns_400 ... ok
+test integration::inbound_mail_integration::ses_notification_dispatches_to_handler ... ok
+test integration::inbound_mail_integration::ses_subscription_confirmation_rejects_non_sns_subscribe_urls ... FAILED
+thread 'integration::inbound_mail_integration::ses_subscription_confirmation_rejects_non_sns_subscribe_urls' (9616) panicked at autumn/tests/integration/inbound_mail_integration.rs:1053:9:
+assertion `left == right` failed: must reject https://sns.example.com/?Action=ConfirmSubscription&TopicArn=arn:aws:sns:us-east-1:123456789012:test-topic&Token=t
+  left: 500
+ right: 400
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 3107 filtered out
+error: test failed, to rerun pass `-p autumn-web --test integration_tests`

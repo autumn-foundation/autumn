@@ -59,7 +59,7 @@ mod tests {
 
     use super::HOST;
     use crate::conformance::SECURITY_HEADERS;
-    use crate::wire::{FALLTHROUGH_SENTINEL, SENSITIVE_HEADERS, WIRE_VERSION};
+    use crate::wire::{ALLOWED_REQUEST_HEADERS, FALLTHROUGH_SENTINEL, WIRE_VERSION};
 
     /// The quoted strings of `export const NAME = Object.freeze([ ... ]);`.
     fn js_list(name: &str) -> Vec<String> {
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn the_header_lists_match() {
-        assert_eq!(js_list("SENSITIVE_HEADERS"), SENSITIVE_HEADERS);
+        assert_eq!(js_list("ALLOWED_REQUEST_HEADERS"), ALLOWED_REQUEST_HEADERS);
         assert_eq!(js_list("SECURITY_HEADERS"), SECURITY_HEADERS);
         assert_eq!(
             js_list("FALLTHROUGH_REASONS"),

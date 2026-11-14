@@ -9756,6 +9756,25 @@ fn resolve_deploy_doctor_config(
     // same target as `autumn deploy check`. An env-only `AUTUMN_DEPLOY__HOST` yields
     // `Some(DeployConfig)`; with no TOML and no env this stays `None` and the preflight skips.
     autumn_web::config::apply_deploy_env_overrides(&mut deploy_cfg, env);
+    // Use the same name check as `autumn deploy`, so doctor does not pass a
+    // config that every deploy command refuses.
+    let names = deploy_cfg.as_ref().map(|cfg| {
+        crate::deploy::resolve_deploy_names(cfg, &crate::deploy::resolve_project_name())
+    });
+    if let Some(Err(message)) = names {
+        return (
+            deploy_cfg,
+            Some(CheckResult {
+                name: "deploy_config",
+                status: CheckStatus::Fail,
+                detail: Some(message),
+                hint: Some(
+                    "Change the [deploy] value in autumn.toml to a permitted value \
+                     (see `autumn deploy check`)",
+                ),
+            }),
+        );
+    }
     (deploy_cfg, None)
 }
 
@@ -22840,6 +22859,21 @@ redirect_uri = "http://localhost/callback"
         let cfg = cfg.expect("valid [deploy] must parse into a config");
         assert_eq!(cfg.host.as_deref(), Some("203.0.113.10"));
         assert_eq!(cfg.ssh_port, 2222);
+    }
+
+    #[test]
+    fn deploy_doctor_config_fails_a_hostile_service_name_like_deploy_check() {
+        use autumn_web::config::MockEnv;
+        let table: toml::Table = "[deploy]\nhost = \"203.0.113.10\"\nservice_name = \"x; id\"\n"
+            .parse()
+            .unwrap();
+        let (cfg, check) = resolve_deploy_doctor_config(&table, &MockEnv::new());
+        assert!(cfg.is_some(), "the config still parses");
+        let check = check.expect("doctor must fail the name");
+        assert_eq!(check.name, "deploy_config");
+        assert!(matches!(check.status, CheckStatus::Fail));
+        let detail = check.detail.expect("detail");
+        assert!(detail.contains("[deploy] service_name"), "{detail}");
     }
 
     #[test]
