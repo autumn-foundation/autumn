@@ -493,6 +493,172 @@ pub(crate) fn trimmed_deploy_profile(raw: &str) -> String {
     trimmed.to_owned()
 }
 
+/// Maximum length of `[deploy] service_name`, `app_name` and `profile`.
+/// systemd refuses a unit name longer than 255 bytes. A deploy adds a suffix of
+/// at most `-migrate-<release id>.service`.
+const DEPLOY_NAME_MAX_LEN: usize = 128;
+
+/// Maximum length of `[deploy] user`.
+const DEPLOY_USER_MAX_LEN: usize = 64;
+
+/// Maximum length of `[deploy] app_dir`.
+const DEPLOY_DIR_MAX_LEN: usize = 1024;
+
+/// Maximum length of a deploy host. DNS names stop at 253 bytes.
+const DEPLOY_HOST_MAX_LEN: usize = 255;
+
+/// Whether `value` is 1 to `max_len` bytes, its first character passes
+/// `first`, and each other character passes `rest`.
+fn is_safe_word(
+    value: &str,
+    max_len: usize,
+    first: fn(char) -> bool,
+    rest: fn(char) -> bool,
+) -> bool {
+    let mut chars = value.chars();
+    value.len() <= max_len && chars.next().is_some_and(first) && chars.all(rest)
+}
+
+/// A character that is safe in a unit name, a file name and a shell word.
+const fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
+}
+
+/// The first character of a name. It is not `-` (an option) or `.` (a dot
+/// path such as `..`).
+const fn is_name_start(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// A character that is safe in a unit-file path and a shell word. Other
+/// characters, for example `%`, `~`, `$`, `;`, whitespace and quotes, have a
+/// meaning in a unit file or a shell.
+const fn is_dir_char(c: char) -> bool {
+    is_name_char(c) || matches!(c, '/' | '+' | '@' | ':')
+}
+
+/// A character that is safe in a host name or an IP address.
+const fn is_host_char(c: char) -> bool {
+    is_name_char(c) || matches!(c, ':' | '%' | '[' | ']')
+}
+
+/// Check a `[deploy]` name: `service_name`, `app_name` or `profile`.
+///
+/// The name goes into unit names, unit files, remote paths and remote shell
+/// lines.
+fn check_deploy_name(key: &str, value: &str, origin: &str) -> Result<(), String> {
+    if is_safe_word(value, DEPLOY_NAME_MAX_LEN, is_name_start, is_name_char) {
+        return Ok(());
+    }
+    Err(format!(
+        "[deploy] {key} {value:?}{origin} is not safe in a unit name, a path or a shell \
+         line: use 1 to {DEPLOY_NAME_MAX_LEN} ASCII letters, digits, `_`, `.` or `-`, and \
+         start with a letter, a digit or `_`"
+    ))
+}
+
+/// Check `[deploy] user`. It goes into the SSH target and the unit `User=`.
+fn check_deploy_user(value: &str) -> Result<(), String> {
+    if is_safe_word(value, DEPLOY_USER_MAX_LEN, is_name_start, |c| {
+        is_name_char(c) || c == '@'
+    }) {
+        return Ok(());
+    }
+    Err(format!(
+        "[deploy] user {value:?} is not a safe user name: use 1 to {DEPLOY_USER_MAX_LEN} \
+         ASCII letters, digits, `_`, `.`, `-` or `@`, and start with a letter, a digit or `_`"
+    ))
+}
+
+/// Check `[deploy] app_dir`. It goes into remote paths and the unit file.
+/// systemd needs an absolute `WorkingDirectory=`.
+fn check_deploy_dir(value: &str) -> Result<(), String> {
+    if is_safe_word(value, DEPLOY_DIR_MAX_LEN, |c| c == '/', is_dir_char) {
+        return Ok(());
+    }
+    Err(format!(
+        "[deploy] app_dir {value:?} is not a safe path: use an absolute path of 1 to \
+         {DEPLOY_DIR_MAX_LEN} ASCII letters, digits, `/`, `_`, `.`, `-`, `+`, `@` or `:`"
+    ))
+}
+
+/// Check a deploy host. It goes into the `ssh` and `scp` argv, and a local
+/// `ssh` config can put it into a shell line (`%h`).
+fn check_deploy_host(value: &str) -> Result<(), String> {
+    if is_safe_word(
+        value,
+        DEPLOY_HOST_MAX_LEN,
+        |c| c != '-' && is_host_char(c),
+        is_host_char,
+    ) {
+        return Ok(());
+    }
+    Err(format!(
+        "[deploy] host {value:?} is not a safe host name: use 1 to {DEPLOY_HOST_MAX_LEN} \
+         ASCII letters, digits, `_`, `.`, `-`, `:`, `%`, `[` or `]`, and do not start with `-`"
+    ))
+}
+
+/// The names [`ResolvedDeployConfig::resolve`] derives from a [`DeployConfig`].
+// `pub(crate)`: `doctor` uses it. See `trimmed_deploy_profile`.
+#[allow(clippy::redundant_pub_crate)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeployNames {
+    /// `[deploy] app_name`, else the project name.
+    pub app_name: String,
+    /// `[deploy] app_dir`, else `/srv/autumn/{app_name}`.
+    pub app_dir: String,
+    /// `[deploy] service_name`, else `app_name`.
+    pub service_name: String,
+    /// `[deploy] profile`, trimmed, else `prod`.
+    pub profile: String,
+}
+
+/// Fill the `app_name` → `app_dir` → `service_name` default chain, then check
+/// each value that goes into a remote command, a remote path or a unit file.
+///
+/// The check runs after the defaults, so a name from the package or the
+/// directory gets the same check. `doctor` calls this too.
+///
+/// # Errors
+///
+/// Returns a message that names the first value that fails its check.
+// `pub(crate)`: `doctor` uses it. See `trimmed_deploy_profile`.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn resolve_deploy_names(
+    cfg: &DeployConfig,
+    project_name: &str,
+) -> Result<DeployNames, String> {
+    let non_blank = |s: &Option<String>| {
+        s.as_ref()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    let explicit_app_name = non_blank(&cfg.app_name);
+    let app_name_origin = if explicit_app_name.is_some() {
+        ""
+    } else {
+        " (from the package or directory name; set `[deploy] app_name`)"
+    };
+    let app_name = explicit_app_name.unwrap_or_else(|| project_name.to_owned());
+    check_deploy_name("app_name", &app_name, app_name_origin)?;
+    let app_dir = non_blank(&cfg.app_dir).unwrap_or_else(|| format!("/srv/autumn/{app_name}"));
+    check_deploy_dir(&app_dir)?;
+    let service_name = non_blank(&cfg.service_name).unwrap_or_else(|| app_name.clone());
+    check_deploy_name("service_name", &service_name, "")?;
+    check_deploy_user(&cfg.user)?;
+    // The profile names the uploaded `autumn-<profile>.toml` and goes into the
+    // env file.
+    let profile = trimmed_deploy_profile(&cfg.profile);
+    check_deploy_name("profile", &profile, "")?;
+    Ok(DeployNames {
+        app_name,
+        app_dir,
+        service_name,
+        profile,
+    })
+}
+
 impl ResolvedDeployConfig {
     /// Resolve a [`DeployConfig`] against the project name, filling in the
     /// `app_name` → `app_dir` → `service_name` default chain.
@@ -503,6 +669,10 @@ impl ResolvedDeployConfig {
     /// `host` is configured — TLS cannot be provisioned without a hostname for
     /// the certificate, so the misconfiguration is rejected before any remote
     /// command runs.
+    ///
+    /// Also returns an error from [`resolve_deploy_names`] when a name, the
+    /// user, the app dir or the profile is too long or has a character that a
+    /// remote shell, `systemctl` or a unit file can read as code.
     pub fn resolve(cfg: &DeployConfig, project_name: &str) -> Result<Self, String> {
         let non_blank = |s: &Option<String>| {
             s.as_ref()
@@ -510,9 +680,12 @@ impl ResolvedDeployConfig {
                 .filter(|v| !v.is_empty())
         };
 
-        let app_name = non_blank(&cfg.app_name).unwrap_or_else(|| project_name.to_owned());
-        let app_dir = non_blank(&cfg.app_dir).unwrap_or_else(|| format!("/srv/autumn/{app_name}"));
-        let service_name = non_blank(&cfg.service_name).unwrap_or_else(|| app_name.clone());
+        let DeployNames {
+            app_name,
+            app_dir,
+            service_name,
+            profile,
+        } = resolve_deploy_names(cfg, project_name)?;
 
         // TLS is opt-in: when disabled, `tls_host` stays `None` and nothing about
         // the render/deploy commands changes. When enabled, a non-blank `host` is
@@ -538,7 +711,7 @@ impl ResolvedDeployConfig {
             service_name,
             readiness_timeout_secs: cfg.readiness_timeout_secs,
             keep_releases: cfg.keep_releases,
-            profile: trimmed_deploy_profile(&cfg.profile),
+            profile,
             tls_enabled: cfg.tls.enabled,
             tls_host,
             install_proxy: cfg.install_proxy,
@@ -690,6 +863,8 @@ impl ResolvedDeployConfig {
 ///
 /// Returns a message when `host` and `hosts` are both configured, when a `hosts`
 /// entry is blank, or when a `hosts` entry repeats (compared after trimming).
+/// Also returns a message when a host has a character that is not safe in a
+/// host name (see `check_deploy_host`).
 // `pub(crate)` (not private): `doctor` enumerates the deploy target list through
 // THIS function so its deploy branch grades the same fleet `deploy check` does —
 // re-deriving the rules there is exactly the drift the parity invariant forbids.
@@ -697,6 +872,15 @@ impl ResolvedDeployConfig {
 // `pub(crate)` as redundant; it is kept to document the intended visibility.
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn deploy_host_list(cfg: &DeployConfig) -> Result<Vec<String>, String> {
+    let hosts = deploy_host_list_unchecked(cfg)?;
+    for host in &hosts {
+        check_deploy_host(host)?;
+    }
+    Ok(hosts)
+}
+
+/// [`deploy_host_list`] without the host-name check.
+fn deploy_host_list_unchecked(cfg: &DeployConfig) -> Result<Vec<String>, String> {
     // `[[deploy.groups]]`: the group order, then the host order.
     if !cfg.groups.is_empty() {
         return Ok(cfg.group_hosts()?.into_iter().map(|g| g.host).collect());
@@ -2463,7 +2647,9 @@ pub(crate) fn deploy_profile_env_overlay(profile_raw: &str) -> Result<impl Env, 
 
 /// Resolve the project's package name (for the `app_name` default), falling back
 /// to the current directory name and finally to `"app"`.
-fn resolve_project_name() -> String {
+// `pub(crate)`: `doctor` uses it for the same name check.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn resolve_project_name() -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     crate::release::read_project_name(&cwd)
         .ok()
@@ -7782,15 +7968,16 @@ mod tests {
     /// database it just called safe.
     #[test]
     fn an_ungradable_app_dir_refuses_rather_than_claiming_durability() {
-        let relative = ResolvedDeployConfig::resolve(
+        // `resolve` refuses a relative app_dir, so set it on the resolved config.
+        let mut relative = ResolvedDeployConfig::resolve(
             &DeployConfig {
                 host: Some("203.0.113.10".to_owned()),
-                app_dir: Some("srv/autumn/myapp".to_owned()),
                 ..DeployConfig::default()
             },
             "myapp",
         )
         .expect("resolves");
+        relative.app_dir = "srv/autumn/myapp".to_owned();
         let graded = classify_sqlite_data_file(
             Some("sqlite:///srv/autumn/myapp/releases/r1/app.db"),
             &relative,
@@ -8038,15 +8225,17 @@ mod tests {
     /// fails after it has already touched the host.
     #[test]
     fn classify_sqlite_data_file_refuses_a_relative_app_dir_on_both_branches() {
-        let relative_dir = ResolvedDeployConfig::resolve(
+        // `resolve` refuses a relative app_dir, so set it on the resolved config.
+        // The classifier keeps its own guard.
+        let mut relative_dir = ResolvedDeployConfig::resolve(
             &DeployConfig {
                 host: Some("203.0.113.10".to_owned()),
-                app_dir: Some("myapp".to_owned()),
                 ..DeployConfig::default()
             },
             "myapp",
         )
         .expect("resolves");
+        relative_dir.app_dir = "myapp".to_owned();
 
         for url in [
             // The branch the guard was originally written for…
@@ -8868,6 +9057,273 @@ mod tests {
             ResolvedDeployConfig::resolve(&cfg, "fallback").expect("deploy config resolves");
         assert_eq!(resolved.app_name, "fallback");
         assert_eq!(resolved.app_dir, "/srv/autumn/fallback");
+    }
+
+    /// Values that a remote shell, `systemctl`, or a unit file can read as code.
+    const HOSTILE_NAMES: &[&str] = &[
+        "x; touch /tmp/pwned",
+        "x && id",
+        "x|id",
+        "$(id)",
+        "`id`",
+        "x\nExecStartPre=/bin/sh -c id",
+        "x\rid",
+        "-x",
+        "--now",
+        "a/b",
+        "../etc",
+        ".hidden",
+        "a b",
+        "a\tb",
+        "a@b",
+        "a'b",
+        "a\"b",
+        "a\\b",
+        "a%b",
+        "a:b",
+        "a*",
+        "naïve",
+    ];
+
+    #[test]
+    fn resolve_rejects_a_hostile_service_name() {
+        for hostile in HOSTILE_NAMES {
+            let cfg = DeployConfig {
+                service_name: Some((*hostile).to_owned()),
+                ..DeployConfig::default()
+            };
+            let err = ResolvedDeployConfig::resolve(&cfg, "myapp")
+                .expect_err(&format!("service_name {hostile:?} must be refused"));
+            assert!(err.contains("[deploy] service_name"), "{hostile:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_an_over_long_service_name() {
+        let cfg = DeployConfig {
+            service_name: Some("a".repeat(DEPLOY_NAME_MAX_LEN + 1)),
+            ..DeployConfig::default()
+        };
+        let err = ResolvedDeployConfig::resolve(&cfg, "myapp").expect_err("too long");
+        assert!(err.contains("[deploy] service_name"), "{err}");
+        let at_cap = DeployConfig {
+            service_name: Some("a".repeat(DEPLOY_NAME_MAX_LEN)),
+            ..DeployConfig::default()
+        };
+        ResolvedDeployConfig::resolve(&at_cap, "myapp").expect("the cap itself is valid");
+    }
+
+    #[test]
+    fn resolve_accepts_plain_unit_names() {
+        for name in ["myapp", "shop-web", "my_app.v2", "App2", "9lives", "_svc"] {
+            let cfg = DeployConfig {
+                service_name: Some(name.to_owned()),
+                app_name: Some(name.to_owned()),
+                ..DeployConfig::default()
+            };
+            let resolved = ResolvedDeployConfig::resolve(&cfg, "myapp")
+                .unwrap_or_else(|e| panic!("{name:?} must resolve: {e}"));
+            assert_eq!(resolved.service_name, name);
+            assert_eq!(resolved.app_name, name);
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_a_hostile_app_name() {
+        for hostile in HOSTILE_NAMES {
+            let cfg = DeployConfig {
+                app_name: Some((*hostile).to_owned()),
+                ..DeployConfig::default()
+            };
+            let err = ResolvedDeployConfig::resolve(&cfg, "myapp")
+                .expect_err(&format!("app_name {hostile:?} must be refused"));
+            assert!(err.contains("[deploy] app_name"), "{hostile:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_a_hostile_project_name_that_the_app_name_inherits() {
+        // The project name comes from `Cargo.toml` or the directory name.
+        for hostile in HOSTILE_NAMES {
+            let err = ResolvedDeployConfig::resolve(&DeployConfig::default(), hostile)
+                .expect_err(&format!("project name {hostile:?} must be refused"));
+            assert!(err.contains("[deploy] app_name"), "{hostile:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_a_hostile_project_name_even_with_an_explicit_service_name() {
+        // The binary path and the unit `ExecStart=` use `app_name`.
+        let cfg = DeployConfig {
+            service_name: Some("myapp".to_owned()),
+            ..DeployConfig::default()
+        };
+        let err = ResolvedDeployConfig::resolve(&cfg, "x;id").expect_err("must be refused");
+        assert!(err.contains("[deploy] app_name"), "{err}");
+    }
+
+    #[test]
+    fn resolve_rejects_a_hostile_ssh_user() {
+        for hostile in [
+            "root\nExecStartPre=/bin/sh -c id",
+            "-oProxyCommand=id",
+            "a b",
+            "a;b",
+            "$(id)",
+            "a%b",
+            "",
+        ] {
+            let cfg = DeployConfig {
+                user: hostile.to_owned(),
+                ..DeployConfig::default()
+            };
+            let err = ResolvedDeployConfig::resolve(&cfg, "myapp")
+                .expect_err(&format!("user {hostile:?} must be refused"));
+            assert!(err.contains("[deploy] user"), "{hostile:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn resolve_accepts_plain_ssh_users() {
+        for user in [
+            "root",
+            "deploy",
+            "_svc",
+            "web-1",
+            "j.doe",
+            "jdoe@corp.example",
+        ] {
+            let cfg = DeployConfig {
+                user: user.to_owned(),
+                ..DeployConfig::default()
+            };
+            let resolved = ResolvedDeployConfig::resolve(&cfg, "myapp")
+                .unwrap_or_else(|e| panic!("{user:?} must resolve: {e}"));
+            assert_eq!(resolved.user, user);
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_a_hostile_app_dir() {
+        for hostile in [
+            "/srv/x\nExecStartPre=/bin/sh -c id",
+            "/srv/$(id)",
+            "/srv/a b",
+            "/srv/a;b",
+            "/srv/`id`",
+            "/srv/%h",
+            "/srv/a'b",
+            "/srv/~",
+            "-rf",
+            "apps/rel",
+            "+/srv",
+            "@srv",
+        ] {
+            let cfg = DeployConfig {
+                app_dir: Some(hostile.to_owned()),
+                ..DeployConfig::default()
+            };
+            let err = ResolvedDeployConfig::resolve(&cfg, "myapp")
+                .expect_err(&format!("app_dir {hostile:?} must be refused"));
+            assert!(err.contains("[deploy] app_dir"), "{hostile:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn resolve_accepts_plain_app_dirs() {
+        for dir in [
+            "/srv/myapp",
+            "/opt/web-1/app_v2.0",
+            "/home/deploy/apps/shop",
+            "/srv/a:b",
+        ] {
+            let cfg = DeployConfig {
+                app_dir: Some(dir.to_owned()),
+                ..DeployConfig::default()
+            };
+            let resolved = ResolvedDeployConfig::resolve(&cfg, "myapp")
+                .unwrap_or_else(|e| panic!("{dir:?} must resolve: {e}"));
+            assert_eq!(resolved.app_dir, dir);
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_a_hostile_profile() {
+        // The profile names an uploaded file and goes into the env file.
+        for hostile in ["x;id", "a\nAUTUMN_X=1", "$(id)", "a/b", "-x"] {
+            let cfg = DeployConfig {
+                profile: hostile.to_owned(),
+                ..DeployConfig::default()
+            };
+            let err = ResolvedDeployConfig::resolve(&cfg, "myapp")
+                .expect_err(&format!("profile {hostile:?} must be refused"));
+            assert!(err.contains("[deploy] profile"), "{hostile:?}: {err}");
+        }
+        for profile in ["prod", "staging", "QA", "eu-west.2", ""] {
+            let cfg = DeployConfig {
+                profile: profile.to_owned(),
+                ..DeployConfig::default()
+            };
+            ResolvedDeployConfig::resolve(&cfg, "myapp")
+                .unwrap_or_else(|e| panic!("{profile:?} must resolve: {e}"));
+        }
+    }
+
+    #[test]
+    fn deploy_host_list_rejects_a_hostile_host() {
+        // A local `ssh` config can put the host into a shell line (`%h`).
+        for hostile in [
+            "a$(id)",
+            "-oProxyCommand=id",
+            "a b",
+            "a;b",
+            "a\nb",
+            "`id`",
+            "a'b",
+        ] {
+            for cfg in [
+                DeployConfig {
+                    host: Some(hostile.to_owned()),
+                    ..DeployConfig::default()
+                },
+                DeployConfig {
+                    hosts: vec!["10.0.0.1".to_owned(), hostile.to_owned()],
+                    ..DeployConfig::default()
+                },
+            ] {
+                let err =
+                    deploy_host_list(&cfg).expect_err(&format!("host {hostile:?} must be refused"));
+                assert!(err.contains("[deploy] host"), "{hostile:?}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn deploy_host_list_accepts_plain_hosts() {
+        for host in [
+            "203.0.113.10",
+            "web-1.example.com",
+            "::1",
+            "fe80::1%eth0",
+            "db_1",
+        ] {
+            let cfg = DeployConfig {
+                host: Some(host.to_owned()),
+                ..DeployConfig::default()
+            };
+            assert_eq!(deploy_host_list(&cfg), Ok(vec![host.to_owned()]));
+        }
+    }
+
+    #[test]
+    fn fleet_resolve_rejects_a_hostile_service_name() {
+        let cfg = DeployConfig {
+            hosts: vec!["10.0.0.1".to_owned(), "10.0.0.2".to_owned()],
+            service_name: Some("x; id".to_owned()),
+            ..DeployConfig::default()
+        };
+        let err = ResolvedFleet::resolve(&cfg, "myapp").expect_err("must be refused");
+        assert!(err.contains("[deploy] service_name"), "{err}");
     }
 
     #[test]
@@ -12222,9 +12678,10 @@ mod tests {
                 .expect("the op ran")
         };
         let drained = shell_of("drain-old");
+        // The unit is the last word, already quoted.
         let unit = drained.rsplit(' ').next().expect("drain-old names a unit");
         assert!(
-            shell_of("drain-old-retry").contains(&format!("unit='{unit}'")),
+            shell_of("drain-old-retry").contains(&format!("unit={unit}")),
             "the retry must target the old slot `{unit}`, never the new one"
         );
     }
