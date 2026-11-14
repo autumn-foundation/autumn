@@ -917,6 +917,7 @@ dependencies = [
  "fd-lock",
  "filetime",
  "flate2",
+ "foldhash 0.2.0",
  "futures",
  "getrandom 0.4.3",
  "h2",

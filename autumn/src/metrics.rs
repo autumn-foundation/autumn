@@ -470,6 +470,15 @@ pub fn set_limits(limits: Limits) {
 /// [`crate::cache::read_through_metrics`].
 static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::default);
 
+/// A map on the record path: instruments by name, and series by label set.
+///
+/// A record probes both. The standard hasher was the largest cost of a
+/// record, larger than the probes and the update together. This one hashes a
+/// short string several times faster. Each process seeds it at random, so a
+/// label value cannot be chosen to collide, and the registry caps bound both
+/// maps in any case.
+type RecordMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
+
 /// Descriptions waiting for the instrument they name to be registered, keyed
 /// by metric name and tagged with the kind they were written for.
 type PendingHelp = HashMap<Box<str>, (InstrumentKind, Box<str>)>;
@@ -485,7 +494,7 @@ type PendingHelp = HashMap<Box<str>, (InstrumentKind, Box<str>)>;
 #[derive(Debug, Default)]
 struct Registry {
     /// Registered instruments keyed by metric name.
-    instruments: RwLock<HashMap<Box<str>, Arc<Instrument>>>,
+    instruments: RwLock<RecordMap<Box<str>, Arc<Instrument>>>,
     /// Bucket bounds configured before their histogram was registered.
     ///
     /// Bounded by [`MAX_INSTRUMENTS_CEILING`], **not** by the installed
@@ -635,7 +644,7 @@ struct Instrument {
     /// untouched instrument must not report a phantom zero series.
     unlabeled_used: AtomicBool,
     /// Labeled series, keyed by their canonical label set.
-    series: RwLock<HashMap<SeriesKey, Arc<Series>>>,
+    series: RwLock<RecordMap<SeriesKey, Arc<Series>>>,
     /// Label sets rejected by the cardinality cap.
     dropped: AtomicU64,
     /// Latches the single cardinality-cap warning.
@@ -658,7 +667,7 @@ impl Instrument {
             unlabeled: Series::new(kind, bounds.len()),
             bounds,
             unlabeled_used: AtomicBool::new(false),
-            series: RwLock::new(HashMap::new()),
+            series: RwLock::new(RecordMap::default()),
             dropped: AtomicU64::new(0),
             cap_warned: AtomicBool::new(false),
             kind_warned: AtomicBool::new(false),
@@ -1013,10 +1022,21 @@ const fn is_forbidden_control(c: char) -> bool {
 fn sanitize_owned_label_value(value: String) -> String {
     // A string of at most `MAX_LABEL_VALUE_LEN` bytes holds at most that many
     // characters, so the common case walks the string once and keeps it.
-    if value.len() <= MAX_LABEL_VALUE_LEN && !value.contains(is_forbidden_control) {
+    if value.len() <= MAX_LABEL_VALUE_LEN && !has_forbidden_control(&value) {
         return value;
     }
     sanitized_chars(&value, MAX_LABEL_VALUE_LEN)
+}
+
+/// Whether `text` holds a character [`is_forbidden_control`] rejects.
+///
+/// Most label values are printable ASCII, and a byte from `0x20` to `0x7E` is
+/// one whole character that is not a control. Such a value is cleared by
+/// byte, with no decode. Any other byte sends the text to the scan by
+/// character, which is the definition.
+fn has_forbidden_control(text: &str) -> bool {
+    let printable_ascii = text.bytes().all(|b| matches!(b, 0x20..=0x7E));
+    !printable_ascii && text.contains(is_forbidden_control)
 }
 
 /// Canonicalize `# HELP` text: control characters removed (a `# HELP` line is
@@ -1108,7 +1128,7 @@ fn occupied_names(name: &str, kind: InstrumentKind) -> Vec<String> {
 /// Whether registering `name` as `kind` would collide with a name an already
 /// registered instrument occupies — in either direction.
 fn collides_with_registered(
-    registered: &HashMap<Box<str>, Arc<Instrument>>,
+    registered: &RecordMap<Box<str>, Arc<Instrument>>,
     name: &str,
     kind: InstrumentKind,
 ) -> bool {
@@ -3446,6 +3466,49 @@ mod tests {
             value, "paid[31mnext",
             "C0 control characters must not reach the exposition format"
         );
+    }
+
+    #[test]
+    fn the_byte_check_finds_every_control_character() {
+        for clean in [
+            "",
+            "ok",
+            "/users/{id}",
+            "GET",
+            "naïve café",
+            "中文 ✓",
+            "~ !",
+        ] {
+            assert!(!has_forbidden_control(clean), "{clean:?}");
+        }
+        // C0, DEL, and C1: the last two are not in the printable ASCII range
+        // the byte check clears, and C1 is two bytes.
+        for dirty in ["a\tb", "\0", "x\x7f", "é\n", "a\u{85}b", "\u{9f}", "中\x1b"] {
+            assert!(has_forbidden_control(dirty), "{dirty:?}");
+        }
+    }
+
+    proptest::proptest! {
+        /// The byte check is the scan by character, for any text, so a label
+        /// value is kept or cleaned exactly as before.
+        #[test]
+        fn the_byte_check_is_the_scan_by_character(
+            text in "[ -~éß中𝒜\u{0}\t\n\u{1b}\u{7f}\u{80}\u{85}\u{9f}\u{a0}]{0,24}",
+        ) {
+            proptest::prop_assert_eq!(
+                has_forbidden_control(&text),
+                text.contains(is_forbidden_control),
+                "{:?}", text
+            );
+            let by_character = if text.len() <= MAX_LABEL_VALUE_LEN
+                && !text.contains(is_forbidden_control)
+            {
+                text.clone()
+            } else {
+                sanitized_chars(&text, MAX_LABEL_VALUE_LEN)
+            };
+            proptest::prop_assert_eq!(sanitize_owned_label_value(text.clone()), by_character);
+        }
     }
 
     #[test]
