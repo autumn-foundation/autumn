@@ -2,16 +2,16 @@
 # unit: whole process (criterion --profile-time: the iteration count is wall-clock bound; read the shares)
 # tool: valgrind --tool=dhat, by first workspace frame
 
-bytes allocated: 475,037,409
-blocks allocated: 2,100,714
-peak live bytes (whole run): 2,534,481
+bytes allocated: 803,242,082
+blocks allocated: 3,804,811
+peak live bytes (whole run): 4,976,657
 
          bytes      blocks  site
 
-   409,928,448       2,672  <criterion::bencher::Bencher>::iter_batched
-    59,309,175     983,025  <http::extensions::Extensions>::insert
-     5,570,505   1,114,101  <http::request::Builder>::and_then
-        82,144           3  <autumn_web::middleware::metrics::MetricsCollector>::new
+   675,218,176       2,832  <criterion::bencher::Bencher>::iter_batched
+   118,619,255   1,966,065  <http::extensions::Extensions>::insert
+     9,174,985   1,834,997  <http::request::Builder>::and_then
+        82,529           4  <autumn_web::middleware::metrics::MetricsCollector>::new
         72,000           8  <clap_builder::builder::command::Command>::arg_internal
         14,400          16  <clap_builder::util::flat_map::Entry>::or_insert
          8,512          76  <clap_builder::parser::matches::matched_arg::MatchedArg>::append_val

@@ -11,7 +11,7 @@
              465    6.4%  free
              447    6.1%  <autumn_web::metrics::Instrument>::series_for
              436    6.0%  autumn_web::metrics::instrument
-             392    5.4%  __memcmp_avx2_movbe
+             398    5.4%  __memcmp_avx2_movbe
              252    3.4%  <autumn_web::metrics::Counter>::with_label
              250    3.4%  core::ptr::drop_glue
              224    3.1%  __memcpy_avx_unaligned_erms
@@ -28,10 +28,10 @@
               42    0.6%  autumn_web::metrics::counter
               42    0.6%  <std::sync::once::Once>::call_once_force::{closure#0}
               15    0.2%  __rustc::__rust_alloc
+              15    0.2%  __rustc::__rust_dealloc
               15    0.2%  __rustc::__rdl_dealloc
               15    0.2%  __rustc::__rust_no_alloc_shim_is_unstable_v2
-              15    0.2%  __rustc::__rust_dealloc
               14    0.2%  autumn_web::metrics::timer
                5    0.1%  metrics_per_call::main
 
-           7,315  100.0%  TOTAL
+           7,321  100.0%  TOTAL

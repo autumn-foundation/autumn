@@ -3,7 +3,7 @@ package = "autumn-web"
 bench = "metrics_per_call"
 mode = "marginal"
 date = "2026-11-14"
-commit = "ee8afae179aa"
+commit = "6a27e408e8ed"
 rustc = "rustc 1.97.0 (2d8144b78 2026-07-07)"
 valgrind = "valgrind-3.22.0"
 source_sha256 = "567308623a698cb70246690b8435290e2746c1e3b53f4fa9ae82ad8d0b6a4261"
@@ -13,14 +13,14 @@ dhat = "valgrind --tool=dhat --dhat-out-file=dhat-run.json \"$BIN\" --iterations
 
 [totals]
 unit = "per iteration (N-iteration run minus zero-iteration run, divided by N)"
-instructions = 7315
+instructions = 7321
 alloc_bytes = 641
 alloc_blocks = 15
 peak_live_bytes = 5950
 callgrind_n = 10000
 dhat_n = 10000
-instructions_base = 855044
-instructions_run = 74005109
+instructions_base = 857156
+instructions_run = 74067398
 alloc_bytes_base = 42407
 alloc_bytes_run = 6452411
 top_function = "autumn_web::metrics::insert_label"
