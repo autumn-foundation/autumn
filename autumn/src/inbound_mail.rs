@@ -89,7 +89,7 @@ use serde::Deserialize;
 mod sns_verify {
     use super::*;
 
-    /// Largest certificate body to read, in bytes. A real SNS certificate is near 2 KiB.
+    /// Largest certificate body to read, in bytes. A real SNS certificate is approximately 2 KiB.
     pub(super) const MAX_CERT_BYTES: u64 = 16 * 1024;
 
     /// Total time limit for one SNS fetch.
@@ -102,10 +102,10 @@ mod sns_verify {
     impl SnsCertUrl {
         /// Accept only `https://sns.<region>.amazonaws.com[.cn]/<name>.pem`.
         ///
-        /// The text must be in canonical form. Thus the host that this check reads is
-        /// the host that the fetch connects to.
+        /// The text must be in canonical form. Then the fetch connects to the host that
+        /// this check reads.
         pub(super) fn parse(raw: &str) -> Option<Self> {
-            let url = sns_origin(raw)?;
+            let url = parse_sns_url(raw)?;
             let name = url.path().strip_prefix('/')?.strip_suffix(".pem")?;
             let name_ok = !name.is_empty()
                 && name
@@ -115,7 +115,7 @@ mod sns_verify {
             (name_ok && exact).then_some(Self(url))
         }
 
-        /// Wrap a URL without the SNS checks. Tests only.
+        /// Wrap a URL without the SNS checks. Use this only in tests.
         #[cfg(test)]
         pub(super) const fn unchecked(url: url::Url) -> Self {
             Self(url)
@@ -130,19 +130,21 @@ mod sns_verify {
         /// Accept only `https://sns.<region>.amazonaws.com[.cn]/?Action=ConfirmSubscription`
         /// with `TopicArn` equal to `expected_topic_arn`.
         pub(super) fn parse(raw: &str, expected_topic_arn: &str) -> Option<Self> {
-            let url = sns_origin(raw)?;
+            let url = parse_sns_url(raw)?;
             if url.path() != "/" || url.fragment().is_some() {
                 return None;
             }
             let mut action = None;
             let mut topic = None;
             for (key, value) in url.query_pairs() {
-                let slot = match key.as_ref() {
-                    "Action" => &mut action,
-                    "TopicArn" => &mut topic,
-                    _ => continue,
+                let slot = if key.eq_ignore_ascii_case("Action") {
+                    &mut action
+                } else if key.eq_ignore_ascii_case("TopicArn") {
+                    &mut topic
+                } else {
+                    continue;
                 };
-                // A repeated key is ambiguous. Refuse it.
+                // Reject a key that occurs more than one time, in any letter case.
                 if slot.replace(value).is_some() {
                     return None;
                 }
@@ -152,18 +154,18 @@ mod sns_verify {
             ok.then_some(Self(url))
         }
 
-        /// Wrap a URL without the SNS checks. Tests only.
+        /// Wrap a URL without the SNS checks. Use this only in tests.
         #[cfg(test)]
         pub(super) const fn unchecked(url: url::Url) -> Self {
             Self(url)
         }
     }
 
-    /// Parse `raw` and keep it only when its origin is an SNS endpoint.
+    /// Parse `raw`. Keep it only when its origin is an SNS endpoint.
     ///
     /// Refuse user info, a port, an IP address and any authority text that is not
     /// the same as the parsed host.
-    fn sns_origin(raw: &str) -> Option<url::Url> {
+    fn parse_sns_url(raw: &str) -> Option<url::Url> {
         let url = url::Url::parse(raw).ok()?;
         let ok = match url.host() {
             Some(url::Host::Domain(host)) => {
@@ -199,28 +201,47 @@ mod sns_verify {
 
     /// Return `true` for an AWS region name, for example `us-east-1` or `us-gov-west-1`.
     fn is_region(label: &str) -> bool {
-        let parts: Vec<&str> = label.split('-').collect();
-        let Some((number, words)) = parts.split_last() else {
+        let Some((words, number)) = label.rsplit_once('-') else {
             return false;
         };
-        words.len() >= 2
+        words.contains('-')
             && words
-                .iter()
+                .split('-')
                 .all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase()))
             && !number.is_empty()
             && number.bytes().all(|b| b.is_ascii_digit())
     }
 
-    /// Build the client for SNS fetches. It does not follow redirects.
+    /// Build the client for SNS fetches. It does not follow redirects or decompress.
     pub(super) fn http_client() -> reqwest::Result<reqwest::Client> {
         http_client_builder().build()
     }
 
-    /// The builder behind [`http_client`].
+    /// Make the builder that [`http_client`] uses.
+    ///
+    /// Decompression stays off, also when the app enables a reqwest compression
+    /// feature. Otherwise `content_length()` is `None` and every fetch fails.
     pub(super) fn http_client_builder() -> reqwest::ClientBuilder {
         crate::reqwest_tls::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(FETCH_TIMEOUT)
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+    }
+
+    /// Check the request with the capsule egress guard (#2351).
+    ///
+    /// This client does not use the capsule HTTP recorder, so the check occurs here.
+    #[cfg_attr(not(feature = "reporting"), allow(clippy::unnecessary_wraps))]
+    fn guard_egress(url: &url::Url) -> Result<(), StatusCode> {
+        #[cfg(feature = "reporting")]
+        crate::capsule::guard_egress("inbound mail", "GET", url.as_str())
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        #[cfg(not(feature = "reporting"))]
+        let _ = url;
+        Ok(())
     }
 
     /// Fetch the signing certificate PEM.
@@ -231,10 +252,7 @@ mod sns_verify {
         client: &reqwest::Client,
         url: &SnsCertUrl,
     ) -> Result<String, StatusCode> {
-        // This client bypasses the capsule's recorded HTTP seam, so guard the egress (#2351).
-        #[cfg(feature = "reporting")]
-        crate::capsule::guard_egress("inbound mail", "GET", url.0.as_str())
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        guard_egress(&url.0)?;
         let mut response = client.get(url.0.clone()).send().await.map_err(|e| {
             tracing::error!(error = %e, "inbound_mail.ses: failed to fetch SNS cert");
             StatusCode::BAD_GATEWAY
@@ -277,17 +295,34 @@ mod sns_verify {
         String::from_utf8(body).map_err(|_| StatusCode::UNAUTHORIZED)
     }
 
+    /// Answer a `SubscriptionConfirmation` with the `SubscribeURL` `raw`.
+    ///
+    /// A URL that is not an SNS confirmation URL for `topic_arn` gets `400` and no
+    /// fetch. Any other URL can cause a blind SSRF.
+    pub(super) async fn handle_subscription(
+        client: &reqwest::Client,
+        raw: &str,
+        topic_arn: &str,
+    ) -> StatusCode {
+        let Some(url) = SnsSubscribeUrl::parse(raw, topic_arn) else {
+            tracing::warn!(
+                subscribe_url = raw,
+                "inbound_mail.ses: SubscribeURL is not an SNS confirmation URL"
+            );
+            return StatusCode::BAD_REQUEST;
+        };
+        confirm_subscription(client, &url).await
+    }
+
     /// GET the `SubscribeURL` to confirm the subscription.
     ///
-    /// Any failure returns `500`, so SNS sends the confirmation again.
+    /// A failed request returns `500`, so SNS sends the confirmation again.
     pub(super) async fn confirm_subscription(
         client: &reqwest::Client,
         url: &SnsSubscribeUrl,
     ) -> StatusCode {
-        // This client bypasses the capsule's recorded HTTP seam, so guard the egress (#2351).
-        #[cfg(feature = "reporting")]
-        if crate::capsule::guard_egress("inbound mail", "GET", url.0.as_str()).is_err() {
-            return StatusCode::SERVICE_UNAVAILABLE;
+        if let Err(status) = guard_egress(&url.0) {
+            return status;
         }
         match client.get(url.0.clone()).send().await {
             Ok(response) if response.status().is_success() => StatusCode::OK,
@@ -473,9 +508,9 @@ mod sns_verify {
 
     /// Verify the SNS notification signature and the `TopicArn` binding.
     ///
-    /// The certificate URL and the `TopicArn` are checked before any fetch. The
-    /// `TopicArn` check stops a validly signed message from a topic of a different
-    /// AWS account.
+    /// This function checks the certificate URL and the `TopicArn` before it fetches
+    /// the certificate. The `TopicArn` check stops a message with a correct signature
+    /// from a topic in a different AWS account.
     ///
     /// Set `AUTUMN_SES_SKIP_SNS_VERIFICATION=1` to disable in tests/local dev.
     pub(super) async fn verify(
@@ -2355,16 +2390,7 @@ fn build_ses_route(
             match parse_ses(&body) {
                 #[cfg(feature = "inbound-ses")]
                 Ok(SnsParseResult::SubscriptionConfirmation { url }) => {
-                    // Fetch only an SNS confirmation URL for this topic. Any other URL is
-                    // a blind SSRF.
-                    let Some(url) = sns_verify::SnsSubscribeUrl::parse(&url, &topic_arn) else {
-                        tracing::warn!(
-                            subscribe_url = %url,
-                            "inbound_mail.ses: SubscribeURL is not an SNS confirmation URL"
-                        );
-                        return StatusCode::BAD_REQUEST;
-                    };
-                    sns_verify::confirm_subscription(&http_client, &url).await
+                    sns_verify::handle_subscription(&http_client, &url, &topic_arn).await
                 }
                 #[cfg(not(feature = "inbound-ses"))]
                 Ok(SnsParseResult::SubscriptionConfirmation { .. }) => StatusCode::OK,
@@ -3313,6 +3339,7 @@ mod tests {
                 format!("https://x@sns.us-west-2.amazonaws.com/{q}"),
                 format!("https://sns.us-west-2.amazonaws.com:443/{q}"),
                 format!("https://sns.us-west-2.amazonaws.com\\@attacker.example/{q}"),
+                format!("https://sns.us-west-2.amazonaws.com%40attacker.example/{q}"),
                 format!("http://sns.us-west-2.amazonaws.com/{q}"),
                 format!("https://169.254.169.254/{q}"),
                 format!("https://sns.us-west-2.s3.amazonaws.com/{q}"),
@@ -3332,13 +3359,14 @@ mod tests {
                 "https://sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&TopicArn=arn:aws:sns:us-west-2:999999999999:MyTopic",
                 "https://sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&Action=Publish&TopicArn=arn:aws:sns:us-west-2:123456789012:MyTopic",
                 "https://sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&TopicArn=arn:aws:sns:us-west-2:123456789012:MyTopic&TopicArn=x",
+                "https://sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&TopicArn=arn:aws:sns:us-west-2:123456789012:MyTopic&action=DeleteTopic",
             ] {
                 assert!(!subscribe_ok(raw), "must reject {raw}");
             }
         }
 
         proptest::proptest! {
-            /// User info before an SNS host never passes, whatever it holds.
+            /// User info before an SNS host never passes, for all values.
             #[test]
             fn userinfo_before_an_sns_host_never_passes(user in "[!-~]{0,40}") {
                 let raw = format!("https://{user}@sns.us-east-1.amazonaws.com/cert.pem");
@@ -3349,7 +3377,7 @@ mod tests {
                 proptest::prop_assert!(!subscribe_ok(&raw));
             }
 
-            /// An accepted URL is exactly `https://<sns host>/...` and the parser agrees.
+            /// An accepted URL starts with `https://<sns host>/`.
             #[test]
             fn an_accepted_cert_url_connects_to_the_host_it_names(
                 prefix in proptest::prop_oneof![
@@ -3406,7 +3434,7 @@ mod tests {
 
         const TOPIC: &str = "arn:aws:sns:us-east-1:123456789012:inbound";
 
-        /// A TCP listener that counts connections and closes each one at once.
+        /// A TCP listener that counts connections and closes each one immediately.
         async fn counting_listener() -> (SocketAddr, Arc<AtomicUsize>) {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -3446,8 +3474,58 @@ mod tests {
             })
         }
 
+        /// `verify` skips every check when this variable is `1`.
+        fn assert_verification_on() {
+            assert_ne!(
+                std::env::var("AUTUMN_SES_SKIP_SNS_VERIFICATION").as_deref(),
+                Ok("1"),
+                "unset AUTUMN_SES_SKIP_SNS_VERIFICATION to run this test"
+            );
+        }
+
+        /// Positive control: the harness sees a fetch when the checks pass.
+        #[tokio::test]
+        async fn valid_cert_url_and_topic_reach_the_fetch() {
+            assert_verification_on();
+            let (addr, hits) = counting_listener().await;
+            let client = client_to(addr, &["sns.us-east-1.amazonaws.com"]);
+            let json = notification("https://sns.us-east-1.amazonaws.com/cert.pem", TOPIC);
+            let status = super::super::sns_verify::verify(&json, &client, TOPIC).await;
+            assert_eq!(status, Err(StatusCode::BAD_GATEWAY));
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "one certificate fetch");
+        }
+
+        #[tokio::test]
+        async fn a_valid_subscribe_url_reaches_the_fetch() {
+            let (addr, hits) = counting_listener().await;
+            let client = client_to(addr, &["sns.us-east-1.amazonaws.com"]);
+            let raw = format!(
+                "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&TopicArn={TOPIC}&Token=t"
+            );
+            let status = super::super::sns_verify::handle_subscription(&client, &raw, TOPIC).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "one confirmation fetch");
+        }
+
+        #[tokio::test]
+        async fn a_userinfo_subscribe_url_is_rejected_without_a_fetch() {
+            let (addr, hits) = counting_listener().await;
+            let client = client_to(
+                addr,
+                &["attacker.s3.amazonaws.com", "sns.us-east-1.amazonaws.com"],
+            );
+            let raw = format!(
+                "https://sns.us-east-1.amazonaws.com@attacker.s3.amazonaws.com/\
+                 ?Action=ConfirmSubscription&TopicArn={TOPIC}&Token=t"
+            );
+            let status = super::super::sns_verify::handle_subscription(&client, &raw, TOPIC).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "no confirmation fetch");
+        }
+
         #[tokio::test]
         async fn userinfo_cert_url_is_rejected_without_a_fetch() {
+            assert_verification_on();
             let (addr, hits) = counting_listener().await;
             let client = client_to(
                 addr,
@@ -3464,6 +3542,7 @@ mod tests {
 
         #[tokio::test]
         async fn wrong_topic_is_rejected_without_a_fetch() {
+            assert_verification_on();
             let (addr, hits) = counting_listener().await;
             let client = client_to(addr, &["sns.us-east-1.amazonaws.com"]);
             let json = notification(
@@ -3574,7 +3653,8 @@ mod tests {
             })
             .await;
             let pem = sns_verify::fetch_cert_pem(&client(), &cert_url(addr, "/cert.pem")).await;
-            assert_eq!(pem.map(|p| p.len()), Ok(16 * 1024));
+            let max = usize::try_from(sns_verify::MAX_CERT_BYTES).unwrap();
+            assert_eq!(pem.map(|p| p.len()), Ok(max));
         }
 
         #[tokio::test]
@@ -3622,12 +3702,14 @@ mod tests {
 
         #[tokio::test]
         async fn confirm_subscription_fetch_failure_returns_500() {
-            // Bind, then drop, so the port refuses connections.
-            let addr = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .unwrap()
-                .local_addr()
-                .unwrap();
+            // The server closes each connection with no response.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    drop(stream);
+                }
+            });
             let status = sns_verify::confirm_subscription(&client(), &subscribe_url(addr)).await;
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         }

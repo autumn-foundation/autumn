@@ -1033,17 +1033,18 @@ async fn ses_subscription_status(subscribe_url: &str) -> u16 {
         .as_u16()
 }
 
-/// A `SubscribeURL` outside SNS is refused before any fetch (no blind SSRF).
+/// A `SubscribeURL` outside SNS gets `400`. Hosts outside SNS use `.invalid`, so a
+/// regression does not reach a real host.
 #[cfg(feature = "inbound-ses")]
 #[tokio::test]
 async fn ses_subscription_confirmation_rejects_non_sns_subscribe_urls() {
     let confirm = format!("?Action=ConfirmSubscription&TopicArn={SES_TOPIC}&Token=t");
     for url in [
-        format!("https://sns.example.com/{confirm}"),
-        format!("https://sns.us-east-1.amazonaws.com@attacker.example/{confirm}"),
+        format!("https://sns.example.invalid/{confirm}"),
+        format!("https://sns.us-east-1.amazonaws.com@attacker.invalid/{confirm}"),
         format!("https://sns.us-east-1.amazonaws.com:8443/{confirm}"),
         format!("http://sns.us-east-1.amazonaws.com/{confirm}"),
-        format!("https://169.254.169.254/latest/meta-data/{confirm}"),
+        format!("https://metadata.invalid/latest/meta-data/{confirm}"),
         "https://sns.us-east-1.amazonaws.com/?Action=Publish&Token=t".to_string(),
         "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription\
          &TopicArn=arn:aws:sns:us-east-1:999999999999:other&Token=t"
