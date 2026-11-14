@@ -94,6 +94,10 @@ pub enum NewError {
     /// Filesystem error during project creation.
     #[error("failed to create project: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The vendored assets could not be written.
+    #[error("failed to vendor assets: {0}")]
+    Assets(#[from] crate::assets::AssetsError),
 }
 
 /// Entry point called from `main.rs` and delegates to [`generate_with`].
@@ -540,49 +544,46 @@ pub fn member_workflow(path: &str, rendered: &str, package: &str, dir: &str) -> 
 }
 
 fn scaffold_vendor_assets(project_dir: &Path) -> Result<(), NewError> {
-    let htmx_bytes = autumn_web::HTMX_JS;
+    use crate::assets::{AssetPath, VendorAsset, VendorManifest, compute_sri, write_asset};
+
     let htmx_version = autumn_web::HTMX_VERSION;
-    let htmx_source =
-        format!("https://cdn.jsdelivr.net/npm/htmx.org@{htmx_version}/dist/htmx.min.js");
-    let htmx_file = "js/htmx.min.js";
-    let integrity = crate::assets::compute_sri(htmx_bytes);
+    let vendored: [(&str, &str, String, &str, &[u8]); 2] = [
+        (
+            "htmx",
+            htmx_version,
+            format!("https://cdn.jsdelivr.net/npm/htmx.org@{htmx_version}/dist/htmx.min.js"),
+            "js/htmx.min.js",
+            autumn_web::HTMX_JS,
+        ),
+        (
+            "htmx-ext-sse",
+            "2.2.2",
+            "https://unpkg.com/htmx-ext-sse@2.2.2/sse.js".to_owned(),
+            "js/htmx-ext-sse.min.js",
+            autumn_web::HTMX_SSE_JS,
+        ),
+    ];
 
-    fs::write(project_dir.join("static").join(htmx_file), htmx_bytes)?;
-
-    let sse_bytes = autumn_web::HTMX_SSE_JS;
-    let sse_source = "https://unpkg.com/htmx-ext-sse@2.2.2/sse.js".to_owned();
-    let sse_file = "js/htmx-ext-sse.min.js";
-    let sse_integrity = crate::assets::compute_sri(sse_bytes);
-
-    fs::write(project_dir.join("static").join(sse_file), sse_bytes)?;
-
+    let static_dir = project_dir.join("static");
     let mut assets = std::collections::BTreeMap::new();
-    assets.insert(
-        "htmx".to_owned(),
-        crate::assets::VendorAsset {
-            version: htmx_version.to_owned(),
-            source: htmx_source,
-            file: htmx_file.to_owned(),
-            integrity,
-        },
-    );
-    assets.insert(
-        "htmx-ext-sse".to_owned(),
-        crate::assets::VendorAsset {
-            version: "2.2.2".to_owned(),
-            source: sse_source,
-            file: sse_file.to_owned(),
-            integrity: sse_integrity,
-        },
-    );
-    let manifest = crate::assets::VendorManifest {
+    for (name, version, source, file, bytes) in vendored {
+        let file = AssetPath::new(file)?;
+        write_asset(&static_dir, &file, bytes)?;
+        assets.insert(
+            name.to_owned(),
+            VendorAsset {
+                version: version.to_owned(),
+                source,
+                file,
+                integrity: compute_sri(bytes),
+            },
+        );
+    }
+    let manifest = VendorManifest {
         version: "1".to_owned(),
         assets,
     };
-    let manifest_path = project_dir.join("static").join(".autumn-assets.json");
-    crate::assets::save_manifest(&manifest_path, &manifest)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-
+    crate::assets::save_manifest(&static_dir.join(".autumn-assets.json"), &manifest)?;
     Ok(())
 }
 
