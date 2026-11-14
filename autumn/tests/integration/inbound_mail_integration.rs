@@ -1045,10 +1045,9 @@ async fn ses_subscription_confirmation_rejects_non_sns_subscribe_urls() {
         format!("http://sns.us-east-1.amazonaws.com/{confirm}"),
         format!("https://169.254.169.254/latest/meta-data/{confirm}"),
         "https://sns.us-east-1.amazonaws.com/?Action=Publish&Token=t".to_string(),
-        format!(
-            "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription\
-             &TopicArn=arn:aws:sns:us-east-1:999999999999:other&Token=t"
-        ),
+        "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription\
+         &TopicArn=arn:aws:sns:us-east-1:999999999999:other&Token=t"
+            .to_string(),
     ] {
         assert_eq!(
             ses_subscription_status(&url).await,
