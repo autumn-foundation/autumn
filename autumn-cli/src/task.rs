@@ -179,20 +179,32 @@ fn print_task_table(tasks: &[TaskListing]) {
 mod tests {
     use super::*;
 
-    use std::ffi::OsStr;
     use std::path::Path;
 
-    /// Returns the entry for `key` in `command`. `None` means inherited.
-    /// `Some(None)` means removed. `Some(Some(v))` means set to `v`.
-    fn env_entry<'a>(command: &'a Command, key: &str) -> Option<Option<&'a OsStr>> {
-        command
-            .get_envs()
-            .find(|(name, _)| *name == OsStr::new(key))
-            .map(|(_, value)| value)
+    /// The state of one variable in the child environment.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Env {
+        /// Not touched: the child inherits it.
+        Inherited,
+        /// Explicitly removed.
+        Removed,
+        /// Set to a value.
+        Set(String),
     }
 
-    fn set(value: &str) -> Option<Option<&OsStr>> {
-        Some(Some(OsStr::new(value)))
+    fn env_of(command: &Command, var: &str) -> Env {
+        match command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(var))
+        {
+            None => Env::Inherited,
+            Some((_, None)) => Env::Removed,
+            Some((_, Some(value))) => Env::Set(value.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn set(value: &str) -> Env {
+        Env::Set(value.to_owned())
     }
 
     #[test]
@@ -201,7 +213,7 @@ mod tests {
         // first. An inherited value lists the tasks and does not run the task.
         let command = run_task_command(Path::new("app"), "dev", "cleanup", "[]");
 
-        assert_eq!(env_entry(&command, "AUTUMN_LIST_TASKS"), Some(None));
+        assert_eq!(env_of(&command, "AUTUMN_LIST_TASKS"), Env::Removed);
     }
 
     #[test]
@@ -210,11 +222,7 @@ mod tests {
         let command = run_task_command(Path::new("app"), "dev", "cleanup", "[]");
 
         for &var in crate::routes::ALL_DUMP_MODE_ENVS {
-            assert_eq!(
-                env_entry(&command, var),
-                Some(None),
-                "{var} must be removed"
-            );
+            assert_eq!(env_of(&command, var), Env::Removed, "{var} must be removed");
         }
     }
 
@@ -222,13 +230,13 @@ mod tests {
     fn run_task_command_sets_task_name_args_and_profile() {
         let command = run_task_command(Path::new("app"), "prod", "backfill", r#"["--dry-run"]"#);
 
-        assert_eq!(env_entry(&command, "AUTUMN_RUN_TASK"), set("backfill"));
+        assert_eq!(env_of(&command, "AUTUMN_RUN_TASK"), set("backfill"));
         assert_eq!(
-            env_entry(&command, "AUTUMN_TASK_ARGS_JSON"),
+            env_of(&command, "AUTUMN_TASK_ARGS_JSON"),
             set(r#"["--dry-run"]"#)
         );
-        assert_eq!(env_entry(&command, "AUTUMN_ENV"), set("prod"));
-        assert_eq!(env_entry(&command, "AUTUMN_PROFILE"), set("prod"));
+        assert_eq!(env_of(&command, "AUTUMN_ENV"), set("prod"));
+        assert_eq!(env_of(&command, "AUTUMN_PROFILE"), set("prod"));
     }
 
     #[test]
@@ -236,15 +244,11 @@ mod tests {
         let command = list_tasks_command(Path::new("app"), "staging");
 
         for &var in crate::routes::ALL_DUMP_MODE_ENVS {
-            assert_eq!(
-                env_entry(&command, var),
-                Some(None),
-                "{var} must be removed"
-            );
+            assert_eq!(env_of(&command, var), Env::Removed, "{var} must be removed");
         }
-        assert_eq!(env_entry(&command, "AUTUMN_LIST_TASKS"), set("1"));
-        assert_eq!(env_entry(&command, "AUTUMN_ENV"), set("staging"));
-        assert_eq!(env_entry(&command, "AUTUMN_PROFILE"), set("staging"));
+        assert_eq!(env_of(&command, "AUTUMN_LIST_TASKS"), set("1"));
+        assert_eq!(env_of(&command, "AUTUMN_ENV"), set("staging"));
+        assert_eq!(env_of(&command, "AUTUMN_PROFILE"), set("staging"));
     }
 
     #[test]
