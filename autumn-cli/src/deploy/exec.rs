@@ -71,6 +71,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::proxy::{ProxyCompatFailure, ProxyController};
+pub use super::ssh_ident::{SshHost, SshIdentError, SshUser};
 use super::{PreflightCheck, ResolvedDeployConfig};
 
 /// A secret string (e.g. the env-file body carrying the signing secret and
@@ -409,30 +410,46 @@ pub trait DeployExecutor {
 }
 
 /// The SSH target derived from a resolved `[deploy]` config.
+///
+/// The user and host are validated types, so `ssh` and `scp` cannot read them
+/// as options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshTarget {
-    /// SSH-reachable host (already validated non-blank).
-    pub host: String,
+    /// SSH host.
+    pub host: SshHost,
     /// SSH user.
-    pub user: String,
+    pub user: SshUser,
     /// SSH port.
     pub port: u16,
 }
 
 impl SshTarget {
-    /// Build an SSH target from a resolved config, returning `None` when no host
-    /// is configured (preflight rejects that case before we ever get here).
-    #[must_use]
-    pub fn from_resolved(cfg: &ResolvedDeployConfig) -> Option<Self> {
+    /// Build an SSH target from raw config values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshIdentError`] when the user or host is not valid.
+    pub fn new(host: &str, user: &str, port: u16) -> Result<Self, SshIdentError> {
+        Ok(Self {
+            host: SshHost::parse(host)?,
+            user: SshUser::parse(user)?,
+            port,
+        })
+    }
+
+    /// Build an SSH target from a resolved config. Returns `Ok(None)` when no
+    /// host is configured (preflight rejects that case before we get here).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SshIdentError`] when the user or host is not valid.
+    pub fn from_resolved(cfg: &ResolvedDeployConfig) -> Result<Option<Self>, SshIdentError> {
         cfg.host
             .as_deref()
             .map(str::trim)
             .filter(|h| !h.is_empty())
-            .map(|host| Self {
-                host: host.to_owned(),
-                user: cfg.user.clone(),
-                port: cfg.ssh_port,
-            })
+            .map(|host| Self::new(host, &cfg.user, cfg.ssh_port))
+            .transpose()
     }
 }
 
@@ -473,10 +490,15 @@ const SSH_BATCH_OPTS: [&str; 10] = [
 
 /// Build the argv passed to the system `ssh` binary to run `remote_shell` on the
 /// target. Pure — exposed so tests assert the exact vector without executing.
+///
+/// `--` ends the options. Then `ssh` cannot read the destination or the remote
+/// command as an option. This is a second barrier after the [`SshUser`] and
+/// [`SshHost`] checks.
 #[must_use]
 pub fn ssh_argv(target: &SshTarget, remote_shell: &str) -> Vec<String> {
     let mut argv = vec!["-p".to_owned(), target.port.to_string()];
     argv.extend(SSH_BATCH_OPTS.iter().map(|s| (*s).to_owned()));
+    argv.push("--".to_owned());
     argv.push(format!("{}@{}", target.user, target.host));
     argv.push(remote_shell.to_owned());
     argv
@@ -485,12 +507,20 @@ pub fn ssh_argv(target: &SshTarget, remote_shell: &str) -> Vec<String> {
 /// Build the argv passed to the system `scp` binary to copy `local` to
 /// `remote_path` on the target. Pure — exposed so tests assert the exact vector.
 /// Note `scp` spells the port `-P` (uppercase), unlike `ssh`'s `-p`.
+///
+/// `--` ends the options, as in [`ssh_argv`]. An IPv6 host goes in brackets.
 #[must_use]
 pub fn scp_argv(target: &SshTarget, local: &Path, remote_path: &str) -> Vec<String> {
     let mut argv = vec!["-P".to_owned(), target.port.to_string()];
     argv.extend(SSH_BATCH_OPTS.iter().map(|s| (*s).to_owned()));
+    argv.push("--".to_owned());
     argv.push(local.display().to_string());
-    argv.push(format!("{}@{}:{}", target.user, target.host, remote_path));
+    argv.push(format!(
+        "{}@{}:{}",
+        target.user,
+        target.host.scp_form(),
+        remote_path
+    ));
     argv
 }
 
@@ -4575,11 +4605,8 @@ mod tests {
 
     #[test]
     fn ssh_upload_refuses_a_hostile_path_before_it_runs_scp() {
-        let exec = SshExecutor::new(SshTarget {
-            host: "203.0.113.10".to_owned(),
-            user: "root".to_owned(),
-            port: 22,
-        });
+        let exec =
+            SshExecutor::new(SshTarget::new("203.0.113.10", "root", 22).expect("valid target"));
         // The local file does not exist, so a spawned `scp` would fail with a
         // different message.
         let err = exec
@@ -8100,11 +8127,7 @@ mod tests {
         // preflight is a bare TCP connect, so a host that accepts TCP and hangs the SSH
         // handshake would block the deploy forever. Assert the exact argv, never
         // `contains`, so any change to the option set is deliberate.
-        let target = SshTarget {
-            host: "203.0.113.10".to_owned(),
-            user: "deploy".to_owned(),
-            port: 2222,
-        };
+        let target = SshTarget::new("203.0.113.10", "deploy", 2222).expect("valid target");
 
         let ssh = ssh_argv(&target, "systemctl daemon-reload");
         assert_eq!(
@@ -8122,6 +8145,8 @@ mod tests {
                 "ServerAliveInterval=15".to_owned(),
                 "-o".to_owned(),
                 "ServerAliveCountMax=4".to_owned(),
+                // `--` ends the options, so the destination is never an option.
+                "--".to_owned(),
                 "deploy@203.0.113.10".to_owned(),
                 "systemctl daemon-reload".to_owned(),
             ]
@@ -8150,10 +8175,94 @@ mod tests {
                 "ServerAliveInterval=15".to_owned(),
                 "-o".to_owned(),
                 "ServerAliveCountMax=4".to_owned(),
+                "--".to_owned(),
                 "/local/target/release/myapp".to_owned(),
                 "deploy@203.0.113.10:/srv/autumn/myapp/releases/r1/myapp".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn argv_ends_options_before_every_operand() {
+        // `ssh` and `scp` read an operand that starts with `-` as an option.
+        // `--` must come after the fixed options and before the first operand.
+        let target = SshTarget::new("203.0.113.10", "deploy", 22).expect("valid target");
+        let ssh = ssh_argv(&target, "-oProxyCommand=x");
+        let end = ssh
+            .iter()
+            .position(|a| a == "--")
+            .expect("ssh argv has `--`");
+        assert_eq!(&ssh[end + 1..], ["deploy@203.0.113.10", "-oProxyCommand=x"]);
+
+        let scp = scp_argv(&target, Path::new("-oProxyCommand=x"), "/srv/a");
+        let end = scp
+            .iter()
+            .position(|a| a == "--")
+            .expect("scp argv has `--`");
+        assert_eq!(
+            &scp[end + 1..],
+            ["-oProxyCommand=x", "deploy@203.0.113.10:/srv/a"]
+        );
+    }
+
+    #[test]
+    fn scp_argv_brackets_an_ipv6_host() {
+        // `scp` splits `host:path` at the first `:`. An IPv6 host needs brackets.
+        let target = SshTarget::new("2001:db8::1", "deploy", 22).expect("valid target");
+        let scp = scp_argv(&target, Path::new("/local/app"), "/srv/app");
+        assert_eq!(
+            scp.last().map(String::as_str),
+            Some("deploy@[2001:db8::1]:/srv/app")
+        );
+        let ssh = ssh_argv(&target, "true");
+        assert!(ssh.contains(&"deploy@2001:db8::1".to_owned()), "{ssh:?}");
+    }
+
+    #[test]
+    fn ssh_target_refuses_option_shaped_user_and_host() {
+        let bad = "-oProxyCommand=touch /tmp/pwned";
+        assert_eq!(
+            SshTarget::new("203.0.113.10", bad, 22),
+            Err(SshIdentError::InvalidUser(bad.to_owned()))
+        );
+        assert_eq!(
+            SshTarget::new(bad, "deploy", 22),
+            Err(SshIdentError::InvalidHost(bad.to_owned()))
+        );
+    }
+
+    #[test]
+    fn from_resolved_validates_user_and_host() {
+        let bad = "-oProxyCommand=touch /tmp/pwned";
+        let good = resolved();
+        let target = SshTarget::from_resolved(&good)
+            .expect("valid config")
+            .expect("host is set");
+        assert_eq!(target.host.as_str(), "203.0.113.10");
+        assert_eq!(target.user.as_str(), "root");
+
+        let no_host = ResolvedDeployConfig {
+            host: None,
+            ..good.clone()
+        };
+        assert_eq!(SshTarget::from_resolved(&no_host), Ok(None));
+
+        let bad_user = ResolvedDeployConfig {
+            user: bad.to_owned(),
+            ..good.clone()
+        };
+        assert!(matches!(
+            SshTarget::from_resolved(&bad_user),
+            Err(SshIdentError::InvalidUser(_))
+        ));
+        let bad_host = ResolvedDeployConfig {
+            host: Some(bad.to_owned()),
+            ..good
+        };
+        assert!(matches!(
+            SshTarget::from_resolved(&bad_host),
+            Err(SshIdentError::InvalidHost(_))
+        ));
     }
 
     #[test]

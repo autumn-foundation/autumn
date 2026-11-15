@@ -400,11 +400,16 @@ it is the documented env-over-TOML precedence applied to the spelling you did
 > | `app_name`, `service_name`, `profile` | 1 to 128 ASCII letters, digits, `_`, `.`, `-`. Start with a letter, a digit or `_`. |
 > | `user` | 1 to 64 ASCII letters, digits, `_`, `.`, `-`, `@`. Start with a letter, a digit or `_`. |
 > | `app_dir` | An absolute path of 1 to 1024 ASCII letters, digits, `/`, `_`, `.`, `-`, `+`, `@`, `:`. |
-> | `host`, `hosts` | 1 to 255 ASCII letters, digits, `_`, `.`, `-`, `:`, `%`, `[`, `]`. Do not start with `-`. |
+> | `host`, `hosts` | An IPv6 address without brackets. It can have a zone, for example `fe80::1%eth0`. Or a name or IPv4 address of 1 to 253 ASCII letters, digits, `_`, `.`, `-`. Start a name with a letter or a digit. |
 >
 > The check also applies to a default. If you do not set `app_name`, it comes
 > from the package name or the directory name. If that name fails the check,
-> set `app_name`. `autumn doctor` reports the same failure as `deploy_config`.
+> set `app_name`. `autumn doctor` reports the same failure as `deploy_config`,
+> or as `deploy_host` for a host.
+>
+> `ssh` and `scp` read an argument that starts with `-` as an option. An option
+> such as `ProxyCommand` runs a local command. For a host that needs other
+> characters, add a `Host` alias in `~/.ssh/config` and use the alias here.
 
 Put these two values in a project `.env` (git-ignored — never committed). The
 deploy reads them and writes **only** them to a `0600` env file

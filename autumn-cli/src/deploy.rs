@@ -28,6 +28,7 @@ pub mod exec;
 mod fleet;
 pub mod media;
 pub mod proxy;
+mod ssh_ident;
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -489,14 +490,8 @@ pub(crate) fn trimmed_deploy_profile(raw: &str) -> String {
 /// at most `-migrate-<release id>.service`.
 const DEPLOY_NAME_MAX_LEN: usize = 128;
 
-/// Maximum length of `[deploy] user`.
-const DEPLOY_USER_MAX_LEN: usize = 64;
-
 /// Maximum length of `[deploy] app_dir`.
 const DEPLOY_DIR_MAX_LEN: usize = 1024;
-
-/// Maximum length of a deploy host. DNS names stop at 253 bytes.
-const DEPLOY_HOST_MAX_LEN: usize = 255;
 
 /// Whether `value` is 1 to `max_len` bytes, its first character passes
 /// `first`, and each other character passes `rest`.
@@ -528,11 +523,6 @@ const fn is_dir_char(c: char) -> bool {
     is_name_char(c) || matches!(c, '/' | '+' | '@' | ':')
 }
 
-/// A character that is safe in a host name or an IP address.
-const fn is_host_char(c: char) -> bool {
-    is_name_char(c) || matches!(c, ':' | '%' | '[' | ']')
-}
-
 /// Check a `[deploy]` name: `service_name`, `app_name` or `profile`.
 ///
 /// The name goes into unit names, unit files, remote paths and remote shell
@@ -549,16 +539,12 @@ fn check_deploy_name(key: &str, value: &str, origin: &str) -> Result<(), String>
 }
 
 /// Check `[deploy] user`. It goes into the SSH target and the unit `User=`.
+/// [`exec::SshUser`] holds the rule, so the deploy, doctor and SSH paths use
+/// one check.
 fn check_deploy_user(value: &str) -> Result<(), String> {
-    if is_safe_word(value, DEPLOY_USER_MAX_LEN, is_name_start, |c| {
-        is_name_char(c) || c == '@'
-    }) {
-        return Ok(());
-    }
-    Err(format!(
-        "[deploy] user {value:?} is not a safe user name: use 1 to {DEPLOY_USER_MAX_LEN} \
-         ASCII letters, digits, `_`, `.`, `-` or `@`, and start with a letter, a digit or `_`"
-    ))
+    exec::SshUser::parse(value)
+        .map(drop)
+        .map_err(|e| e.to_string())
 }
 
 /// Check `[deploy] app_dir`. It goes into remote paths and the unit file.
@@ -574,20 +560,12 @@ fn check_deploy_dir(value: &str) -> Result<(), String> {
 }
 
 /// Check a deploy host. It goes into the `ssh` and `scp` argv, and a local
-/// `ssh` config can put it into a shell line (`%h`).
+/// `ssh` config can put it into a shell line (`%h`). [`exec::SshHost`] holds
+/// the rule, so the deploy, doctor and SSH paths use one check.
 fn check_deploy_host(value: &str) -> Result<(), String> {
-    if is_safe_word(
-        value,
-        DEPLOY_HOST_MAX_LEN,
-        |c| c != '-' && is_host_char(c),
-        is_host_char,
-    ) {
-        return Ok(());
-    }
-    Err(format!(
-        "[deploy] host {value:?} is not a safe host name: use 1 to {DEPLOY_HOST_MAX_LEN} \
-         ASCII letters, digits, `_`, `.`, `-`, `:`, `%`, `[` or `]`, and do not start with `-`"
-    ))
+    exec::SshHost::parse(value)
+        .map(drop)
+        .map_err(|e| e.to_string())
 }
 
 /// The names [`ResolvedDeployConfig::resolve`] derives from a [`DeployConfig`].
@@ -916,6 +894,18 @@ fn deploy_host_list_unchecked(cfg: &DeployConfig) -> Result<Vec<String>, String>
     }
 
     Ok(hosts)
+}
+
+/// Build the `ssh`/`scp` executor for one host.
+///
+/// Every deploy, status, rollback and maintenance path uses this. It refuses a
+/// user or host that `ssh` can read as an option. A missing host gives
+/// [`DEPLOY_HOST_MISSING_DETAIL`].
+fn ssh_executor(cfg: &ResolvedDeployConfig) -> Result<exec::SshExecutor, DeployError> {
+    exec::SshTarget::from_resolved(cfg)
+        .map_err(|e| DeployError::Config(e.to_string()))?
+        .map(exec::SshExecutor::new)
+        .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
 }
 
 /// Narrow the configured host list to the `--only` selection (issue #1621, §3.2)
@@ -2110,11 +2100,7 @@ pub fn run(action: DeployAction, options: &DeployOptions) -> Result<(), DeployEr
                 &resolved.profile,
                 action,
                 options.maintenance.as_ref(),
-                |cfg| {
-                    exec::SshTarget::from_resolved(cfg)
-                        .map(exec::SshExecutor::new)
-                        .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
-                },
+                ssh_executor,
             )
         }
         DeployAction::Up => {
@@ -4027,13 +4013,7 @@ fn run_up(
             metrics_path: &metrics_path,
             bake_host: bake_host.as_deref(),
         },
-        // Unreachable: preflight already proved every host is present. Return the config
-        // error rather than panic.
-        |cfg| {
-            exec::SshTarget::from_resolved(cfg)
-                .map(exec::SshExecutor::new)
-                .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
-        },
+        ssh_executor,
     )
 }
 
@@ -5639,11 +5619,7 @@ fn run_rollback(
         .with_tls_host(resolved.tls_host.clone());
 
     if fleet_rollback {
-        return run_fleet_rollback_with(&checks, &fleet, &proxy, public_port, |cfg| {
-            exec::SshTarget::from_resolved(cfg)
-                .map(exec::SshExecutor::new)
-                .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
-        });
+        return run_fleet_rollback_with(&checks, &fleet, &proxy, public_port, ssh_executor);
     }
 
     // A hostless fleet is a config error, not an index panic (#2274).
@@ -5651,9 +5627,7 @@ fn run_rollback(
         .hosts
         .first()
         .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
-    let target = exec::SshTarget::from_resolved(single)
-        .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))?;
-    let executor = exec::SshExecutor::new(target);
+    let executor = ssh_executor(single)?;
 
     let rollback_target = exec::resolve_rollback_target(single, public_port, &executor)
         .map_err(|e| DeployError::Exec(e.to_string()))?;
@@ -6071,11 +6045,7 @@ fn run_status(
             port.port
         ),
     );
-    let statuses = collect_fleet_status(fleet, port.port, |cfg| {
-        exec::SshTarget::from_resolved(cfg)
-            .map(exec::SshExecutor::new)
-            .ok_or_else(|| DeployError::Config(DEPLOY_HOST_MISSING_DETAIL.to_owned()))
-    })?;
+    let statuses = collect_fleet_status(fleet, port.port, ssh_executor)?;
     let report = fleet::fleet_drift(&statuses);
     if options.json {
         // Reports (like `plan`) go to stdout; a `Value` cannot fail to serialise.
@@ -6937,6 +6907,76 @@ mod tests {
         let shared = group_cfg(&[("web", &["10.0.0.1"]), ("worker", &["10.0.0.1"])]);
         let err = deploy_host_list(&shared).unwrap_err();
         assert!(err.contains("more than once"), "{err}");
+    }
+
+    /// A value that `ssh` reads as an option. `ProxyCommand` runs it locally.
+    const OPTION_SHAPED: &str = "-oProxyCommand=touch /tmp/pwned";
+
+    #[test]
+    fn deploy_host_list_refuses_an_option_shaped_host() {
+        for cfg in [
+            DeployConfig {
+                host: Some(format!(" {OPTION_SHAPED} ")),
+                ..DeployConfig::default()
+            },
+            fleet_cfg(&["10.0.0.1", OPTION_SHAPED]),
+            group_cfg(&[("web", &["10.0.0.1"]), ("worker", &[OPTION_SHAPED])]),
+        ] {
+            let err = deploy_host_list(&cfg).expect_err("an option-shaped host is refused");
+            assert!(
+                err.contains("`[deploy] host`") && err.contains(OPTION_SHAPED),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_host_list_keeps_valid_targets() {
+        let cfg = DeployConfig {
+            user: "deploy_user".to_owned(),
+            ..fleet_cfg(&["web-1.example.com", "203.0.113.10", "2001:db8::1"])
+        };
+        assert_eq!(
+            deploy_host_list(&cfg).expect("valid targets"),
+            ["web-1.example.com", "203.0.113.10", "2001:db8::1"]
+        );
+    }
+
+    #[test]
+    fn ssh_executor_refuses_option_shaped_values_and_keeps_the_missing_host_error() {
+        let good = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("10.0.0.1".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("resolves");
+        assert!(ssh_executor(&good).is_ok());
+
+        for bad in [
+            ResolvedDeployConfig {
+                user: OPTION_SHAPED.to_owned(),
+                ..good.clone()
+            },
+            ResolvedDeployConfig {
+                host: Some(OPTION_SHAPED.to_owned()),
+                ..good.clone()
+            },
+        ] {
+            match ssh_executor(&bad) {
+                Err(DeployError::Config(message)) => {
+                    assert!(message.contains(OPTION_SHAPED), "{message}");
+                }
+                other => panic!("expected a config error, got {other:?}"),
+            }
+        }
+
+        let hostless = ResolvedDeployConfig { host: None, ..good };
+        match ssh_executor(&hostless) {
+            Err(DeployError::Config(message)) => assert_eq!(message, DEPLOY_HOST_MISSING_DETAIL),
+            other => panic!("expected a config error, got {other:?}"),
+        }
     }
 
     #[test]

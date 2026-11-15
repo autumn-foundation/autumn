@@ -1987,6 +1987,12 @@ impl Default for DeployBakeConfig {
 pub struct DeployConfig {
     /// SSH-reachable address (hostname or IP) of the target server.
     ///
+    /// Use an IPv6 address without brackets (a zone such as `%eth0` is
+    /// permitted), or a host name or IPv4 address. A name uses only ASCII
+    /// letters, digits, `.`, `_` and `-`, and starts with a letter or digit.
+    /// `autumn deploy` refuses other values. This rule also applies to
+    /// [`hosts`](Self::hosts) and group hosts.
+    ///
     /// Required when a deploy actually runs (`autumn deploy`), but `None` is
     /// valid at rest so a bare `[deploy]` table parses. Enforced by
     /// [`validate`](Self::validate).
