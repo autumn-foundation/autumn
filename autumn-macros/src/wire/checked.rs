@@ -1261,19 +1261,28 @@ fn pattern_names(
         }
         _ => {
             let mut names = Vec::new();
-            for tt in pat {
-                match tt {
-                    proc_macro2::TokenTree::Ident(x) => names.push((x.to_string(), None)),
-                    proc_macro2::TokenTree::Group(g) => {
-                        let inner: Vec<proc_macro2::TokenTree> = g.stream().into_iter().collect();
-                        names.extend(pattern_names(&inner, None));
-                    }
-                    _ => {}
-                }
+            let tokens: TokenStream = pat.iter().cloned().collect();
+            match syn::parse::Parser::parse2(syn::Pat::parse_multi_with_leading_vert, tokens) {
+                Ok(parsed) => PatternNames(&mut names).visit_pat(&parsed),
+                // Not a pattern syn knows: every name in it shadows.
+                Err(_) => every_name(pat, &mut names),
             }
             names
         }
     }
+}
+
+/// Collects the names a parsed pattern binds, each shadowed. A field label
+/// or a path in the pattern binds nothing.
+struct PatternNames<'n>(&'n mut Vec<(String, Option<Held>)>);
+
+impl Visit<'_> for PatternNames<'_> {
+    fn visit_pat_ident(&mut self, pat: &syn::PatIdent) {
+        self.0.push((pat.ident.to_string(), None));
+        visit::visit_pat_ident(self, pat);
+    }
+
+    fn visit_expr(&mut self, _: &Expr) {}
 }
 
 /// Whether `tt` is the punctuation `ch`.
@@ -1420,7 +1429,7 @@ fn macro_bindings(
             // `match value { … }`: the arms bind `value`. A maud `@match` is
             // the same.
             proc_macro2::TokenTree::Ident(id) if id == "match" => {
-                if let Some(body) = brace_at(tts, i + 1) {
+                if let Some(body) = match_body(tts, i) {
                     let value =
                         held_value(&tts[i + 1..body], &|name| held_at(&out, i, name, lookup));
                     let maud = is_punct(i.checked_sub(1).and_then(|k| tts.get(k)), '@');
@@ -1444,6 +1453,24 @@ fn macro_bindings(
         bindings: out,
         matches,
     }
+}
+
+/// The arms group of the `match` at `at`: the first `{ }` group after a
+/// whole scrutinee. So the block of `match { x } { … }` is the scrutinee.
+fn match_body(tts: &[proc_macro2::TokenTree], at: usize) -> Option<usize> {
+    let scrutinee = |end: usize| {
+        let tokens: TokenStream = tts[at + 1..end].iter().cloned().collect();
+        syn::parse::Parser::parse2(Expr::parse_without_eager_brace, tokens).is_ok()
+    };
+    let first = brace_at(tts, at + 1)?;
+    let mut body = first;
+    while !scrutinee(body) {
+        match brace_at(tts, body + 1) {
+            Some(next) => body = next,
+            None => return Some(first),
+        }
+    }
+    Some(body)
 }
 
 /// What each element of a loop over `tts` holds. `tts` is a nested list with
@@ -2451,6 +2478,40 @@ mod tests {
         assert_eq!(
             nested_reads("my! { match other { $x => item.name } (item.id) }"),
             ["id"]
+        );
+    }
+
+    #[test]
+    fn a_block_scrutinee_is_not_the_match_arms() {
+        assert_eq!(
+            nested_reads("html! { (match { item.kind } { _ => \"ok\" }) }"),
+            ["kind"]
+        );
+        assert_eq!(
+            nested_reads(
+                "html! { @match { &item.details } { Some(d) => { (d.color) } None => {} } }"
+            ),
+            ["details"]
+        );
+    }
+
+    #[test]
+    fn a_field_label_or_a_path_in_a_pattern_does_not_shadow() {
+        assert_eq!(
+            nested_reads("html! { (match other { Other { item: _ } => item.name }) }"),
+            ["name"]
+        );
+        assert_eq!(
+            nested_reads("html! { @if let Other { item: x } = other { (item.name) (x.y) } }"),
+            ["name"]
+        );
+        assert_eq!(
+            nested_reads("html! { @if let item::Kind(x) = other { (item.id) } }"),
+            ["id"]
+        );
+        assert_eq!(
+            nested_reads("html! { @if let Other { item, .. } = other { (item.name) } }"),
+            [] as [&str; 0]
         );
     }
 
