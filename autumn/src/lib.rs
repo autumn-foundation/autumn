@@ -705,6 +705,9 @@ pub mod runtime_config;
 pub mod seed;
 #[cfg(feature = "slo")]
 pub mod slo;
+/// An in-process error budget burn meter for an [`slo::Slo`].
+#[cfg(feature = "slo")]
+pub mod slo_meter;
 
 // ── Fake-seeder registration forwarding ─────────────────────────────────────
 //
