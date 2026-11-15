@@ -96,6 +96,7 @@ fn clear_competing_one_shot_env(command: &mut Command) {
     for var in [
         "AUTUMN_BUILD_STATIC",
         "AUTUMN_DUMP_ROUTES",
+        "AUTUMN_DUMP_OPENAPI",
         "AUTUMN_DUMP_CACHE_COHERENCE",
         "AUTUMN_DUMP_DATA_FLOW",
         "AUTUMN_DUMP_AGENT_AUTHORITY",
@@ -299,6 +300,7 @@ mod tests {
         let competing_vars = [
             "AUTUMN_BUILD_STATIC",
             "AUTUMN_DUMP_ROUTES",
+            "AUTUMN_DUMP_OPENAPI",
             "AUTUMN_DUMP_CACHE_COHERENCE",
             "AUTUMN_DUMP_DATA_FLOW",
             "AUTUMN_DUMP_AGENT_AUTHORITY",
@@ -309,6 +311,7 @@ mod tests {
             "AUTUMN_MIGRATE",
             "AUTUMN_RETENTION_DRY_RUN",
             "AUTUMN_DB_RETENTION",
+            "AUTUMN_DATA_CAPSULE",
             "AUTUMN_REPLAY_CAPSULE",
         ];
         let mut command = Command::new("true");
