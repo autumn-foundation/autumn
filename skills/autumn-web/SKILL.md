@@ -3495,6 +3495,18 @@ The files are Prometheus burn-rate rules and alerts (14.4x over 1h/5m, 6x over
 Rollouts `AnalysisTemplate`, Flagger `MetricTemplate`s and Helm values. Route
 and latency SLOs read the request-duration histogram (issue #3064).
 
+To act on a burning budget inside the app, use
+`autumn_web::slo_meter::BurnMeter` (`slo` feature). Build it from a validated
+`Slo`, call `record(good)` per event, and check `firing(&BURN_WINDOWS[0])`
+(both windows over the factor, as in the generated alert) or
+`burn_tenths_at(now, window)`. Memory is `retention / bucket` slots:
+
+```rust
+let meter = Arc::new(BurnMeter::new(&slo, Duration::from_mins(1), Duration::from_hours(1)));
+meter.record(status < 500);
+if meter.firing(&slo::BURN_WINDOWS[0]) { /* shed optional work */ }
+```
+
 Bake each host after its cutover; roll it back on a 5xx or latency breach or a
 restart (off by default):
 
