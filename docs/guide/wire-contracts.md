@@ -1011,11 +1011,18 @@ on some changes:
   crate, because the name can also be a local function. Write
   `routes![mesh_catalog::get_item]` to have the check judge it.
 * The check sees a nested read through field access, a struct pattern, a
-  `let`, `if let` or `match` binding, a macro body, a maud `@let` or
-  `@if let`, `unwrap`, `clone`, `as_ref`, and the `Option` and `Result`
-  callbacks (`item.details.as_ref().map(|d| d.color)`).
-* A loop, an index or another method call stops the path.
-  `item.details.lines[0].price` reads `details.lines` only.
+  `let`, `if let` or `match` binding, a macro body, a maud `@let`,
+  `@if let`, `@match` or `@for`, `unwrap`, `clone`, `as_ref`, and the
+  `Option` and `Result` callbacks (`item.details.as_ref().map(|d| d.color)`).
+  A typed binding keeps the path: `@let d: &Details = &item.details`.
+* A loop or an index over a nested list keeps the path. `for l in
+  &item.lines` and `item.lines[0].price` read `lines.price`. A loop or an
+  index over the whole response does not read its fields.
+* Another method call stops the path. `item.lines.first()` and
+  `item.lines.iter().map(…)` read `lines` only.
+* In a macro body, a binding holds the value only for `x`, `Some(x)` and
+  `Ok(x)`. Another pattern, such as `Some(Details { color, .. })`, does not
+  read the fields it names.
 * A field with more than one nested type, such as `Envelope<Payload>`, gives
   the same nested reads and writes to each type.
 * The check knows a nested write-set only when the call site sets a named
