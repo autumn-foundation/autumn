@@ -23,13 +23,13 @@
 //! .unwrap()
 //! .remove(0);
 //!
-//! let meter = BurnMeter::new(&slo, Duration::from_secs(60), Duration::from_secs(3_600));
+//! let meter = BurnMeter::new(&slo, Duration::from_mins(1), Duration::from_hours(1));
 //! let now = Instant::now();
 //! for i in 0..1_000 {
 //!     meter.record_at(now, i % 50 != 0); // 2% errors
 //! }
 //! // A 0.1% budget burned at 2% is a burn rate of 20×.
-//! assert_eq!(meter.burn_tenths_at(now, Duration::from_secs(300)), Some(200));
+//! assert_eq!(meter.burn_tenths_at(now, Duration::from_mins(5)), Some(200));
 //! assert!(meter.firing_at(now, &BURN_WINDOWS[0]));
 //! ```
 //!
@@ -145,6 +145,7 @@ impl BurnMeter {
         } else {
             slot.bad += 1;
         }
+        drop(ring);
     }
 
     /// The counts over the `window` that ends at `now`.
@@ -155,7 +156,9 @@ impl BurnMeter {
         let ring = self.lock();
         let newest = self.epoch(&ring, now);
         let len = ring.slots.len() as u64;
-        let span = duration_nanos(window).div_ceil(self.bucket_nanos).clamp(1, len);
+        let span = duration_nanos(window)
+            .div_ceil(self.bucket_nanos)
+            .clamp(1, len);
         let oldest = newest.saturating_sub(span - 1);
         ring.slots
             .iter()
@@ -243,7 +246,7 @@ mod tests {
     use super::*;
     use crate::slo::{BURN_WINDOWS, SliKind, SloConfig, validate};
 
-    const MINUTE: Duration = Duration::from_secs(60);
+    const MINUTE: Duration = Duration::from_mins(1);
 
     fn slo(objective: f64) -> Slo {
         validate(&[SloConfig {
@@ -269,28 +272,25 @@ mod tests {
 
     #[test]
     fn no_events_has_no_burn_rate() {
-        let meter = BurnMeter::new(&slo(99.9), MINUTE, Duration::from_secs(3_600));
+        let meter = BurnMeter::new(&slo(99.9), MINUTE, Duration::from_hours(1));
         assert_eq!(meter.burn_tenths_at(Instant::now(), MINUTE), None);
         assert!(!meter.firing(&BURN_WINDOWS[0]));
     }
 
     #[test]
     fn burn_rate_is_error_ratio_over_budget() {
-        let meter = BurnMeter::new(&slo(99.0), MINUTE, Duration::from_secs(3_600));
+        let meter = BurnMeter::new(&slo(99.0), MINUTE, Duration::from_hours(1));
         let now = Instant::now();
         // 1% budget, 1% errors: burning exactly at the objective.
         record(&meter, now, 99, 1);
         assert_eq!(meter.budget_ppm(), 10_000);
-        assert_eq!(
-            meter.counts_at(now, MINUTE),
-            Counts { good: 99, bad: 1 }
-        );
+        assert_eq!(meter.counts_at(now, MINUTE), Counts { good: 99, bad: 1 });
         assert_eq!(meter.burn_tenths_at(now, MINUTE), Some(10));
     }
 
     #[test]
     fn old_buckets_leave_the_window() {
-        let meter = BurnMeter::new(&slo(99.0), MINUTE, Duration::from_secs(3_600));
+        let meter = BurnMeter::new(&slo(99.0), MINUTE, Duration::from_hours(1));
         let start = Instant::now();
         record(&meter, start, 0, 10);
         let later = start + 10 * MINUTE;
@@ -308,14 +308,14 @@ mod tests {
         let later = start + 5 * MINUTE;
         record(&meter, later, 3, 0);
         assert_eq!(
-            meter.counts_at(later, Duration::from_secs(86_400)),
+            meter.counts_at(later, Duration::from_hours(24)),
             Counts { good: 3, bad: 0 }
         );
     }
 
     #[test]
     fn fast_burn_alert_needs_both_windows() {
-        let meter = BurnMeter::new(&slo(99.9), MINUTE, Duration::from_secs(3_600));
+        let meter = BurnMeter::new(&slo(99.9), MINUTE, Duration::from_hours(1));
         let start = Instant::now();
         let page = &BURN_WINDOWS[0]; // 14.4x over 1h and 5m
         // A burst of errors 30 minutes ago, healthy since.
@@ -346,8 +346,8 @@ mod tests {
     #[test]
     fn parses_burn_window_durations() {
         assert_eq!(parse_window("5m"), Some(5 * MINUTE));
-        assert_eq!(parse_window("6h"), Some(Duration::from_secs(21_600)));
-        assert_eq!(parse_window("3d"), Some(Duration::from_secs(259_200)));
+        assert_eq!(parse_window("6h"), Some(Duration::from_hours(6)));
+        assert_eq!(parse_window("3d"), Some(Duration::from_hours(72)));
         assert_eq!(parse_window("30s"), Some(Duration::from_secs(30)));
         for bad in ["", "m", "5", "5w", "-5m", "+5m", "1.5h"] {
             assert_eq!(parse_window(bad), None, "{bad}");
