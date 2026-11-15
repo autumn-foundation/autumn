@@ -1218,13 +1218,16 @@ fn is_word(tt: Option<&proc_macro2::TokenTree>, w: &str) -> bool {
 /// A pattern without its type: `d: &Details` gives `d`. The cut is at the
 /// first `:` at this level that is not part of `::`.
 fn untyped(pat: &[proc_macro2::TokenTree]) -> &[proc_macro2::TokenTree] {
-    // The first `:` of a `::` is joined to the next one.
-    let in_path = |k: usize| {
-        matches!(pat.get(k), Some(proc_macro2::TokenTree::Punct(p))
-            if p.as_char() == ':' && p.spacing() == proc_macro2::Spacing::Joint)
+    let colon = |k: usize| is_punct(pat.get(k), ':');
+    // The first `:` of a `::` is joined to the second. A `:` is also joined
+    // to a `&` after it, as in `d:&Details`.
+    let opens_path = |k: usize| {
+        colon(k + 1)
+            && matches!(&pat[k], proc_macro2::TokenTree::Punct(p)
+                if p.spacing() == proc_macro2::Spacing::Joint)
     };
     let end = (0..pat.len())
-        .find(|&k| is_punct(pat.get(k), ':') && !in_path(k) && !(k > 0 && in_path(k - 1)))
+        .find(|&k| colon(k) && !opens_path(k) && !(k > 0 && colon(k - 1) && opens_path(k - 1)))
         .unwrap_or(pat.len());
     &pat[..end]
 }
@@ -1321,8 +1324,9 @@ fn maud_binding(
 struct Level {
     /// Names bound over a token range of this level.
     bindings: Vec<MacroBinding>,
-    /// The index of each `match` body, and the value it matches on.
-    matches: BTreeMap<usize, Option<Held>>,
+    /// The index of each `match` body, the value it matches on, and whether
+    /// it is a maud `@match`.
+    matches: BTreeMap<usize, (Option<Held>, bool)>,
 }
 
 /// The kind of tokens at one level of a macro body.
@@ -1330,8 +1334,8 @@ struct Level {
 enum Body<'h> {
     /// Plain tokens.
     Plain,
-    /// The arms of a `match` on this value.
-    Arms(Option<&'h Held>),
+    /// The arms of a `match` on `value`. `maud` is true for a maud `@match`.
+    Arms { value: Option<&'h Held>, maud: bool },
 }
 
 /// What `name` holds at token `at`: the latest binding that covers `at`,
@@ -1367,7 +1371,7 @@ fn macro_bindings(
 ) -> Level {
     let mut out = match body {
         Body::Plain => Vec::new(),
-        Body::Arms(value) => arm_bindings(tts, value),
+        Body::Arms { value, maud } => arm_bindings(tts, value, maud),
     };
     let mut matches = BTreeMap::new();
     let mut i = 0;
@@ -1397,7 +1401,8 @@ fn macro_bindings(
             // `for l in &item.lines { }` binds each element of `lines` over
             // its block. Every other name in the pattern shadows its outer
             // meaning.
-            proc_macro2::TokenTree::Ident(id) if id == "for" => {
+            // `for<'a>` in a type is not a loop.
+            proc_macro2::TokenTree::Ident(id) if id == "for" && !is_punct(tts.get(i + 1), '<') => {
                 if let Some(body) = brace_at(tts, i + 1)
                     && let Some(in_at) = (i + 1..body).find(|&k| is_word(tts.get(k), "in"))
                 {
@@ -1418,7 +1423,8 @@ fn macro_bindings(
                 if let Some(body) = brace_at(tts, i + 1) {
                     let value =
                         held_value(&tts[i + 1..body], &|name| held_at(&out, i, name, lookup));
-                    matches.insert(body, value);
+                    let maud = is_punct(i.checked_sub(1).and_then(|k| tts.get(k)), '@');
+                    matches.insert(body, (value, maud));
                 }
                 i += 1;
             }
@@ -1460,24 +1466,31 @@ fn element_value(
 }
 
 /// The bindings of the arms of a `match` on `value`. An arm is
-/// `pattern [if guard] => body`. The body is one `{ }` group, or the tokens
-/// up to the next `,`. Each arm's names cover its guard and its body.
-fn arm_bindings(tts: &[proc_macro2::TokenTree], value: Option<&Held>) -> Vec<MacroBinding> {
-    let arrow = |k: usize| {
-        matches!(&tts[k], proc_macro2::TokenTree::Punct(p)
-            if p.as_char() == '=' && p.spacing() == proc_macro2::Spacing::Joint)
-            && is_punct(tts.get(k + 1), '>')
+/// `pattern [if guard] => body`. Each arm's names cover its guard and its
+/// body. When the arms are not Rust, every name in them shadows.
+fn arm_bindings(
+    tts: &[proc_macro2::TokenTree],
+    value: Option<&Held>,
+    maud: bool,
+) -> Vec<MacroBinding> {
+    let ranges = if maud {
+        Some(maud_arms(tts))
+    } else {
+        rust_arms(tts)
+    };
+    let Some(ranges) = ranges else {
+        let mut names = Vec::new();
+        every_name(tts, &mut names);
+        return vec![MacroBinding {
+            names,
+            from: 0,
+            to: tts.len(),
+        }];
     };
     let mut out = Vec::new();
-    let mut start = 0;
-    while let Some(at) = (start..tts.len()).find(|&k| arrow(k)) {
-        let body = at + 2;
-        let end = if brace_at(tts, body) == Some(body) {
-            body + 1
-        } else {
-            (body..tts.len())
-                .find(|&k| is_punct(tts.get(k), ','))
-                .unwrap_or(tts.len())
+    for (start, end) in ranges {
+        let Some(at) = (start..end).find(|&k| is_arrow(tts, k)) else {
+            continue;
         };
         let mut pat = &tts[start..at];
         if let Some(guard) = pat.iter().position(|tt| is_word(Some(tt), "if")) {
@@ -1491,9 +1504,73 @@ fn arm_bindings(tts: &[proc_macro2::TokenTree], value: Option<&Held>) -> Vec<Mac
             from: start,
             to: end,
         });
+    }
+    out
+}
+
+/// Whether the tokens at `k` are `=>`.
+fn is_arrow(tts: &[proc_macro2::TokenTree], k: usize) -> bool {
+    matches!(tts.get(k), Some(proc_macro2::TokenTree::Punct(p))
+        if p.as_char() == '=' && p.spacing() == proc_macro2::Spacing::Joint)
+        && is_punct(tts.get(k + 1), '>')
+}
+
+/// The token range of each arm of a maud `@match`. Maud ends a body at its
+/// `{ }` group, or else at the next `,`.
+fn maud_arms(tts: &[proc_macro2::TokenTree]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while let Some(at) = (start..tts.len()).find(|&k| is_arrow(tts, k)) {
+        let body = at + 2;
+        let end = if brace_at(tts, body) == Some(body) {
+            body + 1
+        } else {
+            (body..tts.len())
+                .find(|&k| is_punct(tts.get(k), ','))
+                .unwrap_or(tts.len())
+        };
+        out.push((start, end));
         start = end + usize::from(is_punct(tts.get(end), ','));
     }
     out
+}
+
+/// The token range of each arm of a Rust `match`, or `None` when the tokens
+/// are not Rust arms. syn finds where each arm ends: a block-like body needs
+/// no `,`, and a `,` inside `::<…>` does not end a body.
+fn rust_arms(tts: &[proc_macro2::TokenTree]) -> Option<Vec<(usize, usize)>> {
+    use quote::ToTokens;
+    use syn::parse::{Parse, Parser};
+    let parse = |input: syn::parse::ParseStream<'_>| {
+        let mut arms = Vec::new();
+        while !input.is_empty() {
+            arms.push(syn::Arm::parse(input)?);
+        }
+        Ok(arms)
+    };
+    let arms = parse.parse2(tts.iter().cloned().collect()).ok()?;
+    let mut out = Vec::new();
+    let mut start = 0;
+    for arm in &arms {
+        let end = start + arm.to_token_stream().into_iter().count();
+        out.push((start, end));
+        start = end;
+    }
+    (start == tts.len()).then_some(out)
+}
+
+/// Every name in `tts` and its groups, each shadowed.
+fn every_name(tts: &[proc_macro2::TokenTree], out: &mut Vec<(String, Option<Held>)>) {
+    for tt in tts {
+        match tt {
+            proc_macro2::TokenTree::Ident(id) => out.push((id.to_string(), None)),
+            proc_macro2::TokenTree::Group(g) => {
+                let inner: Vec<proc_macro2::TokenTree> = g.stream().into_iter().collect();
+                every_name(&inner, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Whether the `|` at `i` opens a closure's parameters.
@@ -1583,7 +1660,10 @@ fn scan_tokens(
             let inner = level
                 .matches
                 .get(&i)
-                .map_or(Body::Plain, |value| Body::Arms(value.as_ref()));
+                .map_or(Body::Plain, |(value, maud)| Body::Arms {
+                    value: value.as_ref(),
+                    maud: *maud,
+                });
             scan_tokens(&group.stream(), resolve, &here, inner, reads);
             continue;
         }
@@ -2229,6 +2309,31 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_maud_let_with_no_space_keeps_the_nested_path() {
+        assert_eq!(
+            nested_reads("html! { @let d:&Details = &item.details; (d.color) }"),
+            ["details", "details.color"]
+        );
+    }
+
+    #[test]
+    fn a_path_in_a_maud_pattern_is_not_a_type() {
+        assert_eq!(
+            nested_reads(
+                "let d = &item.details; \
+                 html! { @if let Option::Some(d) = &other { (d.x) } (d.size) }"
+            ),
+            ["details", "details.size"]
+        );
+        assert_eq!(
+            nested_reads(
+                "html! { @if let std::option::Option::Some(d) = &item.details { (d.color) } }"
+            ),
+            ["details"]
+        );
+    }
+
+    #[test]
     fn a_typed_maud_if_let_keeps_the_nested_path() {
         assert_eq!(
             nested_reads(
@@ -2278,6 +2383,89 @@ mod tests {
     }
 
     #[test]
+    fn a_maud_match_arm_with_a_bar_or_a_ref_pattern_keeps_the_nested_path() {
+        assert_eq!(
+            nested_reads(
+                "html! { @match &item.details { | Some(d) => { (d.color) } None => {} } }"
+            ),
+            ["details", "details.color"]
+        );
+        assert_eq!(
+            nested_reads("html! { @match &item.details { &Some(ref d) => (d.size), _ => {} } }"),
+            ["details", "details.size"]
+        );
+    }
+
+    #[test]
+    fn a_maud_match_or_for_sees_the_bindings_before_it() {
+        assert_eq!(
+            nested_reads(
+                "html! { @let d = &item.details; @match d { x if x.on => (x.size), _ => {} } }"
+            ),
+            ["details", "details.on", "details.size"]
+        );
+        assert_eq!(
+            nested_reads("html! { @let ls = &item.rows; @for r in ls { (r.x) } }"),
+            ["rows", "rows.x"]
+        );
+    }
+
+    #[test]
+    fn a_maud_match_inside_a_for_keeps_the_nested_path() {
+        assert_eq!(
+            nested_reads(
+                "html! { @for l in &item.lines { @match &l.kind { Some(k) => (k.name), \
+                 None => {} } } (l.x) }"
+            ),
+            ["lines", "lines.kind", "lines.kind.name"]
+        );
+    }
+
+    #[test]
+    fn a_match_arm_with_no_comma_does_not_reach_the_next_arm() {
+        let calls = calls_of(
+            "async fn page(catalog: CatalogClient) { \
+             let res = catalog.get_item(&id, NoBody).await; \
+             format!(\"{}\", match &res { Ok(r) => if r.on { 1 } else { 2 } Err(r) => r.code }); \
+             format!(\"{}\", match &res { Ok(r) => match r.kind { _ => 1 } Err(r) => r.code }); }",
+        );
+        assert_eq!(calls[0].reads, ["kind", "on"]);
+        assert_eq!(
+            nested_reads(
+                "html! { (match other { A => if c { 1 } else { 2 } item => item.name }) }"
+            ),
+            [] as [&str; 0]
+        );
+    }
+
+    #[test]
+    fn a_comma_in_a_match_arm_turbofish_does_not_end_the_arm() {
+        assert_eq!(
+            nested_reads("html! { (match other { A => f::<u8, u8>(&item.name), _ => 0 }) }"),
+            ["name"]
+        );
+    }
+
+    #[test]
+    fn a_match_in_a_macro_body_that_is_not_rust_shadows_its_names() {
+        assert_eq!(
+            nested_reads("my! { match other { $x => item.name } (item.id) }"),
+            ["id"]
+        );
+    }
+
+    #[test]
+    fn a_higher_ranked_for_is_not_a_loop() {
+        assert_eq!(
+            nested_reads(
+                "my! { let f: &dyn for<'a> Fn(&'a str) = &g(item); \
+                 for x in &item.lines { (item.name) } }"
+            ),
+            ["lines", "name"]
+        );
+    }
+
+    #[test]
     fn a_match_in_a_macro_body_keeps_the_nested_path() {
         assert_eq!(
             nested_reads(
@@ -2304,6 +2492,25 @@ mod tests {
                  @let c = &item.cells[2]; (c.y) }"
             ),
             ["cells", "cells.y", "lines", "lines.price", "rows", "rows.x"]
+        );
+    }
+
+    #[test]
+    fn a_maud_loop_or_index_over_the_whole_response_does_not_read_its_fields() {
+        let calls = calls_of(
+            "async fn page(catalog: CatalogClient) { \
+             let items = catalog.list_items(NoBody).await.unwrap(); \
+             html! { (items[0].id) @for i in &items { (i.name) } \
+             @let f = &items[1]; (f.z) } }",
+        );
+        assert_eq!(calls[0].reads, [] as [&str; 0]);
+    }
+
+    #[test]
+    fn a_maud_loop_variable_shadows_the_response() {
+        assert_eq!(
+            nested_reads("html! { @for item in &item.lines { (item.price) } (item.id) }"),
+            ["id", "lines", "lines.price"]
         );
     }
 

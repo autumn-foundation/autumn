@@ -1017,13 +1017,15 @@ on some changes:
   A typed binding keeps the path: `@let d: &Details = &item.details`.
 * A loop or an index over a nested list keeps the path.
   `for l in &item.lines { l.price }` and `item.lines[0].price` read
-  `lines.price`. A loop or an
-  index over the whole response does not read its fields.
+  `lines.price`. A loop or an index over the whole response does not read
+  its fields.
 * Another method call stops the path. `item.lines.first()` and
   `item.lines.iter().map(…)` read `lines` only.
 * In a macro body, a binding holds the value only for `x`, `Some(x)` and
-  `Ok(x)`. Another pattern, such as `Some(Details { color, .. })`, does not
-  read the fields it names.
+  `Ok(x)`, also with `&`, `ref` or `mut`. Another pattern, such as
+  `Some(Details { color, .. })`, does not read the fields it names. A
+  closure parameter in a macro body does not hold the value:
+  `html! { (item.details.as_ref().map(|d| d.color)) }` reads `details` only.
 * A field with more than one nested type, such as `Envelope<Payload>`, gives
   the same nested reads and writes to each type.
 * The check knows a nested write-set only when the call site sets a named

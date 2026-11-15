@@ -2635,6 +2635,8 @@ mod tests {
             kinds(&report.callee_first),
             [BreakKind::ResponseFieldMissing("lines.color".to_owned())]
         );
+        assert!(report.caller_first.is_empty(), "{report:?}");
+        assert_eq!(report.verdict(), Verdict::CallerFirst);
     }
 
     #[test]
