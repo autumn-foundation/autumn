@@ -181,11 +181,17 @@ impl BurnMeter {
     /// error.
     #[must_use]
     pub fn burn_tenths_at(&self, now: Instant, window: Duration) -> Option<u32> {
-        let error_ppm = self.counts_at(now, window).error_ppm()?;
-        if self.budget_ppm == 0 {
-            return Some(if error_ppm == 0 { 0 } else { u32::MAX });
+        let counts = self.counts_at(now, window);
+        if counts.total() == 0 {
+            return None;
         }
-        let tenths = u64::from(error_ppm) * 10 / u64::from(self.budget_ppm);
+        if self.budget_ppm == 0 {
+            return Some(if counts.bad == 0 { 0 } else { u32::MAX });
+        }
+        // bad / total / (budget_ppm / PPM), in tenths, from the counts so
+        // the ratio is not rounded to whole ppm first.
+        let tenths = u128::from(counts.bad) * 10 * u128::from(PPM)
+            / (u128::from(self.budget_ppm) * u128::from(counts.total()));
         Some(u32::try_from(tenths).unwrap_or(u32::MAX))
     }
 
@@ -382,6 +388,16 @@ mod tests {
         let at = BurnMeter::new(&slo(99.9), MINUTE, Duration::from_hours(1));
         record(&at, now, 10_000 - 144, 144);
         assert!(!at.firing_at(now, &BURN_WINDOWS[0]));
+    }
+
+    #[test]
+    fn burn_tenths_does_not_round_the_ratio_to_whole_ppm_first() {
+        // 99.9999% leaves a 1 ppm budget. 1 bad in 1_000_001 is a burn of
+        // 0.999999x, which is 9 tenths, but under 1 ppm of error.
+        let meter = BurnMeter::new(&slo(99.9999), MINUTE, MINUTE);
+        let now = Instant::now();
+        record(&meter, now, 1_000_000, 1);
+        assert_eq!(meter.burn_tenths_at(now, MINUTE), Some(9));
     }
 
     #[test]
