@@ -215,9 +215,9 @@ fn connect(uri: &str, path: &Path) -> Result<SqliteConnection, SnapshotError> {
 /// See [`SnapshotError`].
 pub fn snapshot(target: &str, out_path: &Path) -> Result<(), SnapshotError> {
     let mut conn = open_target(&database_target(target)?)?;
-    // `VACUUM INTO` reads a URI, so the output is one too. A lossy string
-    // changes a non-UTF-8 name (#2589 item 15), and a relative name that
-    // starts with `file:` becomes a URI (item 18).
+    // `VACUUM INTO` reads a URI, so the output is one too. A lossy string would
+    // change a non-UTF-8 name, and a relative name starting with `file:` would
+    // become a URI (#2589).
     let out = replication::file_uri(out_path).ok_or_else(|| not_unicode(out_path))?;
     diesel::sql_query("VACUUM INTO ?")
         .bind::<Text, _>(&out)
@@ -285,14 +285,11 @@ fn staging_path(db: &Path) -> PathBuf {
 /// The staged copy is verified again, not just the source: a short write or a
 /// full disk must not survive as far as the rename.
 fn stage(artifact: &Path, staged: &Path, db: &Path) -> Result<(), SnapshotError> {
-    // `create_new` is `O_CREAT | O_EXCL`, which FAILS if anything already sits at
-    // this path and never follows a symlink there. `std::fs::copy` does follow
-    // one, and the staging name is predictable, so between the caller's
-    // `remove_file` and this create an account that can write the database
-    // directory could plant a link and have a privileged restore truncate an
-    // arbitrary file it points at — before `verify` ever runs. Failing closed on
-    // an occupied path closes that window; the copy then goes through this
-    // handle, so it cannot be redirected afterwards either.
+    // `create_new` is `O_CREAT | O_EXCL`: it fails if anything sits at this path
+    // and never follows a symlink. The staging name is predictable, so with
+    // `std::fs::copy` an account that can write the directory could plant a link
+    // and have a privileged restore truncate the file it points at. Failing on an
+    // occupied path closes that window, and the copy then goes through this handle.
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -308,20 +305,14 @@ fn stage(artifact: &Path, staged: &Path, db: &Path) -> Result<(), SnapshotError>
         artifact.display(),
         staged.display()
     )))?;
-    // Everything that can be done to the FILE is done through this handle, never
-    // by reopening the name. Creating it with `O_CREAT | O_EXCL` only proves
-    // nothing was there when we made it; the name stays writable by whoever can
-    // write the directory, so a `set_permissions(path)`/`chown(path)`/reopen
-    // after the handle is dropped can be redirected at a symlink planted in
-    // between — and `chown` through one hands an attacker the mode and owner of
-    // whatever it points at.
+    // Mode and owner are set through this handle, never by name: a symlink
+    // planted at the name after creation would redirect a path-based `chown`.
     inherit_target_permissions_via(db, &out, staged)?;
     out.sync_all()
         .map_err(SnapshotError::io(format!("flushing {}", staged.display())))?;
 
-    // `verify` and the publishing rename must address the file by NAME —
-    // SQLite opens a path, and `rename(2)` takes one. So confirm the name still
-    // resolves to the file this handle owns, and refuse if it does not.
+    // `verify` and the rename must use the name (SQLite opens a path, `rename(2)`
+    // takes one), so confirm the name still resolves to this handle's file.
     same_file_as_handle(&out, staged)?;
     verify(staged)?;
     same_file_as_handle(&out, staged)

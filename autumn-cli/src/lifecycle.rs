@@ -255,9 +255,7 @@ struct RawBinding {
     edges: Vec<EffectEdge>,
 }
 
-// `syn::Path` does not implement `Debug` without the `extra-traits` feature, so
-// `Debug` is hand-written (rendering the path as its `::`-joined segment idents)
-// to keep the `Debug`-derived [`Scan`] compiling without pulling in that feature.
+// Hand-written: `syn::Path` implements `Debug` only with syn's `extra-traits` feature.
 impl std::fmt::Debug for RawBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let path = self
@@ -369,7 +367,7 @@ pub fn analyze(wf: &LifecycleDef) -> LifecycleReport {
     let states: BTreeSet<&str> = wf.states.iter().map(String::as_str).collect();
     let mut violations = Vec::new();
 
-    // (c) EXISTENCE — every referenced state must be declared.
+    // Existence: every referenced state must be declared.
     if !states.contains(wf.initial.as_str()) {
         violations.push(Violation {
             kind: ViolationKind::Existence,
@@ -408,10 +406,8 @@ pub fn analyze(wf: &LifecycleDef) -> LifecycleReport {
         }
     }
 
-    // (d) TERMINAL-SOURCE — a declared terminal state must have no outgoing
-    // transitions, otherwise it is not actually terminal (an unsound "movable
-    // terminal"). This mirrors the by-construction compile error the macro
-    // emits, keeping the CLI gate honest even on source that would not compile.
+    // Terminal-source: a terminal with an outgoing transition is not terminal. Mirrors the macro's
+    // compile error, so the gate holds even on source that would not compile.
     let terminal_set: BTreeSet<&str> = wf.terminals.iter().map(String::as_str).collect();
     for (from, to) in &wf.transitions {
         if terminal_set.contains(from.as_str()) {
@@ -423,9 +419,7 @@ pub fn analyze(wf: &LifecycleDef) -> LifecycleReport {
         }
     }
 
-    // DUPLICATE-TRANSITION — the same edge declared twice. Not a graph property:
-    // it mirrors the macro's compile error, so this pass never reports sound a
-    // lifecycle the build rejects.
+    // Duplicate transition: not a graph property, but the macro rejects it, so this pass must too.
     let mut seen_edges: BTreeSet<(&str, &str)> = BTreeSet::new();
     for (from, to) in &wf.transitions {
         if !seen_edges.insert((from.as_str(), to.as_str())) {
@@ -437,15 +431,13 @@ pub fn analyze(wf: &LifecycleDef) -> LifecycleReport {
         }
     }
 
-    // Forward adjacency (from -> [to]) over declared edges.
     let mut forward: HashMap<&str, Vec<&str>> = HashMap::new();
     for (from, to) in &wf.transitions {
         forward.entry(from.as_str()).or_default().push(to.as_str());
     }
 
-    // (a) REACHABILITY — BFS from `initial`. Only meaningful when `initial` is a
-    // real state (otherwise existence already reported it and there is no anchor
-    // to walk from).
+    // Reachability: BFS from `initial`, skipped when `initial` is undeclared (existence already
+    // reported it).
     let reachable = if states.contains(wf.initial.as_str()) {
         let reachable = bfs(wf.initial.as_str(), &forward);
         for state in &wf.states {
@@ -465,9 +457,8 @@ pub fn analyze(wf: &LifecycleDef) -> LifecycleReport {
         BTreeSet::new()
     };
 
-    // (b) DEAD-END — reverse BFS from the terminals gives the set of states that
-    // can reach *some* terminal. A reachable, non-terminal state outside that set
-    // is a dead-end.
+    // Dead-end: a reachable non-terminal state from which no terminal is reachable, found by a
+    // reverse BFS from the terminals.
     let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();
     for (from, to) in &wf.transitions {
         reverse.entry(to.as_str()).or_default().push(from.as_str());
@@ -572,12 +563,8 @@ fn scan_project(root: &Path) -> std::io::Result<Scan> {
         scan_source(&src, &rel, &mut scan);
         scan.files_scanned += 1;
     }
-    // Post-pass: now that the complete set of scanned lifecycle ids is known,
-    // correlate every collected effect binding (qualified-match first, then a
-    // unique-bare-name fallback for imported lifecycles). Deferring this until
-    // the whole scan finishes lets a binding correlate to a lifecycle declared
-    // later in scan order, and lets the bare-name fallback see whether a name is
-    // globally unique.
+    // Resolve effect bindings only after the whole scan, so a binding can match a lifecycle
+    // declared later and the bare-name fallback knows whether a name is globally unique.
     scan.effect_edges =
         resolve_effect_bindings(std::mem::take(&mut scan.raw_bindings), &scan.lifecycles);
     Ok(scan)
@@ -615,11 +602,6 @@ fn scan_source(src: &str, file: &str, scan: &mut Scan) {
     let Ok(ast) = syn::parse_file(src) else {
         return;
     };
-    // Aliases are scoped lexically to the module subtree in which the
-    // `use ...::lifecycle as <alias>;` appears. The scan starts at the file root
-    // with an empty inherited set; each module extends it with its own renames
-    // (see `scan_items`) and passes that extended set only to its descendants, so
-    // a `use` inside a child module never leaks to a parent or sibling module.
     let mut module_path = Vec::new();
     scan_items(&ast.items, file, scan, &BTreeSet::new(), &mut module_path);
 }
@@ -710,13 +692,8 @@ fn collect_lifecycle_enum(
     aliases: &BTreeSet<String>,
     module_path: &[String],
 ) {
-    // Recognize the attribute as `#[lifecycle]` when it is:
-    //  - a single-segment path `lifecycle`, or a same-file alias of it
-    //    (`use ...::lifecycle as lc; #[lc(...)]`); or
-    //  - a multi-segment path whose *last* segment is `lifecycle`, so qualified
-    //    forms like `#[autumn_web::lifecycle(...)]` (valid Rust) are recognized.
-    // Matching only `is_ident("lifecycle")` would miss both the qualified and the
-    // aliased invocations and silently pass an unsound lifecycle.
+    // Match `lifecycle`, an in-scope alias of it, or any path ending in `lifecycle`
+    // (`#[autumn_web::lifecycle(...)]`). Missing a form would silently pass an unsound lifecycle.
     let Some(attr) = item_enum.attrs.iter().find(|a| {
         let path = a.path();
         path.get_ident().map_or_else(
@@ -783,8 +760,7 @@ fn collect_state_machine_effects(
             if !is_state_machine_attr(attr) {
                 continue;
             }
-            // Tolerant: an unrelated `transitions(...)` form → `Ok(None)`, and a
-            // parse miss → `Err`; both simply skip this attribute.
+            // An inline `transitions(...)` form (`Ok(None)`) or a parse error skips this attribute.
             if let Ok(Some((lifecycle_path, edges))) =
                 attr.parse_args_with(parse_state_machine_effects)
                 && !edges.is_empty()
@@ -876,8 +852,7 @@ fn resolve_lifecycle_id(module_path: &[String], path: &syn::Path) -> Option<Stri
         return None;
     }
     let (mut prefix, rest): (Vec<String>, &[String]) = match segs[0].as_str() {
-        // `crate::…` is rooted at the crate root; the scanner ids are also rooted
-        // there with no crate-name segment, so the prefix is empty.
+        // Scanner ids carry no crate-name segment, so `crate::` maps to an empty prefix.
         "crate" => (Vec::new(), &segs[1..]),
         "self" => (module_path.to_vec(), &segs[1..]),
         "super" => {
@@ -890,7 +865,6 @@ fn resolve_lifecycle_id(module_path: &[String], path: &syn::Path) -> Option<Stri
             }
             (prefix, &segs[i..])
         }
-        // A plain relative path resolves under the binding's own module.
         _ => (module_path.to_vec(), &segs[..]),
     };
     if rest.is_empty() {
@@ -990,10 +964,8 @@ fn parse_effect_edges(content: ParseStream) -> syn::Result<Vec<EffectEdge>> {
                             "expected `guard = \"...\"`, `on = \"...\"`, or `on_commit = <Job>`",
                         ));
                     }
-                    // Continue the meta list only on a following `, <ident> =`
-                    // (another key for this edge); a `, <State> ->` (or the end)
-                    // begins the next edge and its comma is left for the
-                    // separator below.
+                    // `, <ident> =` is another key for this edge; `, <State> ->` starts the next
+                    // edge, so its comma is left for the separator below.
                     if !content.peek(Token![,]) {
                         break;
                     }
@@ -1361,7 +1333,6 @@ pub fn render_dot(wf: &LifecycleDef, labels: &BTreeMap<(String, String), String>
     out.push_str("    rankdir=LR;\n");
     out.push_str("    node [shape=box, style=rounded];\n");
     out.push_str("    __start [shape=point, width=0.15];\n");
-    // Highlight the initial state (filled) and terminal states (double circle).
     let _ = writeln!(
         out,
         "    {} [style=\"rounded,filled\", fillcolor=lightblue];",

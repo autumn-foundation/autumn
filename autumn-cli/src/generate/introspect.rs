@@ -22,9 +22,7 @@ use super::schema_edit::{add_mod_declaration, singularize, update_main_rs};
 use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// A single introspected column, in catalog (`ordinal_position`) order.
-// A flat catalog descriptor: each bool is an independent fact read straight from
-// `information_schema`, not interacting state, so separate fields read clearer
-// than packing them into an enum.
+// Each bool is an independent `information_schema` fact, so flat fields read clearer than an enum.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
@@ -152,21 +150,15 @@ pub fn plan_pull(
     let models_dir = project_root.join("src").join("models");
     let repos_dir = project_root.join("src").join("repositories");
 
-    // Fold the in-place edits (mod.rs / schema.rs / repositories/mod.rs) across
-    // every table into a single computed string each, so multi-table pulls touch
-    // each aggregator file exactly once.
+    // Accumulate the aggregator edits across tables so each file is modified once.
     let mut models_mod = read_or_empty(&models_dir.join("mod.rs"));
     let mut schema = read_or_empty(&project_root.join("src").join("schema.rs"));
     let mut repos_mod = read_or_empty(&repos_dir.join("mod.rs"));
 
-    // Detect generated-name collisions up front: two tables can singularize to
-    // the same module (e.g. `status` and `statuses`), which would otherwise make
-    // the second model file silently clobber the first.
+    // Two tables can singularize to the same module (`status`, `statuses`); without this check
+    // the second model file would silently clobber the first.
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    // Track whether any repository was actually emitted, so the `repositories`
-    // module is only wired up when at least one exists.
     let mut emitted_repository = false;
-    // `routes![]` entries for the read-only API handlers of emitted repositories.
     let mut route_entries: Vec<String> = Vec::new();
 
     for table in tables {
@@ -174,10 +166,8 @@ pub fn plan_pull(
         let snake_name = snake(&resource);
         let pascal_name = pascal(&resource);
 
-        // A table that can't be turned into compilable Autumn code (no usable
-        // model name, an invalid column identifier, or no `id` BIGINT primary
-        // key) is a hard error when the user asked for it by name, or skipped
-        // with a notice during an unscoped pull so the rest still come through.
+        // An unsupported table is an error when requested by name, and skipped during an
+        // unscoped pull so the rest still come through.
         if let Some(reason) = unsupported_reason(table, &resource) {
             if options.explicit {
                 return Err(GenerateError::Config(format!(
@@ -197,11 +187,8 @@ pub fn plan_pull(
             )));
         }
 
-        // Issue #1318: a `lock_version` column normally comes back annotated, but
-        // `render_model` declines when annotating would leave the model with no
-        // insertable columns at all (the attribute drops it from `New{Model}`).
-        // Say so rather than letting the counter come back as a plain integer
-        // with the conflict check quietly missing.
+        // `render_model` skips `#[lock_version]` when it would leave `New{Model}` empty (#1318).
+        // Warn so the lost conflict check is not silent.
         if let Some(col) = table.columns.iter().find(|c| is_lock_version_column(c))
             && !annotate_lock_version(&table.columns, col)
         {
@@ -214,20 +201,15 @@ pub fn plan_pull(
             ));
         }
 
-        // (a) src/models/<snake>.rs
         plan.create(
             models_dir.join(format!("{snake_name}.rs")),
             render_model(&pascal_name, &table.table, &table.columns),
         );
-        // (b) src/models/mod.rs aggregator line
         models_mod = add_mod_declaration(&models_mod, &snake_name);
-        // (c) src/schema.rs table! block
         schema = upsert_schema_block(&schema, &table.table, &table.columns, options.force)?;
 
-        // (d) optional repository. `unsupported_reason` already guaranteed the
-        // Autumn `id`/`i64` PK convention the repository macro assumes, so the
-        // emitted trait is always compilable. The real table name is passed
-        // through so the schema import is correct for irregular plurals.
+        // `unsupported_reason` already enforced the `id`/`i64` PK the repository macro assumes.
+        // The real table name keeps the schema import right for irregular plurals.
         if options.with_repository {
             plan.create(
                 repos_dir.join(format!("{snake_name}.rs")),
@@ -238,20 +220,16 @@ pub fn plan_pull(
                 ),
             );
             repos_mod = add_mod_declaration(&repos_mod, &snake_name);
-            // Register the read-only JSON handlers the `api = ...` repository
-            // generates so `/api/<table>` is reachable. Mutating handlers
-            // (create/update/delete) are intentionally left out until the user
-            // adds a policy — matching the scaffold's default posture and the
-            // security note in the generated repository.
+            // Only the read-only handlers: mutating ones stay unregistered until the user adds a
+            // policy, matching the scaffold's default posture.
             route_entries.push(format!("repositories::{snake_name}::{snake_name}_api_list"));
             route_entries.push(format!("repositories::{snake_name}::{snake_name}_api_get"));
             emitted_repository = true;
         }
     }
 
-    // If an unscoped pull skipped every table, leave the project untouched
-    // rather than writing empty aggregators, bumping deps, and exiting "ok".
-    // (An explicitly-requested unsupported table already errored above.)
+    // An unscoped pull that skipped every table leaves the project untouched: no empty
+    // aggregators, no dependency changes.
     if seen.is_empty() {
         eprintln!("  \u{2139} No supported tables to pull \u{2014} nothing was generated.");
         return Ok(Plan::new(project_root));
@@ -260,9 +238,7 @@ pub fn plan_pull(
     plan.modify(models_dir.join("mod.rs"), models_mod);
     plan.modify(project_root.join("src").join("schema.rs"), schema);
 
-    // src/main.rs: declare the modules the emitted code lives in. A fresh
-    // `autumn new` main.rs declares none of these, so without this the
-    // generated app would not compile.
+    // A fresh `autumn new` main.rs declares none of these modules.
     let main_path = project_root.join("src").join("main.rs");
     if let Ok(main_existing) = std::fs::read_to_string(&main_path) {
         let mut mods = vec!["models", "schema"];
@@ -277,12 +253,9 @@ pub fn plan_pull(
         plan.modify(repos_dir.join("mod.rs"), repos_mod);
     }
 
-    // Cargo.toml: the `#[model]` expansion references diesel/serde/chrono/uuid,
-    // none of which a freshly-`autumn new`-ed project carries. The `#[model]`
-    // macro itself is exported only behind `autumn-web`'s `db` feature, which a
-    // DB-free `autumn new --daemon` project disables; enable it so the pulled
-    // models compile there too. `db` needs a backend (#2605), and `db pull`
-    // reads Postgres, so enable `postgres` too.
+    // The `#[model]` expansion needs diesel/serde/chrono/uuid, and the macro is exported only
+    // behind autumn-web's `db` feature, which `autumn new --daemon` disables. `db` needs a
+    // backend (#2605); `db pull` reads Postgres, so enable `postgres`.
     let cargo_path = project_root.join("Cargo.toml");
     let existing = read_or_empty(&cargo_path);
     let with_deps = super::model::ensure_cargo_dependencies(&existing, super::model::MODEL_DEPS);
@@ -290,9 +263,6 @@ pub fn plan_pull(
         super::schema_edit::ensure_autumn_web_feature_status(&with_deps, "db");
     let (updated, _) = super::schema_edit::ensure_autumn_web_feature_status(&with_db, "postgres");
     if !db_enabled {
-        // No `autumn-web` dependency could be located to enable `db` on. The
-        // generated `#[autumn_web::model]` code needs that feature, so warn
-        // rather than emit silently-uncompilable output.
         eprintln!(
             "  \u{26a0} Could not enable autumn-web's `db` feature automatically. \
              Add `features = [\"db\", \"postgres\"]` to the `autumn-web` dependency in Cargo.toml \
@@ -322,12 +292,9 @@ pub fn render_model(pascal_name: &str, table: &str, columns: &[Column]) -> Strin
     out.push_str("//! framework treats this as ordinary user code.\n\n");
     let _ = writeln!(out, "use crate::schema::{table};");
     out.push('\n');
-    // The model macro infers the table as `pascal_to_snake(Struct) + "s"`, which
-    // is wrong for irregular plurals (`person` -> `persons`, not `people`). Emit
-    // an explicit `table = "..."` override whenever the inference would not match
-    // the real table name, so the struct compiles against the emitted schema
-    // block. For regular plurals the inference matches and we emit the bare
-    // attribute, keeping greenfield round-trips byte-identical.
+    // The macro infers `pascal_to_snake(Struct) + "s"`, wrong for irregular plurals
+    // (`person` -> `persons`, not `people`). Override only on a mismatch, so greenfield
+    // round-trips stay byte-identical.
     if inferred_table_name(pascal_name) == table {
         out.push_str("#[autumn_web::model]\n");
     } else {
@@ -338,19 +305,11 @@ pub fn render_model(pascal_name: &str, table: &str, columns: &[Column]) -> Strin
         if col.is_pk {
             out.push_str("    #[id]\n");
         } else if annotate_lock_version(columns, col) {
-            // Issue #1318: `lock_version` is the framework's optimistic-locking
-            // counter, so pulling a table that has one must reproduce the
-            // attribute `generate model` would have emitted — otherwise a
-            // `db pull` of a greenfield-generated table silently downgrades the
-            // column to a plain editable integer, losing the conflict check and
-            // the derived `etag()`, and breaking the byte-identical round-trip
-            // property this function documents above.
+            // Reproduce what `generate model` emits (#1318); a plain integer would lose the
+            // conflict check and `etag()`.
             out.push_str("    #[lock_version]\n");
         } else if is_write_excluded(col) {
-            // Read-only / framework-managed columns are kept out of `NewX` and
-            // the update set via `#[default]`: a `created_at` with a DB default,
-            // or a stored generated column. (A plain mutable column with a DB
-            // default stays settable — `#[default]` would lock it out of writes.)
+            // Keeps read-only and framework-managed columns out of `NewX` and the update set.
             out.push_str("    #[default]\n");
         }
         let _ = writeln!(out, "    pub {}: {},", col.name, col.rust_type());
@@ -406,21 +365,10 @@ fn is_lock_version_column(col: &Column) -> bool {
     col.name == super::model::LOCK_VERSION_COLUMN
         && !col.nullable
         && matches!(col.kind, FieldKind::I32 | FieldKind::I64)
-        // `has_default` is load-bearing, not incidental. `#[lock_version]`
-        // excludes the column from `New{Model}`, so the INSERT stops naming it
-        // — and `db pull` deliberately emits no migration, so nothing here can
-        // add the default that would fill the gap. On a legacy table whose
-        // application supplied `lock_version` itself, annotating would turn
-        // every insert into a NOT NULL violation. A greenfield-generated table
-        // always carries `DEFAULT 0` (see `parse_model_metadata`), so the
-        // round-trip property still holds; a defaultless legacy column is
-        // pulled as the ordinary integer it has always been.
-        //
-        // It must be a real integer default, not merely *a* default: a
-        // `NOT NULL` column defaulted to a NULL-valued expression
-        // (`DEFAULT nullif(0,0)`) reports `has_default` and still fails every
-        // insert that omits it, so annotating would break a project that
-        // previously worked by always supplying the column.
+        // `#[lock_version]` drops the column from the INSERT, and `db pull` emits no migration,
+        // so the database must supply the value. Without a default, a legacy table whose app
+        // set the column itself would fail every insert. Any default is not enough:
+        // `DEFAULT nullif(0,0)` is still NULL. Greenfield tables carry `DEFAULT 0`.
         && col.default_is_integer_literal
 }
 
@@ -432,9 +380,8 @@ pub fn render_schema_block(table: &str, columns: &[Column]) -> String {
         .filter(|c| c.is_pk)
         .map(|c| c.name.as_str())
         .collect();
-    // `plan_pull` rejects/skips tables without an `id` primary key before they
-    // reach here, so `pk` is non-empty in practice; default to the Autumn `id`
-    // convention rather than inventing the first column as the key.
+    // `plan_pull` filters out tables without an `id` PK, so this fallback is not reached in
+    // practice. It follows the Autumn `id` convention rather than guessing the first column.
     let pk_clause = if pk.is_empty() {
         "id".to_owned()
     } else {
@@ -468,8 +415,6 @@ fn upsert_schema_block(
     force: bool,
 ) -> Result<String, GenerateError> {
     let block = render_schema_block(table, columns);
-    // Locate any existing block once and branch on the result, rather than
-    // re-scanning the (growing) schema for has/matches/replace separately.
     match schema_block_range(existing, table) {
         Some((start, end)) => {
             if force {
@@ -735,8 +680,7 @@ pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)>
         if bytes[open] != b'{' && bytes.get(end + gap) == Some(&b';') {
             end += gap + 1;
         }
-        // Does this macro define the table we're looking for? The name may sit
-        // on its own line, before the key (`posts\n(id) {`).
+        // The name may sit on its own line, before the key (`posts\n(id) {`).
         if block_table_name(existing, open).is_some_and(|name| unraw(&name) == want) {
             return Some((macro_start, end));
         }
@@ -777,9 +721,8 @@ fn unsupported_reason(table: &TableSchema, resource: &str) -> Option<String> {
             "the derived model name '{resource}' is not a valid Rust identifier"
         ));
     }
-    // The raw table name is emitted verbatim as the `schema.rs` module and in
-    // `use crate::schema::<table>`, so it too must be a valid identifier (a
-    // table named `as` singularizes to a fine model `A` but breaks the schema).
+    // The raw table name is emitted as the `schema.rs` module, so it must be an identifier too:
+    // `as` singularizes to a fine model `A` but breaks the schema.
     if !super::dsl::is_valid_ident(&table.table) || super::dsl::is_rust_keyword(&table.table) {
         return Some(format!(
             "the table name '{}' is not a valid snake_case Rust identifier (or is a reserved keyword)",
@@ -795,10 +738,8 @@ fn unsupported_reason(table: &TableSchema, resource: &str) -> Option<String> {
         }
     }
     if !has_autumn_id_pk(&table.columns) {
-        // Tailor the message for a UUID `id` PK: that is a shape Autumn can
-        // *generate* (`generate model --id uuid`) but `db pull` cannot yet
-        // round-trip, so point that out specifically rather than implying the
-        // table simply lacks an `id` column.
+        // A UUID `id` PK is generatable (`generate model --id uuid`) but not pullable yet, so
+        // name it instead of implying the table lacks an `id`.
         let pks: Vec<&Column> = table.columns.iter().filter(|c| c.is_pk).collect();
         if matches!(pks.as_slice(), [pk] if pk.name == "id" && pk.kind == FieldKind::Uuid) {
             return Some(
@@ -1083,8 +1024,6 @@ mod tests {
         assert!(repo_mod.contains("pub mod post;"));
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(main.contains("mod repositories;"));
-        // The read-only API handlers are registered so /api/posts is reachable;
-        // mutating handlers are intentionally left out until a policy is added.
         assert!(
             main.contains("repositories::post::post_api_list"),
             "API list route must be registered: {main}"
@@ -1099,8 +1038,7 @@ mod tests {
     #[test]
     fn plan_pull_unscoped_all_unsupported_writes_nothing() {
         let tmp = project();
-        // Only a uuid-keyed table: unscoped pull skips it and must not touch the
-        // project (no empty mod.rs/schema.rs, no Cargo.toml churn).
+        // Only a uuid-keyed table, which an unscoped pull skips.
         let sessions = TableSchema {
             table: "sessions".to_owned(),
             columns: vec![col("token", FieldKind::Uuid, false, true)],
@@ -1203,9 +1141,8 @@ mod tests {
 
     #[test]
     fn unsupported_reason_explains_uuid_id_pk() {
-        // A UUID `id` PK is a shape Autumn can generate but db pull cannot yet
-        // round-trip; the reason must call that out specifically, and an explicit
-        // pull must fail loudly rather than emit broken code.
+        // A UUID `id` PK is generatable but not pullable yet: the reason must say so, and an
+        // explicit pull must fail.
         let uuid_posts = TableSchema {
             table: "posts".to_owned(),
             columns: vec![
@@ -1313,8 +1250,7 @@ mod tests {
             columns: vec![
                 id_col(),
                 Column {
-                    // A mutable column with a DB default must stay settable, so it
-                    // must NOT be `#[default]` (that would lock it out of writes).
+                    // A mutable column with a DB default must stay settable: no `#[default]`.
                     name: "status".to_owned(),
                     kind: FieldKind::String,
                     nullable: false,
@@ -1345,16 +1281,12 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
         let model = fs::read_to_string(tmp.path().join("src/models/widget.rs")).unwrap();
         assert!(model.contains("#[id]\n    pub id: i64,"));
-        // mutable defaulted column: plain field, settable.
         assert!(model.contains("    pub status: String,"));
         assert!(!model.contains("#[default]\n    pub status:"));
-        // generated column: read-only via #[default].
         assert!(model.contains("#[default]\n    pub search: String,"));
-        // framework-managed created_at: #[default].
         assert!(model.contains("#[default]\n    pub created_at: chrono::NaiveDateTime,"));
-        // the PK must not be doubly annotated.
+        // The PK must not be doubly annotated.
         assert!(!model.contains("#[id]\n    #[default]"));
-        // a plain column has neither.
         assert!(model.contains("    pub label: String,"));
     }
 
@@ -1379,9 +1311,8 @@ mod tests {
     #[test]
     fn plan_pull_skips_non_id_pk_table_entirely() {
         let tmp = project();
-        // A uuid-keyed table cannot be modeled: the `#[model]` macro references
-        // the `id` column directly. On an unscoped pull it is skipped entirely —
-        // neither the model nor the repository is emitted.
+        // `#[model]` references the `id` column directly, so an unscoped pull skips a
+        // uuid-keyed table entirely: no model, no repository.
         let sessions = TableSchema {
             table: "sessions".to_owned(),
             columns: vec![
@@ -1653,9 +1584,7 @@ mod tests {
     fn plan_pull_force_replaces_block_with_brace_in_comment() {
         let tmp = project();
         let src = tmp.path().join("src");
-        // A hand-edited block whose doc comment contains a `}` must not confuse
-        // brace-matching: the whole block (through its real closing brace) is
-        // replaced, leaving no dangling brace.
+        // A `}` in a doc comment must not end the block early and leave a dangling brace.
         fs::write(
             src.join("schema.rs"),
             "diesel::table! {\n    posts (id) {\n        /// trailing brace } in a comment\n        old_col -> Text,\n    }\n}\n",
@@ -1704,8 +1633,7 @@ mod tests {
             "diesel::table! {\n    posts (id) {\n        id -> Int8,\n        old_col -> Text,\n    }\n}\n",
         )
         .unwrap();
-        // Without --force, regenerating the model against this stale block would
-        // emit uncompilable code, so the pull must error rather than "succeed".
+        // A model regenerated against this stale block would not compile.
         let err = plan_pull(tmp.path(), &[post_table()], PullOptions::default()).unwrap_err();
         assert!(
             err.to_string().contains("differs from the live database"),
@@ -1809,7 +1737,7 @@ mod tests {
         );
     }
 
-    // ── Round-trip property (AC4) ───────────────────────────────────────────
+    // ── Round-trip property ─────────────────────────────────────────────────
 
     #[test]
     fn round_trip_matches_greenfield_model_byte_for_byte() {
@@ -1931,10 +1859,8 @@ mod tests {
 
     #[test]
     fn pulling_a_generated_lock_version_column_reproduces_the_attribute() {
-        // A greenfield-generated table carries `lock_version INTEGER NOT NULL
-        // DEFAULT 0` alongside its real columns, so pulling it must give back the
-        // same model — otherwise `db pull` silently downgrades the column to a
-        // plain editable integer and the conflict check disappears.
+        // A greenfield table carries `lock_version INTEGER NOT NULL DEFAULT 0`; pulling it must
+        // give back the same model.
         let model = render_model(
             "Post",
             "posts",
@@ -1948,11 +1874,8 @@ mod tests {
 
     #[test]
     fn pulling_a_lock_only_table_declines_the_annotation_rather_than_emitting_an_empty_insert() {
-        // A table whose only non-key column is the counter: annotating would drop
-        // it from `NewPost`, leaving an empty struct whose `Insertable` derive
-        // does not compile — turning a project that used to build into one that
-        // does not. `db pull` mirrors a database it does not own, so it declines
-        // the attribute instead of refusing the table.
+        // The counter is the only non-key column: annotating would leave `NewPost` empty and
+        // its `Insertable` derive would not compile.
         let model = render_model("Post", "posts", &[id_column(), lock_version_column(true)]);
         assert!(
             !model.contains("#[lock_version]"),
@@ -1971,16 +1894,9 @@ mod tests {
 
     #[test]
     fn pulling_a_lock_version_defaulted_to_a_null_valued_expression_leaves_it_ordinary() {
-        // `has_default` says a default EXPRESSION exists, not that the database
-        // will supply a usable value. A `NOT NULL` column defaulted to
-        // `nullif(0,0)` reports `column_default = "NULLIF(0, 0)"` and still
-        // violates the constraint on every insert that omits it — verified
-        // against Postgres 16 — so annotating would break a project that
-        // previously worked by always supplying the column itself.
-        //
-        // (A literal `DEFAULT NULL` cannot reach here at all: Postgres
-        // normalizes a constant-NULL default away and reports no
-        // `column_default`, so `has_default` is already false.)
+        // `DEFAULT nullif(0,0)` sets `has_default` but still violates NOT NULL on every insert
+        // that omits the column. (Postgres drops a literal `DEFAULT NULL`, so that case
+        // reports no default at all.)
         let mut col = lock_version_column(true);
         col.default_is_integer_literal = false;
         let model = render_model("Post", "posts", &[id_column(), title_column(), col]);
@@ -1993,10 +1909,8 @@ mod tests {
 
     #[test]
     fn pulling_a_defaultless_lock_version_column_leaves_it_an_ordinary_integer() {
-        // A legacy table whose application set `lock_version` itself has no
-        // database default. Annotating would drop the column from `New{Model}`
-        // — and `db pull` emits no migration to add a default — so every insert
-        // would then violate the NOT NULL constraint. Pull it as-is instead.
+        // A legacy app sets `lock_version` itself. Annotating would drop it from `New{Model}`
+        // with no default to fill it, so every insert would violate NOT NULL.
         let model = render_model(
             "Post",
             "posts",

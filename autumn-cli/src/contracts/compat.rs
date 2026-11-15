@@ -1521,7 +1521,7 @@ mod tests {
         breaks.iter().map(|b| b.kind.clone()).collect()
     }
 
-    // --- the rules the issue names ---
+    // --- fields, paths and methods ---
 
     #[test]
     fn a_removed_response_field_that_a_caller_reads_fails() {
@@ -2259,7 +2259,7 @@ mod tests {
         assert!(text.contains("Deploy marketing before core."), "{text}");
     }
 
-    // --- review regressions ---
+    // --- edge cases ---
 
     #[test]
     fn a_body_on_a_route_that_had_none_is_a_break() {

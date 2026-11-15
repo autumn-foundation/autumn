@@ -554,6 +554,9 @@ webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"]
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"], optional = true }
 secrecy = { version = "0.10.3", features = ["serde"] }
 lru = "0.19"
+# The hasher of the app-metrics registry. Already in the graph: `lru` uses
+# `hashbrown`, and `hashbrown` uses this.
+foldhash = "0.2"
 hmac = "0.13"
 sha2 = "0.11"
 backtrace = { version = "0.3", optional = true }
@@ -748,6 +751,11 @@ harness = false
 # Fixed-iteration held-handle recording workload (profilers).
 [[bench]]
 name = "metrics_held"
+harness = false
+
+# Fixed-iteration per-call recording workload (profilers).
+[[bench]]
+name = "metrics_per_call"
 harness = false
 
 [[bench]]

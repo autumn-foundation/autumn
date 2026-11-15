@@ -112,11 +112,9 @@ struct GenerateDefaults {
     id: Option<String>,
 }
 
-// `deny_unknown_fields` so a mistyped top-level table (e.g. `[scafold.Post]`
-// instead of `[scaffold.Post]`, or `[genrate]`) is a hard error when the file is
-// used as an explicit `--config` scaffold source, rather than being silently
-// ignored and producing a fieldless resource. Defaults-only reads use the
-// lenient `GenerateDefaultsConfig` view instead.
+// `deny_unknown_fields`: a mistyped top-level table (`[scafold.Post]`, `[genrate]`) in an
+// explicit `--config` file is an error, not a silently fieldless resource. Defaults-only reads
+// use `GenerateDefaultsConfig`, which tolerates malformed `[scaffold.*]` contents.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GeneratorConfig {
@@ -179,11 +177,9 @@ pub fn read_scaffold_config(
     resource_name: &str,
 ) -> Result<Option<ScaffoldConfigEntry>, GenerateError> {
     let mut config = parse_config(config_path)?;
-    // Normalize to PascalCase so `bookmark` and `Bookmark` both match
-    // `[scaffold.Bookmark]`, consistent with how the generator itself handles
-    // resource names passed on the CLI.
+    // PascalCase so `bookmark` and `Bookmark` both match `[scaffold.Bookmark]`, as for CLI
+    // resource names.
     let mut entry = config.scaffold.remove(&pascal(resource_name));
-    // Propagate [generate] id default when the per-resource section doesn't override it.
     if let Some(e) = entry.as_mut()
         && e.id.is_none()
     {
@@ -237,7 +233,6 @@ pub fn read_explicit_scaffold_config(
     resource_name: &str,
     cli_has_fields: bool,
 ) -> Result<ScaffoldConfigEntry, GenerateError> {
-    // The `[scaffold.X]` section (with `[generate] id` already propagated).
     if let Some(entry) = read_scaffold_config(config_path, resource_name)? {
         return Ok(entry);
     }
@@ -330,7 +325,6 @@ pub fn merge_config_with_cli(
     let defaults = pick(cli_defaults, config.defaults);
     let queries = pick(cli_queries, config.queries);
     let searchable = pick(cli_searchable, config.searchable);
-    // CLI flag wins; TOML config enables it when present.
     let soft_delete = cli_soft_delete || config.soft_delete;
     let api = cli_api || config.api;
     let sharded = cli_sharded || config.sharded;
@@ -444,7 +438,6 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
         let tmp = TempDir::new().unwrap();
         let path = write_config(&tmp, "[scaffold.Bookmark]\nfields = [\"url:String\"]\n");
 
-        // CLI input `bookmark` (snake_case) must find `[scaffold.Bookmark]`.
         let entry = read_scaffold_config(&path, "bookmark")
             .unwrap()
             .expect("snake_case name should resolve to PascalCase section");
@@ -517,8 +510,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
 
     #[test]
     fn explicit_config_missing_section_among_others_errors_without_cli_fields() {
-        // Typo protection: the file defines a scaffold resource, but not the
-        // requested one, and the CLI supplied no fields → likely a typo.
+        // Other scaffold sections exist and the CLI gave no fields: likely a typo.
         let tmp = TempDir::new().unwrap();
         let path = write_config(&tmp, "[scaffold.Other]\nfields = [\"name:String\"]\n");
         let err = read_explicit_scaffold_config(&path, "Post", false).unwrap_err();
@@ -545,8 +537,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
 
     #[test]
     fn unknown_key_inside_generate_table_errors() {
-        // A typo under [generate] must not be silently ignored (which would
-        // fall back to BigSerial despite the user intending uuid).
+        // A typo under [generate] must error, not silently fall back to BigSerial.
         let tmp = TempDir::new().unwrap();
         let path = write_config(&tmp, "[generate]\nide = \"uuid\"\n");
         let err = read_generate_defaults(&path).unwrap_err();
@@ -554,16 +545,14 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             matches!(err, GenerateError::Config(_)),
             "unknown [generate] key must error, got: {err:?}"
         );
-        // The same applies to the defaults-only entry reader and the strict path.
         assert!(read_generate_defaults_entry(&path).is_err());
         assert!(read_scaffold_config(&path, "Post").is_err());
     }
 
     #[test]
     fn defaults_only_read_rejects_misspelled_top_level_table() {
-        // A typo'd defaults table ([genrate]) or a stray top-level `id` key must
-        // not be silently dropped (which would fall back to BigSerial despite the
-        // user intending uuid). [scaffold.*] recipes stay ignored.
+        // A typo'd top-level table or a stray top-level `id` key must error, not silently
+        // fall back to BigSerial.
         for bad in [
             "[genrate]\nid = \"uuid\"\n",
             "id = \"uuid\"\n",
@@ -580,17 +569,15 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
 
     #[test]
     fn defaults_only_read_tolerates_malformed_scaffold_recipe() {
-        // A checked-in [scaffold.*] recipe with an unsupported/typo'd key must
-        // NOT break defaults-only reads (generate model / auto-discovered
-        // scaffold), which only consult [generate].
+        // A malformed [scaffold.*] recipe must not break defaults-only reads (generate model,
+        // auto-discovered scaffold), which only consult [generate].
         let tmp = TempDir::new().unwrap();
         let path = write_config(
             &tmp,
             "[generate]\nid = \"uuid\"\n\n\
              [scaffold.Post]\nfields = [\"title:String\"]\nindex = [\"title\"]\n",
         );
-        // `index` is an unknown key for ScaffoldConfigEntry (deny_unknown_fields),
-        // so a full parse would fail — but the defaults-only readers must not.
+        // `index` is unknown to ScaffoldConfigEntry, so a full parse would fail.
         assert_eq!(read_generate_defaults(&path).unwrap(), IdType::Uuid);
         assert_eq!(
             read_generate_defaults_entry(&path).unwrap().id.as_deref(),
@@ -635,8 +622,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             matches!(err, GenerateError::Config(_)),
             "misspelled top-level table must error, got: {err:?}"
         );
-        // Defaults-only reads also reject a misspelled top-level table, so a
-        // project-default typo is never silently dropped.
+        // Defaults-only reads reject it too.
         assert!(read_generate_defaults(&path).is_err());
     }
 

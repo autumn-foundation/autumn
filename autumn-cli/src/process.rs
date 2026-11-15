@@ -15,9 +15,8 @@
 #![allow(dead_code, clippy::missing_const_for_fn)]
 
 use std::path::{Path, PathBuf};
-// Not `cfg(unix)`-gated: `wait_with_timeout` is compiled on every platform so
-// `autumn dev`'s non-Unix cooperative stop (#1616) can share the same bounded
-// wait the Unix `SIGTERM` path uses.
+// Not `cfg(unix)`-gated: `autumn dev`'s non-Unix cooperative stop (#1616) uses the same bounded
+// `wait_with_timeout` as the Unix `SIGTERM` path.
 use std::process::Child;
 use std::time::Duration;
 
@@ -257,12 +256,9 @@ pub fn acquire_pidfile(path: &Path, pid: u32) -> Result<(), AcquireError> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(AcquireError::Io)?;
     }
-    // A live owner already holds the lock: say so before anything else. That is
-    // the answer the caller acts on, it does not depend on our own pid, and
-    // reporting it here keeps a doomed acquire from spending the start-time
-    // retry budget below only to fail with a less useful error. This is a fast
-    // path, not the claim — `acquire_via_link` re-checks atomically, so a lock
-    // released between here and there is still reclaimed correctly.
+    // Report a live owner first: it is the answer the caller acts on, and it keeps a doomed acquire
+    // from spending the start-time retry budget below. This is a fast path, not the claim;
+    // `acquire_via_link` re-checks atomically.
     if let Some(existing) = read_pidfile(path)
         && is_record_alive(&existing)
     {
@@ -362,11 +358,10 @@ fn acquire_via_link(temp: &Path, path: &Path) -> Result<(), AcquireError> {
                     PidState::Alive(existing) => {
                         return Err(AcquireError::AlreadyRunning(existing));
                     }
-                    // Stale or corrupt: reclaim and retry the atomic link. The
-                    // link guarantees any existing lock is fully written, so an
-                    // unparseable file here is genuine corruption, not an in-
-                    // flight create. A concurrent deletion (NotFound) is fine —
-                    // the next iteration's `hard_link` will win.
+                    // Stale or corrupt: reclaim and retry the link. The link guarantees an existing
+                    // lock is fully written, so an unparseable file is real corruption, not an
+                    // in-flight create. A concurrent deletion (NotFound) is fine: the next
+                    // `hard_link` wins.
                     PidState::Stale | PidState::Free if attempt == 0 => {
                         if let Err(err) = std::fs::remove_file(path)
                             && err.kind() != std::io::ErrorKind::NotFound
@@ -565,12 +560,9 @@ pub struct ProcRow {
 /// Pure, so the Windows reaping policy is unit-tested on every platform.
 #[must_use]
 pub fn descendants_of(root: u32, rows: &[ProcRow]) -> Vec<u32> {
-    // The root must be in the snapshot. If it has already exited, its PID is
-    // free to be recycled and every row still naming it as a parent belongs to
-    // whoever held that number before — with no start time to compare against,
-    // the guard below is disabled precisely where it is needed most. Sweeping
-    // nothing is the only safe answer; the caller's own reapers (the managed
-    // Postgres one) cover what is actually ours.
+    // The root must be in the snapshot. Once it exits its PID can be recycled, and rows naming it
+    // as parent belong to the previous holder; with no root start time the age guard below cannot
+    // catch that. Sweep nothing; the caller's own reapers cover what is ours.
     let Some(root_created) = rows.iter().find(|r| r.pid == root).map(|r| r.created) else {
         return Vec::new();
     };
@@ -727,12 +719,10 @@ pub fn stop_record(
     if !is_record_alive(record) {
         return StopOutcome::Drained;
     }
-    // The app missed its graceful-drain budget and is still our daemon, so its
-    // `on_shutdown` hooks (which stop a managed Postgres child) may not have
-    // run. Reap the whole tree, not just the app PID, so supervised children are
-    // not orphaned holding the data dir/port. The tree sweep goes first: on
-    // Windows it is reconstructed from a snapshot, and killing the root before
-    // taking it loses the parentage the sweep walks.
+    // The app missed its drain budget, so its `on_shutdown` hooks (which stop a managed Postgres)
+    // may not have run. Reap the whole tree so children do not keep the data dir/port. Sweep the
+    // tree first: on Windows it is rebuilt from a snapshot, and killing the root first loses the
+    // parentage the sweep walks.
     force_kill_group(record.pid);
     force_kill(record.pid);
     if !wait_for_record_exit(record, KILL_SETTLE) {
@@ -741,11 +731,9 @@ pub fn stop_record(
     match delivery {
         // Killed after it missed its budget: hooks may not have run.
         Ok(()) => StopOutcome::Escalated,
-        // Killed without ever being asked: hooks certainly did not run. The
-        // caller has to say so — on Windows the request is a file create, which
-        // can fail (a full volume, a directory at the path, an AV lock) while
-        // the kill still succeeds, so a silent "stopped" would report a graceful
-        // drain that never happened.
+        // Killed without ever being asked: hooks did not run. On Windows the request is a file
+        // create, which can fail (full volume, directory at the path, AV lock) while the kill
+        // succeeds, so reporting "stopped" would claim a drain that never happened.
         Err(e) => StopOutcome::Unreachable(e.to_string()),
     }
 }
@@ -783,12 +771,9 @@ pub fn stop_postmaster(pid: u32, timeout: Duration) {
         );
     }
     if !wait_for_pid_exit(pid, timeout) {
-        // A fast shutdown didn't finish in time (e.g. a stuck backend). Postgres
-        // `setsid`s, so the postmaster leads its own process group with its
-        // backends in it; `SIGKILL`ing only the postmaster PID can leave those
-        // children holding the data dir/shared memory and block the next start.
-        // Kill the whole Postgres group (the postmaster is its leader, so its PID
-        // is the PGID).
+        // Fast shutdown timed out (e.g. a stuck backend). Postgres `setsid`s, so the postmaster
+        // leads a process group holding its backends; killing only the postmaster can leave them
+        // holding the data dir/shared memory. Kill the group (PGID = postmaster PID).
         force_kill_group(pid);
         force_kill(pid);
     }
@@ -1120,11 +1105,9 @@ mod tests {
     fn create_new_rejects_live_pid() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("serve.pid");
-        // Our own PID is alive; a second acquire must be rejected — and must be
-        // rejected AS `AlreadyRunning`, not as some earlier failure. The second
-        // acquire below names a pid that does not exist, which is exactly the
-        // shape of a caller whose child died mid-start: the live owner is still
-        // the more useful answer.
+        // Our own PID is alive, so the second acquire must fail as `AlreadyRunning`, not an earlier
+        // error, even though it names a pid that does not exist (a caller whose child died
+        // mid-start).
         acquire_pidfile(&path, std::process::id()).expect("first acquire");
         match acquire_pidfile(&path, std::process::id() + 1) {
             Err(AcquireError::AlreadyRunning(pid)) => assert_eq!(pid, std::process::id()),
@@ -1224,9 +1207,8 @@ mod tests {
 
     // ── Portable stop request (#1639) ────────────────────────────────────
     //
-    // Compiled and run on every platform, not just the one that uses the file
-    // arm: Windows is the platform this project's CI almost never exercises
-    // interactively, so the logic that only runs there has to be tested here.
+    // Compiled on every platform, not only Windows where the file arm is used, because CI rarely
+    // exercises Windows-only logic otherwise.
 
     #[test]
     fn stop_request_file_is_created_on_delivery() {
@@ -1346,10 +1328,8 @@ mod tests {
 
     // ── Stop outcomes (#1639) ────────────────────────────────────────────
     //
-    // Only `Drained` means the app's `on_shutdown` hooks ran. The other arms
-    // each need something different said to the operator, and reporting a
-    // graceful stop that never happened is the failure this distinction exists
-    // to prevent.
+    // Only `Drained` means the app's `on_shutdown` hooks ran. Each other arm needs a different
+    // message, and must never report a graceful stop that did not happen.
 
     #[test]
     fn a_child_that_ignores_the_request_is_escalated_after_the_budget() {

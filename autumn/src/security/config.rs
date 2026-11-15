@@ -271,12 +271,6 @@ pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     mac_hex(&keyed_mac(key), message)
 }
 
-/// Constant-time string comparison for HMAC verification.
-fn ct_eq_str(a: &str, b: &str) -> bool {
-    use subtle::ConstantTimeEq;
-    a.as_bytes().ct_eq(b.as_bytes()).into()
-}
-
 /// Generate a random 32-byte ephemeral key from two UUID v4 values.
 fn generate_ephemeral_key() -> Vec<u8> {
     let a = uuid::Uuid::new_v4();
@@ -328,6 +322,29 @@ fn mac_hex(mac: &Hmac<Sha256>, message: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// The length of a hex-encoded HMAC-SHA256.
+const MAC_HEX_LEN: usize = 64;
+
+/// [`mac_hex`] into a stack buffer: the same lowercase hex bytes, with no
+/// heap `String`. A verify compares the MAC and drops it, on every request
+/// that carries a signed cookie, so it does not need an owned one.
+fn mac_hex_bytes(mac: &Hmac<Sha256>, message: &[u8]) -> [u8; MAC_HEX_LEN] {
+    let mut mac = mac.clone();
+    mac.update(message);
+    let mut out = [0_u8; MAC_HEX_LEN];
+    // A SHA-256 output is 32 bytes and the buffer is twice that, so the
+    // length check inside cannot fail. If it did, the zeroed buffer holds no
+    // hex digit and matches no signature.
+    let _ = hex::encode_to_slice(mac.finalize().into_bytes(), &mut out);
+    out
+}
+
+/// Constant-time comparison of a computed MAC with a presented signature.
+fn ct_eq_mac(expected: &[u8; MAC_HEX_LEN], hex_sig: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    expected.as_slice().ct_eq(hex_sig.as_bytes()).into()
+}
+
 fn keyed_mac(key: &[u8]) -> Hmac<Sha256> {
     <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length")
 }
@@ -354,14 +371,14 @@ impl ResolvedSigningKeys {
     /// `message` under any key. It computes one MAC per key, whatever the
     /// number of candidates. All comparisons are constant-time.
     pub fn verify_any(&self, message: &[u8], hex_sigs: &[&str]) -> bool {
-        let expected: Vec<String> = std::iter::once(&self.current_mac)
+        let expected: Vec<[u8; MAC_HEX_LEN]> = std::iter::once(&self.current_mac)
             .chain(&self.previous_macs)
-            .map(|mac| mac_hex(mac, message))
+            .map(|mac| mac_hex_bytes(mac, message))
             .collect();
         let mut matched = false;
         for candidate in hex_sigs {
             for mac in &expected {
-                matched |= ct_eq_str(mac, candidate);
+                matched |= ct_eq_mac(mac, candidate);
             }
         }
         matched
@@ -370,11 +387,11 @@ impl ResolvedSigningKeys {
     /// Returns `true` when `hex_sig` is a valid HMAC-SHA256 of `message` under
     /// any key (current first, then previous). All comparisons are constant-time.
     pub fn verify(&self, message: &[u8], hex_sig: &str) -> bool {
-        if ct_eq_str(&mac_hex(&self.current_mac, message), hex_sig) {
+        if ct_eq_mac(&mac_hex_bytes(&self.current_mac, message), hex_sig) {
             return true;
         }
         for prev_mac in &self.previous_macs {
-            if ct_eq_str(&mac_hex(prev_mac, message), hex_sig) {
+            if ct_eq_mac(&mac_hex_bytes(prev_mac, message), hex_sig) {
                 return true;
             }
         }
@@ -2284,6 +2301,90 @@ mod tests {
         let old_sig = old_keys.sign(b"session-id");
         let new_keys = ResolvedSigningKeys::new(new_key, vec![old_key]);
         assert!(new_keys.verify(b"session-id", &old_sig));
+    }
+
+    /// The check a verify made before it compared a stack buffer: the MAC as
+    /// an owned hex string, compared in constant time.
+    fn verify_by_string(keys: &ResolvedSigningKeys, message: &[u8], hex_sig: &str) -> bool {
+        use subtle::ConstantTimeEq;
+        std::iter::once(&keys.current_mac)
+            .chain(&keys.previous_macs)
+            .any(|mac| {
+                mac_hex(mac, message)
+                    .as_bytes()
+                    .ct_eq(hex_sig.as_bytes())
+                    .into()
+            })
+    }
+
+    #[test]
+    fn the_stack_mac_is_the_bytes_of_the_string_mac() {
+        let keys = ResolvedSigningKeys::new(b"k".to_vec(), vec![b"older".to_vec()]);
+        for message in [&b""[..], b"a", b"session-id", &[0xff; 200]] {
+            for mac in std::iter::once(&keys.current_mac).chain(&keys.previous_macs) {
+                let on_stack = mac_hex_bytes(mac, message);
+                assert_eq!(on_stack.as_slice(), mac_hex(mac, message).as_bytes());
+                assert!(
+                    on_stack
+                        .iter()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verify_accepts_and_rejects_what_the_string_check_did() {
+        let keys = ResolvedSigningKeys::new(
+            b"current-key-32-bytes-xxxxxxxxxx".to_vec(),
+            vec![b"previous-key".to_vec(), b"oldest-key".to_vec()],
+        );
+        let stranger = ResolvedSigningKeys::new(b"another-key".to_vec(), vec![]);
+        let message = b"session-id";
+        let current = keys.sign(message);
+        let previous = mac_hex(&keys.previous_macs[0], message);
+        let oldest = mac_hex(&keys.previous_macs[1], message);
+        let mut candidates = vec![
+            current.clone(),
+            previous,
+            oldest,
+            stranger.sign(message),
+            keys.sign(b"another message"),
+            String::new(),
+            // A hex signature is lowercase. The same digits in upper case,
+            // a prefix, and a longer string are other strings.
+            current.to_uppercase(),
+            current[..63].to_owned(),
+            format!("{current}0"),
+            format!(" {current}"),
+            "0".repeat(64),
+            "z".repeat(64),
+            "é".repeat(32),
+        ];
+        // One changed digit at each end and in the middle.
+        for at in [0, 31, 63] {
+            let mut flipped = current.clone().into_bytes();
+            flipped[at] = if flipped[at] == b'0' { b'1' } else { b'0' };
+            candidates.push(String::from_utf8(flipped).unwrap());
+        }
+        for candidate in &candidates {
+            assert_eq!(
+                keys.verify(message, candidate),
+                verify_by_string(&keys, message, candidate),
+                "{candidate:?}"
+            );
+            assert_eq!(
+                keys.verify_any(message, &[candidate.as_str(), "not-a-signature"]),
+                verify_by_string(&keys, message, candidate),
+                "verify_any: {candidate:?}"
+            );
+        }
+        // The three real signatures pass, and nothing else in the list does.
+        let passed = candidates
+            .iter()
+            .filter(|c| keys.verify(message, c))
+            .count();
+        assert_eq!(passed, 3);
     }
 
     #[test]

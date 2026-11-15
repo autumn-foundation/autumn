@@ -194,14 +194,10 @@ pub(super) fn resolve(
     options: &ScaffoldOptions,
     for_revert: bool,
 ) -> Result<Option<Nesting>, GenerateError> {
-    // `--belongs-to` is typed once, when the relationship is created. A later
-    // `generate … --force` (the ordinary "I changed a field, re-scaffold it"
-    // move) rarely repeats it — and dropping the nesting there would rewrite the
-    // child module without its nested handlers while the parent kept calling
-    // `children_section`, leaving the project uncompilable. The markers in the
-    // parent's routes file are a durable record of the relationship, so recover
-    // it. `destroy` already reads the same evidence, which keeps the two
-    // directions symmetric.
+    // A later `generate … --force` rarely repeats `--belongs-to`. Dropping the nesting then would
+    // rewrite the child without its nested handlers while the parent still calls
+    // `children_section`, breaking the build, so recover the parent from the markers in its routes
+    // file, as `destroy` does.
     let inferred_parent = if options.belongs_to.is_none() {
         infer_parent_from_markers(project_root, child_plural, fields)
     } else {
@@ -210,16 +206,9 @@ pub(super) fn resolve(
     let inferred = options.belongs_to.is_none() && inferred_parent.is_some();
     let effective = options.belongs_to.as_deref().or(inferred_parent.as_deref());
 
-    // A parent's injected section must never outlive the relationship it calls
-    // into. That section passes `row.id` — the PARENT's own key — to
-    // `children_section`, so if this run rebinds the child to a DIFFERENT parent
-    // (or to none), the call keeps compiling while meaning something else
-    // entirely: `posts.rs` would hand a post id to a helper now filtering on
-    // `user_id`, and Post #3's page would quietly list User #3's comments and
-    // create rows owned by them. Nothing on the child's side can fix that, and
-    // silently rewriting the other parent's view is not this command's
-    // business — so refuse before a single file is written, which leaves the
-    // project exactly as it was.
+    // The parent's injected section passes its own `row.id` to `children_section`. If this run
+    // binds the child to a different parent (or none), that call still compiles but filters on the
+    // wrong key, listing and creating the wrong rows. Refuse before any file is written.
     if !for_revert && !options.api {
         let effective_plural = effective.map(|parent| pluralize(&snake(parent)));
         let stale: Vec<String> = parents_carrying_child(project_root, child_plural)
@@ -228,10 +217,8 @@ pub(super) fn resolve(
             .filter(|parent_plural| Some(parent_plural.as_str()) != effective_plural.as_deref())
             .collect();
         if let Some(stale_parent) = stale.first() {
-            // Each shape fails differently, and saying which is the whole
-            // value of the message: a dropped foreign key stops the project
-            // COMPILING (loud), while a re-parent leaves it compiling and
-            // reading the wrong rows (silent, and much worse).
+            // Say which failure it is: a dropped foreign key breaks the build, a re-parent silently
+            // reads the wrong rows.
             let because = effective_plural.as_deref().map_or_else(
                 || {
                     format!(
@@ -267,10 +254,8 @@ pub(super) fn resolve(
     let parent_snake = snake(raw_parent);
     let parent_plural = pluralize(&parent_snake);
 
-    // Variant gates. Each of these owns a different list/DOM/persistence
-    // contract that the nested list + inline form would silently break, so
-    // refuse them up front with an actionable message rather than emit output
-    // that half-works (the precedent set by the `slug` gates in issue #1260).
+    // Each of these variants owns a list/DOM/persistence contract the nested list and inline form
+    // would break, so refuse them up front, as the `slug` gates do (#1260).
     let unsupported = if options.api {
         Some((
             "--api",
@@ -306,9 +291,7 @@ pub(super) fn resolve(
         )));
     }
 
-    // The foreign key is the child's OWN `references` column pointing at the
-    // parent's table — this generator consumes `references:` (#1026), it does
-    // not re-derive it.
+    // The foreign key is the child's own `references` column to the parent's table (#1026).
     let Some(fk_field) = fields
         .iter()
         .find(|f| f.reference_table().as_deref() == Some(parent_plural.as_str()))
@@ -357,9 +340,8 @@ pub(super) fn resolve(
         return Ok(Some(nesting));
     }
 
-    // The generated child module links back to `crate::routes::<parents>::paths`,
-    // and the parent-side list is injected into that module's `show` — so the
-    // parent has to be a scaffolded HTML resource already.
+    // The child module links back to `crate::routes::<parents>::paths` and the list is injected
+    // into the parent's `show`, so the parent must already be a scaffolded HTML resource.
     let parent_routes = project_root
         .join("src")
         .join("routes")
@@ -372,11 +354,8 @@ pub(super) fn resolve(
              command."
         )));
     };
-    // The preflight must check EVERY anchor the body injection relies on, not
-    // just the signature: a `show` whose signature still matches but whose body
-    // has been rewritten (the `Ok(…)` tail moved, the markup furniture removed)
-    // would otherwise be "patched" into code that does not parse — the
-    // generator breaking a file it does not own, and reporting success.
+    // Check every anchor the body injection needs, not just the signature: a `show` whose body was
+    // rewritten by hand would otherwise be patched into code that does not parse.
     if injection_anchors(&parent_src).is_none() {
         return Err(GenerateError::Config(format!(
             "`--belongs-to {parent_pascal}` could not find a standard `show` handler in \
@@ -388,10 +367,8 @@ pub(super) fn resolve(
              hand-write the parent-scoped list in that `show` view."
         )));
     }
-    // A `--sharded` PARENT holds `mut db: ShardedDb`, which will not coerce to
-    // the `&mut Db` the injected `children_section` call takes. The child's own
-    // `--sharded` is already refused above; this is the same refusal for the
-    // OTHER side of the relationship, which the child's own flags cannot see.
+    // A `--sharded` parent holds `mut db: ShardedDb`, which does not coerce to the `&mut Db` the
+    // injected `children_section` call takes. The child's own flags cannot see this.
     if !show_signature(&parent_src).is_some_and(|sig| sig.contains(SHOW_DB_PARAM)) {
         return Err(GenerateError::Config(format!(
             "`--belongs-to {parent_pascal}` needs a parent on the standard `Db` connection, \
@@ -436,14 +413,9 @@ pub(super) fn reapply_children(previous: &str, fresh: &str) -> Result<String, Ve
     if children.is_empty() {
         return Ok(fresh.to_owned());
     }
-    // The CHILD's own generate preflights the parent's shape in `resolve`, but a
-    // PARENT regeneration runs none of that — it has no `--belongs-to` of its
-    // own. So check the same preconditions here against the FRESH render before
-    // putting anything back: a variant change can reshape `show` into something
-    // the section cannot live in, and "the marker landed" is not the test —
-    // a `--sharded` parent's `show` still takes the injection cleanly and then
-    // fails to compile, because `children_section` borrows `&mut Db` and the
-    // handler now holds a `ShardedDb`.
+    // A parent regeneration has no `--belongs-to`, so `resolve` never checked it. Check the fresh
+    // render: a variant change can reshape `show` so the section no longer fits, and a `--sharded`
+    // parent takes the injection cleanly but then fails to compile (`ShardedDb` is not `&mut Db`).
     if !show_accepts_children_section(fresh) {
         return Err(children);
     }
@@ -465,9 +437,8 @@ fn children_nested_under_src(src: &str) -> Vec<String> {
     let mut children: Vec<String> = src
         .lines()
         .filter_map(|line| {
-            // `rfind` because the marker is a line TRAILER; the code ahead of it
-            // may legitimately mention the same text. The prefix carries its
-            // colon, so `// autumn:nested-extractors` cannot match.
+            // `rfind`: the marker is a line trailer and the code before it may contain the same
+            // text. The prefix ends in a colon, so `// autumn:nested-extractors` cannot match.
             let trimmed = line.trim_end();
             let at = trimmed.rfind(CHILD_MARKER_PREFIX)?;
             let child = &trimmed[at + CHILD_MARKER_PREFIX.len()..];
@@ -565,7 +536,7 @@ pub(super) fn parents_carrying_child(project_root: &Path, child_plural: &str) ->
             std::fs::read_to_string(path).is_ok_and(|src| carries_child_marker(&src, child_plural))
         })
         .collect();
-    // Stable order so a recomputed plan is deterministic across filesystems.
+    // `read_dir` order varies by filesystem; sort so the plan is deterministic.
     found.sort();
     found
 }
@@ -585,9 +556,8 @@ fn find_show_signature_line(src: &str) -> Option<usize> {
         if trimmed.starts_with(SHOW_SIGNATURE_PREFIX) {
             return signature_end_line(&lines, *i).is_some();
         }
-        // Multi-line form, as `rustfmt` rewrites it once the signature grows
-        // past `max_width` — which is exactly what happens after this injection
-        // adds six extractors and the project's CI runs `cargo fmt --check`.
+        // Multi-line form, as `rustfmt` rewrites it once the injected extractors push it past
+        // `max_width`.
         trimmed == "pub async fn show("
             && lines
                 .get(i + 1)
@@ -645,8 +615,8 @@ fn injection_anchors(src: &str) -> Option<(usize, usize, usize)> {
     let (body_start, body_end) = show_body_range(&lines, signature);
     let ok_tail = (body_start..body_end).find(|i| lines[*i].trim_start().starts_with("Ok("))?;
     let render_anchor = (body_start..body_end).find(|i| lines[*i].trim_start() == RENDER_ANCHOR)?;
-    // The markup furniture must come after the `Ok(…)` the binding is inserted
-    // before — otherwise the section would be rendered before it is bound.
+    // The "Back to list" anchor, where the render call goes, must come after the `Ok(…)` the
+    // binding is inserted before, or the section would be rendered before it is bound.
     if render_anchor <= ok_tail {
         return None;
     }
@@ -667,34 +637,28 @@ pub(super) fn inject_into_parent_show(parent_src: &str, child_plural: &str) -> S
     }
     let (source, endings) = Endings::split(parent_src);
     let Some((signature, ok_tail, render_anchor)) = injection_anchors(&source) else {
-        // Not a shape we understand. `resolve` already refuses this on the
-        // generate path; returning the input untouched keeps the function
-        // total — it never emits a half-edit.
+        // Not a shape we understand (`resolve` refuses it on the generate path). Never half-edit.
         return parent_src.to_owned();
     };
 
     let mut lines: Vec<String> = source.lines().map(ToOwned::to_owned).collect();
 
-    // 1. Extra extractors on the signature — added once per parent, however many
-    //    children it ends up with. Every added declaration carries the marker so
-    //    the undo is exact in either signature shape.
+    // 1. Extra extractors on the signature, once per parent. Each added declaration carries the
+    //    marker so the undo is exact in either signature shape.
     let signature_close = signature_end_line(
         &lines.iter().map(String::as_str).collect::<Vec<_>>(),
         signature,
     )
     .unwrap_or(signature);
-    // Detected by the DECLARATION text as well as the marker: `rustfmt` relocates
-    // the marker comment into the body when it explodes the signature, so a
-    // marker-only check would re-inject a duplicate set of parameters into an
-    // already-injected, already-formatted parent.
+    // Also detected by declaration text: `rustfmt` moves the marker into the body when it splits
+    // the signature, and a marker-only check would inject a duplicate parameter set.
     let already_injected = lines[signature..=signature_close].iter().any(|line| {
         line.contains(EXTRACTORS_MARKER) || EXTRACTOR_PARAM_DECLS.iter().any(|d| line.contains(d))
     });
     let mut shift = 0usize;
     if !already_injected {
-        // The allowance goes above the signature — and above any `#[get(...)]`
-        // route attribute already sitting there, which must stay adjacent to the
-        // function it annotates.
+        // The allow attribute goes above the signature and any `#[get(...)]` attribute, which
+        // must stay adjacent to its fn.
         let attrs_start = lines[..signature]
             .iter()
             .rposition(|line| !line.trim_start().starts_with('#'))
@@ -702,8 +666,8 @@ pub(super) fn inject_into_parent_show(parent_src: &str, child_plural: &str) -> S
         lines.insert(attrs_start, extractors_allow_line());
         let (signature, signature_close) = (signature + 1, signature_close + 1);
         if signature == signature_close {
-            // One-line signature (as generated): splice the declarations in
-            // front of the return type and stamp the marker on the line.
+            // One-line signature (as generated): splice the declarations in front of the return
+            // type and stamp the marker on the line.
             lines[signature] = format!(
                 "{}{}{SHOW_RETURN} {EXTRACTORS_MARKER}",
                 lines[signature]
@@ -712,8 +676,7 @@ pub(super) fn inject_into_parent_show(parent_src: &str, child_plural: &str) -> S
                 extractor_params_inline(),
             );
         } else {
-            // `rustfmt`-split signature: one marked line per declaration, above
-            // the closing `) -> …` line.
+            // `rustfmt`-split signature: one marked line per declaration, above `) -> …`.
             for (offset, decl) in EXTRACTOR_PARAM_DECLS.iter().enumerate() {
                 lines.insert(
                     signature_close + offset,
@@ -726,21 +689,16 @@ pub(super) fn inject_into_parent_show(parent_src: &str, child_plural: &str) -> S
     }
     let (ok_tail, render_anchor) = (ok_tail + shift, render_anchor + shift);
 
-    // 2. The render call inside the `html!` block, above the "Back to list"
-    //    furniture so the children read as part of the record's own detail.
-    //    Inserted BEFORE the binding so the earlier `ok_tail` index stays valid.
+    // 2. The render call, above the "Back to list" furniture. Inserted before the binding so the
+    //    `ok_tail` index stays valid.
     lines.insert(
         render_anchor,
         format!("        (__autumn_children_{child_plural}) {marker}"),
     );
 
-    // 3. The `let … = children_section(…).await?;` binding, immediately before the
-    //    handler's `Ok(…)` tail. The section is `await`ed outside the `html!`
-    //    macro because Maud's markup is a synchronous expression.
-    //
-    //    `row.id` is the parent's own primary key — the value the child's foreign
-    //    key column holds. `&mut db` (rather than a move) so a parent with several
-    //    nested children can render each section in turn off the same connection.
+    // 3. The `children_section` binding, just before the `Ok(…)` tail. It is awaited outside
+    //    `html!` because Maud markup is a synchronous expression. `row.id` is the parent's key,
+    //    which the child's foreign key holds; `&mut db` lets several children share the connection.
     let binding = format!(
         "    let __autumn_children_{child_plural} = crate::routes::{child_plural}::children_section(\
          &mut db, row.id, &autumn_web::pagination::PageRequest::default(), \
@@ -773,11 +731,9 @@ pub(super) fn remove_nested_child_section(content: &str, child_plural: &str) -> 
     let binding_head = format!("let __autumn_children_{child_plural} =");
     let render_call = format!("(__autumn_children_{child_plural})");
 
-    // Only lines inside the `show` handler are ever injected, so only those are
-    // ever removed: a user who happens to write one of these tokens elsewhere in
-    // the file keeps their line. A file whose `show` can no longer be located
-    // (it was rewritten after injection) falls back to a whole-file sweep —
-    // leaving dangling references to a just-deleted module would be worse.
+    // Only remove lines inside `show`, where they were injected, so a user's own use of these
+    // tokens elsewhere survives. If `show` can no longer be found, sweep the whole file: dangling
+    // references to a deleted module would be worse.
     let (from, to) = find_show_signature_line(&source)
         .map_or((0, all.len()), |signature| show_body_range(&all, signature));
 
@@ -786,9 +742,8 @@ pub(super) fn remove_nested_child_section(content: &str, child_plural: &str) -> 
     while i < to {
         let trimmed = all[i].trim_start();
         if trimmed.starts_with(&binding_head) {
-            // The binding runs to its terminating `.await?;`, which is on this
-            // same line when unformatted and several lines down once `rustfmt`
-            // has split the call.
+            // The binding ends at `.await?;`: on this line when unformatted, several lines down
+            // once `rustfmt` has split the call.
             let end = (i..to).find(|j| all[*j].contains(".await?;")).unwrap_or(i);
             for item in drop.iter_mut().take(end + 1).skip(i) {
                 *item = true;
@@ -808,28 +763,21 @@ pub(super) fn remove_nested_child_section(content: &str, child_plural: &str) -> 
         .map(|(_, line)| (*line).to_owned())
         .collect();
 
-    // The extractors are shared by every nested child of this parent, so they
-    // only come off with the last one. Both layouts are undone: the inline
-    // splice on a one-line signature, and the one-declaration-per-line form
-    // `rustfmt` leaves behind.
+    // The extractors are shared by every nested child, so they come off only with the last one, in
+    // either layout: the inline splice or the one-declaration-per-line form `rustfmt` leaves.
     let any_child_left = lines
         .iter()
         .any(|line| line.contains(CHILD_MARKER_PREFIX) && !line.contains(EXTRACTORS_MARKER));
-    // Only ever touch a signature this generator actually spliced — the marker
-    // is the proof, wherever `rustfmt` has since moved it.
+    // Only touch a signature this generator spliced; the marker proves it, wherever `rustfmt`
+    // moved it.
     let was_injected = lines.iter().any(|line| line.contains(EXTRACTORS_MARKER));
     if !any_child_left && was_injected {
-        // Drop only lines that ARE one of the declarations this generator adds
-        // — matched in full, not merely "carries the marker". A blanket
-        // marker-suffix filter would delete the whole one-line `show` signature,
-        // which also carries the marker.
+        // Drop only lines that are exactly one of the added declarations: a marker-suffix filter
+        // would also delete the one-line `show` signature, which carries the marker too.
         //
-        // The marker is matched OPTIONALLY because `rustfmt` relocates it: when
-        // it explodes the one-line signature it keeps the single trailing
-        // comment and parks it as the first line of the body, leaving the
-        // declarations themselves bare. Matching the declaration text is what
-        // makes the undo survive a formatted project — and the project's own
-        // generated CI runs `cargo fmt --check`, so formatted is the norm.
+        // The marker is optional because `rustfmt` moves it into the body when it splits the
+        // signature, leaving the declarations bare. Generated projects run `cargo fmt --check`,
+        // so this is the norm.
         let decl_lines: Vec<String> = EXTRACTOR_PARAM_DECLS
             .iter()
             .map(|decl| format!("{decl},"))
@@ -840,22 +788,16 @@ pub(super) fn remove_nested_child_section(content: &str, child_plural: &str) -> 
                 return false; // the orphaned marker `rustfmt` left in the body
             }
             let Some(marked) = trimmed.strip_suffix(EXTRACTORS_MARKER) else {
-                // Unmarked: only the parameter declarations themselves qualify,
-                // and only because `rustfmt` strips their markers when it
-                // explodes the signature. `ALLOW_ATTR` deliberately does NOT,
-                // since the flat templates emit that very attribute on `index`
-                // and `<snake>_form_for` — matching it unmarked would have
-                // destroy quietly delete lines this injection never added.
+                // Unmarked: only the declarations qualify, since `rustfmt` strips their markers.
+                // `ALLOW_ATTR` does not: the flat templates emit it on `index` and
+                // `<snake>_form_for`, so matching it unmarked would delete lines never injected.
                 return !decl_lines.iter().any(|decl| trimmed == decl);
             };
             let marked = marked.trim_end();
             !(decl_lines.iter().any(|decl| marked == decl) || marked == ALLOW_ATTR)
         });
-        // …and un-splice the inline form from a one-line signature. If the
-        // declarations are not the ones THIS version emits (a project injected
-        // by an older CLI), the line is left completely alone: leftover unused
-        // parameters are a warning, deleting a signature we don't recognise is a
-        // broken build.
+        // …and un-splice the inline form. Declarations this version does not emit (an older CLI)
+        // are left alone: unused parameters are a warning, a deleted signature is a broken build.
         let inline = extractor_params_inline();
         for line in &mut lines {
             if !line.trim_end().ends_with(EXTRACTORS_MARKER) {
@@ -1027,9 +969,8 @@ mod tests {
 
     #[test]
     fn injection_refuses_a_show_whose_view_body_was_rewritten() {
-        // Signature intact, markup furniture gone: the anchors the render call
-        // needs are missing, so the file must be left EXACTLY alone rather than
-        // patched into something that does not parse.
+        // Signature intact, markup furniture gone: the render anchor is missing, so the file must
+        // be left exactly alone rather than patched into code that does not parse.
         let mangled = PARENT.replace(
             "        (autumn_web::a11y::Link::new(paths::index(), \"Back to list\"))\n",
             "",
@@ -1062,9 +1003,8 @@ mod tests {
 
     #[test]
     fn removal_never_deletes_a_signature_carrying_an_unrecognised_extractor_splice() {
-        // A parent injected by an OLDER CLI carries the marker but a different
-        // parameter list. Removal must not guess: leaving unused parameters is a
-        // warning, deleting the `show` signature is a broken build.
+        // An older CLI's splice: the marker with a different parameter list. Unused parameters are
+        // a warning; deleting the `show` signature is a broken build.
         let stale = PARENT.replace(
             ") -> AutumnResult<Markup> {",
             ", __nested_csrf: Option<CsrfToken>) -> AutumnResult<Markup> { // autumn:nested-extractors",
@@ -1079,10 +1019,8 @@ mod tests {
 
     #[test]
     fn a_marker_is_never_matched_as_a_prefix_of_a_longer_plural() {
-        // `// autumn:nested:posts` is a prefix of `// autumn:nested:postscripts`.
-        // A substring test would make a flat `Post` scaffold believe it was
-        // nested — and mount `routes::posts::nested_index` against a module
-        // that emits no such handler.
+        // `// autumn:nested:posts` is a prefix of `// autumn:nested:postscripts`. A substring test
+        // would treat a flat `Post` scaffold as nested and mount a handler it does not emit.
         let with_longer = inject_into_parent_show(PARENT, "postscripts");
         assert!(with_longer.contains("// autumn:nested:postscripts"));
         assert!(
@@ -1090,9 +1028,7 @@ mod tests {
             "a `postscripts` section must not read as a `posts` one:\n{with_longer}"
         );
         assert!(carries_child_marker(&with_longer, "postscripts"));
-        // …and the idempotency check keys off the same test, so nesting
-        // `posts` under that parent still injects rather than silently
-        // skipping.
+        // The idempotency check uses the same test, so nesting `posts` still injects.
         let both = inject_into_parent_show(&with_longer, "posts");
         assert!(both.contains("__autumn_children_posts ="), "{both}");
         assert!(both.contains("__autumn_children_postscripts ="), "{both}");

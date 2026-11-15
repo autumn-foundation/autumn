@@ -47,15 +47,6 @@ pub async fn __replay_finalized_session_response_for_anonymous(
     None
 }
 
-#[derive(Clone)]
-pub(crate) struct IdempotencySessionScope;
-
-impl IdempotencySessionScope {
-    pub(crate) fn new(_: Option<String>, _: Option<String>) -> Self {
-        Self
-    }
-}
-
 pub(crate) fn persistence_failed_response() -> Response<Body> {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = axum::http::StatusCode::SERVICE_UNAVAILABLE;

@@ -21,9 +21,7 @@
 pub enum Confidence {
     /// Safe by construction — a rename or import move. Rewritten sites are
     /// reported as a count plus the diff.
-    // No shipped migration currently earns this label (issue #2234); kept for
-    // the next one that does. Tests construct it, so production code alone
-    // does not.
+    // No shipped migration earns this label yet (#2234); only tests construct it.
     #[cfg_attr(not(test), allow(dead_code))]
     Auto,
     /// Rewritten, but each site is listed individually in the summary for a
@@ -136,14 +134,9 @@ pub struct AppMigration {
 
 /// The canonical registry of app-code migrations, oldest release first.
 pub static APP_MIGRATIONS: &[AppMigration] = &[
-    // 0.4.0 and 0.5.0 ship no codemod — every break in those releases is
-    // semantic or configuration-level. They are registered anyway: without an
-    // entry, an app upgrading 0.3.x -> 0.6.0 would be told about the two 0.6.0
-    // changes and nothing else, which reads as "those are the only breaks in
-    // range". A `GuideOnly` entry is how the summary names the change and links
-    // its guide section. `MIGRATION_GUIDE_FLOOR` in
-    // `scripts/check-migration-guides.sh` is 0.4.0, so that is where this
-    // starts too.
+    // 0.4.0 and 0.5.0 ship no codemod. `GuideOnly` entries make the summary name and link every
+    // break in range, not only the ones with a rewrite. This starts at 0.4.0 to match
+    // `MIGRATION_GUIDE_FLOOR` in `scripts/check-migration-guides.sh`.
     AppMigration {
         id: "0.4.0-security-production-signing-secret",
         version: "0.4.0",
@@ -212,19 +205,15 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         id: "0.6.0-repository-with-pool-untracked",
         version: "0.6.0",
         title: "repository constructor `with_pool` is renamed to `with_pool_untracked`",
-        // `review`, not `auto` (issue #2234): the receiver check is textual,
-        // not name resolution, so it can miss a hand-written type or a
-        // foreign `#[repository]`. Every site is still rewritten; each one is
-        // also flagged for a human to read.
+        // `review`, not `auto` (#2234): the receiver check is textual, not name resolution, so
+        // every rewritten site is also listed for a human to read.
         confidence: Confidence::Review,
         guide: "docs/migrations/0.6.0.md#repository-with_pool-is-renamed-to-with_pool_untracked",
         rewrite: Rewrite::CallRename {
             from: "with_pool",
             to: "with_pool_untracked",
-            // `pub fn with_pool_untracked(pool) -> Self` — an associated
-            // function taking exactly the pool. `AppState::with_pool(pool)`
-            // and `AuthzContext::with_pool(pool)` are builder *methods* that
-            // still carry the old name and must not be touched.
+            // An associated function taking only the pool. `AppState::with_pool(pool)` and
+            // `AuthzContext::with_pool(pool)` are builder methods that keep the old name.
             form: CallForm::AssociatedFunction,
             args: 1,
             receiver: Some(ReceiverShape {
@@ -233,12 +222,8 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
             }),
         },
     },
-    // 0.7.0 ships no codemod: each of its breaks needs a value, a wire change
-    // in a client this tool never sees, or a change of impl *shape* — none of
-    // them rename-level. They are registered as `GuideOnly` so the upgrade
-    // summary names them and links the guide section, rather than a 0.6.x app
-    // being told "nothing to change" about a release that broke three seams
-    // and rewrote query decoding.
+    // 0.7.0 ships no codemod: each break needs a value, a client wire change or a new impl
+    // shape. `GuideOnly` entries make the summary name and link them.
     AppMigration {
         id: "0.7.0-routing-route-seo-field",
         version: "0.7.0",
@@ -263,19 +248,8 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         guide: "docs/migrations/0.7.0.md#app-wide-layers-are-now-erased",
         rewrite: Rewrite::GuideOnly,
     },
-    // Not a compile break — this one still builds, which is exactly why it
-    // needs surfacing: `Query<T>` was rewritten, and four of its runtime
-    // behaviours changed. A 0.6.x app that uses `Query<T>` beyond unique
-    // scalar keys can start returning 400s, stop resolving map duplicates
-    // last-value-wins, or see `Vec<(String, String)>` come back key-sorted,
-    // with nothing in the build to warn it. `GuideOnly` is precisely the slot
-    // for a client-dependent change no source-level rewrite can decide.
-    // The highest-consequence item in the release, and invisible in Rust: an
-    // `autumn.toml` that already sets `auto_migrate_in_production = true` under
-    // a CUSTOM profile did nothing on 0.6.x and applies migrations at startup
-    // on 0.7.0. The key did not change; the profile name-gate around it was
-    // removed. An operator who reads only the compile breaks would meet this
-    // for the first time against a live database.
+    // Invisible in Rust: `auto_migrate_in_production = true` under a custom profile did nothing
+    // on 0.6.x and applies migrations at startup on 0.7.0.
     AppMigration {
         id: "0.7.0-migrate-profile-agnostic",
         version: "0.7.0",
@@ -284,6 +258,8 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         guide: "docs/migrations/0.7.0.md#startup-migrations-are-now-profile-agnostic-1903",
         rewrite: Rewrite::GuideOnly,
     },
+    // Still compiles: `Query<T>` can now return 400s, no longer resolves map duplicates
+    // last-value-wins, and sorts `Vec<(String, String)>` by key. Nothing in the build warns.
     AppMigration {
         id: "0.7.0-query-decoding",
         version: "0.7.0",
@@ -292,13 +268,8 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         guide: "docs/migrations/0.7.0.md#queryt-decoding-1972",
         rewrite: Rewrite::GuideOnly,
     },
-    // 0.8.0 ships no codemod either: every break below (one entry per section of
-    // the guide's *Breaking changes*) needs a value, a new
-    // field, a changed impl shape, or a decision about behaviour — none is
-    // rename-level. They are registered as `GuideOnly` so `autumn upgrade` names
-    // them and links the guide section, rather than a 0.7.x app being told
-    // "nothing to change" about a release that tightened a dozen compile-time
-    // checks.
+    // 0.8.0 ships no codemod: no break below (one per section of the guide's *Breaking changes*)
+    // is rename-level, so each is `GuideOnly`.
     AppMigration {
         id: "0.8.0-http-client-error-non-exhaustive",
         version: "0.8.0",
@@ -523,11 +494,8 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         guide: "docs/migrations/0.8.0.md#dependencies-validator-moves-to-021",
         rewrite: Rewrite::GuideOnly,
     },
-    // 0.9.0 ships no codemod either. Each break below (one entry per section of
-    // the guide's *Breaking changes*) adds a field or variant, changes a trait
-    // signature, or changes runtime behaviour — none is rename-level. They are
-    // registered as `GuideOnly` so `autumn upgrade` names each one and links its
-    // guide section.
+    // 0.9.0 ships no codemod: no break below (one per section of the guide's *Breaking changes*)
+    // is rename-level, so each is `GuideOnly`.
     AppMigration {
         id: "0.9.0-commentable-soft-delete-argument",
         version: "0.9.0",
@@ -920,12 +888,8 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         guide: "docs/migrations/0.9.0.md#agent-authority-manifest-rows-gain-webmcp-fields",
         rewrite: Rewrite::GuideOnly,
     },
-    // 0.10.0 ships no codemod either. Each break below (one entry per section
-    // of the guide's *Breaking changes*) moves code behind a feature, adds a
-    // field or variant, changes a trait, a type or markup, or raises the
-    // toolchain or a dependency — none is rename-level. They are registered as
-    // `GuideOnly` so `autumn upgrade` names each one and links its guide
-    // section.
+    // 0.10.0 ships no codemod: no break below (one per section of the guide's *Breaking changes*)
+    // is rename-level, so each is `GuideOnly`.
     AppMigration {
         id: "0.10.0-features-optional-modules",
         version: "0.10.0",
@@ -1108,9 +1072,8 @@ impl Ord for Version {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         (self.major, self.minor, self.patch)
             .cmp(&(other.major, other.minor, other.patch))
-            // `0.7.0-rc.1` precedes `0.7.0`, so an app on the candidate is
-            // *behind* the release and still needs its migrations. Derived
-            // ordering would have put `false` first and inverted this.
+            // `0.7.0-rc.1` precedes `0.7.0`: an app on the candidate still needs the release's
+            // migrations. A derived `Ord` would sort `None` first and invert this.
             .then_with(|| other.prerelease.is_some().cmp(&self.prerelease.is_some()))
     }
 }
@@ -1150,9 +1113,8 @@ pub fn parse_version_req(req: &str) -> Option<Version> {
     if req.is_empty() || req.contains(',') {
         return None;
     }
-    // An upper bound is not a floor. `autumn-web = "<0.6"` says nothing about
-    // which release the app is on — stripping the `<` would read it as 0.6.0
-    // and skip the very 0.6.0 codemod a 0.5.x app needs. Ask for `--from`.
+    // An upper bound is not a floor: reading `<0.6` as 0.6.0 would skip the 0.6.0 codemod a
+    // 0.5.x app needs. Ask for `--from`.
     if req.starts_with('<') {
         return None;
     }
@@ -1172,11 +1134,8 @@ pub fn parse_version_req(req: &str) -> Option<Version> {
         return None;
     }
     let mut parts = core.split('.');
-    // An omitted segment is Cargo's "any value here", whose floor is zero, and
-    // an explicit wildcard segment says the same thing: `0.5.*` and `0.5` pin
-    // the same floor. Only the *major* wildcard is refused — a bare `*` accepts
-    // every release, so reading it as 0.0.0 would silently select every
-    // migration ever written instead of asking for `--from`.
+    // An omitted or wildcard segment floors at zero: `0.5.*` and `0.5` pin the same floor. A
+    // wildcard major is refused: reading `*` as 0.0.0 would select every migration ever written.
     let first = parts.next()?;
     if is_wildcard(first) {
         return None;
@@ -1190,8 +1149,7 @@ pub fn parse_version_req(req: &str) -> Option<Version> {
                 wildcarded = true;
                 Some(0)
             }
-            // `1.*.3` is not a requirement Cargo accepts, and reading the `3`
-            // after a wildcard would invent precision the user did not write.
+            // Cargo rejects `1.*.3`; reading the `3` would invent precision the user never wrote.
             Some(_) if wildcarded => None,
             Some(part) => part.parse::<u64>().ok(),
         }
@@ -1300,8 +1258,7 @@ mod tests {
         assert_eq!(parse_version_req("0.7.0+build.5"), Some(v(0, 7, 0)));
         assert_eq!(parse_version_req("0.7.0-rc.1"), Some(pre(0, 7, 0)));
         assert_eq!(parse_version_req("0.7.0-rc.1+build.5"), Some(pre(0, 7, 0)));
-        // The identifier is carried verbatim, not flattened: the report has to
-        // be able to echo the version that was actually asked for.
+        // The identifier is kept verbatim so the report can echo the version that was asked for.
         assert_eq!(
             parse_version_req("0.7.0-beta.2"),
             Some(pre_id(0, 7, 0, "beta.2"))
@@ -1322,9 +1279,8 @@ mod tests {
 
     #[test]
     fn prereleases_of_one_triple_are_interchangeable_for_selection() {
-        // Ordering only has to separate pre-release from stable: every registry
-        // version is a released one, so `rc.1` vs `beta.2` never decides which
-        // migrations apply. Display keeps them distinct; comparison does not.
+        // Every registry version is a release, so ordering only separates pre-release from stable.
+        // Display keeps `rc.1` and `beta.2` distinct; comparison does not.
         assert_eq!(pre_id(0, 7, 0, "rc.1"), pre_id(0, 7, 0, "rc.1"));
         assert!(pre_id(0, 7, 0, "beta.2") < v(0, 7, 0));
         assert_eq!(
@@ -1343,9 +1299,8 @@ mod tests {
 
     #[test]
     fn an_app_on_a_release_candidate_still_needs_that_releases_migrations() {
-        // Upgrading 0.7.0-rc.1 -> 0.7.0: the candidate is *behind* the release,
-        // so the release's migrations apply. Treating the two as equal selected
-        // nothing.
+        // Upgrading 0.7.0-rc.1 -> 0.7.0: the candidate is behind the release, so the release's
+        // migrations apply.
         let ids = ids(&select_between(
             FIXTURE_REGISTRY,
             &pre(0, 7, 0),
@@ -1368,13 +1323,10 @@ mod tests {
 
     #[test]
     fn rejects_unparsable_requirements() {
-        // A wildcard, a multi-comparator range, and a git/branch style pin
-        // carry no single lower bound this command can trust — better to ask
-        // for `--from` than to guess and rewrite against the wrong release.
+        // No single lower bound: ask for `--from` rather than rewrite against a guessed release.
         assert_eq!(parse_version_req("*"), None);
         assert_eq!(parse_version_req(">=0.4, <0.6"), None);
-        // An upper bound is not a floor: reading `<0.6` as 0.6.0 would skip
-        // the 0.6.0 codemod on an app actually resolved to 0.5.x.
+        // An upper bound is not a floor: reading `<0.6` as 0.6.0 would skip the 0.6.0 codemod.
         assert_eq!(parse_version_req("<0.6"), None);
         assert_eq!(parse_version_req("<=0.6.0"), None);
         assert_eq!(parse_version_req(""), None);
@@ -1382,17 +1334,13 @@ mod tests {
         // A wildcard *major* is the bare `*` in another spelling.
         assert_eq!(parse_version_req("x"), None);
         assert_eq!(parse_version_req("X.1"), None);
-        // Precision after a wildcard is not a requirement Cargo accepts, and
-        // honouring the `3` would invent a floor the user did not write.
+        // Cargo rejects precision after a wildcard.
         assert_eq!(parse_version_req("1.*.3"), None);
     }
 
     #[test]
     fn a_wildcard_segment_floors_at_zero() {
-        // Cargo's wildcard requirements. `0.5.*` and `0.5` are the same
-        // requirement, so they have to parse to the same floor — and `0.*` is
-        // `0` written out, which this has always accepted as 0.0.0. Only the
-        // major position is refused, because `*` alone accepts every release.
+        // `0.5.*` is `0.5` and `0.*` is `0`, so each pair parses to the same floor.
         assert_eq!(parse_version_req("0.5.*"), Some(Version::new(0, 5, 0)));
         assert_eq!(parse_version_req("0.5.x"), Some(Version::new(0, 5, 0)));
         assert_eq!(parse_version_req("^1.2.*"), Some(Version::new(1, 2, 0)));
@@ -1414,12 +1362,8 @@ mod tests {
 
     #[test]
     fn excludes_migrations_the_app_is_already_past() {
-        // An app already on 0.6.0 needs none of 0.6.0's migrations — but it
-        // does need everything 0.7.0 introduced. This asserted an EMPTY result
-        // while 0.7.0 had no entries yet, which quietly conflated "excludes
-        // what the app is past" with "the target release adds nothing"; the
-        // moment 0.7.0 registered its first migration the assertion was wrong
-        // about the thing it is named for. Assert the boundary itself.
+        // An app on 0.6.0 needs none of 0.6.0's migrations but all of 0.7.0's. Assert the
+        // boundary, not an empty result, so the test survives new 0.7.0 entries.
         let selected = migrations_between(&v(0, 6, 0), &v(0, 7, 0));
         let ids: Vec<_> = selected.iter().map(|m| m.id).collect();
         assert!(
@@ -1586,10 +1530,8 @@ mod tests {
 
     #[test]
     fn no_two_renames_in_one_release_chain_into_each_other() {
-        // `rewrite_source_for_releases` iterates release by release, so a chain
-        // that crosses releases resolves in one run. A chain *within* one
-        // release would need a second pass that does not happen — so it is
-        // forbidden rather than half-supported.
+        // `rewrite_source_for_releases` resolves chains across releases in one run, but a chain
+        // within one release would need a second pass that does not happen.
         for migration in app_migrations() {
             let Rewrite::CallRename { to, .. } = migration.rewrite else {
                 continue;
@@ -1614,9 +1556,7 @@ mod tests {
             .iter()
             .find(|m| m.id == "0.6.0-repository-with-pool-untracked")
             .expect("the with_pool rename is the first shipped codemod (issue #1629)");
-        // `review`, not `auto` (issue #2234): receiver identification is
-        // textual, not name resolution, so flagging every rewrite for a human
-        // to read is the safer default until that gap closes.
+        // `review`, not `auto` (#2234): receiver identification is textual, not name resolution.
         assert_eq!(migration.confidence, Confidence::Review);
         assert_eq!(
             migration.rewrite,
@@ -1643,8 +1583,7 @@ mod tests {
         assert!(shape.matches("PgPostRepository"));
         assert!(shape.matches("PgSubredditRepository"));
         assert!(shape.matches("PgRepository"), "a trait named `Repository`");
-        // An app type that merely starts with `Pg`, or merely ends in
-        // `Repository`, is not something the macro generated.
+        // A type that only starts with `Pg` or only ends in `Repository` is not generated.
         assert!(!shape.matches("PgCache"));
         assert!(!shape.matches("PgConnectionPool"));
         assert!(!shape.matches("PostRepository"), "that is the trait");

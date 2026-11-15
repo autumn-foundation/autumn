@@ -63,14 +63,9 @@ const STATUS_SQL: &str = "SELECT name, description, state::text, variants::text,
     exclusion_group, updated_at::text AS updated_at \
     FROM autumn_experiments WHERE name = $1;";
 
-// The three mutations below fold their validation guard directly into the
-// mutating statement's own WHERE/EXISTS clause, instead of running a
-// separate SELECT COUNT(*) check before opening a transaction. A pre-check
-// followed by a later, separately-opened transaction leaves a real
-// TOCTOU race window (a concurrent process can change the experiment's
-// state between the check and the write); checking and mutating in the
-// same statement makes the guard atomic with the write, and "zero rows
-// affected" is the failure signal (see `pg::execute_with_audit`).
+// Each mutation below checks its guard in its own WHERE/EXISTS clause rather than in a separate
+// SELECT, so the check is atomic with the write and leaves no TOCTOU window. Zero rows affected
+// is the failure signal (see `pg::execute_with_audit`).
 const SET_WEIGHTS_SQL: &str = "UPDATE autumn_experiments SET variants = $1::jsonb, updated_at = NOW() \
     WHERE name = $2 AND state NOT IN ('concluded', 'archived');";
 
@@ -138,16 +133,13 @@ pub fn run_status(opts: &StatusOptions) {
 pub fn run_set_weights(opts: &SetWeightsOptions) {
     let db_url = resolve_database_url();
     let actor = opts.actor.as_deref().unwrap_or("cli");
-    // Parse "control=50,treatment=50" into JSON array of variant objects.
     let variants_json = parse_weights_to_json(&opts.weights).unwrap_or_else(|e| {
         eprintln!("autumn experiments set-weights: {e}");
         std::process::exit(1);
     });
     let mutation = format!("set_weights={variants_json}");
-    // Bind as a typed JSON value (not a bare string) — the `$1::jsonb` cast in
-    // SET_WEIGHTS_SQL makes Postgres report the parameter's type as jsonb, and
-    // `postgres-types`'s `ToSql` for `String`/`&str` only declares itself
-    // compatible with text-ish types, not JSON/JSONB.
+    // Bind a JSON value, not a string: the `$1::jsonb` cast makes Postgres type the parameter as
+    // jsonb, and `ToSql` for `String`/`&str` only accepts text types.
     let variants_value: serde_json::Value = match serde_json::from_str(&variants_json) {
         Ok(v) => v,
         Err(e) => pg::die("experiments set-weights", e),
@@ -262,8 +254,6 @@ fn resolve_database_url() -> String {
     crate::config::resolve_database_url()
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,10 +282,8 @@ mod tests {
         );
     }
 
-    // ── Issue #1243 follow-up: guard checks folded into the mutation itself
-    // (via WHERE/EXISTS), not a separate pre-transaction check, so there is
-    // no round trip between "is this valid?" and "make the change" for a
-    // concurrent process to race into. ────────────────────────────────────
+    // Each guard lives in the mutation's own WHERE/EXISTS clause, so no concurrent change can land
+    // between the check and the write (#1243).
 
     #[test]
     fn conclude_sql_validates_winner_in_variants_atomically() {
@@ -332,9 +320,6 @@ mod tests {
 
     #[test]
     fn no_mutation_sql_is_a_separate_pre_transaction_check() {
-        // There must be no standalone `SELECT COUNT(*)`-style existence
-        // check left anywhere — every guard lives inside the mutating
-        // statement's own WHERE/EXISTS clause instead.
         for sql in [SET_WEIGHTS_SQL, CONCLUDE_SQL, OVERRIDE_UPSERT_SQL] {
             assert!(
                 !sql.trim_start().to_uppercase().starts_with("SELECT COUNT"),
@@ -343,7 +328,7 @@ mod tests {
         }
     }
 
-    // ── Issue #1243: no more psql shell-out ─────────────────────────────────
+    // SQL runs through tokio_postgres, not a psql shell-out (#1243).
 
     #[test]
     fn no_sql_constant_uses_psql_variable_syntax() {

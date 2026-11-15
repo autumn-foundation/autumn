@@ -277,9 +277,7 @@ pub fn parse_models_dir(dir: &Path, backend: Backend) -> Result<ParsedSchema, Sc
             source,
         })?;
         let path = entry.path();
-        // Query the entry's type directly (one syscall, from the DirEntry) rather
-        // than an extra `Path::is_file` metadata stat, and skip anything that is
-        // not a regular file — e.g. a subdirectory named `something.rs`.
+        // `DirEntry::file_type` avoids a second stat. Skip non-files, e.g. a directory named `x.rs`.
         let file_type = entry.file_type().map_err(|source| SchemaParseError::Io {
             path: path.display().to_string(),
             source,
@@ -1112,13 +1110,11 @@ struct ModelArgs {
 /// future macro argument does not break the parser.
 fn parse_model_args(attr: &syn::Attribute) -> ModelArgs {
     let mut args = ModelArgs::default();
-    // A bare `#[model]` (path, no parens) carries no arguments.
     if matches!(attr.meta, syn::Meta::Path(_)) {
         return args;
     }
-    // `parse_nested_meta` errors on the first argument whose value we do not
-    // consume; to stay forward-compatible we consume-and-ignore unknown ones so
-    // a future `#[model(...)]` argument never breaks parsing of the known ones.
+    // `parse_nested_meta` stops at the first argument whose value is not consumed, so unknown
+    // arguments are consumed and ignored: a future macro argument cannot break this parse.
     let _ = attr.parse_nested_meta(|meta| {
         if meta.path.is_ident("table")
             && let Ok(value) = meta.value()
@@ -1140,12 +1136,10 @@ fn parse_model_args(attr: &syn::Attribute) -> ModelArgs {
                 args.schema = Some(name);
             }
         } else if meta.input.peek(syn::token::Paren) {
-            // Unknown nested list `key(...)` — consume it so parsing can
-            // continue to the next comma-separated argument.
+            // Consume an unknown `key(...)` so parsing continues.
             let _ = meta.parse_nested_meta(|_| Ok(()));
         } else if let Ok(value) = meta.value() {
-            // Unknown `key = value` — consume the value token so parsing can
-            // continue to the next comma-separated argument.
+            // Consume an unknown `key = value` so parsing continues.
             let _ = value.parse::<syn::Lit>();
         }
         Ok(())
@@ -1225,17 +1219,12 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             "id" => out.is_id = true,
             "indexed" => out.is_indexed = true,
             "unique" => out.is_unique = true,
-            // `#[default]` gates the `created_at` NOW() convention default (see
-            // `convention_default`): the generator always marks its `created_at`
-            // with `#[default]`, so a hand-written `created_at` WITHOUT the marker
-            // gets no inferred NOW() default.
+            // The generator marks its `created_at` with `#[default]`; a `created_at` without it
+            // gets no inferred NOW() default (see `convention_default`).
             "default" => out.is_default = true,
-            // #1384: the per-locale container column is `TEXT NOT NULL` with an
-            // empty-JSON-object default. The type alone does not carry that —
-            // `Translated` lowers to plain `Text` — so the marker has to be
-            // recorded here or the declarative lane emits `ADD COLUMN … TEXT NOT
-            // NULL` with no DEFAULT: potentially blocking on Postgres, and
-            // refused outright by `emit_add_column` on SQLite.
+            // #1384: the per-locale column is `TEXT NOT NULL` with an empty-JSON default that the
+            // `Text` type cannot carry. Without the marker, `ADD COLUMN` has no DEFAULT: it can
+            // block on Postgres and `emit_add_column` refuses it on SQLite.
             "translatable" => out.is_translatable = true,
             // #1806: same storage contract as `#[translatable]` — `TEXT NOT
             // NULL` with an empty-container default the type cannot carry.
@@ -1248,9 +1237,8 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             "references" => {
                 let mut target = None;
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
-                    // Read `table`, `on_delete` and `on_update`. Consume each other
-                    // nested list or `key = value` pair. Then a new argument cannot
-                    // stop the read of the target.
+                    // Read `table`, `on_delete` and `on_update`; consume any other argument so a
+                    // new one cannot stop the read.
                     let _ = attr.parse_nested_meta(|meta| {
                         let action_key = ["on_delete", "on_update"]
                             .into_iter()
@@ -1366,7 +1354,7 @@ fn build_table(
         .clone()
         .unwrap_or_else(|| naming::pluralize(&naming::pascal_to_snake(&model_name)));
 
-    // Lift the named fields (a tuple/unit struct carries no columns).
+    // A tuple or unit struct has no columns.
     let mut raw_fields: Vec<RawField> = Vec::new();
     if let syn::Fields::Named(named) = &item.fields {
         for field in &named.named {
@@ -1393,8 +1381,7 @@ fn build_table(
     table.managed = args.managed;
     table.schema = args.schema;
 
-    // (1) A synthesized reserved `id` PK leads the column list (BigSerial
-    // convention: an `Int64` PK with no explicit default).
+    // A synthesized `id` PK leads the column list.
     if needs_synthetic_id {
         let mut id = Column::new("id", ColumnType::Int64);
         id.primary_key = true;
@@ -1402,7 +1389,7 @@ fn build_table(
         table.primary_key.push("id".to_owned());
     }
 
-    // Collected index sources, mirroring the generator's emission order.
+    // Index sources, in the generator's emission order.
     let mut plain_index_fields: Vec<String> = Vec::new();
     let mut unique_index_fields: Vec<String> = Vec::new();
     let mut has_created_at = false;
@@ -1413,8 +1400,7 @@ fn build_table(
         }
         let is_pk = pk_field_names.contains(&raw.name);
 
-        // Resolve the column type. A `#[references]` field is always an `Int64`
-        // FK column regardless of the written Rust type (which is `i64` anyway).
+        // A `#[references]` field is always an `Int64` FK column.
         let is_reference = raw.attrs.reference != ReferenceSpec::None;
         if is_reference && let Some(problem) = reference_action_problem(raw) {
             // Fail closed: a bad action must never become `NO ACTION`. The diff
@@ -1433,13 +1419,9 @@ fn build_table(
         } else if raw.attrs.is_translatable
             && ColumnType::rust_type_leaf(&raw.rust_type) == "Translated"
         {
-            // #2292: the `#[translatable]` MARKER is what makes a
-            // `Translated`-typed field a managed `TEXT` column — not the type
-            // name. `ColumnType::from_rust_type` no longer claims the
-            // `Translated` leaf, so an unmarked look-alike
-            // (`domain::Translated`, or a bare `Translated` without the
-            // marker) falls through to the type-driven mapping below and is
-            // skipped with a diagnostic, exactly like any other unknown type.
+            // #2292: the `#[translatable]` marker, not the type name, makes a `Translated` field
+            // a `TEXT` column. `from_rust_type` does not claim `Translated`, so an unmarked
+            // look-alike is skipped with a diagnostic like any unknown type.
             Some(ColumnType::Text)
         } else {
             ColumnType::from_rust_type(&raw.rust_type)
@@ -1467,8 +1449,7 @@ fn build_table(
             (ty, _) => ty,
         };
         let Some(ty) = column_ty else {
-            // Unknown/unsupported type (a generated enum, an association type):
-            // record a diagnostic and skip — never fabricate a wrong mapping.
+            // An unsupported type (a generated enum, an association) is skipped, never guessed.
             diagnostics.push(SchemaDiagnostic {
                 model: model_name.clone(),
                 table: table_name.clone(),
@@ -1488,21 +1469,14 @@ fn build_table(
         column.primary_key = is_pk;
         column.unique = raw.attrs.is_unique;
 
-        // Default (slice-3+): recover only the DB column defaults the generator
-        // emits *by convention* (see `convention_default`) — the `#[default]`-marked
-        // `created_at` NOW() default and a Postgres UUID primary key's
-        // `gen_random_uuid()`. The convention is a fallback: it never overwrites an
-        // already-parsed explicit default. A hand-written `created_at` without
-        // `#[default]`, and other non-convention `#[default]` fields (a soft-delete
-        // `deleted_at`, an enum/numeric literal), carry no inferred DB default —
-        // their value lives in the migration, not the struct.
+        // Infer only the defaults the generator emits by convention (see `convention_default`),
+        // and never over an explicit one. Any other `#[default]` field (a soft-delete
+        // `deleted_at`, an enum literal) keeps its DB default in the migration, not the struct.
         column.default = column
             .default
             .or_else(|| {
-                // #1384: a `#[translatable]` column's empty-container default is
-                // part of its storage contract, not a convention — carry it into
-                // the schema IR so a declarative `ADD COLUMN` matches what
-                // `generate model` emits (`TEXT NOT NULL DEFAULT '{}'`).
+                // #1384: the empty-container default is part of the column's storage contract,
+                // so `ADD COLUMN` matches `generate model`'s `TEXT NOT NULL DEFAULT '{}'`.
                 raw.attrs
                     .is_translatable
                     .then(|| ColumnDefault::Sql(TRANSLATABLE_COLUMN_DEFAULT.to_owned()))
@@ -1514,8 +1488,7 @@ fn build_table(
             })
             .or_else(|| convention_default(&raw.name, &ty, is_pk, raw.attrs.is_default, backend));
 
-        // Foreign key: infer the target table from the generator's convention
-        // (the field name minus a trailing `_id`, pluralized) unless overridden.
+        // The inferred target is the field name minus `_id`, pluralized.
         match &raw.attrs.reference {
             ReferenceSpec::None => {}
             ReferenceSpec::Inferred => {
@@ -1531,7 +1504,6 @@ fn build_table(
                 .with_on_update(raw.attrs.on_update)
         });
 
-        // Index bookkeeping (deduped/retained below, mirroring the generator).
         if raw.attrs.is_unique {
             unique_index_fields.push(raw.name.clone());
         }
@@ -1539,8 +1511,7 @@ fn build_table(
             plain_index_fields.push(raw.name.clone());
         }
 
-        // Record a struct-declared PK column name (a synthesized `id` was already
-        // pushed above; an explicit PK is pushed here in declaration order).
+        // Declared PK columns follow in declaration order.
         if is_pk {
             table.primary_key.push(raw.name.clone());
         }
@@ -1548,21 +1519,16 @@ fn build_table(
         table.columns.push(column);
     }
 
-    // (2) Synthesize `created_at TIMESTAMP DEFAULT NOW()` when the struct did not
-    // declare it, matching what the generator always appends.
+    // The generator always appends `created_at TIMESTAMP DEFAULT NOW()`.
     if !has_created_at {
         let mut created = Column::new("created_at", ColumnType::Timestamp);
         created.default = Some(ColumnDefault::Now);
         table.columns.push(created);
     }
 
-    // (3) Mark the single-column `BigSerial` convention id (an `Int64` PK with no
-    // explicit default — the synthesized `id` or an `#[id]` `i64` field) with the
-    // serial marker, SYMMETRICALLY with what database introspection records for a
-    // `BIGSERIAL` column. Without this the model side would carry `serial: None`
-    // while a pulled `BIGSERIAL` carries `Some(BigSerial)`, making an otherwise-clean
-    // model↔database round-trip diff spuriously report a primary-key change. A UUID
-    // PK (or a composite PK) is left `None`, matching introspection.
+    // Introspection marks a `BIGSERIAL` PK as serial, so mark a single `Int64` PK with no default
+    // the same, or a round-trip diff reports a spurious primary-key change. UUID and composite
+    // PKs stay unmarked, as introspection leaves them.
     if let [pk_name] = table.primary_key.as_slice() {
         let pk_name = pk_name.clone();
         if let Some(pk) = table.columns.iter_mut().find(|c| c.name == pk_name)
@@ -1573,11 +1539,8 @@ fn build_table(
         }
     }
 
-    // Index emission, mirroring `schema_edit::create_table_sql_*`:
-    //  - every `references` column gets an auto-index (already folded into
-    //    `plain_index_fields`);
-    //  - a `unique` field's own unique index covers lookups, so it must not
-    //    also get a redundant plain index (issue #1032).
+    // As `schema_edit::create_table_sql_*` emits them: a `references` column gets a plain index,
+    // but a `unique` field's unique index already covers lookups (#1032).
     plain_index_fields.retain(|name| !unique_index_fields.contains(name));
     plain_index_fields.dedup();
     for field_name in &plain_index_fields {
@@ -1592,7 +1555,7 @@ fn build_table(
     }
     for field_name in &unique_index_fields {
         table.indexes.push(Index {
-            // Plain (un-disambiguated) form; 63-byte disambiguation is a later slice.
+            // Not shortened for Postgres's 63-byte identifier limit.
             name: format!("idx_{table_name}_{field_name}_unique"),
             columns: vec![field_name.clone()],
             unique: true,
@@ -1690,8 +1653,7 @@ fn type_to_string(ty: &syn::Type) -> String {
 }
 
 #[cfg(test)]
-// Fixtures use a uniform `r#"…"#` raw-string style (several embed `"`); keeping
-// the rest bare would be inconsistent noise.
+// Fixtures use `r#"…"#` throughout because several embed `"`.
 #[allow(clippy::needless_raw_string_hashes)]
 mod tests {
     use super::*;
@@ -1719,9 +1681,8 @@ mod tests {
             found.get("accounts"),
             Some(&BTreeMap::from([
                 ("api_token".to_owned(), false),
-                // `#[encrypted(deterministic)]` must be recorded as such: a
-                // scrub has to re-encrypt in the same mode, or equality lookups
-                // against the column quietly stop matching.
+                // `true` is deterministic mode: a scrub must re-encrypt in the same mode, or
+                // equality lookups stop matching.
                 ("email".to_owned(), true),
             ]))
         );
@@ -1996,8 +1957,7 @@ mod tests {
         expected.managed = false;
         let mut id = Column::new("id", ColumnType::Int64);
         id.primary_key = true;
-        // The convention `BigSerial` id carries the serial marker (symmetric with
-        // what a pulled `BIGSERIAL` records), so a round-trip diff stays clean.
+        // Matches what a pulled `BIGSERIAL` records, so a round-trip diff stays clean.
         id.serial = Some(SerialKind::BigSerial);
         expected.columns.push(id);
         expected.columns.push(Column::new("name", ColumnType::Text));
@@ -2178,10 +2138,8 @@ mod tests {
 
     #[test]
     fn now_default_only_for_created_at_not_other_timestamps() {
-        // A `#[default]` on a non-`created_at` timestamp field must NOT infer a
-        // NOW() default: the generator gives a DB `DEFAULT NOW()` only to the
-        // reserved `created_at` column. A non-`created_at` `#[default]`'s DB
-        // default (if any) lives in the migration, not the struct.
+        // The generator gives `DEFAULT NOW()` only to `created_at`; another `#[default]`
+        // timestamp keeps its DB default in the migration.
         let src = r#"
             #[model]
             pub struct Event {
@@ -2200,11 +2158,8 @@ mod tests {
 
     #[test]
     fn hand_written_created_at_without_default_marker_has_no_inferred_default() {
-        // The `created_at` NOW() convention is gated on the generator's
-        // `#[default]` marker. A hand-written model that declares a `created_at`
-        // timestamp WITHOUT `#[default]` has DDL `created_at TIMESTAMP NOT NULL`
-        // with NO default — so the parser must report `default == None`, or a
-        // later snapshot/diff would spuriously try to ADD a NOW() default.
+        // Without `#[default]` the DDL is `created_at TIMESTAMP NOT NULL` with no default; an
+        // inferred NOW() would make a later diff add one.
         let src = r#"
             #[autumn_web::model]
             pub struct Event {
@@ -2221,11 +2176,8 @@ mod tests {
 
     #[test]
     fn hand_written_agg_event_created_at_has_no_inferred_default() {
-        // An inline copy of `AggEvent` from
-        // `autumn/tests/integration/repository_grouped_aggregates.rs`, a real
-        // hand-written model whose `created_at` carries no `#[default]` and whose
-        // DDL is `created_at TIMESTAMP NOT NULL` (no default). The parser must not
-        // over-infer a NOW() default for it.
+        // A copy of `AggEvent` from `autumn/tests/integration/repository_grouped_aggregates.rs`,
+        // whose DDL gives `created_at` no default.
         let src = r#"
             #[autumn_web::model(table = "test_agg_events")]
             pub struct AggEvent {
@@ -2243,12 +2195,8 @@ mod tests {
 
     #[test]
     fn soft_delete_deleted_at_has_no_inferred_default() {
-        // The generator emits a nullable `deleted_at` with `#[default]` ONLY to
-        // exclude it from the `New*`/`Update*` insert structs — the migration
-        // leaves its column default UNSET, so new rows stay NULL. The parser must
-        // report `default == None` (never `Some(Now)`), or a later snapshot/diff
-        // would read a spurious "add DEFAULT NOW()" change that, if applied, would
-        // make newly inserted rows appear soft-deleted.
+        // `#[default]` on `deleted_at` only keeps it out of the `New*`/`Update*` structs; the
+        // column has no DB default. An inferred NOW() would make new rows look soft-deleted.
         let src = r#"
             #[model]
             pub struct Post {
@@ -2271,11 +2219,8 @@ mod tests {
 
     #[test]
     fn uuid_primary_key_recovers_gen_random_uuid_default_on_postgres() {
-        // `autumn generate model --id uuid` emits `#[id] pub id: uuid::Uuid`, and
-        // its Postgres migration declares the PK as
-        // `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`. The parser must recover
-        // that convention default, or a later snapshot/diff would read the live
-        // DB's `gen_random_uuid()` default as drift and try to REMOVE it.
+        // `generate model --id uuid` declares `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`.
+        // Without the default, a diff would read it as drift and remove it.
         let src = r#"
             #[autumn_web::model]
             pub struct Session {
@@ -2324,9 +2269,7 @@ mod tests {
 
     #[test]
     fn non_pk_uuid_field_has_no_inferred_default() {
-        // The `gen_random_uuid()` convention is PRIMARY-KEY-only: a plain
-        // `uuid::Uuid` column carries no DB default (its value, if any, lives in
-        // the migration), so the parser must report `default == None` for it.
+        // The `gen_random_uuid()` convention applies to the primary key only.
         let src = r#"
             #[autumn_web::model]
             pub struct ApiKey {
@@ -2346,9 +2289,7 @@ mod tests {
 
     #[test]
     fn bigserial_primary_key_has_no_inferred_default() {
-        // A `BIGSERIAL PRIMARY KEY` is type-encoded — the serial type IS the
-        // default, there is no separate `DEFAULT` clause — so an `i64` `#[id]` PK
-        // must NOT pick up `gen_random_uuid()` (which is UUID-PK-only).
+        // `BIGSERIAL` encodes its default in the type; there is no `DEFAULT` clause.
         let src = r#"
             #[autumn_web::model]
             pub struct Post {
@@ -2591,11 +2532,8 @@ mod tests {
 
     #[test]
     fn diagnostic_records_custom_table_name() {
-        // A `#[model(table = "app_users")]` model with an unresolved field must
-        // record the RESOLVED custom table name (`app_users`), not the convention
-        // name (`users`) — so a downstream consumer (the diff engine's
-        // parser-gap suppression) can match the diagnostic to the actual baseline
-        // table and never diff a present-but-unmodelled column as a drop.
+        // The diagnostic names the resolved table (`app_users`), not `users`, so the diff's
+        // parser-gap suppression matches the baseline table and never drops the column.
         let src = r#"
             #[model(table = "app_users")]
             pub struct User {
@@ -2744,8 +2682,7 @@ mod tests {
 
     #[test]
     fn model_unknown_nested_list_arg_is_consumed_and_managed_survives() {
-        // A future nested-list arg `key(...)` must be consumed, not abort the
-        // `managed` marker that precedes it.
+        // An unknown `key(...)` must not abort the read of the `managed` marker before it.
         let src = r#"
             #[model(managed, future_list(a = 1, b = 2))]
             pub struct Account {
@@ -2761,8 +2698,7 @@ mod tests {
 
     #[test]
     fn references_unknown_kv_arg_is_ignored_and_target_survives() {
-        // An unknown `future_key = "..."` argument must not stop the read of
-        // `table`.
+        // An unknown `future_key = "..."` must not stop the read of `table`.
         let src = r#"
             #[model]
             pub struct Comment {
@@ -2830,7 +2766,7 @@ mod tests {
         }
     }
 
-    // ---- #[renamed_from] hints (#1975, Decision 5) ----
+    // ---- #[renamed_from] hints (#1975) ----
 
     #[test]
     fn field_renamed_from_records_a_column_hint() {
@@ -3479,8 +3415,7 @@ mod tests {
 
     #[test]
     fn references_unknown_action_skips_the_column_with_a_diagnostic() {
-        // A typo must not become `NO ACTION`. The parser skips the column.
-        // Then the diff does not change the table.
+        // A typo must not become `NO ACTION`: the column is skipped, so the diff leaves it alone.
         let src = r#"
             #[model]
             pub struct Comment {

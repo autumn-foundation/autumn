@@ -78,9 +78,8 @@ pub fn plan_inbound_mail(project_root: &Path, name: &str) -> Result<Plan, Genera
     let with_mods = update_main_rs(&main_existing, &["inbound_mailers"], &[]);
     let updated_main = add_inbound_mail_router_to_app(&with_mods, &module_path);
     plan.modify(main_path.clone(), updated_main);
-    // `mod inbound_mailers;` is shared infrastructure (see
-    // `emit::SHARED_MAIN_MODULE_NAMES`) — only this handler's own router
-    // registration is reverted here.
+    // `mod inbound_mailers;` is shared (see `emit::SHARED_MAIN_MODULE_NAMES`); only this handler's
+    // router registration is reverted.
     plan.push_revert(crate::generate::emit::Revert::InboundMailHandler {
         path: main_path,
         handler_module_path: module_path,
@@ -93,9 +92,8 @@ pub fn plan_inbound_mail(project_root: &Path, name: &str) -> Result<Plan, Genera
     if updated_cargo != cargo_existing {
         plan.modify(cargo_path.clone(), updated_cargo);
     }
-    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
-    // model.rs: destroy recomputes this plan against the already-generated
-    // Cargo.toml, where the feature is by definition already present.
+    // Pushed unconditionally: destroy recomputes this plan against the generated Cargo.toml, where
+    // the feature is already present. See `plan_cargo_deps` in model.rs.
     plan.push_revert(crate::generate::emit::Revert::CargoAutumnWebFeature {
         path: cargo_path,
         feature: "inbound-mailgun".to_owned(),
@@ -262,13 +260,13 @@ fn add_inbound_mail_router_to_app(src: &str, handler_module_path: &str) -> Strin
         )"
     );
 
-    // If a router call already exists, chain the new handler onto it instead of inserting
-    // a second router. Skip if this specific handler is already registered.
+    // Chain onto an existing router instead of adding a second one, unless this handler is already
+    // registered.
     if let Some(router_pos) = src.find(".inbound_mail_router(") {
         if src.contains(handler_module_path) {
             return src.to_owned();
         }
-        // Find the closing paren of the .inbound_mail_router(...) argument.
+        // Find the `)` that closes the `.inbound_mail_router(` call.
         let start = router_pos + ".inbound_mail_router(".len();
         let bytes = src.as_bytes();
         let mut depth = 1usize;
@@ -279,11 +277,8 @@ fn add_inbound_mail_router_to_app(src: &str, handler_module_path: &str) -> Strin
                 b')' => {
                     depth -= 1;
                     if depth == 0 {
-                        // Insert before the closing `)`, but skip over any
-                        // trailing comma + whitespace that rustfmt may have
-                        // added after the router expression. Without this,
-                        // `handler(old),)` becomes `handler(old),.handler(new))`
-                        // which is invalid Rust.
+                        // Insert before any trailing comma rustfmt added: `handler(old),)` would
+                        // otherwise become `handler(old),.handler(new))`, which does not parse.
                         let mut insert_pos = i;
                         while insert_pos > start && bytes[insert_pos - 1].is_ascii_whitespace() {
                             insert_pos -= 1;
@@ -305,7 +300,6 @@ fn add_inbound_mail_router_to_app(src: &str, handler_module_path: &str) -> Strin
 
     // Insert after `.routes(` call if present, otherwise before `.run()`.
     let target = if src.contains(".routes(") {
-        // Find the closing paren of the first .routes() call and insert after
         find_after_routes_call(src).map(|pos| {
             let mut out = src.to_owned();
             out.insert_str(pos, &format!("\n        {snippet}"));
@@ -524,7 +518,7 @@ async fn main() {
         assert!(main_after.contains(".inbound_mail_router("));
     }
 
-    // ── RED: file plan assertions ─────────────────────────────────────────
+    // ── File plan assertions ──────────────────────────────────────────────
 
     #[test]
     fn plan_creates_handler_file() {
@@ -660,7 +654,6 @@ async fn main() {
 
     #[test]
     fn add_inbound_mail_router_is_idempotent_when_handler_already_present() {
-        // Handler already fully registered — no change expected.
         let src = r"autumn_web::app()
         .routes(routes![index])
         .inbound_mail_router(InboundMailRouter::new().handler(inbound_mailers::replies::replies_handler_info()))
@@ -696,11 +689,8 @@ async fn main() {
 
     #[test]
     fn remove_inbound_mail_handler_removes_a_rustfmt_wrapped_router_call() {
-        // rustfmt commonly wraps this call across several lines (it's long:
-        // an .endpoint(...) config with a path and an env-var lookup).
-        // Line-based removal would strip only the `.handler(...)` line and
-        // leave the rest of the (now handler-less) call behind — issue
-        // #1048 PR review.
+        // rustfmt wraps this long call across lines. Line-based removal would strip only the
+        // `.handler(...)` line and leave the handler-less call behind.
         let src = "fn main() {\n    App::new()\n        .routes(routes![index])\n        .inbound_mail_router(\n            ::autumn_web::inbound_mail::InboundMailRouter::new()\n                .endpoint(::autumn_web::inbound_mail::InboundMailEndpointConfig::mailgun(\n                    \"/inbound/mailgun\",\n                    std::env::var(\"MAILGUN_SIGNING_KEY\").unwrap_or_default(),\n                ))\n                .handler(inbound_mailers::replies::replies_handler_info()),\n        )\n        .run()\n}\n";
         let updated =
             remove_inbound_mail_handler(src, "inbound_mailers::replies::replies_handler_info");

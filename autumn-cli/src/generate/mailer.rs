@@ -90,9 +90,8 @@ pub fn plan_mailer_ex(
     let mut plan = Plan::new(project_root);
 
     // ── templates/mailers/_layout.html (idempotent) ────────────────────────
-    // Created on the first `generate mailer` call; subsequent calls skip it so
-    // user edits to the shared layout are not overwritten. Uses create_if_absent
-    // so concurrent generator runs are safe (exclusive-create, no TOCTOU race).
+    // Shared by every mailer: later runs keep the user's edits. Exclusive create, so concurrent
+    // runs do not race.
     if !no_layout {
         plan.create_if_absent(
             project_root
@@ -164,10 +163,8 @@ pub fn plan_mailer_ex(
     });
 
     // ── src/mailers/mod.rs (create or update) ──────────────────────────────
-    // The "previews" sub-module declared here is shared by every generated
-    // mailer, not owned by this one — `emit::sync_mod_declarations_in`
-    // removes it once `src/mailers/previews/mod.rs` no longer exists, so no
-    // static revert is pushed for it here.
+    // `previews` is shared by every mailer, so it gets no revert here:
+    // `emit::sync_mod_declarations_in` removes it once `src/mailers/previews/mod.rs` is gone.
     let mod_path = project_root.join("src").join("mailers").join("mod.rs");
     let with_mailer_mod = add_mod_declaration(&read_or_empty(&mod_path), &snake_name);
     let with_both_mods = add_mod_declaration(&with_mailer_mod, "previews");
@@ -208,11 +205,7 @@ pub fn plan_mailer_ex(
 
     // ── migrations/<ts>_create_mail_unsubscribes (opt-in, idempotent) ──────
     if list_unsubscribe.is_some() {
-        // The suppression migration is backend-aware (issue #1927): a SQLite app
-        // gets SQLite-dialect DDL (`INTEGER PRIMARY KEY AUTOINCREMENT`,
-        // `DEFAULT CURRENT_TIMESTAMP`) instead of the Postgres-only
-        // `BIGSERIAL`/`NOW()` form, so the generated migration applies on either
-        // backend.
+        // SQLite and Postgres need different DDL for the suppression table (#1927).
         let backend = super::detect_backend(project_root);
         plan_unsubscribe_migration(project_root, &mut plan, backend);
     }
@@ -488,10 +481,8 @@ fn render_layout_txt() -> String {
 /// full document is emitted instead.
 fn render_html_template(struct_name: &str, no_layout: bool) -> String {
     if no_layout {
-        // Full self-contained document with a `<head>` `<style>` block. The
-        // generated mailer calls `.inline_css(true)`, so these class rules are
-        // rewritten onto the elements as inline `style="…"` at send time and
-        // render in Gmail/Outlook (which drop `<head>`/`<style>`). See #1254.
+        // The generated mailer calls `.inline_css(true)`, so these class rules become inline
+        // `style="…"` at send time and render in Gmail/Outlook, which drop `<style>` (#1254).
         format!(
             "<!DOCTYPE html>\n\
              <html>\n\
@@ -507,12 +498,8 @@ fn render_html_template(struct_name: &str, no_layout: bool) -> String {
              </html>\n"
         )
     } else {
-        // Authored with a `<style>` block + CSS classes — the ergonomic way to
-        // style email. The generated mailer calls `.inline_css(true)`, so at
-        // send time Autumn rewrites these rules onto the elements as
-        // `style="…"` attributes (issue #1254); that is what makes them render
-        // in Gmail/Outlook, which strip `<head>`/`<style>`. The `@media` rule is
-        // preserved in a retained `<style>` block for clients that honor it.
+        // `.inline_css(true)` inlines these rules at send time for Gmail/Outlook (#1254). The
+        // `@media` rule stays in a retained `<style>` block for clients that honor it.
         format!(
             "<style>\n\
             \x20 .greeting {{ margin:0 0 16px; font-size:24px; color:#1a1a2e; }}\n\
@@ -541,9 +528,7 @@ fn render_smoke_test(struct_name: &str, snake_name: &str, no_layout: bool) -> St
     let layout_assertions = if no_layout {
         String::new()
     } else {
-        // Assert the layout {{ content }} marker was replaced (composition
-        // happened) without asserting the default layout's HTML structure —
-        // users may customize _layout.html to use divs, custom CSS, etc.
+        // Check only that `{{ content }}` was replaced: users may restructure `_layout.html`.
         r#"                assert!(
                     !html.contains("{{ content }}"),
                     "layout marker must be replaced after composition; got: {html}"
@@ -857,10 +842,8 @@ async fn main() {
         let layout_html = tmp.path().join("templates/mailers/_layout.html");
         let layout_txt = tmp.path().join("templates/mailers/_layout.txt");
 
-        // Welcome creates the shared layout files (create_if_absent);
-        // Goodbye's own plan carries the SAME create_if_absent actions
-        // (they're silently skipped at execute time since the files already
-        // exist), so both mailers' plans mention them.
+        // Both plans carry the layout's create_if_absent actions; Goodbye's are skipped at
+        // execute time because the files exist.
         plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
@@ -872,8 +855,7 @@ async fn main() {
         assert!(layout_html.exists());
         assert!(layout_txt.exists());
 
-        // Destroying Welcome alone must NOT delete the shared layout —
-        // Goodbye's mailer/preview files still `include_str!` it.
+        // Destroying Welcome must keep the layout: Goodbye still `include_str!`s it.
         plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .revert(Flags::default())
@@ -889,8 +871,7 @@ async fn main() {
             "shared _layout.txt must survive — Goodbye's mailer still includes it"
         );
 
-        // Now destroy the last remaining mailer — the shared layout must
-        // finally go too.
+        // Destroying the last mailer removes the layout too.
         plan_mailer(tmp.path(), "Goodbye", None, false)
             .unwrap()
             .revert(Flags::default())
@@ -899,7 +880,7 @@ async fn main() {
         assert!(!layout_txt.exists());
     }
 
-    // ── RED: file plan assertions ─────────────────────────────────────────
+    // ── File plan assertions ──────────────────────────────────────────────
 
     #[test]
     fn plan_creates_mailer_file() {
@@ -1038,7 +1019,6 @@ async fn main() {
         assert!(plan_mailer(tmp.path(), "Welcome", Some("a\" )]"), false).is_err());
         assert!(plan_mailer(tmp.path(), "Welcome", Some("with space"), false).is_err());
         assert!(plan_mailer(tmp.path(), "Welcome", Some(""), false).is_err());
-        // Identifier-like scopes are accepted.
         assert!(plan_mailer(tmp.path(), "Welcome", Some("weekly_digest"), false).is_ok());
         assert!(plan_mailer(tmp.path(), "Welcome", Some("product-updates"), false).is_ok());
     }
@@ -1050,7 +1030,6 @@ async fn main() {
         assert!(plan_mailer(tmp.path(), "Welcome", Some("wöchentlich"), false).is_err());
         assert!(plan_mailer(tmp.path(), "Welcome", Some("list.name"), false).is_err());
         assert!(plan_mailer(tmp.path(), "Welcome", Some("list/name"), false).is_err());
-        // Dash and underscore are fine.
         assert!(plan_mailer(tmp.path(), "Welcome", Some("a-b_c"), false).is_ok());
     }
 
@@ -1091,11 +1070,9 @@ async fn main() {
             .find(|p| p.is_dir())
             .unwrap();
 
-        // A second list mailer must reuse the existing suppression table:
-        // its plan still carries the migration's actions (so `autumn
-        // destroy` can find it later), but they all target the SAME
-        // already-existing directory, and executing must not create a
-        // second migration directory or error.
+        // A second list mailer reuses the suppression table: its plan still carries the
+        // migration's actions (so `autumn destroy` finds it), but they target the existing
+        // directory, and executing creates no second one.
         let second =
             plan_mailer(tmp.path(), "ProductUpdates", Some("product_updates"), false).unwrap();
         let migration_paths: Vec<_> = second
@@ -1141,9 +1118,7 @@ async fn main() {
             .unwrap();
         assert!(migration_dir_exists());
 
-        // Destroying WeeklyDigest alone must NOT remove the shared
-        // mail_unsubscribes migration — ProductUpdates still opts into
-        // --list-unsubscribe and needs the suppression table.
+        // Destroying WeeklyDigest must keep the migration: ProductUpdates still needs the table.
         plan_mailer(tmp.path(), "WeeklyDigest", Some("weekly_digest"), false)
             .unwrap()
             .revert(Flags::default())
@@ -1156,8 +1131,7 @@ async fn main() {
             "shared mail_unsubscribes migration must survive — ProductUpdates still needs it"
         );
 
-        // Now destroy the last remaining list-unsubscribe mailer — the
-        // migration must finally go too.
+        // Destroying the last list-unsubscribe mailer removes the migration too.
         plan_mailer(tmp.path(), "ProductUpdates", Some("product_updates"), false)
             .unwrap()
             .revert(Flags::default())
@@ -1171,14 +1145,8 @@ async fn main() {
 
     #[test]
     fn destroying_the_only_mailer_keeps_mail_feature_auth_still_needs() {
-        // Codex PR review (issue #1048): "mail" is needed by BOTH `generate
-        // auth` (password reset/confirmation emails) and `generate mailer` —
-        // two entirely different generators, so the mailer's own
-        // `src/mailers` owner_dir sibling check alone can't see that auth
-        // still needs the feature.
-        // `generate auth` (issue #1353) requires a shared 4-arg `pub fn layout`
-        // in src/main.rs so its views can render through `crate::layout`, so this
-        // project's main.rs must expose one (as `autumn new` emits).
+        // `generate auth` also needs "mail", which the mailer's `src/mailers` sibling check
+        // cannot see (#1048). Auth needs the 4-arg `pub fn layout` `autumn new` emits (#1353).
         let tmp = project_with_main(
             "use autumn_web::prelude::*;\n\n\
              pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {\n\
@@ -1223,7 +1191,7 @@ async fn main() {
         );
     }
 
-    // ── GREEN: execute and inspect written content ────────────────────────
+    // ── Execute and inspect written content ───────────────────────────────
 
     #[test]
     fn execute_writes_mailer_struct_and_macro_annotations() {
@@ -1293,8 +1261,8 @@ async fn main() {
 
     #[test]
     fn html_template_shows_style_block_example_relying_on_inlining() {
-        // AC6 (issue #1254): the scaffolded per-mailer template demonstrates the
-        // `<style>`-block + CSS-class happy path that inlining resolves.
+        // The template demonstrates the `<style>`-block + CSS-class path that inlining
+        // resolves (#1254).
         let tmp = project_with_main(default_main());
         plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
@@ -1314,8 +1282,6 @@ async fn main() {
 
     #[test]
     fn generated_mailer_enables_css_inlining() {
-        // AC6 (issue #1254): the generated mailer opts into inlining so the
-        // `<style>`-block template renders styled end to end.
         let tmp = project_with_main(default_main());
         plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
@@ -1331,12 +1297,8 @@ async fn main() {
 
     #[test]
     fn generated_preview_enables_css_inlining() {
-        // AC6 (issue #1254): the generated preview fixture must carry the same
-        // `.inline_css(true)` opt-in the production mailer has, so a scaffolded
-        // mailer's preview is inlined regardless of the app's `mail.inline_css`
-        // config default (the preview route resolves per-message-override-or-
-        // config-default, so without the override a `false` default would show
-        // RAW `<style>` CSS even though a real send is inlined).
+        // Without the per-message override, a `false` `mail.inline_css` default would show the
+        // preview with raw `<style>` CSS while a real send is inlined (#1254).
         let tmp = project_with_main(default_main());
         plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
@@ -1845,9 +1807,7 @@ async fn main() {
             .unwrap();
 
         let mailer = fs::read_to_string(tmp.path().join("src/mailers/welcome.rs")).unwrap();
-        // The smoke test should assert that the {{ content }} marker was
-        // replaced (composition happened), not that the default layout uses
-        // tables — users may customize _layout.html to any structure.
+        // The smoke test checks the `{{ content }}` marker, not the default layout's structure.
         assert!(
             mailer.contains("{{ content }}"),
             "smoke test must assert the layout content marker was replaced"

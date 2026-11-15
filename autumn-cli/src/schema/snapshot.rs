@@ -99,9 +99,7 @@ impl SchemaSnapshot {
 
     /// Build a snapshot from an [`autumn_schema_core::Schema`], taking its
     /// backend tag and tables.
-    // Part of the snapshot API surface; the model-derived `snapshot` command
-    // builds from `Vec<Table>` directly, so this `Schema`-taking constructor is
-    // exercised by tests / later slices rather than the current command path.
+    // No caller yet: the `snapshot` command builds from `Vec<Table>` directly.
     #[allow(dead_code)]
     #[must_use]
     pub fn from_schema(schema: Schema) -> Self {
@@ -130,9 +128,6 @@ impl SchemaSnapshot {
 
 /// Failure modes for reading, writing, or validating a snapshot file. `Display`
 /// carries no secrets — a snapshot describes schema shape only.
-// The read-side variants (`Json` / `UnsupportedVersion` / `BackendMismatch`) are
-// produced by `load_snapshot` / `ensure_backend_matches`, which the slice-4 diff
-// engine consumes; the current `snapshot` command only writes (using `Io`).
 #[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
@@ -191,9 +186,8 @@ pub fn to_canonical_json(snapshot: &SchemaSnapshot) -> String {
         backend: snapshot.backend,
         tables: canonical_tables(&snapshot.tables),
     };
-    // `serde_json::to_string_pretty` on a struct emits fields in declaration
-    // order (not a sorted map), so ordering nondeterminism can only come from the
-    // `Vec`s we sort above — the output is stable.
+    // Struct fields serialize in declaration order, so only the `Vec`s sorted
+    // above could vary; the output is stable.
     let mut json = serde_json::to_string_pretty(&canonical)
         .expect("SchemaSnapshot is always serializable to JSON");
     json.push('\n');
@@ -207,8 +201,7 @@ fn canonical_tables(tables: &[Table]) -> Vec<Table> {
     tables.sort_by(|a, b| a.name.cmp(&b.name));
     for table in &mut tables {
         table.indexes.sort_by(|a, b| a.name.cmp(&b.name));
-        // Checks carry an `Option<String>` name; fall back to the expression as a
-        // stable tiebreak so unnamed checks still order deterministically.
+        // Check names are optional; the expression breaks ties between unnamed checks.
         table.checks.sort_by(|a, b| {
             a.name
                 .cmp(&b.name)
@@ -248,10 +241,8 @@ pub fn write_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<(), Snap
         })?;
     }
 
-    // Stage into a temp file in the *same directory* as the destination so the
-    // final `rename` is an atomic same-filesystem swap. `NamedTempFile` picks a
-    // collision-resistant name and removes the temp file on drop, so any early
-    // return below (or a failed `persist`) cleans it up automatically.
+    // The temp file sits in the destination's directory so `persist` is an
+    // atomic same-filesystem rename. It is removed on drop if anything fails.
     let dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
@@ -287,9 +278,8 @@ pub fn load_snapshot(path: &Path) -> Result<SchemaSnapshot, SnapshotError> {
 /// [`load_snapshot`]. Split out so it is testable without touching the
 /// filesystem; `label` names the source in any error.
 fn parse_snapshot_str(text: &str, label: &str) -> Result<SchemaSnapshot, SnapshotError> {
-    // Read the version from a loose `Value` first so an unknown *future* format
-    // (whose table shape this build may not understand) still fails with the
-    // precise version error instead of a confusing deserialize error.
+    // Read the version from a loose `Value` first, so a future format fails
+    // with the version error rather than a deserialize error.
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|source| SnapshotError::Json {
             path: label.to_owned(),
@@ -376,8 +366,7 @@ mod tests {
         let snapshot = SchemaSnapshot::new(Backend::Postgres, fixture_tables());
         let json = to_canonical_json(&snapshot);
         let back = parse_snapshot_str(&json, "<test>").expect("parse back");
-        // Equality is order-insensitive at the table/index level only if both
-        // sides are canonical; canonicalize the original for the comparison.
+        // The parsed form is canonical, so compare against the canonical input.
         // The fixture has no foreign-key action, so the format is version 1.
         let expected = SchemaSnapshot {
             snapshot_version: 1,
@@ -522,10 +511,8 @@ mod tests {
             json, expected,
             "canonical JSON drifted from the golden fixture"
         );
-        // Byte-stability: re-serializing yields identical bytes.
         assert_eq!(to_canonical_json(&snapshot), json);
-        // And canonicalization is idempotent: feeding the canonical form back in
-        // produces the same output (input order does not matter).
+        // Canonicalization is idempotent.
         let reparsed = parse_snapshot_str(&json, "<test>").expect("parse");
         assert_eq!(to_canonical_json(&reparsed), json);
     }
@@ -535,19 +522,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("schema-snapshot.json");
 
-        // Seed a pre-existing (stale) baseline at the destination.
         std::fs::write(&path, "OLD STALE CONTENT").expect("seed old baseline");
 
         let snapshot = SchemaSnapshot::new(Backend::Postgres, fixture_tables());
         write_snapshot(&path, &snapshot).expect("write");
 
-        // The destination now holds the fresh canonical JSON (replacement worked).
         let written = std::fs::read_to_string(&path).expect("read back");
         assert_eq!(written, to_canonical_json(&snapshot));
         assert!(!written.contains("OLD STALE CONTENT"));
 
-        // No temp file leaked into the directory on success: the destination is
-        // the only entry.
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read_dir")
             .map(|e| e.expect("entry").file_name())
@@ -596,7 +579,6 @@ mod tests {
 
     #[test]
     fn end_to_end_from_parsed_model_source() {
-        // Slice-2 parser -> snapshot -> canonical JSON contains the expected shape.
         let src = r#"
             #[autumn_web::model]
             pub struct Post {
@@ -614,7 +596,6 @@ mod tests {
         assert!(json.contains("\"name\": \"title\""));
         assert!(json.contains("\"snapshot_version\": 1"));
         assert!(json.contains("\"default\": \"Now\""));
-        // Re-loading the produced JSON yields a valid, version-1 snapshot.
         let loaded = parse_snapshot_str(&json, "<test>").expect("reload");
         assert_eq!(loaded.snapshot_version, 1);
         assert_eq!(loaded.tables.len(), 1);

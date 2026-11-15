@@ -691,6 +691,34 @@ fn bot_protection_problem_response<ResBody: From<String> + Default>(
         .unwrap_or_default()
 }
 
+/// Whether `req` must carry a CAPTCHA token: a urlencoded form sent with a
+/// mutating method to a path that is not exempt, while `dev_bypass` is off.
+/// Every other request is forwarded as it is.
+fn is_challenged(settings: &BotProtectionSettings, req: &Request<axum::body::Body>) -> bool {
+    if is_safe_method(req.method()) || crate::security::is_websocket_connect(req) {
+        return false;
+    }
+
+    // Match the normalized path so `/inbound/mailgun/../other` cannot use an exemption to reach
+    // another route.
+    let clean = crate::security::path::clean_path(req.uri().path());
+    if crate::security::path::is_exempt_path(clean.as_str(), &settings.exempt_paths) {
+        return false;
+    }
+
+    if settings.dev_bypass {
+        return false;
+    }
+
+    // Only urlencoded forms are challenged. JSON APIs, multipart uploads and webhooks pass.
+    let content_type = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded")
+}
+
 impl<S, ResBody> Service<Request<axum::body::Body>> for BotProtectionService<S>
 where
     S: Service<Request<axum::body::Body>, Response = Response<ResBody>> + Clone + Send + 'static,
@@ -707,39 +735,15 @@ where
     }
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
-        if is_safe_method(req.method()) || crate::security::is_websocket_connect(&req) {
-            let mut inner = self.inner.clone();
-            std::mem::swap(&mut self.inner, &mut inner);
-            return Box::pin(async move { inner.call(req).await });
+        if !is_challenged(&self.settings, &req) {
+            // Nothing runs before the inner call, so the future does not have to own the
+            // service. Call the instance that was polled ready, in place: a clone of it copies
+            // every service below this one, for a request this layer only forwards.
+            return Box::pin(self.inner.call(req));
         }
 
-        // Match the normalized path so `/inbound/mailgun/../other` cannot use an exemption to reach
-        // another route.
-        let clean = crate::security::path::clean_path(req.uri().path());
-        if crate::security::path::is_exempt_path(clean.as_str(), &self.settings.exempt_paths) {
-            let mut inner = self.inner.clone();
-            std::mem::swap(&mut self.inner, &mut inner);
-            return Box::pin(async move { inner.call(req).await });
-        }
-
-        if self.settings.dev_bypass {
-            let mut inner = self.inner.clone();
-            std::mem::swap(&mut self.inner, &mut inner);
-            return Box::pin(async move { inner.call(req).await });
-        }
-
-        // Only urlencoded forms are challenged. JSON APIs, multipart uploads and webhooks pass.
-        let content_type = req
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
-        if !crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded") {
-            let mut inner = self.inner.clone();
-            std::mem::swap(&mut self.inner, &mut inner);
-            return Box::pin(async move { inner.call(req).await });
-        }
-
+        // Verification runs before the inner call, so the future owns the service. The swap
+        // makes the call use the instance that was polled ready.
         let settings = Arc::clone(&self.settings);
         let mut inner = self.inner.clone();
         std::mem::swap(&mut self.inner, &mut inner);
@@ -1320,5 +1324,321 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Requests the layer only forwards ────────────────────────────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// What a [`Probe`] saw, shared by all of its clones.
+    #[derive(Default)]
+    struct ProbeLog {
+        clones: AtomicUsize,
+        calls: AtomicUsize,
+        unready_calls: AtomicUsize,
+    }
+
+    impl ProbeLog {
+        fn clones(&self) -> usize {
+            self.clones.load(Ordering::SeqCst)
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn unready_calls(&self) -> usize {
+            self.unready_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    /// An inner service that counts its clones and its calls, and the calls
+    /// made on an instance `poll_ready` did not ready. A clone is not ready.
+    ///
+    /// The response echoes the request method in `x-seen-method`, and the
+    /// request body.
+    struct Probe {
+        log: Arc<ProbeLog>,
+        ready: bool,
+        fail: bool,
+    }
+
+    impl Clone for Probe {
+        fn clone(&self) -> Self {
+            self.log.clones.fetch_add(1, Ordering::SeqCst);
+            Self {
+                log: Arc::clone(&self.log),
+                ready: false,
+                fail: self.fail,
+            }
+        }
+    }
+
+    impl Service<Request<Body>> for Probe {
+        type Response = Response<Body>;
+        type Error = &'static str;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.ready = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<Body>) -> Self::Future {
+            self.log.calls.fetch_add(1, Ordering::SeqCst);
+            if !std::mem::take(&mut self.ready) {
+                self.log.unready_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            if self.fail {
+                return std::future::ready(Err("inner failed"));
+            }
+
+            let response = Response::builder()
+                .header("x-seen-method", req.method().as_str())
+                .body(req.into_body())
+                .unwrap();
+            std::future::ready(Ok(response))
+        }
+    }
+
+    /// `layer` over a [`Probe`], and the probe's log.
+    fn probed(
+        layer: &BotProtectionLayer,
+        fail: bool,
+    ) -> (BotProtectionService<Probe>, Arc<ProbeLog>) {
+        let log = Arc::new(ProbeLog::default());
+        let probe = Probe {
+            log: Arc::clone(&log),
+            ready: false,
+            fail,
+        };
+        (layer.layer(probe), log)
+    }
+
+    /// A layer that needs the token `tok`, with `/inbound/` exempt.
+    fn challenging_layer() -> BotProtectionLayer {
+        BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("tok")))
+            .with_exempt_paths(vec!["/inbound/".to_owned()])
+    }
+
+    /// Ready the service, then call it, as a tower caller does.
+    async fn drive(
+        svc: &mut BotProtectionService<Probe>,
+        req: Request<Body>,
+    ) -> Result<Response<Body>, &'static str> {
+        ServiceExt::<Request<Body>>::ready(svc)
+            .await?
+            .call(req)
+            .await
+    }
+
+    fn request(
+        method: &str,
+        uri: &str,
+        content_type: Option<&str>,
+        body: &'static str,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(content_type) = content_type {
+            builder = builder.header("Content-Type", content_type);
+        }
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    const FORM: Option<&str> = Some("application/x-www-form-urlencoded");
+
+    async fn body_of(response: Response<Body>) -> axum::body::Bytes {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    /// One request of every kind [`challenging_layer`] does not challenge.
+    /// None carries a CAPTCHA token.
+    fn forwarded_requests() -> Vec<(&'static str, Request<Body>, &'static str)> {
+        let mut websocket = request("CONNECT", "/ws", None, "");
+        websocket
+            .extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+        vec![
+            ("GET", request("GET", "/page", None, ""), ""),
+            ("GET form", request("GET", "/page", FORM, "a=1"), "a=1"),
+            ("HEAD", request("HEAD", "/page", None, ""), ""),
+            ("OPTIONS", request("OPTIONS", "/page", None, ""), ""),
+            ("TRACE", request("TRACE", "/page", None, ""), ""),
+            ("WebSocket CONNECT", websocket, ""),
+            (
+                "exempt form POST",
+                request("POST", "/inbound/mailgun", FORM, "a=1&b=2"),
+                "a=1&b=2",
+            ),
+            (
+                "JSON POST",
+                request("POST", "/submit", Some("application/json"), "{\"a\":1}"),
+                "{\"a\":1}",
+            ),
+            (
+                "multipart POST",
+                request(
+                    "POST",
+                    "/submit",
+                    Some("multipart/form-data; boundary=x"),
+                    "--x--\r\n",
+                ),
+                "--x--\r\n",
+            ),
+            (
+                "POST without a content type",
+                request("POST", "/submit", None, "raw"),
+                "raw",
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn forwarded_request_reaches_the_readied_inner_without_a_clone() {
+        for (name, req, body) in forwarded_requests() {
+            let (mut svc, log) = probed(&challenging_layer(), false);
+            let method = req.method().as_str().to_owned();
+
+            let response = drive(&mut svc, req).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            assert_eq!(log.calls(), 1, "{name}: one inner call");
+            assert_eq!(log.unready_calls(), 0, "{name}: on the readied instance");
+            assert_eq!(log.clones(), 0, "{name}: no clone of the inner service");
+            assert_eq!(
+                response.headers().get("x-seen-method").unwrap(),
+                method.as_str(),
+                "{name}"
+            );
+            assert_eq!(&body_of(response).await[..], body.as_bytes(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_bypass_forwards_a_form_post_without_a_clone() {
+        let layer = BotProtectionLayer::from_config(&BotProtectionConfig {
+            dev_bypass: true,
+            ..Default::default()
+        });
+        let (mut svc, log) = probed(&layer, false);
+
+        let response = drive(&mut svc, request("POST", "/submit", FORM, "field=value"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(log.calls(), 1);
+        assert_eq!(log.unready_calls(), 0);
+        assert_eq!(log.clones(), 0);
+        assert_eq!(&body_of(response).await[..], b"field=value");
+    }
+
+    #[tokio::test]
+    async fn challenged_form_reaches_inner_only_with_a_valid_token() {
+        let (mut svc, log) = probed(&challenging_layer(), false);
+        let refused = [
+            ("no token", request("POST", "/submit", FORM, "field=value")),
+            (
+                "wrong token",
+                request("POST", "/submit", FORM, "cf-turnstile-response=nope"),
+            ),
+            // A dot segment does not turn a challenged route into an exempt one.
+            (
+                "dot segment",
+                request("POST", "/inbound/../submit", FORM, "field=value"),
+            ),
+            // A plain `CONNECT` is not a `WebSocket` upgrade.
+            ("plain CONNECT", request("CONNECT", "/ws", FORM, "a=1")),
+        ];
+        for (name, req) in refused {
+            let response = drive(&mut svc, req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+        }
+        assert_eq!(log.calls(), 0);
+
+        // The scanned body is restored for the inner service.
+        let form = "other=1&cf-turnstile-response=tok";
+        let response = drive(&mut svc, request("POST", "/submit", FORM, form))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(log.calls(), 1);
+        assert_eq!(log.unready_calls(), 0);
+        assert_eq!(&body_of(response).await[..], form.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn one_service_serves_forwarded_and_challenged_requests_in_turn() {
+        let (mut svc, log) = probed(&challenging_layer(), false);
+        let valid = "cf-turnstile-response=tok";
+        let requests = [
+            (request("GET", "/page", None, ""), StatusCode::OK),
+            (request("POST", "/submit", FORM, valid), StatusCode::OK),
+            (request("GET", "/page", None, ""), StatusCode::OK),
+            (
+                request("POST", "/submit", FORM, "a=1"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                request("POST", "/inbound/hook", FORM, "a=1"),
+                StatusCode::OK,
+            ),
+            (request("POST", "/submit", FORM, valid), StatusCode::OK),
+            (
+                request("POST", "/submit", Some("application/json"), "{}"),
+                StatusCode::OK,
+            ),
+        ];
+
+        for (i, (req, expected)) in requests.into_iter().enumerate() {
+            let response = drive(&mut svc, req).await.unwrap();
+            assert_eq!(response.status(), expected, "request {i}");
+        }
+
+        assert_eq!(log.calls(), 6);
+        assert_eq!(log.unready_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn clone_of_the_service_serves_a_forwarded_request() {
+        // A router clones the service for each request and drives the clone one time.
+        let (svc, log) = probed(&challenging_layer(), false);
+
+        let response = svc
+            .clone()
+            .oneshot(request("GET", "/page", None, ""))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(log.clones(), 1, "only the clone the caller made");
+        assert_eq!(log.unready_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn inner_error_is_returned_unchanged() {
+        let (mut svc, log) = probed(&challenging_layer(), true);
+        let requests = [
+            ("safe method", request("GET", "/page", None, "")),
+            ("exempt path", request("POST", "/inbound/hook", FORM, "a=1")),
+            (
+                "not a form",
+                request("POST", "/submit", Some("application/json"), "{}"),
+            ),
+            (
+                "challenged",
+                request("POST", "/submit", FORM, "cf-turnstile-response=tok"),
+            ),
+        ];
+
+        for (name, req) in requests {
+            let result = drive(&mut svc, req).await;
+            assert_eq!(result.unwrap_err(), "inner failed", "{name}");
+        }
+
+        assert_eq!(log.calls(), 4);
+        assert_eq!(log.unready_calls(), 0);
     }
 }

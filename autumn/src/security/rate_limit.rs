@@ -67,13 +67,14 @@
 
 use lru::LruCache;
 use std::future::Future;
+use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use crate::time::{ClockSource, SystemClock};
-use axum::http::{HeaderValue, Request, Response, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use chrono::{DateTime, Utc};
 use http::header::{CONTENT_TYPE, HeaderName, RETRY_AFTER};
 use tower::{Layer, Service};
@@ -88,6 +89,36 @@ use super::trusted_proxies::ProxyResolver;
 const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
 const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
 const X_RATELIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
+
+/// A header value holding `n` in decimal: the same bytes as
+/// `HeaderValue::from(n)`, in one allocation of exactly that length.
+///
+/// `HeaderValue::from(integer)` reserves room for the type's longest rendering
+/// and then freezes the buffer, which costs a second allocation whenever the
+/// number is shorter than that. The quota headers always are: a ten-digit Unix
+/// time in a twenty-byte reservation, a small count in a ten-byte one.
+fn decimal_header_value(n: u64) -> HeaderValue {
+    /// Decimal digits in `u64::MAX`.
+    const MAX_DIGITS: usize = 20;
+
+    let mut buf = [0_u8; MAX_DIGITS];
+    let mut start = MAX_DIGITS;
+    let mut rest = n;
+    // Least significant digit first, written from the end of the buffer.
+    for slot in buf.iter_mut().rev() {
+        // `rest % 10` is a single decimal digit.
+        #[allow(clippy::cast_possible_truncation)]
+        let digit = (rest % 10) as u8;
+        *slot = b'0' + digit;
+        start -= 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    // ASCII digits are always a valid header value.
+    HeaderValue::from_bytes(&buf[start..]).unwrap_or_else(|_| HeaderValue::from(n))
+}
 
 // ── Public extension types ────────────────────────────────────────────────────
 
@@ -685,27 +716,58 @@ impl Limiter {
 
     /// Extract the bucket key based on the configured strategy.
     fn extract_key<B>(&self, req: &Request<B>) -> Option<String> {
+        self.extract_key_parts(
+            req.headers(),
+            || ProxyResolver::peer_ip(req),
+            || req.extensions().get::<RateLimitPrincipal>(),
+        )
+    }
+
+    /// [`extract_key`](Self::extract_key) from the parts of a request it
+    /// reads: the headers, the TCP peer IP and the [`RateLimitPrincipal`]
+    /// extension.
+    ///
+    /// The single implementation of the keying scheme. A caller that holds
+    /// those parts but no `Request` gets the key the global limiter would give
+    /// the same request, without rebuilding one around a copy of the headers.
+    ///
+    /// `peer_ip` and `principal` are closures because each is read under some
+    /// strategies only: the peer when the key is the client IP, the principal
+    /// under [`KeyStrategy::AuthenticatedPrincipal`].
+    fn extract_key_parts<'a>(
+        &self,
+        headers: &HeaderMap,
+        peer_ip: impl FnOnce() -> Option<IpAddr>,
+        principal: impl FnOnce() -> Option<&'a RateLimitPrincipal>,
+    ) -> Option<String> {
         match self.key_strategy {
-            KeyStrategy::Ip => self.client_ip(req),
-            KeyStrategy::ApiToken => {
-                let token = extract_bearer_token(req);
-                if token.is_some() {
-                    token.map(|t| ["token:", t].concat())
-                } else {
-                    self.client_ip(req)
-                }
-            }
-            KeyStrategy::AuthenticatedPrincipal => {
-                let principal = req
-                    .extensions()
-                    .get::<RateLimitPrincipal>()
-                    .map(|p| ["principal:", p.0.as_str()].concat());
-                if principal.is_some() {
-                    principal
-                } else {
-                    self.client_ip(req)
-                }
-            }
+            KeyStrategy::Ip => self.client_ip_parts(headers, peer_ip()),
+            KeyStrategy::ApiToken => extract_bearer_token(headers).map_or_else(
+                || self.client_ip_parts(headers, peer_ip()),
+                |token| Some(["token:", token].concat()),
+            ),
+            KeyStrategy::AuthenticatedPrincipal => principal().map_or_else(
+                || self.client_ip_parts(headers, peer_ip()),
+                |principal| Some(["principal:", principal.0.as_str()].concat()),
+            ),
+        }
+    }
+
+    /// The `X-RateLimit-Limit` value for a request whose effective burst is
+    /// `burst`.
+    ///
+    /// The limiter's own burst is rendered once, at construction, and shared
+    /// from there. Only a burst that a path override or a tier changed is
+    /// rendered per request.
+    fn limit_header(&self, burst: f64) -> HeaderValue {
+        // Both are whole numbers converted from a `u32`, so equal values have
+        // equal bits. Unequal bits only cost a render of the same digits.
+        if burst.to_bits() == self.burst.to_bits() {
+            self.burst_header.clone()
+        } else {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let burst = burst as u32;
+            decimal_header_value(u64::from(burst))
         }
     }
 
@@ -813,8 +875,8 @@ fn tenant_qualify_owned_bucket_key(key_strategy: KeyStrategy, raw_key: String) -
 /// Extract the key string from the `Authorization: Bearer <token>` header,
 /// borrowed from the header value. The caller copies it once, into its
 /// prefixed bucket key.
-fn extract_bearer_token<B>(req: &Request<B>) -> Option<&str> {
-    req.headers()
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| {
@@ -829,9 +891,11 @@ fn extract_bearer_token<B>(req: &Request<B>) -> Option<&str> {
 }
 
 impl Limiter {
-    fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
+    /// The client IP as a bucket key, resolved from a request's headers and
+    /// TCP peer IP by the limiter's proxy policy.
+    fn client_ip_parts(&self, headers: &HeaderMap, peer_ip: Option<IpAddr>) -> Option<String> {
         self.resolver
-            .resolve_client_addr(req)
+            .resolve_client_addr_parts(headers, peer_ip)
             .map(|ip| ip.to_string())
     }
 }
@@ -1136,9 +1200,9 @@ where
             || (self.limiter.honors_mcp_exempt
                 && req.extensions().get::<RateLimitEnvelopeCounted>().is_some())
         {
-            let mut inner = self.inner.clone();
-            std::mem::swap(&mut self.inner, &mut inner);
-            return Box::pin(async move { inner.call(req).await });
+            // Nothing runs before or after the inner call, so call the instance
+            // `poll_ready` readied in place: no clone of the inner stack (#2830).
+            return Box::pin(self.inner.call(req));
         }
         let resolved = self.limiter.resolve_key_and_params(&req);
 
@@ -1155,11 +1219,7 @@ where
 
             let burst_for_header = resolved.as_ref().map_or_else(
                 || limiter.burst_header.clone(),
-                |(_, burst, _)| {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let b = *burst as u32;
-                    HeaderValue::from(b)
-                },
+                |(_, burst, _)| limiter.limit_header(*burst),
             );
 
             match decision {
@@ -1176,10 +1236,10 @@ where
                     let mut response = Response::new(ResBody::from(body_json));
                     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
                     let headers = response.headers_mut();
-                    headers.insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
+                    headers.insert(RETRY_AFTER, decimal_header_value(retry_after_secs));
                     headers.insert(X_RATELIMIT_LIMIT, burst_for_header);
                     headers.insert(X_RATELIMIT_REMAINING, HeaderValue::from_static("0"));
-                    headers.insert(X_RATELIMIT_RESET, HeaderValue::from(reset_at_unix));
+                    headers.insert(X_RATELIMIT_RESET, decimal_header_value(reset_at_unix));
                     headers.insert(
                         CONTENT_TYPE,
                         HeaderValue::from_static("application/problem+json"),
@@ -1199,10 +1259,13 @@ where
                         headers.insert(X_RATELIMIT_LIMIT, burst_for_header);
                     }
                     if !headers.contains_key(X_RATELIMIT_REMAINING) {
-                        headers.insert(X_RATELIMIT_REMAINING, HeaderValue::from(remaining));
+                        headers.insert(
+                            X_RATELIMIT_REMAINING,
+                            decimal_header_value(u64::from(remaining)),
+                        );
                     }
                     if !headers.contains_key(X_RATELIMIT_RESET) {
-                        headers.insert(X_RATELIMIT_RESET, HeaderValue::from(reset_at_unix));
+                        headers.insert(X_RATELIMIT_RESET, decimal_header_value(reset_at_unix));
                     }
                     Ok(response)
                 }
@@ -1545,27 +1608,21 @@ fn resolve_throttle_params<'a>(
     }
 }
 
-/// Extract a bucket key for a throttle check by reconstructing a minimal
-/// request from the parts an axum extractor already broke out, then reusing
-/// the shipped [`Limiter::extract_key`] so IP-via-proxy-resolver, bearer-token,
-/// and authenticated-principal keying all behave exactly as the global limiter
-/// (satisfying "no new keying scheme").
+/// Extract a bucket key for a throttle check from the parts an axum extractor
+/// already broke out.
+///
+/// It goes through [`Limiter::extract_key_parts`], the implementation behind
+/// the global limiter's [`Limiter::extract_key`], so IP-via-proxy-resolver,
+/// bearer-token and authenticated-principal keying all behave exactly as they
+/// do there: no new keying scheme. The parts are borrowed as they are; nothing
+/// is copied to stand in for a request.
 fn extract_throttle_key(
     limiter: &Limiter,
     headers: &axum::http::HeaderMap,
     peer: Option<std::net::SocketAddr>,
     principal: Option<&RateLimitPrincipal>,
 ) -> Option<String> {
-    let mut req: Request<()> = Request::new(());
-    *req.headers_mut() = headers.clone();
-    if let Some(addr) = peer {
-        req.extensions_mut()
-            .insert(axum::extract::ConnectInfo(addr));
-    }
-    if let Some(p) = principal {
-        req.extensions_mut().insert(p.clone());
-    }
-    limiter.extract_key(&req)
+    limiter.extract_key_parts(headers, || peer.map(|addr| addr.ip()), || principal)
 }
 
 /// Build the 429 problem-details response returned by the `#[throttle]`
@@ -1590,10 +1647,10 @@ fn build_rate_limited_response(
     let mut response = Response::new(Body::from(rate_limit_problem_body(key_class)));
     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
     let hdrs = response.headers_mut();
-    hdrs.insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
-    hdrs.insert(X_RATELIMIT_LIMIT, HeaderValue::from(limit));
+    hdrs.insert(RETRY_AFTER, decimal_header_value(retry_after_secs));
+    hdrs.insert(X_RATELIMIT_LIMIT, decimal_header_value(u64::from(limit)));
     hdrs.insert(X_RATELIMIT_REMAINING, HeaderValue::from_static("0"));
-    hdrs.insert(X_RATELIMIT_RESET, HeaderValue::from(reset_at_unix));
+    hdrs.insert(X_RATELIMIT_RESET, decimal_header_value(reset_at_unix));
     hdrs.insert(
         CONTENT_TYPE,
         HeaderValue::from_static("application/problem+json"),
@@ -1798,6 +1855,14 @@ mod tests {
             trusted_proxies: proxies.iter().map(|proxy| (*proxy).to_owned()).collect(),
             ..Default::default()
         })
+    }
+
+    impl Limiter {
+        /// The client-IP bucket key of a request: its headers and peer, read
+        /// the way [`Limiter::extract_key`] reads them.
+        fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
+            self.client_ip_parts(req.headers(), ProxyResolver::peer_ip(req))
+        }
     }
 
     fn req_with_connect_info(xff: &str, peer: &str) -> Request<()> {
@@ -2509,7 +2574,7 @@ mod tests {
             .header("authorization", "Bearer my-secret-token")
             .body(())
             .unwrap();
-        assert_eq!(extract_bearer_token(&req), Some("my-secret-token"));
+        assert_eq!(extract_bearer_token(req.headers()), Some("my-secret-token"));
     }
 
     #[test]
@@ -2518,7 +2583,7 @@ mod tests {
             .header("authorization", "BEARER token123")
             .body(())
             .unwrap();
-        assert_eq!(extract_bearer_token(&req), Some("token123"));
+        assert_eq!(extract_bearer_token(req.headers()), Some("token123"));
     }
 
     #[test]
@@ -2527,13 +2592,13 @@ mod tests {
             .header("authorization", "Basic dXNlcjpwYXNz")
             .body(())
             .unwrap();
-        assert!(extract_bearer_token(&req).is_none());
+        assert!(extract_bearer_token(req.headers()).is_none());
     }
 
     #[test]
     fn extract_bearer_token_returns_none_when_absent() {
         let req = Request::builder().body(()).unwrap();
-        assert!(extract_bearer_token(&req).is_none());
+        assert!(extract_bearer_token(req.headers()).is_none());
     }
 
     #[test]
@@ -4143,5 +4208,714 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    // ── Keying from borrowed parts ────────────────────────────────────────────
+
+    /// The key for a request rebuilt around a copy of the parts: its headers,
+    /// its peer as `ConnectInfo` and its principal as an extension, keyed by
+    /// [`Limiter::extract_key`] like any request the global limiter sees.
+    ///
+    /// What [`extract_throttle_key`] must agree with, whatever the parts hold.
+    fn key_via_rebuilt_request(
+        limiter: &Limiter,
+        headers: &HeaderMap,
+        peer: Option<SocketAddr>,
+        principal: Option<&RateLimitPrincipal>,
+    ) -> Option<String> {
+        let mut req: Request<()> = Request::new(());
+        *req.headers_mut() = headers.clone();
+        if let Some(addr) = peer {
+            req.extensions_mut().insert(ConnectInfo(addr));
+        }
+        if let Some(principal) = principal {
+            req.extensions_mut().insert(principal.clone());
+        }
+        limiter.extract_key(&req)
+    }
+
+    fn limiter_keyed_by(key_strategy: KeyStrategy, trust: bool) -> Limiter {
+        Limiter::from_config(&RateLimitConfig {
+            key_strategy,
+            trust_forwarded_headers: trust,
+            ..Default::default()
+        })
+    }
+
+    /// Headers from `(name, value)` lines, kept in order, so a repeated name
+    /// is a repeated header line.
+    fn header_lines(lines: &[(&'static str, &[u8])]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in lines {
+            headers.append(*name, HeaderValue::from_bytes(value).unwrap());
+        }
+        headers
+    }
+
+    /// The throttle key for the parts, after checking it is also the key of a
+    /// request rebuilt around them.
+    fn throttle_key(
+        limiter: &Limiter,
+        lines: &[(&'static str, &[u8])],
+        peer: Option<&str>,
+        principal: Option<&str>,
+    ) -> Option<String> {
+        let headers = header_lines(lines);
+        let peer: Option<SocketAddr> = peer.map(|addr| addr.parse().unwrap());
+        let principal = principal.map(|id| RateLimitPrincipal(id.to_owned()));
+        let key = extract_throttle_key(limiter, &headers, peer, principal.as_ref());
+        assert_eq!(
+            key,
+            key_via_rebuilt_request(limiter, &headers, peer, principal.as_ref()),
+            "parts and a request rebuilt from them must key alike"
+        );
+        key
+    }
+
+    #[test]
+    fn throttle_key_by_ip_resolves_the_borrowed_headers_and_peer() {
+        let trusting = limiter_keyed_by(KeyStrategy::Ip, true);
+        let xff: &[(&'static str, &[u8])] = &[("x-forwarded-for", b"1.1.1.1, 2.2.2.2")];
+        assert_eq!(
+            throttle_key(&trusting, xff, Some("9.9.9.9:4000"), None).as_deref(),
+            Some("2.2.2.2")
+        );
+        // The proxy's own appended address is skipped.
+        assert_eq!(
+            throttle_key(&trusting, xff, Some("2.2.2.2:4000"), None).as_deref(),
+            Some("1.1.1.1")
+        );
+        // A chain split over several lines reads as one.
+        assert_eq!(
+            throttle_key(
+                &trusting,
+                &[
+                    ("x-forwarded-for", b"1.1.1.1"),
+                    ("accept", b"*/*"),
+                    ("x-forwarded-for", b"3.3.3.3"),
+                ],
+                Some("9.9.9.9:4000"),
+                None
+            )
+            .as_deref(),
+            Some("3.3.3.3")
+        );
+        assert_eq!(
+            throttle_key(
+                &trusting,
+                &[("x-real-ip", b" 7.7.7.7 ")],
+                Some("9.9.9.9:4000"),
+                None
+            )
+            .as_deref(),
+            Some("7.7.7.7")
+        );
+        // A principal and a bearer token are not part of an IP key.
+        assert_eq!(
+            throttle_key(
+                &trusting,
+                &[("authorization", b"Bearer tok")],
+                Some("[2001:db8::7]:4000"),
+                Some("user-1")
+            )
+            .as_deref(),
+            Some("2001:db8::7")
+        );
+
+        let untrusting = limiter_keyed_by(KeyStrategy::Ip, false);
+        assert_eq!(
+            throttle_key(&untrusting, xff, Some("9.9.9.9:4000"), None).as_deref(),
+            Some("9.9.9.9")
+        );
+        // No peer and no trusted header: no key, so the caller bypasses.
+        assert_eq!(throttle_key(&untrusting, xff, None, None), None);
+        assert_eq!(throttle_key(&trusting, &[], None, None), None);
+    }
+
+    #[test]
+    fn throttle_key_by_api_token_reads_the_borrowed_authorization_header() {
+        let limiter = limiter_keyed_by(KeyStrategy::ApiToken, false);
+        let peer = Some("9.9.9.9:4000");
+        assert_eq!(
+            throttle_key(
+                &limiter,
+                &[("authorization", b"Bearer tok-abc")],
+                None,
+                None
+            )
+            .as_deref(),
+            Some("token:tok-abc")
+        );
+        assert_eq!(
+            throttle_key(
+                &limiter,
+                &[("authorization", b"bEaReR   padded  ")],
+                peer,
+                None
+            )
+            .as_deref(),
+            Some("token:padded")
+        );
+        // Everything else falls back to the client IP: another scheme, an empty
+        // token, a value that is not visible ASCII, and a bearer token that is
+        // not on the first `Authorization` line.
+        let fallbacks: [&[(&'static str, &[u8])]; 6] = [
+            &[],
+            &[("authorization", b"Basic dXNlcjpwYXNz")],
+            &[("authorization", b"Bearer ")],
+            &[("authorization", b"Bearer")],
+            &[("authorization", b"Bearer caf\xc3\xa9")],
+            &[
+                ("authorization", b"Basic dXNlcjpwYXNz"),
+                ("authorization", b"Bearer tok-abc"),
+            ],
+        ];
+        for lines in fallbacks {
+            assert_eq!(
+                throttle_key(&limiter, lines, peer, None).as_deref(),
+                Some("9.9.9.9"),
+                "{lines:?}"
+            );
+            assert_eq!(throttle_key(&limiter, lines, None, None), None, "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn throttle_key_by_principal_reads_the_borrowed_principal() {
+        let limiter = limiter_keyed_by(KeyStrategy::AuthenticatedPrincipal, false);
+        let peer = Some("9.9.9.9:4000");
+        assert_eq!(
+            throttle_key(&limiter, &[], peer, Some("user-99")).as_deref(),
+            Some("principal:user-99")
+        );
+        assert_eq!(
+            throttle_key(&limiter, &[], None, Some("user-99")).as_deref(),
+            Some("principal:user-99")
+        );
+        // The principal is used as given, an empty or non-ASCII one included.
+        assert_eq!(
+            throttle_key(&limiter, &[], peer, Some("")).as_deref(),
+            Some("principal:")
+        );
+        assert_eq!(
+            throttle_key(&limiter, &[], peer, Some("zoë:1")).as_deref(),
+            Some("principal:zoë:1")
+        );
+        // Without one, the client IP; a bearer token is not a principal.
+        assert_eq!(
+            throttle_key(&limiter, &[("authorization", b"Bearer tok")], peer, None).as_deref(),
+            Some("9.9.9.9")
+        );
+        assert_eq!(throttle_key(&limiter, &[], None, None), None);
+    }
+
+    #[test]
+    fn extract_key_parts_reads_only_the_parts_its_strategy_keys_on() {
+        use std::cell::Cell;
+
+        // (peer reads, principal reads) for one key extraction.
+        let reads = |strategy: KeyStrategy, headers: &HeaderMap, principal: Option<&str>| {
+            let limiter = limiter_keyed_by(strategy, false);
+            let principal = principal.map(|id| RateLimitPrincipal(id.to_owned()));
+            let peer_reads = Cell::new(0_u32);
+            let principal_reads = Cell::new(0_u32);
+            let _ = limiter.extract_key_parts(
+                headers,
+                || {
+                    peer_reads.set(peer_reads.get() + 1);
+                    Some(IpAddr::from([9, 9, 9, 9]))
+                },
+                || {
+                    principal_reads.set(principal_reads.get() + 1);
+                    principal.as_ref()
+                },
+            );
+            (peer_reads.get(), principal_reads.get())
+        };
+        let none = HeaderMap::new();
+        let bearer = header_lines(&[("authorization", b"Bearer tok")]);
+
+        assert_eq!(reads(KeyStrategy::Ip, &bearer, Some("user-1")), (1, 0));
+        assert_eq!(
+            reads(KeyStrategy::ApiToken, &bearer, Some("user-1")),
+            (0, 0)
+        );
+        assert_eq!(reads(KeyStrategy::ApiToken, &none, Some("user-1")), (1, 0));
+        assert_eq!(
+            reads(KeyStrategy::AuthenticatedPrincipal, &bearer, Some("user-1")),
+            (0, 1)
+        );
+        assert_eq!(
+            reads(KeyStrategy::AuthenticatedPrincipal, &bearer, None),
+            (1, 1)
+        );
+    }
+
+    // ── Quota header values ───────────────────────────────────────────────────
+
+    /// Whether two header values share one buffer, as a clone of a shared
+    /// value does and a freshly rendered one does not.
+    fn same_buffer(a: &HeaderValue, b: &HeaderValue) -> bool {
+        std::ptr::eq(a.as_bytes().as_ptr(), b.as_bytes().as_ptr())
+    }
+
+    #[test]
+    fn decimal_header_value_is_byte_identical_to_the_integer_conversion() {
+        let mut samples = vec![0_u64, 1, 9, u64::from(u32::MAX), u64::MAX, u64::MAX - 1];
+        // Every digit-count boundary: 10^k - 1, 10^k and 10^k + 1.
+        let mut power = 1_u64;
+        for _ in 0..19 {
+            power *= 10;
+            samples.extend([power - 1, power, power + 1]);
+        }
+        for n in samples {
+            let value = decimal_header_value(n);
+            assert_eq!(value.as_bytes(), n.to_string().as_bytes());
+            assert_eq!(value, HeaderValue::from(n));
+            assert!(!value.is_sensitive());
+            if let Ok(small) = u32::try_from(n) {
+                assert_eq!(value, HeaderValue::from(small));
+            }
+        }
+    }
+
+    #[test]
+    fn limit_header_shares_the_prerendered_value_for_the_limiters_own_burst() {
+        let limiter = limiter(true); // burst 5
+        let own = limiter.limit_header(5.0);
+        assert_eq!(own, "5");
+        assert!(
+            same_buffer(&own, &limiter.burst_header),
+            "the limiter's own burst must reuse its pre-rendered header value"
+        );
+
+        // A burst a path override or a tier changed is rendered for the request.
+        for (burst, expected) in [
+            (1_u32, "1"),
+            (7, "7"),
+            (100, "100"),
+            (u32::MAX, "4294967295"),
+        ] {
+            let value = limiter.limit_header(f64::from(burst));
+            assert_eq!(value, expected);
+            assert_eq!(value, HeaderValue::from(burst));
+            assert!(!same_buffer(&value, &limiter.burst_header));
+        }
+
+        // A configured burst of zero is clamped to one, in the bucket and the header alike.
+        let clamped = Limiter::from_config(&RateLimitConfig {
+            burst: 0,
+            ..Default::default()
+        });
+        let own = clamped.limit_header(clamped.burst);
+        assert_eq!(own, "1");
+        assert!(same_buffer(&own, &clamped.burst_header));
+    }
+
+    fn quota_headers<B>(response: &Response<B>) -> [Option<&str>; 4] {
+        [
+            RETRY_AFTER,
+            X_RATELIMIT_LIMIT,
+            X_RATELIMIT_REMAINING,
+            X_RATELIMIT_RESET,
+        ]
+        .map(|name| response.headers().get(name).and_then(|v| v.to_str().ok()))
+    }
+
+    #[tokio::test]
+    async fn quota_headers_carry_exact_decimal_values_when_allowed_and_when_denied() {
+        let now = Utc.timestamp_opt(1_748_736_000, 0).unwrap();
+        let layer = RateLimitLayer::from_config(&cfg(true, 0.5, 2))
+            .with_clock(Arc::new(crate::time::FixedClock::at(now)));
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(layer);
+
+        let first = app.clone().oneshot(req_with_ip("4.4.4.4")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(
+            quota_headers(&first),
+            [None, Some("2"), Some("1"), Some("1748736000")]
+        );
+
+        // The last token: the reset moves to when the next one arrives.
+        let second = app.clone().oneshot(req_with_ip("4.4.4.4")).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            quota_headers(&second),
+            [None, Some("2"), Some("0"), Some("1748736002")]
+        );
+
+        let denied = app.clone().oneshot(req_with_ip("4.4.4.4")).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            quota_headers(&denied),
+            [Some("2"), Some("2"), Some("0"), Some("1748736002")]
+        );
+        assert_eq!(
+            denied.headers().get(CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+    }
+
+    #[tokio::test]
+    async fn limit_header_is_the_effective_burst_under_path_overrides_and_tiers() {
+        let burst_override = |burst| RateLimitOverride {
+            burst,
+            requests_per_second: None,
+        };
+        let mut tiers = std::collections::HashMap::new();
+        for (name, burst) in [("premium", 10), ("standard", 5), ("unlimited", 0)] {
+            tiers.insert(
+                name.to_owned(),
+                RateLimitTierConfig {
+                    requests_per_second: 0.1,
+                    burst,
+                },
+            );
+        }
+        let layer = RateLimitLayer::from_config(&RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 5,
+            key_strategy: KeyStrategy::AuthenticatedPrincipal,
+            tiers,
+            ..Default::default()
+        })
+        .with_path_override("/strict", burst_override(Some(1)))
+        .with_path_override("/same", burst_override(Some(5)))
+        .with_path_override("/zero", burst_override(Some(0)))
+        .with_path_override(
+            "/rate-only",
+            RateLimitOverride {
+                burst: None,
+                requests_per_second: Some(1.0),
+            },
+        )
+        .with_tier_hook(|principal| principal.split_once('-').map(|(tier, _)| tier.to_owned()));
+        let own = layer.limiter.burst_header.clone();
+        let (mut service, _log) = probed(&layer);
+
+        // (path, principal, limit, whether the value is the limiter's shared one)
+        let cases = [
+            ("/", "user-1", "5", true),
+            ("/strict", "user-1", "1", false),
+            ("/same", "user-1", "5", true),
+            // A zero burst is clamped to one, as in the bucket.
+            ("/zero", "user-1", "1", false),
+            ("/rate-only", "user-1", "5", true),
+            ("/", "premium-1", "10", false),
+            ("/", "standard-1", "5", true),
+            ("/", "unlimited-1", "1", false),
+            // A burst set by a path override beats the tier's.
+            ("/strict", "premium-1", "1", false),
+            ("/rate-only", "premium-1", "10", false),
+        ];
+        for (path, principal, limit, shared) in cases {
+            let mut req = Request::builder().uri(path).body(()).unwrap();
+            req.extensions_mut()
+                .insert(RateLimitPrincipal(principal.to_owned()));
+            let response = drive(&mut service, req).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path} as {principal}");
+            let value = response.headers().get(X_RATELIMIT_LIMIT).unwrap();
+            assert_eq!(value, limit, "{path} as {principal}");
+            assert_eq!(same_buffer(value, &own), shared, "{path} as {principal}");
+        }
+    }
+
+    // ── How the limiter drives the inner service ──────────────────────────────
+
+    /// What a [`ProbeService`] and its clones saw.
+    #[derive(Debug, Default)]
+    struct ProbeLog {
+        clones: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+        /// Calls that landed on an instance `poll_ready` had not readied.
+        unready_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ProbeLog {
+        /// `(clones, calls, unready calls)` so far.
+        fn counts(&self) -> (usize, usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (
+                self.clones.load(SeqCst),
+                self.calls.load(SeqCst),
+                self.unready_calls.load(SeqCst),
+            )
+        }
+    }
+
+    /// Inner service that records how the limiter drives it: each clone, each
+    /// call, and whether the called instance is the one `poll_ready` readied.
+    /// Readiness belongs to the polled instance; a clone starts without it.
+    #[derive(Debug)]
+    struct ProbeService {
+        log: Arc<ProbeLog>,
+        ready: bool,
+    }
+
+    impl Clone for ProbeService {
+        fn clone(&self) -> Self {
+            self.log
+                .clones
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self {
+                log: Arc::clone(&self.log),
+                ready: false,
+            }
+        }
+    }
+
+    impl Service<Request<()>> for ProbeService {
+        type Response = Response<String>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.ready = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<()>) -> Self::Future {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.log.calls.fetch_add(1, SeqCst);
+            if !std::mem::take(&mut self.ready) {
+                self.log.unready_calls.fetch_add(1, SeqCst);
+            }
+            std::future::ready(Ok(Response::new("inner".to_owned())))
+        }
+    }
+
+    fn probed(layer: &RateLimitLayer) -> (RateLimitService<ProbeService>, Arc<ProbeLog>) {
+        let log = Arc::new(ProbeLog::default());
+        let service = layer.layer(ProbeService {
+            log: Arc::clone(&log),
+            ready: false,
+        });
+        (service, log)
+    }
+
+    /// Polls the service ready, then calls that same instance.
+    async fn drive(
+        service: &mut RateLimitService<ProbeService>,
+        req: Request<()>,
+    ) -> Response<String> {
+        let Ok(response) = ServiceExt::<Request<()>>::ready(service)
+            .await
+            .unwrap()
+            .call(req)
+            .await;
+        response
+    }
+
+    fn probe_req() -> Request<()> {
+        Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "6.6.6.6")
+            .body(())
+            .unwrap()
+    }
+
+    /// [`probe_req`] carrying `marker` as a request extension.
+    fn marked_req(marker: impl Clone + Send + Sync + 'static) -> Request<()> {
+        let mut req = probe_req();
+        req.extensions_mut().insert(marker);
+        req
+    }
+
+    #[tokio::test]
+    async fn exempt_request_calls_the_readied_inner_service_without_cloning_it() {
+        let layer = RateLimitLayer::from_config(&cfg(true, 0.1, 1));
+        let (mut service, log) = probed(&layer);
+
+        // Past the burst of one, every exempt request reaches the inner service
+        // and comes back as the inner service returned it.
+        for _ in 0..3 {
+            let response = drive(&mut service, marked_req(RateLimitExempt)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.body(), "inner");
+            assert_eq!(quota_headers(&response), [None; 4]);
+        }
+        assert_eq!(
+            log.counts(),
+            (0, 3, 0),
+            "an exempt request must call the readied inner service in place, with no clone"
+        );
+
+        // The exempt requests spent nothing: the client's one token is still there.
+        let counted = drive(&mut service, probe_req()).await;
+        assert_eq!(counted.status(), StatusCode::OK);
+        let denied = drive(&mut service, probe_req()).await;
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn envelope_counted_request_passes_through_only_a_limiter_that_honors_it() {
+        let config = cfg(true, 0.1, 1);
+
+        // The framework's default limiter: passed through, in place.
+        let honoring = RateLimitLayer::from_config(&config).honoring_mcp_exempt();
+        let (mut service, log) = probed(&honoring);
+        for _ in 0..3 {
+            let response = drive(&mut service, marked_req(RateLimitEnvelopeCounted)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(quota_headers(&response), [None; 4]);
+        }
+        assert_eq!(log.counts(), (0, 3, 0));
+
+        // A user-installed limiter still charges it.
+        let charging = RateLimitLayer::from_config(&config);
+        let (mut service, log) = probed(&charging);
+        let statuses = [
+            drive(&mut service, marked_req(RateLimitEnvelopeCounted))
+                .await
+                .status(),
+            drive(&mut service, marked_req(RateLimitEnvelopeCounted))
+                .await
+                .status(),
+        ];
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]);
+        // The denied request never reaches the inner service.
+        assert_eq!(log.counts().1, 1);
+    }
+
+    #[tokio::test]
+    async fn counted_request_calls_the_readied_inner_service() {
+        let layer = RateLimitLayer::from_config(&cfg(true, 0.1, 5));
+        let (mut service, log) = probed(&layer);
+
+        for calls in 1..=3 {
+            let response = drive(&mut service, probe_req()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.body(), "inner");
+            // The decision is made inside the returned future, so the readied
+            // instance moves into it and a fresh clone stays behind.
+            assert_eq!(log.counts(), (calls, calls, 0));
+            assert!(!service.inner.ready);
+        }
+    }
+
+    // ── Property tests ────────────────────────────────────────────────────────
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        static PEERS: [&str; 4] = [
+            "10.0.0.1:4000",
+            "9.9.9.9:4000",
+            "2.2.2.2:4000",
+            "[2001:db8::7]:4000",
+        ];
+
+        /// One header line the key extraction reads, by name.
+        fn header_line() -> impl Strategy<Value = (&'static str, Vec<u8>)> {
+            let authorization = prop_oneof![
+                4 => "Bearer [a-z0-9-]{1,8}".prop_map(String::into_bytes),
+                1 => Just(b"bEaReR   padded  ".to_vec()),
+                1 => Just(b"Bearer ".to_vec()),
+                1 => Just(b"Bearer".to_vec()),
+                1 => Just(b"Basic dXNlcjpwYXNz".to_vec()),
+                1 => Just(b"Bearer caf\xc3\xa9".to_vec()),
+                1 => Just(Vec::new()),
+            ];
+            let forwarded = prop_oneof![
+                Just(&b"1.1.1.1"[..]),
+                Just(&b"1.1.1.1, 2.2.2.2"[..]),
+                Just(&b" 3.3.3.3 , 10.0.0.7 ,"[..]),
+                Just(&b"10.0.0.7:8080"[..]),
+                Just(&b"[2001:db8::1]:443"[..]),
+                Just(&b"unknown"[..]),
+                Just(&b""[..]),
+                Just(&b"caf\xc3\xa9"[..]),
+            ]
+            .prop_map(<[u8]>::to_vec);
+            prop_oneof![
+                3 => authorization.prop_map(|value| ("authorization", value)),
+                4 => forwarded.clone().prop_map(|value| ("x-forwarded-for", value)),
+                2 => forwarded.prop_map(|value| ("x-real-ip", value)),
+                1 => Just(("accept", b"*/*".to_vec())),
+            ]
+        }
+
+        /// A limiter under any key strategy and any proxy policy: the
+        /// rate-limit section's own fields, or a top-level resolver.
+        fn any_limiter() -> impl Strategy<Value = Limiter> {
+            let ranges = || {
+                prop::sample::subsequence(vec!["10.0.0.0/8", "2.2.2.2", "not-a-range"], 0..=3)
+                    .prop_map(|ranges| ranges.into_iter().map(str::to_owned).collect::<Vec<_>>())
+            };
+            (
+                prop::sample::select(vec![
+                    KeyStrategy::Ip,
+                    KeyStrategy::ApiToken,
+                    KeyStrategy::AuthenticatedPrincipal,
+                ]),
+                any::<bool>(),
+                ranges(),
+                prop::option::of((any::<bool>(), ranges(), prop::option::of(0_u32..3))),
+            )
+                .prop_map(|(key_strategy, trust, trusted_proxies, top_level)| {
+                    let config = RateLimitConfig {
+                        key_strategy,
+                        trust_forwarded_headers: trust,
+                        trusted_proxies,
+                        ..Default::default()
+                    };
+                    let resolver = top_level.map(|(trust, ranges, trusted_hops)| {
+                        ProxyResolver::from_config(&TrustedProxiesConfig {
+                            ranges,
+                            trusted_hops,
+                            trust_forwarded_headers: trust,
+                        })
+                    });
+                    Limiter::from_config_with_resolver(&config, resolver)
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// The throttle key from borrowed parts is the key of a request
+            /// rebuilt around a copy of them: any headers, peer and principal,
+            /// under any key strategy and proxy policy.
+            #[test]
+            fn throttle_key_from_parts_matches_a_rebuilt_request(
+                limiter in any_limiter(),
+                lines in prop::collection::vec(header_line(), 0..6),
+                peer in prop::option::of(prop::sample::select(&PEERS[..])),
+                principal in prop::option::of(".{0,8}"),
+            ) {
+                let mut headers = HeaderMap::new();
+                for (name, value) in &lines {
+                    headers.append(*name, HeaderValue::from_bytes(value).unwrap());
+                }
+                let peer: Option<SocketAddr> = peer.map(|addr| addr.parse().unwrap());
+                let principal = principal.map(RateLimitPrincipal);
+
+                prop_assert_eq!(
+                    extract_throttle_key(&limiter, &headers, peer, principal.as_ref()),
+                    key_via_rebuilt_request(&limiter, &headers, peer, principal.as_ref())
+                );
+            }
+
+            /// The quota headers' decimal rendering holds the bytes the
+            /// `HeaderValue` integer conversions hold.
+            #[test]
+            fn decimal_header_value_matches_the_integer_conversions(
+                wide in any::<u64>(),
+                narrow in any::<u32>(),
+            ) {
+                let value = decimal_header_value(wide);
+                prop_assert_eq!(&value, &HeaderValue::from(wide));
+                prop_assert_eq!(value.as_bytes().to_vec(), wide.to_string().into_bytes());
+                prop_assert!(!value.is_sensitive());
+
+                let value = decimal_header_value(u64::from(narrow));
+                prop_assert_eq!(&value, &HeaderValue::from(narrow));
+                prop_assert_eq!(value.as_bytes().to_vec(), narrow.to_string().into_bytes());
+            }
+        }
     }
 }

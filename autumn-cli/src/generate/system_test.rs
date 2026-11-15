@@ -53,13 +53,10 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
     let pascal_name = pascal(name);
     let mut plan = Plan::new(project_root);
 
-    // Patch Cargo.toml: add system-tests feature + [[test]] entry.
     let cargo_path = project_root.join("Cargo.toml");
     let existing = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
 
-    // Reject virtual workspace manifests (they have [workspace] but no
-    // [package]). Patching a virtual manifest with [features] or [[test]]
-    // would corrupt it; the user should run this command inside a package.
+    // Adding [features] or [[test]] to a virtual manifest would corrupt it.
     if is_virtual_workspace(&existing) {
         return Err(GenerateError::Config(
             "Cargo.toml is a virtual workspace manifest (no [package] section). \
@@ -68,13 +65,11 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
         ));
     }
 
-    // Resolve the dep key before generating the file so the import uses the
-    // right crate name (e.g. `autumn::prelude::*` instead of `autumn_web::prelude::*`
-    // when the project renames the dependency).
+    // The generated import uses the project's name for the dependency
+    // (`autumn::prelude::*` when it renames `autumn-web` to `autumn`).
     let dep_key = resolve_autumn_web_dep_key(&existing);
     let dep_crate = dep_key.replace('-', "_");
 
-    // Ensure tests/system/ directory exists by placing the file there.
     plan.create(
         project_root
             .join("tests")
@@ -87,10 +82,8 @@ pub fn plan_system_test(project_root: &Path, name: &str) -> Result<Plan, Generat
     if patched != existing {
         plan.modify(cargo_path.clone(), patched);
     }
-    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
-    // model.rs: destroy recomputes this plan against the already-generated
-    // Cargo.toml, where the `[[test]]` entry is by definition already
-    // present.
+    // Pushed unconditionally: destroy recomputes this plan against the generated Cargo.toml,
+    // where the `[[test]]` entry already exists and no `modify` is planned.
     plan.push_revert(crate::generate::emit::Revert::SystemTestCargoPatch {
         path: cargo_path,
         snake_name,
@@ -119,9 +112,7 @@ fn is_array_table_header(trimmed: &str, name: &str) -> bool {
 ///
 /// Returns `"autumn-web"` when no renamed entry is found.
 fn resolve_autumn_web_dep_key(cargo_toml: &str) -> String {
-    // Strip an inline TOML comment from a value fragment (everything after the
-    // first unquoted `#`).  This is a best-effort scan: it handles the common
-    // case of `foo = "bar" # package = "autumn-web"` correctly.
+    // Best-effort strip of an inline TOML comment: cut at the first `#` outside a string.
     fn strip_inline_comment(s: &str) -> &str {
         let mut in_str = false;
         let mut prev_backslash = false;
@@ -152,8 +143,7 @@ fn resolve_autumn_web_dep_key(cargo_toml: &str) -> String {
     let mut in_dep_section = false;
     // Key from a `[dependencies.KEY]` / `[dev-dependencies.KEY]` subtable header.
     let mut subtable_key: Option<String> = None;
-    // Set when we open a multi-line inline table `key = {` with no closing `}`
-    // on the same line.  Only valid inside an open brace block; cleared on `}`.
+    // Key of a multi-line inline table `key = {` still open; cleared on `}`.
     let mut open_table_key: Option<String> = None;
 
     for line in cargo_toml.lines() {
@@ -161,12 +151,10 @@ fn resolve_autumn_web_dep_key(cargo_toml: &str) -> String {
         if trimmed.starts_with('[') {
             subtable_key = None;
             open_table_key = None;
-            // Plain `[dependencies]` / `[dev-dependencies]` (with optional comment)
             in_dep_section = trimmed == "[dependencies]"
                 || trimmed == "[dev-dependencies]"
                 || trimmed.starts_with("[dependencies] #")
                 || trimmed.starts_with("[dev-dependencies] #");
-            // Subtable form: `[dependencies.KEY]` or `[dev-dependencies.KEY]`
             if !in_dep_section {
                 for prefix in &["[dependencies.", "[dev-dependencies."] {
                     if let Some(rest) = trimmed.strip_prefix(prefix) {
@@ -191,16 +179,14 @@ fn resolve_autumn_web_dep_key(cargo_toml: &str) -> String {
         if !in_dep_section || trimmed.starts_with('#') {
             continue;
         }
-        // Inside a `[dependencies.KEY]` subtable — if we see `package = "autumn-web"`
-        // the key is the subtable name itself.
+        // In a `[dependencies.KEY]` subtable, `package = "autumn-web"` makes KEY the alias.
         if let Some(ref key) = subtable_key {
             if mentions_autumn_web(trimmed) {
                 return key.clone();
             }
             continue;
         }
-        // Inside an open multi-line table `key = {\n ... \n}` — every line
-        // belongs to the same entry until we see the closing `}`.
+        // Every line of an open multi-line table belongs to its entry until `}`.
         if let Some(ref key) = open_table_key {
             if trimmed.contains('}') {
                 open_table_key = None;
@@ -209,14 +195,12 @@ fn resolve_autumn_web_dep_key(cargo_toml: &str) -> String {
             }
             continue;
         }
-        // New key=value line.
         if let Some((key, rest)) = trimmed.split_once('=') {
             let key = key.trim().trim_matches('"').to_owned();
             let rest = rest.trim();
             if mentions_autumn_web(rest) {
                 return key;
             }
-            // If the value opens a brace without closing it, enter multi-line mode.
             let open_count = rest.chars().filter(|&c| c == '{').count();
             let close_count = rest.chars().filter(|&c| c == '}').count();
             if open_count > close_count {
@@ -248,11 +232,9 @@ fn features_section_has_key(cargo_toml: &str, key: &str) -> bool {
             continue;
         }
         if in_features {
-            // Another table header ends the [features] section.
             if trimmed.starts_with('[') {
                 break;
             }
-            // Check if this line declares the key (bare or TOML-quoted form).
             let quoted_key = format!("\"{key}\"");
             let bare_match = trimmed
                 .strip_prefix(key)
@@ -283,19 +265,17 @@ fn test_section_names_test(cargo_toml: &str, test_name: &str) -> bool {
         }
         if in_test {
             if trimmed.starts_with('[') {
-                // This header ends the current [[test]] section. If it's
-                // another [[test]], re-enter immediately so we don't skip it.
+                // A header ends this section; another `[[test]]` starts a new one.
                 in_test = is_array_table_header(trimmed, "test");
                 continue;
             }
-            // Accept both bare `name` and quoted `"name"` key forms.
             let after_name = trimmed
                 .strip_prefix("\"name\"")
                 .or_else(|| trimmed.strip_prefix("name"));
             if let Some(after) = after_name {
                 let after = after.trim_start();
                 if let Some(val) = after.strip_prefix('=') {
-                    // Strip any trailing TOML inline comment before comparing.
+                    // Drop a trailing inline comment.
                     let val = val.trim();
                     let val = val.split_once(" #").map_or(val, |(v, _)| v.trim());
                     if val == test_name || val == expected {
@@ -316,9 +296,7 @@ fn find_features_header_end(cargo_toml: &str) -> Option<usize> {
     for line in cargo_toml.lines() {
         let trimmed = line.trim();
         let is_header = is_features_header(trimmed);
-        // Advance pos past this line (include its line ending).
         pos += line.len();
-        // Account for \r\n vs \n.
         if cargo_toml[pos..].starts_with("\r\n") {
             pos += 2;
         } else if cargo_toml[pos..].starts_with('\n') {
@@ -337,19 +315,15 @@ fn find_features_header_end(cargo_toml: &str) -> Option<usize> {
 pub(super) fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
     let mut out = existing.to_owned();
 
-    // 1. Add [features] system-tests entry if not already in the [features] table.
-    // We scan only the [features] section so that a dev-dependency enabling
-    // autumn-web/system-tests does not suppress the local feature definition
-    // (which is required by `--features system-tests` and `#[cfg(feature = ...)]`).
+    // 1. The feature. Only the [features] table counts: a dependency enabling
+    // `autumn-web/system-tests` does not define the local feature that
+    // `--features system-tests` and `#[cfg(feature = ...)]` need.
     let dep_key = resolve_autumn_web_dep_key(&out);
     let feature_line = format!("system-tests = [\"{dep_key}/system-tests\"]");
     if !features_section_has_key(&out, "system-tests") {
-        // Find the byte offset of the end of the "[features]" header line so we
-        // can insert immediately after it regardless of line ending style (LF or
-        // CRLF) or trailing inline comments on the header.
+        // Insert right after the header line, whatever its line ending or trailing comment.
         if let Some(insert_pos) = find_features_header_end(&out) {
-            // If the header had no trailing newline (EOF case), add one before
-            // the feature line so the manifest stays valid TOML.
+            // A header at EOF has no newline; add one so the manifest stays valid TOML.
             let prefix = if insert_pos > 0 && !out[..insert_pos].ends_with('\n') {
                 "\n"
             } else {
@@ -361,8 +335,7 @@ pub(super) fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
         }
     }
 
-    // 2. Add [[test]] entry if no [[test]] section already names this test.
-    // Scan section-by-section so key order and whitespace don't matter.
+    // 2. The [[test]] entry.
     if !test_section_names_test(&out, snake_name) {
         let _ = write!(
             out,
@@ -615,11 +588,8 @@ mod tests {
 
     #[test]
     fn destroying_the_only_system_test_keeps_a_pre_existing_hand_written_feature_gate() {
-        // The project already gates unrelated hand-written code on
-        // `system-tests` (independent of this generator) before `generate
-        // system-test` ever runs. Destroying the only generated system test
-        // must not strip that pre-existing feature declaration out from
-        // under the hand-written code (issue #1048 PR review).
+        // Hand-written code gates on `system-tests` before the generator runs. Destroying the
+        // only generated system test must keep that feature (issue #1048).
         let tmp = temp_project();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(
@@ -700,7 +670,6 @@ mod tests {
             .unwrap()
             .execute(flags)
             .unwrap();
-        // Second attempt should fail.
         let result = plan_system_test(tmp.path(), "Collision")
             .unwrap()
             .execute(flags);
@@ -732,7 +701,6 @@ mod tests {
 
     #[test]
     fn patch_cargo_toml_crlf_features_header() {
-        // Cargo.toml with CRLF line endings should still have the feature inserted.
         let crlf = "[package]\r\nname = \"x\"\r\n\r\n[features]\r\nother = []\r\n";
         let patched = patch_cargo_toml(crlf, "my_test");
         assert!(
@@ -757,8 +725,6 @@ mod tests {
 
     #[test]
     fn patch_cargo_toml_idempotent_with_commented_features_header() {
-        // If [features] already has system-tests under a commented header,
-        // patching again must not insert a second key.
         let src = "[package]\nname = \"x\"\n\n[features] # project features\nsystem-tests = [\"autumn-web/system-tests\"]\nother = []\n";
         let patched = patch_cargo_toml(src, "my_test");
         let count = patched.matches("system-tests =").count();
@@ -770,11 +736,8 @@ mod tests {
 
     #[test]
     fn find_features_header_end_no_trailing_newline() {
-        // [features] as the very last line with no trailing newline — pos does
-        // not advance past a newline but the header is still found.
         let src = "[package]\nname = \"x\"\n\n[features]";
         let pos = super::find_features_header_end(src);
-        // Should point to the byte just past "[features]" (end of string).
         assert!(
             pos.is_some(),
             "should find header even without trailing newline"
@@ -805,7 +768,7 @@ mod tests {
     #[test]
     fn plan_system_test_errors_on_unreadable_cargo_toml() {
         use std::os::unix::fs::PermissionsExt;
-        // Skip when running as root (CI containers) since chmod 000 is ineffective.
+        // Root (as in CI containers) can read a mode-000 file: nothing to test.
         if std::fs::read("/etc/shadow").is_ok() {
             return;
         }
@@ -827,8 +790,6 @@ mod tests {
 
     #[test]
     fn patch_cargo_toml_no_trailing_newline_on_features_header() {
-        // When [features] is the last line with no newline, the feature line
-        // must be on a new line (not run together as "[features]system-tests").
         let src = "[package]\nname = \"x\"\n\n[features]";
         let patched = patch_cargo_toml(src, "eof_test");
         assert!(
@@ -839,8 +800,6 @@ mod tests {
 
     #[test]
     fn test_section_names_test_multiple_sections() {
-        // When there are multiple [[test]] sections, the scanner must check
-        // all of them and not stop after the first one.
         let src = "[[test]]\nname = \"other_test\"\npath = \"tests/other.rs\"\n\
                    \n[[test]]\nname = \"my_test\"\npath = \"tests/my_test.rs\"\n";
         assert!(
@@ -890,7 +849,6 @@ mod tests {
 
     #[test]
     fn test_section_names_test_inline_comment() {
-        // name values with trailing TOML inline comments must still be recognised.
         let src =
             "[[test]]\nname = \"todo_flow\" # browser test\npath = \"tests/system/todo_flow.rs\"\n";
         assert!(
@@ -901,17 +859,12 @@ mod tests {
 
     #[test]
     fn patch_cargo_toml_idempotent_with_quoted_feature_key() {
-        // A valid TOML manifest may quote the key: `"system-tests" = [...]`.
-        // The generator must recognise this and not insert a duplicate bare key.
         let src = "[package]\nname = \"x\"\n\n[features]\n\"system-tests\" = [\"autumn-web/system-tests\"]\n";
         let patched = patch_cargo_toml(src, "my_test");
-        // Confirm no bare (unquoted) system-tests key was inserted.
         assert!(
             !patched.contains("\nsystem-tests ="),
             "must not insert a bare system-tests key when a quoted one already exists; patched: {patched:?}"
         );
-        // The feature content should not have grown — the original and patched
-        // [features] section should be identical.
         let orig_lines: Vec<_> = src.lines().filter(|l| l.contains("system-tests")).collect();
         let patch_lines: Vec<_> = patched
             .lines()
@@ -925,7 +878,6 @@ mod tests {
 
     #[test]
     fn resolve_dep_key_subtable_syntax() {
-        // `[dev-dependencies.autumn]` with `package = "autumn-web"` in the body.
         let src = "[package]\nname = \"x\"\n\n[dev-dependencies.autumn]\nversion = \"0.1\"\npackage = \"autumn-web\"\n";
         assert_eq!(
             super::resolve_autumn_web_dep_key(src),
@@ -936,7 +888,6 @@ mod tests {
 
     #[test]
     fn resolve_dep_key_ignores_inline_comment_mention() {
-        // A comment mentioning package = "autumn-web" must not fool the resolver.
         let src = "[dependencies]\nfoo = \"1\" # package = \"autumn-web\"\nautumn-web = \"0.1\"\n";
         assert_eq!(
             super::resolve_autumn_web_dep_key(src),
@@ -947,7 +898,6 @@ mod tests {
 
     #[test]
     fn resolve_dep_key_not_fooled_by_prior_dependency() {
-        // `serde` precedes `autumn`; stale pending_key must not return "serde".
         let src = "[dependencies]\nserde = \"1\"\nautumn = { package = \"autumn-web\", version = \"0.1\" }\n";
         assert_eq!(
             super::resolve_autumn_web_dep_key(src),
@@ -958,7 +908,6 @@ mod tests {
 
     #[test]
     fn resolve_dep_key_multiline_table() {
-        // `autumn = {` on one line, `package = "autumn-web"` on the next.
         let src = "[dependencies]\nautumn = {\npackage = \"autumn-web\"\nversion = \"0.1\"\n}\n";
         assert_eq!(
             super::resolve_autumn_web_dep_key(src),
@@ -969,7 +918,6 @@ mod tests {
 
     #[test]
     fn plan_creates_system_test_file_with_renamed_dep() {
-        // When autumn-web is aliased, the generated file must import via the alias.
         let tmp = TempDir::new().unwrap();
         let cargo = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n[dependencies]\nautumn = { package = \"autumn-web\", version = \"0.1\" }\n\n[features]\n";
         fs::write(tmp.path().join("Cargo.toml"), cargo).unwrap();
@@ -990,7 +938,6 @@ mod tests {
 
     #[test]
     fn test_section_names_test_quoted_name_key() {
-        // A valid TOML quoted key `"name" = "todo_flow"` must be recognised.
         let src = "[[test]]\n\"name\" = \"todo_flow\"\npath = \"tests/system/todo_flow.rs\"\n";
         assert!(
             super::test_section_names_test(src, "todo_flow"),
@@ -1005,7 +952,6 @@ mod tests {
             .unwrap()
             .execute(Flags::default())
             .unwrap();
-        // Second attempt with force should succeed.
         plan_system_test(tmp.path(), "Force")
             .unwrap()
             .execute(Flags {

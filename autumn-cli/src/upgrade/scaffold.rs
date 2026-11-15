@@ -182,10 +182,8 @@ impl Manifest {
             files: self.digests.clone(),
             pinned: self.pinned.clone(),
         };
-        // Serialization cannot fail for this shape (plain strings, bools, and a
-        // string map), but a panic here would abort a scaffold over
-        // bookkeeping, so the failure degrades to a manifest-free project —
-        // which the reconciler already handles as "no baseline".
+        // Cannot fail for this shape. If it did, an empty body leaves a manifest-free
+        // project ("no baseline") instead of aborting the scaffold over bookkeeping.
         let body = toml::to_string(&file).unwrap_or_default();
         format!(
             "# Scaffold provenance for `autumn upgrade` (issue #1593).\n\
@@ -210,15 +208,9 @@ impl Manifest {
             version: file.version,
             written_by: file.written_by,
             options: GenerateOptions {
-                // Anything but the two flavours this CLI knows is treated as no
-                // manifest at all. Falling back to `fullstack` would keep
-                // trusting the recorded *digests* while rendering the wrong
-                // templates against them — so an API project's `Dockerfile`,
-                // untouched and matching its baseline, would classify as
-                // `update` and be replaced with the fullstack one while its
-                // `Cargo.toml` stayed API-shaped. A value written by a newer
-                // release, or a typo, is exactly when the conservative
-                // no-baseline path is wanted.
+                // An unknown flavour means no manifest. Falling back to `fullstack` would
+                // render the wrong templates against trusted digests, so an untouched API
+                // `Dockerfile` would be replaced with the fullstack one.
                 with_api: match file.flavor.as_str() {
                     FLAVOR_API => true,
                     FLAVOR_FULLSTACK => false,
@@ -232,21 +224,13 @@ impl Manifest {
             digests: file.files,
             pinned: file.pinned,
         })
-        // A combination `autumn new` would have refused cannot have produced
-        // this project, so the manifest is corrupt however well-formed it
-        // parses. `--api` with `--daemon`, for instance, are different app
-        // shapes with conflicting feature sets: trusting it would render the
-        // API templates against a fullstack daemon's digests and make its
-        // `Dockerfile` and `build.rs` look like safe updates. Validated with
-        // `autumn new`'s own rule, so the two can never disagree about what is
-        // possible.
+        // A combination `autumn new` refuses (e.g. `--api` with `--daemon`) cannot have
+        // produced this project, so the manifest is corrupt. Trusting it would render the
+        // wrong templates against its digests and offer them as safe updates.
         .filter(|manifest: &Self| crate::new::check_option_combination(manifest.options).is_ok())
-        // A release string that cannot be read cannot be compared, so it cannot
-        // be refused either — and a manifest left *trusted* with digests some
-        // newer renderer wrote is the downgrade path all over again. Unknown
-        // has to mean no baseline. Absent still does not: a project whose first
-        // upgrade left conflicts standing has no `version` line at all, and its
-        // digests are perfectly good.
+        // An unreadable release cannot be compared, and trusting digests a newer
+        // renderer wrote would downgrade files, so unknown means no baseline. Absent
+        // is fine: a first upgrade that left conflicts writes no `version` line.
         .filter(|manifest: &Self| {
             [manifest.version.as_deref(), manifest.written_by.as_deref()]
                 .into_iter()
@@ -265,13 +249,8 @@ impl Manifest {
     /// upgrading conservatively.
     #[must_use]
     pub fn load(root: &Path) -> Option<Self> {
-        // Refusing to *write* through a linked manifest was only half of it.
-        // Read through one and whoever controls the target supplies the
-        // digests — and a digest matching a project's current scaffold file
-        // turns that file into an `update`, so the next `--apply` overwrites
-        // something nobody vouched for. A manifest reachable only through a
-        // link is treated as absent, which is the same conservative answer a
-        // project that never had one gets.
+        // A manifest reached through a symlink counts as absent: whoever controls the
+        // target would supply digests that turn files into `update`s.
         // Parsed from the one snapshot: a second read could land in a swap.
         match read_current(root, MANIFEST_PATH) {
             OnDisk::Text(text) => Self::parse(&text),
@@ -590,20 +569,11 @@ pub fn resolve_options(root: &Path, manifest: Option<&Manifest>) -> GenerateOpti
     }
     let autumn_toml = std::fs::read_to_string(root.join("autumn.toml")).unwrap_or_default();
     let bundled_pg = autumn_toml.contains("Managed local Postgres");
-    // Positive evidence of the fullstack CSS pipeline, any one of which the
-    // API scaffold never writes. Deliberately not "a `static/` directory
-    // exists": a JSON API serves its `openapi.json` or a favicon from one, and
-    // `add` is the one verdict that writes with no baseline behind it — so a
-    // flavour guessed from a weak signal does not mislabel a report, it seeds
-    // Tailwind into an app that has no use for it. Any one of these is enough,
-    // so deleting a single file cannot reclassify a fullstack project either.
-    // Each of these is a file the fullstack scaffold writes and the API
-    // scaffold never does. A `static/` directory — or even a `static/css/` one
-    // — is not evidence: a JSON API serves its `openapi.json`, its favicon, or
-    // a stylesheet for a docs page out of exactly those. Getting this wrong is
-    // not a mislabelled report: `add` writes with no baseline behind it, so a
-    // weak signal seeds Tailwind into an app with no view stack, and the first
-    // `--apply` then records the guess as fact.
+    // Files only the fullstack scaffold writes; any one is enough, so deleting one
+    // cannot reclassify a project. A `static/` or `static/css/` directory is not
+    // evidence: a JSON API serves `openapi.json`, a favicon or docs CSS from it. A
+    // wrong guess matters because `add` writes with no baseline, seeding Tailwind
+    // into an API app, and `--apply` then records the guess as fact.
     let fullstack = root.join("tailwind.config.js").exists()
         || root.join("static/css/input.css").exists()
         || root.join("static/js/htmx.min.js").exists();
@@ -800,11 +770,9 @@ fn shadowing_copies(root: &Path) -> Vec<Entry> {
 /// the same way.
 #[must_use]
 pub fn workspace_root_above(root: &Path) -> Option<PathBuf> {
-    // A manifest carrying `[workspace]` alongside its `[package]` is the
-    // standard way for a crate below another workspace to form its own — and a
-    // workspace root owns the toolchain, lint, formatting and CI files no
-    // matter what sits above it. Answering "member" here would take exactly
-    // those out of scope and let drift in them go unreported.
+    // A crate whose manifest also declares `[workspace]` is its own workspace root, and
+    // owns its toolchain, lint, formatting and CI files whatever sits above it. Calling it a
+    // member would take those out of scope and hide drift in them.
     if declares_workspace(root) {
         return None;
     }
@@ -921,10 +889,9 @@ enum OnDisk {
 /// own `git status` can never show.
 fn read_current(root: &Path, relative: &str) -> OnDisk {
     // A swap in flight leaves its path absent for a moment. Wait it out, so a
-    // held file is not read as missing. A claim left by a crash costs only
-    // this bounded wait. A read that lands while the file is being renamed
-    // back can also fail outright (Windows reports a sharing or pending-delete
-    // error, not "not found"), so an unreadable path waits the same way.
+    // held file is not read as missing; a claim left by a crash costs only this
+    // bounded wait. A read during the rename back can also fail outright (Windows
+    // reports a sharing or pending-delete error), so an unreadable path waits too.
     for attempt in 1..SWAP_ATTEMPTS {
         let now = read_current_once(root, relative);
         if now != OnDisk::Absent && now != OnDisk::Opaque(ConflictReason::Unreadable) {
@@ -1037,18 +1004,15 @@ pub fn classify(
                 // else, including the pin: a pinned file that happens to match
                 // is current, not an exception. A link never counts.
                 OnDisk::Text(text) if *text == normalized => (Status::UpToDate, String::new()),
-                // The developer has said this one is theirs.
                 _ if pinned(path) => (Status::Pinned, String::new()),
                 // Not there at all. Autumn wrote it once and it is gone → a
                 // deliberate deletion. Never wrote it → this release added it.
                 OnDisk::Absent if recorded(path).is_some() => (Status::Removed, String::new()),
                 OnDisk::Absent => (Status::Add, super::diff::render("", template)),
-                // There, but nothing can be said about it. Never an `add`: the
-                // whole reason to look is that writing would destroy whatever
-                // is really in the file.
+                // Present but unreadable. Never an `add`: writing would destroy
+                // whatever is really in the file.
                 OnDisk::Opaque(reason) => (Status::Conflict(*reason), String::new()),
-                // Reachable, but only through a link. Readable or not, it is
-                // never written.
+                // Readable or not, a path reached through a link is never written.
                 OnDisk::Linked(text) => (
                     Status::Conflict(ConflictReason::Symlink),
                     text.as_ref()
@@ -1212,10 +1176,8 @@ impl ScaffoldReport {
     /// deleted file keeps its entry so it is still reported as *removed*
     /// rather than silently re-offered.
     fn next_manifest(&self, previous: Option<&Manifest>) -> Manifest {
-        // Carried forward, but only for paths this release still owns. A key
-        // for a file the framework no longer generates is dead weight — and a
-        // hand-edited or hostile manifest should not be able to accumulate
-        // entries in a file Autumn rewrites.
+        // Carried forward only for paths this release still owns, so a hand-edited
+        // or hostile manifest cannot accumulate entries in a file Autumn rewrites.
         let owned: BTreeSet<&str> = self
             .entries
             .iter()
@@ -1236,11 +1198,9 @@ impl ScaffoldReport {
                 digests.insert(entry.path.clone(), digest(&entry.template));
             }
         }
-        // The baseline moves only once nothing is left to reconcile. Recording
-        // the target while conflicts stand would tell the next run — and the
-        // developer reading it — that this upgrade is finished. With nothing
-        // previously recorded there is simply no such release yet, and the
-        // field is left out rather than filled with a guess.
+        // The baseline moves only once nothing is left to reconcile: recording the
+        // target while conflicts stand would claim this upgrade is finished. With
+        // nothing previously recorded, the field is left out.
         let version = if self.conflicts().is_empty() {
             Some(self.target.clone())
         } else {
@@ -1317,16 +1277,11 @@ pub fn plan_after(
     let target = env!("CARGO_PKG_VERSION").to_owned();
     let manifest = Manifest::load(root);
     let options = resolve_options(root, manifest.as_ref());
-    // A baseline from a release newer than this CLI cannot be reconciled: the
-    // templates here are older than the files those digests describe, so every
-    // untouched file would classify as a writable `update` and `--apply` would
-    // downgrade it. Nothing is rendered and nothing is classified.
-    // The newest release either field names. `written_by` is the one that
-    // matters — a conflict holds `version` back while the digests advance, so
-    // `version` alone would let an older CLI trust newer digests — but taking
-    // the newer of the two costs nothing, covers a manifest written before the
-    // mark existed, and refuses an incoherent manifest whose `version` somehow
-    // exceeds it rather than reasoning about which field to believe.
+    // A baseline newer than this CLI cannot be reconciled: every untouched file
+    // would classify as an `update` and `--apply` would downgrade it, so nothing
+    // is rendered. `written_by` is the field that matters (a conflict holds
+    // `version` back); taking the newer of the two also covers manifests written
+    // before `written_by` existed.
     let scaffolded_by_newer = newer_release_recorded(manifest.as_ref());
     let files = scaffolded_by_newer
         .is_none()
@@ -1566,17 +1521,9 @@ pub fn apply(report: &mut ScaffoldReport) -> Result<(), WriteFailure> {
 /// that guarantees a red gate afterwards has not succeeded, and returning
 /// success would tell a CI script otherwise.
 fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
-    // A report with no entries reconciled nothing, and rebuilding the manifest
-    // from no entries prunes every digest in it and stamps this CLI's version
-    // over whatever was recorded. That is the baseline the whole feature rests
-    // on, destroyed by a run that did not even look at the files.
-    //
-    // Keyed on the entries themselves rather than on *why* they are empty. That
-    // distinction has already cost once: this guard was written as `!named` for
-    // the unreadable-package-name case, and the newer-scaffold refusal then
-    // arrived with entries empty and `named` true, walking straight past it.
-    // Every reason to refuse produces an empty plan, so that is the thing to
-    // check.
+    // A report with no entries reconciled nothing; rebuilding from it would prune
+    // every digest and stamp this CLI's version over the recorded baseline. Keyed
+    // on the entries, not on why they are empty: every refusal yields an empty plan.
     if report.entries.is_empty() {
         return Ok(());
     }
@@ -1619,11 +1566,8 @@ fn write_one(entry: &Entry) -> Result<(), WriteError> {
                 .to_owned(),
         }));
     }
-    // A plan is only ever built for `add` and `update`, and `read_current`
-    // classifies a link or an unreadable file as a conflict, so reaching this
-    // with either would be a bug rather than a race. Checked anyway: this is
-    // the last line before a write, and the cost of being wrong is a file
-    // outside the project.
+    // A link or unreadable file is always a conflict, so reaching this is a bug,
+    // not a race. Checked anyway: being wrong here writes outside the project.
     if matches!(on_disk, OnDisk::Opaque(_) | OnDisk::Linked(_)) {
         return Err(WriteError::from(
             "this path is a symlink or is unreadable; it was left exactly as it is".to_owned(),
@@ -1743,14 +1687,10 @@ fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), Publish
     let directory = absolute
         .parent()
         .ok_or_else(|| PublishError::Failed("no parent directory".to_owned()))?;
-    // Created through ordinary `0o666` open semantics so the process umask
-    // applies, exactly as it does to the `fs::write` that `autumn new` uses.
-    // `tempfile`'s own constructor deliberately creates `0600`, and deriving a
-    // mode from the directory does not reproduce the umask either: a `0775`
-    // checkout under umask `022` yields `0664` that way and `0644` from a real
-    // write, quietly granting group write. `make_in` still supplies the unique
-    // name and the delete-on-drop, so nothing this function did not create is
-    // ever removed.
+    // Opened with ordinary `0o666` semantics so the process umask applies, as for
+    // the `fs::write` in `autumn new`. `tempfile`'s default is `0600`, and copying
+    // the directory's mode would ignore the umask (silently granting group write). `make_in`
+    // still supplies the unique name and delete-on-drop, so only a file it created is removed.
     let mut temp = tempfile::Builder::new()
         .prefix(".autumn-upgrade-")
         .suffix(".tmp")
@@ -1806,8 +1746,8 @@ fn swap(
     absolute: &Path,
     expected: &str,
 ) -> Result<(), PublishError> {
-    // Close the staged file first. Windows moves a file with a live handle
-    // badly, and the published file must not keep one open.
+    // Close the staged file first: Windows moves a file with a live handle badly, and the
+    // published file must not keep one open.
     let staged = temp.into_temp_path();
     let directory = absolute
         .parent()
@@ -2018,10 +1958,8 @@ fn render(report: &ScaffoldReport, diffs: bool) -> String {
         target = report.target
     );
 
-    // Said up front, and on every run that still has an unbaselined file — not
-    // only on the first. A project's first `--apply` writes a partial manifest,
-    // and gating this on "a manifest exists" made the explanation vanish while
-    // every remaining file was still reported as having no baseline.
+    // Shown while any file lacks a baseline: a first `--apply` writes a partial
+    // manifest, so "a manifest exists" is not enough.
     if report.needs_baseline_note() {
         let _ = writeln!(
             out,
@@ -2121,9 +2059,8 @@ fn render_outcome(out: &mut String, report: &ScaffoldReport, diffs: bool) {
     let conflicts = report.conflicts().len();
     let _ = writeln!(out);
     match report.outcome {
-        // Nothing to write and nothing to resolve: everything listed is a file
-        // the developer removed or accepted. "0 conflict(s) need review" as the
-        // headline of a report that just listed findings reads as a bug.
+        // Nothing to write or resolve: everything listed was removed or accepted, so the
+        // headline must not read "0 conflict(s) need review".
         super::Outcome::Preview if applicable == 0 && conflicts == 0 => {
             let _ = writeln!(
                 out,
@@ -2205,10 +2142,8 @@ pub fn json(report: &ScaffoldReport) -> serde_json::Value {
         "outcome": report.outcome.label(),
         "drift": report.drifted(),
         "workspace_member": report.workspace_member,
-        // The plan, and the part of it that reached disk — the same split the
-        // app-code report draws, for the same reason: "what would this do" and
-        // "what is on disk now" are different questions, and a gate that reads
-        // the wrong one calls a preview a completed upgrade.
+        // The plan and the part of it that reached disk, kept apart so a gate
+        // cannot mistake a preview for a completed upgrade.
         "writable": report.applicable().len(),
         "written": match report.outcome {
             super::Outcome::Preview => 0,
@@ -2772,8 +2707,7 @@ mod tests {
 
     #[test]
     fn a_report_with_only_conflicts_does_not_advertise_apply() {
-        // `--apply` would write nothing here, and telling someone to run a
-        // command that cannot help them is how a tool loses their attention.
+        // `--apply` would write nothing here, so it must not be suggested.
         let tmp = scaffolded(GenerateOptions::default());
         write(tmp.path(), "Dockerfile", "FROM scratch\n");
 
@@ -2809,8 +2743,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_scaffold_file_is_a_conflict_and_is_never_written_through() {
-        // Writing through a link can leave the project entirely, which is the
-        // same reason the app-code codemods refuse to follow one.
+        // Writing through a link can leave the project entirely.
         let tmp = scaffolded(GenerateOptions::default());
         let outside = tmp.path().join("outside.txt");
         fs::write(&outside, "not mine to touch\n").unwrap();
@@ -2835,10 +2768,8 @@ mod tests {
 
     #[test]
     fn the_scaffold_is_always_this_release_not_an_arbitrary_to_version() {
-        // The CLI ships one set of templates: its own. `--to` selects which
-        // codemods run; it cannot conjure a historical scaffold, and a report
-        // claiming to reconcile to 0.6.0 while rendering 0.7.0's files would be
-        // a lie. Downgrades are explicitly out of scope for this command.
+        // The CLI ships only its own templates. `--to` selects which codemods run;
+        // it cannot render a historical scaffold.
         let tmp = scaffolded(GenerateOptions::default());
         let report = plan(tmp.path(), "0.6.0");
         assert_eq!(report.target, env!("CARGO_PKG_VERSION"));
@@ -2846,10 +2777,8 @@ mod tests {
 
     #[test]
     fn an_api_project_that_serves_something_from_static_is_still_an_api_project() {
-        // `add` is the one verdict that writes with no baseline behind it, so a
-        // wrong flavour guess does not merely mislabel a report — it seeds
-        // Tailwind into a JSON API. A `static/` directory alone is not evidence
-        // of a fullstack app: an API serves its `openapi.json` from one.
+        // A `static/` directory alone is not evidence of a fullstack app: an API
+        // serves its `openapi.json` from one. A wrong guess seeds Tailwind via `add`.
         let tmp = scaffolded(GenerateOptions {
             with_api: true,
             ..GenerateOptions::default()
@@ -3513,10 +3442,8 @@ mod tests {
 
     #[test]
     fn a_file_that_merely_looks_like_scratch_is_neither_deleted_nor_a_blocker() {
-        // Nothing outside the framework-owned set may be touched, and that
-        // includes a path that happens to resemble this command's own staging
-        // file — someone else's, or a concurrent `--apply`'s, whose deletion
-        // would defeat the very race protection staging exists for.
+        // A file that resembles this command's staging file may be someone
+        // else's or a concurrent `--apply`'s, so it is never deleted.
         let tmp = scaffolded(GenerateOptions::default());
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         let mut manifest = Manifest::load(tmp.path()).unwrap();
@@ -3544,11 +3471,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_manifest_is_never_written_through() {
-        // The manifest is written by a different path than the scaffold files,
-        // and had none of their symlink protection: a symlinked
-        // `.autumn/scaffold.toml` would have been followed and its target
-        // outside the project truncated, invisibly to the project's own
-        // `git diff`.
+        // The manifest is written by a different path than the scaffold files.
+        // Following a symlinked `.autumn/scaffold.toml` would truncate a file
+        // outside the project, invisibly to its `git diff`.
         let tmp = scaffolded(GenerateOptions::default());
         let outside = tmp.path().join("outside.toml");
         fs::write(&outside, "not mine to touch\n").unwrap();
@@ -3589,11 +3514,9 @@ mod tests {
 
     #[test]
     fn an_unrecognised_flavor_is_no_baseline_rather_than_a_guess() {
-        // A `flavor` this CLI does not know — a typo, corruption, or a value a
-        // newer release writes — must not silently read as `fullstack`. The
-        // digests would still be trusted, so an API project's `Dockerfile`
-        // would be classified `update` and replaced with the fullstack one
-        // while its `Cargo.toml` stayed API-shaped.
+        // An unknown `flavor` must not read as `fullstack`: the digests would
+        // still be trusted, so an API project's `Dockerfile` would classify as
+        // `update` and be replaced with the fullstack one.
         let tmp = scaffolded(GenerateOptions {
             with_api: true,
             ..GenerateOptions::default()
@@ -3621,9 +3544,7 @@ mod tests {
     #[test]
     fn publishing_an_addition_never_replaces_a_destination_that_appeared() {
         // `rename` replaces the destination on Unix, so a file another process
-        // creates during the staging window — after the plan's re-read, while
-        // the bytes are being synced — would be silently clobbered by the very
-        // step that advertises it will not.
+        // creates after the plan's re-read would be silently clobbered.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("arrived.toml");
         fs::write(&path, "someone else got here first\n").unwrap();
@@ -4052,10 +3973,8 @@ mod tests {
 
     #[test]
     fn a_preview_and_an_apply_agree_about_build_rs() {
-        // `build.rs` is the one framework-owned file the codemods also scan, so
-        // it is exactly the file whose preview must not disagree with what
-        // `--apply` then does. Classifying the preview against the old contents
-        // reported a writable `update` for a file the apply would refuse.
+        // `build.rs` is the one framework-owned file the codemods also scan. The
+        // preview must not offer a writable `update` that the apply would refuse.
         let tmp = scaffolded(GenerateOptions::default());
         // Stale but provably untouched: without the codemods in the picture
         // this is a writable `update`.
@@ -4225,10 +4144,8 @@ mod tests {
 
     #[test]
     fn a_nested_workspace_root_is_a_root_not_a_member() {
-        // `[package]` and `[workspace]` in one manifest is the standard way for
-        // a crate below another workspace to form its own. It owns its
-        // toolchain, lint, formatting and CI files — treating it as a member
-        // drops exactly those out of scope, so drift in them goes unreported.
+        // A crate with both `[package]` and `[workspace]` is its own workspace
+        // root and owns its toolchain, lint, formatting and CI files.
         let outer = TempDir::new().unwrap();
         fs::write(
             outer.path().join("Cargo.toml"),
@@ -4264,11 +4181,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_manifest_is_not_a_baseline_to_trust() {
-        // Refusing to WRITE through a linked manifest was only half of it: read
-        // through one, and whoever controls the target supplies the digests.
-        // A digest matching the project's current file turns it into an
-        // `update`, and the next `--apply` overwrites a file nobody vouched
-        // for.
+        // Read through a link, whoever controls the target supplies the digests,
+        // and a matching digest turns a file nobody vouched for into an `update`.
         let tmp = scaffolded(GenerateOptions::default());
         let outside = tmp.path().join("outside-manifest.toml");
         let real = fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap();
@@ -4300,12 +4214,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_newly_created_manifest_is_as_readable_as_the_files_it_describes() {
-        // The manifest is created, not replaced, on every `autumn new` and on a
-        // legacy project's first `--accept`. Publishing it as a replacement
-        // finds no destination permissions to copy, so `tempfile`'s 0600 would
-        // stick — and a manifest another uid cannot read is discarded as
-        // unreadable, which throws away every baseline it holds and turns the
-        // next upgrade into a wall of conflicts.
+        // The manifest is created, not replaced, so there are no destination
+        // permissions to copy. A `0600` manifest another uid cannot read is
+        // discarded, losing every baseline it holds.
         use std::os::unix::fs::PermissionsExt as _;
 
         let tmp = scaffolded(GenerateOptions::default());
@@ -4327,10 +4238,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_apply_that_cannot_record_its_baseline_is_not_a_success() {
-        // The scaffold files are written correctly, but without the baseline
-        // the very next `--check` reports them as conflicts and exits 3. An
-        // apply that guarantees a red gate afterwards has not succeeded, and
-        // reporting exit 0 tells a CI script otherwise.
+        // Without the baseline the next `--check` reports the written files as
+        // conflicts and exits 3, so success here would mislead a CI script.
         let tmp = scaffolded(GenerateOptions::default());
         let outside = tmp.path().join("outside.toml");
         fs::write(&outside, "not mine\n").unwrap();
@@ -4355,16 +4264,14 @@ mod tests {
 
     #[test]
     fn a_project_scaffolded_by_a_newer_release_is_refused_not_downgraded() {
-        // The recorded digests still match, so every untouched file looks like
-        // a writable `update` against this older CLI's templates — and applying
-        // them would DOWNGRADE the Dockerfile, build script and CI workflow.
-        // Downgrades are out of scope; silently performing one is worse still.
+        // The recorded digests still match, so every untouched file looks like a
+        // writable `update` against this older CLI's templates; applying would
+        // downgrade them.
         let tmp = scaffolded(GenerateOptions::default());
         let mut manifest = Manifest::load(tmp.path()).unwrap();
         manifest.version = Some("99.0.0".to_owned());
         manifest.save(tmp.path()).unwrap();
-        // An older template on disk, matching its recorded digest exactly as a
-        // newer CLI's output would.
+        // A newer release's file on disk, matching its recorded digest.
         let newer = "# written by a newer release\n";
         write(tmp.path(), "clippy.toml", newer);
         let mut manifest = Manifest::load(tmp.path()).unwrap();
@@ -4390,10 +4297,8 @@ mod tests {
 
     #[test]
     fn an_impossible_option_combination_is_no_baseline() {
-        // `--api` with `--daemon` is a combination `autumn new` refuses: they
-        // are different app shapes with conflicting feature sets. A manifest
-        // claiming both is corrupt, and trusting it renders the API templates
-        // against a fullstack daemon's digests — making its `Dockerfile` and
+        // `autumn new` refuses `--api` with `--daemon`, so a manifest claiming
+        // both is corrupt. Trusting it would make the `Dockerfile` and
         // `build.rs` look like safe updates.
         let tmp = scaffolded(GenerateOptions::default());
         let text = fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap();
@@ -4420,10 +4325,8 @@ mod tests {
 
     #[test]
     fn refusing_a_newer_scaffold_leaves_its_manifest_untouched() {
-        // The refusal protects the files; it must protect their provenance too.
-        // A report with no entries rebuilds the manifest from nothing, pruning
-        // every digest and stamping this older CLI's version over the newer
-        // one — destroying the very record that triggered the refusal.
+        // A report with no entries must not rebuild the manifest from nothing,
+        // pruning every digest and stamping this older CLI's version over it.
         let tmp = scaffolded(GenerateOptions::default());
         let mut manifest = Manifest::load(tmp.path()).unwrap();
         manifest.version = Some("99.0.0".to_owned());
@@ -4444,11 +4347,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_added_file_gets_the_mode_an_ordinary_write_would_give_it() {
-        // A directory's access bits do not encode the umask: under umask 022 a
-        // `0775` checkout yields `0664` from `mode & 0o666` but `0644` from an
-        // ordinary write, quietly granting group write. The only way to get
-        // this right is to create the file with normal 0666 semantics and let
-        // the umask apply.
+        // A directory's mode does not encode the umask: under umask 022 a `0775`
+        // checkout yields `0664` from `mode & 0o666` but `0644` from an ordinary
+        // write.
         use std::os::unix::fs::PermissionsExt as _;
 
         let tmp = scaffolded(GenerateOptions::default());
@@ -4480,12 +4381,9 @@ mod tests {
 
     #[test]
     fn a_partial_upgrade_by_a_newer_release_still_refuses_an_older_cli() {
-        // `version` is held back while conflicts stand (so a half-finished
-        // upgrade never reads as finished), but the digests advance to the
-        // newer templates regardless. One field cannot mean both "the release
-        // fully reconciled to" and "the newest renderer that wrote here" — and
-        // reading the first as the second lets an older CLI trust newer digests
-        // and downgrade the files they describe.
+        // `version` is held back while conflicts stand, but the digests still
+        // advance. Reading `version` as the newest renderer would let an older
+        // CLI trust newer digests and downgrade the files they describe.
         let tmp = scaffolded(GenerateOptions::default());
         let newer = "# written by a newer release\n";
         write(tmp.path(), "clippy.toml", newer);
@@ -4554,11 +4452,8 @@ mod tests {
 
     #[test]
     fn an_unparsable_recorded_version_is_no_baseline() {
-        // A version that cannot be read cannot be compared, so it cannot be
-        // refused either — and a manifest left trusted with digests a newer
-        // renderer wrote is the downgrade path all over again. Unknown must
-        // mean no baseline, which is what the doc comment on the comparison
-        // already claimed and nothing implemented.
+        // An unreadable version cannot be compared, so it cannot be refused, and
+        // trusting its digests risks a downgrade. Unknown must mean no baseline.
         for field in ["version", "written_by"] {
             let tmp = scaffolded(GenerateOptions::default());
             let text = fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap();
@@ -4618,11 +4513,9 @@ mod tests {
 
     #[test]
     fn provenance_compares_prereleases_by_full_semver_precedence() {
-        // `Version`'s own ordering distinguishes only prerelease-vs-stable,
-        // deliberately: codemod selection treats every prerelease of a triple
-        // as interchangeable. Provenance cannot. Reusing that comparator makes
-        // `0.8.0-rc.2` and `0.8.0-rc.1` equal, so an rc.1 CLI does not refuse
-        // an rc.2 project and downgrades every file it renders.
+        // `Version`'s own ordering treats every prerelease of a triple as equal,
+        // which codemod selection wants. Provenance does not: an rc.1 CLI must
+        // refuse an rc.2 project.
         assert!(newer("0.8.0-rc.2"), "rc.2 is newer than rc.1");
         assert!(!newer("0.8.0-rc.1"), "the same release is not newer");
         assert!(!newer("0.8.0-rc.0"), "rc.0 is older");
