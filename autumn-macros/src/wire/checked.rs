@@ -654,8 +654,8 @@ impl<'a> Analyzer<'a> {
                 ),
                 _ => None,
             },
-            // `item.lines[0]` is an element of the list at path `lines`. The
-            // whole response is not a field path, so its index is not kept.
+            // `item.lines[0]` is an element of the list at path `lines`. An
+            // index on the whole response gives `None`.
             Expr::Index(index) => match self.bound_of(&index.expr)? {
                 bound @ Bound::Response(_, parent) if parent != ROOT => Some(bound),
                 _ => None,
@@ -1140,7 +1140,8 @@ type MacroScope = BTreeMap<String, Option<Held>>;
 /// A closure's parameters (`|item| …`) cover its body: the tokens up to the
 /// next `,` at the same level, or the end of the group. A `for item in … { }`
 /// binding covers its `{ }` block. A maud `@if let` covers its `{ }` block,
-/// and a maud `@let` covers the rest of its level. Outside that range the
+/// and a maud `@let` covers the rest of its level. A `match` arm's names
+/// cover its guard and its body. Outside that range the
 /// name keeps its outer meaning, so a read of the payload there is still a
 /// read.
 struct MacroBinding {
@@ -1154,8 +1155,8 @@ struct MacroBinding {
 const SAME_VALUE_METHODS: [&str; 5] = ["as_ref", "as_deref", "clone", "unwrap", "to_owned"];
 
 /// The response value that `tts` gives, when it is `&base.a.b` with
-/// optional [`SAME_VALUE_METHODS`] calls. An index below the root keeps the
-/// path: `&item.lines[0]` holds `lines`.
+/// optional [`SAME_VALUE_METHODS`] calls. An index on a nested field keeps
+/// the path: `&item.lines[0]` holds `lines`.
 fn held_value(
     tts: &[proc_macro2::TokenTree],
     lookup: &dyn Fn(&str) -> Option<Held>,
@@ -1170,7 +1171,7 @@ fn held_value(
     let (index, mut path) = lookup(&base.to_string())?;
     i += 1;
     while i < tts.len() {
-        if !path.is_empty() && is_index(&tts[i]) {
+        if !path.is_empty() && is_index(tts.get(i)) {
             i += 1;
             continue;
         }
@@ -1181,9 +1182,8 @@ fn held_value(
         if !dot {
             return None;
         }
-        let empty_call = matches!(tts.get(i + 2), Some(proc_macro2::TokenTree::Group(g))
-            if g.delimiter() == proc_macro2::Delimiter::Parenthesis && g.stream().is_empty());
-        if empty_call && SAME_VALUE_METHODS.contains(&name.to_string().as_str()) {
+        if is_empty_call(tts.get(i + 2)) && SAME_VALUE_METHODS.contains(&name.to_string().as_str())
+        {
             i += 3;
             continue;
         }
@@ -1200,23 +1200,31 @@ fn held_value(
 }
 
 /// Whether `tt` is an index: a `[…]` group.
-fn is_index(tt: &proc_macro2::TokenTree) -> bool {
-    matches!(tt, proc_macro2::TokenTree::Group(g) if g.delimiter() == proc_macro2::Delimiter::Bracket)
+fn is_index(tt: Option<&proc_macro2::TokenTree>) -> bool {
+    matches!(tt, Some(proc_macro2::TokenTree::Group(g)) if g.delimiter() == proc_macro2::Delimiter::Bracket)
+}
+
+/// Whether `tt` is an empty call: `()`.
+fn is_empty_call(tt: Option<&proc_macro2::TokenTree>) -> bool {
+    matches!(tt, Some(proc_macro2::TokenTree::Group(g))
+        if g.delimiter() == proc_macro2::Delimiter::Parenthesis && g.stream().is_empty())
+}
+
+/// Whether `tt` is the word `w`.
+fn is_word(tt: Option<&proc_macro2::TokenTree>, w: &str) -> bool {
+    matches!(tt, Some(proc_macro2::TokenTree::Ident(id)) if id == w)
 }
 
 /// A pattern without its type: `d: &Details` gives `d`. The cut is at the
 /// first `:` at this level that is not part of `::`.
 fn untyped(pat: &[proc_macro2::TokenTree]) -> &[proc_macro2::TokenTree] {
-    let colon = |k: usize| is_punct(pat.get(k), ':');
+    // The first `:` of a `::` is joined to the next one.
+    let in_path = |k: usize| {
+        matches!(pat.get(k), Some(proc_macro2::TokenTree::Punct(p))
+            if p.as_char() == ':' && p.spacing() == proc_macro2::Spacing::Joint)
+    };
     let end = (0..pat.len())
-        .find(|&k| {
-            colon(k)
-                && !colon(k + 1)
-                && !(k > 0
-                    && colon(k - 1)
-                    && matches!(&pat[k - 1], proc_macro2::TokenTree::Punct(p)
-                        if p.spacing() == proc_macro2::Spacing::Joint))
-        })
+        .find(|&k| is_punct(pat.get(k), ':') && !in_path(k) && !(k > 0 && in_path(k - 1)))
         .unwrap_or(pat.len());
     &pat[..end]
 }
@@ -1277,7 +1285,7 @@ fn maud_binding(
     at: usize,
     lookup: &dyn Fn(&str) -> Option<Held>,
 ) -> Option<MacroBinding> {
-    let word = |k: usize, w: &str| matches!(tts.get(k), Some(proc_macro2::TokenTree::Ident(id)) if id == w);
+    let word = |k: usize, w: &str| is_word(tts.get(k), w);
     let lone_eq = |k: usize| {
         matches!(&tts[k], proc_macro2::TokenTree::Punct(p)
             if p.as_char() == '=' && p.spacing() == proc_macro2::Spacing::Alone)
@@ -1309,8 +1317,7 @@ fn maud_binding(
     None
 }
 
-/// The bindings one level of a macro body makes, and the `match` bodies in
-/// it.
+/// The bindings one level of a macro body makes, and its `match` bodies.
 struct Level {
     /// Names bound over a token range of this level.
     bindings: Vec<MacroBinding>,
@@ -1318,7 +1325,7 @@ struct Level {
     matches: BTreeMap<usize, Option<Held>>,
 }
 
-/// What one level of a macro body is.
+/// The kind of tokens at one level of a macro body.
 #[derive(Clone, Copy)]
 enum Body<'h> {
     /// Plain tokens.
@@ -1350,8 +1357,9 @@ fn brace_at(tts: &[proc_macro2::TokenTree], from: usize) -> Option<usize> {
     })
 }
 
-/// The bindings one level of a macro body makes. Nested groups are scanned
-/// on their own. `lookup` gives what a name outside the binding holds.
+/// The bindings one level of a macro body makes, and its `match` bodies.
+/// Nested groups are scanned on their own. `lookup` gives what a name outside
+/// the binding holds.
 fn macro_bindings(
     tts: &[proc_macro2::TokenTree],
     lookup: &dyn Fn(&str) -> Option<Held>,
@@ -1387,24 +1395,25 @@ fn macro_bindings(
                 i = j + 1;
             }
             // `for l in &item.lines { }` binds each element of `lines` over
-            // its block. Each other name in the pattern shadows.
+            // its block. Every other name in the pattern shadows its outer
+            // meaning.
             proc_macro2::TokenTree::Ident(id) if id == "for" => {
                 if let Some(body) = brace_at(tts, i + 1)
-                    && let Some(within) = (i + 1..body)
-                        .find(|&k| matches!(&tts[k], proc_macro2::TokenTree::Ident(w) if w == "in"))
+                    && let Some(in_at) = (i + 1..body).find(|&k| is_word(tts.get(k), "in"))
                 {
-                    let value = element_value(&tts[within + 1..body], &|name| {
+                    let value = element_value(&tts[in_at + 1..body], &|name| {
                         held_at(&out, i, name, lookup)
                     });
                     out.push(MacroBinding {
-                        names: pattern_names(untyped(&tts[i + 1..within]), value),
+                        names: pattern_names(untyped(&tts[i + 1..in_at]), value),
                         from: body,
                         to: body + 1,
                     });
                 }
                 i += 1;
             }
-            // `match value { … }`: the arms bind `value`. Also maud `@match`.
+            // `match value { … }`: the arms bind `value`. A maud `@match` is
+            // the same.
             proc_macro2::TokenTree::Ident(id) if id == "match" => {
                 if let Some(body) = brace_at(tts, i + 1) {
                     let value =
@@ -1431,8 +1440,9 @@ fn macro_bindings(
     }
 }
 
-/// The element a loop over `tts` binds: a nested list, with optional
-/// [`ITER_METHODS`] calls. The whole response gives `None`.
+/// What each element of a loop over `tts` holds. `tts` is a nested list with
+/// optional [`ITER_METHODS`] calls. A loop over the whole response gives
+/// `None`.
 fn element_value(
     tts: &[proc_macro2::TokenTree],
     lookup: &dyn Fn(&str) -> Option<Held>,
@@ -1442,8 +1452,7 @@ fn element_value(
         && is_punct(tts.get(end - 3), '.')
         && matches!(&tts[end - 2], proc_macro2::TokenTree::Ident(m)
             if ITER_METHODS.contains(&m.to_string().as_str()))
-        && matches!(&tts[end - 1], proc_macro2::TokenTree::Group(g)
-            if g.delimiter() == proc_macro2::Delimiter::Parenthesis && g.stream().is_empty())
+        && is_empty_call(tts.get(end - 1))
     {
         end -= 3;
     }
@@ -1471,10 +1480,7 @@ fn arm_bindings(tts: &[proc_macro2::TokenTree], value: Option<&Held>) -> Vec<Mac
                 .unwrap_or(tts.len())
         };
         let mut pat = &tts[start..at];
-        if let Some(guard) = pat
-            .iter()
-            .position(|tt| matches!(tt, proc_macro2::TokenTree::Ident(w) if w == "if"))
-        {
+        if let Some(guard) = pat.iter().position(|tt| is_word(Some(tt), "if")) {
             pat = &pat[..guard];
         }
         if is_punct(pat.first(), '|') {
@@ -1549,7 +1555,8 @@ fn field_at(tts: &[proc_macro2::TokenTree], at: usize) -> Option<String> {
 /// the same are excluded: `binding.method(…)`, `binding.field::<T>()`,
 /// `binding.mac!(…)`, and `other.binding.field` — where `binding` is itself a
 /// field of something else. A chain `binding.a.b` reads the path `a.b`, up to
-/// the first method call or tuple index.
+/// the first method call or tuple index. An index on a nested field keeps the
+/// path.
 fn scan_tokens(
     tokens: &proc_macro2::TokenStream,
     resolve: &dyn Fn(&str) -> Option<Held>,
@@ -1590,12 +1597,12 @@ fn scan_tokens(
         let Some((index, mut path)) = lookup_in(&here, &base.to_string()) else {
             continue;
         };
-        // `next` is the token after the path so far. An index below the
-        // root keeps the path: `lines[0].price` reads `lines.price`.
+        // `next` is the token after the path so far. An index on a nested
+        // field keeps the path: `lines[0].price` reads `lines.price`.
         let mut next = i + 1;
         let mut span = None;
         loop {
-            while !path.is_empty() && tts.get(next).is_some_and(is_index) {
+            while !path.is_empty() && is_index(tts.get(next)) {
                 next += 1;
             }
             let Some(name) = field_at(&tts, next + 1) else {

@@ -1015,8 +1015,9 @@ on some changes:
   `@if let`, `@match` or `@for`, `unwrap`, `clone`, `as_ref`, and the
   `Option` and `Result` callbacks (`item.details.as_ref().map(|d| d.color)`).
   A typed binding keeps the path: `@let d: &Details = &item.details`.
-* A loop or an index over a nested list keeps the path. `for l in
-  &item.lines` and `item.lines[0].price` read `lines.price`. A loop or an
+* A loop or an index over a nested list keeps the path.
+  `for l in &item.lines { l.price }` and `item.lines[0].price` read
+  `lines.price`. A loop or an
   index over the whole response does not read its fields.
 * Another method call stops the path. `item.lines.first()` and
   `item.lines.iter().map(…)` read `lines` only.
