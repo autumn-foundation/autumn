@@ -705,6 +705,8 @@ pub mod runtime_config;
 pub mod seed;
 #[cfg(feature = "slo")]
 pub mod slo;
+#[cfg(feature = "slo")]
+pub mod slo_meter;
 
 // ── Fake-seeder registration forwarding ─────────────────────────────────────
 //
