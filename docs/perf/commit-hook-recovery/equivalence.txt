@@ -1,0 +1,29 @@
+NOTICE:  database "ledger_hookeq_before" does not exist, skipping
+NOTICE:  database "ledger_hookeq_after" does not exist, skipping
+=== before
+autumn_repository_commit_hooks_pkey
+idx_autumn_commit_hooks_finished
+idx_autumn_repository_commit_hooks_handler_ready
+idx_autumn_repository_commit_hooks_pending_recovery
+idx_autumn_repository_commit_hooks_ready
+idx_autumn_repository_commit_hooks_stale_recovery
+recover_running: ->  Index Scan using idx_autumn_repository_commit_hooks_stale_recovery on autumn_repository_commit_hooks UPDATE 10
+recover_pending: ->  Seq Scan on autumn_repository_commit_hooks UPDATE 19
+rows: 100206
+edge rows by status after the tick: edge-after_hook_failed-after-noerr-payload=after_hook_failed, edge-after_hook_failed-at-noerr-payload=after_hook_failed, edge-after_hook_failed-before-noerr-payload=after_hook_failed, edge-after_hook_failed-fresh-noerr-payload=after_hook_failed, edge-after_hook_failed-old-noerr-payload=after_hook_failed, edge-after_hook_succeeded-after-noerr-payload=after_hook_succeeded, edge-after_hook_succeeded-at-noerr-payload=after_hook_succeeded, edge-after_hook_succeeded-before-noerr-payload=enqueued, edge-after_hook_succeeded-fresh-noerr-payload=after_hook_succeeded, edge-after_hook_succeeded-old-noerr-payload=enqueued, edge-completed-after-noerr-payload=completed, edge-completed-at-noerr-payload=completed, edge-completed-before-noerr-payload=completed, edge-completed-fresh-noerr-payload=completed, edge-completed-old-noerr-payload=completed, edge-enqueued-after-noerr-payload=enqueued, edge-enqueued-at-noerr-payload=enqueued, edge-enqueued-before-noerr-payload=enqueued, edge-enqueued-fresh-noerr-payload=enqueued, edge-enqueued-old-noerr-payload=enqueued, edge-failed-after-noerr-payload=failed, edge-failed-at-noerr-payload=failed, edge-failed-before-noerr-payload=failed, edge-failed-fresh-noerr-payload=failed, edge-failed-old-noerr-payload=failed, edge-pending_after_hook-after-noerr-payload=pending_after_hook, edge-pending_after_hook-at-noerr-payload=pending_after_hook, edge-pending_after_hook-before-noerr-payload=after_hook_failed, edge-pending_after_hook-fresh-noerr-payload=pending_after_hook, edge-pending_after_hook-old-noerr-payload=after_hook_failed, edge-running-after-noerr-payload=running, edge-running-at-noerr-payload=running, edge-running-before-noerr-payload=enqueued, edge-running-fresh-noerr-payload=running, edge-running-old-noerr-payload=failed
+md5 of the full table, sorted by id: c19138590247a6d785057d3911191dbb
+=== after
+autumn_repository_commit_hooks_pkey
+idx_autumn_commit_hooks_finished
+idx_autumn_repository_commit_hooks_after_hook_recovery
+idx_autumn_repository_commit_hooks_handler_ready
+idx_autumn_repository_commit_hooks_pending_recovery
+idx_autumn_repository_commit_hooks_ready
+idx_autumn_repository_commit_hooks_stale_recovery
+recover_running: ->  Index Scan using idx_autumn_repository_commit_hooks_stale_recovery on autumn_repository_commit_hooks UPDATE 10
+recover_pending: ->  Index Scan using idx_autumn_repository_commit_hooks_after_hook_recovery on autumn_repository_commit_hooks UPDATE 19
+rows: 100206
+edge rows by status after the tick: edge-after_hook_failed-after-noerr-payload=after_hook_failed, edge-after_hook_failed-at-noerr-payload=after_hook_failed, edge-after_hook_failed-before-noerr-payload=after_hook_failed, edge-after_hook_failed-fresh-noerr-payload=after_hook_failed, edge-after_hook_failed-old-noerr-payload=after_hook_failed, edge-after_hook_succeeded-after-noerr-payload=after_hook_succeeded, edge-after_hook_succeeded-at-noerr-payload=after_hook_succeeded, edge-after_hook_succeeded-before-noerr-payload=enqueued, edge-after_hook_succeeded-fresh-noerr-payload=after_hook_succeeded, edge-after_hook_succeeded-old-noerr-payload=enqueued, edge-completed-after-noerr-payload=completed, edge-completed-at-noerr-payload=completed, edge-completed-before-noerr-payload=completed, edge-completed-fresh-noerr-payload=completed, edge-completed-old-noerr-payload=completed, edge-enqueued-after-noerr-payload=enqueued, edge-enqueued-at-noerr-payload=enqueued, edge-enqueued-before-noerr-payload=enqueued, edge-enqueued-fresh-noerr-payload=enqueued, edge-enqueued-old-noerr-payload=enqueued, edge-failed-after-noerr-payload=failed, edge-failed-at-noerr-payload=failed, edge-failed-before-noerr-payload=failed, edge-failed-fresh-noerr-payload=failed, edge-failed-old-noerr-payload=failed, edge-pending_after_hook-after-noerr-payload=pending_after_hook, edge-pending_after_hook-at-noerr-payload=pending_after_hook, edge-pending_after_hook-before-noerr-payload=after_hook_failed, edge-pending_after_hook-fresh-noerr-payload=pending_after_hook, edge-pending_after_hook-old-noerr-payload=after_hook_failed, edge-running-after-noerr-payload=running, edge-running-at-noerr-payload=running, edge-running-before-noerr-payload=enqueued, edge-running-fresh-noerr-payload=running, edge-running-old-noerr-payload=failed
+md5 of the full table, sorted by id: c19138590247a6d785057d3911191dbb
+=== diff
+identical: 100206 rows, every column

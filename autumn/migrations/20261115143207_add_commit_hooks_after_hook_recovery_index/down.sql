@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_autumn_repository_commit_hooks_after_hook_recovery;

@@ -2798,6 +2798,44 @@ mod tests {
         );
     }
 
+    /// The stale after-hook recovery runs on every worker tick. Without a
+    /// `claimed_at` index whose predicate is its `status IN (...)` list, each
+    /// tick reads the whole queue table, finished history included. Both
+    /// Postgres migration sets an app can install must ship one.
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn stale_after_hook_recovery_has_an_index_in_both_postgres_migration_sets() {
+        let predicate = "WHERE status IN ('pending_after_hook', 'after_hook_succeeded')";
+        assert!(
+            HOOK_RECOVER_STALE_PENDING_SQL.contains(&predicate["WHERE ".len()..]),
+            "the recovery predicate changed; change the indexes below with it"
+        );
+        let sets = [
+            (
+                "autumn/migrations (FRAMEWORK_MIGRATIONS)",
+                include_str!(
+                    "../migrations/20261115143207_add_commit_hooks_after_hook_recovery_index/up.sql"
+                ),
+            ),
+            (
+                "autumn/repository_commit_hook_migrations",
+                include_str!(
+                    "../repository_commit_hook_migrations/20260515000000_create_repository_commit_hook_queue/up.sql"
+                ),
+            ),
+        ];
+        for (set, sql) in sets {
+            let index = sql.split(';').find(|stmt| {
+                stmt.contains("ON autumn_repository_commit_hooks (claimed_at)")
+                    && stmt.contains(predicate)
+            });
+            assert!(
+                index.is_some(),
+                "{set} has no claimed_at index with `{predicate}`"
+            );
+        }
+    }
+
     // The `SQLite` SQL has the same status machine, with `CURRENT_TIMESTAMP`, `excluded`
     // and bare `'{}'` in place of `NOW()`, `EXCLUDED` and `::JSONB`.
     #[cfg(feature = "sqlite")]
