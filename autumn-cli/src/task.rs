@@ -62,7 +62,7 @@ const LIST_TASKS_ENV: &str = "AUTUMN_LIST_TASKS";
 /// Selects the run-task one-shot mode in the app. The value is the task name.
 const RUN_TASK_ENV: &str = "AUTUMN_RUN_TASK";
 
-/// Build the command for `autumn task --list`.
+/// Makes the command for `autumn task --list`.
 fn list_tasks_command(binary: &std::path::Path, profile: &str) -> Command {
     let mut command = Command::new(binary);
     command
@@ -70,6 +70,7 @@ fn list_tasks_command(binary: &std::path::Path, profile: &str) -> Command {
         .env("AUTUMN_ENV", profile)
         .env("AUTUMN_PROFILE", profile)
         .stdout(Stdio::piped())
+        // `output()` captures stderr by default. Show the app errors to the user.
         .stderr(Stdio::inherit());
     crate::routes::clear_other_dump_modes(&mut command, LIST_TASKS_ENV);
     command
@@ -101,11 +102,11 @@ fn list_tasks(binary: &std::path::Path, opts: &TaskOptions<'_>) {
     print_task_table(&tasks);
 }
 
-/// Build the command for `autumn task <name>`.
+/// Makes the command for `autumn task <name>`.
 ///
-/// `AppBuilder::run` checks the dump modes and `AUTUMN_LIST_TASKS` before
-/// `AUTUMN_RUN_TASK`. This removes all of them, so an inherited value cannot
-/// replace the task run (#3733).
+/// `AppBuilder::run` reads the dump modes and `AUTUMN_LIST_TASKS` before
+/// `AUTUMN_RUN_TASK`. This function removes them from the child environment.
+/// Thus a value from the parent shell cannot stop the task (#3733).
 fn run_task_command(
     binary: &std::path::Path,
     profile: &str,
@@ -181,8 +182,8 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    /// The entry `command` holds for `key`: `None` = inherited,
-    /// `Some(None)` = removed, `Some(Some(v))` = set to `v`.
+    /// Returns the entry for `key` in `command`. `None` means inherited.
+    /// `Some(None)` means removed. `Some(Some(v))` means set to `v`.
     fn env_entry<'a>(command: &'a Command, key: &str) -> Option<Option<&'a OsStr>> {
         command
             .get_envs()
@@ -196,8 +197,8 @@ mod tests {
 
     #[test]
     fn run_task_command_clears_inherited_list_tasks() {
-        // Regression for #3733. `AppBuilder::run` checks AUTUMN_LIST_TASKS first,
-        // so an inherited value lists the tasks and does not run the task.
+        // Tests the fix for #3733. `AppBuilder::run` reads `AUTUMN_LIST_TASKS`
+        // first. An inherited value lists the tasks and does not run the task.
         let command = run_task_command(Path::new("app"), "dev", "cleanup", "[]");
 
         assert_eq!(env_entry(&command, "AUTUMN_LIST_TASKS"), Some(None));
@@ -205,6 +206,7 @@ mod tests {
 
     #[test]
     fn run_task_command_clears_every_dump_mode() {
+        // `AppBuilder::run` reads each dump mode before the task modes (#2370).
         let command = run_task_command(Path::new("app"), "dev", "cleanup", "[]");
 
         for &var in crate::routes::ALL_DUMP_MODE_ENVS {
@@ -231,7 +233,7 @@ mod tests {
 
     #[test]
     fn list_tasks_command_clears_every_dump_mode_and_keeps_its_own() {
-        let command = list_tasks_command(Path::new("app"), "dev");
+        let command = list_tasks_command(Path::new("app"), "staging");
 
         for &var in crate::routes::ALL_DUMP_MODE_ENVS {
             assert_eq!(
@@ -241,8 +243,8 @@ mod tests {
             );
         }
         assert_eq!(env_entry(&command, "AUTUMN_LIST_TASKS"), set("1"));
-        assert_eq!(env_entry(&command, "AUTUMN_ENV"), set("dev"));
-        assert_eq!(env_entry(&command, "AUTUMN_PROFILE"), set("dev"));
+        assert_eq!(env_entry(&command, "AUTUMN_ENV"), set("staging"));
+        assert_eq!(env_entry(&command, "AUTUMN_PROFILE"), set("staging"));
     }
 
     #[test]
