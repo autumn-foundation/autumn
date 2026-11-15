@@ -134,7 +134,12 @@ impl BurnMeter {
         let epoch = self.epoch(&ring, now);
         let len = ring.slots.len() as u64;
         let slot = &mut ring.slots[usize::try_from(epoch % len).unwrap_or(0)];
-        if slot.epoch != epoch {
+        if slot.epoch > epoch {
+            // The slot already holds a newer bucket, so this event is older
+            // than the retention. Drop it rather than wipe newer counts.
+            return;
+        }
+        if slot.epoch < epoch {
             *slot = Bucket {
                 epoch,
                 ..Bucket::default()
@@ -190,10 +195,17 @@ impl BurnMeter {
     /// A window the meter cannot parse, or one with no events, does not fire.
     #[must_use]
     pub fn firing_at(&self, now: Instant, alert: &BurnWindow) -> bool {
+        // The rule fires on `bad / total > budget_ppm * factor_tenths / 10^7`.
+        // Cross-multiplied, so a burn just over the factor is not rounded
+        // down to it.
+        let limit = u128::from(self.budget_ppm) * u128::from(alert.factor_tenths);
         let over = |window: &str| {
-            parse_window(window)
-                .and_then(|w| self.burn_tenths_at(now, w))
-                .is_some_and(|tenths| tenths > alert.factor_tenths)
+            parse_window(window).is_some_and(|w| {
+                let counts = self.counts_at(now, w);
+                counts.total() > 0
+                    && u128::from(counts.bad) * 10 * u128::from(PPM)
+                        > limit * u128::from(counts.total())
+            })
         };
         over(alert.long) && over(alert.short)
     }
@@ -222,7 +234,7 @@ impl BurnMeter {
 #[must_use]
 pub fn parse_window(window: &str) -> Option<Duration> {
     let unit_at = window.len().checked_sub(1)?;
-    let (digits, unit) = window.split_at(unit_at);
+    let (digits, unit) = window.split_at_checked(unit_at)?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -355,6 +367,41 @@ mod tests {
         for w in BURN_WINDOWS {
             assert!(parse_window(w.long).is_some() && parse_window(w.short).is_some());
         }
+    }
+
+    #[test]
+    fn alert_compares_the_exact_ratio_not_rounded_tenths() {
+        let meter = BurnMeter::new(&slo(99.9), MINUTE, Duration::from_hours(1));
+        let now = Instant::now();
+        // 145 / 10_001 is a burn rate of 14.4986x: over 14.4x, but it
+        // rounds down to 144 tenths.
+        record(&meter, now, 10_001 - 145, 145);
+        assert_eq!(meter.burn_tenths_at(now, MINUTE), Some(144));
+        assert!(meter.firing_at(now, &BURN_WINDOWS[0]));
+        // Exactly at the threshold does not fire: the rule uses `>`.
+        let at = BurnMeter::new(&slo(99.9), MINUTE, Duration::from_hours(1));
+        record(&at, now, 10_000 - 144, 144);
+        assert!(!at.firing_at(now, &BURN_WINDOWS[0]));
+    }
+
+    #[test]
+    fn non_ascii_window_suffix_is_rejected() {
+        assert_eq!(parse_window("5秒"), None);
+        assert_eq!(parse_window("秒"), None);
+    }
+
+    #[test]
+    fn late_record_does_not_reset_a_newer_slot() {
+        let meter = BurnMeter::new(&slo(99.0), MINUTE, MINUTE);
+        let start = Instant::now();
+        record(&meter, start + MINUTE, 0, 1);
+        // An event from the bucket before arrives late. It is outside
+        // retention, so it is dropped rather than wiping the newer bucket.
+        record(&meter, start, 1, 0);
+        assert_eq!(
+            meter.counts_at(start + MINUTE, MINUTE),
+            Counts { good: 0, bad: 1 }
+        );
     }
 
     #[test]
