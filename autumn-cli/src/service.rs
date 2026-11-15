@@ -112,11 +112,9 @@ pub fn service_name(project_identity: &str) -> String {
     if name.chars().count() <= MAX_SERVICE_NAME {
         return name;
     }
-    // Too long. Truncating from the end would cut the `-<dirhash>` suffix —
-    // the only part that distinguishes two checkouts sharing a directory name —
-    // so two long projects would collide on one SCM entry and the second
-    // install, uninstall and status would all target the first's service. Trim
-    // the human-readable half instead and keep the hash whole.
+    // Trim the readable half and keep the `-<dirhash>` suffix whole: it is the only part that
+    // tells two checkouts sharing a directory name apart, so cutting it would make them collide
+    // on one SCM entry.
     let (readable, hash) = sanitized
         .rsplit_once('-')
         .map_or((sanitized.as_str(), ""), |(head, tail)| (head, tail));
@@ -141,12 +139,9 @@ pub fn service_display_name(project_identity: &str) -> String {
     if display.chars().count() <= MAX_SERVICE_NAME {
         return display;
     }
-    // The SCM caps the display name at the same 256 characters as the service
-    // name, and `CreateService` rejects an over-long one — so bounding only the
-    // internal name would still fail `install-service` for a directory name near
-    // Windows' own 255-character component limit. Trim the readable half and keep
-    // the `-<dirhash>` suffix, for the same reason `service_name` does: it is
-    // what tells two checkouts apart in `services.msc`.
+    // The SCM caps the display name at 256 characters too and `CreateService` rejects a longer
+    // one. Keep the `-<dirhash>` suffix, as `service_name` does, so two checkouts stay
+    // distinguishable in `services.msc`.
     let (readable, hash) = project_identity
         .rsplit_once('-')
         .map_or((project_identity, ""), |(head, tail)| (head, tail));
@@ -599,17 +594,15 @@ mod windows_impl {
                 return 1;
             }
         };
-        // Creating the directories HERE, as the installing user, is what gives
-        // them an owner-only ACL that still admits SYSTEM — so the Local System
-        // service can reach state the user owns.
+        // Created here, as the installing user, so they get an owner-only ACL that still admits
+        // SYSTEM, which the Local System service runs as.
         if let Err(e) = paths.ensure_dirs() {
             eprintln!("autumn serve install-service: cannot create runtime dirs: {e}");
             return 1;
         }
 
-        // A daemon already holds this project's pidfile, so the service's app
-        // child would be refused at start and the service would report a failure
-        // the operator has to go read the log to understand. Say it here.
+        // A running daemon holds the pidfile, so the service's app child would be refused at
+        // start with a failure only visible in the log. Report it here instead.
         if let Some((pid, endpoint)) = serve::running_daemon_summary(opts.package.as_deref()) {
             eprintln!(
                 "autumn serve install-service: a daemon is already running for this \
@@ -643,12 +636,9 @@ mod windows_impl {
             profile: opts.profile.clone().or_else(serve::env_profile_for_record),
             release: opts.release,
             bundled_pg: opts.bundled_pg,
-            // The EFFECTIVE role and pin, not the bare flags. A service runs as
-            // Local System and inherits none of the installing shell's
-            // environment, so `AUTUMN_ROLE=worker autumn serve install-service`
-            // would otherwise register a service that quietly runs combined —
-            // and an `AUTUMN_JOBS__PIN` one that drains every queue. This is the
-            // same recovery `serve restart` already does through `serve.mode`.
+            // The effective role and pin, not the bare flags: the service runs as Local System
+            // and inherits none of the installing shell's environment, so `AUTUMN_ROLE` and
+            // `AUTUMN_JOBS__PIN` would otherwise be lost.
             role: serve::effective_role_for_record(opts.role.clone()),
             pin: serve::effective_pin_for_record(opts.pin.clone()),
         };
@@ -677,8 +667,7 @@ mod windows_impl {
             // The same budget a `--daemon` start allows, so a first boot that
             // provisions a managed cluster is not called a failure.
             serve::start_ready_timeout(opts.bundled_pg),
-            // The preshutdown timeout follows the budget the app reports once
-            // it is running.
+            // The preshutdown timeout follows the budget the app reports once it is running.
             &paths,
         ) {
             eprintln!("autumn serve install-service: {e}");
@@ -715,7 +704,6 @@ mod windows_impl {
             name: OsString::from(name),
             display_name: OsString::from(service_display_name(identity)),
             service_type: ServiceType::OWN_PROCESS,
-            // The boot-start half of the journey.
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
             executable_path: std::env::current_exe()
@@ -727,9 +715,8 @@ mod windows_impl {
                 record_path.as_os_str().to_os_string(),
             ],
             dependencies: vec![],
-            // Local System: the default account, so registration needs no
-            // credentials and the journey stays one command. The runtime
-            // directory's ACL admits SYSTEM for exactly this reason.
+            // Local System, so registration needs no credentials. The runtime directory's ACL
+            // admits SYSTEM for this reason.
             account_name: None,
             account_password: None,
         };
@@ -743,7 +730,6 @@ mod windows_impl {
         service
             .set_description(service_description(working_dir))
             .map_err(|e| format!("cannot set the service description: {e}"))?;
-        // The crash-recovery half.
         service
             .update_failure_actions(ServiceFailureActions {
                 reset_period: ServiceFailureResetPeriod::After(failure_reset_period()),
@@ -760,30 +746,25 @@ mod windows_impl {
                 ),
             })
             .map_err(|e| format!("cannot set the service restart policy: {e}"))?;
-        // Without this, only a *crash* counts as a failure. The host reports a
-        // failed app child as a non-zero service exit code, which is the signal
-        // that actually distinguishes "the app died" from "an operator stopped
-        // it" — so it has to count.
+        // Otherwise only a crash counts as a failure. The host reports a failed app child as a
+        // non-zero exit code, which is what separates "the app died" from "an operator stopped it".
         service
             .set_failure_actions_on_non_crash_failures(true)
             .map_err(|e| format!("cannot arm the service restart policy: {e}"))?;
-        // Set a safe timeout before the start. The app replaces it with its
-        // real budget once it reports (see below). The OS default can be 10s.
+        // A safe timeout before the start (the OS default can be 10s), replaced below with the
+        // budget the app reports.
         let _ = service.set_preshutdown_timeout(super::preshutdown_for_reported(None));
         service
             .start::<&std::ffi::OsStr>(&[])
             .map_err(|e| format!("registered the service but could not start it: {e}"))?;
-        // Wait for `Running`, so the command's success means the app is serving
-        // rather than that the Service Control Manager accepted a start request.
-        // A service whose app fails to boot otherwise reports success here and
-        // the operator finds out from the event log.
+        // Wait for `Running`, so success means the app is serving, not just that the SCM
+        // accepted a start request.
         let deadline = Instant::now() + start_timeout;
         loop {
             match service.query_status().map(|s| s.current_state) {
                 Ok(ServiceState::Running) => {
-                    // Give the drain the same time at machine shutdown that it
-                    // gets from `sc stop`. The app may write its budget a moment
-                    // after the SCM shows Running, so poll briefly.
+                    // Give the drain the same time at machine shutdown as at `sc stop`. The app
+                    // may write its budget just after the SCM shows Running, so poll briefly.
                     let until = Instant::now() + Duration::from_secs(10);
                     let reported = loop {
                         let budget = serve::recorded_stop_budget(paths);
@@ -839,8 +820,7 @@ mod windows_impl {
     /// and the next boot brings up a second instance beside it.
     pub fn restart_registered(project_identity: &str) -> Option<Result<(), String>> {
         let name = service_name(project_identity);
-        // Only when something is actually registered; a missing service is the
-        // ordinary daemon case, not an error.
+        // A missing service is the ordinary daemon case, not an error.
         match super::registered_service_state(project_identity) {
             Ok(None) => return None,
             Ok(Some(_)) => {}
@@ -878,10 +858,8 @@ mod windows_impl {
                     format!("cannot open `{name}`: {e}")
                 }
             })?;
-        // The SELECTED project's paths. Re-deriving from `None` would read the
-        // workspace root's state for a `-p api` restart and fall back to the
-        // default budget, timing out on a member service that is draining
-        // correctly — and then never starting it again.
+        // The selected project's paths. Resolving from `None` would read the workspace root's
+        // budget for a `-p api` restart and time out on a member service that is still draining.
         let paths = crate::paths::RuntimePaths::resolve(project_identity).ok();
         let stop_timeout = scm_stop_timeout(paths.as_ref());
         if service
@@ -898,8 +876,7 @@ mod windows_impl {
         service
             .start::<&std::ffi::OsStr>(&[])
             .map_err(|e| format!("cannot start `{name}`: {e}"))?;
-        // The same budget an install allows, so a restart that re-provisions a
-        // managed cluster is not called a failure.
+        // The install budget, so a restart that re-provisions a managed cluster is not a failure.
         wait_for_state(
             &service,
             name,
@@ -947,7 +924,7 @@ mod windows_impl {
         let config = service.query_config().ok()?;
         let path = super::record_path_from_command_line(&config.executable_path.to_string_lossy())?;
         let record = ServiceRecord::parse(&std::fs::read_to_string(path).ok()?).ok()?;
-        // The record is a file. Trust it only for this service.
+        // The record is a plain file; trust it only if it names this service.
         (record.name == name).then(|| RuntimePaths::from_parts(record.paths))
     }
 
@@ -955,8 +932,8 @@ mod windows_impl {
     fn uninstall(opts: &ServeOptions) -> i32 {
         let identity = serve::project_identity_for(opts.package.as_deref());
         let name = service_name(&identity);
-        // The installed tree first: the caller's environment may differ from the
-        // one the service was registered under.
+        // Prefer the installed paths: the caller's environment may differ from the one the
+        // service was registered under.
         let paths =
             installed_runtime_paths(&name).or_else(|| RuntimePaths::resolve(&identity).ok());
 
@@ -967,10 +944,9 @@ mod windows_impl {
                 false
             }
         };
-        // Only once the SCM entry is gone. Removing the record while the service
-        // is still registered `AutoStart` leaves a host that cannot read its own
-        // configuration, cannot log why, and is restarted forever by the very
-        // failure policy this command was asked to remove.
+        // Clean up only once the SCM entry is gone. Removing the record of a service still
+        // registered `AutoStart` leaves a host that cannot read its configuration or log why,
+        // restarted forever by its failure policy.
         if !deregistered {
             eprintln!(
                 "autumn serve uninstall-service: `{name}` is still registered, so \
@@ -980,10 +956,8 @@ mod windows_impl {
             return 1;
         }
         if let Some(paths) = paths.as_ref() {
-            // A managed cluster outlives the app when a stop had to escalate, so
-            // reap it before removing the records that identify it. The data
-            // directory is deliberately kept — the operator's database is not
-            // this command's to delete.
+            // A managed cluster outlives the app when a stop escalated, so reap it before removing
+            // the records that identify it. The data directory (the operator's database) is kept.
             serve::reap_managed_postgres_for(paths);
             serve::cleanup_daemon_state(paths);
             let _ = std::fs::remove_file(paths.service_record_file());
@@ -1026,16 +1000,12 @@ mod windows_impl {
                     windows_service::Error::Winapi(io) => io.raw_os_error(),
                     _ => None,
                 };
-                // Nothing registered. Not an error: the operator asked for it
-                // gone and it is gone, and the daemon state is still ours to
-                // clean up.
+                // Not registered is not an error: the daemon state still needs cleaning up.
                 if super::open_failure_means_absent(raw) {
                     return Ok(Deregistered::WasNotRegistered);
                 }
-                // Anything else — a denial above all — must NOT reach the
-                // cleanup path. Deleting the record of a service that is still
-                // registered `AutoStart` leaves a host that cannot read its own
-                // configuration on the next restart, and cannot log why.
+                // Anything else, a denial above all, must not reach the cleanup path: the service
+                // may still be registered `AutoStart` and needs its record.
                 if super::open_failure_is_access_denied(raw) {
                     return Err(format!(
                         "cannot open `{name}`: access denied. Removing a service \
@@ -1052,18 +1022,14 @@ mod windows_impl {
         if state(&service).map_err(|e| format!("cannot query `{name}`: {e}"))?
             != ServiceState::Stopped
         {
-            // Stop it through the SCM so the host runs its own drain — the same
-            // one `autumn serve stop` triggers — rather than being killed with
-            // its `on_shutdown` hooks unrun.
+            // Stop through the SCM so the host runs the same drain as `autumn serve stop`, with its
+            // `on_shutdown` hooks.
             service
                 .stop()
                 .map_err(|e| format!("cannot stop `{name}`: {e}"))?;
             let deadline = Instant::now() + stop_timeout;
-            // NOT `unwrap_or(Stopped)`: a query that fails is not a service that
-            // stopped. Treating it as one deletes the entry, then reaps Postgres
-            // and removes the daemon records out from under a host that may
-            // still be draining — cutting off the very requests this command
-            // waits for.
+            // A failed query is not a stopped service. Treating it as one would delete the entry
+            // and the daemon state under a host that may still be draining.
             while state(&service).map_err(|e| format!("cannot query `{name}`: {e}"))?
                 != ServiceState::Stopped
             {
@@ -1097,8 +1063,7 @@ mod windows_impl {
     /// The service's entry point, once the SCM has bootstrapped it.
     fn service_main() {
         if let Err(e) = supervise() {
-            // Nothing is attached to stderr inside a service, so record the
-            // failure where the operator is already told to look.
+            // A service has no stderr, so record the failure in the daemon log.
             log_host_failure(&e);
         }
     }
@@ -1182,19 +1147,16 @@ mod windows_impl {
         let mut announced_stop = false;
         let mut saw_stop_request = false;
         loop {
-            // Check for the ask BEFORE reaping the child: `autumn serve stop`
-            // creates the request and only then waits out the drain, so the
-            // request is always visible first — and latching it here means the
-            // later cleanup that removes the file cannot turn an operator's stop
-            // into a phantom crash.
+            // Check for a stop request before reaping the child: `autumn serve stop` creates the
+            // file before the drain, and latching it here keeps its later removal from turning an
+            // operator's stop into a crash.
             saw_stop_request = super::stop_was_requested(
                 saw_stop_request,
                 stop_requested.load(Ordering::SeqCst),
                 stop_file.exists(),
             );
             if saw_stop_request && !announced_stop {
-                // Tell the Service Control Manager how long this will take, or it
-                // declares a correctly-draining service hung.
+                // Without a wait hint the SCM declares a draining service hung.
                 report(
                     ServiceState::StopPending,
                     ServiceExitCode::Win32(0),
@@ -1209,8 +1171,7 @@ mod windows_impl {
                 Ok(None) => {}
             }
             if saw_stop_request {
-                // Enforce the app's own budget: `stop_child` escalates to a
-                // force-kill of the process tree once it expires, exactly as
+                // `stop_child` force-kills the process tree once the app's budget expires, as
                 // `autumn serve stop` does.
                 return Ok((serve::stop_child(child, paths, budget), true));
             }
@@ -1274,14 +1235,10 @@ mod windows_impl {
                 .set_service_status(ServiceStatus {
                     service_type: ServiceType::OWN_PROCESS,
                     current_state: state,
-                    // `PRESHUTDOWN`, not `SHUTDOWN`. A machine shutdown gives
-                    // every `SHUTDOWN`-accepting service a share of
-                    // `WaitToKillServiceTimeout` — 5 seconds by default — and no
-                    // wait hint extends it, so an app with a 30-second drain
-                    // would be terminated mid-drain on every reboot and its
-                    // managed cluster left for WAL recovery. `PRESHUTDOWN` runs
-                    // earlier, with a default of 10 to 180 seconds that we raise to cover the
-                    // app's own budget. The two flags are mutually exclusive.
+                    // `PRESHUTDOWN`, not `SHUTDOWN`: `SHUTDOWN` services share
+                    // `WaitToKillServiceTimeout` (5s by default) and no wait hint extends it, so a
+                    // longer drain would be killed on every reboot. `PRESHUTDOWN` runs earlier with
+                    // a timeout we raise to the app's budget. The two flags are mutually exclusive.
                     controls_accepted: if state == ServiceState::Running {
                         ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN
                     } else {
@@ -1308,8 +1265,7 @@ mod windows_impl {
                     log_host_failure(&message);
                     report(
                         ServiceState::Stopped,
-                        // A start that never produced a serving app is a failure, so
-                        // the SCM's restart policy applies.
+                        // A failed start is a failure, so the SCM's restart policy applies.
                         ServiceExitCode::ServiceSpecific(1),
                         Duration::default(),
                     )?;
@@ -1322,8 +1278,7 @@ mod windows_impl {
             Duration::default(),
         )?;
 
-        // Never `unwrap_or_default()`: a zero budget turns every SCM stop into a
-        // force-kill after the grace buffer alone.
+        // Never zero: a zero budget turns every SCM stop into a force-kill after the grace buffer.
         let budget =
             serve::recorded_stop_budget(&paths).unwrap_or(super::FALLBACK_DRAIN_BUDGET_SECS);
         let (app_exit_code, saw_stop_request) = watch_app(
@@ -1350,9 +1305,8 @@ mod windows_impl {
                 ServiceExitCode::ServiceSpecific(
                     app_exit_code
                         .and_then(|code| u32::try_from(code).ok())
-                        // A code of 0 that reached here means the app was killed
-                        // rather than exiting; reporting 0 would tell the SCM it
-                        // stopped cleanly and suppress the restart.
+                        // A 0 here means the app was killed, not that it exited; reporting 0
+                        // would tell the SCM it stopped cleanly and skip the restart.
                         .filter(|&code| code != 0)
                         .unwrap_or(1),
                 )
@@ -1460,15 +1414,13 @@ mod tests {
 
     #[test]
     fn service_name_is_prefixed_and_derived_from_the_project() {
-        // Deterministic and project-scoped: `install`, `uninstall` and `doctor`
-        // all re-derive it, so the operator never has to name the service.
+        // `install`, `uninstall` and `doctor` all re-derive it, so it must be deterministic.
         assert_eq!(service_name("mytool-a1b2c3d4"), "autumn-mytool-a1b2c3d4");
     }
 
     #[test]
     fn service_name_replaces_characters_the_scm_forbids() {
-        // The identity's first half is a directory name, so it can carry
-        // anything a directory can. A `\` or `/` would be rejected by the SCM.
+        // The identity starts with a directory name; the SCM rejects `\` and `/`.
         let name = service_name(r"my app/v2\x-a1b2c3d4");
         assert_eq!(name, "autumn-my_app_v2_x-a1b2c3d4");
         assert!(!name.contains('/') && !name.contains('\\') && !name.contains(' '));
@@ -1482,10 +1434,7 @@ mod tests {
 
     #[test]
     fn a_truncated_service_name_keeps_the_hash_that_distinguishes_checkouts() {
-        // The hash suffix is the ONLY thing separating two checkouts that share
-        // a directory name. Truncating from the end would drop it, so two long
-        // projects would collide on one SCM entry — and the second's uninstall
-        // would deregister the first's service.
+        // The hash suffix is the only thing separating two checkouts that share a directory name.
         let one = service_name(&format!("{}-a1b2c3d4", "x".repeat(500)));
         let two = service_name(&format!("{}-9f8e7d6c", "x".repeat(500)));
         assert!(one.ends_with("-a1b2c3d4"), "{one}");
@@ -1496,8 +1445,7 @@ mod tests {
 
     #[test]
     fn an_identity_with_no_hash_still_truncates_safely() {
-        // Defensive: `project_identity` always appends one, but a name built
-        // some other way must not panic or overrun.
+        // `project_identity` always appends a hash; a name without one must still not overrun.
         let name = service_name(&"x".repeat(500));
         assert!(name.starts_with(SERVICE_NAME_PREFIX));
         assert!(name.chars().count() <= MAX_SERVICE_NAME);
@@ -1505,10 +1453,7 @@ mod tests {
 
     #[test]
     fn the_display_name_is_bounded_and_keeps_its_identifying_suffix() {
-        // The SCM caps the display name at the same 256 characters as the
-        // service name, so bounding only the internal name still fails
-        // `CreateService` for a directory name near Windows' 255-character
-        // component limit.
+        // The SCM caps the display name at 256 characters, like the service name.
         let display = service_display_name(&format!("{}-a1b2c3d4", "x".repeat(500)));
         assert!(
             display.chars().count() <= MAX_SERVICE_NAME,
@@ -1543,10 +1488,8 @@ mod tests {
 
     #[test]
     fn stop_wait_hint_is_clamped_to_what_the_scm_can_carry() {
-        // The budget comes from user config. A wrapping add would produce a tiny
-        // hint; an unclamped one PANICS inside `windows-service`, which converts
-        // it to `u32` milliseconds — taking down the service host mid-stop and
-        // stranding the service in `StopPending`.
+        // The budget comes from user config. `windows-service` converts the hint to `u32`
+        // milliseconds and panics on overflow, killing the host mid-stop.
         let hint = stop_wait_hint(u64::MAX);
         assert_eq!(hint, MAX_WAIT_HINT);
         assert!(
@@ -1559,10 +1502,8 @@ mod tests {
 
     #[test]
     fn an_scm_stop_waits_at_least_as_long_as_the_host_will_drain() {
-        // The host waits the app's budget plus a grace buffer before force-
-        // killing. A shorter uninstall deadline abandons a service that is still
-        // draining correctly and leaves it registered — the very state
-        // `uninstall-service` was asked to remove.
+        // The host waits the app's budget plus a grace buffer before force-killing. A shorter
+        // uninstall deadline gives up on a service that is still draining and leaves it registered.
         for budget in [0, 35, 60, 600] {
             assert!(
                 stop_wait_hint(budget) >= Duration::from_secs(budget),
@@ -1573,19 +1514,17 @@ mod tests {
 
     #[test]
     fn the_fallback_drain_budget_is_never_zero() {
-        // The service host uses it when `serve.addr` cannot be read. Zero would
-        // make `sc.exe stop` force-kill after the grace buffer alone — a hard
-        // kill that skips shutdown hooks, which is the outcome this whole slice
-        // exists to eliminate.
+        // Used when `serve.addr` cannot be read. Zero would make `sc.exe stop` force-kill after the
+        // grace buffer alone, skipping shutdown hooks.
         assert_ne!(FALLBACK_DRAIN_BUDGET_SECS, 0);
-        // And it survives into the hint the SCM is told to wait for.
+        // It also reaches the wait hint given to the SCM.
         assert!(stop_wait_hint(FALLBACK_DRAIN_BUDGET_SECS) > STOP_HOOK_HEADROOM);
     }
 
     #[test]
     fn an_operator_stop_is_intentional_whatever_the_exit_code() {
-        // A stop whose drain overran gets force-killed, so it exits non-zero.
-        // Restarting it would fight the operator.
+        // A drain that overran is force-killed and exits non-zero; restarting it would fight the
+        // operator.
         assert!(exit_is_intentional(true, Some(1)));
         assert!(exit_is_intentional(true, None));
     }
@@ -1597,15 +1536,12 @@ mod tests {
 
     #[test]
     fn only_a_missing_service_counts_as_absent() {
-        // `uninstall-service` treats "not registered" as licence to delete the
-        // daemon's records. A denial read as an absence would remove the record
-        // of a service still registered `AutoStart`, whose next restart then
-        // fails with no configuration to read and no way to log why.
+        // `uninstall-service` deletes the daemon's records when the service is not registered,
+        // so a denial must not read as an absence.
         assert!(open_failure_means_absent(Some(
             ERROR_SERVICE_DOES_NOT_EXIST
         )));
-        // ERROR_ACCESS_DENIED — what a non-elevated shell gets asking for
-        // STOP | DELETE.
+        // ERROR_ACCESS_DENIED: a non-elevated shell asking for STOP | DELETE.
         assert!(!open_failure_means_absent(Some(5)));
         // ERROR_INVALID_HANDLE, and an error carrying no OS code at all.
         assert!(!open_failure_means_absent(Some(6)));
@@ -1623,18 +1559,14 @@ mod tests {
 
     #[test]
     fn a_stop_request_latches_once_seen() {
-        // `autumn serve stop`'s cleanup removes the request file after the app
-        // exits. Without the latch, the host's next poll would see no request,
-        // read the exit as a crash, and have the SCM restart a daemon the
-        // operator just stopped.
+        // `autumn serve stop` removes the request file after the app exits. Without the latch the
+        // next poll would read the exit as a crash and the SCM would restart the daemon.
         assert!(stop_was_requested(true, false, false));
     }
 
     #[test]
     fn either_channel_alone_requests_a_stop() {
-        // The Service Control Manager's handler sets the flag; `autumn serve
-        // stop` only creates the file. Both must count, or one of the two ways
-        // to stop a service-hosted daemon reads as a crash.
+        // The SCM handler sets the flag; `autumn serve stop` only creates the file. Both count.
         assert!(stop_was_requested(false, true, false));
         assert!(stop_was_requested(false, false, true));
     }
@@ -1646,16 +1578,14 @@ mod tests {
 
     #[test]
     fn a_latched_stop_survives_an_exit_code_that_looks_like_a_crash() {
-        // The two halves compose: a drain that overran is force-killed (non-zero
-        // exit) but is still the operator's stop, not a crash to restart.
+        // A drain that overran is force-killed (non-zero exit) but is still the operator's stop.
         let saw = stop_was_requested(false, true, false);
         assert!(exit_is_intentional(saw, Some(1)));
     }
 
     #[test]
     fn a_crash_is_not_intentional_so_the_scm_restarts_it() {
-        // This is the whole crash-recovery guarantee: an app that died on its
-        // own must come back.
+        // An app that died on its own must come back.
         assert!(!exit_is_intentional(false, Some(101)));
         // Killed by the OS: no exit code at all.
         assert!(!exit_is_intentional(false, None));
@@ -1663,8 +1593,7 @@ mod tests {
 
     #[test]
     fn restart_delays_back_off_rather_than_hammering() {
-        // An app that crashes on boot would otherwise be restarted every five
-        // seconds forever, burying the cause in the event log.
+        // An app that crashes on boot must not be restarted at a fixed short interval forever.
         let delays = restart_delays();
         assert!(delays.len() >= 3, "{delays:?}");
         assert!(
@@ -1676,8 +1605,7 @@ mod tests {
 
     #[test]
     fn failure_count_resets_after_a_quiet_day() {
-        // Without a reset window, three crashes spread over a week would be
-        // treated as an escalating series and hit the longest delay.
+        // Without a reset window, crashes spread over a week would escalate to the longest delay.
         assert_eq!(failure_reset_period(), Duration::from_hours(24));
     }
 
@@ -1702,8 +1630,7 @@ mod tests {
 
     #[test]
     fn service_record_round_trips_through_toml() {
-        // The host reads this back in a different security context; a field lost
-        // in the round trip is a daemon started with the wrong profile or role.
+        // A field lost in the round trip starts the daemon with the wrong profile or role.
         let record = sample_record();
         let parsed = ServiceRecord::parse(&record.to_toml().expect("serialize")).expect("parse");
         assert_eq!(parsed, record);
@@ -1711,8 +1638,7 @@ mod tests {
 
     #[test]
     fn service_record_tolerates_a_minimal_file() {
-        // Every optional field defaults, so a record written by an older install
-        // still starts the service rather than failing to parse.
+        // Optional fields default, so a record from an older install still parses.
         let minimal = r#"
             name = "autumn-demo"
             binary = "C:\\proj\\demo.exe"
@@ -1731,8 +1657,7 @@ mod tests {
 
     #[test]
     fn the_off_windows_message_names_the_platform_equivalent() {
-        // A Linux user who types this should learn what to do, not just that
-        // they cannot do this.
+        // Off Windows, the message points at the platform's equivalent.
         let message = unsupported_message("install-service");
         assert!(message.contains("systemd"), "{message}");
         assert!(message.contains("launchd"), "{message}");

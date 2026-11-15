@@ -119,7 +119,6 @@ fn format_anchors(anchors: &[RevertAnchor]) -> String {
 /// String buffer to avoid multiple intermediate `String` and `Vec` allocations.
 fn format_collisions(paths: &[PathBuf]) -> String {
     use std::fmt::Write;
-    // Estimate ~60 bytes per path
     let mut out = String::with_capacity(paths.len() * 60);
     for (i, p) in paths.iter().enumerate() {
         if i > 0 {
@@ -235,7 +234,6 @@ pub fn timestamp_now() -> String {
 /// without mocking the system clock.
 #[must_use]
 pub fn timestamp_from_unix(unix_secs: u64) -> String {
-    // Days since 1970-01-01.
     let days = unix_secs / 86_400;
     let rem = unix_secs % 86_400;
     let hour = rem / 3600;
@@ -352,10 +350,9 @@ pub fn detect_backend_offline(
         Some(&effective),
         crate::migrate::read_optional_toml_table,
     );
-    // Same precedence as `detect_backend_with`: the real environment wins, and
-    // `.env` only fills keys it does not define. A malformed `.env` is dropped
-    // rather than surfaced — this is a best-effort hint, and the commands that
-    // act on a real URL report it loudly themselves.
+    // Same precedence as `detect_backend_with`: the real environment wins and `.env` only
+    // fills keys it does not define. A malformed `.env` is ignored: this is a best-effort
+    // hint, and the commands that act on a real URL report it themselves.
     let base = FnEnv(&|k: &str| std::env::var(k));
     let dotenv: std::collections::BTreeMap<String, String> =
         autumn_web::dotenv::resolve_dotenv_vars_in(project_root, &effective, &base)
@@ -395,19 +392,13 @@ where
 {
     use autumn_web::config::DatabaseBackend;
 
-    // Mirror `autumn migrate`: overlay a project `.env` UNDER the real
-    // environment before resolving the DB URL, so a URL that lives only in
-    // `.env` (e.g. `DATABASE_URL=sqlite://app.db`) is honored. Without this a
-    // SQLite app whose URL is only in `.env` mis-detects as Postgres and the
-    // generator emits Postgres DDL (`BIGSERIAL`/`NOW()`) even though migrate and
-    // the running app resolve the SQLite URL. `.env` is read from
-    // `project_root` (the same dir the profile-merged `autumn.toml` is read
-    // from) for the resolved profile, honoring the framework's dotenv gating
-    // (only the `dev`/`test` profiles auto-load unless `AUTUMN_DOTENV=1`) and
-    // profile-selector exclusion. Precedence matches migrate's `DotenvOsEnv`
-    // exactly: the real env (`env_var`) wins, and `.env` only fills keys it does
-    // not define. A malformed `.env` is ignored for detection (a best-effort
-    // hint) — `autumn migrate` still surfaces it loudly at migration time.
+    // Mirror `autumn migrate`: overlay the project `.env` under the real environment, so a
+    // URL that lives only in `.env` (e.g. `DATABASE_URL=sqlite://app.db`) is honored and a
+    // SQLite app is not mis-detected as Postgres and handed Postgres DDL (`BIGSERIAL`,
+    // `NOW()`). The framework's dotenv gating applies (only `dev`/`test` auto-load unless
+    // `AUTUMN_DOTENV=1`). As in migrate's `DotenvOsEnv`, the real env (`env_var`) wins and
+    // `.env` only fills keys it does not define. A malformed `.env` is ignored here;
+    // `autumn migrate` reports it at migration time.
     let base = FnEnv(&env_var);
     let dotenv_overlay: std::collections::BTreeMap<String, String> =
         autumn_web::dotenv::resolve_dotenv_vars_in(project_root, profile.unwrap_or("dev"), &base)
@@ -483,9 +474,8 @@ pub fn sqlite_field_kind_unsupported_error(field: &str, rust_type: &str) -> Gene
 pub fn reject_sqlite_unsupported_field_kinds(fields: &[dsl::Field]) -> Result<(), GenerateError> {
     for f in fields {
         if !f.kind.sqlite_has_diesel_conversion() {
-            // `Field::rust_type` (not `FieldKind::rust_type`) so an `Enum`
-            // field reports its generated enum type name rather than the bare
-            // `String` storage-representation fallback.
+            // `Field::rust_type`, not `FieldKind::rust_type`: an `Enum` field reports its
+            // generated enum name rather than the `String` storage type.
             return Err(sqlite_field_kind_unsupported_error(&f.name, &f.rust_type()));
         }
     }
@@ -792,10 +782,9 @@ mod tests {
     fn hand_written_ddl_generators_emit_applicable_sqlite_ddl() {
         const TS: &str = "20260101000000";
 
-        // The roster is the audit's scope, so losing an entry must not be
-        // silent — deleting one below fails the equality further down rather
-        // than quietly shrinking what gets checked. Adding a generator that
-        // emits its own migration means adding it to BOTH lists.
+        // A second copy of the roster, checked for equality below, so dropping a generator
+        // from the audit fails instead of silently shrinking it. A new generator that emits
+        // its own migration goes in both lists.
         const AUDITED: &[&str] = &[
             "auth",
             "mailer --list-unsubscribe",

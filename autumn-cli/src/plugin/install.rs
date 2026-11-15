@@ -1747,11 +1747,9 @@ pub fn plan_add(
         }
     };
 
-    // `Cargo.toml` is queued BEFORE `src/main.rs`. `Plan::execute` writes
-    // actions in order with no rollback, so if the second write fails (a
-    // read-only file, ENOSPC) this ordering leaves a dependency with no mount
-    // — inert, compiling, visible in `cargo tree` — rather than a mount with
-    // no dependency, which leaves the app uncompilable.
+    // Queue `Cargo.toml` before `src/main.rs`: `Plan::execute` has no rollback,
+    // and a failed second write should leave an inert dependency, not a mount with
+    // no dependency that stops the app compiling.
     let mut plan = Plan::new(root);
     // Exact: the trust review and the conformance record describe this
     // release, and a caret would let Cargo take a later, unreviewed patch.
@@ -1810,11 +1808,9 @@ pub fn plan_add_community(
     let snippet = super::catalog::community_mount_snippet(crate_name)
         .unwrap_or_else(|| "        .plugin(/* see the crate's README */)".to_owned());
 
-    // NOT `AlreadyInstalled`: that outcome reports the dependency *and* the
-    // mount as in place, and a community mount is never written — so a re-run
-    // would claim a complete install and stop showing the snippet the user
-    // still has to paste. The outcome stays dependency-only; only the wording
-    // changes.
+    // Not `AlreadyInstalled`: a community mount is never written, so that outcome
+    // would claim a complete install and hide the snippet the user still has to
+    // paste.
     let dependency_added = !dependency_present(&manifest_src, crate_name);
     let mut plan = Plan::new(root);
     if dependency_added {
@@ -2404,7 +2400,7 @@ maud = { version = "0.27", features = ["axum"] }
         catalog::lookup("autumn-admin-plugin").expect("admin entry")
     }
 
-    // ── AC #3: version safety ────────────────────────────────────────────────
+    // ── version safety ───────────────────────────────────────────────────────
 
     #[test]
     fn same_minor_series_is_compatible() {
@@ -3177,7 +3173,7 @@ maud = { version = "0.27", features = ["axum"] }
         assert!(!unpatched_local_framework(tmp.path()));
     }
 
-    // ── AC #2: dependency + mount ────────────────────────────────────────────
+    // ── dependency + mount ───────────────────────────────────────────────────
 
     #[test]
     fn dependency_line_is_the_shorthand_form() {
@@ -3280,7 +3276,7 @@ maud = { version = "0.27", features = ["axum"] }
         );
     }
 
-    // ── AC #4: idempotency ───────────────────────────────────────────────────
+    // ── idempotency ──────────────────────────────────────────────────────────
 
     #[test]
     fn mount_present_ignores_comment_mentions() {
@@ -3395,7 +3391,7 @@ maud = { version = "0.27", features = ["axum"] }
             format!("{SCAFFOLD_CARGO}\n[dev-dependencies]\nautumn-admin-plugin = \"0.7.0\"\n");
         assert!(!dependency_present(&cargo, "autumn-admin-plugin"));
 
-        // Mount already present + dev-dependency only ⇒ still an install, not
+        // Mount already present with only a dev-dependency is still an install, not
         // "already installed".
         let mounted = SCAFFOLD_MAIN.replace(
             ".routes(routes![index])",
@@ -3531,7 +3527,7 @@ maud = { version = "0.27", features = ["axum"] }
         );
     }
 
-    // ── AC #5: safe degradation ──────────────────────────────────────────────
+    // ── safe degradation ─────────────────────────────────────────────────────
 
     /// A single-line chain has nowhere to splice a call, so the command must
     /// decline rather than guess.

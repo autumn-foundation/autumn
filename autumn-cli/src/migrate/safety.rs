@@ -106,8 +106,7 @@ pub struct SafetyFinding {
 /// reviewed and accepted.
 ///
 /// Classifies against Postgres. Use [`classify_sql_for`] on a `SQLite` app.
-// Retained as a Postgres-default convenience wrapper for the test suite;
-// production always passes the app's detected backend.
+// Test-only: production always passes the app's detected backend.
 #[cfg(test)]
 pub fn classify_sql(sql: &str) -> Vec<SafetyFinding> {
     classify_sql_for(DatabaseBackend::Postgres, sql)
@@ -124,15 +123,10 @@ pub fn classify_sql(sql: &str) -> Vec<SafetyFinding> {
 /// statements are reported as [`RiskLevel::Unsupported`] — they fail at apply
 /// time, so the deploy gate blocks them.
 pub fn classify_sql_for(backend: DatabaseBackend, sql: &str) -> Vec<SafetyFinding> {
-    // Strip block comments at the whole-SQL level before splitting so that a
-    // semicolon inside a block comment (e.g. `/* note; end */`) does not produce
-    // a spurious empty statement fragment.
     let stmts = statements(backend, sql);
 
-    // Tables created within this migration have no existing rows or live traffic,
-    // so a non-concurrent index build on them is safe.  Collect the names upfront
-    // so we can suppress the false-positive PotentiallyBlocking finding for those
-    // tables when we encounter their CREATE INDEX statements below.
+    // A table this migration creates has no rows or traffic, so a non-concurrent index on it
+    // is safe.
     let newly_created: Vec<String> = stmts
         .iter()
         .filter(|s| !has_review_suppression(backend, s))
@@ -315,15 +309,13 @@ fn alter_table_subcommands(backend: DatabaseBackend, normalized: &str) -> Vec<&s
 /// A subcommand is "known" when a specific safety rule covers all risk scenarios
 /// for it (including the case where it is safe and produces no finding).
 fn is_known_alter_subcommand(backend: DatabaseBackend, subcommand: &str) -> bool {
-    // On SQLite every subcommand is already classified: the four the grammar
-    // accepts by the rules below, and every other one as Unsupported. So none
-    // is left for the manual-review fallback.
+    // On SQLite every subcommand is classified: the four the grammar accepts by the rules
+    // below, every other one as Unsupported. None is left for manual review.
     if backend == DatabaseBackend::Sqlite {
         return true;
     }
-    // `add column` is known unless it carries an inline PRIMARY KEY constraint,
-    // which Autumn does not specifically classify.  UNIQUE and REFERENCES are handled
-    // by dedicated rules; NOT NULL is handled by the NOT NULL rule.
+    // `add column` is known unless it has an inline PRIMARY KEY. UNIQUE, REFERENCES and
+    // NOT NULL have their own rules.
     let add_col_known =
         subcommand.starts_with("add column ") && !subcommand.contains(" primary key");
     add_col_known
@@ -1829,9 +1821,8 @@ fn classify_statement(
         return vec![];
     }
     let sqlite = backend == DatabaseBackend::Sqlite;
-    // SQLite lets `ALTER TABLE … ADD <col>` and `DROP <col>` omit the `COLUMN`
-    // keyword. Every rule below matches the `COLUMN` spelling, so canonicalize
-    // first rather than duplicating each match.
+    // SQLite lets `ADD <col>` and `DROP <col>` omit `COLUMN`. Every rule below matches the
+    // `COLUMN` spelling, so canonicalize first.
     let canonical;
     let normalized = if sqlite {
         canonical = canonical_sqlite_alter(normalized);
@@ -1840,8 +1831,7 @@ fn classify_statement(
         normalized
     };
 
-    // Statements SQLite has no syntax for at all. They fail at apply time, so
-    // there is nothing further to classify about them.
+    // Statements SQLite has no syntax for fail at apply time; nothing more to classify.
     if sqlite && let Some(f) = sqlite_unsupported_statement(normalized) {
         return vec![f];
     }
@@ -1864,17 +1854,15 @@ fn classify_statement(
         findings.extend(do_block_findings(&body, newly_created, depth));
         return findings;
     }
-    // Some SQLite ADD COLUMN restrictions apply only to a table that already has
-    // rows: NOT NULL without a usable default, a non-constant default, and a
-    // STORED generated column. A table this same migration creates has none, so
-    // those statements apply cleanly — the suppression that the index rule
-    // below makes for index builds. UNIQUE and PRIMARY KEY are NOT in that
-    // set: SQLite rejects them on an empty table too.
+    // Some SQLite ADD COLUMN restrictions apply only to a table with rows: NOT NULL without
+    // a usable default, a non-constant default, and a STORED generated column. A table this
+    // migration creates is empty, so those apply cleanly. UNIQUE and PRIMARY KEY are
+    // rejected on an empty table too.
     let fresh_table = sqlite
         && extract_altered_table_name(normalized)
             .is_some_and(|t| newly_created.iter().any(|c| same_table(backend, c, t)));
 
-    // DROP TABLE — check first; it subsumes DROP COLUMN detection
+    // DROP TABLE is checked first: it subsumes DROP COLUMN.
     if normalized.starts_with("drop table") {
         findings.push(SafetyFinding {
             operation: "DROP TABLE".to_owned(),
@@ -1887,7 +1875,6 @@ fn classify_statement(
         return findings;
     }
 
-    // DROP VIEW
     if normalized.starts_with("drop view") {
         findings.push(SafetyFinding {
             operation: "DROP VIEW".to_owned(),
@@ -1900,7 +1887,6 @@ fn classify_statement(
         return findings;
     }
 
-    // DROP SEQUENCE
     if normalized.starts_with("drop sequence") {
         findings.push(SafetyFinding {
             operation: "DROP SEQUENCE".to_owned(),
@@ -1914,7 +1900,6 @@ fn classify_statement(
         return findings;
     }
 
-    // TRUNCATE TABLE
     if normalized.starts_with("truncate ") {
         findings.push(SafetyFinding {
             operation: "TRUNCATE".to_owned(),
@@ -1927,7 +1912,6 @@ fn classify_statement(
         return findings;
     }
 
-    // DROP COLUMN
     if normalized.contains(" drop column ") {
         findings.push(SafetyFinding {
             operation: "DROP COLUMN".to_owned(),
@@ -1952,7 +1936,6 @@ fn classify_statement(
         });
     }
 
-    // RENAME COLUMN
     if normalized.contains(" rename column ") {
         findings.push(SafetyFinding {
             operation: "RENAME COLUMN".to_owned(),
@@ -1964,7 +1947,6 @@ fn classify_statement(
         });
     }
 
-    // RENAME TABLE
     if normalized.contains("alter table")
         && normalized.contains(" rename to ")
         && !normalized.contains(" rename column ")
@@ -1979,14 +1961,11 @@ fn classify_statement(
         });
     }
 
-    // SQLite's ALTER TABLE grammar is exactly RENAME TO, RENAME [COLUMN],
-    // ADD COLUMN and DROP COLUMN. Every other subcommand — ALTER COLUMN in any
-    // spelling, ADD/DROP CONSTRAINT, SET SCHEMA, OWNER TO — is a parse error, so
-    // one rule covers them all rather than a list that can fall behind Postgres.
+    // SQLite's ALTER TABLE grammar is exactly RENAME TO, RENAME [COLUMN], ADD COLUMN and
+    // DROP COLUMN. Everything else is a parse error, so one rule covers it all rather than
+    // a list that can fall behind Postgres.
     if sqlite && normalized.starts_with("alter table") {
         let subcommands = alter_table_subcommands(backend, normalized);
-        // SQLite takes exactly one action per ALTER TABLE; Postgres allows a
-        // comma-separated list.
         if subcommands.len() > 1 {
             findings.push(SafetyFinding {
                 operation: "Multi-action ALTER TABLE (unsupported on SQLite)".to_owned(),
@@ -2019,7 +1998,6 @@ fn classify_statement(
         }
     }
 
-    // ALTER COLUMN TYPE (Postgres)
     if !sqlite
         && let Some(i) = normalized.find("alter column")
         && normalized[i..].contains(" type ")
@@ -2034,14 +2012,10 @@ fn classify_statement(
         });
     }
 
-    // ADD COLUMN NOT NULL — checked per subcommand so that a DEFAULT on one column
-    // in a multi-column ALTER TABLE does not suppress the check for other columns.
-    //
-    // Two unsafe cases:
-    //  1. No DEFAULT at all — Postgres must validate every existing row under lock.
-    //  2. Volatile DEFAULT (contains a function call) — Postgres must evaluate the
-    //     function per-row and cannot use the fast constant-default path (PG 11+),
-    //     so the table is still rewritten under the exclusive lock.
+    // Checked per subcommand, so a DEFAULT on one column does not hide another column
+    // without one. Unsafe on Postgres: no DEFAULT (every row is validated under lock), or a
+    // volatile DEFAULT (evaluated per row, so the PG 11+ constant-default path is lost and
+    // the table is rewritten).
     if normalized.starts_with("alter table") {
         for subcommand in alter_table_subcommands(backend, normalized) {
             if subcommand.starts_with("add column ") && subcommand.contains("not null") {
@@ -2053,10 +2027,8 @@ fn classify_statement(
                 } else {
                     subcommand.contains(" default ")
                 };
-                // A DEFAULT is "volatile" when it is a VOLATILE function call —
-                // i.e. one that Postgres must evaluate per-row, preventing the PG11+
-                // fast-constant-default path.  STABLE functions (e.g. `now()`) are
-                // evaluated once at statement time and do not require a table rewrite.
+                // STABLE functions such as `now()` are evaluated once per statement and need no
+                // rewrite. Only a VOLATILE call counts.
                 let has_volatile_default = has_default
                     && subcommand.find(" default ").is_some_and(|pos| {
                         let default_expr =
@@ -2067,15 +2039,13 @@ fn classify_statement(
                 if !has_default {
                     findings.push(SafetyFinding {
                         operation: "ADD COLUMN NOT NULL (no default)".to_owned(),
-                        // SQLite does not merely slow down here: it rejects the
-                        // statement ("Cannot add a NOT NULL column with default
-                        // value NULL"), so this can never apply.
+                        // SQLite rejects this outright ("Cannot add a NOT NULL column with
+                        // default value NULL").
                         risk: if sqlite && !fresh_table {
                             RiskLevel::Unsupported
                         } else if sqlite {
-                            // A table created in this same migration has no rows,
-                            // so SQLite accepts the statement; Postgres still
-                            // validates nothing on an empty table either.
+                            // A table this migration creates has no rows, so SQLite
+                            // accepts the statement.
                             RiskLevel::Safe
                         } else {
                             RiskLevel::PotentiallyBlocking
@@ -2116,8 +2086,8 @@ fn classify_statement(
         }
     }
 
-    // ADD COLUMN with inline UNIQUE — implicitly builds a non-concurrent unique index
-    // ADD COLUMN with inline REFERENCES — scans existing rows to validate the FK
+    // Inline UNIQUE builds a non-concurrent unique index; inline REFERENCES scans existing
+    // rows to validate the FK.
     if normalized.starts_with("alter table") {
         for subcommand in alter_table_subcommands(backend, normalized) {
             if !subcommand.starts_with("add column ") {
@@ -2157,9 +2127,8 @@ fn classify_statement(
                                   (`autumn schema diff --write-migration` emits the rebuild).",
                 });
             }
-            // SQLite accepts an added REFERENCES column but requires its default
-            // to be NULL, and never scans existing rows to validate the key — so
-            // the Postgres row-validation finding does not apply there.
+            // SQLite never scans existing rows to validate a new FK, so the Postgres
+            // row-validation finding does not apply.
             if sqlite {
                 // A generated column is the one ADD COLUMN form left; SQLite
                 // accepts VIRTUAL and rejects STORED.
@@ -2174,12 +2143,9 @@ fn classify_statement(
                                       the STORED column in its CREATE TABLE.",
                     });
                 }
-                // SQLite's ADD COLUMN default must reduce to a constant.
-                // NOTE: no rule for `REFERENCES` with a non-NULL default. SQLite
-                // enforces that only when `PRAGMA foreign_keys` is ON, and
-                // Autumn's migration connection deliberately leaves it OFF (see
-                // `establish_sqlite_migration_connection`), so the statement does
-                // apply on the path this classifier grades.
+                // SQLite's ADD COLUMN default must reduce to a constant. A non-NULL default on
+                // a REFERENCES column is rejected only with `PRAGMA foreign_keys` ON, and the
+                // migration connection leaves it OFF (`establish_sqlite_migration_connection`).
                 if !fresh_table
                     && let Some(default) = add_column_default_token(backend, subcommand)
                     && !is_sqlite_constant_default(&default)
@@ -2209,10 +2175,8 @@ fn classify_statement(
         }
     }
 
-    // Unclassified ALTER TABLE subcommand — fires when any subcommand in the statement
-    // is not covered by the specific rules above. Checking all subcommands individually
-    // prevents a known-safe subcommand (e.g. ADD COLUMN) from hiding an unknown one
-    // (e.g. DROP CONSTRAINT) in the same multi-action ALTER TABLE.
+    // Any subcommand no rule above covers needs review. Checking each one keeps a known-safe
+    // subcommand (ADD COLUMN) from hiding an unknown one (DROP CONSTRAINT).
     if normalized.starts_with("alter table") {
         let subcommands = alter_table_subcommands(backend, normalized);
         let all_known = subcommands
@@ -2233,7 +2197,6 @@ fn classify_statement(
         }
     }
 
-    // CREATE INDEX / CREATE UNIQUE INDEX without CONCURRENTLY
     let is_create_index =
         normalized.starts_with("create index") || normalized.starts_with("create unique index");
     // The trailing space matters: `concurrently` must be the SQL option, not the
@@ -2271,7 +2234,6 @@ fn classify_statement(
         });
     }
 
-    // Data backfill — bulk DML inside a migration requires a separate job
     if normalized.starts_with("update ")
         || normalized.starts_with("insert into ")
         || normalized.starts_with("delete from ")
@@ -2290,10 +2252,8 @@ fn classify_statement(
         });
     }
 
-    // CTE-prefixed bulk DML — WITH … UPDATE / DELETE / INSERT
-    // A CTE starts with `with` so the plain DML checks above don't fire.
-    // Check both the outer statement (`) update/delete/insert`) and CTE bodies
-    // (`(update/delete/insert`) to catch data-modifying CTEs followed by SELECT.
+    // A CTE starts with `with`, so the plain DML checks above miss it. Match both an outer
+    // write (`) update`) and a write in a CTE body (`(update`) followed by SELECT.
     if normalized.starts_with("with ")
         && (normalized.contains(") update ")
             || normalized.contains(") delete ")
@@ -2312,12 +2272,9 @@ fn classify_statement(
         });
     }
 
-    // DROP INDEX (non-concurrent) — holds an exclusive table lock
-    // Use token-aware check: `concurrently` must be the SQL option immediately after
-    // `drop index`, not a substring of the index name (e.g. idx_concurrently).
-    // Postgres only: on SQLite a DROP INDEX is a cheap catalog edit, and the
-    // generated SQLite `DROP COLUMN` path is *required* to emit one first —
-    // flagging it would fail the deploy gate on every such migration.
+    // Postgres only: on SQLite DROP INDEX is a cheap catalog edit, and the generated SQLite
+    // `DROP COLUMN` path must emit one first. The trailing space keeps an index named
+    // `concurrently_…` from counting as the option.
     if !sqlite
         && normalized.starts_with("drop index")
         && !normalized.starts_with("drop index concurrently ")
@@ -2332,8 +2289,8 @@ fn classify_statement(
         });
     }
 
-    // ALTER TYPE RENAME VALUE — renaming an enum label breaks old replicas that
-    // still INSERT or compare against the old label during a rolling deploy.
+    // Renaming an enum label breaks old replicas that still use the old label during a rolling
+    // deploy.
     if !sqlite && normalized.starts_with("alter type") && normalized.contains(" rename value ") {
         findings.push(SafetyFinding {
             operation: "ALTER TYPE RENAME VALUE".to_owned(),
@@ -2346,7 +2303,6 @@ fn classify_statement(
         return findings;
     }
 
-    // ALTER TYPE RENAME TO — renaming the type itself breaks references in old replicas.
     if !sqlite && normalized.starts_with("alter type") && normalized.contains(" rename to ") {
         findings.push(SafetyFinding {
             operation: "ALTER TYPE RENAME".to_owned(),
@@ -2359,7 +2315,7 @@ fn classify_statement(
         return findings;
     }
 
-    // Generic catch-all — DDL/DML not matched by any rule above
+    // Catch-all for DDL no rule above matched.
     let is_known_start = normalized.starts_with("drop table")
         || normalized.starts_with("drop index")
         || normalized.starts_with("alter table") // unclassified subcommands handled above
@@ -2376,8 +2332,7 @@ fn classify_statement(
         || normalized.starts_with("alter sequence")
         || normalized.starts_with("drop sequence")
         || normalized.starts_with("create type")
-        // `alter type` is intentionally absent — unclassified forms fall through to ManualReview
-        // `drop type` is intentionally absent — falls through to ManualReview
+        // `alter type` and `drop type` are absent on purpose: unclassified forms need review.
         || normalized.starts_with("create extension")
         || normalized.starts_with("create view")
         || normalized.starts_with("drop view")
@@ -2612,7 +2567,6 @@ mod tests {
 
     #[test]
     fn alter_type_add_value_requires_manual_review() {
-        // ADD VALUE is not specifically classified — operator must review.
         let findings = classify_sql("ALTER TYPE status ADD VALUE 'archived';");
         assert_eq!(
             findings.len(),
@@ -2624,8 +2578,6 @@ mod tests {
 
     #[test]
     fn rename_constraint_requires_manual_review() {
-        // RENAME CONSTRAINT is a schema change that Autumn cannot auto-classify —
-        // it must not silently pass as safe.
         let findings = classify_sql("ALTER TABLE users RENAME CONSTRAINT old_name TO new_name;");
         assert_eq!(
             findings.len(),
@@ -2655,7 +2607,6 @@ mod tests {
 
     #[test]
     fn mixed_known_and_unknown_alter_table_subcommands_flagged() {
-        // ADD COLUMN is safe, but DROP CONSTRAINT is unclassified — should get ManualReview.
         let sql = "ALTER TABLE posts ADD COLUMN subtitle TEXT, DROP CONSTRAINT posts_title_key;";
         let findings = classify_sql(sql);
         assert!(
@@ -2757,7 +2708,6 @@ mod tests {
 
     #[test]
     fn add_column_with_primary_key_requires_manual_review() {
-        // PRIMARY KEY inline on ADD COLUMN is not specifically classified.
         let findings = classify_sql("ALTER TABLE posts ADD COLUMN id BIGSERIAL PRIMARY KEY;");
         assert!(
             findings.iter().any(|f| f.risk == RiskLevel::ManualReview),
@@ -2898,9 +2848,8 @@ mod tests {
 
     #[test]
     fn line_comment_with_semicolon_does_not_hide_following_statement() {
-        // A `;` inside a `--` comment must not be treated as a statement separator.
-        // Before the fix, `-- rollout complete; safe\nDROP TABLE posts` would be split
-        // and the fragment `safe\nDROP TABLE posts` no longer starts with `drop table`.
+        // Splitting at the `;` inside the `--` comment would leave `safe to proceed\nDROP TABLE
+        // posts`, which no rule matches.
         let sql = "-- rollout complete; safe to proceed\nDROP TABLE posts;";
         let findings = classify_sql(sql);
         assert_eq!(
@@ -2913,8 +2862,7 @@ mod tests {
 
     #[test]
     fn autumn_safety_comment_does_not_double_classify() {
-        // Autumn-generated SQL includes a leading safety comment; ensure the
-        // comment text itself doesn't trigger a second finding.
+        // The `-- autumn-safety:` marker text itself must not make a second finding.
         let sql = "-- autumn-safety: destructive\nALTER TABLE posts DROP COLUMN body;";
         let findings = classify_sql(sql);
         assert_eq!(findings.len(), 1);
@@ -2922,7 +2870,6 @@ mod tests {
 
     #[test]
     fn autumn_safety_reviewed_suppresses_manual_review_finding() {
-        // Operator acknowledges a CREATE FUNCTION is safe for their deploy.
         let sql = "-- autumn-safety: reviewed\nCREATE FUNCTION noop() RETURNS void LANGUAGE sql AS $$SELECT 1$$;";
         let findings = classify_sql(sql);
         assert!(
@@ -3089,7 +3036,6 @@ mod tests {
 
     #[test]
     fn cte_select_only_is_safe() {
-        // A read-only CTE should not produce a DataBackfill finding.
         let sql = "WITH recent AS (SELECT id FROM posts ORDER BY created_at DESC LIMIT 10) \
                    SELECT * FROM recent;";
         let findings = classify_sql(sql);
@@ -3101,7 +3047,7 @@ mod tests {
 
     #[test]
     fn cte_body_write_with_outer_select_is_data_backfill() {
-        // data-modifying CTE where the outer statement is SELECT, not UPDATE/DELETE.
+        // The write is in the CTE body; the outer statement is a SELECT.
         let sql = "WITH touched AS \
                    (UPDATE posts SET migrated = true WHERE migrated IS NULL RETURNING id) \
                    SELECT count(*) FROM touched;";
@@ -3148,7 +3094,6 @@ mod tests {
 
     #[test]
     fn known_ddl_does_not_trigger_manual_review() {
-        // CREATE TABLE is safe — must not get a ManualReview finding on top
         let findings = classify_sql("CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);");
         assert!(
             findings.iter().all(|f| f.risk != RiskLevel::ManualReview),
@@ -3158,7 +3103,6 @@ mod tests {
 
     #[test]
     fn add_column_does_not_trigger_unclassified_alter_table() {
-        // A safe ADD COLUMN must not also generate a ManualReview finding.
         let findings = classify_sql("ALTER TABLE posts ADD COLUMN subtitle TEXT NULL;");
         assert!(
             findings.iter().all(|f| f.risk != RiskLevel::ManualReview),
@@ -3252,7 +3196,6 @@ mod tests {
 
     #[test]
     fn block_comment_only_mention_of_keyword_is_not_classified() {
-        // Only mentions DROP TABLE inside a block comment; actual statement is safe.
         let sql = "/* was: DROP TABLE posts; */ ALTER TABLE posts ADD COLUMN active BOOL;";
         let findings = classify_sql(sql);
         assert!(
@@ -3263,7 +3206,6 @@ mod tests {
 
     #[test]
     fn block_comment_with_semicolon_does_not_hide_following_statement() {
-        // The semicolon inside the block comment must not split the statement early.
         let sql = "/* cleanup; safe to drop */ DROP TABLE posts;";
         let findings = classify_sql(sql);
         assert_eq!(
@@ -4374,7 +4316,6 @@ mod tests {
 
     #[test]
     fn dollar_quoted_function_with_semicolons_is_one_statement() {
-        // The semicolons inside $$ ... $$ must not produce extra statement fragments.
         let sql = "CREATE FUNCTION bump() RETURNS void AS $$ BEGIN \
                    UPDATE posts SET hits = hits + 1; RETURN; END; $$ LANGUAGE plpgsql;";
         let findings = classify_sql(sql);
@@ -4414,10 +4355,7 @@ mod tests {
 
     #[test]
     fn split_statements_keeps_semicolon_in_string_literal_intact() {
-        // Regression test (PR review, issue #1023): a `DEFAULT 'hello; world'`
-        // clause -- exactly what `sql_default_literal` produces for a
-        // `--default` value containing a semicolon -- must not be split at
-        // the semicolon inside the quotes.
+        // `sql_default_literal` emits this for a `--default` value holding a `;` (#1023).
         let sql = "CREATE TABLE posts (\n    \
              id BIGSERIAL PRIMARY KEY,\n    \
              title TEXT NOT NULL DEFAULT 'hello; world',\n    \
@@ -4434,8 +4372,7 @@ mod tests {
 
     #[test]
     fn split_statements_handles_doubled_escaped_quote_in_literal() {
-        // `''` is the standard SQL-escaped single quote; a semicolon after one
-        // must still be treated as inside the (still-open) literal.
+        // `''` is an escaped quote, so the literal is still open at the `;`.
         let sql = "INSERT INTO posts (title) VALUES ('it''s; still one literal');";
         let statements = split_statements(DatabaseBackend::Postgres, sql);
         assert_eq!(statements.len(), 1, "got: {statements:?}");
@@ -4472,8 +4409,7 @@ mod tests {
 
     #[test]
     fn drop_index_concurrently_is_safe_from_classifier() {
-        // CONCURRENTLY avoids the table lock; the opt-out check in migrate.rs handles
-        // the metadata.toml requirement separately.
+        // migrate.rs checks the `metadata.toml` requirement for CONCURRENTLY separately.
         let findings = classify_sql("DROP INDEX CONCURRENTLY idx_posts_title;");
         assert!(
             findings
@@ -4762,7 +4698,7 @@ mod tests {
         }
     }
 
-    // ── review regressions: SQLite dialect (#1906) ────────────────────────
+    // ── SQLite dialect edge cases (#1906) ─────────────────────────────────
 
     /// Every operation reported for `sql` on `SQLite`.
     fn sqlite_ops(sql: &str) -> Vec<String> {
@@ -4817,8 +4753,7 @@ mod tests {
 
     #[test]
     fn sqlite_reads_a_default_with_no_space_before_the_value() {
-        // `DEFAULT(0)` is valid SQL. Missing it made the NOT NULL rule fire and
-        // block a statement SQLite applies cleanly.
+        // Misreading `DEFAULT(0)` would fire the NOT NULL rule on a statement SQLite applies.
         assert!(
             classify_sql_for(
                 DatabaseBackend::Sqlite,
@@ -4989,7 +4924,7 @@ mod tests {
                 sqlite_ops(sql)
             );
         }
-        // The four forms SQLite does parse stay classified as before.
+        // The four forms SQLite parses keep their own rules.
         for sql in [
             "ALTER TABLE t ADD COLUMN c TEXT;",
             "ALTER TABLE t DROP COLUMN c;",
@@ -5124,7 +5059,7 @@ mod tests {
         assert_eq!(subs, ["add column a text default 'it''s,x'"]);
     }
 
-    // ── #3527 (issue #3521): Postgres ALTER TABLE split ──────────────────────
+    // ── Postgres ALTER TABLE split (#3521) ───────────────────────────────────
 
     fn pg_subs(sql: &str) -> Vec<&str> {
         alter_table_subcommands(DatabaseBackend::Postgres, sql)

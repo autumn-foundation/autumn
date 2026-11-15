@@ -213,8 +213,6 @@ fn resolve_database_url() -> String {
     crate::config::resolve_database_url()
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,7 +252,7 @@ mod tests {
         );
     }
 
-    // ── Issue #1243: no more psql shell-out ─────────────────────────────────
+    // SQL runs through tokio_postgres, not a psql shell-out (#1243).
 
     #[test]
     fn no_sql_constant_uses_psql_variable_syntax() {
@@ -276,8 +274,8 @@ mod tests {
 
     #[test]
     fn no_sql_constant_uses_textual_transaction_control() {
-        // Transactions are now driven by tokio_postgres::Client::transaction(),
-        // not textual BEGIN/COMMIT statements sent through psql.
+        // Transactions go through `tokio_postgres::Client::transaction()`, not textual
+        // BEGIN/COMMIT.
         for sql in [ENABLE_SQL, DISABLE_SQL, SET_ROLLOUT_SQL, ALLOW_UPSERT_SQL] {
             assert!(!sql.contains("BEGIN;"), "no textual BEGIN: {sql}");
             assert!(!sql.contains("COMMIT;"), "no textual COMMIT: {sql}");

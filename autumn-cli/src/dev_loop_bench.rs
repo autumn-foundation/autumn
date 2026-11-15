@@ -128,23 +128,17 @@ pub const fn budget_for(class: ChangeClass) -> LatencyBudget {
             p95_ms: 8_000,
             max_ms: 15_000,
         },
-        // Cold-start onboarding budget (issue #977). The original target was
-        // p95 60s / max 90s. Issue #2309 raised it to p95 130s / max 160s.
-        //
-        // Issue #2795 cut the build (ADR 0027, ADR 0045, ADR 0046). Two CI
-        // runs of 5 samples then measured 50.4-52.8s and 75.8-76.9s: the
-        // runners differ. The gate checks p95 and max only. With 3 runs,
-        // p95 is the slowest sample. p95 is 30% above the slowest sample
-        // seen. See docs/guide/dev-loop-latency.md for the full history.
+        // Cold-start onboarding budget (#977). CI runners differ: two runs of 5 samples measured
+        // 50.4-52.8s and 75.8-76.9s. The gate checks p95 and max only; with 3 runs p95 is the
+        // slowest sample, so p95 is set 30% above the slowest sample seen.
+        // See docs/guide/dev-loop-latency.md for the history.
         ChangeClass::ColdStartHello => LatencyBudget {
             p50_ms: 80_000,
             p95_ms: 100_000,
             max_ms: 120_000,
         },
-        // Database-backed cold start is informational only in this slice, so
-        // these limits are not gated. The bundled managed-Postgres provider adds
-        // significant compile + first-boot weight (it embeds and starts a real
-        // Postgres), so the expectation is generous.
+        // Informational, not gated. The bundled managed-Postgres provider embeds and starts a
+        // real Postgres, so compile and first boot are much slower.
         ChangeClass::ColdStartDb => LatencyBudget {
             p50_ms: 120_000,
             p95_ms: 180_000,
@@ -202,8 +196,7 @@ pub fn compute_stats(samples: &[u64]) -> ClassStats {
 // ── Budget checking ──────────────────────────────────────────────────────────
 
 /// Result of comparing measured statistics against the accepted budget.
-// Each bool is an independent, named outcome flag (pass / p95 / max /
-// informational); a state machine would obscure rather than clarify them.
+// Each bool is an independent outcome flag: pass, p95, max, informational.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Serialize)]
 pub struct BudgetCheckResult {
@@ -464,9 +457,8 @@ pub fn run(
     eprintln!("Note: live measurement requires `autumn dev` and a running HTTP server.");
     eprintln!("Use --dry-run to print the budget table without starting a server.\n");
 
-    // Build a synthetic report using placeholder stats so the command is
-    // useful in CI even before the live measurement driver is wired up.
-    // The live measurement driver is tracked in the parent issue.
+    // Placeholder stats until the live measurement driver is wired up, so CI still exercises
+    // the reporting path.
     let results = build_placeholder_results(example);
     let all_passed = results.iter().all(|r| r.passed);
 
@@ -512,9 +504,7 @@ pub fn emit_report(
 
     if let Some(path) = output {
         if let Err(e) = std::fs::write(path, &machine) {
-            // A requested report that can't be written must fail the run: CI gates
-            // read this file, and a fail-open here would let a gate pass with no
-            // report.
+            // CI gates read this file, so a report that cannot be written fails the run.
             eprintln!("Error: could not write report to {path}: {e}");
             exit = 1;
         } else {
@@ -621,9 +611,8 @@ fn build_placeholder_results(example: &str) -> Vec<BudgetCheckResult> {
         .iter()
         .map(|&class| {
             let budget = budget_for(class);
-            // Placeholder: report zero samples so CI can exercise the reporting
-            // path. Replace with live HTTP polling once the measurement driver
-            // lands. compute_stats(&[]) → all-zeros → passes every budget.
+            // Placeholder until the measurement driver lands: zero samples give all-zero stats,
+            // which pass every budget.
             let stats = compute_stats(&[]);
             check_budget(class, stats, &budget)
         })
@@ -661,11 +650,9 @@ fn cpu_model_from_cpuinfo(cpuinfo: &str) -> Option<String> {
 
 // ── Cold-start onboarding benchmark (issue #977) ──────────────────────────────
 //
-// This file holds the **pure, unit-tested** half of the cold-start benchmark:
-// budgets, statistics, budget checking, report building, and the dry-run budget
-// table. The **live measurement driver** (scaffold → cold compile → serve → time
-// the first 200) is all subprocess / TCP / filesystem I/O and lives in
-// [`crate::cold_start_driver`], which is excluded from coverage like `dev.rs`.
+// The pure half: budgets, statistics, gate, report and dry-run table. The live driver
+// (scaffold, cold compile, serve, time the first 200) is all I/O and lives in
+// [`crate::cold_start_driver`], which is excluded from coverage.
 
 /// Outcome of the (optional) database-backed cold-start shape.
 pub enum DbOutcome {
@@ -900,13 +887,10 @@ pub fn cargo_executable_path(stdout: &[u8], bin_name: &str) -> Option<PathBuf> {
 
 // ── Overload / load-shedding benchmark (issue #1006) ──────────────────────────
 //
-// This is the pure, unit-tested half of `autumn dev-loop-bench --overload`: the
-// accepted budget, statistics, and gate logic for the Success Metric declared
-// in issue #1006. The live measurement driver (scaffold a throwaway app with a
-// slow handler, boot it with `server.max_concurrent_requests` configured, fire
-// concurrent load, sample RSS) is all subprocess / TCP / filesystem I/O and
-// lives in [`crate::overload_driver`], which is excluded from coverage like
-// `cold_start_driver.rs`.
+// The pure half of `autumn dev-loop-bench --overload`: budget, statistics and gate. The live
+// driver (boot a slow-handler app with `server.max_concurrent_requests`, fire concurrent load,
+// sample RSS) is all I/O and lives in [`crate::overload_driver`], which is excluded from
+// coverage.
 
 /// Accepted budget for the overload benchmark (issue #1006's Success Metric).
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -968,9 +952,8 @@ pub struct OverloadStats {
 }
 
 /// Result of checking measured [`OverloadStats`] against the [`OverloadBudget`].
-// Each bool is an independent, named outcome flag for one of the three
-// budget dimensions (p99 ratio / shed latency / RSS) plus whether RSS
-// sampling ran at all — mirrors `BudgetCheckResult`'s identical allow.
+// Each bool is an independent outcome flag: p99 ratio, shed latency, RSS, and whether RSS was
+// sampled at all.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Serialize)]
 pub struct OverloadCheckResult {
@@ -1064,10 +1047,8 @@ pub fn check_overload_budget(
     let shed_max_ms = compute_stats(&stats.shed_samples_ms).max_ms;
     let shed_p99_ms = percentile_99(&stats.shed_samples_ms);
 
-    // Integer percentage (nearest whole percent) to avoid a lossy u64→f64
-    // cast, matching `check_budget`'s `p95_overage_pct` idiom. Ample precision
-    // for gating against a 120%-style budget. `checked_div` naturally yields
-    // `0.0` for a zero baseline (no ratio can be established).
+    // Whole-percent integer math avoids a lossy u64→f64 cast. `checked_div` yields `0.0` for a
+    // zero baseline, where no ratio exists.
     let p99_ratio = admitted_p99_ms
         .saturating_mul(100)
         .checked_div(baseline_p99_ms)
@@ -1911,9 +1892,7 @@ mod tests {
 
     #[test]
     fn run_output_write_failure_returns_nonzero() {
-        // A requested --output that cannot be written must fail the run (not be
-        // swallowed): CI gates read this file, so a fail-open would let a gate
-        // pass with no report.
+        // A requested --output that cannot be written must fail the run: CI gates read this file.
         let exit = run(
             "examples/hello",
             3,
@@ -2496,13 +2475,9 @@ mod tests {
 
     #[test]
     fn overload_budget_check_fails_when_nothing_was_ever_shed() {
-        // A broken admission gate that never enforces the ceiling would
-        // otherwise report success: shed_count == 0 vacuously satisfies
-        // shed_fast_enough (nothing to be slow), and admitted p99/RSS can
-        // both look fine when every offered request is simply admitted. The
-        // benchmark's offered load is always ceiling * load_multiplier, so a
-        // working gate must shed *something* — `passed` must catch this even
-        // though every other budget dimension looks perfect.
+        // A gate that never sheds would otherwise pass: `shed_count == 0` satisfies
+        // `shed_fast_enough` vacuously, and admitted p99 and RSS look fine when everything is
+        // admitted. Offered load is ceiling * load_multiplier, so a working gate sheds something.
         let mut stats = passing_overload_stats();
         stats.shed_count = 0;
         stats.shed_samples_ms = vec![];
@@ -2670,10 +2645,8 @@ mod tests {
 
     #[test]
     fn percentile_99_respects_p50_p95_p99_ordering() {
-        // `percentile_99` and `compute_stats`'s p50/p95 use the same
-        // nearest-rank method over the same sorted sample set, so p50 <= p95
-        // <= p99 must hold — guards against a regression in either
-        // implementation diverging from the other.
+        // `percentile_99` and `compute_stats` both use nearest-rank over the same sorted samples,
+        // so p50 <= p95 <= p99 must hold.
         let samples: Vec<u64> = (1..=100).collect();
         let class_stats = compute_stats(&samples);
         let p99 = percentile_99(&samples);

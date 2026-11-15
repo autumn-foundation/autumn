@@ -72,14 +72,8 @@ pub fn plan_migration_with_options(
     super::model::validate_resource_name(name)?;
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, uniques)?;
-    // Issue #1340: `generate migration` emits SQL and nothing else — it never
-    // writes a model file, so there is nowhere for the `#[encrypted(...)]`
-    // attribute to land. Accepting `{encrypted}` here would add an ordinary
-    // plaintext column while the author believes they declared encryption:
-    // precisely the silent failure this DSL token exists to eliminate. Point at
-    // the two generators that do wire the attribute, and at the existing
-    // `Encrypt<Column>On<Table>` shape for converting a column that already
-    // exists.
+    // This command writes no model, so `{encrypted}` would silently add a plaintext column
+    // (#1340).
     if let Some(field) = fields.iter().find(|f| f.is_encrypted()) {
         return Err(GenerateError::InvalidField {
             token: field.name.clone(),
@@ -96,19 +90,9 @@ pub fn plan_migration_with_options(
             ),
         });
     }
-    // Issue #1384: same reasoning as `{encrypted}` above, and the same silent
-    // failure. `generate migration` emits SQL only, so the `#[translatable]`
-    // attribute — and the `Translated` field type that carries every bit of the
-    // behaviour — would never reach a model. The column would be added as
-    // `TEXT NOT NULL DEFAULT '{}'` while the model kept reading it as a plain
-    // `String`, so the app would render raw JSON where the author believed they
-    // had declared per-locale content.
-    //
-    // Refusing here also closes the `--unique` hole by construction: the flag is
-    // folded in above by `apply_unique_flags`, after `parse_field`'s own
-    // `:unique` cross-check has already run, so `--unique` on a translatable
-    // column would otherwise have emitted a UNIQUE index over the whole JSON
-    // container — precisely what the inline spelling refuses.
+    // Likewise `{translatable}` (#1384): no model would read the JSON column as `Translated`.
+    // This also refuses `--unique`, which `apply_unique_flags` folds in after `parse_field`'s
+    // own check and which would index the whole JSON container.
     if let Some(field) = fields.iter().find(|f| f.is_translatable()) {
         return Err(GenerateError::InvalidField {
             token: field.name.clone(),
@@ -123,14 +107,10 @@ pub fn plan_migration_with_options(
             ),
         });
     }
-    // Determine the target app's database backend so the emitted ALTER TABLE
-    // DDL is backend-aware (SQLite foundation, issue #1614).
     let backend = detect_backend(project_root);
 
-    // The directory uses snake_case (`add_title_to_posts`) but the shape is
-    // detected from the original PascalCase form because the keywords `To`
-    // and `From` only have an unambiguous meaning at PascalCase chunk
-    // boundaries.
+    // The shape is detected from the PascalCase name: `To` and `From` are only unambiguous at
+    // PascalCase chunk boundaries.
     let dir_name = format!("{timestamp}_{}", snake_or_pascal_to_snake(name));
     let migration_dir = project_root.join("migrations").join(&dir_name);
 
@@ -139,40 +119,19 @@ pub fn plan_migration_with_options(
     let shape = detect_migration_shape(&pascalish(name));
     let (up, down) = match shape {
         MigrationShape::AddColumns { ref table } if !fields.is_empty() => {
-            // A `references` field here gets the same target-model warning /
-            // UUID-PK error as `generate model`/`generate scaffold` (issue
-            // #1026) — otherwise the same DSL token gives inconsistent
-            // feedback depending only on which subcommand declared it.
-            // `own_id_type` is `None`: this shape only `ALTER TABLE`s an
-            // *existing* table, so its actual primary-key type isn't tracked
-            // anywhere the generator can see — a self-reference here is left
-            // unvalidated rather than guessed at.
+            // Same `references` checks as `generate model` (#1026). `own_id_type` is `None`: the
+            // altered table's PK type is unknown here, so a self-reference is not guessed at.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
-            // Issue #1318: a `lock_version` token means optimistic locking here
-            // too — `add_columns_up_sql_for` gives it the `DEFAULT 0` the
-            // DB-managed column needs — so validate it exactly as `generate
-            // model`/`generate scaffold` do. Scoped to the ADD shape on
-            // purpose: a REMOVE migration names a column that already exists,
-            // and dropping a legacy `lock_version` whose name now collides with
-            // the magic one is a legitimate (indeed, the recommended) thing to
-            // do. Its rollback re-adds the column with the type the user
-            // supplied, so rejecting `RemoveLockVersionFromPosts
-            // lock_version:String` would block the very escape hatch the other
-            // error messages point at.
+            // Validate `lock_version` as `generate model` does (#1318). ADD shape only: dropping a
+            // legacy `lock_version` of another type is the escape hatch the errors point at.
             super::model::validate_lock_version_field(&fields, &[])?;
-            // The same standing guard `generate model`/`scaffold` carries: a
-            // field kind with no working diesel SQLite conversion would leak an
-            // uncompilable column into the app. Every kind converts as of #1924
-            // (AC #4).
+            // Same guard as `generate model`: a kind with no diesel SQLite conversion would not
+            // compile. Every kind converts as of #1924.
             if backend == autumn_web::config::DatabaseBackend::Sqlite {
                 super::reject_sqlite_unsupported_field_kinds(&fields)?;
             }
-            // `src/schema.rs`'s current content, so a `unique` field being
-            // added here can't pick an index name that coincidentally
-            // collides with a plain index on some other, already-existing
-            // column from an earlier migration this one has no other way to
-            // see (issue #1032 review follow-up). Empty string (no
-            // collision-check widening) if the file doesn't exist yet.
+            // Lets a `unique` index name avoid colliding with an index from an earlier migration
+            // (#1032). Empty when the file does not exist yet.
             let existing_schema =
                 std::fs::read_to_string(project_root.join("src/schema.rs")).unwrap_or_default();
             (
@@ -181,16 +140,10 @@ pub fn plan_migration_with_options(
             )
         }
         MigrationShape::RemoveColumns { ref table } if !fields.is_empty() => {
-            // `remove_columns_down_sql`'s rollback restores the FK
-            // constraint/index for a `references` field (issue #1026), so it
-            // needs the same UUID-PK guard as `AddColumns` — otherwise a
-            // target with a UUID primary key still produces a `down.sql`
-            // that fails to apply on rollback.
+            // The rollback restores a `references` field's FK and index (#1026), so it needs the
+            // same UUID-PK guard as `AddColumns`.
             super::model::check_reference_targets(&mut plan, project_root, &fields, table, None)?;
-            // The rollback (`down.sql`) re-adds the removed columns via
-            // `ALTER TABLE … ADD COLUMN …`, so a field kind with no working
-            // diesel SQLite conversion would still leak into generated DDL —
-            // reject it up front, matching the AddColumns path (AC #4, #1924).
+            // `down.sql` re-adds the columns, so the SQLite kind guard applies here too (#1924).
             if backend == autumn_web::config::DatabaseBackend::Sqlite {
                 super::reject_sqlite_unsupported_field_kinds(&fields)?;
             }
@@ -235,14 +188,11 @@ pub fn plan_migration_with_options(
             encrypt_columns_down_sql(table, columns),
         ),
         MigrationShape::AddSearch { ref table } => {
-            // Full-text search is backend-aware (issue #1910): Postgres emits a
-            // `tsvector` generated column + GIN index; SQLite emits an
-            // external-content FTS5 virtual table + maintenance triggers (see
-            // `add_search_up_sql_for`). Neither leaks DDL that breaks the other
-            // backend, so `--search` now works on both.
+            // Postgres gets a `tsvector` column + GIN index, SQLite an FTS5 table + triggers
+            // (#1910; see `add_search_up_sql_for`).
             let singular = singularize(table);
 
-            // Collect all potential model file candidates in order of preference
+            // Model file candidates, in order of preference.
             let mut candidates = Vec::new();
 
             let first_cand = project_root
@@ -480,10 +430,8 @@ mod tests {
 
     #[test]
     fn destroy_migration_refuses_directory_with_unplanned_file_unless_forced() {
-        // issue #1048 PR review: a developer may drop a README.md or an
-        // auxiliary fixture alongside the generated up.sql/down.sql. Destroy
-        // must treat that extra file as divergence rather than silently
-        // sweeping it up with `remove_dir_all`.
+        // An extra file beside up.sql/down.sql (a README, a fixture) is divergence, not
+        // something `remove_dir_all` may sweep up (#1048).
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -619,9 +567,7 @@ mod tests {
 
     #[test]
     fn remove_columns_with_references_field_errors_on_uuid_target() {
-        // The restored FK constraint in remove_columns_down_sql needs the
-        // same UUID-PK guard as AddColumns — otherwise a target with a UUID
-        // primary key still produces a down.sql that fails on rollback.
+        // Otherwise a UUID-keyed target yields a down.sql that fails on rollback.
         let tmp = project();
         let models_dir = tmp.path().join("src/models");
         fs::create_dir_all(&models_dir).unwrap();
@@ -1257,7 +1203,7 @@ pub struct Post {
         });
     }
 
-    // ── `plan_migration_destroy_fallback` (issue #1048 PR review) ───────────
+    // ── `plan_migration_destroy_fallback` (issue #1048) ─────────────────────
 
     /// A project holding a `#[searchable]` `Post` model and the
     /// `AddSearchToPosts` migration generated from it, returned with the
@@ -1292,10 +1238,8 @@ pub struct Post {
 
     #[test]
     fn destroy_add_search_migration_after_model_already_destroyed_still_removes_it() {
-        // A common cleanup order — destroying the model before destroying
-        // an `AddSearchTo<Table>` migration that depended on its
-        // `#[searchable]` config — must not strand the migration directory
-        // just because `plan_migration_with_options` can no longer read it.
+        // Destroying the model first must not strand an `AddSearchTo<Table>` migration whose
+        // `#[searchable]` config is now gone.
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -1316,10 +1260,8 @@ pub struct Post {
                     "99999999999999",
                 )
                 .unwrap();
-                // The fallback plan cannot reproduce the SQL — the search
-                // config is gone — but the digest `generate` recorded still
-                // proves the files are its own untouched output, so no
-                // --force is needed (issue #1835).
+                // The SQL cannot be reproduced, but the digest `generate` recorded proves the
+                // files are untouched, so no --force is needed (#1835).
                 fallback_plan.revert(Flags::default()).unwrap();
                 assert!(!dir.exists());
             },
@@ -1328,8 +1270,7 @@ pub struct Post {
 
     #[test]
     fn destroy_add_search_migration_still_refuses_hand_edited_sql() {
-        // The #1048 guard under the #1835 code path: the recorded digest makes
-        // the fallback plan usable, and an edit still has to break it.
+        // With a recorded digest (#1835), an edited file still blocks the fallback (#1048).
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -1358,9 +1299,8 @@ pub struct Post {
 
     #[test]
     fn destroy_add_search_migration_without_provenance_still_needs_force() {
-        // The pre-#1835 path, still taken by a project generated before the
-        // manifest existed: nothing was recorded and the search config is
-        // gone, so the SQL is unverifiable and the directory is left alone.
+        // A project generated before the manifest (#1835) recorded no digest, so with the
+        // search config gone the SQL is unverifiable.
         temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
@@ -1463,11 +1403,8 @@ pub struct Post {
 
     #[test]
     fn add_columns_self_reference_to_table_being_altered_has_no_warning() {
-        // `AddCategoryToCategories category:references` targets the very
-        // table it's altering — a filesystem lookup for a "Category" model
-        // is irrelevant here (the table obviously already exists, that's
-        // the point of ALTER TABLE), so no "model not found" warning should
-        // fire for the self-reference.
+        // A self-reference targets the table being altered, which exists, so no "model not
+        // found" warning.
         let tmp = project();
         let plan = plan_migration(
             tmp.path(),
@@ -1481,11 +1418,8 @@ pub struct Post {
 
     #[test]
     fn add_columns_self_reference_errors_when_existing_model_has_uuid_pk() {
-        // Unlike `generate model`, `generate migration Add…To…` alters an
-        // EXISTING table — if that table's own model file is on disk and
-        // declares a UUID primary key, the self-reference must still be
-        // caught (it's not "unknown PK type, can't check", it's "known PK
-        // type, from the file the caller didn't think to look at").
+        // The altered table's model file on disk declares a UUID PK, so the self-reference is
+        // still caught.
         let tmp = project();
         let models_dir = tmp.path().join("src/models");
         fs::create_dir_all(&models_dir).unwrap();
@@ -1526,10 +1460,8 @@ pub struct Post {
 
     #[test]
     fn adding_a_lock_version_column_carries_the_default_that_makes_it_usable() {
-        // The retrofit path — "add optimistic locking to a resource I already
-        // shipped" — is how this column normally arrives. `#[lock_version]`
-        // keeps it out of `New{Model}`, so a bare NOT NULL add would leave
-        // every later insert failing; the DEFAULT also backfills existing rows.
+        // `#[lock_version]` keeps the column out of `New{Model}`, so a bare NOT NULL add would
+        // fail every later insert. The DEFAULT also backfills existing rows.
         let tmp = project();
         let plan = plan_migration(
             tmp.path(),
@@ -1547,8 +1479,7 @@ pub struct Post {
 
     #[test]
     fn adding_a_lock_version_column_of_the_wrong_type_is_rejected() {
-        // Same DSL token, same feedback as `generate model`/`generate scaffold`
-        // — otherwise the diagnosis depends only on which subcommand you typed.
+        // Same feedback as `generate model` for the same token.
         let tmp = project();
         let err = plan_migration(
             tmp.path(),
@@ -1566,10 +1497,8 @@ pub struct Post {
 
     #[test]
     fn removing_a_legacy_lock_version_column_is_never_type_checked() {
-        // Dropping a pre-existing ordinary `lock_version` is exactly the escape
-        // hatch the other error messages point at, and the rollback re-adds the
-        // column with the type the caller supplied. Applying the optimistic-lock
-        // type restriction to a REMOVE migration would block it.
+        // Dropping a legacy `lock_version` is the escape hatch the other errors point at. The
+        // rollback re-adds it with the caller's type, so a type check would block it.
         let tmp = project();
         let plan = plan_migration(
             tmp.path(),

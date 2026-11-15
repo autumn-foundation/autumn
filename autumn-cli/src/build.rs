@@ -38,17 +38,13 @@ fn build_cargo_command(
     auditable: bool,
 ) -> Command {
     let mut cargo = Command::new("cargo");
-    // `cargo auditable build` embeds the resolved dependency list into the
-    // compiled binary (a `.dep-v0` section), so a deployed single binary can
-    // report exactly which crate versions are inside it with no source tree
-    // and no lockfile — see `autumn sbom --binary` and
-    // docs/guide/supply-chain.md.
+    // `cargo auditable build` embeds the resolved dependency list in the binary (a `.dep-v0`
+    // section), so a deployed binary can report its crate versions with no source tree or
+    // lockfile. See `autumn sbom --binary` and docs/guide/supply-chain.md.
     //
-    // It MUST be reached through this subcommand. `cargo-auditable` only enters
-    // wrapper mode when `CARGO_AUDITABLE_ORIG_ARGS` is set, and only `cargo
-    // auditable` itself sets it; pointing RUSTC_WORKSPACE_WRAPPER straight at
-    // the binary makes it exit 1 on cargo's first `rustc -vV` probe, failing
-    // the build before anything compiles.
+    // It must go through the subcommand: `cargo-auditable` enters wrapper mode only when
+    // `CARGO_AUDITABLE_ORIG_ARGS` is set, which only `cargo auditable` does. As a bare
+    // RUSTC_WORKSPACE_WRAPPER it exits 1 on cargo's first `rustc -vV` probe.
     if auditable {
         cargo.arg("auditable");
     }
@@ -62,11 +58,9 @@ fn build_cargo_command(
     if let Some(b) = bin {
         cargo.args(["--bin", b]);
     }
-    // Build the feature string. `embed-assets` (the app-crate feature that pulls
-    // in `autumn-web/embed-assets`) is added when we are in the embed phase.
-    // `extra_features` (e.g. `autumn-web/managed-pg-bundled`) is forwarded from
-    // the CLI so that apps wiring ManagedPostgresPoolProvider can compile in both
-    // the fingerprint phase and the final embed phase without feature-gate errors.
+    // `embed-assets` is added in the embed phase. `extra_features` (e.g.
+    // `autumn-web/managed-pg-bundled`) goes to both phases, so apps wiring
+    // ManagedPostgresPoolProvider compile in each.
     match (embed, extra_features) {
         (true, Some(extra)) => {
             cargo.args(["--features", &format!("embed-assets,{extra}")]);
@@ -459,10 +453,8 @@ fn resolve_project_edge_scan(
             .unwrap_or_else(|| cwd.clone())
     };
     let requested = edge_scan_requested_features(features, embed);
-    // A custom `[[bin]] path` for the capsule can live outside `src/`, which
-    // the scan's own `src/` walk never reaches — see
-    // `resolve_edge_scan_with_extra_file`'s doc for why (Codex review on
-    // #2739, round 7).
+    // A custom `[[bin]] path` for the capsule can live outside `src/`, which the scan's own
+    // `src/` walk never reaches; see `resolve_edge_scan_with_extra_file`.
     let capsule_bin = crate::doctor::resolve_edge_capsule_bin(&root);
     crate::edge_scan::resolve_edge_scan_with_extra_file(&root, &requested, capsule_bin.as_deref())
 }
@@ -508,9 +500,8 @@ fn build_embedded(
         .join("static");
 
     eprintln!("Compiling ({profile} profile)...");
-    // Phase 1: compile WITHOUT embed-assets so build scripts populate static/.
-    // Pass extra features (e.g. managed-pg-bundled) so apps wiring
-    // ManagedPostgresPoolProvider can compile even in this pre-embed phase.
+    // Phase 1: compile without embed-assets so build scripts populate static/. Extra features
+    // are passed here too, or apps wiring ManagedPostgresPoolProvider fail to compile.
     run_cargo_or_exit(build_cargo_command(
         debug, false, package, bin, features, auditable,
     ));
@@ -585,8 +576,7 @@ fn effective_package<'a>(
 }
 
 /// Run the static build pipeline.
-// Each flag is an independent, orthogonal switch on the same pipeline and every
-// call site is the single `Commands::Build` match arm, so grouping them into an
+// Each flag is an independent switch on one pipeline, called from a single match arm, so an
 // options struct would add a type without removing an argument.
 #[allow(clippy::fn_params_excessive_bools)]
 pub fn run(
@@ -601,11 +591,9 @@ pub fn run(
     eprintln!("\u{1F342} autumn build\n");
 
     // ── Diesel table width ───────────────────────────────────────────────────
-    // A warning, never a stop: a table over 32 columns forces diesel's
-    // `64-column-tables` feature on the whole graph, which costs every crate
-    // that uses diesel compile time and memory. The app may want that table
-    // anyway; it should know the price. Pure source reading plus one
-    // `cargo metadata`, before the compile so it is seen early.
+    // A warning, never a stop: a table over 32 columns forces diesel's `64-column-tables` on the
+    // whole graph, costing every diesel crate compile time and memory. The app may want that
+    // table anyway, but should know the price. Checked before the compile so it is seen early.
     if let Some(warning) =
         crate::schema::width::format_build_warning(&crate::schema::width::scan(Path::new(".")))
     {
@@ -615,10 +603,9 @@ pub fn run(
     let profile = if debug { "dev" } else { "release" };
 
     // ── Edge preflight (issue #1790) ─────────────────────────────────────────
-    // Deliberately BEFORE any cargo invocation: the scan is pure source reading,
-    // so a flag/scan conflict (`--edge` with nothing to compile) is reported
-    // in milliseconds, not after a full native build. `run_edge_capsule_build`
-    // compiles the capsule later, after the native build and fingerprinting.
+    // Before any cargo invocation: the scan is pure source reading, so a flag/scan conflict
+    // (`--edge` with nothing to compile) is reported in milliseconds, not after a full native
+    // build. `run_edge_capsule_build` compiles the capsule later.
     let edge_scan = resolve_project_edge_scan(debug, embed, package, bin, features);
     // A warning, not a stop: the scan reads every file under `src/`, also one
     // that no `mod` declares. rustc stops a real case with the macro's error.
@@ -646,9 +633,8 @@ pub fn run(
         );
     }
 
-    // Embedding produces a self-contained release binary; it is not static-site
-    // generation, so it skips the static renderer (which requires `#[static_get]`
-    // routes and the app's runtime state) and lets dynamic-server apps build a
+    // Embedding builds a self-contained binary, not a static site: it skips the static renderer
+    // (which needs `#[static_get]` routes and runtime state), so dynamic-server apps get a
     // single binary without a database or pre-render step.
     if embed {
         build_embedded(debug, profile, package, bin, features, auditable);
@@ -673,9 +659,8 @@ pub fn run(
     // that member's static/ tree rather than the workspace root's.
     let (binary, manifest_dir, resolved_pkg) = find_binary(debug, package, bin);
 
-    // Release builds fingerprint *after* the compile (the runtime reads the
-    // manifest from disk, so order doesn't matter, and the static renderer below
-    // then resolves the new hashed URLs).
+    // Release builds only. The runtime reads the manifest from disk, so fingerprinting after the
+    // compile is fine, and the static renderer below then sees the hashed URLs.
     if !debug {
         eprintln!("\nFingerprinting static assets...");
         let static_dir = manifest_dir.as_deref().map_or_else(
@@ -690,11 +675,9 @@ pub fn run(
     // routes and no `#[static_get]` routes must still get its capsule, and a
     // static-render failure must not silently drop it.
     if plan == EdgePlan::Build {
-        // Follow find_binary's package resolution unconditionally — with or
-        // without a selector. The capsule must belong to the member whose
-        // sources were scanned, not whichever workspace member happens to own
-        // an edge-capsule bin; if the resolved member lacks the bin, the
-        // missing-target error (naming that member) is the correct answer.
+        // Follow find_binary's package resolution even without a selector: the capsule belongs to
+        // the member whose sources were scanned. If that member lacks the bin, the missing-target
+        // error names it.
         run_edge_capsule_build(&edge_scan, package.or(resolved_pkg.as_deref()), features);
     }
 
@@ -824,7 +807,6 @@ fn collect_and_fingerprint(root: &Path, dir: &Path, out: &mut HashMap<String, St
             hex::encode(&result[..4]) // 4 bytes = 8 hex chars
         };
 
-        // Build the fingerprinted filename: stem + hash + extension.
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -875,9 +857,7 @@ fn remove_previous_fingerprints(static_dir: &Path) {
     };
     for fingerprinted_rel in files.values() {
         if let Some(rel) = fingerprinted_rel.as_str() {
-            // Reject any path that tries to escape the static directory.
-            // The manifest is written by this tool and should never contain
-            // traversal components, but guard against tampered manifests.
+            // This tool never writes traversal components; guard against a tampered manifest.
             if rel.contains("..") || Path::new(rel).is_absolute() {
                 continue;
             }
@@ -1001,11 +981,9 @@ fn resolve_binary_from_metadata(
         },
     );
 
-    // Guard: when --bin is given without -p, reject the request if more than one
-    // package in the workspace owns a binary with that name.  Cargo would build
-    // all matching targets and emit an output-filename-collision warning; we must
-    // error here so the caller gets a clear message rather than silently using
-    // the first match's manifest_dir with the last-written binary on disk.
+    // With --bin and no -p, refuse when several packages own that binary: Cargo would build all
+    // of them and warn about the output collision, and we would pair the first match's
+    // manifest_dir with the last-written binary.
     if let (Some(explicit), None) = (bin, package) {
         let owners: Vec<&str> = matching_packages
             .iter()
@@ -1028,11 +1006,9 @@ fn resolve_binary_from_metadata(
             // Otherwise prefer `default-run` so packages with multiple binaries
             // always start the right one. Mirror the same logic as `dev.rs`.
             let name = if let Some(explicit) = bin {
-                // Only accept this package when it actually owns the requested
-                // binary target — without this guard, a workspace with multiple
-                // members matching the CWD filter would always pick the first
-                // member regardless of which one owns the bin, giving the wrong
-                // manifest_dir for fingerprinting and static rendering.
+                // Accept the package only if it owns the requested bin; otherwise several members
+                // matching the CWD filter would all resolve to the first, with the wrong
+                // manifest_dir.
                 if !pkg_owns_bin(pkg, explicit) {
                     return None;
                 }
@@ -1043,11 +1019,9 @@ fn resolve_binary_from_metadata(
                 pkg["targets"].as_array()?.iter().find_map(|t| {
                     let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
                     let name = t["name"].as_str()?;
-                    // The edge capsule is a companion target, never the app:
-                    // without this skip, metadata ordering could hand the
-                    // capsule bin to the static renderer, which would launch
-                    // it as the origin binary. Selecting it stays possible via
-                    // --bin or default-run — both explicit choices.
+                    // The edge capsule is a companion target, never the app: metadata order could
+                    // otherwise hand it to the static renderer as the origin binary. --bin or
+                    // default-run can still select it.
                     if is_bin && name != EDGE_BIN {
                         Some(name.to_owned())
                     } else {
@@ -1118,11 +1092,9 @@ mod tests {
 
     #[test]
     fn auditable_builds_go_through_the_cargo_auditable_subcommand() {
-        // `cargo-auditable` CANNOT be used as a bare RUSTC_WORKSPACE_WRAPPER:
-        // its wrapper mode only engages when `CARGO_AUDITABLE_ORIG_ARGS` is
-        // set, which only `cargo auditable` itself does. Invoked any other way
-        // it prints "'cargo auditable' should be invoked through Cargo" and
-        // exits 1 — killing the build on cargo's very first `rustc -vV` probe.
+        // `cargo-auditable` engages wrapper mode only when `CARGO_AUDITABLE_ORIG_ARGS` is set,
+        // which only `cargo auditable` does. Invoked any other way it exits 1 on cargo's first
+        // `rustc -vV` probe.
         let args = cargo_args_auditable(false, false, true);
         assert_eq!(
             args.first().map(String::as_str),
@@ -1949,10 +1921,9 @@ mod tests {
 
     #[test]
     fn apply_renderer_env_effective_pkg_prefers_package_over_resolved() {
-        // When both --package and --bin are given, effective_pkg uses --package.
-        // (Verifies the or_else short-circuit without touching managed-PG state.)
+        // With both --package and --bin supplied, the call must not panic and must still clear an
+        // inherited attach URL.
         let mut cmd = Command::new("echo");
-        // Just verify the function doesn't panic with both args supplied.
         apply_renderer_env(
             &mut cmd,
             false,
@@ -1979,12 +1950,9 @@ mod tests {
         let css_content = b"body { color: red; }";
         std::fs::write(css_dir.join("autumn.css"), css_content).unwrap();
 
-        // Call the inner function directly with an absolute path so the test
-        // never touches the process-global CWD (which is racy on all platforms
-        // and causes failures on Windows where CWD is a per-process lock).
+        // An absolute path keeps the test off the process-global CWD, which other tests race on.
         fingerprint_assets_in(&static_dir);
 
-        // Manifest must exist.
         let manifest_path = static_dir.join(".autumn-manifest.json");
         assert!(manifest_path.exists(), "manifest must be written");
 
@@ -2006,7 +1974,6 @@ mod tests {
             "fingerprinted path has correct extension"
         );
 
-        // The fingerprinted copy must exist.
         assert!(
             static_dir.join(fp).exists(),
             "fingerprinted copy must be written: {fp}"

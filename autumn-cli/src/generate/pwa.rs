@@ -61,9 +61,8 @@ fn plan_pwa_shared(project_root: &Path) -> Plan {
         render_maskable_icon_svg(),
     );
 
-    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
-    // model.rs: destroy recomputes this plan against the already-generated
-    // main.rs, where these edits are by definition already present.
+    // Pushed unconditionally: destroy recomputes this plan against the
+    // already-generated main.rs, where these edits are already present.
     let main_path = project_root.join("src").join("main.rs");
     plan.push_revert(crate::generate::emit::Revert::PwaMainRsInjection {
         path: main_path.clone(),
@@ -78,16 +77,10 @@ fn plan_pwa_shared(project_root: &Path) -> Plan {
         ],
     });
 
-    // migrations/<ts>_create_push_subscriptions/{up,down}.sql — the table the
-    // framework's `DbPushSubscriptionStore` reads (issue #1392).
-    //
-    // Like the notifications feed, push subscriptions are a singleton scaffold:
-    // re-running (especially with `--force`) must not mint a SECOND
-    // `*_create_push_subscriptions` directory, since two `CREATE TABLE
-    // push_subscriptions` migrations would fail the next `autumn migrate` on
-    // the duplicate table and make destroy's suffix match ambiguous. So reuse
-    // an existing directory when one is present, minting a fresh timestamped
-    // one only on a clean project.
+    // The table the framework's `DbPushSubscriptionStore` reads (#1392). It is a
+    // singleton migration: a re-run (even with `--force`) reuses the existing
+    // directory, since a second `CREATE TABLE push_subscriptions` would fail the
+    // next `autumn migrate` and make destroy's suffix match ambiguous.
     let backend = detect_backend(project_root);
     let migration_dir = existing_push_migration_dir(project_root).unwrap_or_else(|| {
         project_root.join("migrations").join(format!(
@@ -104,14 +97,12 @@ fn plan_pwa_shared(project_root: &Path) -> Plan {
         drop_table_sql(PUSH_SUBSCRIPTIONS_TABLE),
     );
 
-    // System test
     let system_test_path = project_root
         .join("tests")
         .join("system")
         .join("pwa_smoke.rs");
     plan.create(system_test_path, render_pwa_system_test());
 
-    // Cargo.toml: add system-tests feature if absent
     let cargo_path = project_root.join("Cargo.toml");
     plan.push_revert(crate::generate::emit::Revert::SystemTestCargoPatch {
         path: cargo_path,
@@ -133,8 +124,8 @@ fn plan_pwa_shared(project_root: &Path) -> Plan {
 pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
 
-    // Read src/main.rs up front (rather than where it's injected below) so
-    // the layout() shape can be validated before any plan actions are built.
+    // Read up front so the layout() shape is validated before any plan actions
+    // are built.
     let main_path = project_root.join("src").join("main.rs");
     let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
         GenerateError::Io(std::io::Error::new(
@@ -155,7 +146,6 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
 
     let mut plan = plan_pwa_shared(project_root);
 
-    // src/main.rs: inject PWA meta tags + route handlers (idempotent)
     let updated_main = inject_pwa_into_main(&main_existing);
     // A silently unmounted router is the worst outcome here: the command exits
     // 0, the client snippet ships, and every `fetch` it makes 404s with
@@ -173,7 +163,6 @@ pub fn plan_pwa(project_root: &Path) -> Result<Plan, GenerateError> {
         plan.modify(main_path, updated_main);
     }
 
-    // Cargo.toml: add system-tests feature if absent
     let cargo_path = project_root.join("Cargo.toml");
     let cargo_existing = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
     let patched_cargo = patch_system_test_cargo_toml(&cargo_existing, "pwa_smoke");
@@ -249,10 +238,8 @@ fn push_subscription_fields() -> Vec<Field> {
     vec![
         field("tenant_id", false),
         field("principal_id", false),
-        // UNIQUE is load-bearing, not decoration: it is what makes the store's
-        // `ON CONFLICT (endpoint) DO UPDATE` upsert atomic rather than a racy
-        // select-then-insert, and what stops one browser accumulating a row
-        // per page load.
+        // UNIQUE makes the store's `ON CONFLICT (endpoint) DO UPDATE` upsert
+        // atomic and stops one browser accumulating a row per page load.
         field("endpoint", true),
         field("p256dh", false),
         field("auth", false),
@@ -447,7 +434,7 @@ self.addEventListener('notificationclick', (event) => {
 }
 
 fn render_icon_svg() -> String {
-    // Note: using concat! to avoid raw-string issues with #ffffff and system-ui
+    // concat! rather than a raw string: the SVG contains `"#`, which ends an `r#"…"#`.
     concat!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 192 192\">\n",
         "  <!-- Replace this placeholder with your app icon (PNG recommended for broad compatibility) -->\n",
@@ -808,9 +795,8 @@ document.addEventListener('click', (event) => {{
 
 fn render_pwa_system_test() -> String {
     let manifest_selector = r#"link[rel="manifest"]"#;
-    // Handler stubs are defined inline so this integration test crate compiles without
-    // depending on src/main.rs.  The real handlers (with include_str! paths and the app's
-    // layout helper) are injected there by `inject_pwa_into_main`.
+    // Handler stubs are inline so the test crate compiles without src/main.rs; the real
+    // handlers are injected there by `inject_pwa_into_main`.
     let stubs = concat!(
         "#[get(\"/manifest.webmanifest\")]\n",
         "async fn pwa_manifest() -> impl IntoResponse {\n",
@@ -1024,9 +1010,8 @@ fn push_router_anchor(source: &str) -> Option<usize> {
             seen_main = true;
         }
         // Only a line that ENDS with the builder opener is an anchor: a
-        // single-line chain (`autumn_web::app().routes(…).run().await;`) has
-        // no place to insert a `.merge(…)` line, so it is deliberately left
-        // alone and reported instead of being spliced mid-expression.
+        // single-line chain (`autumn_web::app().routes(…).run().await;`) has no
+        // place for a `.merge(…)` line, so it is left alone and reported.
         (seen_main && line.trim_end().ends_with("autumn_web::app()"))
             .then(|| offset + line.trim_end().len())
     })
@@ -1063,8 +1048,7 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
 
     let lines: Vec<&str> = source.lines().collect();
 
-    // Find the first `head {` line (Maud DSL — no leading keyword).
-    // Support both `head {` and `head{` (both are valid Maud syntax).
+    // First Maud `head {` (or `head{`) line.
     let Some(head_idx) = lines.iter().position(|l| {
         let t = l.trim();
         t == "head {" || t == "head{"
@@ -1074,8 +1058,7 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
 
     let head_indent = indent_count(lines[head_idx]);
 
-    // Find the closing `}` of the head block (first `}` at the same indent
-    // level as `head {`, after `head {`).
+    // The head block closes at the first `}` at `head {`'s indent.
     let Some(close_rel) = lines[head_idx + 1..]
         .iter()
         .position(|l| indent_count(l) == head_indent && l.trim() == "}")
@@ -1085,9 +1068,7 @@ fn inject_pwa_meta_into_head(source: &str) -> String {
     let close_idx = head_idx + 1 + close_rel;
 
     let inner_indent = " ".repeat(head_indent + 4);
-    // Use an external script to stay compliant with `script-src 'self'` CSP.
-    // The script sets `data-sw-registered="true"` on `<html>` after registration;
-    // the system test polls for that attribute.
+    // An external script, not inline, so a `script-src 'self'` CSP allows it.
     let meta_block = format!(
         "{inner_indent}link rel=\"manifest\" href=\"/manifest.webmanifest\";\n\
          {inner_indent}meta name=\"theme-color\" content=\"#ffffff\";\n\
@@ -1242,10 +1223,8 @@ fn inject_pwa_handlers(source: &str) -> String {
         return source.to_owned();
     }
 
-    // Insert before the line that is exactly `#[autumn_web::main]` — a naive
-    // substring search would also match the text inside a comment that merely
-    // mentions the macro (e.g. `// routes are wired under #[autumn_web::main]`)
-    // and slice the file mid-comment. Appends at end as fallback.
+    // Insert before the line that is exactly `#[autumn_web::main]` (a substring
+    // match could hit a comment mentioning it); else append at the end.
     find_main_attr_line_start(source).map_or_else(
         || {
             let mut result = source.to_owned();
@@ -1483,10 +1462,8 @@ async fn main() {
 
     #[test]
     fn plan_pwa_rejects_layout_missing_current_path() {
-        // nav_bar's arrival made layout() take current_path as its second
-        // argument; pwa_offline's generated call now assumes that shape.
-        // Running against an app that hasn't migrated must fail loudly with
-        // an actionable message instead of silently emitting a call that
+        // pwa_offline's generated call assumes layout() takes current_path, so
+        // an app on the old shape must get an actionable error, not code that
         // won't compile.
         let tmp = project_with_main(OLD_SHAPE_MAIN);
         let err = plan_pwa(tmp.path()).unwrap_err();
@@ -1497,12 +1474,9 @@ async fn main() {
 
     #[test]
     fn plan_pwa_accepts_rustfmt_wrapped_layout_signature() {
-        // rustfmt wraps layout()'s ~108-char signature onto separate lines
-        // (verified: `rustfmt` puts each param on its own line at the
-        // default 100-column width) — current_path then no longer shares a
-        // physical line with `fn layout(`, so a naive single-line scan would
-        // false-positive as "missing current_path" on any formatted,
-        // up-to-date project.
+        // rustfmt puts each param of layout()'s ~108-char signature on its own
+        // line, so a single-line scan would wrongly report "missing
+        // current_path" on every formatted project.
         let wrapped_main = DEFAULT_MAIN.replace(
             "pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
             "pub fn layout(\n    title: &str,\n    current_path: &str,\n    flash: maud::Markup,\n    content: maud::Markup,\n) -> maud::Markup {",
@@ -1518,11 +1492,8 @@ async fn main() {
 
     #[test]
     fn plan_pwa_accepts_layout_with_renamed_path_parameter() {
-        // Rust calls are positional — a layout() with 4 parameters compiles
-        // fine against pwa_offline's 4-arg call regardless of what the
-        // second parameter is named. Requiring the literal name
-        // "current_path" would reject valid, already-migrated apps that
-        // simply chose a different name (e.g. `path`, `request_path`).
+        // Rust calls are positional: any 4-parameter layout() compiles against
+        // pwa_offline's call, whatever the second parameter is named.
         let renamed_main = DEFAULT_MAIN.replace(
             "pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
             "pub fn layout(title: &str, request_path: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {",
@@ -1825,10 +1796,8 @@ async fn main() {
 
     #[test]
     fn inject_handlers_ignores_main_attr_mentioned_in_comment() {
-        // A comment that merely mentions `#[autumn_web::main]` must not be
-        // treated as the insertion point — the naive substring search used to
-        // slice the file mid-comment, leaving the handlers inside the comment
-        // text and the file uncompilable.
+        // A comment mentioning `#[autumn_web::main]` is not the insertion point;
+        // splicing there would leave the handlers inside the comment.
         let source = "\
 use autumn_web::prelude::*;
 
@@ -2088,13 +2057,9 @@ async fn main() {
 
     #[test]
     fn destroy_pwa_still_works_after_main_rs_reverted_to_pre_nav_bar_shape() {
-        // issue #1048 PR review: `plan_pwa` (used to recompute the plan for
-        // destroy too) rejects `main.rs` whenever `layout()` has fewer than
-        // 4 parameters. That precondition only matters for a *fresh*
-        // generate — but a common cleanup order (hand-revert `main.rs` to
-        // the pre-`nav_bar` shape, or run a competing generator that
-        // rewrites `layout()`) would otherwise strand every PWA file
-        // because `destroy pwa` fails before `Plan::revert` ever runs.
+        // `plan_pwa` rejects a `layout()` with fewer than 4 parameters, which
+        // only matters for a fresh generate. Destroy must still clean up after
+        // `main.rs` was hand-reverted to the pre-`nav_bar` shape (#1048).
         let tmp = project_with_main(DEFAULT_MAIN);
         plan_pwa(tmp.path())
             .unwrap()
@@ -2102,9 +2067,7 @@ async fn main() {
             .unwrap();
         assert!(tmp.path().join("static/manifest.webmanifest").exists());
 
-        // Simulate main.rs having been rewritten to the old, incompatible
-        // arity after PWA was generated (still contains the PWA injections,
-        // just with layout() narrowed back down).
+        // Keep the PWA injections but narrow layout() back to 3 parameters.
         let main_path = tmp.path().join("src/main.rs");
         let with_pwa = fs::read_to_string(&main_path).unwrap();
         let narrowed = with_pwa.replace(
@@ -2309,15 +2272,10 @@ async fn main() {
 
     #[test]
     fn client_snippet_never_prompts_for_permission_on_page_load() {
-        // A permission prompt fired on load is the single fastest way to get
-        // permanently blocked, and Chrome/Firefox both penalise it. The
-        // snippet must expose an explicit opt-in instead.
-        //
-        // The check has to be positional, not a substring test: `contains`
-        // cannot tell a call INSIDE `autumnPushSubscribe` from one at top
-        // level, which is exactly the failure being guarded against. So find
-        // every `requestPermission` and require each to sit inside a function
-        // body — i.e. on an indented line.
+        // A prompt fired on load gets the site permanently blocked, and Chrome and
+        // Firefox penalise it. `contains` cannot tell a call inside
+        // `autumnPushSubscribe` from a top-level one, so require every
+        // `requestPermission` to sit on an indented line, inside a function body.
         let js = render_pwa_register_js();
         let prompts: Vec<&str> = js
             .lines()
@@ -2347,10 +2305,8 @@ async fn main() {
 
     #[test]
     fn client_snippet_sends_a_csrf_token_with_both_push_posts() {
-        // Autumn's production smart defaults turn CSRF on, and the CSRF cookie
-        // is HttpOnly — so without this the generated subscribe/unsubscribe
-        // POSTs 403 and push opt-in is unusable in exactly the environment it
-        // is meant for.
+        // Production defaults turn CSRF on and the CSRF cookie is HttpOnly, so
+        // without a token the subscribe/unsubscribe POSTs 403.
         let js = render_push_opt_in();
         assert!(
             js.contains(autumn_web::push::CSRF_TOKEN_HEADER),
@@ -2360,10 +2316,8 @@ async fn main() {
             js.contains(autumn_web::push::CSRF_TOKEN_HEADER_NAME_HEADER),
             "…and the configured header name to send it back in:\n{js}"
         );
-        // Every POST must go through the helper that attaches it — a `fetch`
-        // with a hand-written `content-type` header would silently skip it.
-        // Counted, not fixed at a number: adding a POST later must not be able
-        // to quietly ship one without a token.
+        // Every POST must use the helper that attaches the token. Counted rather
+        // than fixed, so a POST added later cannot ship without one.
         let posts = js.matches("method: 'POST'").count();
         assert!(
             posts >= 2,
@@ -2378,11 +2332,9 @@ async fn main() {
 
     #[test]
     fn client_snippet_replaces_a_subscription_made_with_a_rotated_key() {
-        // A browser keeps its subscription across deployments. After a
-        // `[push] private_key` rotation `subscribe()` REJECTS rather than
-        // replacing one made with the old applicationServerKey, so without
-        // this the affected users cannot opt back in through the generated
-        // button at all.
+        // After a `[push] private_key` rotation, `subscribe()` rejects rather than
+        // replacing a subscription made with the old key, so affected users could
+        // not opt back in through the button.
         let js = render_push_opt_in();
         assert!(
             js.contains("autumnPushKeyMatches"),
@@ -2429,10 +2381,9 @@ async fn main() {
 
     #[test]
     fn a_router_mount_inside_a_comment_does_not_count_as_mounted() {
-        // This project's own docs show a quick-start snippet containing the
-        // mount call, so a `main.rs` that pasted it into a comment would look
-        // mounted, skip injection AND skip the warning — leaving every
-        // generated `fetch` to 404 with nothing pointing at the cause.
+        // The docs' quick-start snippet contains the mount call. Pasted into a
+        // comment, it must not look mounted, or injection and the warning are
+        // both skipped and every generated `fetch` 404s.
         let commented = DEFAULT_MAIN.replace(
             "#[autumn_web::main]",
             "// Example from the guide:\n             //     .merge(autumn_web::push::router())\n             #[autumn_web::main]",
@@ -2484,13 +2435,11 @@ async fn main() {
 
     #[test]
     fn signing_out_forgets_the_row_without_revoking_a_shared_subscription() {
-        // An origin has ONE `PushSubscription` shared by every tab. With two
-        // accounts open, the row belongs to whichever signed in last, and the
-        // scoped unsubscribe route returns `204` either way (deliberately, so
-        // it cannot be used to probe who owns an endpoint). Revoking the
-        // browser subscription on the strength of that `204` would invalidate
-        // the OTHER account's endpoint — its next push `410`s, gets pruned,
-        // and it silently stops receiving until it opts in again.
+        // An origin has one `PushSubscription` shared by every tab, and the scoped
+        // unsubscribe route returns `204` whether or not this account owns the
+        // row (so it cannot probe ownership). Revoking on sign-out could kill
+        // another signed-in account's endpoint: its next push `410`s and the row
+        // is pruned.
         let js = render_push_opt_in();
         assert!(
             js.contains("window.autumnPushForget = "),
@@ -2511,7 +2460,6 @@ async fn main() {
             opt_out.contains("subscription.unsubscribe()"),
             "an explicit opt-out must still revoke the browser subscription:\n{opt_out}"
         );
-        // And `autumnPushForget` must NOT revoke.
         let forget = js
             .split_once("window.autumnPushForget = ")
             .expect("forget exists")
@@ -2547,10 +2495,8 @@ async fn main() {
 
     #[test]
     fn client_snippet_unsubscribes_when_the_user_signs_out() {
-        // A subscription outliving its session is a privacy leak: the row
-        // stays bound to the user who logged out, so the app keeps pushing
-        // their notifications to that browser — in front of whoever uses the
-        // device next.
+        // A subscription outliving its session keeps pushing the logged-out
+        // user's notifications to that browser, in front of the next user.
         let js = render_push_opt_in();
         assert!(
             js.contains("addEventListener('submit'"),
@@ -2572,16 +2518,10 @@ async fn main() {
 
     #[test]
     fn a_stalled_unsubscribe_never_traps_the_user_in_their_session() {
-        // The logout POST is preventDefault'd, so the form MUST submit
-        // regardless of what the unsubscribe promise does.
-        //
-        // `.catch(…).finally(…)` looks sufficient and is not:
-        // `autumnPushUnsubscribe` awaits `navigator.serviceWorker.ready`,
-        // which by specification never rejects — it stays pending until a
-        // worker activates. A worker that fails to install therefore leaves
-        // `finally` unreached and the user unable to log out. Only a race
-        // against a deadline actually secures the invariant this test names,
-        // so that is what is asserted.
+        // The logout POST is preventDefault'd, so the form must submit whatever
+        // the unsubscribe promise does. `.catch().finally()` is not enough:
+        // `navigator.serviceWorker.ready` never rejects, so a worker that fails
+        // to install leaves `finally` unreached. Only a deadline race works.
         let js = render_push_opt_in();
         assert!(
             js.contains("Promise.race("),
@@ -2619,13 +2559,9 @@ async fn main() {
 
     #[test]
     fn client_snippet_sends_credentials_on_every_push_request() {
-        // The server resolves the subscriber from the session; without the
-        // cookie every call is an anonymous 401.
-        //
-        // Compared against the number of `fetch` calls rather than a fixed
-        // count: every request the push half makes either authenticates or
-        // reads a per-visitor token, so a new one without credentials is a bug
-        // whatever the total happens to be.
+        // The server resolves the subscriber from the session cookie. Compared
+        // against the `fetch` count, not a fixed number, so a new request
+        // without credentials fails here.
         let js = render_push_opt_in();
         assert_eq!(
             js.matches("credentials: 'same-origin'").count(),
@@ -2701,10 +2637,9 @@ async fn main() {
             sql.contains("id BIGSERIAL PRIMARY KEY"),
             "the store selects `id` as BigInt:\n{sql}"
         );
-        // The store maps `created_at` as `Timestamptz`. The shared helper emits
-        // a plain `TIMESTAMP`, so this generator rewrites that one column — if
-        // the helper's spacing ever changes, the rewrite silently no-ops and
-        // this is what catches it.
+        // The helper emits `TIMESTAMP` and the generator rewrites it to match the
+        // store's `Timestamptz`; if the helper's spacing changes, the rewrite
+        // silently no-ops and this catches it.
         assert!(
             sql.contains("created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"),
             "`created_at` must be TIMESTAMPTZ to match the store's mapping:\n{sql}"
@@ -2717,10 +2652,8 @@ async fn main() {
 
     #[test]
     fn push_migration_makes_endpoint_unique_specifically() {
-        // `contains("UNIQUE")` alone would pass with the constraint on the
-        // wrong column — and `endpoint` being unique is what makes the store's
-        // `ON CONFLICT (endpoint) DO UPDATE` atomic rather than a racy
-        // select-then-insert.
+        // `contains("UNIQUE")` alone would pass with the constraint on the wrong
+        // column; the store's `ON CONFLICT (endpoint)` upsert needs it on `endpoint`.
         let sql = push_subscriptions_up_sql(DatabaseBackend::Postgres);
         let unique_line = sql
             .lines()
@@ -2778,8 +2711,7 @@ async fn main() {
     #[test]
     fn re_running_reuses_the_existing_push_migration_directory() {
         // Two `*_create_push_subscriptions` directories would fail the next
-        // `autumn migrate` on the duplicate table — the same singleton rule
-        // the notifications generator follows.
+        // `autumn migrate` on the duplicate table.
         let tmp = project_with_main(DEFAULT_MAIN);
         plan_pwa(tmp.path())
             .unwrap()

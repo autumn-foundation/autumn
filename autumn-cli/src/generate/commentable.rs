@@ -800,19 +800,13 @@ fn replay(files: &[String]) -> Replay {
                     state.columns_unknown = false;
                 }
                 TableEvent::Rename { from, to } => {
-                    // A rename is positive evidence the table exists: the
-                    // author just renamed it, and in a valid history the
-                    // statement would fail otherwise. The old scan read every
-                    // `RENAME TO comments` as the table existing; the
-                    // generalisation keeps that and additionally carries the
-                    // source table's columns across (#2282). When the history
-                    // never saw the source, its columns are unknown — present
-                    // but not polymorphic, so generation stays loud instead of
-                    // claiming a reuse it cannot verify.
+                    // A rename is evidence the table exists: in a valid history the statement
+                    // would fail otherwise. The source's columns carry across (#2282). When the
+                    // history never saw the source, its columns are unknown, so generation stays
+                    // loud instead of claiming a reuse it cannot verify.
                     //
-                    // `RENAME TO` takes a bare relation name: the table stays
-                    // in its schema, so `archive.legacy_comments RENAME TO
-                    // comments` yields `archive.comments`, not `comments`.
+                    // `RENAME TO` takes a bare name and the table stays in its schema:
+                    // `archive.legacy_comments RENAME TO comments` yields `archive.comments`.
                     let to = TableRef {
                         schema: to.schema.or_else(|| from.schema.clone()),
                         name: to.name,
@@ -908,13 +902,8 @@ fn parse_table_ref(text: &str) -> Option<(TableRef, usize)> {
     // The longer keyword first — it starts with the shorter one.
     rest = strip_keyword(rest, "if not exists");
     rest = strip_keyword(rest, "if exists");
-    // `ONLY` is PostgreSQL's "do not recurse to inheritance children" marker,
-    // and it does NOT sit where `IF EXISTS` does — the grammar is
-    // `ALTER TABLE [ IF EXISTS ] [ ONLY ] name [ * ]`, so the two COMBINE.
-    // Listing them as alternatives missed `ALTER TABLE IF EXISTS ONLY
-    // comments`, a valid spelling whose ALTERs were then ignored: the scan
-    // reported an incomplete schema and the generator emitted a duplicate
-    // `CREATE TABLE comments` that fails on the next `migrate`.
+    // `ONLY` (do not recurse to inheritance children) follows `IF EXISTS` rather than replacing
+    // it: the grammar is `ALTER TABLE [ IF EXISTS ] [ ONLY ] name [ * ]`.
     rest = strip_keyword(rest, "only");
     let (first, used) = parse_ident_segment(rest)?;
     rest = &rest[used..];
@@ -927,9 +916,8 @@ fn parse_table_ref(text: &str) -> Option<(TableRef, usize)> {
         (None, first)
     };
     let consumed = text.len() - rest.len();
-    // `public` (however spelled — quoted `"public"` names the same schema) is
-    // the default schema: `public.comments` and `comments` name the same
-    // relation, so they share one record.
+    // `public` (quoted or not) is the default schema: `public.comments` and `comments` are the
+    // same relation, so they share one record.
     let schema = schema.filter(|schema| schema != "public");
     Some((TableRef { schema, name }, consumed))
 }
@@ -1278,16 +1266,12 @@ const REQUIRED_COLUMNS: &[&str] = &[
 /// `RENAME COLUMN <other> TO <column>` is the opposite and must not count as a
 /// removal, so the position of the name relative to `to` decides.
 fn alter_removes_column(statement: &str, column: &str) -> bool {
-    // COLUMN is optional in a drop as well (`ALTER TABLE comments DROP
-    // commentable_type`), so the keyword cannot be what identifies one. Every
-    // `DROP` in the statement is examined because one ALTER may carry several
-    // (`DROP CONSTRAINT ck, DROP COLUMN commentable_type`).
+    // COLUMN is optional in a drop (`DROP commentable_type`), and one ALTER may carry several
+    // drops (`DROP CONSTRAINT ck, DROP COLUMN commentable_type`), so every `drop` is examined.
     for (at, _) in statement.match_indices(" drop ") {
         let rest = statement[at + " drop ".len()..].trim_start();
-        // These drop something OTHER than a column: a constraint, or a property
-        // of one (`ALTER COLUMN commentable_type DROP NOT NULL` names the column
-        // but keeps it). Reading them as removals would report a polymorphic
-        // table as broken and emit a duplicate migration.
+        // These drop a constraint or a column property, not a column
+        // (`ALTER COLUMN commentable_type DROP NOT NULL` keeps the column).
         if [
             "constraint ",
             "default",
@@ -1308,9 +1292,7 @@ fn alter_removes_column(statement: &str, column: &str) -> bool {
             return true;
         }
     }
-    // PostgreSQL makes COLUMN optional: `RENAME commentable_type TO kind`
-    // renames the column exactly as `RENAME COLUMN commentable_type TO kind`
-    // does. The `from` side covers both spellings.
+    // COLUMN is optional in a rename too: `RENAME commentable_type TO kind`.
     if let Some((from, to)) = column_rename(statement) {
         // Renaming the column AWAY removes it; renaming another column INTO
         // the discriminator name adds it, so the `to` side has to be clear.
@@ -1431,10 +1413,9 @@ fn migration_up_sql_where(project_root: &Path, keep: impl Fn(&Path, &str) -> boo
     let Ok(entries) = std::fs::read_dir(project_root.join("migrations")) else {
         return Vec::new();
     };
-    // Sorted by directory name, which carries the timestamp prefix diesel
-    // orders by. Read order from the filesystem is unspecified, and this scan
-    // now depends on sequence: a create followed by a drop is not the same
-    // history as a drop followed by a create.
+    // Sorted by directory name, the timestamp order diesel applies. Filesystem order is
+    // unspecified, and the replay depends on sequence: create-then-drop differs from
+    // drop-then-create.
     let mut dirs: Vec<std::path::PathBuf> = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -1515,30 +1496,18 @@ fn strip_sql_comments(sql: &str) -> String {
 
     while i < bytes.len() {
         match bytes[i] {
-            // A single-quoted STRING LITERAL is data, never DDL. Its contents
-            // are blanked rather than copied, because every matcher downstream
-            // scans this text for keywords, table names, columns and
-            // parentheses — and a literal can contain all four. Without this,
-            // `VALUES ('DROP TABLE comments;')` reads as a drop, and
-            // `DEFAULT ')'` closes a column list early.
+            // A single-quoted string literal is data, so its contents are blanked: the matchers
+            // scan for keywords, names and parentheses, and `VALUES ('DROP TABLE comments;')` or
+            // `DEFAULT ')'` must not match.
             //
-            // Length is preserved (one space per byte) so byte offsets stay
-            // valid: `replay_migration_history` sorts events by position, and
-            // the body slice is taken by index.
+            // One space per byte keeps offsets valid: `replay_migration_history` sorts events by
+            // position, and the body slice is taken by index.
             b'\'' => {
-                // In an E-STRING — and ONLY there — a backslash escapes the
-                // next character, so `E'can\'t; DROP TABLE comments;'` does not
-                // end at that apostrophe. Closing it there left the rest of the
-                // literal to be replayed as DDL.
-                //
-                // The restriction to E-strings is the important half. Under
-                // `standard_conforming_strings = on` (the default, checked)
-                // PostgreSQL treats a backslash in an ORDINARY literal as an
-                // ordinary character: `'can\'t X'` is an ERROR precisely
-                // because the quote still closes, and `'ends_with_backslash\'`
-                // closes normally. Honouring escapes everywhere would swallow
-                // the statements after such a literal — the same bug pointing
-                // the other way.
+                // Only in an E-string does a backslash escape the next character
+                // (`E'can\'t; DROP TABLE comments;'`). Under `standard_conforming_strings = on`
+                // (the default) a backslash in an ordinary literal is an ordinary character, so
+                // `'ends_with_backslash\'` closes there; honouring escapes everywhere would
+                // swallow the statements after it.
                 let escapes = is_escape_string_prefix(sql, i);
                 out.push('\'');
                 i += 1;
@@ -1571,13 +1540,8 @@ fn strip_sql_comments(sql: &str) -> String {
                     i += ch.len_utf8();
                 }
             }
-            // A DOLLAR-QUOTED literal is data as much as a single-quoted one,
-            // and blanking only `'…'` left it exposed: PostgreSQL's
-            // `$msg$DROP TABLE comments;$msg$` is an ordinary way to store a
-            // string containing quotes, and its contents were being scanned as
-            // executable DDL. A migration that merely LOGS such a line emitted
-            // a false `Drop`, `already_migrated` went false, and the next
-            // scaffold wrote a duplicate `CREATE TABLE comments`.
+            // A dollar-quoted literal (`$msg$DROP TABLE comments;$msg$`) is data too, so its
+            // contents are blanked.
             b'$' => {
                 if let Some(tag_len) = dollar_tag_len(&sql[i..]) {
                     let tag = &sql[i..i + tag_len];
@@ -1605,15 +1569,9 @@ fn strip_sql_comments(sql: &str) -> String {
                     i += 1;
                 }
             }
-            // A double-quoted IDENTIFIER is a name — exactly what the matchers
-            // are looking for — so it is copied through intact. `"comments"`
-            // and `"commentable_type"` have to stay findable.
-            //
-            // Case is preserved here and folded everywhere else, because
-            // quoting is what makes an identifier case-SENSITIVE: PostgreSQL
-            // treats `"Comments"` and `comments` as different relations, so
-            // lowercasing the whole file would report a table that the runtime
-            // cannot find.
+            // A double-quoted identifier is a name the matchers look for, so it is copied intact.
+            // Its case is kept because quoting makes it case-sensitive: PostgreSQL treats
+            // `"Comments"` and `comments` as different relations.
             b'"' => {
                 out.push('"');
                 i += 1;
@@ -1654,14 +1612,9 @@ fn strip_sql_comments(sql: &str) -> String {
             }
             _ => {
                 let ch = sql[i..].chars().next().unwrap_or(' ');
-                // Unquoted SQL is case-insensitive, so it folds here — leaving
-                // the quoted branches above as the only case-preserving path.
-                //
-                // ASCII fold specifically: `char::to_lowercase` can expand one
-                // char into several (İ → i̇), which would shift every byte
-                // offset after it — and offsets are load-bearing, since events
-                // are ordered by position and the CREATE body is sliced by
-                // index. SQL keywords are ASCII, so nothing is lost.
+                // Unquoted SQL is case-insensitive, so it folds here. ASCII fold only:
+                // `char::to_lowercase` can expand one char into several (İ → i̇) and shift every
+                // byte offset after it. SQL keywords are ASCII.
                 out.push(ch.to_ascii_lowercase());
                 i += ch.len_utf8();
             }
@@ -1692,9 +1645,8 @@ pub fn push_commentable_migration(
     backend: autumn_web::config::DatabaseBackend,
     for_revert: bool,
 ) -> Result<bool, GenerateError> {
-    // On a revert plan the directory is (by construction) already on disk from
-    // the generate run being undone, so the table always reads as present and
-    // the revert would never take it back out.
+    // Skipped on a revert: the directory from the run being undone is on disk, so the table
+    // would always read as present and the revert would never remove it.
     if !for_revert {
         let table = comments_table(project_root);
         if let CommentsTable::Conflicting {
@@ -1713,17 +1665,12 @@ pub fn push_commentable_migration(
             return Ok(false);
         }
     }
-    // …but only take out a migration this generator actually WROTE. A project
-    // whose polymorphic `comments` table predates the scaffold got no migration
-    // from us at all (generation skipped it), and `Plan::revert` matches by the
-    // `_create_comments` suffix — so pushing the action unconditionally would
-    // have `destroy scaffold` delete a hand-written migration, or block on it,
-    // for a file this tool never created. `--force` would delete it outright.
+    // A revert removes only a migration this generator wrote. `Plan::revert` matches by the
+    // `_create_comments` suffix, so a hand-written migration for a pre-existing table would
+    // otherwise be deleted by `destroy scaffold`.
     //
-    // Ownership is judged by content: byte-identical to what `up_sql` emits for
-    // this backend means ours. An edited copy (the author added the `author_id`
-    // foreign key the header suggests, say) is left alone — leaving a file
-    // behind is recoverable, deleting one is not.
+    // Ownership is judged by content: byte-identical to `up_sql` for this backend. An edited
+    // copy is left alone; leaving a file behind is recoverable, deleting one is not.
     if for_revert && !generator_owned_comments_migration(project_root, backend) {
         return Ok(false);
     }
@@ -1752,10 +1699,8 @@ fn commentable_declared_below(dir: &Path, excluding: &[std::path::PathBuf]) -> b
             }
             continue;
         }
-        // Compared as a PATH, not a basename. `src/models/admin/post.rs` is a
-        // different model from `src/models/post.rs` and must still count as a
-        // survivor when the flat one is destroyed — skipping it by shared
-        // filename would delete the shared migration out from under it.
+        // Compared as a path, not a basename: `src/models/admin/post.rs` still counts as a
+        // survivor when `src/models/post.rs` is destroyed.
         if excluding.contains(&path) {
             continue;
         }
@@ -1799,12 +1744,9 @@ pub fn another_model_is_still_commentable(project_root: &Path, destroying_model:
     let models_dir = project_root.join("src").join("models");
     let destroying_file = format!("{destroying_model}.rs");
 
-    // Per-file layout (`src/models/<snake>.rs`), the one the generators emit —
-    // walked RECURSIVELY. A hand-organised app may keep models in nested
-    // modules (`src/models/admin/post.rs`), and reading a directory entry as a
-    // file simply fails, so a flat scan would conclude nobody else needs the
-    // shared table and delete the migration out from under a model that does.
-    // The cost of the mistake is a deployment with no storage for a live model.
+    // Per-file layout (`src/models/<snake>.rs`), walked recursively: a hand-organised app may
+    // nest models (`src/models/admin/post.rs`), and missing one would delete the shared
+    // migration a live model still needs.
     if commentable_declared_below(&models_dir, &[models_dir.join(&destroying_file)]) {
         return true;
     }
@@ -1880,9 +1822,7 @@ mod tests {
         assert!(sql.contains("parent_id BIGINT REFERENCES comments(id) ON DELETE CASCADE"));
         assert!(sql.contains("deleted_at TIMESTAMP"));
         assert!(sql.contains("(commentable_type, commentable_id, created_at, id)"));
-        // The polymorphic column must NOT gain a foreign key — a single column
-        // cannot reference two tables, and pretending otherwise would break the
-        // second commentable model.
+        // The polymorphic column has no foreign key: one column cannot reference two tables.
         assert!(!sql.contains("commentable_id BIGINT NOT NULL REFERENCES"));
     }
 
@@ -2481,8 +2421,7 @@ mod tests {
         std::fs::remove_file(nested.join("announcement.rs")).expect("rm");
         assert!(!another_model_is_still_commentable(tmp.path(), "post"));
 
-        // A same-named model in another module is a DIFFERENT model, and it
-        // still needs the table. Matching by bare filename skipped it too.
+        // A same-named model in another module is a different model that still needs the table.
         std::fs::write(
             nested.join("post.rs"),
             "#[autumn_web::model]\n#[commentable(by = User)]\npub struct Post {}\n",
@@ -2578,11 +2517,8 @@ mod tests {
             "only archived_comments remains; `comments` has to be created again"
         );
 
-        // Renaming a table INTO `comments` brings one back — with no columns
-        // claimed, so it is not polymorphic until an ALTER adds them.
-        // Renaming it back restores the polymorphic table: the rename carries
-        // the source table's columns across (#2282) — the old scan landed on
-        // an empty column list here and could not know them.
+        // Renaming it back restores the polymorphic table: the rename carries the source
+        // table's columns across (#2282).
         let back = migrations.join("0003_rename_back");
         std::fs::create_dir_all(&back).expect("mkdir");
         std::fs::write(
@@ -3210,11 +3146,8 @@ mod tests {
     /// the thread outlives the parent and resurfaces if the id is reused.
     #[test]
     fn each_commentable_parent_gets_a_cleanup_trigger() {
-        // The function travels WITH the trigger, not in the shared migration.
-        // Diesel orders by version prefix, and the shared table's `{ts}2` sorts
-        // after a parent's `{ts}` — so a trigger depending on the shared
-        // migration would be created before its function existed and
-        // `CREATE TRIGGER` would fail outright.
+        // The function ships with the trigger, not in the shared migration: the shared table's
+        // `{ts}2` version sorts after a parent's `{ts}`, so the function would not exist yet.
         let shared = up_sql(DatabaseBackend::Postgres);
         assert!(
             !shared.contains("comments_delete_for_parent"),
@@ -3232,11 +3165,9 @@ mod tests {
         );
         assert!(trigger.contains("AFTER DELETE ON posts"));
 
-        // The trigger's discriminator is its ONLY link to the comments, and
-        // nothing checks it at run time: a later `#[commentable(type_name =
-        // "Article")]` on the model would leave this trigger deleting `'Post'`
-        // rows that never existed, orphaning the thread silently. The generator
-        // cannot see a future edit, so it says so where the editor will look.
+        // The discriminator is the trigger's only link to the comments and nothing checks it at
+        // run time: a later `#[commentable(type_name = "Article")]` would orphan the thread. The
+        // migration has to say so where the editor will look.
         for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
             let sql = parent_cleanup_sql(backend, "posts", "Post");
             assert!(
@@ -3394,10 +3325,8 @@ mod tests {
             );
         }
 
-        // The other half, and the one a careless fix breaks: in an ORDINARY
-        // literal a backslash is DATA, so the quote still closes. PostgreSQL
-        // returns `ends_with_backslash\` for the first value here — if the
-        // masker swallowed onward, the following DROP would vanish.
+        // In an ordinary literal a backslash is data, so the quote still closes and the
+        // following DROP must register.
         std::fs::write(
             dir.join("up.sql"),
             format!(
@@ -3459,8 +3388,7 @@ mod tests {
             );
         }
 
-        // A REAL drop after such a literal still registers — the masking must
-        // not swallow the rest of the file.
+        // A real drop after such a literal still registers.
         std::fs::write(
             dir.join("up.sql"),
             format!(

@@ -384,18 +384,16 @@ fn build_binary(
     features: &crate::routes::CargoFeatures,
 ) -> crate::routes::ResolvedBinary {
     eprintln!("  building (release) \u{2026}");
-    // The deployed binary's feature selection is forwarded verbatim. Measuring
-    // a default-feature build and then enforcing its limit on a production
-    // binary that enables more is a contract about a program nobody runs.
+    // Forward the deployed binary's features verbatim: a limit measured on a default-feature build
+    // says nothing about a production binary that enables more.
     crate::routes::compile_binary_with(
         opts.package,
         opts.bin,
         features,
         &crate::routes::CargoProfile::from_release(true),
     );
-    // The package directory comes from the same selection as the binary.
-    // The child must start in that directory. Autumn reads `autumn.toml` from
-    // the working directory, not from the workspace root.
+    // The child must start in the package directory: Autumn reads `autumn.toml` from the working
+    // directory, not from the workspace root.
     crate::routes::find_resolved_binary_in_profile(
         opts.package,
         opts.bin,
@@ -449,14 +447,10 @@ fn child_env(profile: &str) -> Vec<(String, String)> {
     // Clearing this one is safe: the override reads an empty value as "unset".
     env.push(("AUTUMN_SERVER__UNIX_SOCKET".to_owned(), String::new()));
 
-    // TLS is deliberately NOT cleared the same way. `apply_env_overrides`
-    // materializes `server.tls` from the *presence* of either TLS variable and
-    // stores the empty string as a path, so setting them to "" would switch
-    // TLS *on* — with empty certificate paths — for every app, including the
-    // overwhelming majority that configure none. That would break plain
-    // `autumn calibrate` everywhere in order to serve the rare in-process-TLS
-    // case. A profile that terminates TLS itself is reported by the readiness
-    // timeout instead, which names it as the likely cause.
+    // TLS is not cleared the same way: `apply_env_overrides` turns `server.tls` on when either TLS
+    // variable is present, even empty, so clearing them would enable TLS with empty certificate
+    // paths for every app. A profile that terminates TLS itself surfaces as a readiness timeout,
+    // which names it as the likely cause.
 
     env
 }
@@ -617,10 +611,8 @@ fn measure(calibration: &Calibration, port: u16, targets: &[String]) -> Vec<Rung
         ));
     }
 
-    // `find_saturation` walks the ladder assuming ascending concurrency: a
-    // descending one would make the widest rung the baseline and stop at the
-    // second, recording that widest rung as the knee no matter where the real
-    // one is. Normalising here makes the flag order-insensitive.
+    // `find_saturation` assumes ascending concurrency; a descending ladder would record the widest
+    // rung as the knee. `normalized_ladder` sorted it when the calibration was resolved.
     let mut rungs = Vec::with_capacity(calibration.concurrency.len());
     for &concurrency in &calibration.concurrency {
         // Repeat each rung and keep the median: one window is hostage to
@@ -699,14 +691,10 @@ fn drive(
                     let url = format!("{base}{path}");
                     let sent = Instant::now();
                     let outcome = client.get(&url).send();
-                    // Count only what finished inside the offered window. A
-                    // request still in flight at the deadline was neither
-                    // delivered during the window nor is its latency
-                    // attributable to it, and counting it against a
-                    // fixed-length denominator would overstate throughput for
-                    // exactly the slow handlers where the envelope matters
-                    // most. Requests issued before the deadline that land
-                    // after it are simply dropped from both tallies.
+                    // Count only what finished inside the offered window. A request that lands
+                    // after the deadline is dropped from both tallies: counting it against a
+                    // fixed-length window would overstate throughput for exactly the slow handlers
+                    // where the envelope matters most.
                     if Instant::now() > deadline {
                         break;
                     }
@@ -726,16 +714,10 @@ fn drive(
         }
     });
 
-    // Deliberately the *offered* window, not `started.elapsed()`. Workers stop
-    // issuing at the deadline, but `thread::scope` joins on the slowest
-    // in-flight request: a single straggler that runs into the client's 30s
-    // timeout would stretch the denominator to 30s and report a rung at a few
-    // percent of what it actually delivered — which `find_saturation` would
-    // then read as "gained too little" and record a ceiling far below what the
-    // binary sustains. Every counted response was issued inside this window,
-    // so the window is the honest denominator.
-    // The offered window, and now an honest denominator for it: every counted
-    // response both started and finished inside it.
+    // The offered window, not `started.elapsed()`: `thread::scope` joins on the slowest in-flight
+    // request, so one straggler hitting the client's 30s timeout would stretch the denominator and
+    // make `find_saturation` record a ceiling far below what the binary sustains. Every counted
+    // response started and finished inside this window.
     let wall_secs = duration.as_secs_f64();
     debug_assert!(started.elapsed() >= duration || concurrency == 0);
     let latencies_ms = latencies.lock().map(|l| l.clone()).unwrap_or_default();

@@ -103,10 +103,9 @@ pub fn run(args: &PullArgs) {
 
 fn pull(args: &PullArgs) -> Result<(), PullError> {
     let url = migrate::resolve_primary_url(args.profile.as_deref()).ok_or(PullError::NoUrl)?;
-    // `PgConnection::establish` accepts both URL and libpq key-value DSNs
-    // (`host=... dbname=...`), but `url::Url::parse` only understands the former.
-    // Defer parsing to the error path so a valid key-value connection string
-    // still connects; host/port are only needed for a credential-safe message.
+    // `PgConnection::establish` accepts key-value DSNs (`host=... dbname=...`)
+    // that `url::Url::parse` rejects, so parse only on the error path, for a
+    // credential-safe message.
     let mut conn = PgConnection::establish(&url).map_err(|_| {
         let (host, port) = parse_host_port(&url).unwrap_or_else(|_| ("localhost".to_owned(), 5432));
         PullError::Connection { host, port }
@@ -117,9 +116,7 @@ fn pull(args: &PullArgs) -> Result<(), PullError> {
         return Err(PullError::NoTables);
     }
 
-    // Fetch every target table's columns and primary keys in two batched
-    // queries (not two per table), then assemble each `TableSchema` with no
-    // further I/O.
+    // Two batched queries for every table, not two per table.
     let columns_by_table = fetch_columns(&mut conn, &table_names)?;
     let pks_by_table = fetch_primary_keys(&mut conn, &table_names)?;
 
@@ -129,9 +126,7 @@ fn pull(args: &PullArgs) -> Result<(), PullError> {
         match build_table_schema(table, &columns_by_table, &pks_by_table) {
             Ok(schema) => tables.push(schema),
             // An unscoped pull skips a table it can't map (e.g. a `jsonb` column)
-            // with a notice so the supported tables still come through; an
-            // explicitly-requested table is still a hard error. Connection/SQL
-            // failures always propagate.
+            // with a notice; an explicitly requested table is a hard error.
             Err(e) if !explicit && matches!(e, PullError::UnsupportedType { .. }) => {
                 eprintln!("  \u{2139} Skipping table '{table}': {e}");
             }
@@ -327,12 +322,9 @@ fn build_table_schema(
             .column_default
             .as_deref()
             .is_some_and(|d| d.trim_start().to_ascii_lowercase().starts_with("nextval("));
-        // Whether the default is a plain integer literal, so the database really
-        // does initialize the column when an INSERT omits it. `column_default`
-        // being present is not enough: `DEFAULT nullif(0,0)` is a default that
-        // still violates a NOT NULL constraint. Accepts an optional `::type`
-        // cast and surrounding parens/whitespace, which is how Postgres renders
-        // `DEFAULT 0` back (`0`) and `DEFAULT 0::integer` (`0::integer`).
+        // A present default is not enough: `DEFAULT nullif(0,0)` still violates
+        // NOT NULL. Accepts the optional `::type` cast and parens Postgres may
+        // render back around an integer literal.
         let default_is_integer_literal = row.column_default.as_deref().is_some_and(|d| {
             let d = d.trim();
             let d = d

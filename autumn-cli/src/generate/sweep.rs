@@ -205,10 +205,9 @@ fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep:
              Other resources can use it, so autumn destroy keeps it. Delete it by hand if \
              nothing uses it.",
         ),
-        // The manifest is project content, so a forged entry can name any
-        // file and its digest. Delete only in a directory where the current
-        // templates also create a file. Then a forged entry cannot reach a
-        // file outside the generator's own directories.
+        // The manifest is project content, so a forged entry can name any file and its digest.
+        // Delete only in a directory where the current templates also create a file, so a
+        // forged entry cannot reach outside the generator's own directories.
         Some(Scope::Owned) if !planned.owned_dirs.holds(parent_key(shown), dir) => warn(
             sweep,
             "the current templates do not make this file, and they create no file in its \
@@ -438,7 +437,6 @@ mod tests {
 
     #[test]
     fn an_untouched_renamed_file_is_removed() {
-        // The `old.rs` -> `new.rs` case from the issue.
         let dir = tmp();
         let root = dir.path();
         let mut p = Provenance::default();
@@ -953,9 +951,9 @@ mod tests {
 
     #[test]
     fn an_orphan_a_mod_line_still_declares_is_kept() {
-        // v1 wrote `src/jobs/foo.rs` and `pub mod foo;`. v2 names `foo_job.rs`,
-        // so its revert misses `pub mod foo;`. Deleting `foo.rs` would stop
-        // the build.
+        // An older template wrote `src/jobs/foo.rs` and `pub mod foo;`. The current one
+        // names `foo_job.rs`, so its revert misses `pub mod foo;`. Deleting `foo.rs` would
+        // stop the build.
         let dir = tmp();
         let root = dir.path();
         let mut p = Provenance::default();

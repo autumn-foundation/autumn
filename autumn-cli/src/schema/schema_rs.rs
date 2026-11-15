@@ -1277,7 +1277,7 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         assert!(checked > 0, "no example table was checked");
     }
 
-    // -- review findings ------------------------------------------------------
+    // -- edge cases: renames, schemas, comments and macro calls --------------
 
     /// A rename keeps the old block, with its attributes, under the new name
     /// when the new block cannot be rendered.

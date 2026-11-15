@@ -230,8 +230,8 @@ mod tests {
 
     #[test]
     fn every_ac_named_tier_one_command_is_tier_one() {
-        // The issue names these explicitly as the Tier 1 floor. If one ever
-        // moves to Tier 2, that is a policy change that must be deliberate.
+        // These are the Tier 1 floor. Moving one to Tier 2 is a policy change and
+        // must be deliberate.
         for command in [
             "autumn new",
             "autumn doctor",
@@ -240,8 +240,7 @@ mod tests {
             "autumn test",
             "autumn serve (foreground)",
             "managed Postgres",
-            // Promoted out of Tier 2 by #1639: the daemon lifecycle and the
-            // Windows service journey now run natively.
+            // Promoted to Tier 1 by #1639: the daemon lifecycle and Windows service run natively.
             "autumn serve --daemon / stop / status / restart",
             "autumn serve install-service / uninstall-service",
         ] {
@@ -269,14 +268,10 @@ mod tests {
 
     #[test]
     fn the_deploy_group_is_split_by_what_actually_reaches_a_host() {
-        // `autumn deploy` is not one tier. `up`/`rollback`/`status`/
-        // `maintenance` open an SSH session (and the mutating ones stage secrets
-        // with Unix file modes), so they are Tier 2. `check` and `plan` are
-        // local-only — config grading, unit rendering, and a portable TCP
-        // reachability probe — so they are Tier 1, and refusing them would both
-        // be untrue and remove the only way a Windows developer can validate a
-        // deploy config before switching to WSL2. `autumn-cli/src/deploy.rs`
-        // draws the same line in `reaches_a_remote_host`.
+        // `up`/`rollback`/`status`/`maintenance` open an SSH session (the mutating ones
+        // stage secrets with Unix file modes), so they are Tier 2. `check` and `plan` run
+        // locally, so they are Tier 1 and let a Windows developer validate a deploy
+        // config. `deploy.rs` draws the same line in `reaches_a_remote_host`.
         assert_eq!(
             tier_for("autumn deploy check / plan"),
             Some(SupportTier::Native)
@@ -328,7 +323,7 @@ mod tests {
         assert!(message.contains("Tier 2 (WSL2)"), "{message}");
         assert!(message.contains("WSL2 shell"), "{message}");
         assert!(message.contains(POLICY_DOC_URL), "{message}");
-        // The refusal must say what is actually unsupported, not just "unsupported".
+        // The refusal must name what is unsupported.
         assert!(message.contains("ssh"), "{message}");
     }
 

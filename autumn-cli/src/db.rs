@@ -180,11 +180,10 @@ fn drop(profile: Option<&str>, force: bool) -> Result<(), DbError> {
 /// a notice) when `src/bin/seed.rs` is absent.
 fn reset(profile: Option<&str>, force: bool) -> Result<(), DbError> {
     let resolved = migrate::effective_profile(profile);
-    // Apply the production guard once, up front, before any destructive work.
     guard_destructive(&resolved, force)?;
 
-    // `db drop` is invoked with --force because reset has already cleared the
-    // production guard above; otherwise the child would re-refuse.
+    // Reset already passed the production guard, so the child `db drop` gets
+    // `--force` instead of refusing again.
     run_step("drop", &["db", "drop", "--force"], profile)?;
     run_step("create", &["db", "create"], profile)?;
     run_step("migrate", &["migrate"], profile)?;
@@ -289,7 +288,6 @@ struct MaintenanceTarget {
 fn maintenance_target(url: &str) -> Result<MaintenanceTarget, DbError> {
     let parsed = url::Url::parse(url).map_err(|_| DbError::UnparsableUrl)?;
 
-    // The database name is the first (and only meaningful) path segment.
     let db_name = parsed
         .path_segments()
         .and_then(|mut segments| segments.next())

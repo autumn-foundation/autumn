@@ -193,7 +193,6 @@ pub fn plan_admin_with_options(
     let snake_name = snake(name);
     let pascal_name = pascal(name);
 
-    // Verify the source model file exists before emitting anything.
     let model_path = project_root
         .join("src")
         .join("models")
@@ -211,10 +210,6 @@ pub fn plan_admin_with_options(
 
     let model_source = std::fs::read_to_string(&model_path).map_err(GenerateError::Io)?;
 
-    // Gate: the generated admin adapter and the admin plugin trait
-    // (`autumn-admin-plugin`) are i64-keyed (`get`/`update`/`delete` take
-    // `id: i64`, `table.find(id)`), so a UUID-keyed model would produce
-    // non-compiling admin code. Reject up-front, mirroring the scaffold gate.
     if model_has_uuid_id(&model_source, &pascal_name) {
         return Err(GenerateError::Config(format!(
             "UUID primary keys are not yet supported for `generate admin`: the admin \
@@ -226,8 +221,7 @@ pub fn plan_admin_with_options(
 
     let lock_version_field = detect_lock_version_field(&model_source, &pascal_name);
 
-    // Auto-detect at-rest encrypted columns from the model so the generated admin
-    // redacts/disables exactly those fields (#805), merged with any explicit opts.
+    // Merge the encrypted columns detected on the model, so the admin redacts exactly those (#805).
     let (det_encrypted, det_visible, det_deterministic) =
         detect_encrypted_fields(&model_source, &pascal_name);
     let mut options = options.clone();
@@ -236,32 +230,18 @@ pub fn plan_admin_with_options(
     options.encrypted_deterministic.extend(det_deterministic);
 
     let fields = parse_fields(field_tokens)?;
-    // Issue #2291: the MODEL is the source of truth for whether a column is a
-    // per-locale container — `#[translatable]` is what makes `Translated`
-    // refuse the bare string the admin's text control produces. Detect it from
-    // the model AST (mirroring `detect_encrypted_fields` above) and refuse any
-    // submitted field bound to one, no matter how the DSL token is spelled.
-    //
-    // Generation only: destroying an admin generated before the field became
-    // `#[translatable]` must still be able to reach `Plan::revert`.
+    // The model decides whether a column is per-locale: `#[translatable]` makes `Translated` refuse
+    // the bare string the admin's text control submits (#2291). Skipped on destroy, so an admin
+    // generated before the field became `#[translatable]` can still be reverted.
     let model_translatable = if options.for_destroy {
         Vec::new()
     } else {
         detect_translatable_fields(&model_source, &pascal_name)
     };
     reject_translatable_fields(&fields, &model_translatable)?;
-    // Issue #1340: the MODEL is the only source of truth for whether a column is
-    // encrypted at rest — `#[encrypted]` is what puts the `serialize_as` wrapper
-    // on the insert/update path. A `{encrypted}` DSL token here declares the same
-    // thing, so the two must agree.
-    //
-    // When they don't, refuse rather than trusting the token. Marking the admin
-    // field `.encrypted()` only changes the UI: it redacts the value and skips it
-    // in search. The model still has no wrapper, so the admin's own create form
-    // would write the submitted value straight to the column as PLAINTEXT — and
-    // then display `••••••••` over it. That is strictly worse than not redacting,
-    // because it manufactures a false at-rest-encryption guarantee over a column
-    // anyone with database access can read.
+    // The model decides whether a column is encrypted: `#[encrypted]` adds the `serialize_as`
+    // wrapper (#1340). A `{encrypted}` token without it would only redact the admin UI while the
+    // create form writes plaintext, a false promise of encryption at rest.
     for field in &fields {
         if field.is_encrypted()
             && !options.encrypted.contains(&field.name)
@@ -288,7 +268,6 @@ pub fn plan_admin_with_options(
 
     let mut plan = Plan::new(project_root);
 
-    // Admin adapter: `src/admin/<snake>.rs`
     let admin_dir = project_root.join("src").join("admin");
     plan.create(
         admin_dir.join(format!("{snake_name}.rs")),
@@ -303,7 +282,6 @@ pub fn plan_admin_with_options(
         ),
     );
 
-    // Admin module declaration: `src/admin/mod.rs`
     let admin_mod_path = admin_dir.join("mod.rs");
     plan.modify(
         admin_mod_path.clone(),
@@ -314,7 +292,6 @@ pub fn plan_admin_with_options(
         name: snake_name.clone(),
     });
 
-    // Smoke test: `tests/<snake>_admin.rs`
     plan.create(
         project_root
             .join("tests")
@@ -411,11 +388,8 @@ fn reject_model_translatable_fields(
 
 pub fn plan_admin_destroy_fallback(project_root: &Path, name: &str) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
-    // Unlike `plan_admin_with_options`, this path has no model-file-exists
-    // check to incidentally narrow what `name` can be — it's reached
-    // precisely because that file is gone — so an invalid name (path
-    // separators, `..`) must be rejected explicitly before it's used to
-    // build filesystem paths (issue #1048 PR review).
+    // No model-file check narrows `name` here (the file is gone), so reject path separators and
+    // `..` before building paths (#1048).
     super::model::validate_resource_name(name)?;
 
     let snake_name = snake(name);
@@ -604,64 +578,34 @@ fn detect_translatable_fields(model_source: &str, pascal_name: &str) -> Vec<Stri
 
 const fn admin_field_kind(field: &Field) -> &'static str {
     match field.kind {
-        // `Enum`'s "AdminFieldKind::Text" here is never actually emitted:
-        // `render_fields_vec` always overrides an enum field with an explicit
-        // `AdminFieldKind::Select(...)` (issue #1030), the same way an
-        // explicit `--select` overrides this base kind today.
-        // `Decimal` renders as plain text, not `AdminFieldKind::Float`: the
-        // admin update handler coerces `Float` input through `f64` (see
-        // `coerce_form_value` in `autumn-admin-plugin`), which would
-        // reintroduce the exact binary-float rounding this field type exists
-        // to avoid. Routing it through `Text` leaves the raw decimal string
-        // untouched for `rust_decimal`'s exact `FromStr`/`Deserialize`.
-        //
-        // `Time` (issue #3405) is text too: the admin panel has no time kind,
-        // and a `NaiveTime` reads `HH:MM` and `HH:MM:SS` from text.
+        // `Enum` never emits `Text`: `render_fields_vec` replaces it with a `Select` (#1030).
+        // `Decimal` is text, not `Float`: the admin coerces `Float` input through `f64`, which
+        // rounds. Text keeps the string exact for `rust_decimal`.
+        // `Time` (#3405) is text too: the admin has no time kind, and `NaiveTime` parses
+        // `HH:MM[:SS]`.
         FieldKind::String
         | FieldKind::Uuid
         | FieldKind::Enum
         | FieldKind::Decimal { .. }
         | FieldKind::Slug
         | FieldKind::Time => "AdminFieldKind::Text",
-        // `RichText` (issue #1255) edits as a plain multi-line textarea in the
-        // admin panel: the column holds Markdown source, and the admin's
-        // record editor is a raw-value editor, not the app-facing form that
-        // renders `rich_text_area`'s hint and preview.
+        // `RichText` (#1255) holds Markdown source, and the admin is a raw-value editor: a plain
+        // textarea, not the app-facing `rich_text_area`.
         FieldKind::Text | FieldKind::RichText => "AdminFieldKind::TextArea",
         // A foreign-key id renders the same as any other integer column.
         FieldKind::I32 | FieldKind::I64 | FieldKind::References => "AdminFieldKind::Integer",
         FieldKind::Bool => "AdminFieldKind::Boolean",
         FieldKind::F32 | FieldKind::F64 => "AdminFieldKind::Float",
         FieldKind::NaiveDateTime | FieldKind::DateTime => "AdminFieldKind::DateTime",
-        // Bytea and Attachment both render as hidden in the admin panel —
-        // binary blobs and file metadata aren't suitable for direct inline
-        // editing. `position` (issue #1358) is hidden for a different
-        // reason: it is server-managed (the repository assigns and
-        // maintains it on insert/delete/move) and excluded from the
-        // generated `New*`/`Update*` structs entirely, so it is not
-        // directly editable either way.
-        // `commentable` (issue #1367) is hidden for the same reason as
-        // `position`: the framework maintains the comment counter inside each
-        // comment's own transaction, so an editable admin field would only
-        // ever let an operator desynchronise it from the comments table.
+        // Binary blobs and file metadata are not editable inline. `Position` (#1358) and
+        // `Commentable` (#1367) are framework-maintained and absent from `New*`/`Update*`.
         FieldKind::Bytea | FieldKind::Attachment | FieldKind::Position | FieldKind::Commentable => {
             "AdminFieldKind::Hidden"
         }
-        // `json`/`jsonb` (issue #1341) uses the admin panel's existing
-        // `AdminFieldKind::Json`: a monospace textarea whose submission is
-        // coerced back to a real JSON value by `coerce_form_value` before the
-        // generic `serde_json::from_value::<New{Model}>` deserialize — this
-        // kind already exists (see `AdminField`'s own `variants`/`settings`
-        // examples) and is exactly what a raw `serde_json::Value` column
-        // needs. Routing it to `Hidden` instead (an earlier revision of this
-        // fix) is NOT an option: `Hidden` values are stripped by
-        // `strip_meta_fields` before the model adapter ever sees them, so a
-        // *required* json column would permanently fail every admin
-        // create/update (the field is always missing), and a *nullable* one
-        // would silently null itself out on every edit of an unrelated field
-        // (Codex review finding on #1341). `coerce_form_value`'s JSON arm is
-        // now fallible and rejects malformed non-blank input instead of
-        // silently persisting it as a raw string (see `autumn-admin-plugin`).
+        // `Json` (#1341): `coerce_form_value` turns the textarea back into a JSON value and
+        // rejects malformed input. `Hidden` would not work: hidden values are stripped before the
+        // model adapter sees them, so a required json column could never be saved and a nullable
+        // one would be nulled.
         FieldKind::Json => "AdminFieldKind::Json",
     }
 }
@@ -693,12 +637,7 @@ const fn is_default_optional(field: &Field) -> bool {
 }
 
 fn is_default_hide_from_list(field: &Field) -> bool {
-    // TextArea bodies and binary blobs clutter the table; updated_at is redundant noise.
-    // `RichText` renders as a TextArea too (see `admin_field_kind`), and a
-    // Markdown body is the single worst column to inline in a list view.
-    // `Json` (issue #1341) renders as `AdminFieldKind::Json` — the same
-    // textarea-shaped raw-value editor — so a structured-data blob is just as
-    // unsuitable for an inline list cell.
+    // Long bodies and blobs (text, rich text, binary, JSON) clutter the list; updated_at is noise.
     matches!(
         field.kind,
         FieldKind::Text | FieldKind::RichText | FieldKind::Bytea | FieldKind::Json
@@ -719,25 +658,13 @@ fn is_update_writable(
         && !options.readonly.contains(&field.name)
         && !is_lock_version_field(field, lock_version_field)
         && !is_default_readonly(field)
-        // Issue #1358: `#[position]` excludes the column from both
-        // `New{Model}` and `Update{Model}` entirely (like `#[lock_version]`
-        // excludes its own column) — referencing `new_row.<position_field>`
-        // here would fail to compile.
+        // `#[position]` (#1358) and `#[commentable]` (#1367) columns are absent from `New{Model}`
+        // and `Update{Model}`, so writing them would not compile.
         && !field.kind.is_position()
-        // Issue #1367: the same reasoning, one field kind over. The
-        // `#[commentable]` counter is emitted `#[default]`, so it is absent from
-        // `New{Model}`/`Update{Model}` too, and `Patch::Set(new_row.comment_count)`
-        // would not compile. Hiding the control (see the `FieldKind` arm above)
-        // was only half of it: the control and the write path have to agree.
         && !field.kind.is_commentable()
         && !matches!(field.kind, FieldKind::Bytea)
-        // Issue #1340: an at-rest encrypted column is not updatable through the
-        // admin. The plugin renders its edit control disabled and WITHOUT a
-        // `name` ("Encrypted at rest — managed outside the admin"), so the form
-        // never submits one — including it in the update would write whatever
-        // placeholder stood in for the absent key. Create still accepts an
-        // initial value: there the control is a normal input and the insert
-        // encrypts it through `serialize_as`.
+        // An encrypted column (#1340) renders a disabled control with no `name`, so an update would
+        // write a placeholder. Create still takes a value and encrypts it through `serialize_as`.
         && !admin_field_is_encrypted(options, &field.name)
 }
 
@@ -756,12 +683,9 @@ fn render_admin_file(
     options: &AdminOptions,
     lock_version_field: Option<&str>,
 ) -> String {
-    // Issue #1340: an `#[encrypted]` column routes through diesel
-    // `serialize_as`, which CONSUMES the value — so diesel implements
-    // `Insertable` for the owned `New{Model}` only, never `&New{Model}`.
-    // Borrowing fails to compile the generated admin with "the trait bound
-    // `&NewX: Insertable<table>` is not satisfied". Plain models keep the
-    // borrowed form so their output stays byte-for-byte identical.
+    // `serialize_as` on an `#[encrypted]` column consumes the value, so diesel implements
+    // `Insertable` for the owned `New{Model}` only (#1340). Plain models keep `&` so their output
+    // is unchanged.
     let insert_record = if model_has_encrypted_columns(options) {
         "new_row"
     } else {
@@ -1029,12 +953,8 @@ fn render_fields_vec(
         if options.exclude.contains(&f.name) || is_lock_version_field(f, lock_version_field) {
             continue;
         }
-        // A closed-set `enum{...}` field is a `Select` widget by construction
-        // (issue #1030) — auto-derive one from its variants unless an
-        // explicit `--select` already overrides it (e.g. to curate a subset
-        // or relabel the options). One `effective_select` covers both
-        // sources so every downstream "is this field select-shaped" check
-        // only has to consult one place.
+        // An `enum{...}` field is a `Select` by construction (#1030); an explicit `--select`
+        // overrides the derived one.
         let effective_select: Option<SelectSpec> = options
             .select
             .iter()
@@ -1064,9 +984,8 @@ fn render_fields_vec(
         if options.readonly.contains(&f.name) || is_default_readonly(f) {
             let _ = write!(out, "\n                .readonly()");
         }
-        // Select, hidden, and encrypted fields are not text-searchable. An
-        // encrypted column stores ciphertext envelopes, so an `ILIKE` against it
-        // for plaintext would never match (#805) — omit it from search.
+        // Select and hidden fields are not text-searchable, nor is an encrypted column: ILIKE over
+        // ciphertext never matches plaintext (#805).
         let is_select_or_hidden = effective_select.is_some() || options.hidden.contains(&f.name);
         if is_default_searchable(f)
             && !is_select_or_hidden
@@ -1083,9 +1002,8 @@ fn render_fields_vec(
         if is_default_hide_from_list(f) {
             let _ = write!(out, "\n                .hide_from_list()");
         }
-        // At-rest encrypted columns (#805): redacted/disabled, or shown in read
-        // views when `admin_visible`. Per-field, so unrelated same-named plaintext
-        // columns elsewhere stay editable.
+        // Encrypted columns (#805) are redacted and disabled, or shown in read views with
+        // `admin_visible`.
         if options.encrypted_visible.contains(&f.name) {
             let _ = write!(out, "\n                .encrypted_visible()");
         } else if options.encrypted.contains(&f.name) {
@@ -1121,7 +1039,8 @@ fn render_apply_filters(
     let has_search = !searchable.is_empty();
     let has_filters = !filterable_bool.is_empty();
 
-    // Decide whether `query` and `params` need to be mutable / used.
+    // With no search or filters the generated body neither reassigns `query` nor reads `params`,
+    // so drop `mut` and prefix `_` to keep the generated code warning-free.
     let query_param = if has_search || has_filters {
         "mut query"
     } else {
@@ -1205,17 +1124,12 @@ fn render_apply_sort(
         .iter()
         .filter(|f| !options.exclude.contains(&f.name))
         .filter(|f| !is_lock_version_field(f, lock_version_field))
-        // At-rest encrypted columns hold a base64 envelope, so `ORDER BY` sorts
-        // by ciphertext bytes — arbitrary for a randomized column (and
-        // reshuffled by every write), and unrelated to plaintext order for a
-        // deterministic one. Falling through to the `id` default is honest;
-        // emitting an arm that claims to sort by a column it cannot is not.
-        // Same rationale as the scaffolded index's `.sortable(..)` suppression.
+        // An encrypted column stores a ciphertext envelope, so sorting by it is meaningless. It
+        // falls through to the `id` default, as in the scaffolded index.
         .filter(|f| !admin_field_is_encrypted(options, &f.name))
         .collect();
 
     let mut arms = String::new();
-    // id arms always first
     let _ = write!(
         arms,
         "            (Some(\"id\"), SortDirection::Asc) => \
@@ -1233,7 +1147,6 @@ fn render_apply_sort(
             name = f.name
         );
     }
-    // Default fallback
     let _ = write!(
         arms,
         "            (_, SortDirection::Asc) => query = query.order({plural}::id.asc()),\n\
@@ -1287,10 +1200,8 @@ fn render_update_body(
             name = f.name
         );
     }
-    // Issue #1340: same `serialize_as` consumption rule as the insert above —
-    // diesel implements `AsChangeset` for the owned changeset only once any
-    // column is encrypted, so borrowing fails with "the trait bound
-    // `&__XChangeset: AsChangeset` is not satisfied". Plain models keep `&`.
+    // As with the insert: once a column is encrypted, diesel implements `AsChangeset` for the
+    // owned changeset only (#1340).
     let changeset_record = if model_has_encrypted_columns(options) {
         "diesel_changeset"
     } else {
@@ -1337,12 +1248,8 @@ fn render_lock_version_update_body(
 
     let mut set_fields = String::new();
     for f in &writable {
-        // Issue #1340: this is a RAW `col.eq(value)` tuple — unlike the ordinary
-        // update above it never builds an `Update{Model}` changeset, so it would
-        // bypass the `#[diesel(serialize_as = …)]` wrapper an `#[encrypted]`
-        // column depends on and write PLAINTEXT into it. `is_update_writable`
-        // keeps encrypted columns out of `writable` entirely (the edit form
-        // cannot submit them), so no such column reaches this loop.
+        // This raw `col.eq(value)` tuple bypasses the `serialize_as` wrapper and would write
+        // plaintext into an encrypted column (#1340). `is_update_writable` keeps those columns out.
         debug_assert!(
             !admin_field_is_encrypted(options, &f.name),
             "an encrypted column must never reach the raw lock-version set tuple"
@@ -1391,7 +1298,6 @@ fn render_admin_smoke_test(
     options: &AdminOptions,
     lock_version_field: Option<&str>,
 ) -> String {
-    // Build a minimal POST body for the create test using the writable fields.
     let writable: Vec<&Field> = fields
         .iter()
         .filter(|f| is_update_writable(f, options, lock_version_field))
@@ -1403,9 +1309,7 @@ fn render_admin_smoke_test(
         writable
             .iter()
             .map(|f| {
-                // An enum field is a closed set by construction, so the
-                // generic "test" sample value fails its own validation;
-                // use the field's own first declared variant instead.
+                // An enum's validation rejects "test", so use its first declared variant.
                 let sample = f.variants.first().map_or("test", String::as_str);
                 format!("{}={sample}", f.name)
             })
@@ -1545,9 +1449,8 @@ fn render_admin_smoke_test(
 }
 
 #[cfg(test)]
-// Test inputs like `"email:String{encrypted:deterministic}"` are literal DSL
-// tokens, not format strings — the `{…}` is the scaffold's own
-// constraint-modifier syntax under test.
+// Test inputs such as `"email:String{encrypted:deterministic}"` are DSL tokens, not format
+// strings.
 #[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
@@ -1578,9 +1481,7 @@ mod tests {
 
     #[test]
     fn richtext_column_is_a_textarea_hidden_from_the_list() {
-        // A `richtext` column edits as a plain textarea in the admin's
-        // raw-value editor (issue #1255) — and a Markdown body is the single
-        // worst column to inline in a list table, exactly like a `Text` body.
+        // `richtext` (#1255) edits as a plain textarea and stays out of the list, like `Text`.
         let field = |kind: crate::generate::dsl::FieldKind| Field {
             name: "body".to_owned(),
             kind,
@@ -1597,7 +1498,6 @@ mod tests {
             is_default_hide_from_list(&rich),
             "a Markdown body must not clutter the admin list table"
         );
-        // It behaves identically to the `Text` column it mirrors.
         assert_eq!(admin_field_kind(&rich), admin_field_kind(&text));
         assert_eq!(
             is_default_hide_from_list(&rich),
@@ -1607,14 +1507,8 @@ mod tests {
 
     #[test]
     fn json_column_uses_the_existing_admin_json_kind_and_is_hidden_from_the_list() {
-        // Issue #1341: `AdminFieldKind::Json` already existed (monospace
-        // textarea + `coerce_form_value` round-trip) for hand-written admin
-        // configs — the DSL's new `json`/`jsonb` field just needs to reach it.
-        // (An earlier revision of this fix routed it to `Hidden` instead to
-        // dodge a malformed-JSON-passthrough bug in `coerce_form_value`, but
-        // `Hidden` values are stripped before the model adapter ever sees
-        // them — that broke admin create/update outright for json columns.
-        // The real fix is `coerce_form_value` rejecting malformed input.)
+        // The `json` kind (#1341) maps to the existing `AdminFieldKind::Json`, not `Hidden`: hidden
+        // values are stripped before the model adapter sees them.
         let field = Field {
             name: "config".to_owned(),
             kind: FieldKind::Json,
@@ -1639,8 +1533,6 @@ mod tests {
         fs::write(models_dir.join(format!("{snake}.rs")), model_source).unwrap();
         tmp
     }
-
-    // ── RED phase ──────────────────────────────────────────────────────────
 
     /// #1384 (Codex round 4): the admin binds one plain text control to the
     /// whole per-locale container and hands its string to
@@ -1809,9 +1701,7 @@ mod tests {
 
     #[test]
     fn plan_admin_rejects_uuid_keyed_model() {
-        // The admin adapter + plugin trait are i64-keyed, so a UUID model would
-        // produce non-compiling admin code. plan_admin must reject it up-front —
-        // for both the fully-qualified and the bare `Uuid` spelling.
+        // Both the qualified and the bare `Uuid` spelling must be rejected.
         for id_ty in ["uuid::Uuid", "Uuid"] {
             let model_source = format!(
                 "#[autumn_web::model]\n\
@@ -1834,7 +1724,6 @@ mod tests {
 
     #[test]
     fn plan_admin_allows_i64_keyed_model() {
-        // Regression guard: an ordinary i64 PK must NOT trip the UUID gate.
         let model_source = "#[autumn_web::model]\n\
             pub struct Post {\n\
             \x20   #[id]\n\
@@ -1895,11 +1784,9 @@ mod tests {
     #[test]
     fn plan_admin_accepts_pascal_or_snake_name() {
         let tmp = project_with_model("blog_post");
-        // Both "blog_post" and "BlogPost" should find src/models/blog_post.rs
         let plan_snake = plan_admin(tmp.path(), "blog_post", &[]).unwrap();
         let plan_pascal = plan_admin(tmp.path(), "BlogPost", &[]).unwrap();
 
-        // Both produce the same set of paths.
         let paths_snake: Vec<_> = plan_snake
             .actions
             .iter()
@@ -1923,7 +1810,7 @@ mod tests {
         );
     }
 
-    // ── GREEN phase (content verification) ────────────────────────────────
+    // ── Generated content ─────────────────────────────────────────────────
 
     #[test]
     fn execute_writes_admin_file_with_struct_and_impl() {
@@ -1942,11 +1829,9 @@ mod tests {
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
 
-        // Struct + AdminModel impl
         assert!(admin.contains("pub struct PostAdmin;"));
         assert!(admin.contains("impl AdminModel for PostAdmin {"));
 
-        // Slug, display names
         assert!(admin.contains("\"posts\""), "slug must be 'posts'");
         assert!(admin.contains("\"Post\""), "display_name must be 'Post'");
         assert!(
@@ -1959,7 +1844,6 @@ mod tests {
         assert!(admin.contains(".readonly()"));
         assert!(admin.contains(".hide_from_list()"));
 
-        // User fields
         assert!(
             admin.contains("AdminField::new(\"title\", AdminFieldKind::Text)"),
             "title should map to Text"
@@ -1973,7 +1857,6 @@ mod tests {
             "published should map to Boolean"
         );
 
-        // Searchable / filterable defaults
         assert!(
             admin.contains(".searchable()"),
             "text fields should be searchable"
@@ -1983,14 +1866,12 @@ mod tests {
             "bool fields should be filterable"
         );
 
-        // All CRUD method signatures
         assert!(admin.contains("fn list("));
         assert!(admin.contains("fn get("));
         assert!(admin.contains("fn create("));
         assert!(admin.contains("fn update("));
         assert!(admin.contains("fn delete("));
 
-        // Model + schema imports
         assert!(admin.contains("use autumn_web::Patch;"));
         assert!(admin.contains("use crate::models::post::{Post, NewPost, UpdatePost};"));
         assert!(admin.contains("use crate::schema::posts;"));
@@ -2013,17 +1894,14 @@ mod tests {
             "must have apply_filters fn"
         );
         assert!(admin.contains("fn apply_sort"), "must have apply_sort fn");
-        // Search on text fields
         assert!(
             admin.contains("posts::title.ilike"),
             "title should be in ilike search"
         );
-        // Bool filter
         assert!(
             admin.contains("posts::published.eq(true)"),
             "published should have bool filter"
         );
-        // Sort arms for user fields
         assert!(admin.contains("\"title\""), "sort arm for title");
         assert!(admin.contains("\"published\""), "sort arm for published");
     }
@@ -2051,10 +1929,8 @@ mod tests {
 
     #[test]
     fn position_field_excluded_from_admin_update_body() {
-        // Issue #1358: `#[position]` excludes the column from `New{Model}`/
-        // `Update{Model}` entirely, the same way `#[lock_version]` does — a
-        // generated `new_row.rank`/`UpdatePost { rank: ... }` reference would
-        // fail to compile ("no field `rank` on type `NewTask`").
+        // `#[position]` (#1358) is absent from `New{Model}`/`Update{Model}`, so a reference to it
+        // would not compile.
         let tmp = project_with_model("task");
         let plan = plan_admin(
             tmp.path(),
@@ -2078,11 +1954,8 @@ mod tests {
 
     #[test]
     fn commentable_counter_excluded_from_admin_update_body() {
-        // Issue #1367: the `comments:commentable` counter is emitted
-        // `#[default]`, so it is absent from `New{Model}`/`Update{Model}` just
-        // like `#[position]` — and `Patch::Set(new_row.comment_count)` would
-        // fail to compile. Hiding the edit control was only half the fix; the
-        // control and the write path have to agree.
+        // The commentable counter (#1367) is `#[default]` and absent from `New{Model}` and
+        // `Update{Model}`, so `Patch::Set(new_row.comment_count)` would not compile.
         let tmp = project_with_model("post");
         let plan = plan_admin(
             tmp.path(),
@@ -2219,18 +2092,15 @@ pub struct Account {
         plan.execute(Flags::default()).unwrap();
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/account.rs")).unwrap();
-        // Redacted-by-default encrypted column gets .encrypted().
         assert!(
             admin.contains("AdminField::new(\"api_token\", AdminFieldKind::Text)")
                 && admin.contains(".encrypted()"),
             "randomized encrypted column must be marked .encrypted(): {admin}"
         );
-        // admin_visible opt-in gets .encrypted_visible() (not plain .encrypted()).
         assert!(
             admin.contains(".encrypted_visible()"),
             "admin_visible encrypted column must be marked .encrypted_visible(): {admin}"
         );
-        // The non-encrypted column stays untouched (and remains searchable).
         assert!(
             !admin.contains(
                 "AdminField::new(\"username\", AdminFieldKind::Text)\n                .encrypted"
@@ -2243,8 +2113,7 @@ pub struct Account {
             ),
             "plaintext String column stays searchable: {admin}"
         );
-        // Encrypted columns must NOT be marked searchable: ILIKE over ciphertext
-        // would never match plaintext (#805). The only `.searchable()` is username.
+        // ILIKE over ciphertext never matches plaintext (#805), so only `username` is searchable.
         assert_eq!(
             admin.matches(".searchable()").count(),
             1,
@@ -2260,12 +2129,10 @@ pub struct Account {
 
         let test = fs::read_to_string(tmp.path().join("tests/post_admin.rs")).unwrap();
 
-        // Three test functions
         assert!(test.contains("fn post_admin_anonymous_access_is_rejected()"));
         assert!(test.contains("fn post_admin_list_loads_for_admin_user()"));
         assert!(test.contains("fn post_admin_create_redirects_for_admin_user()"));
 
-        // Environment variable checks
         assert!(test.contains("AUTUMN_TEST_BASE_URL"));
         assert!(test.contains("AUTUMN_TEST_ADMIN_SESSION"));
 
@@ -2275,7 +2142,6 @@ pub struct Account {
         // Admin list test expects 200
         assert!(test.contains("200"));
 
-        // Route path
         assert!(test.contains("/admin/posts"));
     }
 
@@ -2310,7 +2176,7 @@ pub struct Account {
     #[test]
     fn collision_without_force_errors() {
         let tmp = project_with_model("post");
-        // Pre-create the admin file to trigger collision detection.
+        // An existing admin file triggers the collision check.
         let admin_dir = tmp.path().join("src/admin");
         fs::create_dir_all(&admin_dir).unwrap();
         fs::write(admin_dir.join("post.rs"), "// existing").unwrap();
@@ -2362,7 +2228,6 @@ pub struct Account {
         plan.execute(Flags::default()).unwrap();
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
-        // Should use Hidden instead of Text
         assert!(
             admin.contains("AdminField::new(\"title\", AdminFieldKind::Hidden)"),
             "hidden option must override field kind to Hidden"
@@ -2404,7 +2269,6 @@ pub struct Account {
         plan.execute(Flags::default()).unwrap();
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
-        // The field should appear with .readonly()
         assert!(
             admin.contains(".readonly()"),
             "readonly option must add .readonly() call"
@@ -2482,7 +2346,6 @@ pub struct Account {
         plan.execute(Flags::default()).unwrap();
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
-        // created_at and updated_at are readonly by default → not in UpdatePost
         assert!(
             !admin.contains("created_at: Patch::Set(new_row.created_at)"),
             "created_at should not appear in UpdatePost (readonly by default)"
@@ -2491,7 +2354,6 @@ pub struct Account {
             !admin.contains("updated_at: Patch::Set(new_row.updated_at)"),
             "updated_at should not appear in UpdatePost (readonly by default)"
         );
-        // title IS writable
         assert!(
             admin.contains("title: Patch::Set(new_row.title)"),
             "title should appear in UpdatePost"
@@ -2537,15 +2399,12 @@ pub struct Account {
         assert!(admin.contains("\"draft\""), "option values must appear");
         assert!(admin.contains("\"published\""), "option values must appear");
         assert!(admin.contains("\"archived\""), "option values must appear");
-        // Labels are humanized from values
         assert!(admin.contains("\"Draft\""), "labels must be title-cased");
     }
 
     #[test]
     fn enum_field_auto_derives_select_kind() {
-        // issue #1030: an `enum{...}` field is a closed set by construction,
-        // so it should render as a `Select` widget without needing an
-        // explicit `--select` flag repeating the same variant list.
+        // An `enum{...}` field renders as a `Select` without a repeated `--select` (#1030).
         let tmp = project_with_model("post");
         let plan = plan_admin_with_options(
             tmp.path(),
@@ -2567,8 +2426,6 @@ pub struct Account {
 
     #[test]
     fn explicit_select_overrides_enum_auto_derivation() {
-        // A user-supplied `--select` should still win over the automatic
-        // derivation, e.g. to present a curated subset or different labels.
         let tmp = project_with_model("post");
         let options = AdminOptions {
             select: vec![SelectSpec {
@@ -2592,11 +2449,8 @@ pub struct Account {
 
     #[test]
     fn admin_smoke_test_uses_first_variant_for_enum_fields() {
-        // The generated create smoke test posts a sample value for every
-        // writable field; `status=test` fails the enum's own closed-set
-        // validation (`test` is not a declared variant), so the generated
-        // test would itself get a validation error instead of the expected
-        // redirect. Use the field's own first variant instead.
+        // The smoke test posts a sample for each writable field; `status=test` would fail the
+        // enum's validation instead of redirecting.
         let tmp = project_with_model("post");
         let plan = plan_admin_with_options(
             tmp.path(),
@@ -2639,9 +2493,8 @@ pub struct Account {
         );
     }
 
-    // Regression test for issue #782: SelectOption must be resolvable from
-    // `autumn_admin_plugin::prelude::*` so generated select adapters compile
-    // without downstream hand-patches.
+    // `SelectOption` must resolve from `autumn_admin_plugin::prelude::*`, or generated select
+    // adapters do not compile (#782).
     #[test]
     fn select_option_generated_code_uses_prelude_importable_type() {
         let tmp = project_with_model("ticket");
@@ -2659,18 +2512,14 @@ pub struct Account {
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/ticket.rs")).unwrap();
 
-        // Generated file must use the glob prelude import so SelectOption is in scope.
         assert!(
             admin.contains("use autumn_admin_plugin::prelude::*;"),
             "generated adapter must use prelude glob import"
         );
-        // SelectOption must appear as a struct literal in the generated body —
-        // it is brought in by `prelude::*` once SelectOption is exported from prelude.
         assert!(
             admin.contains("SelectOption {"),
             "generated adapter must emit SelectOption struct literals for select fields"
         );
-        // Verify the option values are present.
         assert!(admin.contains("\"low\""), "option value 'low' must appear");
         assert!(
             admin.contains("\"medium\""),
@@ -2705,7 +2554,6 @@ pub struct Account {
 
     #[test]
     fn no_searchable_fields_produces_valid_apply_filters() {
-        // A model with only numeric/bool fields — no text-like searchable ones.
         let tmp = project_with_model("counter");
         let plan = plan_admin(
             tmp.path(),
@@ -2716,7 +2564,6 @@ pub struct Account {
         plan.execute(Flags::default()).unwrap();
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/counter.rs")).unwrap();
-        // apply_filters must still be present and compile-valid (no ilike calls)
         assert!(
             admin.contains("fn apply_filters"),
             "apply_filters must exist"
@@ -2727,14 +2574,12 @@ pub struct Account {
         );
     }
 
-    // ── `plan_admin_destroy_fallback` (issue #1048 PR review) ───────────────
+    // ── `plan_admin_destroy_fallback` (#1048) ──────────────────────────────
 
     #[test]
     fn destroy_admin_after_model_already_destroyed_still_removes_admin_outputs() {
-        // A common cleanup order — `destroy model Post` then `destroy admin
-        // Post` — must not strand `src/admin/post.rs`, its mod declaration,
-        // and its smoke test just because `plan_admin_with_options` can no
-        // longer read the (now-gone) model file.
+        // `destroy model Post` then `destroy admin Post` must not strand the admin outputs once the
+        // model file is gone.
         let tmp = project_with_model("post");
         let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -2762,8 +2607,7 @@ pub struct Account {
 
     #[test]
     fn destroy_admin_fallback_still_refuses_a_hand_edited_file() {
-        // The #1048 guard under the #1835 code path: the recorded digest makes
-        // the fallback plan usable, and an edit still has to break it.
+        // The recorded digest (#1835) makes the fallback usable; an edited file still blocks it.
         let tmp = project_with_model("post");
         let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -2781,9 +2625,8 @@ pub struct Account {
 
     #[test]
     fn destroy_admin_fallback_without_provenance_still_needs_force() {
-        // The pre-#1835 path, still taken by a project generated before the
-        // manifest existed: content is unverifiable (the model is gone and
-        // nothing was recorded), so it is treated as diverged and left alone.
+        // A project generated before the manifest existed (#1835) has no digest, so its files
+        // count as diverged and need --force.
         let tmp = project_with_model("post");
         let plan = plan_admin(tmp.path(), "Post", &["title:String".into()]).unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -2817,11 +2660,8 @@ pub struct Account {
 
     #[test]
     fn plan_admin_destroy_fallback_rejects_path_traversal_in_name() {
-        // issue #1048 PR review: unlike `plan_admin_with_options`, this
-        // fallback has no model-file-exists check to incidentally narrow
-        // `name` — it's reached precisely because that file is gone — so a
-        // name containing path separators must be rejected explicitly
-        // before it's used to build filesystem paths for deletion.
+        // No model-file check narrows `name` here, so path separators must be rejected before they
+        // build deletion paths.
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         let err = plan_admin_destroy_fallback(tmp.path(), "../../foo").unwrap_err();
@@ -2880,7 +2720,6 @@ pub struct Account {
         let plan = plan_admin(tmp.path(), "Account", &tokens).unwrap();
         let admin = admin_adapter_contents(&plan);
 
-        // Both encrypted columns are redacted; neither opted into visibility.
         assert!(
             admin.contains(".encrypted()"),
             "the admin must redact the generator-emitted encrypted columns:\n{admin}"
@@ -2889,8 +2728,7 @@ pub struct Account {
             !admin.contains(".encrypted_visible()"),
             "no column opted into admin visibility:\n{admin}"
         );
-        // Redaction is per-field: the plaintext sibling stays fully editable
-        // and searchable.
+        // Redaction is per-field: the plaintext column stays editable and searchable.
         assert!(
             admin.contains("AdminField::new(\"username\""),
             "admin: {admin}"
@@ -2900,8 +2738,7 @@ pub struct Account {
             2,
             "exactly the two encrypted columns must be redacted:\n{admin}"
         );
-        // Ciphertext can never match a plaintext ILIKE, so an encrypted column
-        // must not feed the admin's search filter.
+        // ILIKE over ciphertext never matches plaintext, so encrypted columns stay out of search.
         assert!(
             !admin.contains("api_token.ilike") && !admin.contains("email.ilike"),
             "admin: {admin}"
@@ -3044,7 +2881,6 @@ pub struct Account {
                     "encrypted column must not be updated: `{leaked}`\n{admin}"
                 );
             }
-            // The plaintext sibling still updates.
             assert!(
                 admin.contains("username: Patch::Set(new_row.username)")
                     || admin.contains("accounts::username.eq(new_row.username)"),

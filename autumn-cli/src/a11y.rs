@@ -444,8 +444,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         return;
     };
     for entry in entries.flatten() {
-        // Never follow symlinks: a symlinked directory cycle would otherwise
-        // recurse forever and hang this CI tool.
+        // Never follow symlinks: a symlinked directory cycle would recurse forever.
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -456,13 +455,9 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if file_type.is_dir() {
-            // Skip build output, dot-dirs, and any `tests` directory. Test code
-            // (integration tests, system-test scaffolding, committed fixtures)
-            // is not shipped product markup, so a raw-`html!` defect there is not
-            // a product accessibility bug (issue #1934). The skip is scan-root
-            // RELATIVE: the a11y-verify integration test passes a fixture dir as
-            // the scan root itself, so no `tests` path component exists below
-            // that root and the fixture is still scanned/flagged there.
+            // Test code is not shipped markup, so `tests` dirs are skipped (#1934).
+            // The skip is relative to the scan root: a fixture dir passed as the
+            // root itself is still scanned.
             if name == "target" || name == "tests" || name.starts_with('.') {
                 continue;
             }
@@ -1183,11 +1178,8 @@ fn find_html_blocks(stream: &TokenStream, file: &str, scan: &mut Scan) {
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
     let mut i = 0;
     while i < trees.len() {
-        // A `#[cfg(test)]`-annotated item (`mod tests { … }`, a test `fn`) is
-        // test-only scaffolding, not shipped product markup — an inline
-        // `html!` defect inside it is intentional test data, not a product
-        // accessibility bug (issue #1934, the #1930 `form.rs` case). Skip the
-        // whole item without descending into its body.
+        // A `#[cfg(test)]` item is not shipped markup: a defect in it is test
+        // data (#1934). Skip the whole item.
         if is_cfg_test_attr(&trees, i) {
             i = skip_cfg_test_item(&trees, i + 2);
             continue;
@@ -1198,12 +1190,9 @@ fn find_html_blocks(stream: &TokenStream, file: &str, scan: &mut Scan) {
             && let Some(TokenTree::Group(group)) = trees.get(i + 2)
         {
             let body: Vec<TokenTree> = group.stream().into_iter().collect();
-            // Only maud/autumn `html!` markup is analyzed. A project may define a
-            // DIFFERENT `html!` (e.g. a Yew/JSX island using `<tag>…</tag>`
-            // syntax); handing such a body to the maud parser would strip the
-            // angle brackets and misread `<button></button>` as an empty maud
-            // `button`, a false `button-name`. maud never uses JSX angle-bracket
-            // tags, so a body that does is a different macro — skip it entirely.
+            // A JSX-style `html!` (e.g. Yew) is a different macro: the maud parser
+            // would read `<button></button>` as an empty `button`, a false
+            // `button-name`. maud never uses angle-bracket tags.
             if looks_like_jsx(&body) {
                 i += 3;
                 continue;
@@ -1211,7 +1200,6 @@ fn find_html_blocks(stream: &TokenStream, file: &str, scan: &mut Scan) {
             let nodes = parse_nodes(&body);
             scan.html_blocks += 1;
             analyze_block(&nodes, file, scan);
-            // Descend into the body for nested `html!` splices.
             find_html_blocks(&group.stream(), file, scan);
             i += 3;
             continue;
@@ -1311,20 +1299,14 @@ fn looks_like_jsx(trees: &[TokenTree]) -> bool {
 
 // ── Route attribution ──────────────────────────────────────────────────────
 //
-// A finding is only actionable if the developer knows which page it breaks.
-// Autumn declares routes with attribute macros on the handler
-// (`#[get("/settings")] async fn settings()`), so the routes a piece of markup
-// serves can be read from the same token stream the scanner already walks: index
-// every `fn`, record the free functions each one calls, then walk out from each
-// handler to the markup it reaches.
+// Routes come from attribute macros on handlers (`#[get("/settings")] async fn
+// settings()`): index every `fn`, record the free functions each one calls, then
+// walk out from each handler to the markup it reaches.
 //
-// The walk is deliberately conservative, like the scanner itself. It resolves a
-// call only when the called name is defined EXACTLY once in the scope the call
-// can see (the helpers at the top of the caller's body, then every free item);
-// two functions sharing a name cannot be told apart from tokens, and guessing
-// would key a defect to a route that never renders it. Method calls
-// (`page.sidebar()`) are not resolved at all. Attribution is therefore a
-// best-effort lower bound: an unattributed finding is still a finding.
+// A call resolves only when its name is defined exactly once in the scope it can
+// see (helpers at the top of the caller's body, then free items); guessing could
+// key a defect to a route that never renders it. Method calls are not resolved.
+// Attribution is a lower bound: an unattributed finding is still a finding.
 
 /// Route declared by an attribute macro on a handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2931,34 +2913,24 @@ fn parse_nodes(trees: &[TokenTree]) -> Vec<Node> {
                 }
                 i += 1;
             }
-            // A leading `.`/`#` shorthand with NO explicit tag name is maud's
-            // implicit `div`: `.input { … }` renders `<div class="input">` and
-            // `#button { … }` renders `<div id="button">`. The class/id token is
-            // a VALUE, not a tag, so parse it as a `div` element (which triggers
-            // no rule) rather than letting the next iteration read `input`/`button`
-            // as a phantom element (false positive).
+            // A leading `.`/`#` is maud's implicit `div`: `.input { … }` renders
+            // `<div class="input">`. The token after it is a value, not a tag.
             TokenTree::Punct(p) if matches!(p.as_char(), '#' | '.') => {
                 let (element, next) = parse_element(trees, i);
                 nodes.push(Node::Element(element));
                 i = next;
             }
             TokenTree::Punct(p) if p.as_char() == '@' => {
-                // Control flow (`@if`/`@for`/`@match`/`@let`): dynamic, but still
-                // descend into any block so elements inside are analyzed. Not a
-                // spliced fragment, so it never marks the block as possibly-labeled.
+                // Control flow: its blocks are still analyzed. It is not a splice,
+                // so it never marks the block as possibly labeled.
                 nodes.push(Node::Dynamic { splice: false });
                 if matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if *id == "match") {
-                    // `@match` is special: the brace group after the scrutinee is
-                    // an arm LIST, not markup. Parsing it as markup would treat
-                    // each arm's pattern (e.g. `input => …`) as an element and
-                    // fire a false positive. Skip past `@match`, then parse arms.
+                    // The `@match` brace group is an arm list, not markup: an arm
+                    // pattern like `input => …` is not an element.
                     i = skip_match(trees, i + 2, &mut nodes);
                 } else if matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if *id == "let") {
-                    // `@let` is special: it binds a Rust expression, so any brace
-                    // group in its initializer (`Field { input: true }`) is
-                    // struct-literal syntax, NEVER markup. Unlike `@if`/`@for`,
-                    // descending into it would misread a Rust field named `input`
-                    // as an `<input>`. Skip the whole binding up to its `;`.
+                    // `@let` binds a Rust expression: a brace group in it
+                    // (`Field { input: true }`) is a struct literal, never markup.
                     i = skip_let(trees, i + 2);
                 } else {
                     i = skip_control(trees, i + 1, &mut nodes);
@@ -2968,8 +2940,7 @@ fn parse_nodes(trees: &[TokenTree]) -> Vec<Node> {
                 if g.delimiter() == Delimiter::Brace {
                     nodes.extend(parse_markup(&g.stream()));
                 } else {
-                    // A `(expr)` splice or `[..]` — an unresolvable dynamic value
-                    // that could render a `<label>` fragment beside a control.
+                    // A `(expr)` or `[..]` splice could render a `<label>` beside a control.
                     nodes.push(Node::Dynamic { splice: true });
                 }
                 i += 1;
@@ -3019,17 +2990,9 @@ fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usi
     while i < trees.len() {
         match &trees[i] {
             TokenTree::Ident(id) => {
-                // A Rust macro call in the condition: `ident! { … }` /
-                // `ident!(…)` / `ident![…]` (e.g. `@if ready! { input } { body }`).
-                // The condition is parsed with `parse_without_eager_brace`, which
-                // accepts a macro invocation, so the `!`-delimited group is macro
-                // input — part of the condition, NOT markup. Skip the ident, the
-                // `!`, and the group together (any delimiter), the same way
-                // `match`/`loop`/`unsafe` keep their block out of the body;
-                // otherwise the macro's brace group is misparsed as markup (a
-                // phantom `<input>`) and the real body brace is missed. Requiring a
-                // delimiter group right after `!` excludes the `!=` operator (whose
-                // `!` is followed by `=`, not a group).
+                // A macro call in the condition (`@if ready! { input } { body }`):
+                // its group is macro input, not markup and not the body. Requiring
+                // a group right after `!` excludes the `!=` operator.
                 if !in_pattern
                     && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
                     && matches!(trees.get(i + 2), Some(TokenTree::Group(_)))
@@ -3077,9 +3040,8 @@ fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usi
                     continue;
                 }
                 if pending_block {
-                    // The block of a `match`/`loop`/`unsafe` condition expression
-                    // (e.g. the arm-list of `@if match s { … } { body }`). Part of
-                    // the condition — skip; the body is a later brace.
+                    // The block of a `match`/`loop`/`unsafe` in the condition
+                    // (`@if match s { … } { body }`); the body is a later brace.
                     pending_block = false;
                     i += 1;
                     continue;
@@ -3093,16 +3055,13 @@ fn skip_control(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usi
                 }
                 nodes.extend(parse_markup(&g.stream()));
                 i += 1;
-                // Only `@else` continues this chain. Any other `@`-control
-                // (`@let`/`@if`/`@for`/`@match`) is a sibling that must be
-                // returned to `parse_nodes` so it hits its proper handler —
-                // consuming it here would misparse e.g. a following `@let`'s
-                // struct-literal initializer as markup.
+                // Only `@else` continues this chain. Any other `@`-control is a
+                // sibling for `parse_nodes` to handle (a following `@let` must not
+                // be read as markup).
                 if matches!(trees.get(i), Some(TokenTree::Punct(p)) if p.as_char() == '@')
                     && matches!(trees.get(i + 1), Some(TokenTree::Ident(id)) if *id == "else")
                 {
                     i += 1;
-                    // Reset for the `@else` / `@else if …` continuation.
                     in_pattern = false;
                     saw_cond = false;
                     pending_block = false;
@@ -3182,9 +3141,8 @@ fn skip_match(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> usize
 fn parse_match_arms(trees: &[TokenTree], nodes: &mut Vec<Node>) {
     let mut i = 0;
     while i < trees.len() {
-        // Locate the `=>` that separates this arm's pattern/guard from its body.
-        // A fat arrow is two joined puncts `=` `>`; the first one after the arm
-        // start delimits the body (guards use `>=`/`==`, never `=>`).
+        // The first `=>` after the arm start ends the pattern and guard: a guard
+        // can hold `>=` or `==`, never `=>`.
         let Some(arrow) = find_fat_arrow(trees, i) else {
             break;
         };
@@ -3224,8 +3182,7 @@ fn parse_arm_body(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> u
         }
         return next;
     }
-    // Non-brace body: collect up to the next top-level comma (group contents are
-    // atomic token trees, so any comma seen here is an arm separator).
+    // Groups are atomic token trees, so a comma at this level separates arms.
     let mut j = start;
     while j < trees.len() {
         if matches!(&trees[j], TokenTree::Punct(p) if p.as_char() == ',') {
@@ -3243,15 +3200,8 @@ fn parse_arm_body(trees: &[TokenTree], start: usize, nodes: &mut Vec<Node>) -> u
 fn parse_element(trees: &[TokenTree], start: usize) -> (Element, usize) {
     let line = trees[start].span().start().line;
     let column = trees[start].span().start().column;
-    // A leading `.`/`#` with no explicit tag name is an implicit `div`; the
-    // shorthand class/id begins AT `start` and the tag is `div`. Otherwise the
-    // tag name is a full maud `HtmlName` (`Punctuated<HtmlNameFragment, '-' | ':'>`),
-    // so a custom/namespaced tag like `x-input`, `x-button`, or `svg:rect` must be
-    // read via the SAME `read_name` logic used for attribute names — consuming only
-    // the first identifier would leave the `-`/`:` + suffix in the stream, where the
-    // next pass would misread the `input`/`button`/`rect` suffix as a separate plain
-    // control element and fire a false `label`/`button-name`. Shorthands begin just
-    // past the whole name.
+    // A tag name can hold `-` and `:` (`x-input`, `svg:rect`). Reading only the
+    // first ident would leave `input`/`rect` in the stream as a phantom element.
     let (name, shorthand_start) = match &trees[start] {
         TokenTree::Punct(p) if matches!(p.as_char(), '#' | '.') => ("div".to_owned(), start),
         _ => read_name(trees, start),
@@ -3278,16 +3228,9 @@ fn parse_element(trees: &[TokenTree], start: usize) -> (Element, usize) {
                 attrs.push(attr);
                 i = next;
             }
-            // A quoted (string-literal) attribute name, e.g.
-            // `button "@click"="save" { … }` or `input "aria-label"="Search";`.
-            // maud accepts a `LitStr` as an attribute-name fragment, so route it
-            // through `parse_attr` like an ident name: its `="value"` (or bare /
-            // `[toggler]`) is consumed and the element body that follows is still
-            // parsed. `read_name` records the unquoted text, so a quoted
-            // accessible-name source (`"aria-label"`, `"title"`, `"alt"`) counts
-            // toward the accessible name exactly like the ident form. A non-string
-            // literal is not a valid name here and ends the element (best-effort:
-            // a missed check is acceptable, a false positive is not).
+            // A quoted attribute name (`input "aria-label"="Search";`) is parsed
+            // like an ident name, so it still counts toward the accessible name.
+            // A non-string literal ends the element.
             TokenTree::Literal(lit) if string_literal_value(lit).is_some() => {
                 let (attr, next) = parse_attr(trees, i);
                 attrs.push(attr);
@@ -3331,10 +3274,8 @@ fn parse_shorthand(trees: &[TokenTree], start: usize, attrs: &mut Vec<Attr>) -> 
         let is_id = sym == '#';
         i += 1; // consume the `#`/`.` — guarantees progress even with no name.
         match trees.get(i) {
-            // Dynamic shorthand value: `#(expr)` / `.(expr)`, or a braced markup
-            // group `#{ … }` / `.{ … }` — an unresolvable markup value. (A body
-            // brace never follows a `#`/`.` directly, so this is the class/id
-            // value, never the element body.)
+            // Dynamic value: `#(expr)` or `.{ … }`. A body brace never follows
+            // `#`/`.` directly, so this group is the value, not the body.
             Some(TokenTree::Group(g))
                 if matches!(g.delimiter(), Delimiter::Parenthesis | Delimiter::Brace) =>
             {
@@ -3346,11 +3287,8 @@ fn parse_shorthand(trees: &[TokenTree], start: usize, attrs: &mut Vec<Attr>) -> 
                 }
                 i += 1;
             }
-            // Markup-valued shorthand via a maud control:
-            // `.@if c { "x" }` / `#@match … { … }`. Fully consume the control
-            // (head + brace group(s) + any `@else` chain) so the element's real
-            // body that follows is still parsed. The value is unresolvable, so an
-            // id records as `Dynamic`.
+            // A control value (`.@if c { "x" }`): consume it whole, `@else`
+            // chain included, so the element's real body is still parsed.
             Some(TokenTree::Punct(q)) if q.as_char() == '@' => {
                 if is_id {
                     attrs.push(Attr {
@@ -3447,13 +3385,8 @@ fn read_attr_value(trees: &[TokenTree], i: usize) -> (AttrValue, usize) {
                 (AttrValue::Literal(v), i + 1)
             }),
         Some(TokenTree::Group(_) | TokenTree::Ident(_)) => (AttrValue::Dynamic, i + 1),
-        // A control-flow / markup value: `attr=@if c { "x" }`,
-        // `attr=@match s { _ => "c" }`. maud allows an attribute value to be a
-        // `Markup` control; consume the control head + its brace group(s) (via the
-        // same skipper the shorthand path uses) so the element body that follows
-        // is still parsed rather than orphaned (which would fire a false
-        // `button-name`/`link-name` on the parent). The value is unresolvable, so
-        // it is recorded as `Dynamic` (non-failing).
+        // A control value (`attr=@if c { "x" }`): consume it whole so the
+        // element body after it is still parsed, not orphaned onto the parent.
         Some(TokenTree::Punct(p)) if p.as_char() == '@' => {
             (AttrValue::Dynamic, skip_shorthand_control(trees, i + 1))
         }
@@ -3542,22 +3475,15 @@ fn collect_labels(nodes: &[Node], fors: &mut BTreeSet<String>, dynamic: &mut boo
     for node in nodes {
         match node {
             Node::Element(el) => {
-                // A `<label>` inside an `aria-hidden="true"` (or natively
-                // `hidden`) subtree is not in the accessibility tree, so its
-                // `for` association contributes no accessible name — skip the
-                // element and its subtree entirely, consistent with `walk`'s
-                // name derivation. A dynamic/spliced `aria-hidden=(…)`/`hidden=(…)`
-                // stays non-hidden (conservative).
+                // A label in a hidden subtree is out of the accessibility tree and
+                // names nothing. A spliced `aria-hidden=(…)` counts as not hidden.
                 if is_hidden(el) {
                     continue;
                 }
                 if el.name.eq_ignore_ascii_case("label") {
                     match el.attr("for") {
-                        // Only a label that actually provides a name satisfies the
-                        // association: an empty `<label for=..>` contributes no
-                        // accessible name, so recording it would let an unlabeled
-                        // control pass. A dynamic (spliced) body still counts, per
-                        // the non-failing-splice convention (`label_provides_name`).
+                        // An empty `<label for=..>` names nothing, so it must not
+                        // satisfy the association. A spliced body still counts.
                         Some(AttrValue::Literal(v)) if label_provides_name(el) => {
                             fors.insert(v.clone());
                         }
@@ -3567,12 +3493,9 @@ fn collect_labels(nodes: &[Node], fors: &mut BTreeSet<String>, dynamic: &mut boo
                 }
                 collect_labels(&el.children, fors, dynamic);
             }
-            // A spliced fragment `(expr)` could render a `<label for=..>`, but
-            // only one that is a DIRECT SIBLING of a control can label it. That
-            // sibling-scoped suppression is handled in `walk`; recording it here
-            // would (wrongly) mark the WHOLE block possibly-labeled, so an
-            // unrelated nested splice like `p { (user.name) }` would suppress the
-            // rule for every control in the block (false negative).
+            // A splice can label only a control it is a direct sibling of; `walk`
+            // handles that. Recording it here would let `p { (user.name) }`
+            // exempt every control in the block.
             Node::Dynamic { .. } | Node::Text(_) => {}
         }
     }
@@ -3602,10 +3525,8 @@ fn walk(
     in_named_label: bool,
     scan: &mut Scan,
 ) {
-    // A splice that is a DIRECT SIBLING of a control could render a `<label>`
-    // fragment for it, so its presence in THIS sibling list makes the
-    // association unresolvable. A splice nested inside another element belongs to
-    // a different sibling list and must not suppress controls here.
+    // Only a splice in this sibling list could render a `<label>` for a control
+    // here; one nested in another element must not exempt these controls.
     let sibling_splice = nodes
         .iter()
         .any(|n| matches!(n, Node::Dynamic { splice: true }));
@@ -3619,9 +3540,7 @@ fn walk(
         let Node::Element(el) = node else {
             continue;
         };
-        // An element removed from the accessibility tree by `aria-hidden="true"`
-        // or a native boolean `hidden` on ITSELF needs no accessible name, and
-        // neither does its subtree — skip both rule application and recursion.
+        // A hidden element and its subtree are out of the accessibility tree.
         if is_hidden(el) {
             continue;
         }
@@ -3641,10 +3560,8 @@ fn walk(
 
 fn apply_rules(el: &Element, file: &str, ctx: &LabelCtx, scan: &mut Scan) {
     match el.name.to_ascii_lowercase().as_str() {
-        // An `<img>` is named by `alt` (even empty `alt=""`, the decorative
-        // marker), or — per the axe `image-alt` checks — by an
-        // `aria-label`/`aria-labelledby`, a non-empty `title`, or an explicit
-        // presentational role. Only a bare image with none of these is flagged.
+        // As axe `image-alt`: an `alt` (`alt=""` is decorative), an aria name, a
+        // non-empty `title`, or a presentational role names an image.
         "img"
             if !has_alt_marker(el)
                 && !el.has_aria_name()
@@ -3668,10 +3585,8 @@ fn apply_rules(el: &Element, file: &str, ctx: &LabelCtx, scan: &mut Scan) {
 
 /// Rule 2: a form control needs an associated label or accessible name.
 fn check_field(el: &Element, name: &str, file: &str, ctx: &LabelCtx, scan: &mut Scan) {
-    // `<input type=…>` handling. Literal submit/hidden/button/reset/image
-    // controls need no visible label. A spliced `type=(…)` is unresolvable —
-    // it could be one of those non-labeling types, so skip rather than misfire
-    // on valid markup (per the non-failing-splice convention).
+    // These input types need no label. A spliced `type=(…)` could be one of them,
+    // so it is skipped too.
     if name == "input" {
         match el.attr("type") {
             Some(AttrValue::Literal(ty))
@@ -3688,17 +3603,14 @@ fn check_field(el: &Element, name: &str, file: &str, ctx: &LabelCtx, scan: &mut 
         return;
     }
     match el.attr("id") {
-        // A static id resolves against the collected `<label for>` set. A
-        // dynamic `<label for=(…)>` elsewhere (`dynamic_for`) could target it,
-        // and a splice that is a DIRECT SIBLING of this control could render a
-        // `<label for=..>` fragment for it — either makes the association
-        // unresolvable, so skip rather than risk a false positive.
+        // A spliced `<label for=(…)>` anywhere in the block, or a sibling splice,
+        // could label this id: the association is unresolvable, so skip.
         Some(AttrValue::Literal(id)) => {
             if ctx.fors.contains(id) || ctx.dynamic_for || ctx.sibling_splice {
                 return;
             }
         }
-        // A spliced id cannot be matched to a label — skip rather than misfire.
+        // A spliced id cannot be matched to a label.
         Some(AttrValue::Dynamic) => return,
         _ => {}
     }
@@ -3742,16 +3654,12 @@ fn is_hidden(el: &Element) -> bool {
 /// toward the ancestor's accessible name.
 fn content_provides_name(nodes: &[Node]) -> bool {
     nodes.iter().any(|n| match n {
-        // Only a genuine `(expr)`/`[..]` splice renders text that could name the
-        // control; an `@`-control head (`splice: false`) renders nothing itself
-        // (its branch bodies were already parsed out), so it is not a name.
+        // An `@`-control head renders nothing itself: its bodies were parsed out.
         Node::Dynamic { splice } => *splice,
         Node::Text(t) => !t.trim().is_empty(),
         Node::Element(e) if is_hidden(e) => false,
         Node::Element(e) => {
-            // A descendant contributes a name via its own `aria-label`/
-            // `aria-labelledby`/`title` (used during the name-from-content
-            // traversal), a named child `<img alt>`, or its own descendants.
+            // A descendant's own aria name or `title` counts in name-from-content.
             e.has_aria_name()
                 || e.has_title_name()
                 || (e.name.eq_ignore_ascii_case("img") && attr_is_present_name(e.attr("alt")))
@@ -3788,9 +3696,8 @@ pub fn run_in(root: &Path, opts: A11yVerifyOptions) -> i32 {
 /// `features` are read as on in addition to each crate's default features.
 #[must_use]
 pub fn run_in_with(root: &Path, opts: A11yVerifyOptions, features: &CargoFeatures) -> i32 {
-    // An unreadable scan root is a hard failure, not an empty (PASS) audit:
-    // surface the io error on stderr and exit non-zero so a CI path typo cannot
-    // silently disable the whole check.
+    // An unreadable scan root fails rather than passing empty, so a CI path typo
+    // cannot silently disable the check.
     let scan = match scan_project_with(root, features) {
         Ok(scan) => scan,
         Err(err) => {
@@ -3959,8 +3866,7 @@ mod tests {
 
     #[test]
     fn img_with_whitespace_alt_is_flagged() {
-        // A whitespace-only `alt="  "` collapses to an empty accessible name and
-        // is not a valid decorative marker (only exact `alt=""` is) — flagged.
+        // A whitespace-only `alt` is not a decorative marker; only exact `alt=""` is.
         let src = wrap(r#"img src="x" alt="  ";"#);
         assert_eq!(
             rule_ids(&src),
@@ -3991,8 +3897,7 @@ mod tests {
 
     #[test]
     fn input_with_whitespace_title_and_no_label_is_flagged() {
-        // A whitespace-only `title=" "` is not a name; with no label the field is
-        // flagged.
+        // A whitespace-only `title` is not a name.
         let src = wrap(r#"input title=" " id="q";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
@@ -4047,15 +3952,14 @@ mod tests {
 
     #[test]
     fn input_with_dynamic_id_is_not_flagged() {
-        // A spliced id cannot be matched to a label — skip rather than misfire.
+        // A spliced id cannot be matched to a label.
         let src = wrap(r#"input type="text" id=(field_id);"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn empty_label_for_does_not_satisfy_association() {
-        // An empty `<label for=..>` provides no accessible name, so the
-        // associated control must still be flagged (regression: false negative).
+        // An empty `<label for=..>` names nothing, so the control is still flagged.
         let src = wrap(r#"label for="email" { } input type="text" id="email";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
@@ -4076,18 +3980,14 @@ mod tests {
 
     #[test]
     fn dynamic_for_label_with_empty_body_does_not_satisfy_association() {
-        // A spliced-`for` label with a statically EMPTY body provides no
-        // accessible name, so a static-id control must still be flagged. The
-        // dynamic-`for` marker must carry the same `label_provides_name` guard as
-        // the literal-`for` path (regression: false negative).
+        // A spliced-`for` label with an empty body names nothing either.
         let src = wrap(r#"label for=(id) { } input type="text" id="email";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     #[test]
     fn dynamic_for_label_with_dynamic_body_is_clean() {
-        // A spliced-`for` label with a dynamic (spliced) body counts as providing
-        // a name, per the non-failing-splice convention.
+        // A spliced-`for` label with a spliced body counts as a name.
         let src = wrap(r#"label for=(id) { (title) } input type="text" id="email";"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4101,9 +4001,7 @@ mod tests {
 
     #[test]
     fn input_with_dynamic_type_is_not_flagged() {
-        // A spliced `type=(…)` is unresolvable — it may be a non-labeling type
-        // like submit/button, so skip rather than misfire (regression: false
-        // positive).
+        // A spliced `type=(…)` may be submit or button, so the input is skipped.
         let src = wrap(r#"input type=(kind) value="Save";"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4117,19 +4015,15 @@ mod tests {
 
     #[test]
     fn spliced_label_fragment_beside_control_is_not_flagged() {
-        // A label composed as a separate fragment and spliced next to the raw
-        // control could render a `<label for=..>`; the association is
-        // unresolvable, so per the non-failing-splice convention the control is
-        // treated as possibly-labeled (regression: false positive).
+        // A spliced fragment beside the control could render its `<label for=..>`, so
+        // the control counts as possibly labeled.
         let src = wrap(r#"(field_label) input id="email";"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn unlabeled_input_with_no_splice_is_still_flagged() {
-        // With no spliced fragment anywhere in the block, an unlabeled control
-        // must still be flagged — the fragment marker must not suppress unrelated
-        // static controls.
+        // With no splice in the block, an unlabeled control is still flagged.
         let src = wrap(r#"input id="x";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
@@ -4171,10 +4065,7 @@ mod tests {
 
     #[test]
     fn button_with_only_control_head_is_flagged() {
-        // The only child is an `@if` control HEAD (`splice: false`), whose branch
-        // bodies were parsed out — it renders no accessible text. A definitively
-        // nameless button must still be flagged (regression: false negative — a
-        // control head was wrongly counted as a name).
+        // An `@if` head renders no text, so the button is still nameless.
         let src = wrap(r"button { @if disabled { } }");
         let f = findings_for(&src);
         assert_eq!(f.len(), 1, "{f:?}");
@@ -4183,8 +4074,7 @@ mod tests {
 
     #[test]
     fn button_with_real_splice_content_is_clean() {
-        // A genuine `(expr)` splice body could render the button's name, so it is
-        // treated as named (unchanged; guards against over-correcting the head fix).
+        // A `(expr)` splice body could render the button's name.
         let src = wrap(r"button { (label) }");
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4223,8 +4113,7 @@ mod tests {
 
     #[test]
     fn icon_button_with_aria_hidden_glyph_is_flagged() {
-        // The only content is an `aria-hidden="true"` glyph, which per ARIA does
-        // not contribute an accessible name — the button is effectively nameless.
+        // An `aria-hidden` glyph adds no name, so the button is nameless.
         let src = wrap(r#"button { span aria-hidden="true" { "×" } }"#);
         let f = findings_for(&src);
         assert_eq!(f.len(), 1, "{f:?}");
@@ -4255,71 +4144,57 @@ mod tests {
 
     #[test]
     fn button_with_dynamic_aria_hidden_glyph_is_not_flagged() {
-        // A spliced `aria-hidden=(…)` is unresolvable, so the subtree is treated
-        // as not hidden and its text still counts — conservative, no new false
-        // positive on valid dynamic markup.
+        // A spliced `aria-hidden=(…)` counts as not hidden, so its text still names.
         let src = wrap(r#"button { span aria-hidden=(flag) { "×" } }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn label_with_only_aria_hidden_text_does_not_satisfy_association() {
-        // The `<label>` body is entirely `aria-hidden="true"`, which per ARIA
-        // contributes no accessible name — the label check must use the same
-        // hidden-excluding name walk as buttons/links, so the field is FLAGGED
-        // (regression: false negative — hidden text was wrongly accepted).
+        // A label whose body is all `aria-hidden` names nothing, so the field is flagged.
         let src = wrap(r#"label for="q" { span aria-hidden="true" { "Search" } } input id="q";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     #[test]
     fn label_with_only_control_head_does_not_satisfy_association() {
-        // The `<label>` body is only an `@if` control HEAD (`splice: false`),
-        // which renders no accessible name — so the associated field must still be
-        // FLAGGED (regression: false negative — a control head was wrongly counted
-        // as a name).
+        // A label whose body is only an `@if` head names nothing.
         let src = wrap(r#"label for="q" { @if show { } } input id="q";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     #[test]
     fn label_with_alt_image_satisfies_association() {
-        // A `<label>` whose only content is an `<img alt=..>` has an accessible
-        // name via the alt text, so the associated field is CLEAN (regression:
-        // false positive — the img alt was previously ignored).
+        // An `<img alt=..>` inside the label names the field.
         let src = wrap(r#"label for="q" { img src="s.svg" alt="Search"; } input id="q";"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn label_with_plain_text_still_satisfies_association() {
-        // Unchanged: a `<label for=..>` with real visible text names the field.
+        // A `<label for=..>` with visible text names the field.
         let src = wrap(r#"label for="e" { "Email" } input id="e";"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn empty_label_body_still_does_not_satisfy_association() {
-        // Unchanged: an empty `<label for=..>` provides no accessible name, so
-        // the associated field is FLAGGED.
+        // An empty `<label for=..>` names nothing, so the field is flagged.
         let src = wrap(r#"label for="e" { } input id="e";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     #[test]
     fn label_in_aria_hidden_container_does_not_satisfy_association() {
-        // Regression (false negative): a `<label for=..>` that only exists inside
-        // an `aria-hidden="true"` subtree is not in the accessibility tree, so it
-        // provides no accessible name. `collect_labels` must stop descending into
-        // hidden subtrees (like `walk`), so the visible input is FLAGGED.
+        // A label inside an `aria-hidden` subtree is out of the accessibility tree and
+        // names nothing.
         let src = wrap(r#"div aria-hidden="true" { label for="q" { "Search" } } input id="q";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     #[test]
     fn label_in_visible_container_satisfies_association() {
-        // Unchanged: a `<label for=..>` inside a visible container is in the
-        // accessibility tree and names the associated input, so it is CLEAN.
+        // A label in a visible container names the input.
         let src = wrap(r#"div { label for="q" { "Search" } } input id="q";"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4328,8 +4203,7 @@ mod tests {
 
     #[test]
     fn typed_primitive_splice_is_not_flagged() {
-        // `(Img::new(..))` is a splice, not an `img` element, so the compile-time
-        // guarantee is respected and nothing is re-scanned.
+        // `(Img::new(..))` is a splice, not an `img` element.
         let src = wrap(r"(autumn_web::a11y::Img::new(src, alt))");
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4348,33 +4222,29 @@ mod tests {
 
     #[test]
     fn match_arm_pattern_named_input_is_not_flagged() {
-        // Regression: an `@match` arm whose PATTERN is named `input` must not be
-        // read as an `<input>` element. Parsing the arm list as markup produced a
-        // false `label` finding on valid views.
+        // An `@match` arm pattern named `input` is not an `<input>` element.
         let src = wrap(r#"@match field { input => { "text" } }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn match_arm_body_real_input_is_still_flagged() {
-        // The arm PATTERN is skipped, but the arm BODY is still scanned: a real
-        // unlabeled `<input>` inside an arm body must still be flagged.
+        // The arm body is still scanned.
         let src = wrap(r"@match x { A => { input; } }");
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     #[test]
     fn match_arm_with_guard_does_not_misparse() {
-        // A guard (`Pattern if cond => …`) sits between the pattern and `=>` and
-        // must be skipped along with the pattern — no crash, no false finding.
+        // A guard between the pattern and `=>` is skipped with the pattern.
         let src = wrap(r#"@match x { A if ready => { "ok" } B => { "no" } }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn match_multiple_arms_scan_each_body() {
-        // Several arms, mixed body shapes: only the real markup in bodies counts.
-        // The `input` pattern must not flag; the alt-less `<img>` body must.
+        // Only markup in arm bodies counts: the `input` pattern does not flag, the
+        // alt-less `<img>` body does.
         let src = wrap(r#"@match k { input => { "a" } other => { img src="x.png"; } }"#);
         assert_eq!(
             rule_ids(&src),
@@ -4386,18 +4256,14 @@ mod tests {
 
     #[test]
     fn let_initializer_struct_literal_is_not_parsed_as_markup() {
-        // Regression: `@let props = Field { input: true };` binds a Rust
-        // expression, so its brace group is struct-literal syntax, not markup.
-        // Parsing it as markup misread the Rust field `input` as an `<input>`
-        // element and fired a false `label` finding on valid views.
+        // `@let props = Field { input: true };` is a struct literal, not markup.
         let src = wrap(r#"@let props = Field { input: true }; div { "ok" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn let_binding_does_not_suppress_real_input_elsewhere() {
-        // The `@let` initializer is skipped wholesale, but a real unlabeled
-        // `<input>` later in the same markup must still be flagged.
+        // A real unlabeled `<input>` after the `@let` is still flagged.
         let src = wrap(r#"@let props = Field { input: true }; input type="text" id="name";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
@@ -4411,36 +4277,30 @@ mod tests {
 
     #[test]
     fn let_after_control_reaches_its_skip_handler() {
-        // Regression: only `@else` continues a control chain. A `@let` following a
-        // parsed control block must be returned to `parse_nodes` so it hits
-        // `skip_let` — otherwise its `Field { input: true }` struct literal is
-        // misparsed as markup and fires a bogus `<input>` finding (false positive).
+        // Only `@else` continues a control chain: a following `@let` is still skipped
+        // as Rust, not read as markup.
         let src = wrap(r#"@if show { "ok" } @let props = Field { input: true };"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn if_else_chain_still_parses_and_flags_real_input() {
-        // A genuine `@if … @else …` chain still parses across the `@else`, and a
-        // real unlabeled `<input>` in the `@if` body is still flagged.
+        // An `@if … @else …` chain parses across the `@else`; the `@if` body is scanned.
         let src = wrap(r#"@if c { input; } @else { "x" }"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     #[test]
     fn while_body_element_is_scanned() {
-        // `@while cond { body }`: the body is markup and is scanned, so a real
-        // unlabeled `<input>` in a `@while` body is still flagged.
+        // A `@while` body is markup and is scanned.
         let src = wrap(r"@while more { input; }");
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     #[test]
     fn for_struct_pattern_is_not_parsed_as_markup() {
-        // Regression (false positive): a `@for` loop destructuring a struct
-        // pattern (`@for Field { input, .. } in fields`) has BRACES in the
-        // pattern that are NOT markup. Parsing them misread the Rust field
-        // `input` as an `<input>` element.
+        // Braces in a `@for` pattern (`@for Field { input, .. } in fields`) are not
+        // markup.
         let src = wrap(r#"@for Field { input, label } in fields { "row" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4454,8 +4314,7 @@ mod tests {
 
     #[test]
     fn if_let_struct_pattern_is_not_parsed_as_markup() {
-        // Regression (false positive): `@if let Field { input } = props { .. }`
-        // has a struct PATTERN brace that is not markup.
+        // The struct pattern brace in `@if let Field { input } = props` is not markup.
         let src = wrap(r#"@if let Field { input } = props { "ok" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4475,18 +4334,15 @@ mod tests {
 
     #[test]
     fn if_block_expression_condition_is_not_parsed_as_markup() {
-        // Regression (false positive): maud parses the condition with
-        // `parse_without_eager_brace`, so a block-expression condition
-        // (`@if { input } { body }`) is valid — the FIRST brace is the condition,
-        // the LAST is the markup body. The condition must NOT be parsed as markup.
+        // maud parses the condition with `parse_without_eager_brace`, so in
+        // `@if { input } { body }` the first brace is the condition, the last the body.
         let src = wrap(r#"@if { input } { "ok" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn if_block_expression_condition_body_is_still_scanned() {
-        // The block-expression condition is skipped, but the body IS scanned: a
-        // real unlabeled `<input>` in the body must still be flagged.
+        // The body after a block-expression condition is still scanned.
         let src = wrap(r"@if { ready } { input; }");
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
@@ -4500,9 +4356,8 @@ mod tests {
 
     #[test]
     fn if_body_then_sibling_block_still_scans_body() {
-        // `@if a { body } { sibling }`: the first brace is the body (a condition
-        // token `a` precedes it), the second is a sibling markup block. Both are
-        // scanned, so a real `<input>` in EITHER is flagged.
+        // `@if a { body } { sibling }`: `a` is the condition, so the first brace is the
+        // body and the second a sibling block. Both are scanned.
         let src = wrap(r"@if a { input; } { button { } }");
         assert_eq!(
             rule_ids(&src),
@@ -4514,10 +4369,7 @@ mod tests {
 
     #[test]
     fn match_block_expression_scrutinee_is_not_parsed_as_markup() {
-        // Regression (false positive): a `@match` scrutinee is parsed with
-        // `parse_without_eager_brace`, so a block-expression scrutinee
-        // (`@match { input } { arms }`) is valid — the first brace is the
-        // scrutinee, the second is the arm list. The scrutinee must not be markup.
+        // In `@match { input } { arms }` the first brace is the scrutinee, not markup.
         let src = wrap(r#"@match { input } { A => { "a" } }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4530,18 +4382,15 @@ mod tests {
 
     #[test]
     fn if_match_condition_arm_list_is_not_parsed_as_markup() {
-        // Regression (false positive): a `match` expression IN the `@if` condition
-        // owns its arm-list brace — that brace is part of the condition, and the
-        // real markup body is the FINAL `{ "ok" }`. The arm pattern `input` must
-        // NOT be misread as an `<input>`, and the body must be scanned.
+        // A `match` in the `@if` condition owns its arm-list brace; the body is the
+        // final `{ "ok" }`.
         let src = wrap(r#"@if match state { input => true, _ => false } { "ok" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn if_simple_condition_body_input_still_flagged() {
-        // A plain `@if cond { body }` still parses the body: a real unlabeled
-        // `<input>` is flagged (no match brace to confuse the head).
+        // A plain `@if cond { body }` still scans the body.
         let src = wrap(r"@if cond { input; }");
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
@@ -4561,20 +4410,15 @@ mod tests {
 
     #[test]
     fn if_macro_condition_is_not_parsed_as_markup() {
-        // Regression (false positive): a Rust macro call in the `@if` condition
-        // (`@if ready! { input } { "ok" }`) owns its `!`-delimited brace group —
-        // that group is macro input, part of the condition, and the real markup
-        // body is the FINAL `{ "ok" }`. The macro's `input` token must NOT be
-        // misread as a phantom `<input>`, and the body must be scanned.
+        // A macro call in the condition (`@if ready! { input } { "ok" }`) owns its
+        // group: its `input` is not an element, and the final `{ "ok" }` is the body.
         let src = wrap(r#"@if ready! { input } { "ok" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn if_macro_condition_body_is_still_scanned() {
-        // The macro condition is skipped, but the body IS scanned: an empty
-        // `<button>` in the body is still flagged (the body brace was correctly
-        // identified past the macro's group).
+        // The body after the macro's group is still scanned.
         let src = wrap(r"@if ready! { input } { button { } }");
         assert_eq!(
             rule_ids(&src),
@@ -4586,9 +4430,7 @@ mod tests {
 
     #[test]
     fn if_non_macro_condition_body_input_still_flagged() {
-        // A plain `@if cond { input; }` (no macro) still parses the body, so a
-        // real unlabeled `<input>` is flagged — the macro handling does not
-        // change the macro-free path.
+        // Without a macro, the body's input is still flagged.
         let src = wrap(r"@if cond { input; }");
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
@@ -4597,18 +4439,14 @@ mod tests {
 
     #[test]
     fn custom_hyphenated_tag_is_not_flagged() {
-        // Regression (false positive): a maud element name is a full `HtmlName`
-        // (`Punctuated<HtmlNameFragment, '-' | ':'>`), so `x-input` is ONE custom
-        // tag that matches no rule. Reading only the first ident (`x`) would leave
-        // `-input` in the stream and misfire a `label` on a phantom `<input>`.
+        // `x-input` is one custom tag that matches no rule, not a phantom `<input>`.
         let src = wrap(r"x-input;");
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn custom_hyphenated_tag_with_body_is_not_flagged() {
-        // `x-button { }` is a single custom tag (no `button-name` rule applies),
-        // not a `<button>` — its `{ }` body is parsed normally.
+        // `x-button { }` is one custom tag, not a `<button>`.
         let src = wrap(r"x-button { }");
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4622,8 +4460,7 @@ mod tests {
 
     #[test]
     fn plain_input_tag_is_still_flagged() {
-        // A plain `input;` (no `-`/`:` continuation) is a real `<input>` and is
-        // still flagged — the full-name read does not affect simple tag names.
+        // A plain `input;` is still flagged.
         let src = wrap(r"input;");
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
@@ -4644,9 +4481,7 @@ mod tests {
 
     #[test]
     fn dynamic_class_shorthand_does_not_orphan_body() {
-        // Regression (false positive): a dynamic class shorthand `.(expr)` must
-        // be consumed, else the element ends early and its `{ … }` body is
-        // orphaned — here the button would lose its "Save" text and be flagged.
+        // A dynamic class `.(expr)` is consumed, so the button keeps its "Save" body.
         let src = wrap(r#"button.(cls) { "Save" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4683,8 +4518,7 @@ mod tests {
 
     #[test]
     fn dynamic_id_shorthand_is_treated_as_dynamic() {
-        // A dynamic id `#(expr)` cannot be matched to a label — skip like
-        // `id=(expr)` rather than misfire.
+        // A dynamic id `#(expr)` cannot be matched to a label, like `id=(expr)`.
         let src = wrap(r#"input#(field_id) type="text";"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4707,9 +4541,7 @@ mod tests {
 
     #[test]
     fn leading_class_shorthand_is_implicit_div_not_input() {
-        // Regression (false positive): `.input { }` is an implicit `<div
-        // class="input">`, NOT an `<input>` element — the class token is a VALUE,
-        // not a tag. A `<div>` triggers no rule, so nothing is flagged.
+        // `.input { }` is an implicit `<div class="input">`, not an `<input>`.
         let src = wrap(r".input { }");
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4723,16 +4555,14 @@ mod tests {
 
     #[test]
     fn leading_class_shorthand_with_text_is_implicit_div() {
-        // `.input { "x" }` is still an implicit `<div>`; its text body is not a
-        // control name obligation.
+        // `.input { "x" }` is still an implicit `<div>`.
         let src = wrap(r#".input { "x" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn implicit_div_wrapping_real_input_still_flags_inner_input() {
-        // The implicit `<div class="card">` triggers no rule itself, but its body
-        // is still scanned: a real unlabeled `<input>` inside is STILL flagged.
+        // The implicit `<div>`'s body is still scanned.
         let src = wrap(r".card { input; }");
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
@@ -4741,18 +4571,15 @@ mod tests {
 
     #[test]
     fn markup_valued_class_shorthand_does_not_truncate_button() {
-        // Regression (false positive): `.@if primary { "primary" }` is a
-        // MARKUP-valued class value; the button's real body is the FOLLOWING
-        // `{ "Save" }`. The class control must be fully consumed so the body is
-        // parsed — otherwise the button is analyzed as empty and falsely flagged.
+        // `.@if primary { "primary" }` is the class value; the button's body is the
+        // following `{ "Save" }`.
         let src = wrap(r#"button.@if primary { "primary" } { "Save" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn markup_valued_class_shorthand_empty_button_still_flagged() {
-        // The markup class value is consumed, but a genuinely empty body is still
-        // caught (no over-correction into a false negative).
+        // A genuinely empty body is still flagged.
         let src = wrap(r#"button.@if primary { "primary" } { }"#);
         assert_eq!(
             rule_ids(&src),
@@ -4764,16 +4591,13 @@ mod tests {
 
     #[test]
     fn markup_valued_class_shorthand_before_attr_and_body_is_clean() {
-        // A markup class value followed by a real attribute and body: the anchor
-        // keeps its `href` and its `{ "Link" }` text, so it is not flagged.
+        // After a control class value the anchor keeps its `href` and its text.
         let src = wrap(r#"a.@if c { "x" } href="/y" { "Link" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn splice_valued_class_shorthand_stays_clean() {
-        // A splice-valued class `.(dynamic_class)` was already handled; it must
-        // stay clean (the button keeps its "Save" body).
         let src = wrap(r#"button.(dynamic_class) { "Save" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4782,19 +4606,15 @@ mod tests {
 
     #[test]
     fn colon_qualified_attr_name_does_not_orphan_button_body() {
-        // Regression (false positive): maud names allow `:` (and `-`), so an
-        // Alpine/Vue-style `x-on:click` attribute must be read as ONE name. If the
-        // scanner stopped at the `:`, the leftover token ends the element early and
-        // orphans its `{ "Save" }` body — the button is analyzed as empty and
-        // falsely flagged.
+        // `x-on:click` is one attribute name. Stopping at the `:` would end the element
+        // and orphan its `{ "Save" }` body.
         let src = wrap(r#"button x-on:click="save" { "Save" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn colon_qualified_attr_name_empty_button_still_flagged() {
-        // The colon-qualified name is consumed, but a genuinely empty button is
-        // still caught (no over-correction into a false negative).
+        // A genuinely empty button is still flagged.
         let src = wrap(r#"button x-on:click="save" { }"#);
         assert_eq!(
             rule_ids(&src),
@@ -4806,8 +4626,7 @@ mod tests {
 
     #[test]
     fn colon_qualified_attr_on_link_is_clean() {
-        // A colon-qualified `data:foo` attribute must not truncate the anchor: it
-        // keeps its `href` and its `{ "Link" }` text, so it is not flagged.
+        // A `data:foo` attribute does not truncate the anchor.
         let src = wrap(r#"a href="/x" data:foo="y" { "Link" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4816,34 +4635,28 @@ mod tests {
 
     #[test]
     fn numeric_class_shorthand_does_not_orphan_button_body() {
-        // Regression (false positive): maud `HtmlName` fragments may be integers,
-        // so `.col-12` is ONE class name. If the reader stopped at the numeric
-        // fragment the leftover `-12` ends the element early and orphans its
-        // `{ "Save" }` body — the button is analyzed as empty and falsely flagged.
+        // Name fragments may be integers: `.col-12` is one class name.
         let src = wrap(r#"button.col-12 { "Save" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn numeric_attr_name_does_not_orphan_button_body() {
-        // A numeric attribute-name fragment (`data-1`) must be read as one name so
-        // the button's `{ "Save" }` body is still parsed.
+        // `data-1` is one attribute name.
         let src = wrap(r#"button data-1="x" { "Save" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn numeric_class_shorthand_on_link_is_clean() {
-        // An anchor with a numeric class shorthand keeps its `href` and `{ "Link" }`
-        // text, so it is not flagged.
+        // The anchor keeps its `href` and text after a numeric class.
         let src = wrap(r#"a.col-6 href="/x" { "Link" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn numeric_class_shorthand_empty_button_still_flagged() {
-        // The numeric class name is consumed correctly, but a genuinely empty body
-        // is still caught (no over-correction into a false negative).
+        // A genuinely empty body is still flagged.
         let src = wrap(r"button.col-12 { }");
         assert_eq!(
             rule_ids(&src),
@@ -4855,7 +4668,6 @@ mod tests {
 
     #[test]
     fn plain_empty_button_without_numeric_name_still_flagged() {
-        // A plain nameless button is unaffected by the numeric-fragment fix.
         let src = wrap(r"button { }");
         assert_eq!(
             rule_ids(&src),
@@ -4869,27 +4681,21 @@ mod tests {
 
     #[test]
     fn quoted_attr_name_does_not_orphan_button_body() {
-        // Regression (false positive): maud accepts a STRING-LITERAL attribute
-        // name (`"@click"`). If it is not recognized as an attribute name the
-        // element ends early and orphans its `{ "Save" }` body — the button is
-        // analyzed as empty and falsely flagged.
+        // maud accepts a string-literal attribute name (`"@click"`); the button's
+        // `{ "Save" }` body is still parsed.
         let src = wrap(r#"button "@click"="save" { "Save" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn quoted_aria_label_provides_accessible_name() {
-        // A quoted `"aria-label"` name is recorded like the ident form, so its
-        // static value supplies the accessible name — a labelless `<input>` with
-        // an `aria-label` is not flagged.
+        // A quoted `"aria-label"` names the input like the ident form.
         let src = wrap(r#"input "aria-label"="Search";"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn quoted_non_name_attr_consumed_empty_button_still_flagged() {
-        // The quoted attribute is consumed, but it supplies no accessible name and
-        // the body is empty — a genuinely nameless button is still caught.
         let src = wrap(r#"button "data-x"="y" { }"#);
         assert_eq!(
             rule_ids(&src),
@@ -4903,26 +4709,22 @@ mod tests {
 
     #[test]
     fn match_valued_attr_does_not_truncate_button() {
-        // Regression (false positive): a maud attribute value may be a control
-        // (`class=@match state { _ => "primary" }`). The control must be fully
-        // consumed so the button's real `{ "Save" }` body is parsed — otherwise
-        // the button is analyzed as empty and falsely flagged.
+        // A control-valued attribute (`class=@match state { … }`) is consumed, so the
+        // button's `{ "Save" }` body is parsed.
         let src = wrap(r#"button class=@match state { _ => "primary" } { "Save" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn if_valued_attr_after_real_attr_stays_clean() {
-        // An `@if`-valued attribute following a real `href` must not truncate the
-        // anchor: it keeps its `{ "Link" }` text, so it is not flagged.
+        // An `@if`-valued attribute after `href` does not truncate the anchor.
         let src = wrap(r#"a href="/x" class=@if hot { "hot" } { "Link" }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn if_valued_attr_empty_button_still_flagged() {
-        // The control value is consumed, but a genuinely empty body is still
-        // caught (no over-correction into a false negative).
+        // A genuinely empty body is still flagged.
         let src = wrap(r#"button class=@if c { "x" } { }"#);
         assert_eq!(
             rule_ids(&src),
@@ -4934,8 +4736,7 @@ mod tests {
 
     #[test]
     fn match_valued_attr_then_id_unlabeled_input_still_flagged() {
-        // The control value is consumed and the following `id="q"` attribute is
-        // parsed, but with no matching label the input is still flagged.
+        // The `id="q"` after the control value is parsed; with no label it is flagged.
         let src = wrap(r#"input class=@match s { _ => "c" } id="q";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
@@ -4944,8 +4745,7 @@ mod tests {
 
     #[test]
     fn aria_hidden_button_needs_no_name() {
-        // A `<button aria-hidden="true">` is removed from the accessibility tree,
-        // so it needs no accessible name (regression: false positive).
+        // A `<button aria-hidden="true">` is out of the accessibility tree.
         let src = wrap(r#"button aria-hidden="true" { }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -4983,8 +4783,7 @@ mod tests {
 
     #[test]
     fn dynamic_aria_hidden_control_is_still_checked() {
-        // A spliced `aria-hidden=(…)` is unresolvable → treated as NOT hidden, so
-        // a nameless button is still flagged (no new false negative).
+        // A spliced `aria-hidden=(…)` counts as not hidden.
         let src = wrap(r"button aria-hidden=(flag) { }");
         assert_eq!(
             rule_ids(&src),
@@ -4998,31 +4797,28 @@ mod tests {
 
     #[test]
     fn native_hidden_button_needs_no_name() {
-        // A `<button hidden>` is removed from the accessibility tree, so it needs
-        // no accessible name (regression: false positive on valid markup).
+        // A `<button hidden>` is out of the accessibility tree.
         let src = wrap(r"button hidden { }");
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn native_hidden_subtree_control_is_exempt() {
-        // A control nested inside a natively `hidden` subtree is hidden too, so its
-        // subtree is skipped and the inner input is not flagged.
+        // A control inside a `hidden` subtree is hidden too.
         let src = wrap(r"div hidden { input; }");
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn native_hidden_with_literal_value_needs_no_name() {
-        // `hidden="until-found"` is a present static boolean `hidden` (HTML treats
-        // any value as hidden), so the button is exempt.
+        // HTML treats `hidden` with any value as hidden.
         let src = wrap(r#"button hidden="until-found" { }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
 
     #[test]
     fn button_without_hidden_still_flagged() {
-        // A nameless button with no `hidden` attribute is unaffected by the fix.
+        // A nameless button without `hidden` is still flagged.
         let src = wrap(r"button { }");
         assert_eq!(
             rule_ids(&src),
@@ -5034,16 +4830,14 @@ mod tests {
 
     #[test]
     fn visible_subtree_control_without_hidden_still_flagged() {
-        // A `<div>` without `hidden` does not hide its input — the labelless input
-        // is still flagged (no new false negative).
+        // A `<div>` without `hidden` does not hide its input.
         let src = wrap(r"div { input; }");
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     #[test]
     fn dynamic_hidden_control_is_still_checked() {
-        // A spliced `hidden=(…)` is unresolvable → treated as NOT hidden, so a
-        // nameless button is still flagged (conservative, no new false negative).
+        // A spliced `hidden=(…)` counts as not hidden.
         let src = wrap(r"button hidden=(flag) { }");
         assert_eq!(
             rule_ids(&src),
@@ -5096,8 +4890,7 @@ mod tests {
 
     #[test]
     fn img_with_aria_label_is_clean() {
-        // An `<img>` named by `aria-label` has an accessible name (regression:
-        // false positive — only `alt` was previously accepted).
+        // An `<img>` named by `aria-label` needs no `alt`.
         let src = wrap(r#"img src="x.png" aria-label="Logo";"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -5161,17 +4954,16 @@ mod tests {
 
     #[test]
     fn nested_splice_does_not_suppress_unrelated_control() {
-        // Regression (false negative): a splice nested inside another element
-        // (`p { (user.name) }`) is unrelated to labeling and must NOT suppress the
-        // unlabeled-control rule for a control elsewhere in the block.
+        // A splice nested in another element (`p { (user.name) }`) does not exempt a
+        // control elsewhere in the block.
         let src = wrap(r#"p { (user.name) } input type="text" id="email";"#);
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
 
     #[test]
     fn direct_sibling_splice_still_suppresses_nested_control() {
-        // A splice that is a DIRECT SIBLING of the control (even nested one level
-        // deep) could render a `<label>` fragment for it — still suppressed.
+        // A splice that is a direct sibling of the control, even one level deep, could
+        // render its `<label>`.
         let src = wrap(r#"div { (field_label) input type="text" id="email"; }"#);
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -5201,10 +4993,7 @@ mod tests {
 
     #[test]
     fn jsx_html_button_is_skipped() {
-        // Regression (false positive): a DIFFERENT `html!` (e.g. a Yew/JSX island)
-        // uses `<tag>…</tag>` angle-bracket syntax that maud never uses. Parsing it
-        // as maud would strip the brackets and misread `<button></button>` as an
-        // empty maud `button`. The body is detected as JSX and skipped — no finding.
+        // A JSX-style `html!` body (Yew) is skipped, not misread as maud.
         let src = wrap(r"<button>{label}</button>");
         assert!(findings_for(&src).is_empty(), "{:?}", findings_for(&src));
     }
@@ -5218,8 +5007,7 @@ mod tests {
 
     #[test]
     fn real_maud_button_still_analyzed_after_jsx_skip() {
-        // The JSX skip must not silence real maud: an empty maud `button { }` (no
-        // angle brackets) is STILL parsed and flagged.
+        // The JSX skip does not silence real maud: an empty `button { }` is flagged.
         let src = wrap(r"button { }");
         assert_eq!(
             rule_ids(&src),
@@ -5231,10 +5019,8 @@ mod tests {
 
     #[test]
     fn maud_comparison_in_if_head_is_not_misread_as_jsx() {
-        // Regression (false negative): a `<`/`>` comparison in a control head is a
-        // normal Rust comparison, NOT a JSX tag start. Misreading it as JSX would
-        // skip the WHOLE `html!` body. The body must still be scanned — a real
-        // unlabeled `<input>` inside `@if count < limit { … }` is still flagged.
+        // A `<` comparison in a control head is not a JSX tag, so the body is still
+        // scanned.
         let src = wrap(r"@if count < limit { input; }");
         assert_eq!(rule_ids(&src), vec!["label"], "{:?}", findings_for(&src));
     }
@@ -5273,7 +5059,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let view = dir.path().join("view.rs");
 
-        // Red: an alt-less image in raw html! ships silently until now.
+        // Red: an alt-less image in raw `html!`.
         std::fs::write(&view, wrap(r#"img src="/logo.png";"#)).unwrap();
         let opts = A11yVerifyOptions {
             format: OutputFormat::Text,
@@ -5299,9 +5085,7 @@ mod tests {
 
     #[test]
     fn nonexistent_scan_root_fails_hard() {
-        // A misspelled/unreadable scan root must be a hard non-zero failure, not
-        // a zero-findings PASS — otherwise a CI path typo silently disables the
-        // whole audit.
+        // An unreadable scan root fails rather than passing with zero findings.
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         let opts = A11yVerifyOptions {
@@ -5317,8 +5101,7 @@ mod tests {
 
     #[test]
     fn empty_but_readable_root_passes() {
-        // A genuinely empty-but-readable directory has no findings and must still
-        // pass (exit 0) — distinct from the unreadable-root failure above.
+        // An empty but readable directory passes.
         let dir = tempfile::tempdir().unwrap();
         let opts = A11yVerifyOptions {
             format: OutputFormat::Text,
@@ -5331,10 +5114,8 @@ mod tests {
 
     #[test]
     fn defect_in_inline_cfg_test_module_is_not_flagged() {
-        // A raw-`html!` defect inside a `#[cfg(test)] mod tests { … }` is test
-        // scaffolding, not shipped product markup, so it must not be flagged —
-        // while a real product defect in the same file still is (issue #1934,
-        // the #1930 `form.rs` case).
+        // A defect in `#[cfg(test)] mod tests` is not flagged; a product defect in the
+        // same file still is.
         let src = r#"
             fn view() { let _ = html! { img src="product.png"; }; }
             #[cfg(test)]
@@ -5359,8 +5140,7 @@ mod tests {
 
     #[test]
     fn cfg_not_test_module_is_still_scanned() {
-        // The skip is precise: `#[cfg(not(test))]` is production code and its
-        // defects must still be flagged (only a literal `cfg(test)` is skipped).
+        // `#[cfg(not(test))]` is production code and is still flagged.
         let src = r#"
             #[cfg(not(test))]
             mod prod {
@@ -5374,11 +5154,8 @@ mod tests {
 
     #[test]
     fn defect_under_tests_subdir_is_skipped_but_flagged_at_root() {
-        // The `tests/`-directory skip is scan-root RELATIVE: the SAME defect is
-        // ignored under a `tests/` subdir of the scan root but flagged when it
-        // sits at the root — proving the skip never neuters the fixture-dir
-        // integration test, which passes a fixture dir AS the scan root
-        // (issue #1934).
+        // The `tests/` skip is relative to the scan root: the same defect is ignored
+        // under `tests/` but flagged at the root, where a fixture dir is scanned.
         let dir = tempfile::tempdir().unwrap();
         let opts = A11yVerifyOptions {
             format: OutputFormat::Text,
@@ -5402,7 +5179,7 @@ mod tests {
         );
     }
 
-    // ── Route attribution (issue #1706, AC3) ───────────────────────────────
+    // ── Route attribution (issue #1706) ────────────────────────────────────
 
     /// Build a full report from one or more in-memory `(file, source)` pairs.
     fn report_for(files: &[(&str, &str)]) -> Report {
@@ -5493,9 +5270,8 @@ mod tests {
 
     #[test]
     fn an_ambiguous_helper_name_is_not_traversed() {
-        // Two functions share a name, so a bare `sidebar()` call cannot be
-        // resolved to one of them. Guessing would key the finding to a route
-        // that never renders it, so the call edge is dropped instead.
+        // Two functions share the name, so a bare `sidebar()` call is dropped rather
+        // than guessed.
         let handler = r#"
             #[get("/a")]
             async fn a() -> Markup { html! { (sidebar()) } }
@@ -5544,9 +5320,7 @@ mod tests {
 
     #[test]
     fn method_calls_are_not_resolved_as_helpers() {
-        // `self.sidebar()` is a method call, not a call to the free function
-        // `sidebar`; treating it as one would attribute the finding to a route
-        // that cannot reach it.
+        // `page.sidebar()` is a method call, not a call to the free `sidebar`.
         let src = r#"
             #[get("/a")]
             async fn a(page: Page) -> Markup { html! { (page.sidebar()) } }
@@ -7287,8 +7061,7 @@ mod tests {
     #[test]
     fn a_gated_statement_in_a_custom_macro_is_dropped() {
         for body in [
-            // The token reader also reads these two. They guard against a
-            // regression.
+            // The token reader also reads these two.
             r#"my_macro! { #[cfg(feature = "admin")] let _x = admin(); }"#,
             r#"let _v = my_vec![#[cfg(feature = "admin")] admin(), clean()];"#,
             // Only the AST reads this one right.

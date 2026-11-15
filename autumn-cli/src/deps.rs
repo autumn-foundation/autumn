@@ -351,12 +351,10 @@ pub fn cvss3_base_score(vector: &str) -> Option<f64> {
     let avail = impact_metric(avail?)?;
 
     let iss: f64 = 1.0 - (1.0 - conf) * (1.0 - integ) * (1.0 - avail);
-    // v3.1 revised the changed-scope impact equation (spec §7.1) to remove a
-    // rounding artefact: the exponent dropped from 15 to 13 and the base gained
-    // the 0.9731 factor. It moves scores near a band boundary — the vector in
-    // `the_two_minor_versions_disagree_across_a_band_boundary` is 7.0 (high)
-    // under v3.0 and 6.9 (medium) under v3.1 — so the version must pick the
-    // equation rather than one standing in for both.
+    // v3.1 revised the changed-scope impact equation (spec §7.1): the exponent dropped
+    // from 15 to 13 and the base gained the 0.9731 factor. Scores near a band boundary
+    // differ (see `the_two_minor_versions_disagree_across_a_band_boundary`), so each
+    // version keeps its own equation.
     let impact = if changed {
         if v31 {
             7.52 * (iss - 0.029) - 3.25 * (iss * 0.9731 - 0.02).powi(13)
@@ -1566,9 +1564,8 @@ mod tests {
 
     #[test]
     fn informational_notes_are_not_findings() {
-        // Regression: a real run against this workspace emitted 94
-        // `skipped-private-workspace-crate` notes. A note the policy did not
-        // grade is not a finding, and reporting it buries the ones that are.
+        // A workspace emits one `skipped-private-workspace-crate` note per private crate.
+        // A note the policy did not grade is not a finding; reporting it buries the real ones.
         assert_eq!(parse_audit(INFORMATIONAL_NOTES), Some(Vec::new()));
     }
 
@@ -1583,9 +1580,8 @@ mod tests {
 
     #[test]
     fn a_finding_is_always_one_line() {
-        // Regression: a real `duplicate` diagnostic carries one lock entry per
-        // line in its label. Doctor renders one line per finding and caps the
-        // list, so a finding that expands to four lines defeats the cap.
+        // A `duplicate` diagnostic puts one lock entry per line in its label. Doctor caps
+        // the list by line, so a multi-line finding defeats the cap.
         let findings = parse_audit(MULTILINE_LABEL).expect("summary present");
         assert_eq!(findings.len(), 1);
         let finding = &findings[0];
@@ -1634,9 +1630,8 @@ mod tests {
 
     #[test]
     fn a_malformed_policy_is_reported_before_the_optional_tool_checks() {
-        // Regression, reproduced: with a malformed `deny.toml` and no
-        // cargo-deny installed, doctor reported "not evaluated" and PASSED,
-        // while cargo-deny — and so the CI gate — exits 1 loading the file.
+        // A malformed `deny.toml` must fail even with no cargo-deny installed: reporting
+        // "not evaluated" would pass while cargo-deny (and so the CI gate) exits 1 on it.
         let root = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             root.path().join(POLICY_FILE),
@@ -1653,9 +1648,8 @@ mod tests {
 
     #[test]
     fn a_spelling_only_doctor_can_see_is_reported_rather_than_diverging() {
-        // Doctor parses TOML; the scaffolded workflow greps. A basic key with
-        // an escape decodes for one and not the other, so the two check lists
-        // would differ — the one thing this design exists to prevent.
+        // Doctor parses TOML; the scaffolded workflow greps. A basic key with an escape
+        // decodes for one and not the other, so the two check lists would differ.
         let escaped = "[advisories]\n[\"ban\\u0073\"]\n";
         assert!(
             policy_checks(escaped).contains(&"bans".to_owned()),
@@ -1908,13 +1902,10 @@ mod tests {
 
     #[test]
     fn the_auditor_is_never_invoked_through_the_rustup_shim() {
-        // Regression, caught by the Windows Tier 1 journey: `cargo` on PATH is
-        // rustup's shim, which reads the *project's* `rust-toolchain.toml` and
-        // installs that toolchain before running anything. Doctor runs inside
-        // the user's project, so `cargo deny` there turned a read-only check
-        // into a toolchain download; the next `cargo build` then failed with
-        // "the 'cargo.exe' binary ... is not applicable to the '1.88.0-...'
-        // toolchain". Invoking `cargo-deny` skips rustup entirely.
+        // `cargo` on PATH is rustup's shim, which installs the project's
+        // `rust-toolchain.toml` toolchain before running anything. Inside the user's
+        // project that turns a read-only check into a toolchain download, and on Windows
+        // breaks the next `cargo build`. Invoking `cargo-deny` skips rustup.
         let source = include_str!("deps.rs");
         let code = &source[..source.find("#[cfg(test)]").expect("test module")];
         assert!(
@@ -1945,10 +1936,9 @@ mod tests {
 
     #[test]
     fn the_two_minor_versions_disagree_across_a_band_boundary() {
-        // v3.1 revised the changed-scope impact equation. This vector is the
-        // discriminating case: 7.0 (high) under v3.0, 6.9 (medium) under v3.1.
-        // Every other vector in this suite scores identically under both, which
-        // is exactly why using one equation for both went unnoticed.
+        // v3.1 revised the changed-scope impact equation. This vector scores 7.0 (high)
+        // under v3.0 and 6.9 (medium) under v3.1; every other vector here scores the same
+        // under both.
         const METRICS: &str = "AV:P/AC:H/PR:L/UI:N/S:C/C:H/I:H/A:L";
         assert_eq!(cvss3_base_score(&format!("CVSS:3.0/{METRICS}")), Some(7.0));
         assert_eq!(cvss3_base_score(&format!("CVSS:3.1/{METRICS}")), Some(6.9));
@@ -2037,10 +2027,9 @@ mod tests {
 
     #[test]
     fn a_config_diagnostic_the_policy_promoted_is_a_finding() {
-        // Regression, reproduced against cargo-deny 0.20.2: with
-        // `unused-ignored-advisory = "deny"` a stale waiver is an ERROR and the
-        // CI gate exits 1. Dropping it by code reported "all clear" on a tree
-        // CI rejects.
+        // With `unused-ignored-advisory = "deny"` (cargo-deny 0.20.2) a stale waiver is an
+        // error and the CI gate exits 1, so filtering it out by code would report a clean
+        // tree that CI rejects.
         let findings = parse_audit(PROMOTED_CONFIG_DIAGNOSTIC).expect("summary present");
         assert_eq!(findings.len(), 1, "got {findings:?}");
         assert!(findings[0].blocking);
@@ -2129,8 +2118,7 @@ mod tests {
 
     #[test]
     fn a_db_path_is_read_through_quoting_and_comments() {
-        // The parser handles TOML literal strings, escapes and trailing
-        // comments; hand-slicing the source text did not.
+        // TOML literal strings, escapes and trailing comments must all parse.
         assert_eq!(
             policy_db_path("[advisories]\ndb-path = '/srv/db#1'\n").as_deref(),
             Some("/srv/db#1")

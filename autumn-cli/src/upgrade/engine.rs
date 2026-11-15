@@ -183,12 +183,8 @@ pub fn rewrite_source(
         return Ok(SourceRewrite::default());
     }
 
-    // A token stream proves the file *lexes*, not that it is Rust: `let = f();`
-    // has balanced delimiters and valid tokens and is still rejected by the
-    // compiler. Splicing into a file like that would produce a rewrite of
-    // something that was never going to build, and count it as migrated.
-    // Parsing first is what makes "not valid Rust is reported, not rewritten"
-    // true rather than approximately true.
+    // A token stream only proves the file lexes (`let = f();` lexes). Parse it first so invalid
+    // Rust is reported rather than rewritten and counted as migrated.
     syn::parse_file(source).map_err(|error| error.to_string())?;
 
     let stream: TokenStream = source
@@ -197,9 +193,8 @@ pub fn rewrite_source(
 
     let mut hits = Vec::new();
     scan(&stream, Context::Code, &renames, generated, &mut hits);
-    // Token order is source order for a single stream, but nested groups are
-    // walked depth-first, so the flattened list is not. Sorting makes the diff,
-    // the reported sites, and the splice all read top-to-bottom.
+    // Nested groups are walked depth-first, so the hits are not in source order. The splice
+    // below needs them in order.
     hits.sort_by_key(|hit| hit.range.start);
 
     let mut result = SourceRewrite::default();
@@ -210,8 +205,7 @@ pub fn rewrite_source(
             result.manual.push(hit.site);
             continue;
         }
-        // Fail closed: if the span and the text ever disagree, splicing would
-        // corrupt the file rather than migrate it.
+        // Fail closed: if the span and the text disagree, splicing would corrupt the file.
         let matched = source.get(hit.range.clone()).ok_or_else(|| {
             format!(
                 "internal error: span {}..{} is not a character range of this file",
@@ -240,9 +234,8 @@ pub fn rewrite_source(
         return Ok(result);
     }
     updated.push_str(&source[cursor..]);
-    // Belt and braces on a tool that edits source in place: the rewrite is a
-    // rename, so the result must still lex. If it does not, something about the
-    // splice was wrong and the file is reported as skipped rather than written.
+    // A rename must leave the file lexing. If it does not, the splice was wrong, so the file is
+    // reported as skipped rather than written.
     if let Err(error) = updated.parse::<TokenStream>() {
         return Err(format!(
             "internal error: the rewritten file no longer parses ({error}); left untouched"
@@ -289,8 +282,7 @@ pub fn rewrite_source_for_releases(
         }
     }
 
-    // Each pass reports in its own source order; the caller wants one list that
-    // reads top-to-bottom.
+    // Each pass is in its own source order; merge them into one top-to-bottom list.
     combined
         .rewritten
         .sort_by_key(|site| (site.line, site.column));
@@ -334,23 +326,19 @@ fn scan(
                 );
             }
             TokenTree::Ident(ident) => {
-                // The separator is what makes this a call on something rather
-                // than any other use of the word, and *which* separator says
-                // whether it can be the renamed function at all.
+                // Only a `.` or `::` before the name makes it a call on something, and which one
+                // says whether it can be the renamed function.
                 let Some(separator) = receiver_separator(&trees, index) else {
                     continue;
                 };
                 let name = ident.to_string();
-                // `r#with_pool` is the same name written raw. Match on the bare
-                // name and carry the prefix through to the splice, or the site
-                // is missed in silence.
+                // `r#with_pool` is the same name written raw: match the bare name and keep the
+                // prefix in the replacement.
                 let (prefix, bare) = name
                     .strip_prefix("r#")
                     .map_or(("", name.as_str()), |bare| ("r#", bare));
-                // The form must match too. `AppState::with_pool` is a *builder
-                // method* that keeps the old name, so a `.with_pool(pool)` call
-                // is provably not the renamed constructor — not a site this
-                // declines to rewrite, a site that is a different function.
+                // The form must match too: `AppState::with_pool` is a builder method that keeps
+                // the old name, so `.with_pool(pool)` is a different function, not a site.
                 let Some(rename) = renames
                     .iter()
                     .find(|rename| rename.from == bare && rename.form == separator)
@@ -394,12 +382,10 @@ fn group_context(trees: &[TokenTree], index: usize, outer: Context) -> Context {
     let TokenTree::Group(group) = &trees[index] else {
         return outer;
     };
-    // `#[...]` and `#![...]`: an attribute's body is input to a derive/attribute
-    // macro, or to the compiler. Checked before the macro shape so the `!` of an
-    // inner attribute is not mistaken for a macro bang.
+    // `#[...]` and `#![...]`: an attribute body is input to a macro or the compiler. Checked
+    // before the macro shape so an inner attribute's `!` is not read as a macro bang.
     if group.delimiter() == Delimiter::Bracket {
-        // `#[...]` sits directly after the hash; `#![...]` has the inner-attribute
-        // bang in between.
+        // `#![...]` has the inner-attribute bang between the hash and the bracket.
         let hash_at = previous_punct(trees, index, '!').map_or_else(
             || previous_punct(trees, index, '#'),
             |bang| previous_punct(trees, bang, '#'),
@@ -414,12 +400,10 @@ fn group_context(trees: &[TokenTree], index: usize, outer: Context) -> Context {
     {
         return Context::Macro;
     }
-    // A macro *definition* body is macro input too — and the more dangerous
-    // half: rewriting `macro_rules! m { ($x . with_pool (…)) => … }` edits the
-    // matcher, so the macro stops accepting the calls its users write, while
-    // those call sites are (correctly) reported as manual and left alone. The
-    // definition name sits between the bang and the body, so the invocation
-    // shape above does not see it.
+    // A macro definition body is macro input too: rewriting
+    // `macro_rules! m { ($x . with_pool (…)) => … }` edits the matcher, so the macro stops
+    // accepting its callers' code. The definition name sits between the bang and the body, so
+    // the invocation check above misses it.
     if is_macro_definition_body(trees, index) {
         return Context::Macro;
     }
@@ -514,14 +498,10 @@ fn takes_arguments(trees: &[TokenTree], index: usize, want: usize) -> bool {
 fn count_arguments(group: &proc_macro2::Group) -> usize {
     let mut arguments = 0;
     let mut in_argument = false;
-    // Angle brackets are not a `Group`, so the comma in
-    // `with_pool(make_pool::<Primary, Replica>())` sits at the same token level
-    // as a real argument separator. Depth is tracked only for a *turbofish*
-    // `::<`, which is unambiguous: opening on any bare `<` would let a
-    // comparison (`f(a < b, c)`) swallow the separator after it and undercount,
-    // and undercounting is the direction that produces a wrong edit. Other
-    // comma-bearing generic syntax still overcounts, which reports the site
-    // instead of rewriting it — the safe way to be wrong.
+    // Angle brackets are not a `Group`, so the comma in `make_pool::<Primary, Replica>()` sits at
+    // argument level. Depth is tracked only for an unambiguous turbofish `::<`: a bare `<` could
+    // be a comparison (`f(a < b, c)`) that would swallow a separator, and undercounting produces
+    // a wrong edit. Other generic syntax overcounts, which reports the site: the safe direction.
     let mut generics = 0usize;
     let mut previous_colons = 0usize;
 
@@ -601,11 +581,8 @@ fn turbofish_argument_list(trees: &[TokenTree], angle: usize) -> Option<&proc_ma
 /// — it is already reported as skipped on its own account.
 #[must_use]
 pub fn generated_repository_types(source: &str) -> Vec<(String, Vec<String>)> {
-    // Positive evidence has to be sound: `#[repository] trait AuditRepository;`
-    // tokenises and generates nothing, because a trait without a body is not
-    // Rust. Believing it would verify an unrelated `PgAuditRepository` in a file
-    // that *is* valid. The counter-evidence in `defined_type_names` deliberately
-    // does not do this — see there.
+    // Positive evidence must be sound: `#[repository] trait AuditRepository;` lexes but is not
+    // Rust and generates nothing, yet would verify an unrelated `PgAuditRepository` elsewhere.
     if syn::parse_file(source).is_err() {
         return Vec::new();
     }
@@ -659,17 +636,15 @@ fn collect_defined_types(
                 if context == Context::Code
                     && matches!(keyword.to_string().as_str(), "struct" | "enum" | "union") =>
             {
-                // A struct declared in a function body is visible only in that
-                // body, so it is not evidence for the whole module — the
-                // mirror of the same rule in `collect_repository_types`.
+                // A type declared in a function body is visible only there, so it is not
+                // evidence for the module.
                 if scope == Scope::Module
                     && let Some(TokenTree::Ident(name)) = trees.get(index + 1)
                 {
                     found.push((name.to_string(), module.to_vec()));
                 }
             }
-            // `type Alias = …;`, but not the `type` of an associated item
-            // binding, which is followed by `=` only after a generic list.
+            // `type Alias = …;` declares a name too.
             TokenTree::Ident(keyword) if context == Context::Code && keyword == "type" => {
                 if scope == Scope::Module
                     && let Some(TokenTree::Ident(name)) = trees.get(index + 1)
@@ -678,16 +653,14 @@ fn collect_defined_types(
                 }
             }
             TokenTree::Group(group) => {
-                // `mod name { … }` opens a module; every other brace is just a
-                // block, and the path it holds is the one it inherits.
+                // `mod name { … }` opens a module; any other group keeps the inherited path.
                 let nested = module_name_before(&trees, index).map(|name| {
                     let mut nested = module.to_vec();
                     nested.push(name);
                     nested
                 });
-                // Anything that is not a `mod` body is a block: a `mod`
-                // written *inside* one is still only visible there, so the
-                // scope never widens again once it has narrowed.
+                // Any other group is a block, and a `mod` inside a block is still only visible
+                // there: the scope never widens once it has narrowed.
                 let inner_scope = if nested.is_some() && scope == Scope::Module {
                     Scope::Module
                 } else {
@@ -767,12 +740,9 @@ impl GeneratedRepositories {
         let Some(declared) = self.declared.get(name) else {
             return false;
         };
-        // `self::` and `super::` are relative to the module the *call* is
-        // written in, which this command does not track. Dropping them and
-        // judging the call as if it were unqualified let a generated type in
-        // any module vouch for it, so `self::PgAuditRepository::with_pool`
-        // could be rewritten on the strength of a repository declared
-        // elsewhere entirely. Unresolvable means reported, as everywhere else.
+        // `self::` and `super::` are relative to the calling module, which this command does not
+        // track. Treating them as unqualified would let a repository in any module vouch for the
+        // call, so it is reported.
         if matches!(
             qualifier.first().map(String::as_str),
             Some("self" | "super")
@@ -787,16 +757,12 @@ impl GeneratedRepositories {
             .cloned()
             .collect();
         if qualifier.is_empty() {
-            // Nothing in the call says which module it means, so a hand-written
-            // type of the same name anywhere in the scan makes it ambiguous —
-            // including one in a different crate, since a `use` can bring
-            // either spelling into scope unqualified. Reported, not guessed at.
+            // Unqualified: a hand-written type of the same name anywhere in the scan, even in
+            // another crate (a `use` can bring it into scope), makes the call ambiguous.
             return !self.handwritten.contains_key(name);
         }
-        // A qualifier narrows both sides equally. Module paths carry no crate
-        // identity, so `repositories::PgAuditRepository` can name a generated
-        // type in one crate and a hand-written one in another; when the
-        // qualifier fits both, it has decided nothing.
+        // Module paths carry no crate identity, so a qualifier that also fits a hand-written type
+        // decides nothing.
         if Self::any_path_matches(self.handwritten.get(name), &qualifier) {
             return false;
         }
@@ -833,8 +799,7 @@ fn collect_repository_types(
     let trees: Vec<TokenTree> = stream.clone().into_iter().collect();
     for (index, tree) in trees.iter().enumerate() {
         match tree {
-            // `# [repository ...]` — the attribute is a `#` followed by a
-            // bracket group whose first token is the macro's name.
+            // `#[…repository(…)]`: a `#` followed by a bracket group whose path names the macro.
             TokenTree::Punct(punct) if punct.as_char() == '#' && context == Context::Code => {
                 let Some(TokenTree::Group(group)) = trees.get(index + 1) else {
                     continue;
@@ -845,16 +810,12 @@ fn collect_repository_types(
                 if !is_repository_attribute(&group.stream()) {
                     continue;
                 }
-                // The generated type exists only in the configuration the
-                // `#[cfg]` selects. Under the other one the same name may be an
-                // unrelated import, so a conditional declaration cannot vouch
-                // for a call unconditionally.
+                // Under a `#[cfg]` the type may not exist, and the name may be an unrelated
+                // import, so a conditional declaration vouches for nothing.
                 if attribute_run_is_cfg_gated(&trees, index) {
                     continue;
                 }
-                // A declaration inside a block generates a type visible only
-                // in that block, so it vouches for nothing beyond it — and the
-                // calls it could vouch for are all inside it too.
+                // A declaration inside a block generates a type visible only in that block.
                 if scope == Scope::Module
                     && let Some(trait_name) = trait_name_after(&trees, index + 2)
                 {
@@ -862,17 +823,15 @@ fn collect_repository_types(
                 }
             }
             TokenTree::Group(group) => {
-                // `mod name { … }` opens a module; every other brace is just a
-                // block, and the path it holds is the one it inherits.
+                // `mod name { … }` opens a module; any other group keeps the inherited path.
                 let nested = module_name_before(&trees, index).map(|name| {
                     let mut nested = module.to_vec();
                     nested.push(name);
                     nested
                 });
                 let inner = nested.as_deref().unwrap_or(module);
-                // Anything that is not a `mod` body is a block: a `mod` written
-                // *inside* one is still only visible there, so the scope never
-                // widens again once it has narrowed.
+                // Any other group is a block, and a `mod` inside a block is still only visible
+                // there: the scope never widens once it has narrowed.
                 let inner_scope = if nested.is_some() && scope == Scope::Module {
                     Scope::Module
                 } else {
@@ -911,13 +870,9 @@ fn is_repository_attribute(stream: &TokenStream) -> bool {
     if last != "repository" {
         return false;
     }
-    // A qualified path names the crate the macro comes from, and only Autumn's
-    // proves Autumn generated the type: another dependency's
-    // `#[other_macros::repository]` was otherwise read as evidence, which then
-    // licensed rewriting an unrelated same-named import. A manifest may rename
-    // the dependency, so a rename combined with the *qualified* spelling is
-    // reported rather than rewritten — the safe direction, and the bare
-    // `#[repository]` the scaffold emits is unaffected.
+    // A qualified path must name Autumn's crate: `#[other_macros::repository]` generates some
+    // other type. A renamed dependency written qualified is therefore reported rather than
+    // rewritten; the bare `#[repository]` spelling is unaffected.
     crate_segment
         .first()
         .is_none_or(|krate| matches!(krate.as_str(), "autumn_web" | "autumn"))
@@ -932,10 +887,9 @@ fn attribute_path_segments(stream: &TokenStream) -> Vec<String> {
     for tree in stream.clone() {
         match tree {
             TokenTree::Ident(ident) => segments.push(ident.to_string()),
-            // Path separators, and a leading `::` for a fully-qualified path.
+            // Path separators, including a leading `::`.
             TokenTree::Punct(punct) if punct.as_char() == ':' => {}
-            // The argument list ends the path; anything else is not a path at
-            // all, and either way the name is already whatever came before it.
+            // An argument list, or anything else, ends the path.
             _ => break,
         }
     }
@@ -948,10 +902,9 @@ fn attribute_last_segment(stream: &TokenStream) -> Option<String> {
     for tree in stream.clone() {
         match tree {
             TokenTree::Ident(ident) => last_segment = Some(ident.to_string()),
-            // Path separators, and a leading `::` for a fully-qualified path.
+            // Path separators, including a leading `::`.
             TokenTree::Punct(punct) if punct.as_char() == ':' => {}
-            // The argument list ends the path; anything else is not a path at
-            // all, and either way the name is already whatever came before it.
+            // An argument list, or anything else, ends the path.
             _ => break,
         }
     }
@@ -1011,8 +964,7 @@ fn module_name_before(trees: &[TokenTree], index: usize) -> Option<String> {
     let Some(TokenTree::Ident(name)) = trees.get(index.checked_sub(1)?) else {
         return None;
     };
-    // The `mod` keyword sits directly before the name under either spelling —
-    // `pub mod name { … }` puts the visibility before the keyword, not after.
+    // `mod` sits directly before the name; `pub mod` puts the visibility before the keyword.
     let keyword = trees.get(index.checked_sub(2)?);
     matches!(keyword, Some(TokenTree::Ident(keyword)) if keyword == "mod").then(|| name.to_string())
 }
@@ -1071,10 +1023,8 @@ fn receiver_verdict(
     generated: &GeneratedRepositories,
 ) -> Option<ManualReason> {
     let required = required?;
-    // `PgPostRepository :: with_pool` — the receiver sits three tokens back,
-    // past the pair of colons. Anything else (a `>` closing `<T as Trait>`, a
-    // macro-built path) is not a plain receiver and is reported rather than
-    // rewritten.
+    // `PgPostRepository :: with_pool`: the receiver sits three tokens back. Anything else (a `>`
+    // closing `<T as Trait>`, a macro-built path) is not a plain receiver and is reported.
     let Some(at) = index.checked_sub(3) else {
         return Some(ManualReason::UnexpectedReceiver);
     };
@@ -1111,8 +1061,7 @@ fn path_qualifier(trees: &[TokenTree], at: usize) -> Vec<String> {
         segments.push(ident.to_string());
         index -= 3;
     }
-    // A leading `::` on a fully-qualified path leaves no ident to read, and the
-    // segments were collected innermost first.
+    // Segments were collected innermost first. A leading `::` stops the loop with no ident.
     segments.reverse();
     segments
 }
@@ -1135,9 +1084,8 @@ fn receiver_separator(trees: &[TokenTree], index: usize) -> Option<CallForm> {
         )
     };
     match punct.as_char() {
-        // A second `.` makes this a range or struct-update expression
-        // (`0..with_pool(n)`, `C { ..with_pool(d) }`), whose operand is a free
-        // function — not a method on a receiver.
+        // A second `.` makes this a range or struct update (`0..with_pool(n)`,
+        // `C { ..with_pool(d) }`), whose operand is a free function, not a method.
         '.' if !preceded_by('.') => Some(CallForm::Method),
         ':' if preceded_by(':') => Some(CallForm::AssociatedFunction),
         _ => None,
@@ -1161,8 +1109,7 @@ mod tests {
             to: "with_pool_untracked",
             form: CallForm::AssociatedFunction,
             args: 1,
-            // Mirrors the shipped migration: `#[repository]` emits `Pg{trait}`
-            // and the scaffold names every trait `{Model}Repository`.
+            // `#[repository]` emits `Pg{trait}`; the scaffold names traits `{Model}Repository`.
             receiver: Some(ReceiverShape {
                 prefix: "Pg",
                 suffix: "Repository",
@@ -1202,9 +1149,8 @@ mod tests {
 
     #[test]
     fn collects_the_type_each_repository_trait_generates() {
-        // Every spelling the attribute is written in, including the arguments
-        // form (`tenant_scoped`) and a doc comment between the two, which is
-        // itself an attribute by the time the token stream sees it.
+        // Bare, with arguments, and with a doc comment (an attribute in the token stream) between
+        // the attribute and the trait.
         let types = generated_names(
             "#[repository]\npub trait PostRepository {}\n\
              #[repository(tenant_scoped)]\ntrait CommentRepository {}\n\
@@ -1218,10 +1164,8 @@ mod tests {
 
     #[test]
     fn a_foreign_repository_attribute_is_not_evidence() {
-        // Codex review on #2231: the matcher read only the last path segment,
-        // so another crate's `repository` attribute proved that Autumn had
-        // generated `PgAuditRepository` — and an unrelated imported type of
-        // that name was then rewritten.
+        // Another crate's `repository` attribute does not prove Autumn generated
+        // `PgAuditRepository`; trusting it would rewrite an unrelated imported type.
         for attribute in [
             "#[other_macros::repository]",
             "#[diesel::repository(Audit)]",
@@ -1237,8 +1181,7 @@ mod tests {
 
     #[test]
     fn recognises_the_qualified_attribute_spelling() {
-        // What the scaffold emits, plus the renamed-dependency spelling a
-        // manifest can produce and a fully-qualified path.
+        // The scaffold's spelling, a renamed dependency, and a fully-qualified path.
         for attribute in [
             "#[autumn_web::repository(Post, table = \"posts\")]",
             "#[autumn::repository(Post)]",
@@ -1251,8 +1194,7 @@ mod tests {
 
     #[test]
     fn does_not_read_repository_out_of_another_attributes_arguments() {
-        // The path is what names the macro. `#[cfg(feature = "repository")]`
-        // is a `cfg`, whatever its arguments happen to spell.
+        // The path names the macro: `#[cfg(feature = "repository")]` is a `cfg`.
         assert!(
             generated_names("#[cfg(feature = \"repository\")]\npub trait PostRepository {}\n")
                 .is_empty()
@@ -1265,8 +1207,7 @@ mod tests {
         // Nothing is generated, so nothing may be claimed as generated.
         assert!(generated_names("#[repository]\nstruct Post;\n").is_empty());
         assert!(generated_names("#[serde(rename)]\ntrait Post {}\n").is_empty());
-        // A file that does not parse contributes nothing rather than failing
-        // the whole scan; it is reported as skipped on its own account.
+        // A file that does not parse contributes nothing; it is reported as skipped elsewhere.
         assert!(generated_names("fn f( {").is_empty());
     }
 
@@ -1295,9 +1236,8 @@ mod tests {
         assert!(generated.accepts("PgAuditRepository", &["repositories".to_owned()]));
         assert!(!generated.accepts("PgAuditRepository", &["custom".to_owned()]));
 
-        // But a hand-written type at the *same* module path — another crate's
-        // `repositories`, since these paths carry no crate identity — leaves
-        // the qualifier deciding nothing.
+        // A hand-written type at the same module path (another crate's `repositories`; paths
+        // carry no crate identity) leaves the qualifier deciding nothing.
         generated.note_handwritten(std::iter::once((
             "PgAuditRepository".to_owned(),
             vec!["repositories".to_owned()],
@@ -1314,12 +1254,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["PgAuditRepository", "E", "Alias"]
         );
-        // `#[repository]` output never appears in source, so a trait declaring
-        // one contributes nothing here — that is what makes the two sets
-        // independent evidence.
+        // `#[repository]` output never appears in source, so the two sets are independent evidence.
         assert!(defined_type_names("#[repository]\npub trait PostRepository {}").is_empty());
-        // Macro input is not a definition, for the same reason it is not a
-        // declaration.
+        // Macro input is not a definition.
         assert!(
             defined_type_names("macro_rules! m { () => { struct PgAuditRepository; } }").is_empty()
         );
@@ -1327,10 +1264,8 @@ mod tests {
 
     #[test]
     fn a_block_local_handwritten_type_is_not_module_wide_evidence() {
-        // Mirrors `a_block_local_repository_is_not_module_wide_evidence`
-        // (issue #2234): a struct declared in a function body is visible only
-        // in that body, so recording it against the enclosing module let it
-        // refuse an otherwise-valid unqualified call elsewhere in the module.
+        // A struct declared in a function body is visible only there, so it must not veto an
+        // unqualified call elsewhere in the module (#2234).
         for source in [
             "fn f() { struct PgAuditRepository; }",
             "mod repositories { fn f() { struct PgAuditRepository; } }",
@@ -1349,8 +1284,7 @@ mod tests {
         ))
         .collect();
 
-        // Unqualified: accepted on the name. Resolving it would mean following
-        // `use` declarations, and this is how nearly every call site is written.
+        // Unqualified: accepted on the name, since resolving it would mean following `use`.
         assert!(generated.accepts("PgAuditRepository", &[]));
         // The module it is actually declared in, however the path is spelled.
         assert!(generated.accepts("PgAuditRepository", &["repositories".to_owned()]));
@@ -1375,8 +1309,7 @@ mod tests {
                 vec!["repositories".to_owned(), "inner".to_owned()]
             )]
         );
-        // A declaration inside a plain block is scoped to that block, so it is
-        // not evidence for anything — see the block-scope test below.
+        // A declaration inside a plain block is scoped to that block.
         assert!(
             generated_repository_types("fn f() { #[repository] trait PostRepository {} }")
                 .is_empty()
@@ -1385,10 +1318,8 @@ mod tests {
 
     #[test]
     fn a_block_local_repository_is_not_module_wide_evidence() {
-        // Codex review on #2231: a trait declared in a function body generates a
-        // type visible only in that body, so recording it against the enclosing
-        // module let an unrelated `PgPostRepository` imported elsewhere in that
-        // module be treated as verified and rewritten.
+        // A trait in a function body generates a type visible only there, so it must not verify
+        // an unrelated `PgPostRepository` imported elsewhere in the module.
         for source in [
             "fn f() { #[repository] trait PostRepository {} }",
             "mod repositories { fn f() { #[repository] trait PostRepository {} } }",
@@ -1404,7 +1335,7 @@ mod tests {
 
     #[test]
     fn a_module_level_repository_is_still_evidence() {
-        // The scope fix must not swing the other way.
+        // Block scoping must not drop module-level declarations.
         assert_eq!(
             generated_repository_types(
                 "mod repositories { #[repository] trait PostRepository {} }"
@@ -1418,11 +1349,8 @@ mod tests {
 
     #[test]
     fn a_trait_inside_macro_input_is_not_evidence() {
-        // Tokens inside a macro definition or invocation may never be expanded,
-        // or may be consumed as data. Treating them as declarations would let a
-        // template that merely *mentions* `#[repository] trait AuditRepository`
-        // verify an unrelated `PgAuditRepository` elsewhere in the app — the
-        // exact wrong rewrite the verification exists to prevent.
+        // Macro input may never be expanded, so a template that mentions a `#[repository]` trait
+        // must not verify an unrelated `PgAuditRepository` elsewhere.
         assert!(
             generated_names(
                 "macro_rules! template { () => { #[repository] trait AuditRepository {} } }"
@@ -1442,8 +1370,7 @@ mod tests {
 
     #[test]
     fn a_conventional_name_no_trait_generates_is_reported_not_rewritten() {
-        // The whole point of collecting the traits: `PgAuditRepository` has the
-        // generated shape exactly, and is still the app's own type.
+        // `PgAuditRepository` has the generated shape exactly and is still the app's own type.
         let result = rewrite_source(
             "fn f(p: P) { PgAuditRepository::with_pool(p); }",
             &[&RENAME],
@@ -1483,8 +1410,8 @@ mod tests {
 
     fn rewritten(source: &str) -> String {
         let out = run(source).updated.expect("source was rewritten");
-        // AC: "those sites compile without further edits". Lexing is the half
-        // this layer can check, and it catches every splice-level corruption.
+        // Rewritten sites must compile. Lexing is the part this layer can check, and it catches
+        // every splice-level corruption.
         out.parse::<TokenStream>()
             .unwrap_or_else(|error| panic!("rewritten source no longer parses: {error}\n{out}"));
         out
@@ -1503,11 +1430,9 @@ mod tests {
 
     #[test]
     fn leaves_a_same_named_builder_method_alone() {
-        // `AppState::with_pool` and `AuthzContext::with_pool` are *current*
-        // framework builder methods that keep the old name. The renamed
-        // constructor takes no `self`, so a `.with_pool(pool)` call is provably
-        // a different function — rewriting it would break
-        // `AppState::for_test().with_pool(pool)`, which is ordinary test setup.
+        // `AppState::with_pool` and `AuthzContext::with_pool` are current builder methods that keep
+        // the old name. The renamed constructor takes no `self`, so `.with_pool(pool)` is a
+        // different function.
         let result = run("fn f(s: AppState, p: Pool) { let s = s.with_pool(p); }");
         assert_eq!(result.updated, None);
         assert!(
@@ -1567,9 +1492,8 @@ mod tests {
 
     #[test]
     fn a_comparison_in_the_argument_does_not_hide_a_separator() {
-        // Undercounting is the direction that produces a wrong edit, so a bare
-        // `<` must not open generic depth: this two-argument call stays a
-        // two-argument call and is left alone.
+        // A bare `<` must not open generic depth: undercounting would turn this two-argument call
+        // into a wrong edit.
         let result = run("fn f() { PgPostRepository::with_pool(a < b, pool); }");
         assert_eq!(result.updated, None);
     }
@@ -1767,9 +1691,8 @@ mod tests {
 
     #[test]
     fn a_macro_rules_definition_is_never_rewritten_matcher_or_transcriber() {
-        // The dangerous half: rewriting the matcher makes the macro reject the
-        // invocations its users write, while those invocations are (correctly)
-        // reported as manual and left alone — a tree that does not compile.
+        // Rewriting the matcher makes the macro reject its callers' code, while those calls are
+        // reported and left alone: a tree that does not compile.
         let source = "macro_rules! forward {\n    ($t:ident :: with_pool ( $p:expr )) => { $t::with_pool($p) };\n}\n";
         let result = run(source);
         assert_eq!(
@@ -1817,8 +1740,8 @@ mod tests {
 
     #[test]
     fn a_range_or_struct_update_expression_is_not_a_method_call() {
-        // The operand of `..` is a free function, not a method on a receiver.
-        // Renaming it breaks an app that happens to own that name.
+        // The operand of `..` is a free function, not a method. Renaming it would break an app
+        // that owns that name.
         for source in [
             "fn f() { for i in 0..with_pool(n) {} }",
             "fn f() { let c = C { a: 1, ..with_pool(d) }; }",
@@ -1833,8 +1756,8 @@ mod tests {
 
     #[test]
     fn a_reference_that_is_never_called_is_reported_not_skipped() {
-        // "No site is silently skipped": a function item handed somewhere else
-        // still stops compiling after the rename, so it has to be reported.
+        // A function item passed elsewhere still stops compiling after the rename, so it must be
+        // reported.
         for source in [
             "fn f() { xs.iter().map(PgPostRepository::with_pool); }",
             "fn f() { let g = PgPostRepository::with_pool; g(p); }",
@@ -1890,9 +1813,8 @@ mod tests {
 
     #[test]
     fn chained_renames_across_releases_land_on_the_final_name_in_one_run() {
-        // Two releases in range, the second renaming what the first produced.
-        // A single pass over the original text would stop on the intermediate
-        // name and make a second run change the file again.
+        // The second release renames what the first produced. A single pass would stop on the
+        // intermediate name and a second run would change the file again.
         static FIRST: AppMigration = AppMigration {
             id: "0.6.0-first",
             version: "0.6.0",
@@ -1988,10 +1910,8 @@ mod tests {
 
     #[test]
     fn leaves_an_unrelated_associated_function_with_the_same_name_alone() {
-        // `#[repository]` names its concrete type `Pg{trait}`, so an app's own
-        // `Cache::with_pool(pool)` is not the renamed constructor. It is
-        // reported rather than dropped, because an aliased import of a real
-        // repository would look exactly like this.
+        // An app's own `Cache::with_pool(pool)` is not the renamed constructor. It is reported
+        // rather than dropped because an aliased import of a real repository looks the same.
         let result = run("fn f(p: Pool) { let c = Cache::with_pool(p); }");
         assert_eq!(result.updated, None, "an unrelated type is not rewritten");
         assert_eq!(result.manual.len(), 1, "and not silently skipped either");
@@ -2003,9 +1923,8 @@ mod tests {
 
     #[test]
     fn leaves_an_app_type_that_merely_starts_with_pg_alone() {
-        // `PgCache` is an ordinary Postgres helper someone wrote, not a type
-        // `#[repository]` emitted. Reported, so an aliased repository is not
-        // lost, but never rewritten.
+        // `PgCache` is an app's own helper, not a `#[repository]` type: reported so an aliased
+        // repository is not lost, but never rewritten.
         let result = run("fn f(p: Pool) { let c = PgCache::with_pool(p); }");
         assert_eq!(result.updated, None);
         assert_eq!(
@@ -2016,10 +1935,8 @@ mod tests {
 
     #[test]
     fn rewrites_a_generated_repository_receiver_however_it_is_pathed() {
-        // The prefix is on the final path segment, so a fully-qualified path to
-        // a generated repository still matches — provided the path leads to the
-        // module the trait is declared in, which is what makes it *this* type
-        // rather than a same-named one somewhere else.
+        // The shape is checked on the final path segment, so a qualified path matches when it
+        // leads to the module the trait is declared in.
         let generated: GeneratedRepositories =
             std::iter::once(("PgPostRepository".to_owned(), vec!["repos".to_owned()])).collect();
         let out = rewrite_source(
@@ -2038,10 +1955,8 @@ mod tests {
 
     #[test]
     fn a_self_qualified_receiver_is_reported_not_rewritten() {
-        // Codex review on #2231: `self::` was stripped and the call then judged
-        // as if it were unqualified, so a generated type of that name in *any*
-        // module vouched for it. `self::` means the caller's own module, which
-        // this command cannot resolve, so the site is reported instead.
+        // `self::` means the caller's own module, which this command cannot resolve, so a generated
+        // type of that name elsewhere must not vouch for the call.
         let generated: GeneratedRepositories =
             std::iter::once(("PgPostRepository".to_owned(), vec!["repos".to_owned()])).collect();
         let result = rewrite_source(
@@ -2076,10 +1991,8 @@ mod tests {
 
     #[test]
     fn a_cfg_gated_repository_declaration_is_not_evidence() {
-        // Codex review on #2231: the generated type only exists in the
-        // configuration the `#[cfg]` selects, so it cannot vouch for a call
-        // unconditionally — under the other configuration the same name may be
-        // an unrelated import.
+        // The generated type exists only under the `#[cfg]`; elsewhere the name may be an
+        // unrelated import.
         assert!(
             generated_names(
                 "#[cfg(feature = \"postgres\")]\n#[repository]\npub trait AuditRepository {}\n"
@@ -2102,7 +2015,7 @@ mod tests {
 
     #[test]
     fn an_unconditional_repository_declaration_is_still_evidence() {
-        // The cfg fix must not swing the other way.
+        // cfg gating must not drop unconditional declarations.
         assert_eq!(
             generated_names("#[repository]\npub trait AuditRepository {}\n"),
             vec!["PgAuditRepository".to_owned()],

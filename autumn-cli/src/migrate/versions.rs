@@ -202,11 +202,9 @@ fn migration_dirs_at_ref(git_ref: &str, migrations_dir_name: &str) -> Vec<String
         .args([
             "ls-tree",
             "-d",
-            // Without this, `git ls-tree` additionally filters its *output* by
-            // the current directory's own repo-relative path (even though
-            // `<ref>:<path>` itself already resolves root-relative) -- so
-            // from inside a nested crate, every entry gets silently filtered
-            // away and this looks exactly like "ref has no such directory".
+            // Otherwise `ls-tree` also filters its output by the current directory's
+            // repo-relative path, so from a nested crate every entry is dropped and the
+            // ref looks like it has no such directory.
             "--full-tree",
             "--name-only",
             &format!("{git_ref}:{root_relative_dir}"),
@@ -283,14 +281,10 @@ fn framework_migration_names() -> Vec<String> {
 /// arithmetic'd on) -- or when no free second exists in the two minutes
 /// after the starting point.
 fn resolve_free_version(taken: &BTreeSet<String>, now: NaiveDateTime) -> Result<String, String> {
-    // Lexical string comparison, not `parse_version`+`max`: all versions are
-    // fixed-width digit strings, so string order and chronological order are
-    // the same order REGARDLESS of whether the string is a valid calendar
-    // date. Deciding "is anything already ahead of `now`" this way means a
-    // garbage-but-14-digit version (`20261301000000`) still counts instead of
-    // silently vanishing from consideration -- only the arithmetic below
-    // (bumping past it, checking the horizon) needs it to actually parse, and
-    // that failure gets a loud error rather than a quietly wrong ordering.
+    // Compare as strings, not via `parse_version`: fixed-width digit strings sort
+    // chronologically even when not a valid date, so a garbage 14-digit version still
+    // counts as ahead of `now`. Only the arithmetic below needs it to parse, and that
+    // fails loudly.
     let max_taken_str = taken.iter().max().cloned();
 
     let mut version = now;
@@ -638,26 +632,15 @@ pub fn run_check_collisions() {
             .push("working tree".to_owned());
     }
 
-    // Resolved once and reused below for the coverage check too -- both uses
-    // want the same "what does `origin` currently advertise" answer, and
-    // `git ls-remote` is a network round trip worth paying only once.
+    // Resolved once: `git ls-remote` is a network round trip, and the coverage check
+    // below reuses it.
     let remote_heads = remote_branch_heads();
     let local_heads = local_origin_branch_heads();
 
-    // Whether `refs/remotes/origin/<branch_name>` is safe to scan for
-    // migration claims: not just present, but AT THE COMMIT `origin`
-    // currently advertises. A long-lived clone can retain a ref for a
-    // branch `origin` no longer has at all (nothing prunes it without an
-    // explicit `git fetch --prune`), or one that still exists but has moved
-    // since this checkout's last fetch -- scanning either reads content
-    // that either no longer exists upstream or isn't what would actually be
-    // pushed, so either can claim a version against a phantom, blocking a
-    // migration that reuses a version this checkout only THINKS is taken.
-    // `false` (nothing scanned) when advertisement state itself is unknown
-    // (no network, no `origin` remote): the coverage warning below already
-    // tells the caller the cross-branch half did not run, so actually
-    // scanning unverifiable local refs in that state would both contradict
-    // the warning and risk a false FAIL against content nobody can confirm.
+    // Scan a ref only when its local tip matches what `origin` advertises: a stale ref
+    // (branch deleted or moved upstream) would claim versions against content that will
+    // not be pushed. `false` when the advertisement is unknown (no network, no `origin`);
+    // the coverage warning below already says the cross-branch check did not run.
     let is_ref_current = |branch_name: &str| -> bool {
         remote_heads.as_ref().is_some_and(|remote_heads| {
             remote_heads
@@ -668,17 +651,10 @@ pub fn run_check_collisions() {
 
     let default_ref = resolve_default_branch_ref();
     let mut default_branch_entries: BTreeSet<String> = BTreeSet::new();
-    // Whether `default_branch_entries` above is trustworthy enough to use as
-    // a baseline for "did THIS checkout introduce this migration" -- `false`
-    // when the default ref couldn't even be resolved, OR when it resolved
-    // but its local tip doesn't match what origin currently advertises. In
-    // that case `default_branch_entries` stays EMPTY, which is NOT evidence
-    // that nothing exists there -- just that this checkout never verified
-    // it. Treating it as evidence anyway would misattribute a pre-existing
-    // collision between the (unverified) default branch and some OTHER
-    // (verified) branch to this checkout, since a working-tree migration
-    // inherited unchanged from trunk would look "not yet on the default
-    // branch" purely because we never confirmed otherwise.
+    // Whether `default_branch_entries` is a usable baseline for "this checkout introduced
+    // it": `false` when the default ref is unresolved or stale. The empty set then means
+    // "unverified", not "nothing there"; treating it as evidence would blame this checkout
+    // for a collision a trunk migration already has with another branch.
     let default_verified = default_ref.as_ref().is_some_and(|default_ref| {
         let is_current = default_ref
             .strip_prefix("refs/remotes/origin/")
@@ -695,11 +671,8 @@ pub fn run_check_collisions() {
         is_current
     });
 
-    // Scoped to `origin` only, not the whole `refs/remotes` namespace: a
-    // differently configured remote (e.g. `upstream`) is not what this
-    // checkout would push a fix to, and its refs are outside
-    // `is_ref_current`'s verification entirely -- scanning them would
-    // silently bypass the OID check above for every ref they contain.
+    // Only `origin`: other remotes are not where a fix is pushed, and `is_ref_current`
+    // cannot verify their refs.
     let remote_refs = git_refs(&["refs/remotes/origin"]);
     let refs_seen = remote_refs.len();
     for git_ref in &remote_refs {
@@ -716,9 +689,7 @@ pub fn run_check_collisions() {
         }
     }
 
-    // Kept as a set (not just pushed into `claimants`) so the attribution
-    // pass below can recognize a framework-sourced name specifically --
-    // see the `mine`/`others` loop.
+    // Kept as a set so the attribution pass below can recognize framework-sourced names.
     let framework_names: BTreeSet<String> = framework_migration_names().into_iter().collect();
     for name in &framework_names {
         claimants
@@ -727,24 +698,13 @@ pub fn run_check_collisions() {
             .push("autumn framework migrations".to_owned());
     }
 
-    // `refs_seen > 0` alone does not mean every branch was fetched -- see
-    // `remote_branch_heads`. Every failure mode (nothing fetched at all, a
-    // narrowed subset, or a known branch that has since moved) gets the
-    // same loud warning and the same working-tree-only degrade, since all
-    // three mean a real collision could go undetected.
+    // `refs_seen > 0` does not mean every branch was fetched (see `remote_branch_heads`).
+    // Nothing fetched, a narrowed subset, or a moved branch all get the same warning and
+    // the working-tree-only degrade.
     //
-    // Compares (name, OID) PAIRS, not just names or counts. A name-only
-    // check still misses two cases: a stale local `refs/remotes/origin/*`
-    // for a since-deleted branch keeps the local ref COUNT matching the
-    // remote's even while a genuinely new branch is missing (why this isn't
-    // a bare count), and a branch this checkout already knows by name can
-    // still have been pushed to since the last fetch -- the local ref (and
-    // therefore whatever `migration_dirs_at_ref` reads) is the OLD tip
-    // until fetched again, so the branch being "present" proves nothing
-    // about it being CURRENT. Extra local refs (stale, deleted branches)
-    // are harmless here: this checker only reads them, so a leftover ref
-    // for a branch that no longer exists costs nothing beyond checking a
-    // branch that no longer matters.
+    // Compares (name, OID) pairs: a stale ref for a deleted branch can keep the count equal
+    // while a new branch is missing, and a known branch may have moved since the last
+    // fetch. Extra local refs are harmless.
     let full_branch_coverage = remote_heads.as_ref().is_some_and(|remote_heads| {
         !remote_heads.is_empty()
             && remote_heads
@@ -783,35 +743,17 @@ pub fn run_check_collisions() {
         if names.len() < 2 {
             continue;
         }
-        // A framework claimant is compiled into the exact CLI binary
-        // running this check, not scoped to any git branch -- so unlike a
-        // plain branch-vs-branch collision, it is never "some other
-        // checkout's problem" once it collides with something THIS checkout
-        // is actually introducing. It is NOT sufficient on its own, though:
-        // `FRAMEWORK_MIGRATIONS` includes long-standing compatibility shims
-        // (e.g. the `00000000000000` back-compat version several pre-
-        // existing apps' own genesis migrations intentionally share) that
-        // collide with migrations already shipped on the default branch, and
-        // a migration that exists only on some OTHER verified branch is that
-        // branch's own collision to fail on -- neither is something this
-        // checkout can fix by renumbering. A framework claimant only makes
-        // the collision THIS checkout's concern when it collides with a
-        // migration THIS checkout is actually introducing (working-tree-only
-        // against a verified default-branch baseline, same as the plain
-        // case below).
+        // A framework claimant is compiled into this CLI, not tied to a branch, yet it alone does
+        // not make the collision this checkout's: `FRAMEWORK_MIGRATIONS` includes back-compat
+        // shims (e.g. `00000000000000`) that genesis migrations on trunk share on purpose. It
+        // counts only against a migration this checkout introduces.
         let has_framework_claimant = names.iter().any(|n| framework_names.contains(n));
 
-        // Attributing a collision to THIS checkout needs one of two things
-        // AND a working-tree-only member: a verified default-branch baseline
-        // (so "not in default_branch_entries" reliably means "not already on
-        // trunk"), or every claimant coming from the working tree alone (a
-        // same-checkout duplicate is real regardless of branch state -- it
-        // needs no branch data at all; a framework claimant never qualifies
-        // for this fallback, since it is never a member of `working_tree`).
-        // Without either, a name that's only "in working_tree_only" because
-        // the default branch couldn't be verified might already be shipped,
-        // unchanged, on that branch -- misattributing a pre-existing
-        // collision to this checkout instead of counting it under `others`.
+        // A collision is this checkout's when it has a working-tree-only member and either the
+        // default-branch baseline is verified or every claimant is in the working tree (a
+        // same-checkout duplicate needs no branch data; framework names are never in
+        // `working_tree`). Otherwise the name may already be on an unverified trunk, so the
+        // collision counts under `others`.
         let purely_local = names.iter().all(|n| working_tree.contains(n));
         let has_working_tree_only_member = names.iter().any(|n| working_tree_only.contains(n));
         let attributable_via_working_tree =
@@ -962,11 +904,8 @@ mod tests {
 
     #[test]
     fn resolve_free_version_rejects_a_calendar_invalid_max_taken_version() {
-        // 14 digits, so `version_prefix` (and Diesel) accept it as a
-        // version, but month 13 is not a real calendar date -- arithmetic on
-        // it (bumping past it, checking the horizon) is undefined, so this
-        // must error rather than silently drop it from consideration and
-        // risk generating a version that sorts before it.
+        // 14 digits, so `version_prefix` and Diesel accept it, but month 13 cannot be bumped
+        // past: this must error rather than generate a version that sorts before it.
         let mut taken = BTreeSet::new();
         taken.insert("20261301000000".to_owned());
         let now = dt("20260812120000");
@@ -977,9 +916,8 @@ mod tests {
 
     #[test]
     fn resolve_free_version_ignores_a_calendar_invalid_version_that_is_not_the_max() {
-        // A garbage version that is NOT the lexical max (an earlier taken
-        // version dominates it) never enters the arithmetic path at all, so
-        // it must not block an otherwise-valid resolution.
+        // A garbage version that is not the lexical max never reaches the arithmetic, so it
+        // must not block resolution.
         let mut taken = BTreeSet::new();
         taken.insert("20260812120000".to_owned());
         taken.insert("00000013000000".to_owned()); // 14 digits, garbage, but sorts first
