@@ -3576,17 +3576,23 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 46] = [
 ];
 
 /// Returns true if `s` is a valid Prometheus metric name (`[a-zA-Z_:][a-zA-Z0-9_:]*`).
+///
+/// Read by byte: the grammar is ASCII, and every byte of a character outside
+/// ASCII is `0x80` or more, which the grammar does not hold.
 pub(crate) fn is_valid_metric_name(s: &str) -> bool {
-    let mut it = s.chars();
-    matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':')
-        && it.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    let mut it = s.bytes();
+    matches!(it.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_' || b == b':')
+        && it.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
 }
 
 /// Returns true if `s` is a valid Prometheus label name (`[a-zA-Z_][a-zA-Z0-9_]*`).
+///
+/// Read by byte, as [`is_valid_metric_name`] is. An app metric checks each
+/// label name on each `with_label`.
 pub(crate) fn is_valid_label_name(s: &str) -> bool {
-    let mut it = s.chars();
-    matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let mut it = s.bytes();
+    matches!(it.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
+        && it.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Escape a Prometheus label value (backslash, newline, and double-quote).
@@ -9982,6 +9988,37 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert!(!is_valid_metric_name(""));
         assert!(!is_valid_metric_name("0starts_with_digit"));
         assert!(!is_valid_metric_name("has-hyphen"));
+    }
+
+    proptest::proptest! {
+        /// The byte readers give the answer the grammar gives when it is
+        /// read by character, for any string: ASCII, other scripts, and
+        /// letters that are alphabetic but not ASCII.
+        #[test]
+        fn name_grammars_read_by_byte_match_the_grammar_by_character(
+            s in "[a-zA-Z0-9_:\\-. éßЖ中𝒜\u{0}\u{7f}\u{85}]{0,12}",
+        ) {
+            let metric_by_char = {
+                let mut it = s.chars();
+                matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':')
+                    && it.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+            };
+            let label_by_char = {
+                let mut it = s.chars();
+                matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                    && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            };
+            proptest::prop_assert_eq!(is_valid_metric_name(&s), metric_by_char, "{:?}", s);
+            proptest::prop_assert_eq!(is_valid_label_name(&s), label_by_char, "{:?}", s);
+        }
+    }
+
+    #[test]
+    fn name_grammars_reject_letters_outside_ascii() {
+        for name in ["é", "aé", "éa", "a\u{85}", "ж_total", "a中", "_𝒜"] {
+            assert!(!is_valid_metric_name(name), "{name}");
+            assert!(!is_valid_label_name(name), "{name}");
+        }
     }
 
     #[test]

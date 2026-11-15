@@ -41,8 +41,11 @@
 //! }
 //! ```
 
+use std::sync::OnceLock;
+
 use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::StatusCode;
+use uuid::Uuid;
 
 // The layer needs the idempotency store, so it is built only with the `idempotency` feature.
 // The extractors work without it.
@@ -67,8 +70,6 @@ use futures::StreamExt as _;
 use sha2::Digest as _;
 #[cfg(feature = "idempotency")]
 use tower::{Layer, Service};
-#[cfg(feature = "idempotency")]
-use uuid::Uuid;
 
 #[cfg(feature = "idempotency")]
 use super::config::SubmitTokenConfig;
@@ -100,28 +101,69 @@ pub struct SubmitFormField(pub String);
 /// A one-time submit token minted per render.
 ///
 /// Use this as a handler parameter to embed the token in an HTML form's hidden
-/// `_submit_token` field. A fresh token is generated for every request (both
-/// the GET that renders the form and the 422 re-render on a rejected POST) and
-/// stored in request extensions by [`SubmitTokenLayer`].
-#[derive(Clone, Debug)]
-pub struct SubmitToken(String);
+/// `_submit_token` field. Every request (both the GET that renders the form and
+/// the 422 re-render on a rejected POST) has a fresh token of its own, stored
+/// in request extensions by [`SubmitTokenLayer`].
+///
+/// The random value is drawn the first time the token is read, so a request
+/// that renders no form pays for no random draw. Every read within one request
+/// returns the same value, and so does every clone, whenever it was taken.
+//
+// `Box<str>` and not `String`: with the cell's state word the value is then no
+// larger than the `String` it replaces, so its request extension is not either.
+pub struct SubmitToken(OnceLock<Box<str>>);
 
 impl SubmitToken {
+    /// A token whose value is drawn on its first read.
+    #[cfg(feature = "idempotency")]
+    const fn unminted() -> Self {
+        Self(OnceLock::new())
+    }
+
     /// Returns the submit-token value for embedding in forms.
     #[must_use]
     pub fn token(&self) -> &str {
-        &self.0
+        self.0.get_or_init(|| encode_token(Uuid::new_v4()))
     }
 
     #[cfg(test)]
-    pub(crate) const fn new(token: String) -> Self {
-        Self(token)
+    pub(crate) fn new(token: String) -> Self {
+        Self(OnceLock::from(token.into_boxed_str()))
+    }
+
+    /// Whether the value has been drawn yet.
+    #[cfg(all(test, feature = "idempotency"))]
+    fn is_minted(&self) -> bool {
+        self.0.get().is_some()
+    }
+}
+
+/// The text of a token: the 36-character lowercase hyphenated form of `uuid`.
+///
+/// These are the bytes `Uuid`'s `Display` writes. They are encoded on the stack
+/// and copied once, with no formatter and no growing `String`.
+fn encode_token(uuid: Uuid) -> Box<str> {
+    Box::from(&*uuid.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
+}
+
+impl Clone for SubmitToken {
+    /// Copies the value, and draws it first when it has not been read yet. A
+    /// copy of an undrawn token would draw a value of its own, and the two
+    /// would then name different submissions.
+    fn clone(&self) -> Self {
+        Self(OnceLock::from(Box::<str>::from(self.token())))
+    }
+}
+
+impl std::fmt::Debug for SubmitToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SubmitToken").field(&self.token()).finish()
     }
 }
 
 impl std::fmt::Display for SubmitToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.token())
     }
 }
 
@@ -465,9 +507,9 @@ impl Clone for SubmitTokenSettings {
 /// submit tokens.
 ///
 /// Applied automatically when `security.submit_token.enabled = true` in config
-/// (the default). Mints a fresh [`SubmitToken`] into request extensions on every
-/// request, and guards mutating requests that carry a `_submit_token` form
-/// field.
+/// (the default). Places a fresh [`SubmitToken`] in request extensions on every
+/// request (its value is drawn when a handler first reads it), and guards
+/// mutating requests that carry a `_submit_token` form field.
 #[derive(Clone)]
 pub struct SubmitTokenLayer {
     settings: Arc<SubmitTokenSettings>,
@@ -567,10 +609,10 @@ where
     }
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
-        // Mint a fresh token for every request and expose it via extensions so
-        // GET renders and 422 re-renders can embed it in the next form.
-        let minted = Uuid::new_v4().to_string();
-        req.extensions_mut().insert(SubmitToken(minted));
+        // Every request gets a fresh token in its extensions, so GET renders
+        // and 422 re-renders can embed it in the next form. Its random value is
+        // drawn by the first reader: a request that renders no form draws none.
+        req.extensions_mut().insert(SubmitToken::unminted());
         req.extensions_mut()
             .insert(SubmitFormField(self.settings.field_name.clone()));
 
@@ -913,6 +955,302 @@ mod tests {
             Uuid::parse_str(&token).is_ok(),
             "minted token should be a uuid: {token}"
         );
+    }
+
+    #[test]
+    fn debug_and_display_keep_their_format() {
+        let token = SubmitToken::new("a\"b".to_owned());
+        assert_eq!(format!("{token:?}"), r#"SubmitToken("a\"b")"#);
+        assert_eq!(format!("{token:#?}"), "SubmitToken(\n    \"a\\\"b\",\n)");
+        // `Display` writes the bare value and ignores width and fill.
+        assert_eq!(format!("{token}"), "a\"b");
+        assert_eq!(format!("{token:>10}"), "a\"b");
+
+        let empty = SubmitToken::new(String::new());
+        assert_eq!(empty.token(), "");
+        assert_eq!(format!("{empty:?}"), r#"SubmitToken("")"#);
+    }
+
+    #[test]
+    fn token_is_drawn_once_and_every_read_agrees() {
+        let token = SubmitToken::unminted();
+        assert!(!token.is_minted(), "nothing is drawn before the first read");
+
+        let first = token.token().to_owned();
+        assert!(token.is_minted());
+        assert_eq!(token.token(), first);
+        assert_eq!(token.to_string(), first);
+        assert_eq!(format!("{token:?}"), format!("SubmitToken({first:?})"));
+    }
+
+    #[test]
+    fn display_and_debug_of_an_unread_token_show_the_value_later_reads_return() {
+        let shown = SubmitToken::unminted();
+        let displayed = shown.to_string();
+        assert_eq!(shown.token(), displayed);
+
+        let debugged = SubmitToken::unminted();
+        let text = format!("{debugged:?}");
+        assert_eq!(text, format!("SubmitToken({:?})", debugged.token()));
+    }
+
+    #[test]
+    fn clone_taken_before_the_first_read_carries_the_same_token() {
+        let original = SubmitToken::unminted();
+        let copy = original.clone();
+        let copy_of_copy = copy.clone();
+        assert_eq!(copy.token(), original.token());
+        assert_eq!(copy_of_copy.token(), original.token());
+    }
+
+    #[test]
+    fn clone_taken_after_the_first_read_carries_the_same_token() {
+        let original = SubmitToken::unminted();
+        let first = original.token().to_owned();
+        let copy = original.clone();
+        assert_eq!(copy.token(), first);
+        assert_eq!(
+            original.token(),
+            first,
+            "a clone does not redraw the source"
+        );
+
+        let fixed = SubmitToken::new("abc-123".to_owned());
+        let fixed_copy = fixed.clone();
+        assert_eq!(fixed_copy.token(), "abc-123");
+        assert_eq!(fixed.token(), "abc-123");
+    }
+
+    #[test]
+    fn drawn_token_is_a_canonical_v4_uuid() {
+        let token = SubmitToken::unminted();
+        let text = token.token();
+        let uuid = Uuid::parse_str(text).expect("the token is a uuid");
+        assert_eq!(uuid.get_version_num(), 4);
+        assert_eq!(text.len(), 36);
+        assert_eq!(text, uuid.to_string(), "lowercase and hyphenated");
+    }
+
+    #[test]
+    fn each_unread_token_draws_its_own_value() {
+        let first = SubmitToken::unminted();
+        let second = SubmitToken::unminted();
+        assert_ne!(first.token(), second.token());
+    }
+
+    #[test]
+    fn concurrent_first_reads_agree() {
+        for _ in 0..64 {
+            let token = SubmitToken::unminted();
+            let reads: Vec<String> = std::thread::scope(|scope| {
+                let readers: Vec<_> = (0..4)
+                    .map(|_| scope.spawn(|| token.token().to_owned()))
+                    .collect();
+                readers
+                    .into_iter()
+                    .map(|reader| reader.join().expect("reader thread"))
+                    .collect()
+            });
+            for read in &reads {
+                assert_eq!(read, token.token());
+            }
+        }
+    }
+
+    /// The type is public and lives in request extensions: its auto traits and
+    /// its size are part of what callers and the extension map rely on.
+    #[test]
+    fn submit_token_keeps_its_traits_and_size() {
+        fn assert_traits<T>()
+        where
+            T: Clone
+                + std::fmt::Debug
+                + std::fmt::Display
+                + Send
+                + Sync
+                + Unpin
+                + std::panic::UnwindSafe
+                + std::panic::RefUnwindSafe
+                + 'static,
+        {
+        }
+        assert_traits::<SubmitToken>();
+        assert!(
+            std::mem::size_of::<SubmitToken>() <= std::mem::size_of::<String>(),
+            "the token's request extension must not grow"
+        );
+    }
+
+    proptest::proptest! {
+        /// The stack encoding writes the bytes `Uuid`'s `Display` writes, for
+        /// every bit pattern and not only for version 4.
+        #[test]
+        fn encoded_token_matches_uuid_display(bits in proptest::prelude::any::<u128>()) {
+            let uuid = Uuid::from_u128(bits);
+            proptest::prop_assert_eq!(encode_token(uuid).into_string(), uuid.to_string());
+        }
+    }
+
+    #[test]
+    fn encoded_token_matches_uuid_display_at_the_edges() {
+        for uuid in [Uuid::nil(), Uuid::max(), Uuid::from_u128(0xABCD_EF01 << 96)] {
+            assert_eq!(encode_token(uuid).into_string(), uuid.to_string());
+        }
+    }
+
+    /// The required extractor, the optional extractor and a direct read of the
+    /// extension all see one value within a request.
+    #[tokio::test]
+    async fn every_reader_of_one_request_sees_one_token() {
+        async fn handler(
+            required: SubmitToken,
+            optional: Option<SubmitToken>,
+            req: Request<Body>,
+        ) -> String {
+            let optional = optional.map(|token| token.token().to_owned());
+            let direct = req
+                .extensions()
+                .get::<SubmitToken>()
+                .map(|token| token.token().to_owned());
+            format!(
+                "{}\n{}\n{}",
+                required.token(),
+                optional.unwrap_or_default(),
+                direct.unwrap_or_default()
+            )
+        }
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(layer_with_store(store));
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            let readers: Vec<&str> = body.lines().collect();
+            assert_eq!(readers.len(), 3, "three readers: {body:?}");
+            assert!(Uuid::parse_str(readers[0]).is_ok(), "not a uuid: {body:?}");
+            assert_eq!(readers[1], readers[0]);
+            assert_eq!(readers[2], readers[0]);
+            seen.push(readers[0].to_owned());
+        }
+        assert_ne!(seen[0], seen[1], "each request has a token of its own");
+    }
+
+    /// The layer places the token and never reads it: a request whose handler
+    /// renders no form reaches the inner service with nothing drawn.
+    #[tokio::test]
+    async fn layer_does_not_draw_a_token_nobody_reads() {
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let svc =
+            layer_with_store(store).layer(tower::service_fn(|req: Request<Body>| async move {
+                let drawn = req
+                    .extensions()
+                    .get::<SubmitToken>()
+                    .map(SubmitToken::is_minted);
+                let field = req
+                    .extensions()
+                    .get::<SubmitFormField>()
+                    .map(|field| field.0.clone());
+                Ok::<_, std::convert::Infallible>(Response::new(Body::from(format!(
+                    "{drawn:?} {field:?}"
+                ))))
+            }));
+
+        let requests = [
+            (
+                "GET",
+                Request::builder().uri("/").body(Body::empty()).unwrap(),
+            ),
+            (
+                "JSON POST",
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            ),
+            ("form POST with a token", urlencoded_post("tok-unread")),
+            (
+                "form POST without a token",
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("title=hello"))
+                    .unwrap(),
+            ),
+        ];
+        for (name, request) in requests {
+            let response = svc.clone().oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                &body[..],
+                br#"Some(false) Some("_submit_token")"#,
+                "{name}: the token is present and not drawn"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extractors_without_the_layer_are_unchanged() {
+        let app = Router::new()
+            .route(
+                "/required",
+                get(|token: SubmitToken| async move { token.token().to_owned() }),
+            )
+            .route(
+                "/optional",
+                get(|token: Option<SubmitToken>| async move { token.is_some().to_string() }),
+            );
+
+        let required = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/required")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(required.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(required.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"Submit token not found in request extensions. Is SubmitTokenLayer enabled?"
+        );
+
+        let optional = app
+            .oneshot(
+                Request::builder()
+                    .uri("/optional")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(optional.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(optional.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"false");
     }
 
     #[tokio::test]

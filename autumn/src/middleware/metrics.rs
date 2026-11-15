@@ -51,12 +51,42 @@ pub struct MetricsCollector {
     inner: Arc<MetricsInner>,
 }
 
+/// A map of series by key. A request probes one with its route, and each
+/// query with its statement, under the shard's write lock. The hasher is the
+/// one the app-metrics registry uses: it hashes a short key several times
+/// faster than the standard one, and each process seeds it at random.
+type SeriesMap = HashMap<String, RouteMetrics, foldhash::fast::RandomState>;
+
 #[derive(Debug, Default)]
 struct Shard {
-    by_route: HashMap<String, RouteMetrics>,
-    by_query: HashMap<String, RouteMetrics>,
+    by_route: SeriesMap,
+    by_query: SeriesMap,
     /// Connection hold time per route: checkout to release of one `Db`.
-    holds: HashMap<String, RouteMetrics>,
+    holds: SeriesMap,
+}
+
+/// The longest series key built on the stack.
+const STACK_KEY_LEN: usize = 256;
+
+/// Write `"{method} {route}"` into `buf` and return its length, or `0` when
+/// it is longer than the buffer. Two copies and a space: the formatting
+/// machinery is not needed to join two strings, and this runs once for each
+/// request.
+fn compose_route_key(buf: &mut [u8; STACK_KEY_LEN], method: &str, route: &str) -> usize {
+    let len = method.len().saturating_add(1).saturating_add(route.len());
+    let Some(key) = buf.get_mut(..len) else {
+        return 0;
+    };
+    let Some((method_part, rest)) = key.split_at_mut_checked(method.len()) else {
+        return 0;
+    };
+    let Some((space, route_part)) = rest.split_first_mut() else {
+        return 0;
+    };
+    method_part.copy_from_slice(method.as_bytes());
+    *space = b' ';
+    route_part.copy_from_slice(route.as_bytes());
+    len
 }
 
 /// The database series a sample goes in.
@@ -558,15 +588,8 @@ impl MetricsCollector {
 
         // Compose the key on the stack so a route already in the map costs no allocation. A key
         // over 256 bytes leaves `written == 0` and takes the owned path below.
-        let mut buf = [0u8; 256];
-        let written = {
-            let mut cursor = std::io::Cursor::new(buf.as_mut_slice());
-            if std::io::Write::write_fmt(&mut cursor, format_args!("{method} {route}")).is_ok() {
-                usize::try_from(cursor.position()).unwrap_or_default()
-            } else {
-                0
-            }
-        };
+        let mut buf = [0u8; STACK_KEY_LEN];
+        let written = compose_route_key(&mut buf, method, route);
         let key_str = buf
             .get(..written)
             .and_then(|filled| std::str::from_utf8(filled).ok())
@@ -668,7 +691,7 @@ impl MetricsCollector {
         key: std::fmt::Arguments<'_>,
         latency_ms: u64,
     ) {
-        let mut buf = [0u8; 256];
+        let mut buf = [0u8; STACK_KEY_LEN];
         let written = {
             let mut cursor = std::io::Cursor::new(buf.as_mut_slice());
             if std::io::Write::write_fmt(&mut cursor, key).is_ok() {
@@ -1554,6 +1577,42 @@ mod tests {
 
         // The error path decrements the active count too.
         assert_eq!(collector.inner.requests_active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_stack_key_is_the_formatted_key() {
+        let long = "a".repeat(300);
+        let fits_exactly = format!("/{}", "b".repeat(STACK_KEY_LEN - 5));
+        let one_over = format!("/{}", "c".repeat(STACK_KEY_LEN - 4));
+        let non_ascii = "/caf\u{e9}/\u{4e2d}".repeat(3);
+        for (method, route) in [
+            ("GET", "/"),
+            ("GET", "/users/{id}"),
+            ("", ""),
+            ("", "/only-route"),
+            ("DELETE", ""),
+            ("GET", non_ascii.as_str()),
+            ("GET", fits_exactly.as_str()),
+            ("GET", one_over.as_str()),
+            ("GET", long.as_str()),
+            (long.as_str(), "/"),
+            (long.as_str(), long.as_str()),
+        ] {
+            let formatted = format!("{method} {route}");
+            let mut buf = [0u8; STACK_KEY_LEN];
+            let written = compose_route_key(&mut buf, method, route);
+            if formatted.len() <= STACK_KEY_LEN {
+                assert_eq!(
+                    &buf[..written],
+                    formatted.as_bytes(),
+                    "{method:?} {route:?}"
+                );
+            } else {
+                assert_eq!(written, 0, "a key over the buffer takes the owned path");
+            }
+        }
+        assert_eq!(format!("GET {fits_exactly}").len(), STACK_KEY_LEN);
+        assert_eq!(format!("GET {one_over}").len(), STACK_KEY_LEN + 1);
     }
 
     #[test]

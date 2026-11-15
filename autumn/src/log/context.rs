@@ -246,6 +246,11 @@ impl LogContext {
         self.span.clone()
     }
 
+    /// The request span, borrowed: for a caller that only enters it.
+    pub(crate) const fn span_ref(&self) -> &tracing::Span {
+        &self.span
+    }
+
     /// Take a point-in-time snapshot of all fields on this context.
     #[must_use]
     pub fn snapshot(&self) -> LogFields {

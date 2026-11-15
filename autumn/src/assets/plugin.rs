@@ -537,8 +537,10 @@ where
             let relative = url.strip_prefix(mount).unwrap_or(url);
             router = router.route(
                 &format!("{base}{relative}"),
-                axum::routing::get(move |headers: http::HeaderMap| async move {
-                    asset_response(asset, immutable, &headers)
+                // Take the request and borrow its headers: the `HeaderMap`
+                // extractor would clone every header just to be read here.
+                axum::routing::get(move |request: axum::extract::Request| async move {
+                    asset_response(asset, immutable, request.headers())
                 }),
             );
         }
@@ -1036,6 +1038,201 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"MI");
+    }
+
+    /// Serving a file reads the request's own header map. A handler that took
+    /// the map by value would hold a copy of every header while it ran.
+    #[tokio::test]
+    async fn serving_a_file_does_not_copy_the_request_headers() {
+        for uri in [
+            BUNDLE.url("init.js"),
+            "/static/_plugins/unit-test/init.js".to_owned(),
+        ] {
+            let (request, observed) = crate::assets::header_probe::request(&uri);
+            let response = BUNDLE.router::<()>().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(observed.take(), [true], "{uri}");
+        }
+    }
+
+    /// Status, `ETag` and body of a `GET` for the plain URL of `init.js`.
+    async fn conditional(headers: &[(&str, &[u8])]) -> (StatusCode, bool, Vec<u8>) {
+        let mut request = Request::builder().uri("/static/_plugins/unit-test/init.js");
+        for (name, value) in headers {
+            request = request.header(*name, http::HeaderValue::from_bytes(value).unwrap());
+        }
+        let response = BUNDLE
+            .router::<()>()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let has_etag = response.headers().contains_key(header::ETAG);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, has_etag, body.to_vec())
+    }
+
+    /// Repeated fields, field order and bytes that are not UTF-8 all reach
+    /// the conditional check as the client sent them.
+    #[tokio::test]
+    async fn conditional_headers_are_read_as_sent() {
+        const FULL: &[u8] = b"console.log('init');";
+        let etag = BUNDLE.get("init.js").unwrap().etag.header_value();
+        let etag = etag.as_bytes();
+        let not_modified = (StatusCode::NOT_MODIFIED, true, Vec::new());
+
+        // A match in the second `If-None-Match` field counts.
+        assert_eq!(
+            conditional(&[("if-none-match", b"\"other\""), ("if-none-match", etag)]).await,
+            not_modified
+        );
+        assert_eq!(
+            conditional(&[("if-none-match", etag), ("if-none-match", b"\"other\"")]).await,
+            not_modified
+        );
+        // A field that is not UTF-8 cannot hide a match in another field.
+        assert_eq!(
+            conditional(&[("if-none-match", b"\xff\xfe"), ("if-none-match", etag)]).await,
+            not_modified
+        );
+        // `*` matches alone, and not next to a tag that does not.
+        assert_eq!(conditional(&[("if-none-match", b"*")]).await, not_modified);
+        assert_eq!(
+            conditional(&[("if-none-match", b"*"), ("if-none-match", b"\"other\"")]).await,
+            (StatusCode::OK, true, FULL.to_vec())
+        );
+        // A fresh validator wins over `Range`.
+        assert_eq!(
+            conditional(&[("range", b"bytes=0-1"), ("if-none-match", etag)]).await,
+            not_modified
+        );
+        // Only the first `Range` field is read.
+        assert_eq!(
+            conditional(&[("range", b"bytes=0-1"), ("range", b"bytes=2-3")]).await,
+            (StatusCode::PARTIAL_CONTENT, true, b"co".to_vec())
+        );
+        // The tag is weak, so `If-Range` never matches and the range is dropped.
+        assert_eq!(
+            conditional(&[("range", b"bytes=0-1"), ("if-range", etag)]).await,
+            (StatusCode::OK, true, FULL.to_vec())
+        );
+        assert_eq!(
+            conditional(&[("range", b"bytes=999-")]).await,
+            (StatusCode::RANGE_NOT_SATISFIABLE, true, Vec::new())
+        );
+        // A `Range` that is not visible ASCII is ignored.
+        assert_eq!(
+            conditional(&[("range", b"bytes=0-1\xff")]).await,
+            (StatusCode::OK, true, FULL.to_vec())
+        );
+    }
+
+    /// The bundle's routes, served by a handler that is handed its own copy
+    /// of the request's header map.
+    fn router_with_owned_headers() -> axum::Router {
+        let mut router = axum::Router::new();
+        for asset in BUNDLE.iter() {
+            for (url, immutable) in [(asset.plain_url(), false), (asset.url(), true)] {
+                router = router.route(
+                    url,
+                    axum::routing::get(move |headers: http::HeaderMap| async move {
+                        asset_response(asset, immutable, &headers)
+                    }),
+                );
+            }
+        }
+        router
+    }
+
+    const HEADER_NAMES: [&str; 6] = [
+        "range",
+        "if-range",
+        "if-none-match",
+        "if-modified-since",
+        "accept-encoding",
+        "x-unrelated",
+    ];
+
+    /// Header values a client can send for `asset`: matching and stale
+    /// validators, lists, ranges of every outcome, and bytes outside ASCII.
+    fn header_values(asset: &PluginAsset) -> Vec<Vec<u8>> {
+        let weak = asset.etag.header_value();
+        let weak = weak.to_str().unwrap();
+        let strong = format!("\"{}\"", asset.etag.tag());
+        vec![
+            weak.as_bytes().to_vec(),
+            strong.clone().into_bytes(),
+            format!("\"other\", {weak}").into_bytes(),
+            format!("{strong} , W/\"other\"").into_bytes(),
+            b"\"other\"".to_vec(),
+            b"*".to_vec(),
+            Vec::new(),
+            b"bytes=0-1".to_vec(),
+            b"bytes=1-".to_vec(),
+            b"bytes=-2".to_vec(),
+            b"bytes=999-".to_vec(),
+            b"bytes=0-0,2-2".to_vec(),
+            b"garbage".to_vec(),
+            b"Wed, 21 Oct 2015 07:28:00 GMT".to_vec(),
+            b"\xff\xfe".to_vec(),
+            "caf\u{e9}".as_bytes().to_vec(),
+        ]
+    }
+
+    /// Number of entries [`header_values`] returns.
+    const HEADER_VALUE_COUNT: usize = 16;
+
+    type Answer = (StatusCode, http::HeaderMap, bytes::Bytes);
+
+    async fn answer(router: axum::Router, request: Request<Body>) -> Answer {
+        let response = router.oneshot(request).await.unwrap();
+        let (parts, body) = response.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        (parts.status, parts.headers, body)
+    }
+
+    proptest::proptest! {
+        /// Borrowing the request's header map answers exactly as a handler
+        /// given its own copy of it: same status, same headers, same bytes,
+        /// for any mix of repeated, reordered and non-ASCII request headers.
+        #[test]
+        fn a_route_answers_as_a_handler_with_its_own_copy_of_the_headers(
+            file in 0..3_usize,
+            fingerprinted in proptest::prelude::any::<bool>(),
+            head in proptest::prelude::any::<bool>(),
+            sent in proptest::collection::vec(
+                (0..HEADER_NAMES.len(), 0..HEADER_VALUE_COUNT),
+                0..8,
+            ),
+        ) {
+            let asset = BUNDLE.iter().nth(file).unwrap();
+            let values = header_values(asset);
+            proptest::prop_assert_eq!(values.len(), HEADER_VALUE_COUNT);
+            let request = || {
+                let mut request = Request::builder()
+                    .method(if head { http::Method::HEAD } else { http::Method::GET })
+                    .uri(if fingerprinted { asset.url() } else { asset.plain_url() });
+                for &(name, value) in &sent {
+                    request = request.header(
+                        HEADER_NAMES[name],
+                        http::HeaderValue::from_bytes(&values[value]).unwrap(),
+                    );
+                }
+                request.body(Body::empty()).unwrap()
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let (served, reference) = runtime.block_on(async {
+                (
+                    answer(BUNDLE.router(), request()).await,
+                    answer(router_with_owned_headers(), request()).await,
+                )
+            });
+            proptest::prop_assert_eq!(served, reference);
+        }
     }
 
     #[tokio::test]

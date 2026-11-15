@@ -158,10 +158,14 @@ pub struct ErrorPageContextService<S> {
 /// request moves into the inner service, and adds it to an error response
 /// only.
 struct PendingContext {
-    wants_html: bool,
+    /// The first `Accept` value. It is parsed for an error response only.
+    accept: Option<axum::http::HeaderValue>,
     uri: axum::http::Uri,
     request_id: Option<crate::middleware::RequestId>,
-    headers: axum::http::HeaderMap,
+    /// The request headers, in dev only. The dev error page is their one
+    /// reader: it lists them and the cookies. Elsewhere no copy is made, so
+    /// an error response does not carry the request's credentials either.
+    headers: Option<axum::http::HeaderMap>,
     method: axum::http::Method,
     content_type: Option<String>,
     body_bytes: Option<bytes::Bytes>,
@@ -186,7 +190,9 @@ impl PendingContext {
             return;
         }
 
-        response.extensions_mut().insert(WantsHtml(self.wants_html));
+        response
+            .extensions_mut()
+            .insert(WantsHtml(accept_value_prefers_html(self.accept)));
         let request_id = self
             .request_id
             .as_ref()
@@ -210,10 +216,11 @@ impl PendingContext {
             .map(|pattern| extract_path_params(pattern, uri.path()));
         let cookies = self
             .headers
-            .get(axum::http::header::COOKIE)
+            .as_ref()
+            .and_then(|headers| headers.get(axum::http::header::COOKIE))
             .and_then(|v| v.to_str().ok())
             .map(parse_cookie_header);
-        let headers = Some(self.headers);
+        let headers = self.headers;
         let sql_queries = response
             .extensions()
             .get::<crate::inspector::RequestQueryList>()
@@ -292,17 +299,18 @@ where
     }
 
     fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
-        // The id and method stay typed, and the cookies unparsed: they become text only for an
-        // error response. The headers must be copied now, before the request moves inward.
+        // The id and method stay typed, and the `Accept` and cookies unparsed: they become text
+        // only for an error response. What an error page reads is taken now, before the request
+        // moves inward.
         let captures_body = self.is_dev && should_capture_body(Some(req.method().as_str()));
         let context = PendingContext {
-            wants_html: accepts_html(&req),
+            accept: req.headers().get(axum::http::header::ACCEPT).cloned(),
             uri: req.uri().clone(),
             request_id: req
                 .extensions()
                 .get::<crate::middleware::RequestId>()
                 .cloned(),
-            headers: req.headers().clone(),
+            headers: self.is_dev.then(|| req.headers().clone()),
             method: req.method().clone(),
             content_type: if captures_body {
                 req.headers()
@@ -367,8 +375,20 @@ fn should_capture_body(method: Option<&str>) -> bool {
 ///
 /// Returns `true` for typical browser requests (`text/html` or `*/*`),
 /// `false` for API requests (`application/json`).
+#[cfg(test)]
 fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
     accept_prefers_html(req.headers())
+}
+
+/// [`accept_prefers_html`] for a request whose first `Accept` value is
+/// `accept`. The negotiator reads the first value only, so this is its
+/// answer for the whole request.
+fn accept_value_prefers_html(accept: Option<axum::http::HeaderValue>) -> bool {
+    let mut headers = axum::http::HeaderMap::new();
+    if let Some(accept) = accept {
+        headers.insert(axum::http::header::ACCEPT, accept);
+    }
+    accept_prefers_html(&headers)
 }
 
 /// Which representation the client's `Accept` header prefers.
@@ -937,6 +957,43 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert!(accepts_html(&req));
+    }
+
+    /// The layer keeps the first `Accept` value and parses it for an error
+    /// response. That gives the answer the whole request gives.
+    #[test]
+    fn the_kept_accept_value_gives_the_answer_of_the_request() {
+        let cases: &[&[&str]] = &[
+            &[],
+            &[""],
+            &["text/html"],
+            &["application/json"],
+            &["*/*"],
+            &["text/html,application/xhtml+xml,*/*;q=0.8"],
+            &["application/json, text/html;q=0.9"],
+            &["text/html;q=0.5, application/json;q=0.5"],
+            &["application/problem+json"],
+            &["text/html;q=0"],
+            &["TEXT/HTML"],
+            &["image/png"],
+            // More than one `Accept` line: the first one decides.
+            &["application/json", "text/html"],
+            &["text/html", "application/json"],
+            &["image/png", "*/*"],
+        ];
+        for lines in cases {
+            let mut builder = Request::builder();
+            for line in *lines {
+                builder = builder.header("accept", *line);
+            }
+            let req = builder.body(Body::empty()).unwrap();
+            let kept = req.headers().get(axum::http::header::ACCEPT).cloned();
+            assert_eq!(
+                accept_value_prefers_html(kept),
+                accepts_html(&req),
+                "{lines:?}"
+            );
+        }
     }
 
     #[test]
@@ -1532,7 +1589,8 @@ mod tests {
     /// only for a response the exception filter chain will inspect (one
     /// carrying `AutumnErrorInfo`), and builds the same context it always did
     /// for an error response, in both profiles: the deferred request id,
-    /// query, method and cookie parse render the same text as before.
+    /// query, method and `Accept` parse give the same values as before. The
+    /// headers and cookies are for the dev error page, so only dev has them.
     #[tokio::test]
     async fn context_is_attached_only_to_error_responses() {
         const INBOUND_ID: &str = "0192F3A4-5B6C-7D8E-9F01-23456789ABCD";
@@ -1576,17 +1634,22 @@ mod tests {
             assert_eq!(ctx.request_id.as_deref(), Some(INBOUND_ID));
             assert_eq!(ctx.query.as_deref(), Some("x=1"));
             assert_eq!(ctx.method.as_deref(), Some("GET"));
-            assert_eq!(
-                ctx.headers
-                    .as_ref()
-                    .and_then(|h| h.get("cookie"))
-                    .and_then(|v| v.to_str().ok()),
-                Some("a=b; flag")
-            );
-            assert_eq!(
-                ctx.cookies,
-                Some(serde_json::json!({ "a": "b", "flag": "" }))
-            );
+            if is_dev {
+                assert_eq!(
+                    ctx.headers
+                        .as_ref()
+                        .and_then(|h| h.get("cookie"))
+                        .and_then(|v| v.to_str().ok()),
+                    Some("a=b; flag")
+                );
+                assert_eq!(
+                    ctx.cookies,
+                    Some(serde_json::json!({ "a": "b", "flag": "" }))
+                );
+            } else {
+                assert!(ctx.headers.is_none(), "no header copy outside dev");
+                assert!(ctx.cookies.is_none(), "no cookie parse outside dev");
+            }
             assert!(ctx.body_bytes.is_none() && ctx.content_type.is_none());
             assert!(!ctx.body_truncated);
         }
