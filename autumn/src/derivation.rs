@@ -218,21 +218,7 @@ impl DerivationDef {
     }
 }
 
-/// Length-prefix one labelled component into the hash.
-///
-/// The length prefix is what stops two different field splits from hashing the
-/// same, so `column = "ab"` + `transform = "c"` cannot collide with
-/// `column = "a"` + `transform = "bc"`.
-fn push_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
-    use sha2::Digest as _;
-
-    hasher.update(label.as_bytes());
-    hasher.update(b":");
-    hasher.update((value.len() as u64).to_be_bytes());
-    hasher.update(b":");
-    hasher.update(value);
-    hasher.update(b";");
-}
+use crate::hashing::push_length_prefixed_field as push_component;
 
 // ── Registry ────────────────────────────────────────────────────────────────
 
