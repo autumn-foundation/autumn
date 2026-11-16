@@ -123,8 +123,8 @@ at every COMMIT), ids unique, every id a canonical UUID: 1,795 version 7
 in the v7 run. Nothing in the framework orders by the transaction id or
 reads its version; the id is compared for equality only.
 
-The existing suites pass unchanged: `money_ledger_postgres` (Docker) and the
-lib tests in `money::ledger`.
+The existing suites pass unchanged: `money_ledger_postgres` (Docker, 21 tests) and the
+60 `money::` lib tests.
 
 ## Not changed, for a human decision
 
