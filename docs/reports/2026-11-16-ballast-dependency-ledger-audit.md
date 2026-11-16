@@ -188,6 +188,14 @@ bump.
 - `changelog.d/sqlite-cve-2026-0459-diesel-2-4.md`: new fragment under
   `### Security` — this is user-visible (an app that pulls a new
   `autumn-web` release picks up the fixed SQLite).
+- **Post-push, CI-driven:** `benchmarks/runtime/autumn/Cargo.toml`
+  (`diesel-async` `0.9` → `0.10`, plus a newly-committed `Cargo.lock` it
+  never had) and, after that same review comment's scope turned out
+  broader than first judged, `autumn-cli/src/generate/model.rs`
+  (`MODEL_DEPS`, `MODEL_DEPS_SQLITE`), `autumn-cli/src/generate/teams.rs`
+  (`TEAMS_DEPS`, `TEAMS_DEPS_SQLITE`), and `autumn-cli/src/starters/{cms,
+  saas}/Cargo.toml.tmpl` — all six sites' `diesel-async`/`libsqlite3-sys`
+  pins bumped to match. See Follow-up 5 for how the scope was found.
 
 ## 📊 Measurement
 
@@ -286,19 +294,31 @@ gh api repos/autumn-foundation/autumn/dependabot/alerts
    advisory gate going forward — only this one pin was fixed, not the
    missing coverage.
 5. **The same automated review flagged `autumn-cli/src/starters/{cms,saas}/
-   Cargo.toml.tmpl`'s `diesel-async = "0.9"` pins as inconsistent with this
-   bump — evaluated and NOT changed, with reasoning left on the PR
-   thread.** Unlike `benchmarks/runtime/autumn`, these templates depend on
-   `autumn-web = { version = "{{autumn_version}}", ... }` — a crates.io
-   registry version filled in at `autumn new` time, not a path dependency
-   on this checkout. The currently-published `autumn-web` still requires
-   `diesel-async ^0.9` transitively; bumping the starters' own direct pin to
-   `"0.10"` *today* would make a freshly-scaffolded cms/saas app fail to
-   resolve (`0.10` direct vs. published `autumn-web`'s transitive `^0.9`) —
-   trading a future, release-gated inconsistency for an immediate one. This
-   is the same reasoning already applied to `autumn-cli/src/templates/
-   deny.toml.tmpl`'s waiver in this same PR. Revisit together, once
-   `autumn-web` actually ships a release carrying `diesel-async` 0.10.
+   Cargo.toml.tmpl`'s `diesel-async = "0.9"` pins — first judged (wrongly)
+   as a deliberate non-change, then corrected mid-PR once CI proved the
+   real scope.** The first reply to the review reasoned that these
+   starters' `{{autumn_version}}` templates against the *currently
+   published* `autumn-web`, so bumping their pin now would conflict the
+   other way. That reasoning didn't survive contact with CI: the "App-
+   variant conformance" jobs patch a generated scaffold's `autumn-web` to
+   *this checkout's path* (same mechanism as `benchmarks/runtime/autumn`),
+   and two of them (`searchable`, `attachment-owner`) failed with the exact
+   `diesel ~2.3.9` vs. `diesel-async ^0.9` conflict — not from the starters
+   directly, but from `autumn-cli/src/generate/model.rs`'s `MODEL_DEPS`/
+   `MODEL_DEPS_SQLITE` and `generate/teams.rs`'s mirrored `TEAMS_DEPS`/
+   `TEAMS_DEPS_SQLITE`, which inject their own direct `diesel-async`/
+   `libsqlite3-sys` deps into whatever project `autumn generate model` or
+   `teams` runs against. Those four tables and the `cms`/`saas` starters
+   all ship bundled with the *next* `autumn-cli` release, coupled to
+   whatever `autumn-web` that release carries — not to today's published
+   crate — so they track this checkout's requirement the same way the
+   12 in-tree example apps do. All six sites bumped to `diesel-async
+   "0.10"` / `libsqlite3-sys "0.40"`; verified with the two previously-
+   failing tests (`generated_searchable_scaffold_cargo_checks`,
+   `generated_attachment_owner_scaffold_cargo_checks`) — 2 passed, 0
+   failed. The first PR reply was corrected in a follow-up comment rather
+   than edited, so the thread keeps the wrong reasoning visible alongside
+   the fix.
 6. **`autumn-cli/src/templates/deny.toml.tmpl`'s `RUSTSEC-2026-0459` waiver
    now has a precise, mechanical unblock condition**: it clears on its own
    the day a new `autumn-web` version ships (no further investigation
