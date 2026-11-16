@@ -700,6 +700,11 @@ delete actions remain last-write-wins.
   (up to `n`, default 1). It returns the first output and drops the rest.
   `allow` is asked before each extra copy; return `false` (for example from a
   retry budget) to stop hedging. Only hedge calls that are safe to run twice.
+- `hedge::adaptive::AdaptiveHedge::new(initial)` learns the delay instead:
+  `hedge.run(allow, |attempt| fut)` hedges at the p95 of the last 256 calls
+  (`with_quantile`, `with_window`, `with_warm_up`, `with_bounds(floor,
+  ceiling)`, `with_max_hedges`), using `initial` until 20 samples are in.
+  Keep one per upstream, in shared state.
 
 ## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
 
