@@ -3346,6 +3346,11 @@ mod tests {
 
     /// Every flavor gets the same waivers. `managed-pg-bundled` no longer
     /// pulls `instant` (RUSTSEC-2024-0384), so no flavor waives it.
+    /// `RUSTSEC-2026-0459` is gone too: `diesel` 2.4.0 raised its
+    /// `libsqlite3-sys` cap, and the framework's own `diesel-async`/
+    /// `libsqlite3-sys` pins moved to the fixed versions, so a fresh
+    /// scaffold no longer needs the waiver (it ships coupled to whatever
+    /// `autumn-web` the same `autumn-cli` release carries).
     #[test]
     fn the_advisory_policy_is_the_same_for_every_flavor() {
         let vars = TemplateVars {
@@ -3368,8 +3373,8 @@ mod tests {
             "every flavor keeps the default `jwt` feature, so its tree reaches rsa through jsonwebtoken"
         );
         assert!(
-            policy.contains("RUSTSEC-2026-0459"),
-            "every flavor bundles SQLite through diesel, and no libsqlite3-sys fix can resolve yet"
+            !policy.contains("RUSTSEC-2026-0459"),
+            "diesel 2.4.0 fixed this; no flavor should still waive it:\n{policy}"
         );
     }
 
