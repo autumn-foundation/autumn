@@ -1,0 +1,63 @@
+=== fixture: hist=1000000, T=2000, migrations: autumn/migrations, skipped: 20261115143207_add_commit_hooks_after_hook_recovery_index
+        status        | count  
+----------------------+--------
+ after_hook_failed    |  30235
+ after_hook_succeeded |      4
+ completed            | 940045
+ enqueued             |     20
+ failed               |  29720
+ pending_after_hook   |      6
+ running              |      8
+(7 rows)
+
+  heap  | heap_blocks | indexes 
+--------+-------------+---------
+ 186 MB |       23789 | 95 MB
+(1 row)
+
+=== workload
+pgbench: setting random seed to 3742
+number of transactions actually processed: 2000/2000
+number of failed transactions: 0 (0.000%)
+SQL script 1: /tmp/tmp.A7KTqVt29Q/tick.pgbench
+ - weight: 80 (targets 80.0% of total)
+ - number of failed transactions: 0 (0.000%)
+SQL script 2: /tmp/tmp.A7KTqVt29Q/hook.pgbench
+ - weight: 20 (targets 20.0% of total)
+ - number of failed transactions: 0 (0.000%)
+--- pg_stat_statements (workload; harness SELECTs excluded) ---
+ calls | buffers  |   hit    |  read  | rows | temp_blks_written | wal_bytes | pct_buffers | pct_calls |           stmt            
+-------+----------+----------+--------+------+-------------------+-----------+-------------+-----------+---------------------------
+  1594 | 37928061 | 37796846 | 131215 |   10 |                 0 |     18018 |        99.9 |      23.4 | recover stale pending
+  2000 |     9112 |     9112 |      0 |  433 |                 0 |    151482 |         0.0 |      29.4 | claim
+   406 |     5943 |     5943 |      0 |  406 |                 0 |    122354 |         0.0 |       6.0 | ack
+   406 |     5942 |     5942 |      0 |  406 |                 0 |    154365 |         0.0 |       6.0 | finalize
+   406 |     3845 |     3845 |      0 |  406 |                 0 |    129191 |         0.0 |       6.0 | mark after_hook_succeeded
+   406 |     3676 |     3655 |     21 |  406 |                 0 |   2160424 |         0.0 |       6.0 | pending insert
+  1594 |     1827 |     1827 |      0 |   23 |                 0 |     35323 |         0.0 |      23.4 | recover stale running
+(7 rows)
+
+--- totals ---
+ calls | buffers  | temp_blks_written | wal_bytes | lsn_wal_bytes 
+-------+----------+-------------------+-----------+---------------
+  6812 | 37958406 |                 0 |   2771157 |       2882608
+(1 row)
+
+--- pg_stat_user_tables / indexes ---
+            relname             | seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_ins | n_tup_upd | n_tup_hot_upd | n_live_tup | n_dead_tup 
+--------------------------------+----------+--------------+----------+---------------+-----------+-----------+---------------+------------+------------
+ autumn_repository_commit_hooks |     1594 |   1594385011 |     7218 |          7124 |       406 |      1684 |             0 |        406 |       1684
+(1 row)
+
+                    indexrelname                     | idx_scan | idx_tup_read | idx_tup_fetch | blocks 
+-----------------------------------------------------+----------+--------------+---------------+--------
+ autumn_repository_commit_hooks_pkey                 |     2812 |         1674 |           839 |   9361
+ idx_autumn_commit_hooks_finished                    |        0 |            0 |             0 |   2746
+ idx_autumn_repository_commit_hooks_handler_ready    |        0 |            0 |             0 |      6
+ idx_autumn_repository_commit_hooks_pending_recovery |      406 |         1412 |          1002 |      2
+ idx_autumn_repository_commit_hooks_ready            |     2000 |          865 |           433 |      2
+ idx_autumn_repository_commit_hooks_stale_recovery   |     2000 |         5277 |          4850 |      2
+(6 rows)
+
+=== end state
+status counts: after_hook_failed=30241, completed=940451, enqueued=20, failed=29720, running=12
