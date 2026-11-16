@@ -113,6 +113,10 @@ sets three environment variables, and you can set them yourself:
 | `AUTUMN_TASK_ARGS_JSON` | The task flags as a JSON array of strings, for example `["--user-id","42","--dry-run"]`. Omit it for a task with no flags. |
 | `AUTUMN_LIST_TASKS=1` | Print the registered tasks as JSON and exit. |
 
+If you set `AUTUMN_LIST_TASKS=1` and `AUTUMN_RUN_TASK`, the app lists the tasks
+and does not run the task. `autumn task` removes the variable that it does not
+use.
+
 ```bash
 AUTUMN_RUN_TASK=backfill-user AUTUMN_TASK_ARGS_JSON='["--user-id","42"]' ./blog
 ```
