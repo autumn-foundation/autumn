@@ -1012,7 +1012,7 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
     ),
     (
         "diesel-async",
-        "{ version = \"0.9\", features = [\"postgres\"] }",
+        "{ version = \"0.10\", features = [\"postgres\"] }",
     ),
     (
         "pq-sys",
@@ -1042,11 +1042,11 @@ pub(super) const MODEL_DEPS_SQLITE: &[(&str, &str)] = &[
     ),
     (
         "diesel-async",
-        "{ version = \"0.9\", features = [\"sync-connection-wrapper\"] }",
+        "{ version = \"0.10\", features = [\"sync-connection-wrapper\"] }",
     ),
     (
         "libsqlite3-sys",
-        "{ version = \"0.38\", features = [\"bundled\"] }",
+        "{ version = \"0.40\", features = [\"bundled\"] }",
     ),
     ("diesel_migrations", "\"2\""),
     ("serde", "{ version = \"1\", features = [\"derive\"] }"),

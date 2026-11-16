@@ -16,7 +16,7 @@ path = "src/main.rs"
 autumn-web = { path = "../../autumn" }
 axum = { workspace = true }
 diesel = { version = "2", features = ["postgres"] }
-diesel-async = { version = "0.9", features = ["postgres", "deadpool"] }
+diesel-async = { version = "0.10", features = ["postgres", "deadpool"] }
 # The pool runtime, for connect and wait timeouts in the custom pool (H12).
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"] }
 diesel_migrations = "2"
