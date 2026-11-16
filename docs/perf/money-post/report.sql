@@ -12,7 +12,8 @@ SELECT queryid, toplevel, calls, rows,
  WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
    AND query NOT LIKE '/*harness*/%'
    AND query !~* '^\s*(BEGIN|END|COMMIT|ROLLBACK)'
-   AND query NOT LIKE '%pg_stat%' AND query NOT LIKE '%pg_current_wal_lsn%';
+   AND query NOT LIKE '%pg_stat%' AND query NOT LIKE '%pg_current_wal_lsn%'
+   AND query NOT LIKE '%uuid_send(gen_random_uuid())%';  -- uuid_v7(), the harness's id
 \echo === top statements by buffers (shared_blks_hit + shared_blks_read)
 SELECT toplevel AS top, calls, rows, buffers, hit, read, temp_w,
        round(100.0 * buffers / NULLIF(sum(buffers) OVER (PARTITION BY toplevel), 0), 1) AS pct_buf,

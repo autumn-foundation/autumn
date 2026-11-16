@@ -1420,7 +1420,12 @@ pub async fn post(
     // part-way, the enclosing transaction holds orphan postings and cannot commit. The other
     // order could commit a transaction row with no postings, a permanent unbalance in
     // append-only tables.
-    let id = uuid::Uuid::new_v4().to_string();
+    //
+    // A v7 id starts with its timestamp, so each post's id sorts after the last one. The two
+    // indexes keyed by it (the transaction primary key and the postings' `(transaction_id, seq)`)
+    // then take their inserts on the same few leaf pages. A random v4 id put every post on a new
+    // leaf of each, and the first write to a page after a checkpoint logs the whole page.
+    let id = uuid::Uuid::now_v7().to_string();
     write_postings(conn, &id, transfer).await?;
 
     let insert_sql = format!(
