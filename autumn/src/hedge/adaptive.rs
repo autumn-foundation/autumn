@@ -56,7 +56,7 @@ impl AdaptiveHedge {
     /// Hedge once, at `initial` until warmed up, then at the p95 of the last
     /// [`DEFAULT_WINDOW`] calls. The learned delay is never under 1 ms.
     #[must_use]
-    pub fn new(initial: Duration) -> Self {
+    pub const fn new(initial: Duration) -> Self {
         Self {
             initial,
             floor: Duration::from_millis(1),
@@ -72,7 +72,7 @@ impl AdaptiveHedge {
     /// Hedge at `quantile` of recent latencies. Clamped to `[0, 1]`; a NaN
     /// becomes the default.
     #[must_use]
-    pub fn with_quantile(mut self, quantile: f64) -> Self {
+    pub const fn with_quantile(mut self, quantile: f64) -> Self {
         self.quantile = if quantile.is_nan() {
             DEFAULT_QUANTILE
         } else {
