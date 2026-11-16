@@ -96,15 +96,16 @@ pq-src = { version = ">=0.3.13, <0.4", default-features = false }
 # diesel_migrations) over an async connection — used to run startup
 # migrations and wait checks through the rustls TLS connector, since the
 # bundled libpq (`pq-sys` below) has no SSL support.
-diesel-async = { version = "0.9", features = ["deadpool", "async-connection-wrapper"] }
+diesel-async = { version = "0.10", features = ["deadpool", "async-connection-wrapper"] }
 diesel_migrations = "2"
 http = "1"
 # The `autumn` serve loop (`autumn/src/http_server.rs`, issue #3065) drives
 # `hyper_util::server::conn::auto::Builder` itself. `server-auto` turns on both
 # HTTP/1 and HTTP/2, which the ALPN `h2` advertisement in `tls.rs` needs.
 hyper-util = { version = "0.1.20", default-features = false, features = ["server-auto", "tokio", "service"] }
-# Held at 0.38: 0.39 exists, but diesel 2.3 needs `<0.39`.
-libsqlite3-sys = { version = "0.38", features = ["bundled"] }
+# diesel 2.4 raised its libsqlite3-sys cap to `<0.41`, clearing RUSTSEC-2026-0459
+# (bundled SQLite < 3.54.0, uninitialized page-cache memory with a foreign -wal).
+libsqlite3-sys = { version = "0.40", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }

@@ -26,15 +26,21 @@ yanked = "warn"
 ignore = [
     # RUSTSEC-2024-0370: proc-macro-error is unmaintained. It is a
     # proc-macro dependency of yew-macro. It runs on the host compiler only
-    # and is not linked into the wasm output. yew 0.23 still uses it.
-    # Review-by: 2026-11-13, or when a yew release drops it.
-    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained; yew-macro proc-macro dep, host only, not in the wasm output; yew 0.23 still uses it; review-by 2026-11-13" },
+    # and is not linked into the wasm output. Reconfirmed 2026-11-16: yew
+    # 0.23.0 is still latest (crates.io sparse index) and yew-macro 0.23.0
+    # still requires proc-macro-error "^1" — no fix upstream.
+    # Review-by: 2026-12-05, or when a yew release drops it.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained; yew-macro proc-macro dep, host only, not in the wasm output; yew 0.23.0 (latest) still uses it; reconfirmed unchanged 2026-11-16; review-by 2026-12-05" },
     # RUSTSEC-2025-0141: bincode 1.3.3 is unmaintained (no CVE, no known
     # exploit). It comes from yew -> gloo 0.11 -> gloo-worker 0.5. This crate
     # does not use it in its own source. The wasm build is stripped. A symbol
-    # search cannot show if the code is in the output. yew 0.23 has no fix.
-    # Review-by: 2026-11-13, or when a yew release drops it.
-    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (no CVE); via yew -> gloo -> gloo-worker; unused by this crate; yew 0.23 has no fix; review-by 2026-11-13" },
+    # search cannot show if the code is in the output. Reconfirmed
+    # 2026-11-16: gloo-worker has since shipped 0.7.0, which drops bincode,
+    # but yew 0.23.0 (latest) still requires gloo "^0.11", which resolves to
+    # gloo-worker 0.5.0 — the fix exists upstream but yew itself has not
+    # moved to take it. Review-by: 2026-12-05, or when yew bumps its gloo
+    # requirement past 0.11.
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (no CVE); via yew -> gloo 0.11 -> gloo-worker 0.5; unused by this crate; gloo-worker 0.7.0 drops bincode but yew 0.23.0 (latest) still pins gloo ^0.11; reconfirmed unchanged 2026-11-16; review-by 2026-12-05" },
 ]
 
 [sources]
