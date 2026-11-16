@@ -93,24 +93,10 @@ pub fn is_started_marker(line: &str) -> bool {
 /// since every one of them is dispatched earlier than server startup in
 /// `AppBuilder::run`.
 fn clear_competing_one_shot_env(command: &mut Command) {
-    for var in [
-        "AUTUMN_BUILD_STATIC",
-        "AUTUMN_DUMP_ROUTES",
-        "AUTUMN_DUMP_CACHE_COHERENCE",
-        "AUTUMN_DUMP_DATA_FLOW",
-        "AUTUMN_DUMP_AGENT_AUTHORITY",
-        "AUTUMN_DUMP_GRAPH",
-        "AUTUMN_DUMP_JOBS",
-        "AUTUMN_LIST_TASKS",
-        "AUTUMN_RUN_TASK",
-        "AUTUMN_MIGRATE",
-        "AUTUMN_RETENTION_DRY_RUN",
-        "AUTUMN_DB_RETENTION",
-        "AUTUMN_DATA_CAPSULE",
-        "AUTUMN_REPLAY_CAPSULE",
-    ] {
-        command.env_remove(var);
-    }
+    // BACKFILL_ENV is not one of `all_one_shot_envs()` -- it's consumed by `SearchPlugin`
+    // after normal startup, not by one of `AppBuilder::run`'s one-shot dispatch checks -- so
+    // it never matches an entry to skip, and every mode gets cleared.
+    crate::routes::clear_other_one_shot_envs(command, BACKFILL_ENV);
 }
 
 /// Set or clear [`BACKFILL_PURGE_ENV`] on `command` from `purge`.
@@ -293,26 +279,14 @@ mod tests {
 
     #[test]
     fn clear_competing_one_shot_env_removes_every_var_checked_before_server_startup() {
-        // `AppBuilder::run` dispatches each of these before server startup,
-        // where `SearchPlugin` consumes AUTUMN_SEARCH_BACKFILL. An inherited one
-        // would turn the reindex into a different, possibly mutating, mode.
-        let competing_vars = [
-            "AUTUMN_BUILD_STATIC",
-            "AUTUMN_DUMP_ROUTES",
-            "AUTUMN_DUMP_CACHE_COHERENCE",
-            "AUTUMN_DUMP_DATA_FLOW",
-            "AUTUMN_DUMP_AGENT_AUTHORITY",
-            "AUTUMN_DUMP_GRAPH",
-            "AUTUMN_DUMP_JOBS",
-            "AUTUMN_LIST_TASKS",
-            "AUTUMN_RUN_TASK",
-            "AUTUMN_MIGRATE",
-            "AUTUMN_RETENTION_DRY_RUN",
-            "AUTUMN_DB_RETENTION",
-            "AUTUMN_REPLAY_CAPSULE",
-        ];
+        // `AppBuilder::run` dispatches each of `all_one_shot_envs()` before server startup,
+        // where `SearchPlugin` consumes AUTUMN_SEARCH_BACKFILL. An inherited one would turn
+        // the reindex into a different, possibly mutating, mode. Sourcing this list from the
+        // shared canonical one (rather than a hand copy) is what would have caught this test
+        // never asserting AUTUMN_DUMP_OPENAPI or AUTUMN_DATA_CAPSULE were cleared.
+        let competing_vars: Vec<&str> = crate::routes::all_one_shot_envs().collect();
         let mut command = Command::new("true");
-        set_envs(&mut command, competing_vars);
+        set_envs(&mut command, competing_vars.iter().copied());
         clear_competing_one_shot_env(&mut command);
         let remaining = still_set(&command, &competing_vars);
         assert!(

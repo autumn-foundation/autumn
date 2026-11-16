@@ -122,27 +122,11 @@ pub fn run(opts: &RetentionOptions<'_>) {
 /// these left over in the CLI's own environment (e.g. from a wrapping script,
 /// or a previous `autumn migrate`/`autumn task run ...` invocation in the
 /// same shell) would silently hijack a `--dry-run` invocation into a
-/// completely different — and potentially mutating — mode, since every one of
-/// them is checked earlier in `AppBuilder::run`'s dispatch chain than
-/// `AUTUMN_RETENTION_DRY_RUN` (#1342 review round 23). `AUTUMN_REPLAY_CAPSULE`
-/// is checked *after* retention dry-run and so is deliberately left alone;
+/// completely different — and potentially mutating — mode (#1342).
 /// `AUTUMN_DUMP_SECURITY` only matters inside the `AUTUMN_DUMP_ROUTES` branch,
 /// which is already cleared here.
 fn clear_competing_one_shot_env(command: &mut Command) {
-    for var in [
-        "AUTUMN_BUILD_STATIC",
-        "AUTUMN_DUMP_ROUTES",
-        "AUTUMN_DUMP_CACHE_COHERENCE",
-        "AUTUMN_DUMP_DATA_FLOW",
-        "AUTUMN_DUMP_AGENT_AUTHORITY",
-        "AUTUMN_DUMP_GRAPH",
-        "AUTUMN_DUMP_JOBS",
-        "AUTUMN_LIST_TASKS",
-        "AUTUMN_RUN_TASK",
-        "AUTUMN_MIGRATE",
-    ] {
-        command.env_remove(var);
-    }
+    crate::routes::clear_other_one_shot_envs(command, "AUTUMN_RETENTION_DRY_RUN");
 }
 
 /// Set or clear `AUTUMN_RETENTION_MODEL` on `command` from `model`.
@@ -261,23 +245,15 @@ mod tests {
 
     #[test]
     fn clear_competing_one_shot_env_removes_every_var_checked_before_retention_dry_run() {
-        // AppBuilder::run dispatches each of these before AUTUMN_RETENTION_DRY_RUN, so one
-        // inherited from the CLI's environment would turn --dry-run into another, possibly
-        // mutating, mode.
-        let competing_vars = [
-            "AUTUMN_BUILD_STATIC",
-            "AUTUMN_DUMP_ROUTES",
-            "AUTUMN_DUMP_CACHE_COHERENCE",
-            "AUTUMN_DUMP_DATA_FLOW",
-            "AUTUMN_DUMP_AGENT_AUTHORITY",
-            "AUTUMN_DUMP_GRAPH",
-            "AUTUMN_DUMP_JOBS",
-            "AUTUMN_LIST_TASKS",
-            "AUTUMN_RUN_TASK",
-            "AUTUMN_MIGRATE",
-        ];
+        // AppBuilder::run dispatches each of `all_one_shot_envs()` (other than our own
+        // AUTUMN_RETENTION_DRY_RUN) before or after it; clearing the whole shared list -- not
+        // just the subset dispatched strictly earlier -- is what keeps this test from silently
+        // tolerating a mode the list gains later and this call site never learns about.
+        let competing_vars: Vec<&str> = crate::routes::all_one_shot_envs()
+            .filter(|&v| v != "AUTUMN_RETENTION_DRY_RUN")
+            .collect();
         let mut command = std::process::Command::new("true");
-        for var in competing_vars {
+        for &var in &competing_vars {
             command.env(var, "1");
         }
 
