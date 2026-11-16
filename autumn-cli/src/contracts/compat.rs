@@ -2612,6 +2612,34 @@ mod tests {
     }
 
     #[test]
+    fn an_optional_field_of_a_list_element_a_caller_reads_removed_is_a_break() {
+        // `lines: Vec<Details>`. A loop or an index gives the read
+        // `lines.color`: the check walks the element type.
+        let release = |with_color: bool| {
+            let mut bundle = nested_sets(with_color, &["lines", "lines.color"], None);
+            let item = ep(&mut bundle, "get_item");
+            for fields in [
+                &mut item.response.serialized,
+                &mut item.response.deserialized,
+            ] {
+                let details = fields.iter_mut().find(|f| f.rust_name == "details");
+                let lines = details.expect("details");
+                lines.rust_name = "lines".to_owned();
+                lines.wire_name = "lines".to_owned();
+                lines.ty = "Vec<Details>".to_owned();
+            }
+            bundle
+        };
+        let report = compare(&release(true), &release(false));
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::ResponseFieldMissing("lines.color".to_owned())]
+        );
+        assert!(report.caller_first.is_empty(), "{report:?}");
+        assert_eq!(report.verdict(), Verdict::CallerFirst);
+    }
+
+    #[test]
     fn a_nested_read_without_its_prefix_still_reads_the_top_field() {
         let deployed = nested_sets(true, &["details.color"], Some(&["name"]));
         let mut current = nested_sets(true, &["id"], Some(&["name"]));

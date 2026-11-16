@@ -187,6 +187,18 @@ mod tests {
     }
 
     #[test]
+    fn a_loop_over_a_nested_payload_list_keeps_the_path() {
+        assert_eq!(
+            listener(
+                "async fn on(s: AppState, event: ContactUpdated) -> R { \
+                 for p in &event.phones { let _ = p.number; } \
+                 let _ = event.emails[0].address; Ok(()) }"
+            ),
+            ["emails", "emails.address", "phones", "phones.number"]
+        );
+    }
+
+    #[test]
     fn a_nested_payload_read_is_a_dotted_path() {
         assert_eq!(
             listener(
