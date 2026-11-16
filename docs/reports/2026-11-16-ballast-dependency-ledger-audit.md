@@ -173,15 +173,20 @@ bump.
 - `deny.toml`, `deny-sqlite.toml`, `fuzz/deny.toml`: removed the now-dead
   `RUSTSEC-2026-0459` ignore entry (confirmed via `cargo deny` that the
   advisory no longer matches any crate in any of the three graphs).
-- `autumn-cli/src/templates/deny.toml.tmpl`: **kept** the
-  `RUSTSEC-2026-0459` waiver (freshly-generated apps still depend on
-  whatever `autumn-web` is currently published on crates.io, which has not
-  shipped this fix — CLAUDE.md: no version bump without the user asking for
-  one) but rewrote its `reason`/comment to state the corrected, narrower
-  fact: the fix exists upstream and is live in this repo's unreleased root
-  and `fuzz/` graphs, and the waiver's real expiry is "next `autumn-web`
-  release," not "diesel accepts 0.39" (diesel already does). `review-by`
-  moved 2026-11-16 → 2026-12-05.
+- `autumn-cli/src/templates/deny.toml.tmpl`: first **kept** the
+  `RUSTSEC-2026-0459` waiver with rewritten, narrower `reason`/comment text
+  — then **removed it outright**, one commit later, once CI's
+  `scaffold_waivers_are_a_subset_of_the_frameworks_own` test (`autumn-cli/
+  tests/integration/dependency_audit.rs`) failed: it enforces that every
+  scaffold waiver also appears in the framework's own `deny.toml`, by
+  design ("a waiver the framework itself has not triaged has no business
+  being pre-installed in every generated app"). Removing the entry from
+  root `deny.toml` broke that subset relation for the still-waiving
+  template. The fix is consistent with the release-coupling already
+  established for the `diesel-async`/`libsqlite3-sys` pins below: autumn-cli
+  and autumn-web ship together, so by the time this template reaches a
+  real scaffold, the published `autumn-web` carries the same fix and the
+  waiver would have been dead weight regardless.
 - `examples/island-flock/deny.toml`: `RUSTSEC-2024-0370` and
   `RUSTSEC-2025-0141` `reason`/comments rewritten with the `gloo-worker`
   0.7.0 finding and `review-by` moved 2026-11-13 → 2026-12-05.
