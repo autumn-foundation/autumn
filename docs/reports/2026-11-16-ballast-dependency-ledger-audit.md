@@ -267,18 +267,39 @@ gh api repos/autumn-foundation/autumn/dependabot/alerts
    when something else drags Ballast into them.
 3. **GitHub-native Dependabot alert count/breakdown**: still not readable
    (`dependabot/alerts` → 403) — sixth pass flagging the gap.
-4. **New finding, not yet acted on: `benchmarks/runtime/autumn/` is a fourth
-   satellite graph with no audit coverage at all.** It declares its own
-   empty `[workspace]` (standalone, like `fuzz/` and `island-flock`), has no
-   committed `Cargo.lock`, and pins `diesel-async = "0.9"` directly — unlike
-   `fuzz/` and `island-flock`, it isn't named anywhere in
-   `scripts/check-advisories.sh`'s five-graph header comment, isn't built
-   by any CI workflow found this pass, and wasn't bumped in this PR (out of
-   scope: no lockfile to rehearse against, and it's a benchmark harness, not
-   shipped code). Needs its own decision: commit a `Cargo.lock` and bring it
-   under the advisory gate, or document why a benchmark-only crate with no
-   lockfile is deliberately outside the ledger.
-5. **`autumn-cli/src/templates/deny.toml.tmpl`'s `RUSTSEC-2026-0459` waiver
+4. **`benchmarks/runtime/autumn/` is a fourth satellite graph with no
+   advisory-gate coverage — partially addressed mid-PR.** An automated
+   review on this PR (Codex) caught that this crate's own direct
+   `diesel-async = "0.9"` pin conflicts with the `diesel-async = "0.10"`
+   this PR's `diesel` bump now requires transitively through its path
+   dependency on this checkout's `autumn-web` (`.github/workflows/
+   runtime-latency.yml` does build it, so this was a real, CI-reachable
+   break, not a hypothetical one — missed in the original pass because the
+   dependency-pin search used `--include=Cargo.toml`, which skips
+   `Cargo.toml.tmpl` files but should have caught this one; it was missed
+   for a different reason, see below). Fixed in this PR: pin bumped to
+   `"0.10"`, verified with `cargo check` (clean), and its previously-absent
+   `Cargo.lock` committed (it had none — Tier-1 evidence gap in Ballast's
+   own terms). Still open: this graph isn't named in
+   `scripts/check-advisories.sh`'s five-graph header comment and has no
+   `cargo deny` policy file of its own, so it still isn't under the
+   advisory gate going forward — only this one pin was fixed, not the
+   missing coverage.
+5. **The same automated review flagged `autumn-cli/src/starters/{cms,saas}/
+   Cargo.toml.tmpl`'s `diesel-async = "0.9"` pins as inconsistent with this
+   bump — evaluated and NOT changed, with reasoning left on the PR
+   thread.** Unlike `benchmarks/runtime/autumn`, these templates depend on
+   `autumn-web = { version = "{{autumn_version}}", ... }` — a crates.io
+   registry version filled in at `autumn new` time, not a path dependency
+   on this checkout. The currently-published `autumn-web` still requires
+   `diesel-async ^0.9` transitively; bumping the starters' own direct pin to
+   `"0.10"` *today* would make a freshly-scaffolded cms/saas app fail to
+   resolve (`0.10` direct vs. published `autumn-web`'s transitive `^0.9`) —
+   trading a future, release-gated inconsistency for an immediate one. This
+   is the same reasoning already applied to `autumn-cli/src/templates/
+   deny.toml.tmpl`'s waiver in this same PR. Revisit together, once
+   `autumn-web` actually ships a release carrying `diesel-async` 0.10.
+6. **`autumn-cli/src/templates/deny.toml.tmpl`'s `RUSTSEC-2026-0459` waiver
    now has a precise, mechanical unblock condition**: it clears on its own
    the day a new `autumn-web` version ships (no further investigation
    needed — just confirm the release notes mention the diesel bump, or
