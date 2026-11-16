@@ -88,7 +88,8 @@ impl AdaptiveHedge {
         self
     }
 
-    /// Use `initial` until `warm_up` samples are in.
+    /// Use `initial` until `warm_up` samples are in. A warm-up past the window
+    /// ends once the window is full.
     #[must_use]
     pub const fn with_warm_up(mut self, warm_up: usize) -> Self {
         self.warm_up = warm_up;
@@ -135,7 +136,7 @@ impl AdaptiveHedge {
     pub fn delay(&self) -> Duration {
         let mut sorted: Vec<Duration> = {
             let samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
-            if samples.len() < self.warm_up.max(1) {
+            if samples.len() < self.warm_up.clamp(1, self.window) {
                 return self.initial;
             }
             samples.iter().copied().collect()
@@ -215,6 +216,15 @@ mod tests {
         }
         assert_eq!(hedge.samples(), 10);
         assert_eq!(hedge.delay(), MS(5));
+    }
+
+    #[test]
+    fn warm_up_past_the_window_still_learns() {
+        let hedge = AdaptiveHedge::new(MS(40)).with_window(10);
+        for _ in 0..10 {
+            hedge.record(MS(7));
+        }
+        assert_eq!(hedge.delay(), MS(7));
     }
 
     #[test]
