@@ -201,6 +201,11 @@ bump.
   (`TEAMS_DEPS`, `TEAMS_DEPS_SQLITE`), and `autumn-cli/src/starters/{cms,
   saas}/Cargo.toml.tmpl` — all six sites' `diesel-async`/`libsqlite3-sys`
   pins bumped to match. See Follow-up 5 for how the scope was found.
+  Removing the scaffold's own `RUSTSEC-2026-0459` waiver then orphaned two
+  unit-test assertions that expected it present: `autumn-cli/src/new.rs`'s
+  `the_advisory_policy_is_the_same_for_every_flavor` (flipped to assert
+  the waiver's *absence*; caught independently by both an automated PR
+  review and CI's "Measurement unit tests" job).
 
 ## 📊 Measurement
 
