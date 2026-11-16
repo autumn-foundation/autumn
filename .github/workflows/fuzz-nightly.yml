@@ -58,7 +58,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-fuzz tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.89.0
+        uses: taiki-e/install-action@v2.90.3
         with:
           tool: cargo-fuzz
       - uses: ./.github/actions/kache
