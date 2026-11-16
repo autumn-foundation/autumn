@@ -26,3 +26,35 @@ pub fn push_length_prefixed_field(hasher: &mut sha2::Sha256, label: &str, value:
     hasher.update(value);
     hasher.update(b";");
 }
+
+#[cfg(test)]
+mod tests {
+    use sha2::Digest as _;
+
+    use super::push_length_prefixed_field;
+
+    fn digest(fields: &[(&str, &[u8])]) -> [u8; 32] {
+        let mut hasher = sha2::Sha256::new();
+        for (label, value) in fields {
+            push_length_prefixed_field(&mut hasher, label, value);
+        }
+        hasher.finalize().into()
+    }
+
+    #[test]
+    fn different_field_splits_do_not_collide() {
+        // `column = "ab"` + `transform = "c"` must not hash the same as
+        // `column = "a"` + `transform = "bc"` — the ambiguity this function
+        // exists to close.
+        let split_a = digest(&[("column", b"ab"), ("transform", b"c")]);
+        let split_b = digest(&[("column", b"a"), ("transform", b"bc")]);
+        assert_ne!(split_a, split_b);
+    }
+
+    #[test]
+    fn same_fields_hash_the_same() {
+        let first = digest(&[("method", b"GET"), ("target", b"/")]);
+        let second = digest(&[("method", b"GET"), ("target", b"/")]);
+        assert_eq!(first, second);
+    }
+}
