@@ -74,25 +74,6 @@ unmaintained = "all"
 unsound = "all"
 yanked = "warn"
 ignore = [
-    # RUSTSEC-2026-0459 — SQLite before 3.54.0 can return uninitialized
-    # page-cache memory when a process opens a database file together with a
-    # sibling `-wal` file of a different page size.
-    # https://rustsec.org/advisories/RUSTSEC-2026-0459
-    #
-    # Ships pre-waived because the published autumn-web this template depends
-    # on still pulls `libsqlite3-sys` < 0.39.0 (via `diesel` 2.3.x / `diesel-
-    # async` 0.9.x). The fix itself has landed upstream: `diesel` 2.4.0
-    # (2026-11-13) raised its own cap to `libsqlite3-sys` < 0.41, and this
-    # repo's root workspace and `fuzz/` are already on `diesel` 2.4.0 /
-    # `diesel-async` 0.10.0 / `libsqlite3-sys` 0.40.0 with the advisory
-    # confirmed clear (rehearsed 2026-11-16). This template waiver only
-    # outlives that because autumn-web itself has not cut a release carrying
-    # the bump yet (CLAUDE.md: no version bump without the user asking for
-    # one). Only a database file that a less trusted party wrote, opened next
-    # to a `-wal` file it wrote, is exposed; do not open such files. Drop this
-    # waiver once a released autumn-web pulls the fixed versions. Review-by:
-    # 2026-12-05, or the next autumn-web release, whichever comes first.
-    { id = "RUSTSEC-2026-0459", reason = "bundled SQLite < 3.54.0 (uninitialized memory with a foreign -wal file); the published autumn-web this template depends on still caps libsqlite3-sys < 0.39 via diesel 2.3.x/diesel-async 0.9.x; fix already landed upstream (diesel 2.4.0) and is live on this repo's root/fuzz graphs (rehearsed 2026-11-16) but not yet in a released autumn-web; review-by 2026-12-05 or next autumn-web release" },
     # RUSTSEC-2023-0071 — `rsa` "Marvin Attack" timing sidechannel.
     # https://rustsec.org/advisories/RUSTSEC-2023-0071
     #
