@@ -113,10 +113,11 @@ impl AdaptiveHedge {
         self
     }
 
-    /// Add one observed latency, dropping the oldest past the window.
+    /// Add one observed latency, dropping the oldest past the window (all of
+    /// them, if the window was shrunk).
     pub fn record(&self, latency: Duration) {
         let mut samples = self.samples.lock().unwrap_or_else(PoisonError::into_inner);
-        if samples.len() >= self.window {
+        while samples.len() >= self.window {
             samples.pop_front();
         }
         samples.push_back(latency);
@@ -225,6 +226,18 @@ mod tests {
             hedge.record(MS(7));
         }
         assert_eq!(hedge.delay(), MS(7));
+    }
+
+    #[test]
+    fn shrinking_the_window_trims_old_samples() {
+        let hedge = AdaptiveHedge::new(MS(40)).with_warm_up(1);
+        for _ in 0..30 {
+            hedge.record(MS(100));
+        }
+        let hedge = hedge.with_window(1);
+        hedge.record(MS(1));
+        assert_eq!(hedge.samples(), 1);
+        assert_eq!(hedge.delay(), MS(1));
     }
 
     #[test]
