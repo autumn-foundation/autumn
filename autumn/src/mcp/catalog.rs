@@ -281,11 +281,42 @@ pub fn parse_search(arguments: &Value) -> Result<SearchArgs, String> {
 /// The searchable words of one tool. The server makes them once, at start.
 #[derive(Debug)]
 pub struct ToolWords {
-    name: Vec<String>,
-    tags: Vec<String>,
-    arguments: Vec<String>,
+    name: Part,
+    tags: Part,
+    arguments: Part,
     /// The words of the title and the description.
-    text: Vec<String>,
+    text: Part,
+}
+
+/// The words of one part of a tool, with a filter over their first bytes.
+#[derive(Debug)]
+struct Part {
+    words: Vec<String>,
+    /// One bit per first byte (`byte & 63`) of a word. A term whose bit is
+    /// clear matches no word of the part, so the scan is skipped.
+    firsts: u64,
+}
+
+impl Part {
+    fn new(words: Vec<String>) -> Self {
+        let firsts = words
+            .iter()
+            .filter_map(|word| word.as_bytes().first())
+            .fold(0, |mask, byte| mask | first_bit(*byte));
+        Self { words, firsts }
+    }
+
+    /// Whether some word could start like `term`. A false positive costs a
+    /// scan. A false negative cannot happen.
+    fn may_match(&self, term: &str) -> bool {
+        term.as_bytes()
+            .first()
+            .is_some_and(|byte| self.firsts & first_bit(*byte) != 0)
+    }
+}
+
+const fn first_bit(byte: u8) -> u64 {
+    1 << (byte & 63)
 }
 
 /// The searchable words of each tool, in catalog order.
@@ -299,16 +330,18 @@ pub fn index(tools: &[McpTool]) -> Vec<ToolWords> {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             ToolWords {
-                name: words(&tool.name),
-                tags: tool.tags.iter().flat_map(|tag| words(tag)).collect(),
-                arguments: argument_names(&tool.input_schema)
-                    .iter()
-                    .flat_map(|name| words(name))
-                    .collect(),
-                text: words(&format!(
+                name: Part::new(words(&tool.name)),
+                tags: Part::new(tool.tags.iter().flat_map(|tag| words(tag)).collect()),
+                arguments: Part::new(
+                    argument_names(&tool.input_schema)
+                        .iter()
+                        .flat_map(|name| words(name))
+                        .collect(),
+                ),
+                text: Part::new(words(&format!(
                     "{title} {}",
                     tool.description.as_deref().unwrap_or("")
-                )),
+                ))),
             }
         })
         .collect()
@@ -368,8 +401,8 @@ const TEXT: u32 = 1;
 /// The score of one tool for the query `terms`. Each term adds the points of
 /// each part that it matches, once for each part.
 fn score(words: &ToolWords, terms: &[String]) -> u32 {
-    let any = |part: &[String], term: &str, points: u32| {
-        if part.iter().any(|word| matches(word, term)) {
+    let any = |part: &Part, term: &str, points: u32| {
+        if part.may_match(term) && part.words.iter().any(|word| matches(word, term)) {
             points
         } else {
             0
@@ -378,11 +411,12 @@ fn score(words: &ToolWords, terms: &[String]) -> u32 {
     terms
         .iter()
         .map(|term| {
-            let name_points = if words.name.iter().any(|word| word == term) {
-                NAME_EXACT
-            } else {
-                any(&words.name, term, NAME_PART)
-            };
+            let name_points =
+                if words.name.may_match(term) && words.name.words.iter().any(|word| word == term) {
+                    NAME_EXACT
+                } else {
+                    any(&words.name, term, NAME_PART)
+                };
             name_points
                 + any(&words.tags, term, TAG)
                 + any(&words.arguments, term, ARGUMENT)
@@ -704,10 +738,13 @@ mod tests {
         let tools = catalog();
         let index = index(&tools);
         assert_eq!(index.len(), tools.len());
-        assert_eq!(index[1].name, ["create", "user"]);
-        assert_eq!(index[1].tags, ["users"]);
-        assert_eq!(index[1].arguments, ["email"]);
-        assert_eq!(index[2].text, ["report", "liveness", "report", "liveness"]);
+        assert_eq!(index[1].name.words, ["create", "user"]);
+        assert_eq!(index[1].tags.words, ["users"]);
+        assert_eq!(index[1].arguments.words, ["email"]);
+        assert_eq!(
+            index[2].text.words,
+            ["report", "liveness", "report", "liveness"]
+        );
     }
 
     #[test]
