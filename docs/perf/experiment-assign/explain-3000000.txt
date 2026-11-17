@@ -1,0 +1,113 @@
+-- experiment=exp_03 actor=7c97e5f23a6d34f0881741f5d2fa5507
+=== get_override: first statement of a new session
+                                                                        QUERY PLAN                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Seq Scan on public.autumn_experiment_overrides  (cost=0.00..1.60 rows=1 width=8) (actual time=0.007..0.007 rows=0 loops=1)
+   Output: variant
+   Filter: ((autumn_experiment_overrides.experiment = 'exp_03'::text) AND (autumn_experiment_overrides.actor = '7c97e5f23a6d34f0881741f5d2fa5507'::text))
+   Rows Removed by Filter: 40
+   Buffers: shared hit=1
+ Query Identifier: 4983103144082148721
+ Planning:
+   Buffers: shared hit=105
+ Planning Time: 0.232 ms
+ Execution Time: 0.028 ms
+(10 rows)
+
+=== get_override: same statement, second run on that session
+ Seq Scan on public.autumn_experiment_overrides  (cost=0.00..1.60 rows=1 width=8) (actual time=0.004..0.004 rows=0 loops=1)
+   Output: variant
+   Filter: ((autumn_experiment_overrides.experiment = 'exp_03'::text) AND (autumn_experiment_overrides.actor = '7c97e5f23a6d34f0881741f5d2fa5507'::text))
+   Rows Removed by Filter: 40
+   Buffers: shared hit=1
+ Query Identifier: 4983103144082148721
+ Planning Time: 0.022 ms
+ Execution Time: 0.007 ms
+(8 rows)
+
+=== get_assignment: first statement of a new session
+                                                                                        QUERY PLAN                                                                                        
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using autumn_experiment_assignments_experiment_actor_key on public.autumn_experiment_assignments  (cost=0.43..8.46 rows=1 width=42) (actual time=0.043..0.043 rows=1 loops=1)
+   Output: experiment, actor, variant, is_override, (EXTRACT(epoch FROM assigned_at))::bigint
+   Index Cond: ((autumn_experiment_assignments.experiment = 'exp_03'::text) AND (autumn_experiment_assignments.actor = '7c97e5f23a6d34f0881741f5d2fa5507'::text))
+   Buffers: shared hit=4
+ Query Identifier: 3967660710304518419
+ Planning:
+   Buffers: shared hit=167
+ Planning Time: 0.320 ms
+ Execution Time: 0.063 ms
+(9 rows)
+
+=== get_assignment: same statement, second run on that session
+ Index Scan using autumn_experiment_assignments_experiment_actor_key on public.autumn_experiment_assignments  (cost=0.43..8.46 rows=1 width=42) (actual time=0.025..0.026 rows=1 loops=1)
+   Output: experiment, actor, variant, is_override, (EXTRACT(epoch FROM assigned_at))::bigint
+   Index Cond: ((autumn_experiment_assignments.experiment = 'exp_03'::text) AND (autumn_experiment_assignments.actor = '7c97e5f23a6d34f0881741f5d2fa5507'::text))
+   Buffers: shared hit=4
+ Query Identifier: 3967660710304518419
+ Planning Time: 0.060 ms
+ Execution Time: 0.037 ms
+(7 rows)
+
+=== has_assignment_in_group: first statement of a new session
+                                                                                       QUERY PLAN                                                                                       
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=23.20..23.21 rows=1 width=1) (actual time=0.033..0.034 rows=1 loops=1)
+   Output: $0
+   Buffers: shared hit=6
+   InitPlan 1 (returns $0)
+     ->  Nested Loop  (cost=0.43..23.20 rows=1 width=0) (actual time=0.032..0.032 rows=0 loops=1)
+           Inner Unique: true
+           Join Filter: (a.experiment = e.name)
+           Rows Removed by Join Filter: 3
+           Buffers: shared hit=6
+           ->  Index Scan using idx_autumn_exp_assignments_actor on public.autumn_experiment_assignments a  (cost=0.43..20.51 rows=4 width=7) (actual time=0.021..0.021 rows=1 loops=1)
+                 Output: a.id, a.experiment, a.actor, a.variant, a.is_override, a.assigned_at
+                 Index Cond: (a.actor = 'user:new-0'::text)
+                 Filter: (a.experiment <> 'exp_07'::text)
+                 Buffers: shared hit=4
+           ->  Materialize  (cost=0.00..2.52 rows=3 width=7) (actual time=0.006..0.009 rows=3 loops=1)
+                 Output: e.name
+                 Buffers: shared hit=2
+                 ->  Seq Scan on public.autumn_experiments e  (cost=0.00..2.50 rows=3 width=7) (actual time=0.004..0.006 rows=3 loops=1)
+                       Output: e.name
+                       Filter: (e.exclusion_group = 'checkout'::text)
+                       Rows Removed by Filter: 37
+                       Buffers: shared hit=2
+ Query Identifier: -4921600854887618930
+ Planning:
+   Buffers: shared hit=350
+ Planning Time: 0.657 ms
+ Execution Time: 0.067 ms
+(27 rows)
+
+=== has_assignment_in_group: same statement, second run on that session
+ Result  (cost=23.20..23.21 rows=1 width=1) (actual time=0.015..0.016 rows=1 loops=1)
+   Output: $0
+   Buffers: shared hit=6
+   InitPlan 1 (returns $0)
+     ->  Nested Loop  (cost=0.43..23.20 rows=1 width=0) (actual time=0.014..0.015 rows=0 loops=1)
+           Inner Unique: true
+           Join Filter: (a.experiment = e.name)
+           Rows Removed by Join Filter: 3
+           Buffers: shared hit=6
+           ->  Index Scan using idx_autumn_exp_assignments_actor on public.autumn_experiment_assignments a  (cost=0.43..20.51 rows=4 width=7) (actual time=0.007..0.007 rows=1 loops=1)
+                 Output: a.id, a.experiment, a.actor, a.variant, a.is_override, a.assigned_at
+                 Index Cond: (a.actor = 'user:new-0'::text)
+                 Filter: (a.experiment <> 'exp_07'::text)
+                 Buffers: shared hit=4
+           ->  Materialize  (cost=0.00..2.52 rows=3 width=7) (actual time=0.004..0.006 rows=3 loops=1)
+                 Output: e.name
+                 Buffers: shared hit=2
+                 ->  Seq Scan on public.autumn_experiments e  (cost=0.00..2.50 rows=3 width=7) (actual time=0.003..0.005 rows=3 loops=1)
+                       Output: e.name
+                       Filter: (e.exclusion_group = 'checkout'::text)
+                       Rows Removed by Filter: 37
+                       Buffers: shared hit=2
+ Query Identifier: -4921600854887618930
+ Planning:
+   Buffers: shared hit=2
+ Planning Time: 0.117 ms
+ Execution Time: 0.030 ms
+(27 rows)
+

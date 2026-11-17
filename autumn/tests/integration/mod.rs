@@ -130,6 +130,8 @@ mod error_validation_details;
 mod event_wire_contract;
 mod events_integration;
 #[cfg(feature = "db")]
+mod experiments_assign_connection_profile;
+#[cfg(feature = "db")]
 mod experiments_pg_integration;
 #[cfg(feature = "db")]
 mod export_csv_list_count_profile;
