@@ -6,4 +6,5 @@
   `-log10(P(the peer is still alive))`. Pick one threshold (8.0 by default)
   and every peer gets a timeout that follows its own heartbeat rhythm and
   jitter, with `with_window`, `with_min_std_dev` and `with_acceptable_pause`
-  to tune it.
+  to tune it. The gap before a heartbeat that ends an outage is not learned
+  (`with_outage_phi`), so downtime does not slow later detection.

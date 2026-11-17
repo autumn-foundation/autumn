@@ -714,7 +714,9 @@ delete actions remain last-write-wins.
   `is_available_at(now, threshold)` compares it to a threshold
   (`DEFAULT_THRESHOLD` = 8.0). It learns the mean and jitter of the last 1000
   intervals (`with_window`, `with_min_std_dev` default 100 ms,
-  `with_acceptable_pause`). Time is passed in, so tests replay it exactly.
+  `with_acceptable_pause`). A gap that ends at or above `with_outage_phi`
+  (default 8.0) is not learned; two in a row reseed the window. Time is
+  passed in, so tests replay it exactly.
 
 ## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
 

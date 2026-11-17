@@ -60,6 +60,8 @@ pub struct PhiDetector {
     min_std_dev: Duration,
     acceptable_pause: Duration,
     window: usize,
+    outage_phi: f64,
+    after_outage: bool,
     last: Option<Instant>,
     intervals: VecDeque<Duration>,
 }
@@ -74,6 +76,8 @@ impl PhiDetector {
             min_std_dev: DEFAULT_MIN_STD_DEV,
             acceptable_pause: Duration::ZERO,
             window: DEFAULT_WINDOW,
+            outage_phi: DEFAULT_THRESHOLD,
+            after_outage: false,
             last: None,
             intervals: VecDeque::new(),
         }
@@ -102,21 +106,42 @@ impl PhiDetector {
         self
     }
 
+    /// Treat a heartbeat that arrives when `phi` is at or above `phi` as the
+    /// end of an outage (default [`DEFAULT_THRESHOLD`]). A NaN becomes the
+    /// default; `f64::INFINITY` learns every interval.
+    #[must_use]
+    pub const fn with_outage_phi(mut self, phi: f64) -> Self {
+        self.outage_phi = if phi.is_nan() { DEFAULT_THRESHOLD } else { phi };
+        self
+    }
+
     /// Record a heartbeat received at `now`.
     ///
     /// The first heartbeat seeds the window with `first_interval`, give or
     /// take a quarter. A heartbeat older than the last one is ignored.
+    ///
+    /// The gap before a heartbeat that ends an outage (see
+    /// [`with_outage_phi`](Self::with_outage_phi)) is not learned, so
+    /// downtime does not widen the rhythm. Two such gaps in a row mean the
+    /// peer has slowed down for good, and the window is reseeded from the
+    /// latest gap.
     pub fn heartbeat_at(&mut self, now: Instant) {
         match self.last {
             Some(last) if now < last => return,
-            Some(last) => self.intervals.push_back(now.duration_since(last)),
-            None => {
-                let spread = self.first_interval / 4;
-                self.intervals
-                    .push_back(self.first_interval.saturating_sub(spread));
-                self.intervals
-                    .push_back(self.first_interval.saturating_add(spread));
+            Some(last) => {
+                let interval = now.duration_since(last);
+                if self.phi_at(now) < self.outage_phi {
+                    self.intervals.push_back(interval);
+                    self.after_outage = false;
+                } else if self.after_outage {
+                    self.intervals.clear();
+                    self.seed(interval);
+                    self.after_outage = false;
+                } else {
+                    self.after_outage = true;
+                }
             }
+            None => self.seed(self.first_interval),
         }
         self.last = Some(now);
         self.trim();
@@ -143,6 +168,13 @@ impl PhiDetector {
     #[must_use]
     pub fn samples(&self) -> usize {
         self.intervals.len()
+    }
+
+    /// Add `interval`, give or take a quarter.
+    fn seed(&mut self, interval: Duration) {
+        let spread = interval / 4;
+        self.intervals.push_back(interval.saturating_sub(spread));
+        self.intervals.push_back(interval.saturating_add(spread));
     }
 
     /// Mean and floored standard deviation of the window, in seconds.
@@ -334,6 +366,35 @@ mod tests {
         assert!(detector.is_available_at(last + 100 * MS, DEFAULT_THRESHOLD));
         let late = detector.phi_at(last + Duration::from_hours(1));
         assert!(late.is_finite() && late > DEFAULT_THRESHOLD, "{late}");
+    }
+
+    #[test]
+    fn outage_is_not_learned_as_rhythm() {
+        let start = Instant::now();
+        let mut detector = PhiDetector::new(100 * MS);
+        let last = steady(&mut detector, start, 100 * MS, 1000);
+        let back = last + Duration::from_hours(1);
+        detector.heartbeat_at(back);
+        assert!(!detector.is_available_at(back + 1000 * MS, DEFAULT_THRESHOLD));
+    }
+
+    #[test]
+    fn lasting_slowdown_is_relearned() {
+        let start = Instant::now();
+        let mut detector = PhiDetector::new(100 * MS).with_min_std_dev(10 * MS);
+        let last = steady(&mut detector, start, 100 * MS, 50);
+        let last = steady(&mut detector, last + 5000 * MS, 5000 * MS, 3);
+        assert!(detector.is_available_at(last + 5000 * MS, DEFAULT_THRESHOLD));
+    }
+
+    #[test]
+    fn infinite_outage_phi_learns_every_interval() {
+        let start = Instant::now();
+        let mut detector = PhiDetector::new(100 * MS).with_outage_phi(f64::INFINITY);
+        let last = steady(&mut detector, start, 100 * MS, 10);
+        let samples = detector.samples();
+        detector.heartbeat_at(last + Duration::from_hours(1));
+        assert_eq!(detector.samples(), samples + 1);
     }
 
     #[test]
