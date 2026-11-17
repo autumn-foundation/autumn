@@ -15,9 +15,10 @@
 //! place, the trust check would run against the wrong address. These tests
 //! pin that the replay is checked against the caller's own peer.
 //!
-//! The second test puts `/mcp` in `tenancy.public_paths`, so the envelope
-//! skips tenancy and only the replay can refuse. Without that, the envelope's
-//! own check would refuse first and the replay would never be tested.
+//! The `/mcp` envelope itself is not refused: the replay is the request that
+//! carries the tenant to a handler, and it is the one the trust check refuses.
+//! The third test also puts `/mcp` in `tenancy.public_paths`, the shape an app
+//! that exempts its agent endpoint has, and expects the same refusal.
 
 #![cfg(feature = "mcp")]
 
@@ -110,21 +111,38 @@ async fn the_gateway_selects_the_tenant_through_tools_call() {
     );
 }
 
-/// A direct client is refused at the envelope, before any tool runs.
-#[tokio::test]
-async fn a_direct_client_cannot_select_the_tenant_through_tools_call() {
-    let app = router(behind_gateway());
-    let (status, body) = send(&app, tools_call("203.0.113.9:4000", FLAG)).await;
+/// Asserts the tool call was refused by the trust check, not run in tenant B.
+fn assert_refused_replay(status: StatusCode, body: &str) {
     assert!(
         !body.contains(FLAG),
         "a client outside the gateway range selected tenant B through MCP: {status} {body}"
     );
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the envelope answers JSON-RPC: {body}"
+    );
+    let rpc: serde_json::Value = serde_json::from_str(body).expect("json-rpc");
+    assert_eq!(rpc["result"]["isError"], true, "{rpc}");
+    let text = rpc["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("403") && text.contains("trusted proxy"),
+        "the tool error carries the trust check's 403: {text}"
+    );
 }
 
-/// With `/mcp` exempt from tenancy, the envelope does not check the header.
-/// The replay must still be checked against the caller's own peer, and the
-/// tool must not run in tenant B.
+/// A direct client's tool call is refused by the trust check on the replay.
+#[tokio::test]
+async fn a_direct_client_cannot_select_the_tenant_through_tools_call() {
+    let app = router(behind_gateway());
+    let (status, body) = send(&app, tools_call("203.0.113.9:4000", FLAG)).await;
+    assert_refused_replay(status, &body);
+}
+
+/// With `/mcp` listed in `tenancy.public_paths`, the replay is still checked
+/// against the caller's own peer, and the tool does not run in tenant B.
 #[tokio::test]
 async fn the_replay_checks_the_callers_peer_when_the_envelope_is_exempt() {
     let mut config = behind_gateway();
@@ -132,18 +150,7 @@ async fn the_replay_checks_the_callers_peer_when_the_envelope_is_exempt() {
     let app = router(config);
 
     let (status, body) = send(&app, tools_call("203.0.113.9:4000", FLAG)).await;
-    assert!(
-        !body.contains(FLAG),
-        "the tools/call replay trusted a forged tenant header from a direct client: \
-         {status} {body}"
-    );
-    assert_eq!(status, StatusCode::OK, "the envelope is exempt: {body}");
-    let rpc: serde_json::Value = serde_json::from_str(&body).expect("json-rpc");
-    assert_eq!(rpc["result"]["isError"], true, "{rpc}");
-    let text = rpc["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(text.contains("403"), "the tool error carries the 403: {text}");
+    assert_refused_replay(status, &body);
 
     // The gateway still gets through on the same exempt envelope.
     let (_, body) = send(&app, tools_call("10.0.0.5:4000", FLAG)).await;

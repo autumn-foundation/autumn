@@ -1,0 +1,6 @@
+running 3 tests
+test the_gateway_selects_the_tenant_through_tools_call ... ok
+test a_direct_client_cannot_select_the_tenant_through_tools_call ... ok
+test the_replay_checks_the_callers_peer_when_the_envelope_is_exempt ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s

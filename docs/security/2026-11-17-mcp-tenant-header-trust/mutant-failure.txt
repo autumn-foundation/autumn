@@ -1,0 +1,26 @@
+
+running 3 tests
+the_replay_checks_the_callers_peer_when_the_envelope_is_exempt --- FAILED
+a_direct_client_cannot_select_the_tenant_through_tools_call --- FAILED
+.
+failures:
+
+---- the_replay_checks_the_callers_peer_when_the_envelope_is_exempt stdout ----
+
+thread 'the_replay_checks_the_callers_peer_when_the_envelope_is_exempt'  panicked at autumn/tests/integration/mcp_tenant_header_trust.rs (temporary standalone copy):116:5:
+a client outside the gateway range selected tenant B through MCP: 200 OK {"id":1,"jsonrpc":"2.0","result":{"content":[{"text":"\"tenant-b-sentinel-3729\"","type":"text"}],"isError":false}}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- a_direct_client_cannot_select_the_tenant_through_tools_call stdout ----
+
+thread 'a_direct_client_cannot_select_the_tenant_through_tools_call'  panicked at autumn/tests/integration/mcp_tenant_header_trust.rs (temporary standalone copy):116:5:
+a client outside the gateway range selected tenant B through MCP: 200 OK {"id":1,"jsonrpc":"2.0","result":{"content":[{"text":"\"tenant-b-sentinel-3729\"","type":"text"}],"isError":false}}
+
+
+failures:
+    a_direct_client_cannot_select_the_tenant_through_tools_call
+    the_replay_checks_the_callers_peer_when_the_envelope_is_exempt
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p autumn-web --test <temporary standalone copy>`
