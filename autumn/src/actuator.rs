@@ -1121,7 +1121,7 @@ impl JobRegistry {
             .clock
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        u64::try_from(clock.now().to_chrono().timestamp_millis()).unwrap_or(0)
+        u64::try_from(clock.now().as_millisecond()).unwrap_or(0)
     }
 
     /// Whether any job name has been registered against this registry.
@@ -1560,8 +1560,8 @@ impl JobRegistry {
                     clippy::disallowed_methods,
                     reason = "Real marks are measured by Postgres clock_timestamp(), a real clock"
                 )]
-                let real_now =
-                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(u64::MAX);
+                let real_now = u64::try_from(crate::time::Timestamp::now().as_millisecond())
+                    .unwrap_or(u64::MAX);
                 // Evict the oldest due entry, else the oldest overall. `pg_marks_seq_order`
                 // documents why this is rarely a full scan.
                 let evict_id = guard
@@ -2020,7 +2020,7 @@ impl TaskRegistry {
             return;
         };
         task.status = "idle".to_string();
-        let now = crate::time::ambient_now().to_chrono().to_rfc3339();
+        let now = crate::time::compat::rfc3339(crate::time::ambient_now());
         task.last_run = Some(now.clone());
         task.last_fired_at = Some(now);
         task.last_duration_ms = Some(duration_ms);
@@ -2038,7 +2038,7 @@ impl TaskRegistry {
             return;
         };
         task.status = "idle".to_string();
-        let now = crate::time::ambient_now().to_chrono().to_rfc3339();
+        let now = crate::time::compat::rfc3339(crate::time::ambient_now());
         task.last_run = Some(now.clone());
         task.last_fired_at = Some(now);
         task.last_duration_ms = Some(duration_ms);
@@ -5698,6 +5698,15 @@ pub(crate) fn actuator_router_with_prefix<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The UTC instant at the given wall clock time.
+    fn utc_instant(y: i16, mo: i8, d: i8, h: i8, mi: i8, sec: i8) -> crate::time::Timestamp {
+        crate::time::civil::date(y, mo, d)
+            .at(h, mi, sec, 0)
+            .to_zoned_datetime(crate::time::tz::TimeZone::UTC)
+            .expect("a valid UTC date-time")
+            .timestamp()
+    }
     use crate::config::AutumnConfig;
 
     #[test]
@@ -5892,8 +5901,6 @@ mod tests {
     /// depths, and years of waiting age, for identical state.
     #[test]
     fn installing_a_clock_reaches_registry_clones() {
-        use chrono::{TimeZone, Utc};
-
         // Clone before the clock is installed.
         let registry = JobRegistry::new();
         let earlier_clone = registry.clone();
@@ -5902,13 +5909,11 @@ mod tests {
         // An epoch behind real time, like a sim epoch: a deadline a minute past it is years behind
         // a real-clock reading, so a clone reading real time would call it ready while the injected
         // clock calls it scheduled. An epoch ahead of real time would prove nothing.
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let registry = registry.with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
-            epoch.to_jiff(),
-        )));
+        let epoch = utc_instant(2020, 1, 1, 0, 0, 0);
+        let registry = registry.with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
 
         // A job due a minute after the injected epoch: scheduled, not ready.
-        let ready_at = u64::try_from(epoch.timestamp_millis()).unwrap() + 60_000;
+        let ready_at = u64::try_from(epoch.as_millisecond()).unwrap() + 60_000;
         registry.record_enqueue_scheduled("probe", ready_at);
 
         let through_new = registry.queue_snapshot();
@@ -5941,21 +5946,18 @@ mod tests {
     /// pinned ahead of the database, or zero when it is behind.
     #[test]
     fn a_surveyed_age_survives_the_rebase_onto_the_registry_clock() {
-        use chrono::{TimeZone, Utc};
-
         // The database reports its oldest ready job has waited 5s.
         const DB_AGE_MS: u64 = 5_000;
 
         // A clock pinned far from real time in each direction, so a leaked
         // real-vs-injected subtraction cannot coincidentally pass.
         for year in [1999, 2036] {
-            let epoch = Utc.with_ymd_and_hms(year, 6, 1, 12, 0, 0).unwrap();
-            let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
-                crate::time::FixedClock::at(epoch.to_jiff()),
-            ));
+            let epoch = utc_instant(year, 6, 1, 12, 0, 0);
+            let registry = JobRegistry::new()
+                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
             registry.register_on_queue("probe", "default");
 
-            let registry_now = u64::try_from(epoch.timestamp_millis()).unwrap();
+            let registry_now = u64::try_from(epoch.as_millisecond()).unwrap();
             let survey = HashMap::from([(
                 "default".to_string(),
                 (3u64, Some(ready_at_from_age(registry_now, DB_AGE_MS))),
@@ -5994,19 +5996,16 @@ mod tests {
     /// boundary; trying each mark's own plausible timeline directly cannot.
     #[test]
     fn cancel_at_backend_offset_falls_back_to_the_nearest_of_its_three_timelines() {
-        use chrono::{TimeZone, Utc};
-
         // An arbitrary backend `clock_timestamp()` reading, unrelated to either registry clock.
         const BACKEND_NOW_MS: u64 = 1_800_000_000_000;
         // An arbitrary absolute due-at for an `enqueue_at` mark, far from every other value.
         const ABSOLUTE_MARK_MS: u64 = 9_999_999_999_999;
 
         for year in [1999, 2036] {
-            let epoch = Utc.with_ymd_and_hms(year, 6, 1, 12, 0, 0).unwrap();
-            let epoch_ms = u64::try_from(epoch.timestamp_millis()).unwrap();
-            let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
-                crate::time::FixedClock::at(epoch.to_jiff()),
-            ));
+            let epoch = utc_instant(year, 6, 1, 12, 0, 0);
+            let epoch_ms = u64::try_from(epoch.as_millisecond()).unwrap();
+            let registry = JobRegistry::new()
+                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
             registry.register_on_queue("immediate_job", "mail");
             registry.register_on_queue("relative_job", "mail");
             registry.register_on_queue("absolute_job", "mail");
@@ -6212,15 +6211,12 @@ mod tests {
     /// than judged against both; this still exercises the same scenario.)
     #[test]
     fn note_pg_job_mark_eviction_judges_a_real_timeline_mark_against_real_time_only() {
-        use chrono::{TimeZone, Utc};
-
-        let registry =
-            JobRegistry::new().with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
-                Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap().to_jiff(),
-            )));
+        let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
+            crate::time::FixedClock::at(utc_instant(2100, 1, 1, 0, 0, 0)),
+        ));
         registry.register_on_queue("skewed", "mail");
 
-        let real_now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let real_now = u64::try_from(crate::time::Timestamp::now().as_millisecond()).unwrap();
         // 5 real minutes out, so not due, but small next to the registry's year-2100 reading: a
         // check against the registry clock alone would call it due.
         let genuinely_delayed = real_now + 300_000;
@@ -6274,15 +6270,12 @@ mod tests {
     /// ([`PgMarkTimeline`]) that actually measures it.
     #[test]
     fn note_pg_job_mark_eviction_judges_a_real_timeline_mark_even_when_the_registry_clock_lags() {
-        use chrono::{TimeZone, Utc};
-
-        let registry =
-            JobRegistry::new().with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
-                Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap().to_jiff(),
-            )));
+        let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
+            crate::time::FixedClock::at(utc_instant(2000, 1, 1, 0, 0, 0)),
+        ));
         registry.register_on_queue("lagging", "mail");
 
-        let real_now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let real_now = u64::try_from(crate::time::Timestamp::now().as_millisecond()).unwrap();
         // An hour out in real time — genuinely not due yet — inserted
         // first, so plain FIFO would evict it first.
         let far_future = real_now + 3_600_000;

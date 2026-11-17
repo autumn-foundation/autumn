@@ -18,11 +18,6 @@
     reason = "temporary chrono bridge; some callers are feature- or test-gated"
 )]
 use crate::time::bridge::ChronoBridge as _;
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::JiffBridge as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16687,8 +16682,8 @@ async fn api_versioning_middleware(
         return next.run(request).await;
     };
 
-    let is_deprecated = version.deprecated_at.is_some_and(|d| now >= d.to_jiff());
-    let is_sunset = version.sunset_at.is_some_and(|s| now >= s.to_jiff());
+    let is_deprecated = version.deprecated_at.is_some_and(|d| now >= d);
+    let is_sunset = version.sunset_at.is_some_and(|s| now >= s);
 
     if is_sunset && !meta.sunset_opt_out {
         if meta.has_policy {
@@ -16726,7 +16721,7 @@ async fn api_versioning_middleware(
         ));
         let mut response = err.into_response();
         if let Some(sunset) = version.sunset_at {
-            let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            let http_date = crate::time::compat::http_date(sunset);
             if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
                 response.headers_mut().insert("Sunset", val);
             }
@@ -16736,7 +16731,7 @@ async fn api_versioning_middleware(
             (d, s) => d.or(s),
         };
         if let Some(date) = deprecation_date {
-            let timestamp = date.timestamp();
+            let timestamp = date.as_second();
             if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
                 response.headers_mut().insert("Deprecation", val);
             }
@@ -16752,14 +16747,14 @@ async fn api_versioning_middleware(
             (d, s) => d.or(s),
         };
         if let Some(date) = deprecation_date {
-            let timestamp = date.timestamp();
+            let timestamp = date.as_second();
             if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
                 response.headers_mut().insert("Deprecation", val);
             }
         }
     }
     if let Some(sunset) = version.sunset_at.filter(|_| is_deprecated || is_sunset) {
-        let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let http_date = crate::time::compat::http_date(sunset);
         if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
             response.headers_mut().insert("Sunset", val);
         }
@@ -16784,7 +16779,7 @@ pub fn check_sunset(
         .and_then(|v| v.0.iter().find(|av| av.version == meta.version));
 
     let version = matching_version?;
-    let is_sunset = version.sunset_at.is_some_and(|s| now >= s.to_jiff());
+    let is_sunset = version.sunset_at.is_some_and(|s| now >= s);
 
     if is_sunset && !meta.sunset_opt_out {
         let err = crate::error::AutumnError::gone_msg(format!(
@@ -16793,7 +16788,7 @@ pub fn check_sunset(
         ));
         let mut response = axum::response::IntoResponse::into_response(err);
         if let Some(sunset) = version.sunset_at {
-            let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            let http_date = crate::time::compat::http_date(sunset);
             if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
                 response.headers_mut().insert("Sunset", val);
             }
@@ -16803,7 +16798,7 @@ pub fn check_sunset(
             (d, s) => d.or(s),
         };
         if let Some(date) = deprecation_date {
-            let timestamp = date.timestamp();
+            let timestamp = date.as_second();
             if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
                 response.headers_mut().insert("Deprecation", val);
             }

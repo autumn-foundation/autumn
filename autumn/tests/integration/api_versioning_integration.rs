@@ -1,13 +1,12 @@
 use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
 use autumn_web::time::TickingClock;
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::JiffBridge as _;
-use chrono::{TimeZone, Utc};
 use std::time::Duration;
+
+/// The instant an RFC 3339 literal names.
+fn utc(rfc3339: &str) -> autumn_web::time::Timestamp {
+    rfc3339.parse().expect("a valid RFC 3339 timestamp")
+}
 
 #[get("/api/info", api_version = "v1")]
 async fn api_info_v1() -> &'static str {
@@ -35,11 +34,11 @@ async fn api_plain() -> &'static str {
 
 #[tokio::test]
 async fn test_api_versioning_integration() {
-    let start_time = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
-    let deprecated_at = Utc.with_ymd_and_hms(2026, 6, 2, 0, 0, 0).unwrap();
-    let sunset_at = Utc.with_ymd_and_hms(2026, 6, 3, 0, 0, 0).unwrap();
+    let start_time = utc("2026-06-01T00:00:00Z");
+    let deprecated_at = utc("2026-06-02T00:00:00Z");
+    let sunset_at = utc("2026-06-03T00:00:00Z");
 
-    let clock = TickingClock::starting_at(start_time.to_jiff());
+    let clock = TickingClock::starting_at(start_time);
 
     let client = TestApp::new()
         .routes(routes![
@@ -77,12 +76,12 @@ async fn test_api_versioning_integration() {
     client.advance_clock(Duration::from_secs(24 * 3600 + 10)); // past deprecation (June 2)
     let resp = client.get("/api/info").send().await;
     resp.assert_ok();
-    let expected_deprecation_header = format!("@{}", deprecated_at.timestamp());
+    let expected_deprecation_header = format!("@{}", deprecated_at.as_second());
     assert_eq!(
         resp.header("Deprecation").unwrap(),
         expected_deprecation_header
     );
-    let expected_sunset_header = sunset_at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let expected_sunset_header = "Wed, 03 Jun 2026 00:00:00 GMT";
     assert_eq!(resp.header("Sunset").unwrap(), expected_sunset_header);
 
     // 4. Move past sunset: should return 410 Gone with Sunset header
@@ -110,7 +109,7 @@ async fn test_api_versioning_integration() {
     // 6. Opt-out route past sunset (with no deprecation_at configured) still emits Deprecation header
     let resp = client.get("/api/sunset-only-opt").send().await;
     resp.assert_ok();
-    let expected_sunset_deprecation_header = format!("@{}", sunset_at.timestamp());
+    let expected_sunset_deprecation_header = format!("@{}", sunset_at.as_second());
     assert_eq!(
         resp.header("Deprecation").unwrap(),
         expected_sunset_deprecation_header
@@ -235,11 +234,11 @@ async fn api_authorize_policy_denial_reverse_sunset(
 async fn test_api_versioning_auth_preservation() {
     use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
 
-    let start_time = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
-    let deprecated_at = Utc.with_ymd_and_hms(2026, 6, 2, 0, 0, 0).unwrap();
-    let sunset_at = Utc.with_ymd_and_hms(2026, 6, 3, 0, 0, 0).unwrap();
+    let start_time = utc("2026-06-01T00:00:00Z");
+    let deprecated_at = utc("2026-06-02T00:00:00Z");
+    let sunset_at = utc("2026-06-03T00:00:00Z");
 
-    let clock = TickingClock::starting_at(start_time.to_jiff());
+    let clock = TickingClock::starting_at(start_time);
     let store = MemoryStore::new();
 
     // Seed session data

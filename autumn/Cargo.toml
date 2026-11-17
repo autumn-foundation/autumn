@@ -519,7 +519,7 @@ chrono-tz.workspace = true
 jiff.workspace = true
 # `serde` is a default feature, named here because `SqliteDecimal` depends on it.
 rust_decimal = { workspace = true, features = ["serde"] }
-croner = "4.0.2"
+croner = { version = "4.0.3", default-features = false }
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 proptest = { version = "1.4", optional = true }

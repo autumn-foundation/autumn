@@ -1777,8 +1777,8 @@ fn operation_for(
             .iter()
             .find(|av| av.version == version)
             .is_some_and(|av| {
-                let is_dep = av.deprecated_at.is_some_and(|d| now >= d);
-                let is_sun = av.sunset_at.is_some_and(|s| now >= s);
+                let is_dep = av.deprecated_at.is_some_and(|d| now >= d.to_chrono());
+                let is_sun = av.sunset_at.is_some_and(|s| now >= s.to_chrono());
                 is_dep || is_sun
             })
     });

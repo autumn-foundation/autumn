@@ -32,11 +32,7 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
+use crate::time::cron::CronZoned;
 use std::any::{Any, TypeId};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -389,9 +385,11 @@ pub struct ApiVersion {
     /// The version name (e.g. "v1", "v2").
     pub version: String,
     /// When this version was deprecated.
-    pub deprecated_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, with = "crate::time::compat::serde_autosi_option")]
+    pub deprecated_at: Option<crate::time::Timestamp>,
     /// When this version was sunsetted.
-    pub sunset_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, with = "crate::time::compat::serde_autosi_option")]
+    pub sunset_at: Option<crate::time::Timestamp>,
 }
 
 /// A wrapper for registered API versions in the app state.
@@ -10290,7 +10288,7 @@ pub(crate) fn start_task_scheduler_with_config(
                     loop {
                         state.task_registry.record_next_run_at(
                             &name,
-                            &format_next_task_run_after(state.clock().now().to_chrono(), delay),
+                            &format_next_task_run_after(state.clock().now(), delay),
                         );
                         tokio::select! {
                             // Fixed branch order, so a sim replays it (#3067).
@@ -10379,7 +10377,7 @@ fn send_ws_sys_task_msg(
         let mut msg = serde_json::json!({
             "event": event,
             "task": name,
-            "timestamp": state.clock().now().to_chrono().to_rfc3339(),
+            "timestamp": crate::time::compat::rfc3339(state.clock().now()),
         });
         if let Some(map) = msg.as_object_mut() {
             for (k, v) in extra {
@@ -10908,21 +10906,17 @@ async fn run_cron_task_loop(
     };
     let timezone = timezone
         .as_deref()
-        .and_then(|timezone| {
-            timezone.parse::<chrono_tz::Tz>().map_or_else(
-                |_| {
-                    tracing::warn!(task = %name, timezone = %timezone, "Unrecognized timezone; falling back to UTC");
-                    None
-                },
-                Some,
-            )
-        })
-        .unwrap_or(chrono_tz::UTC);
-    let mut cursor = state.clock().now().to_chrono().with_timezone(&timezone);
+        .map_or(jiff::tz::TimeZone::UTC, |timezone| {
+            cron_time_zone(timezone).unwrap_or_else(|| {
+                tracing::warn!(task = %name, timezone = %timezone, "Unrecognized timezone; falling back to UTC");
+                jiff::tz::TimeZone::UTC
+            })
+        });
+    let mut cursor = CronZoned::new(state.clock().now(), timezone.clone());
     let deferring = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
-        let now = state.clock().now().to_chrono().with_timezone(&timezone);
+        let now = CronZoned::new(state.clock().now(), timezone.clone());
         let scheduled_at = match next_cron_occurrence_after(&cron, &cursor, &now) {
             Ok(scheduled_at) => scheduled_at,
             Err(error) => {
@@ -10932,15 +10926,15 @@ async fn run_cron_task_loop(
         };
         state.task_registry.record_next_run_at(
             &name,
-            &scheduled_at.with_timezone(&chrono::Utc).to_rfc3339(),
+            &crate::time::compat::rfc3339(scheduled_at.timestamp()),
         );
-        let sleep_for = cron_sleep_duration_until(state.clock().now().to_chrono(), &scheduled_at);
+        let sleep_for = cron_sleep_duration_until(state.clock().now(), &scheduled_at);
         tokio::select! {
             // Fixed branch order, so a sim replays it (#3067).
             biased;
             () = shutdown.cancelled() => break,
             () = tokio::time::sleep(sleep_for) => {
-                let woke_at = state.clock().now().to_chrono().with_timezone(&timezone);
+                let woke_at = CronZoned::new(state.clock().now(), timezone.clone());
                 match cron_occurrence_is_overdue(&cron, &scheduled_at, &woke_at) {
                     Ok(true) => {
                         tracing::warn!(
@@ -10972,7 +10966,7 @@ async fn run_cron_task_loop(
                     deferring.store(true, std::sync::atomic::Ordering::Release);
                 }
                 let occurrence = CronTick {
-                    unix_secs: u64::try_from(scheduled_at.timestamp()).unwrap_or_default(),
+                    unix_secs: u64::try_from(scheduled_at.timestamp().as_second()).unwrap_or_default(),
                     window: cron_occurrence_window(&cron, &scheduled_at),
                 };
                 crate::sim::spawn_app_task(&state, execute_cron_task(
@@ -11001,19 +10995,17 @@ async fn run_cron_task_loop(
 /// app's injected clock and the rendered `next_run_at` follows virtual time
 /// under a `#[sim_test]`.
 ///
-/// Goes through [`crate::job::due_at_from`] for the addition rather than `now +
-/// delay`. Once `now` comes from an injected clock it is no longer bounded by
-/// real time, and chrono's `Add` **panics** on overflow — a clock pinned near
-/// `DateTime::MAX_UTC` would kill this scheduler task before its first run, for
-/// a value that only ends up in a log line. `due_at_from` already owns that
-/// clamp for the job queue's deadlines; sharing it keeps the two from drifting
-/// apart, and makes an unrepresentable delay render as the far future rather
-/// than as `now` (which would read as "runs immediately").
-fn format_next_task_run_after(
-    now: chrono::DateTime<chrono::Utc>,
-    delay: std::time::Duration,
-) -> String {
-    crate::job::due_at_from(now, delay).to_rfc3339()
+/// Saturates rather than computing `now + delay`. Once `now` comes from an
+/// injected clock it is no longer bounded by real time, and `Timestamp + delay`
+/// **panics** on overflow — a clock pinned near `Timestamp::MAX` would kill this
+/// scheduler task before its first run, for a value that only ends up in a log
+/// line. A delay too large for a `SignedDuration` renders as the far future
+/// (`Timestamp::MAX`), the same clamp the job queue applies to its deadlines,
+/// rather than as `now` (which would read as "runs immediately").
+fn format_next_task_run_after(now: crate::time::Timestamp, delay: std::time::Duration) -> String {
+    let delta =
+        crate::time::SignedDuration::try_from(delay).unwrap_or(crate::time::SignedDuration::MAX);
+    crate::time::compat::rfc3339(crate::time_math::saturating_ts_add(now, delta))
 }
 
 /// Parses a `#[scheduled(cron = "...")]` expression.
@@ -11028,34 +11020,44 @@ fn parse_cron_expression(expression: &str) -> Result<croner::Cron, croner::error
         .parse(expression)
 }
 
-fn next_cron_occurrence_after<Tz: chrono::TimeZone>(
+/// The time zone a `#[scheduled(cron = ..., timezone = ...)]` task runs in, by
+/// IANA name. `None` for a name the bundled database does not know.
+fn cron_time_zone(name: &str) -> Option<jiff::tz::TimeZone> {
+    jiff::tz::TimeZone::get(name).ok()
+}
+
+fn next_cron_occurrence_after(
     cron: &croner::Cron,
-    cursor: &chrono::DateTime<Tz>,
-    now: &chrono::DateTime<Tz>,
-) -> Result<chrono::DateTime<Tz>, croner::errors::CronError> {
-    let anchor = if cursor < now { now } else { cursor };
+    cursor: &CronZoned,
+    now: &CronZoned,
+) -> Result<CronZoned, croner::errors::CronError> {
+    let anchor = if cursor.timestamp() < now.timestamp() {
+        now
+    } else {
+        cursor
+    };
     cron.find_next_occurrence(anchor, false)
 }
 
-fn cron_occurrence_is_overdue<Tz: chrono::TimeZone>(
+fn cron_occurrence_is_overdue(
     cron: &croner::Cron,
-    scheduled_at: &chrono::DateTime<Tz>,
-    now: &chrono::DateTime<Tz>,
+    scheduled_at: &CronZoned,
+    now: &CronZoned,
 ) -> Result<bool, croner::errors::CronError> {
     let next_after_scheduled = cron.find_next_occurrence(scheduled_at, false)?;
-    Ok(&next_after_scheduled <= now)
+    Ok(next_after_scheduled.timestamp() <= now.timestamp())
 }
 
 /// Time from `scheduled_at` to the next occurrence: the window in which the
 /// loop still runs a late `scheduled_at` (see [`cron_occurrence_is_overdue`]).
 /// Zero when no next occurrence exists.
-fn cron_occurrence_window<Tz: chrono::TimeZone>(
-    cron: &croner::Cron,
-    scheduled_at: &chrono::DateTime<Tz>,
-) -> std::time::Duration {
+fn cron_occurrence_window(cron: &croner::Cron, scheduled_at: &CronZoned) -> std::time::Duration {
     cron.find_next_occurrence(scheduled_at, false)
         .ok()
-        .and_then(|next| next.signed_duration_since(scheduled_at).to_std().ok())
+        .and_then(|next| {
+            std::time::Duration::try_from(next.timestamp().duration_since(scheduled_at.timestamp()))
+                .ok()
+        })
         .unwrap_or_default()
 }
 
@@ -11066,15 +11068,11 @@ fn cron_occurrence_window<Tz: chrono::TimeZone>(
 /// Note the caller must keep this in step with `tokio::time::sleep`: under a
 /// `#[sim_test]` both the injected clock and tokio's timer wheel are advanced
 /// together by `Sim::advance`, which is what keeps the loop from spinning.
-fn cron_sleep_duration_until<Tz: chrono::TimeZone>(
-    now: chrono::DateTime<chrono::Utc>,
-    scheduled_at: &chrono::DateTime<Tz>,
+fn cron_sleep_duration_until(
+    now: crate::time::Timestamp,
+    scheduled_at: &CronZoned,
 ) -> std::time::Duration {
-    scheduled_at
-        .with_timezone(&chrono::Utc)
-        .signed_duration_since(now)
-        .to_std()
-        .unwrap_or_default()
+    std::time::Duration::try_from(scheduled_at.timestamp().duration_since(now)).unwrap_or_default()
 }
 
 async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::AutumnResult<()> {
@@ -16362,7 +16360,7 @@ mod fleet_boot_tests {
         let rows = store.rows().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert!(
-            rows[0].lease_expires_ms <= state.clock().now().to_chrono().timestamp_millis(),
+            rows[0].lease_expires_ms <= state.clock().now().as_millisecond(),
             "released at shutdown"
         );
     }
@@ -16421,7 +16419,7 @@ mod fleet_boot_tests {
         runtime.ownership.expect("ownership runs").finish().await;
         let rows = store.rows().await.unwrap();
         assert!(
-            rows[0].lease_expires_ms <= state.clock().now().to_chrono().timestamp_millis(),
+            rows[0].lease_expires_ms <= state.clock().now().as_millisecond(),
             "released on the installed store"
         );
     }
@@ -16478,7 +16476,7 @@ mod fleet_boot_tests {
         let store = SqlSlotOwnership::new(state.pool().cloned().unwrap(), state.clock_arc());
         let rows = store.rows().await.unwrap();
         assert!(
-            rows[0].lease_expires_ms > state.clock().now().to_chrono().timestamp_millis(),
+            rows[0].lease_expires_ms > state.clock().now().as_millisecond(),
             "not released: the leases lapse"
         );
         shutdown.cancel();
@@ -17713,34 +17711,37 @@ mod tests {
     ///
     /// `format_next_task_run_after` runs at the top of every fixed-delay loop.
     /// While `now` came from real time its sum with an ordinary delay could not
-    /// overflow, but an injected clock is unbounded, and chrono's `Add` panics
-    /// rather than wrapping — so a `FixedClock` near `DateTime::MAX_UTC` would
+    /// overflow, but an injected clock is unbounded, and `Timestamp + delay`
+    /// panics rather than wrapping — so a `FixedClock` near `Timestamp::MAX` would
     /// take the task down before its first run, over a string for a log line.
     #[test]
     fn next_task_run_saturates_instead_of_panicking_at_the_end_of_time() {
-        let max = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+        let max = crate::time::Timestamp::MAX;
 
         // An ordinary delay that would carry `now` past the representable end.
         let rendered = super::format_next_task_run_after(max, std::time::Duration::from_secs(60));
         assert_eq!(
             rendered,
-            max.to_rfc3339(),
+            crate::time::compat::rfc3339(max),
             "a fixed delay past the end of time must clamp, not panic"
         );
 
-        // A delay too large for `TimeDelta` at all renders as the far future,
-        // not as `now` — the latter would read as "this task runs immediately".
+        // A delay too large for `SignedDuration` at all renders as the far
+        // future, not as `now` — the latter would read as "this task runs
+        // immediately".
         let absurd = super::format_next_task_run_after(
-            chrono::Utc::now(),
+            crate::time::Timestamp::UNIX_EPOCH,
             std::time::Duration::from_secs(u64::MAX),
         );
-        assert_eq!(absurd, max.to_rfc3339());
+        assert_eq!(absurd, crate::time::compat::rfc3339(max));
 
-        // The ordinary case is unchanged.
-        let epoch = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        // The ordinary case is unchanged, in the established `+00:00` form.
         assert_eq!(
-            super::format_next_task_run_after(epoch, std::time::Duration::from_secs(60)),
-            (epoch + chrono::TimeDelta::seconds(60)).to_rfc3339()
+            super::format_next_task_run_after(
+                crate::time::Timestamp::UNIX_EPOCH,
+                std::time::Duration::from_secs(60)
+            ),
+            "1970-01-01T00:01:00+00:00"
         );
     }
 
@@ -24826,9 +24827,7 @@ mount = ["service"]
     /// `1_700_000_000`, so the window check lets the occurrence run.
     fn cron_test_state() -> AppState {
         AppState::for_test().with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
-            chrono::DateTime::from_timestamp(1_700_000_001, 0)
-                .expect("a valid timestamp")
-                .to_jiff(),
+            crate::time::Timestamp::from_second(1_700_000_001).expect("a valid timestamp"),
         )))
     }
 
@@ -24945,17 +24944,126 @@ mount = ["service"]
         );
     }
 
+    fn cron_utc(y: i16, mo: i8, d: i8, h: i8, mi: i8, sec: i8) -> super::CronZoned {
+        super::CronZoned::new(
+            crate::time::civil::date(y, mo, d)
+                .at(h, mi, sec, 0)
+                .to_zoned_datetime(crate::time::tz::TimeZone::UTC)
+                .expect("a valid UTC date-time")
+                .timestamp(),
+            crate::time::tz::TimeZone::UTC,
+        )
+    }
+
+    fn cron_new_york(y: i16, mo: i8, d: i8, h: i8, mi: i8) -> super::CronZoned {
+        let tz = super::cron_time_zone("America/New_York").expect("bundled zone");
+        let ts = crate::time::civil::date(y, mo, d)
+            .at(h, mi, 0, 0)
+            .to_zoned_datetime(tz.clone())
+            .expect("an unambiguous New York wall clock time")
+            .timestamp();
+        super::CronZoned::new(ts, tz)
+    }
+
+    #[test]
+    fn cron_time_zone_reads_iana_names_and_rejects_unknown_ones() {
+        let tz = super::cron_time_zone("Europe/Paris").expect("bundled zone");
+        assert_eq!(tz.iana_name(), Some("Europe/Paris"));
+        assert_eq!(
+            super::cron_time_zone("UTC").and_then(|tz| tz.iana_name().map(str::to_owned)),
+            Some("UTC".to_owned())
+        );
+        assert!(super::cron_time_zone("Mars/Olympus_Mons").is_none());
+    }
+
+    // 2026-03-08 02:00 to 03:00 never happens in New York. A daily 02:30 job
+    // runs at the first instant after the gap, once, and the occurrence
+    // window spans to the next day's 02:30.
+    #[test]
+    fn cron_dst_gap_runs_a_fixed_time_job_right_after_the_gap() {
+        let cron = super::parse_cron_expression("30 2 * * *").expect("parse");
+        let cursor = cron_new_york(2026, 3, 7, 12, 0);
+        let next =
+            super::next_cron_occurrence_after(&cron, &cursor, &cursor).expect("next occurrence");
+        assert_eq!(
+            crate::time::compat::rfc3339(next.timestamp()),
+            "2026-03-08T07:00:00+00:00",
+            "03:00 EDT"
+        );
+        assert_eq!(
+            super::cron_occurrence_window(&cron, &next),
+            std::time::Duration::from_secs(23 * 3_600 + 30 * 60)
+        );
+        let after = super::next_cron_occurrence_after(&cron, &next, &next).expect("next");
+        assert_eq!(
+            crate::time::compat::rfc3339(after.timestamp()),
+            "2026-03-09T06:30:00+00:00",
+            "02:30 EDT the next day"
+        );
+    }
+
+    // 2026-11-01 01:00 to 02:00 happens twice in New York. A daily 01:30 job
+    // runs once, on the first pass; an hourly job runs on both.
+    #[test]
+    fn cron_dst_fold_runs_a_fixed_time_job_once() {
+        let daily = super::parse_cron_expression("30 1 * * *").expect("parse");
+        let cursor = cron_new_york(2026, 10, 31, 12, 0);
+        let next = super::next_cron_occurrence_after(&daily, &cursor, &cursor).expect("next");
+        assert_eq!(
+            crate::time::compat::rfc3339(next.timestamp()),
+            "2026-11-01T05:30:00+00:00",
+            "01:30 EDT"
+        );
+        let after = super::next_cron_occurrence_after(&daily, &next, &next).expect("next");
+        assert_eq!(
+            crate::time::compat::rfc3339(after.timestamp()),
+            "2026-11-02T06:30:00+00:00",
+            "01:30 EST the next day, not the repeated hour"
+        );
+
+        let hourly = super::parse_cron_expression("0 * * * *").expect("parse");
+        let start = cron_new_york(2026, 11, 1, 0, 30);
+        let mut ticks = Vec::new();
+        let mut cursor = start;
+        for _ in 0..3 {
+            cursor = super::next_cron_occurrence_after(&hourly, &cursor, &cursor).expect("next");
+            ticks.push(crate::time::compat::rfc3339(cursor.timestamp()));
+        }
+        assert_eq!(
+            ticks,
+            [
+                "2026-11-01T05:00:00+00:00",
+                "2026-11-01T06:00:00+00:00",
+                "2026-11-01T07:00:00+00:00",
+            ],
+            "01:00 EDT, 01:00 EST, 02:00 EST"
+        );
+    }
+
+    #[test]
+    fn cron_sleep_duration_saturates_at_zero_for_a_past_tick() {
+        let at = cron_utc(2026, 5, 5, 12, 0, 0);
+        let before =
+            crate::time::Timestamp::from_second(at.timestamp().as_second() - 90).expect("in range");
+        let after =
+            crate::time::Timestamp::from_second(at.timestamp().as_second() + 1).expect("in range");
+        assert_eq!(
+            super::cron_sleep_duration_until(before, &at),
+            std::time::Duration::from_secs(90)
+        );
+        assert_eq!(
+            super::cron_sleep_duration_until(after, &at),
+            std::time::Duration::ZERO
+        );
+    }
+
     // croner 4 made shorthand steps (`5/5`) opt-in; the scheduler keeps
     // accepting what croner 3 accepted, with the same meaning.
     #[test]
     fn cron_expressions_keep_accepting_shorthand_steps() {
-        use chrono::TimeZone as _;
-
         let shorthand = super::parse_cron_expression("5/5 * * * *").expect("shorthand step");
         let explicit = super::parse_cron_expression("5-59/5 * * * *").expect("explicit range");
-        let now = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 5, 5, 12, 6, 0)
-            .unwrap();
+        let now = cron_utc(2026, 5, 5, 12, 6, 0);
         let next = shorthand
             .find_next_occurrence(&now, false)
             .expect("next occurrence");
@@ -24965,57 +25073,35 @@ mount = ["service"]
                 .find_next_occurrence(&now, false)
                 .expect("next occurrence")
         );
-        assert_eq!(
-            next,
-            chrono_tz::UTC
-                .with_ymd_and_hms(2026, 5, 5, 12, 10, 0)
-                .unwrap()
-        );
+        assert_eq!(next, cron_utc(2026, 5, 5, 12, 10, 0));
         assert!(super::parse_cron_expression("not a cron").is_err());
     }
 
     #[test]
     fn next_cron_occurrence_skips_overdue_slots() {
-        use chrono::TimeZone as _;
-
         let cron = "0 * * * * *"
             .parse::<croner::Cron>()
             .expect("cron expression should parse");
-        let stale_cursor = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 5, 5, 12, 0, 0)
-            .unwrap();
-        let now = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 5, 5, 12, 30, 5)
-            .unwrap();
+        let stale_cursor = cron_utc(2026, 5, 5, 12, 0, 0);
+        let now = cron_utc(2026, 5, 5, 12, 30, 5);
         let next = super::next_cron_occurrence_after(&cron, &stale_cursor, &now)
             .expect("next cron occurrence should resolve");
 
-        assert_eq!(
-            next,
-            chrono_tz::UTC
-                .with_ymd_and_hms(2026, 5, 5, 12, 31, 0)
-                .unwrap()
-        );
+        assert_eq!(next, cron_utc(2026, 5, 5, 12, 31, 0));
     }
 
     // Issue #3052: a late cron occurrence still runs until the next one, so
     // the claim must hold for that whole window.
     #[test]
     fn cron_occurrence_window_spans_to_the_next_occurrence() {
-        use chrono::TimeZone as _;
-
         let daily = "0 0 3 * * *".parse::<croner::Cron>().expect("parse");
-        let at = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 5, 5, 3, 0, 0)
-            .unwrap();
+        let at = cron_utc(2026, 5, 5, 3, 0, 0);
         assert_eq!(
             super::cron_occurrence_window(&daily, &at),
             std::time::Duration::from_hours(24)
         );
         let every_ten = "*/10 * * * * *".parse::<croner::Cron>().expect("parse");
-        let at = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 5, 5, 3, 0, 10)
-            .unwrap();
+        let at = cron_utc(2026, 5, 5, 3, 0, 10);
         assert_eq!(
             super::cron_occurrence_window(&every_ten, &at),
             std::time::Duration::from_secs(10)
@@ -25056,20 +25142,12 @@ mount = ["service"]
 
     #[test]
     fn cron_occurrence_is_overdue_after_later_slot_passed() {
-        use chrono::TimeZone as _;
-
         let cron = "0 * * * * *"
             .parse::<croner::Cron>()
             .expect("cron expression should parse");
-        let scheduled_at = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 5, 5, 12, 1, 0)
-            .unwrap();
-        let slightly_late = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 5, 5, 12, 1, 5)
-            .unwrap();
-        let after_later_slot = chrono_tz::UTC
-            .with_ymd_and_hms(2026, 5, 5, 12, 30, 5)
-            .unwrap();
+        let scheduled_at = cron_utc(2026, 5, 5, 12, 1, 0);
+        let slightly_late = cron_utc(2026, 5, 5, 12, 1, 5);
+        let after_later_slot = cron_utc(2026, 5, 5, 12, 30, 5);
 
         assert!(
             !super::cron_occurrence_is_overdue(&cron, &scheduled_at, &slightly_late)
