@@ -761,7 +761,7 @@ your code referred to Diesel's traits:
 autumn-web = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
-diesel-async = { version = "0.9", features = ["postgres"] }
+diesel-async = { version = "0.10", features = ["postgres"] }
 serde = { version = "1", features = ["derive"] }
 ```
 

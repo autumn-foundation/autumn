@@ -1801,10 +1801,10 @@ axum = { version = "0.8", features = ["macros", "http2"] }
 tokio-util = "0.7"
 diesel = { version = "2", features = ["sqlite", "postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
-diesel-async = { version = "0.8", features = ["deadpool", "postgres"] }
+diesel-async = { version = "0.10", features = ["deadpool", "async-connection-wrapper"] }
 diesel_migrations = "2"
 http = "1"
-libsqlite3-sys = { version = "0.36", features = ["bundled"] }
+libsqlite3-sys = { version = "0.40", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }

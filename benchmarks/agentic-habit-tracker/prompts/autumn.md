@@ -34,7 +34,7 @@ Diesel/`diesel-async` (Postgres), and Maud for HTML.
   # Or use an absolute path from `git rev-parse --show-toplevel`, or `autumn-web = "0.11"`.
   autumn-web = { path = "../../../../../autumn", features = ["seed"] }
   diesel = { version = "2", features = ["postgres", "chrono"] }
-  diesel-async = { version = "0.9", features = ["postgres"] }
+  diesel-async = { version = "0.10", features = ["postgres"] }
   diesel_migrations = "2"
   maud = { version = "0.27", features = ["axum"] }
   serde = { version = "1", features = ["derive"] }
