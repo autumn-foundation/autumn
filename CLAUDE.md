@@ -1,5 +1,13 @@
 # CLAUDE.md - Autumn Workspace Guidelines
 
+## Base branch
+
+**Every PR targets `trunk-dev`.** Only the release PR, `trunk-dev` → `trunk`,
+targets `trunk`. A feature branch merged into `trunk` lands there as one
+squash commit that git cannot match to the `trunk-dev` commits it copies, so
+the next release PR conflicts on every file both sides touched (#3705 gave
+#3754 116 conflicts). The `Base branch` workflow fails such a PR.
+
 ## Versioning
 
 **Never bump the workspace version** (`version` under `[workspace.package]` in

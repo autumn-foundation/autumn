@@ -644,6 +644,56 @@ fn webauthn_docs_do_not_require_openssl() {
     }
 }
 
+/// A feature PR merged into `trunk` instead of `trunk-dev` lands there as one
+/// squash commit, and the next release PR conflicts on every file it touched:
+/// #3705 gave the 0.11.0 release PR 116 conflicting files. The rule is written
+/// where agents read it, and a workflow fails such a PR.
+#[test]
+fn pull_requests_target_trunk_dev() {
+    let root = workspace_root();
+
+    for path in ["CLAUDE.md", "AGENTS.md"] {
+        let doc = std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|err| panic!("read {path}: {err}"));
+        assert!(
+            doc.contains("**Every PR targets `trunk-dev`.**"),
+            "{path} must tell an agent that every PR targets trunk-dev",
+        );
+    }
+
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/base-branch.yml"))
+        .expect("read .github/workflows/base-branch.yml");
+    assert!(
+        workflow.contains("run: bash scripts/check-base-branch.sh"),
+        "base-branch.yml must run the base-branch gate",
+    );
+    // A `branches:` filter would stop the check from re-running when a PR's
+    // base moves from `trunk` to `trunk-dev`, leaving the old failure on it.
+    assert!(
+        !workflow.contains("branches:"),
+        "base-branch.yml must run on every PR, not only PRs into trunk",
+    );
+    for event in ["edited", "labeled", "unlabeled"] {
+        assert!(
+            workflow.contains(event),
+            "base-branch.yml must re-run on `{event}`",
+        );
+    }
+
+    let output = bash_command()
+        .arg("scripts/check-base-branch.sh")
+        .arg("--self-test")
+        .current_dir(&root)
+        .output()
+        .expect("run scripts/check-base-branch.sh --self-test");
+    assert!(
+        output.status.success(),
+        "check-base-branch.sh --self-test failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 /// A release note belongs in its own file under `changelog.d/`, never at the
 /// top of the `## [Unreleased]` section — the lines every other open PR also
 /// edits. The rule only holds while the gate runs and the instruction files
