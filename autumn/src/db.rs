@@ -35,11 +35,6 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::JiffBridge as _;
 use axum::extract::FromRequestParts;
 use diesel;
 // Named by the Postgres pool builder, TLS connector and migration connection.
@@ -148,6 +143,12 @@ pub mod prelude {
 /// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]
 pub mod sqlite_types;
+
+pub mod sql_time;
+pub use sql_time::{
+    AsSqlTime, SqlDate, SqlDateTime, SqlNullableDate, SqlNullableDateTime, SqlNullableTime,
+    SqlNullableTimestamp, SqlTime, SqlTimestamp,
+};
 
 // ── After-commit callback infrastructure ─────────────────────────────────────
 
@@ -4707,7 +4708,7 @@ mod tests {
         })
         .expect("sqlite pool builds")
         .expect("url configured");
-        let clock = crate::time::TickingClock::starting_at(chrono::DateTime::UNIX_EPOCH.to_jiff());
+        let clock = crate::time::TickingClock::starting_at(jiff::Timestamp::UNIX_EPOCH);
         let logs = LogBuffer::new(16, ParameterFilter::default());
         let subscriber = tracing_subscriber::registry().with(LogCaptureLayer::new(logs.clone()));
         let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
