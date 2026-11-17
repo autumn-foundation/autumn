@@ -1093,22 +1093,6 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         rewrite: Rewrite::GuideOnly,
     },
     AppMigration {
-        id: "0.11.0-contracts-export-refuses-unknown-type",
-        version: "0.11.0",
-        title: "Wire contracts: the export refuses a field type it cannot compare",
-        confidence: Confidence::Manual,
-        guide: "docs/migrations/0.11.0.md#wire-contracts-the-export-refuses-a-field-type-it-cannot-compare",
-        rewrite: Rewrite::GuideOnly,
-    },
-    AppMigration {
-        id: "0.11.0-contracts-bundle-format-4",
-        version: "0.11.0",
-        title: "Wire contracts: bundle format 4",
-        confidence: Confidence::Manual,
-        guide: "docs/migrations/0.11.0.md#wire-contracts-bundle-format-4",
-        rewrite: Rewrite::GuideOnly,
-    },
-    AppMigration {
         id: "0.11.0-database-config-roles",
         version: "0.11.0",
         title: "Database: `DatabaseConfig` has a `roles` field",
@@ -1138,14 +1122,6 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         title: "Fleet: `max_open_policy` adds a field and an error",
         confidence: Confidence::Manual,
         guide: "docs/migrations/0.11.0.md#fleet-max_open_policy-adds-a-field-and-an-error",
-        rewrite: Rewrite::GuideOnly,
-    },
-    AppMigration {
-        id: "0.11.0-fleet-ship-mode-continuous",
-        version: "0.11.0",
-        title: "Fleet: `ShipMode::Continuous` carries a shipper",
-        confidence: Confidence::Manual,
-        guide: "docs/migrations/0.11.0.md#fleet-shipmodecontinuous-carries-a-shipper",
         rewrite: Rewrite::GuideOnly,
     },
     AppMigration {

@@ -159,7 +159,7 @@ Two behaviours differ, both deliberate:
 | `Error: Address already in use` | Port 3000 is taken. Set `AUTUMN_SERVER__PORT=3001 autumn dev` or kill the existing process. |
 | `Error: connection refused` | Database is not running. Start Postgres first. |
 | Compile error shown in terminal | Fix the Rust error; `autumn dev` will retry on next save. |
-| `autumn setup` not found | Run `cargo install autumn-cli --version 0.5.0` |
+| `autumn setup` not found | Run `cargo install autumn-cli --version 0.11.0` |
 | On Windows: `autumn deploy up` refuses with "Tier 2 (WSL2)" | Working as designed (trunk-dev, issue #1616) — it reaches a host over `ssh` and stages secrets with Unix file modes. Run it from a WSL2 shell; see `docs/guide/platform-support.md`. `autumn serve --daemon` is **no longer** in that set (issue #1639) — it runs natively. |
 | On Windows: `autumn serve install-service` fails with an access error | It registers an OS service, so it needs an elevated (Administrator) shell. `autumn doctor`'s `daemon_service` check says so before you hit it. |
 

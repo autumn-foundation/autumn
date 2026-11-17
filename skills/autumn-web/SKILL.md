@@ -243,7 +243,7 @@ edition = "2024"
 autumn-web = { version = "0.11", features = ["db", "htmx", "maud"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
-diesel-async = { version = "0.8", features = ["postgres"] }
+diesel-async = { version = "0.10", features = ["postgres"] }
 diesel_migrations = "2"
 maud = { version = "0.27", features = ["axum"] }
 serde = { version = "1", features = ["derive"] }

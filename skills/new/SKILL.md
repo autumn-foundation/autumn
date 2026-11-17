@@ -147,5 +147,5 @@ Notes:
 ## If autumn-cli is not installed
 
 ```bash
-cargo install autumn-cli --version 0.5.0
+cargo install autumn-cli --version 0.11.0
 ```

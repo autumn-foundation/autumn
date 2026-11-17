@@ -25,26 +25,11 @@ For a narrative tour of this release, see the
   code changes
   ([migration guide](docs/migrations/0.11.0.md#dependencies-diesel-async-010-and-libsqlite3-sys-040)).
 
-- **Breaking:** `autumn contracts export` writes bundle format 4, which an
-  older CLI refuses. This CLI reads formats 1 to 4
-  ([migration guide](docs/migrations/0.11.0.md)).
-
-- **Breaking:** `autumn contracts export` stops on a field whose type has no
-  `WireShape` descriptor and is not a known leaf, such as an enum. Mark the
-  field `#[wire(opaque)]`. The export writes bundle format 3, which an older
-  CLI refuses ([migration guide](docs/migrations/0.11.0.md)).
-
 - **Breaking:** `[tenancy] source` defaults to `"session"`, not `"header"`.
   `source = "header"` needs `header_trust = "trusted_proxy"` or
   `"any_client"`, or the app does not start. `TenancyConfig` has a new
   `header_trust` field
   ([migration guide](docs/migrations/0.11.0.md#tenancy-the-tenant-header-needs-header_trust)).
-
-- **Breaking:** `ShipMode::Continuous` carries an `Arc<dyn
-  ContinuousShipper>`, and `ShipMode` is no longer `Copy`, `PartialEq` or
-  `Eq`. Match with `ShipMode::Continuous(_)`. `ContinuousShipper` is sealed:
-  a plugin engine returns `ShipMode::Generations { every }`
-  ([migration guide](docs/migrations/0.11.0.md)).
 
 - **Breaking:** `autumn_edge::wire::SENSITIVE_HEADERS` and
   `strip_sensitive_headers` are removed. Use `ALLOWED_REQUEST_HEADERS`,
@@ -79,9 +64,10 @@ For a narrative tour of this release, see the
 
 - **Breaking:** `#[event]` refuses a payload whose wire shape it cannot read:
   generics, enums, tuple structs, `#[serde(flatten)]` and the other shapes
-  `#[derive(WireShape)]` refuses. Write `#[event(opaque)]` to keep such a
+  `#[derive(WireShape)]` refuses, and a field behind `#[cfg(…)]` or a
+  `#[cfg_attr(…, serde(…))]`. Write `#[event(opaque)]` to keep such a
   payload without a contract. An `#[event]` type that also derives
-  `WireShape` must drop that derive. A `#[listener]` that reads a
+  `WireShape` must drop that derive. A `#[listener]` that reads a `skip`,
   `skip_serializing` or `skip_deserializing` field now fails to build
   ([migration guide](docs/migrations/0.11.0.md)).
 
@@ -152,7 +138,10 @@ For a narrative tour of this release, see the
   reported in both deploy windows. `any` is not compared.
 
 - **wire contracts:** `#[wire(opaque)]` on a `WireShape` field compares it by
-  type name only.
+  type name only. `autumn contracts export` stops on a field whose type has
+  no `WireShape` descriptor and is not a known leaf, such as an enum: mark
+  the field `#[wire(opaque)]`. The bundle is format 4. This CLI reads
+  formats 1 to 4.
 - **wire contracts:** `autumn contracts export --from <dir>` joins a directory
   of descriptors. No build runs.
 
@@ -189,6 +178,9 @@ For a narrative tour of this release, see the
   previous generation. A missing database restores from the newest
   generation. The tombstone rules apply as for `SQLite`. `ShipMode::Rebuild`
   ships nothing: `restore_latest` calls the new `FleetEngine::rebuild`.
+  `ShipMode::Continuous` carries a sealed `ContinuousShipper` that only
+  `SqliteEngine` uses, so `ShipMode` is not `Copy` or `PartialEq`: match it
+  with `matches!`.
 - **db:** core checks the fence before each write to a fleet replica, in
   every ship mode (`replication::FencedDestination`). A newer epoch marker
   refuses the write (`FleetError::Fenced`, `421`;
