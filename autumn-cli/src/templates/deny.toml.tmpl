@@ -148,6 +148,11 @@ ignore = [
 # multiple-versions = "allow"
 # deny = [
 #     # { crate = "openssl", reason = "this app uses rustls" },
+#     # Autumn's time types are jiff (autumn_web::time). These two keep chrono
+#     # from coming back through a feature such as diesel's `chrono`. Leave
+#     # them out if the app uses chrono on purpose.
+#     # { crate = "chrono", reason = "time types come from autumn_web::time (jiff)" },
+#     # { crate = "chrono-tz", reason = "time zones come from autumn_web::time::tz (jiff)" },
 # ]
 
 # ── Sources (optional) ──────────────────────────────────────────────────────

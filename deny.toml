@@ -139,6 +139,13 @@ ignore = true
 # local `cargo deny check bans` runs rather than fighting the tree.
 multiple-versions = "warn"
 wildcards = "allow"
+# Autumn's time types are jiff. chrono and chrono-tz must not come back through
+# a feature: diesel's `chrono`, croner's default features and chrono-tz each
+# pull chrono into every app built on Autumn.
+deny = [
+    { crate = "chrono", reason = "Autumn's time types are jiff; use autumn_web::time" },
+    { crate = "chrono-tz", reason = "Autumn's time zones are jiff::tz; use autumn_web::time::tz" },
+]
 
 [sources]
 # All dependencies come from crates.io; there are no git sources. BLOCKING.
