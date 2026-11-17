@@ -65,6 +65,17 @@ changes — see CLAUDE.md "CI test sharding" for the two cases that do matter
 (renaming a `compile_fail.rs` test function, and what branch protection should
 require).
 
+## Base branch
+
+**Every PR targets `trunk-dev`.** Only the release PR, `trunk-dev` → `trunk`,
+targets `trunk`. A feature branch merged into `trunk` lands there as one
+squash commit that git cannot match to the `trunk-dev` commits it copies, so
+the next release PR conflicts on every file both sides touched. The
+`Base branch` workflow (`scripts/check-base-branch.sh`) fails such a PR; it
+blocks the merge only while a ruleset on `trunk` requires that check. A real
+hotfix into `trunk` carries the `trunk-hotfix` label and is ported to
+`trunk-dev` too.
+
 ## Changelog notes
 
 A release note does **not** go into `CHANGELOG.md`. It goes into its own file:

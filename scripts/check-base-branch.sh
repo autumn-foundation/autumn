@@ -23,7 +23,8 @@
 # Environment (set by .github/workflows/base-branch.yml):
 #   BASE_REF    the PR's base branch
 #   HEAD_REF    the PR's head branch
-#   HEAD_REPO   owner/name of the head repository
+#   HEAD_REPO   owner/name of the head repository (empty when the head fork
+#               was deleted)
 #   BASE_REPO   owner/name of the base repository
 #   LABELS      the PR's labels, comma-separated
 
@@ -66,6 +67,8 @@ self_test() {
     "hotfix label|trunk|fix/urgent|o/r|o/r|bug,trunk-hotfix|0"
     "label name is matched whole|trunk|fix/urgent|o/r|o/r|trunk-hotfix-later|1"
     "base other than trunk|release/0.11|claude/x|o/r|o/r||0"
+    "deleted fork into trunk-dev|trunk-dev|x||o/r||0"
+    "deleted fork into trunk|trunk|trunk-dev||o/r||1"
   )
   local entry name base head head_repo base_repo labels expected got
   for entry in "${cases[@]}"; do
@@ -89,9 +92,8 @@ case "${1:-}" in
   "")
     : "${BASE_REF:?BASE_REF is not set}"
     : "${HEAD_REF:?HEAD_REF is not set}"
-    : "${HEAD_REPO:?HEAD_REPO is not set}"
     : "${BASE_REPO:?BASE_REPO is not set}"
-    decide "$BASE_REF" "$HEAD_REF" "$HEAD_REPO" "$BASE_REPO" "${LABELS:-}"
+    decide "$BASE_REF" "$HEAD_REF" "${HEAD_REPO:-}" "$BASE_REPO" "${LABELS:-}"
     ;;
   *)
     echo "usage: scripts/check-base-branch.sh [--self-test]" >&2

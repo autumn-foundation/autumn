@@ -652,7 +652,7 @@ fn webauthn_docs_do_not_require_openssl() {
 fn pull_requests_target_trunk_dev() {
     let root = workspace_root();
 
-    for path in ["CLAUDE.md", "AGENTS.md"] {
+    for path in ["CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md"] {
         let doc = std::fs::read_to_string(root.join(path))
             .unwrap_or_else(|err| panic!("read {path}: {err}"));
         assert!(
@@ -673,9 +673,19 @@ fn pull_requests_target_trunk_dev() {
         !workflow.contains("branches:"),
         "base-branch.yml must run on every PR, not only PRs into trunk",
     );
+    // Whole list items: `labeled` is also a substring of `unlabeled`.
+    let types: Vec<&str> = workflow
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("types:"))
+        .and_then(|rest| rest.trim().strip_prefix('[')?.strip_suffix(']'))
+        .expect("base-branch.yml must list its pull_request types")
+        .split(',')
+        .map(str::trim)
+        .collect();
     for event in ["edited", "labeled", "unlabeled"] {
         assert!(
-            workflow.contains(event),
+            types.contains(&event),
             "base-branch.yml must re-run on `{event}`",
         );
     }

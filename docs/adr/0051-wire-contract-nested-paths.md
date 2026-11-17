@@ -33,7 +33,10 @@ Option 1.
 - The macros record a read as a dotted path. A field access, a binding of a
   field, a struct pattern, a value adapter (`.unwrap()`, `.as_ref()`) and a
   value callback (`.map(|d| d.color)`) extend the path. A `let`, an
-  `if let` or a `match` inside a macro body binds its own names.
+  `if let` or a `match` inside a macro body binds its own names. Inside a
+  macro body only an `x`, `Some(x)` or `Ok(x)` binding holds the value: a
+  struct pattern or a closure parameter stops the path at its parent, so
+  `html! { (item.details.as_ref().map(|d| d.color)) }` reads `details` only.
 - Each parent path stays in the set: `details.color` also reads `details`.
   A nested struct literal in a request records its fields as dotted paths,
   and the parent stays in the write-set: `details` and `details.color`.
@@ -67,9 +70,14 @@ flowchart LR
 - A nested field that a call site sets, and the callee drops, is a break.
 - An older CLI reads a bundle from this CLI. It compares the top-level
   fields only, as before.
-- A read through another function stops at the field before it. Reads
-  through an index, a loop, a typed maud binding and a `match` arm keep the
-  nested path (issue #3717).
+- Another method call (`.first()`, `.iter().map(..)`) or a read through
+  another function stops the path at the field before it.
+- A loop or an index over a nested list keeps the path:
+  `item.lines[0].price` reads `lines.price`. A loop or an index over the
+  whole response reads none of its fields.
+- A typed maud binding, a `match` in a macro body and a maud `@match` keep
+  the path (#3737, issue #3717). In a macro body, only an `x`, `Some(x)` or
+  `Ok(x)` binding holds the value, also with `&`, `ref` or `mut`.
 
 ## History
 

@@ -6,7 +6,8 @@
 targets `trunk`. A feature branch merged into `trunk` lands there as one
 squash commit that git cannot match to the `trunk-dev` commits it copies, so
 the next release PR conflicts on every file both sides touched (#3705 gave
-#3754 116 conflicts). The `Base branch` workflow fails such a PR.
+#3754 116 conflicts). The `Base branch` workflow fails such a PR. It blocks
+the merge only while a ruleset on `trunk` requires the `Base branch` check.
 
 ## Versioning
 
