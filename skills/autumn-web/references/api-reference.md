@@ -1,13 +1,14 @@
-# autumn-web API Reference (0.10.0)
+# autumn-web API Reference (0.11.0)
 
 Use this file as a quick map for public names, features, dependency versions,
 and config keys. Verify against current source when exact code matters.
 
-Version identity: this reference tracks **0.10.0**, the current release line,
+Version identity: this reference tracks **0.11.0**, the current release line,
 which is also the version `trunk-dev` carries. Entries carry the release they
 arrived in: **(0.6.0)** is absent from 0.5.x, **(0.7.0)** is absent from 0.6.x and
 earlier, **(0.8.0)** is absent from 0.7.x and earlier, **(0.9.0)** is absent
-from 0.8.x and earlier, and **(0.10.0)** is absent from 0.9.x and earlier.
+from 0.8.x and earlier, **(0.10.0)** is absent from 0.9.x and earlier, and
+**(0.11.0)** is absent from 0.10.x and earlier.
 Unmarked entries predate 0.6.0.
 
 ## Published crates
@@ -30,7 +31,7 @@ Unmarked entries predate 0.6.0.
 | `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
-together at `0.10.0`. This table lists the same crates, in the same order, as
+together at `0.11.0`. This table lists the same crates, in the same order, as
 `CRATES` in `scripts/check-publish-dry-run.sh` — that script is the executable
 copy of the publish order.
 
@@ -492,7 +493,7 @@ use autumn_web::commentable::{Comment, CommentNode, ThreadPage};
 async fn add_comment(&self, parent_id: i64, author_id: i64, body: &str,
                      reply_to: Option<i64>) -> AutumnResult<Comment>;
 async fn comment_thread(&self, parent_id: i64) -> AutumnResult<Vec<CommentNode>>;
-// One page of top-level comments and all their replies (#3325).
+// One page of top-level comments and all their replies (0.11.0, #3325).
 async fn comment_thread_page(&self, parent_id: i64, after: Option<i64>,
                              page_size: usize) -> AutumnResult<ThreadPage>;
 // The page that shows `comment_id`.
@@ -700,7 +701,7 @@ delete actions remain last-write-wins.
   (up to `n`, default 1). It returns the first output and drops the rest.
   `allow` is asked before each extra copy; return `false` (for example from a
   retry budget) to stop hedging. Only hedge calls that are safe to run twice.
-- `hedge::adaptive::AdaptiveHedge::new(initial)` learns the delay instead:
+- (0.11.0) `hedge::adaptive::AdaptiveHedge::new(initial)` learns the delay instead:
   `hedge.run(allow, |attempt| fut)` hedges at the p95 of the last 256 calls
   (`with_quantile`, `with_window`, `with_warm_up`, `with_bounds(floor,
   ceiling)`, `with_max_hedges`), using `initial` until 20 samples are in.
@@ -1541,7 +1542,7 @@ double-submits and replays.
 | `declare_plugin_routes(...)` | Plugin route declarations |
 | `plugin_assets(&'static PluginAssets)` | Serve a plugin's compiled-in assets under `/static/_plugins/<ns>/`: hashed URL `immutable`, plain URL `must-revalidate`, ETag/304/Range, routes declared public. Build the bundle with `plugin_assets!("ns")` (embeds `assets/`, `embed-assets`) or `PluginAssets::from_files(ns, &[(path, bytes)])`; emit tags with `ASSETS.script_tag(path)` / `deferred_script_tag` / `stylesheet_tag` (hashed URL + `integrity`). A second, different bundle with the same namespace panics. Guide: `docs/guide/plugin-assets.md` |
 | `on_startup(...)`, `on_shutdown(...)` | Lifecycle hooks. Every role runs them: use `background_task` for a loop |
-| `background_task(name, capability, run)`, `background(BackgroundTask)` | A loop that runs until shutdown, only on the roles that run `capability` (a `Capability` or a `PluginCapability`). `BackgroundTask::queues` and `::explicit` add queues and the plugin switch. Listed in `/actuator/tasks` and `autumn graph` (#3545) |
+| `background_task(name, capability, run)`, `background(BackgroundTask)` | (0.11.0, #3545) A loop that runs until shutdown, only on the roles that run `capability` (a `Capability` or a `PluginCapability`). `BackgroundTask::queues` and `::explicit` add queues and the plugin switch. Listed in `/actuator/tasks` and `autumn graph` (#3545) |
 | `plugin_capability(PluginCapability)` | Declare a plugin capability that no task uses, so `[roles.<name>] capabilities` can name it |
 | `with_extension(value)`, `update_extension(...)`, `extension<T>()` | Typed state extensions |
 | `i18n(bundle)`, `i18n_auto()` | I18n bundle setup |
@@ -1732,14 +1733,14 @@ storage = ["diesel?/serde_json"]
 mail = ["dep:lettre", "maud"]
 seed = ["db"]
 system-info = []
-error-reporting = []            # panic catch + ErrorReporter (in `default`)
+error-reporting = []            # panic catch + ErrorReporter (in `default`; 0.11.0)
 reporting = ["error-reporting"]  # adds failure capture and `autumn replay` (in `default`)
 webauthn = ["dep:webauthn-rs"]
 csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
 ```
 
-`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.10"`.
+`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.11"`.
 
 ## Generated UI (`autumn_web::constela`, feature `constela`)
 
