@@ -18,7 +18,10 @@
 //!
 //! let price: Decimal = "1234.5".parse().unwrap();
 //! let posted_at = Utc.with_ymd_and_hms(2026, 1, 1, 11, 58, 0).unwrap();
-//! let now = FixedClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap()).now();
+//! # use autumn_web::time::bridge::ChronoBridge as _;
+//! let now = FixedClock::at("2026-01-01T12:00:00Z".parse().unwrap())
+//!     .now()
+//!     .to_chrono();
 //!
 //! let markup = html! {
 //!     (number_to_currency(price))
@@ -31,6 +34,11 @@
 //! assert_eq!(markup.into_string(), "$1,234.50 — 3 comments — 2 minutes ago");
 //! ```
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
@@ -766,9 +774,9 @@ mod tests {
     fn time_ago_seconds() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 30).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now);
+        let clock = FixedClock::at(now.to_jiff());
         assert_eq!(
-            time_ago_in_words(dt, clock.now()).into_string(),
+            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
             "30 seconds ago"
         );
     }
@@ -777,9 +785,9 @@ mod tests {
     fn time_ago_one_minute_is_singular() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 1, 0).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now);
+        let clock = FixedClock::at(now.to_jiff());
         assert_eq!(
-            time_ago_in_words(dt, clock.now()).into_string(),
+            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
             "1 minute ago"
         );
     }
@@ -788,9 +796,9 @@ mod tests {
     fn time_ago_minutes() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 3, 0).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now);
+        let clock = FixedClock::at(now.to_jiff());
         assert_eq!(
-            time_ago_in_words(dt, clock.now()).into_string(),
+            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
             "3 minutes ago"
         );
     }
@@ -799,9 +807,9 @@ mod tests {
     fn time_ago_hours() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 14, 0, 0).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now);
+        let clock = FixedClock::at(now.to_jiff());
         assert_eq!(
-            time_ago_in_words(dt, clock.now()).into_string(),
+            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
             "2 hours ago"
         );
     }
@@ -810,9 +818,9 @@ mod tests {
     fn time_ago_days() {
         let now = Utc.with_ymd_and_hms(2026, 1, 3, 12, 0, 0).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now);
+        let clock = FixedClock::at(now.to_jiff());
         assert_eq!(
-            time_ago_in_words(dt, clock.now()).into_string(),
+            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
             "2 days ago"
         );
     }
@@ -821,9 +829,9 @@ mod tests {
     fn time_ago_future() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
         let dt = Utc.with_ymd_and_hms(2026, 1, 3, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now);
+        let clock = FixedClock::at(now.to_jiff());
         assert_eq!(
-            time_ago_in_words(dt, clock.now()).into_string(),
+            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
             "in 2 days"
         );
     }

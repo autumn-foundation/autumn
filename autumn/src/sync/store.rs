@@ -18,6 +18,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -214,7 +219,7 @@ fn replace_pending(
     .bind::<Nullable<Text>, _>(payload)
     .bind::<BigInt, _>(base_version)
     .bind::<Text, _>(updated_at)
-    .bind::<Text, _>(crate::time::ambient_now().to_rfc3339())
+    .bind::<Text, _>(crate::time::ambient_now().to_chrono().to_rfc3339())
     .execute(conn)
     .map(|_| ())
 }
@@ -543,7 +548,7 @@ impl SyncStore {
         op: Op,
         payload: Option<&str>,
     ) -> Result<(), SyncError> {
-        let now = crate::time::ambient_now().to_rfc3339();
+        let now = crate::time::ambient_now().to_chrono().to_rfc3339();
         let op_name = match op {
             Op::Upsert => "upsert",
             Op::Delete => "delete",

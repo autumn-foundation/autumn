@@ -15,6 +15,11 @@
 //! cargo test -p autumn-web --test integration_tests -- --ignored replication_s3
 //! ```
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,8 +211,8 @@ impl StepClock {
 }
 
 impl ClockSource for StepClock {
-    fn now(&self) -> DateTime<Utc> {
-        *self.0.lock().expect("clock")
+    fn now(&self) -> autumn_web::time::Timestamp {
+        self.0.lock().expect("clock").to_jiff()
     }
 }
 

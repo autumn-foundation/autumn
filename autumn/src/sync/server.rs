@@ -41,6 +41,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -304,7 +309,7 @@ fn gc_tombstone_row(change: &Change, version: Version) -> RemoteRow {
         payload: None,
         version,
         deleted: true,
-        updated_at: crate::time::ambient_now(),
+        updated_at: crate::time::ambient_now().to_chrono(),
         device_id: String::new(),
     }
 }
@@ -731,7 +736,7 @@ impl SyncBackend for MemorySyncBackend {
                 dedup_key,
                 AppliedRecord {
                     version,
-                    applied_at: crate::time::ambient_now(),
+                    applied_at: crate::time::ambient_now().to_chrono(),
                     resolved_row,
                 },
             );

@@ -9,6 +9,11 @@
 //! pinned virtual epoch (and epoch + an advance), proving the timestamp is
 //! virtual rather than wall-clock.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::ChronoBridge as _;
 use std::time::Duration;
 
 use autumn_web::app::AppBuilder;
@@ -53,7 +58,7 @@ impl Plugin for ClockProbeJobPlugin {
 /// Reads the injected (virtual) wall clock, so the test can prove it advanced.
 #[get("/now")]
 async fn now_route(clock: Clock) -> String {
-    clock.now().to_rfc3339()
+    clock.now().to_chrono().to_rfc3339()
 }
 
 /// Returns `(enqueued_at, finished_at)` (RFC3339, seconds, `Z`) for the newest

@@ -23,6 +23,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 
@@ -1802,6 +1807,7 @@ fn lock_deadline_bound_ms(in_flight_ttl: Duration) -> i64 {
         in_flight_ttl
     };
     crate::time::ambient_now()
+        .to_chrono()
         .timestamp_millis()
         .saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX))
 }

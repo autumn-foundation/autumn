@@ -9,6 +9,11 @@ use autumn_billing::{PortalRequest, ProviderId, SubscriptionStatus};
 use autumn_web::tenancy::with_tenant;
 use autumn_web::test::TestApp;
 use autumn_web::time::FixedClock;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::{Value, json};
 
@@ -23,7 +28,7 @@ fn now() -> DateTime<Utc> {
 }
 
 fn pinned(app: TestApp) -> TestApp {
-    app.with_clock(FixedClock::at(now()))
+    app.with_clock(FixedClock::at(now().to_jiff()))
 }
 
 fn build() -> Harness {

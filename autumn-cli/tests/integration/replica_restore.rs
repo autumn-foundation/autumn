@@ -22,6 +22,11 @@
 //! ordinary test lane; `offsite_backup.rs` covers the CLI's S3 transport against
 //! `MinIO`, and `autumn-web`'s `sqlite_replication_s3` covers replication's.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -103,8 +108,8 @@ impl StepClock {
 }
 
 impl ClockSource for StepClock {
-    fn now(&self) -> DateTime<Utc> {
-        *self.0.lock().expect("clock")
+    fn now(&self) -> autumn_web::time::Timestamp {
+        self.0.lock().expect("clock").to_jiff()
     }
 }
 

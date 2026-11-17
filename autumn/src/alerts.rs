@@ -68,6 +68,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -335,7 +340,7 @@ impl AlertBuilder {
                 event,
                 title: String::new(),
                 summary: String::new(),
-                timestamp: crate::time::ambient_now(),
+                timestamp: crate::time::ambient_now().to_chrono(),
                 host: host_id(),
                 where_to_look: condition.where_to_look().to_owned(),
                 details: HashMap::new(),
@@ -1156,7 +1161,7 @@ impl AlertChannel for WebhookAlertChannel {
                 .post(&self.url)
                 .header("Content-Type", "application/json");
             if let Some(secret) = self.secret.as_ref() {
-                let timestamp = crate::time::ambient_now().timestamp();
+                let timestamp = crate::time::ambient_now().to_chrono().timestamp();
                 let signing_payload = format!("{timestamp}.{body}");
                 let signature = crate::security::config::hmac_sha256_hex(
                     secret.as_bytes(),
@@ -2058,7 +2063,7 @@ async fn evaluate_health(
     down_since: &mut HashMap<String, DateTime<Utc>>,
 ) {
     let results = state.health_indicator_registry().run_all().await;
-    let now = crate::time::ambient_now();
+    let now = crate::time::ambient_now().to_chrono();
     let grace = chrono::Duration::from_std(settings.health_grace)
         .unwrap_or_else(|_| chrono::Duration::seconds(60));
 

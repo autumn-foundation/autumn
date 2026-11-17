@@ -23,6 +23,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -50,10 +55,10 @@ impl RecordingClock {
 }
 
 impl ClockSource for RecordingClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> crate::time::Timestamp {
         let reading = self.inner.now();
         if let Some(scope) = current_scope() {
-            scope.record_clock(reading);
+            scope.record_clock(reading.to_chrono());
         }
         reading
     }
@@ -197,7 +202,7 @@ impl ReplayClock {
 }
 
 impl ClockSource for ReplayClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> crate::time::Timestamp {
         if !in_replay_request() {
             // A read the recording never attributed (boot, or a spawned
             // task): stable and non-consuming, so it can neither shift the
@@ -207,7 +212,8 @@ impl ClockSource for ReplayClock {
                 .lock()
                 .ok()
                 .and_then(|last| *last)
-                .unwrap_or(self.fallback);
+                .unwrap_or(self.fallback)
+                .to_jiff();
         }
         if let Ok(mut readings) = self.readings.lock()
             && let Some(reading) = readings.pop_front()
@@ -215,7 +221,7 @@ impl ClockSource for ReplayClock {
             if let Ok(mut last) = self.last.lock() {
                 *last = Some(reading);
             }
-            return reading;
+            return reading.to_jiff();
         }
         self.over_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -224,6 +230,7 @@ impl ClockSource for ReplayClock {
             .ok()
             .and_then(|last| *last)
             .unwrap_or(self.fallback)
+            .to_jiff()
     }
 
     fn monotonic(&self) -> crate::time::MonotonicInstant {
@@ -273,8 +280,8 @@ mod tests {
     async fn replay_clock_serves_recorded_readings_in_order() {
         let clock = ReplayClock::new(vec![at(1), at(2)], at(0));
         with_replay_request_scope(async {
-            assert_eq!(clock.now(), at(1));
-            assert_eq!(clock.now(), at(2));
+            assert_eq!(clock.now(), at(1).to_jiff());
+            assert_eq!(clock.now(), at(2).to_jiff());
         })
         .await;
         assert_eq!(clock.over_reads(), 0);
@@ -284,7 +291,7 @@ mod tests {
     async fn replay_clock_reports_readings_it_never_served() {
         let clock = ReplayClock::new(vec![at(1), at(2), at(3)], at(0));
         with_replay_request_scope(async {
-            assert_eq!(clock.now(), at(1));
+            assert_eq!(clock.now(), at(1).to_jiff());
         })
         .await;
         assert_eq!(
@@ -298,8 +305,12 @@ mod tests {
     async fn replay_clock_over_read_reuses_the_last_reading() {
         let clock = ReplayClock::new(vec![at(1)], at(0));
         with_replay_request_scope(async {
-            assert_eq!(clock.now(), at(1));
-            assert_eq!(clock.now(), at(1), "an over-read must repeat, not drift");
+            assert_eq!(clock.now(), at(1).to_jiff());
+            assert_eq!(
+                clock.now(),
+                at(1).to_jiff(),
+                "an over-read must repeat, not drift"
+            );
         })
         .await;
         assert_eq!(clock.over_reads(), 1);
@@ -309,7 +320,7 @@ mod tests {
     async fn replay_clock_with_no_readings_uses_the_fallback() {
         let clock = ReplayClock::new(Vec::new(), at(9));
         with_replay_request_scope(async {
-            assert_eq!(clock.now(), at(9));
+            assert_eq!(clock.now(), at(9).to_jiff());
         })
         .await;
         assert_eq!(clock.over_reads(), 1);
@@ -359,13 +370,17 @@ mod tests {
         let clock = Arc::new(ReplayClock::new(vec![at(1), at(2)], at(0)));
 
         // Boot-shaped read: before any request scope exists.
-        assert_eq!(clock.now(), at(0), "an unscoped read serves the fallback");
+        assert_eq!(
+            clock.now(),
+            at(0).to_jiff(),
+            "an unscoped read serves the fallback"
+        );
         assert_eq!(clock.unconsumed(), 2, "…without consuming");
 
         with_replay_request_scope({
             let clock = Arc::clone(&clock);
             async move {
-                assert_eq!(clock.now(), at(1));
+                assert_eq!(clock.now(), at(1).to_jiff());
                 // Spawned-task-shaped read: `tokio::spawn` does not inherit
                 // the task-local, exactly as it does not inherit the capture
                 // scope at recording time.
@@ -376,12 +391,12 @@ mod tests {
                 let seen = spawned.await.expect("spawned read");
                 assert_eq!(
                     seen,
-                    at(1),
+                    at(1).to_jiff(),
                     "a spawned read repeats the last served reading, non-consuming"
                 );
                 assert_eq!(
                     clock.now(),
-                    at(2),
+                    at(2).to_jiff(),
                     "the handler still gets its next reading"
                 );
             }
@@ -392,7 +407,7 @@ mod tests {
 
     #[test]
     fn recording_clock_passes_through_outside_a_request() {
-        let clock = RecordingClock::new(Arc::new(crate::time::FixedClock::at(at(5))));
-        assert_eq!(clock.now(), at(5));
+        let clock = RecordingClock::new(Arc::new(crate::time::FixedClock::at(at(5).to_jiff())));
+        assert_eq!(clock.now(), at(5).to_jiff());
     }
 }

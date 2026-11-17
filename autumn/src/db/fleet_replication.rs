@@ -38,6 +38,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -656,7 +661,7 @@ impl FleetReplication {
 
     /// The app clock.
     pub(crate) fn now(&self) -> DateTime<Utc> {
-        self.clock.now()
+        self.clock.now().to_chrono()
     }
 
     /// Tell `hook` when a replicator sees a newer epoch. The fleet installs
@@ -758,7 +763,7 @@ impl FleetReplication {
     /// A new ship slot for `key`, at an open. It replaces the slot of an
     /// earlier open.
     pub(crate) fn open_generation_slot(&self, key: &FleetDbKey, epoch: u64) -> Arc<GenerationSlot> {
-        let slot = Arc::new(GenerationSlot::new(self.clock.now(), epoch));
+        let slot = Arc::new(GenerationSlot::new(self.clock.now().to_chrono(), epoch));
         self.slots().insert(key.clone(), Arc::clone(&slot));
         // After the insert: a waiter never sees the key in neither map.
         self.forget_closed(key);
@@ -1649,7 +1654,7 @@ impl FleetReplication {
         if matches!(bound, ClosedBound::At { at: None, .. }) {
             closed.remove(key);
         } else {
-            closed.insert(key.clone(), (bound, now));
+            closed.insert(key.clone(), (bound, now.to_chrono()));
         }
     }
 
@@ -1665,6 +1670,7 @@ impl FleetReplication {
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|key, (bound, at)| {
                 let old = now
+                    .to_chrono()
                     .signed_duration_since(*at)
                     .to_std()
                     .is_ok_and(|age| age >= CLOSED_BOUND_TTL);
@@ -1705,7 +1711,9 @@ impl FleetReplication {
     /// - `at` is not below the clock now: the clock stepped back.
     fn bound_at(&self, key: &FleetDbKey, at: Option<DateTime<Utc>>, epoch: u64) -> Bound {
         match at {
-            Some(at) if at < self.clock.now() && self.serves(key, epoch) => Bound::At(at),
+            Some(at) if at < self.clock.now().to_chrono() && self.serves(key, epoch) => {
+                Bound::At(at)
+            }
             _ => Bound::Unknown,
         }
     }
@@ -1821,8 +1829,9 @@ impl FleetReplication {
             }
             // Before the first successful tick, lag runs from registration, so
             // a database that never ships still trips the threshold.
-            let lag = snapshot.lag(now).unwrap_or_else(|| {
-                now.signed_duration_since(replica.registered_at)
+            let lag = snapshot.lag(now.to_chrono()).unwrap_or_else(|| {
+                now.to_chrono()
+                    .signed_duration_since(replica.registered_at)
                     .to_std()
                     .unwrap_or(Duration::ZERO)
             });
@@ -1876,7 +1885,7 @@ impl FleetReplication {
             true
         };
         let restore_ok = self.lifecycle_details(&mut details);
-        let generations_ok = self.ship_details(&mut details, now);
+        let generations_ok = self.ship_details(&mut details, now.to_chrono());
         // A database whose lock cannot be taken is never replicated. A
         // replica that does not restore is not a backup.
         let healthy = lag_ok && lock_failures.is_empty() && restore_ok && generations_ok;
@@ -2059,7 +2068,7 @@ impl FleetReplication {
             epoch: AtomicU64::new(epoch.unwrap_or(0)),
             path: db.path().to_path_buf(),
             status,
-            registered_at: self.clock.now(),
+            registered_at: self.clock.now().to_chrono(),
         });
         // Another process may own it. The loop claims it when that one lets go.
         replica.claim(db.key());
@@ -2487,7 +2496,9 @@ mod tests {
         let replicas = tmp.path().join("replicas");
         let (fleet, _replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
         let clock = crate::time::TickingClock::starting_at(
-            DateTime::from_timestamp_millis(1_000_000).unwrap(),
+            DateTime::from_timestamp_millis(1_000_000)
+                .unwrap()
+                .to_jiff(),
         );
         let store = Arc::new(MemoryOwnership::new(Arc::new(clock.clone())));
         let host = |owner: &str| {
@@ -4402,8 +4413,8 @@ mod tests {
     }
 
     impl ClockSource for SetClock {
-        fn now(&self) -> DateTime<Utc> {
-            *self.0.lock().unwrap()
+        fn now(&self) -> crate::time::Timestamp {
+            self.0.lock().unwrap().to_jiff()
         }
     }
 
@@ -4429,7 +4440,7 @@ mod tests {
         while crate::time::ClockSource::now(&crate::time::SystemClock) <= at {
             std::thread::yield_now();
         }
-        at
+        at.to_chrono()
     }
 
     #[tokio::test]
@@ -4448,21 +4459,28 @@ mod tests {
         assert!(
             replication
                 .replicated_through(&key)
-                .is_none_or(|through| through < committed_at),
+                .is_none_or(|through| through < committed_at.to_chrono()),
             "a reading equal to the commit time does not cover it"
         );
         clock.advance(1);
         tick(&replication).await;
         let through = replication.replicated_through(&key).expect("caught up");
-        assert!(through >= committed_at, "{through} < {committed_at}");
+        assert!(
+            through >= committed_at.to_chrono(),
+            "{through} < {committed_at}"
+        );
         assert_eq!(fleet.replicated_through(&key), Some(through));
         fleet
-            .wait_replicated(&key, committed_at, Duration::ZERO)
+            .wait_replicated(&key, committed_at.to_chrono(), Duration::ZERO)
             .await
             .expect("already covered: no wait");
         assert!(matches!(
             fleet
-                .wait_replicated(&fleet.key_for("other").unwrap(), committed_at, NOT_STUCK)
+                .wait_replicated(
+                    &fleet.key_for("other").unwrap(),
+                    committed_at.to_chrono(),
+                    NOT_STUCK
+                )
                 .await,
             Err(ReplicatedWaitError::NotReplicating { .. })
         ));
@@ -4488,9 +4506,9 @@ mod tests {
         let through = replication
             .replicated_through(&key)
             .expect("closed, caught up");
-        assert!(through >= committed_at);
+        assert!(through >= committed_at.to_chrono());
         replication
-            .wait_replicated(&key, committed_at, Duration::ZERO)
+            .wait_replicated(&key, committed_at.to_chrono(), Duration::ZERO)
             .await
             .expect("the close shipped it");
 
@@ -4507,7 +4525,7 @@ mod tests {
         assert_eq!(replication.replicated_through(&key), None);
         assert!(matches!(
             replication
-                .wait_replicated(&key, committed_at, NOT_STUCK)
+                .wait_replicated(&key, committed_at.to_chrono(), NOT_STUCK)
                 .await,
             Err(ReplicatedWaitError::NotReplicating { .. })
         ));
@@ -4640,13 +4658,13 @@ mod tests {
 
         // No tick: the wait times out and names the bound it saw.
         let waited = replication
-            .wait_replicated(&key, committed_at, Duration::from_millis(50))
+            .wait_replicated(&key, committed_at.to_chrono(), Duration::from_millis(50))
             .await;
         assert!(
             matches!(
                 &waited,
                 Err(ReplicatedWaitError::TimedOut { through: Some(through), .. })
-                    if *through < committed_at
+                    if *through < committed_at.to_chrono()
             ),
             "{waited:?}"
         );
@@ -4660,7 +4678,7 @@ mod tests {
             })
         };
         replication
-            .wait_replicated(&key, committed_at, NOT_STUCK)
+            .wait_replicated(&key, committed_at.to_chrono(), NOT_STUCK)
             .await
             .expect("the pass covers the commit and wakes the wait");
         ticker.join().unwrap();

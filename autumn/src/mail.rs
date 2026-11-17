@@ -22,6 +22,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -2759,7 +2764,9 @@ fn file_transport_filename(mail: &Mail) -> String {
     let sequence = FILE_TRANSPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
         "{}-{}-{:016x}-{}.eml",
-        crate::time::ambient_now().format("%Y%m%d%H%M%S%6f"),
+        crate::time::ambient_now()
+            .to_chrono()
+            .format("%Y%m%d%H%M%S%6f"),
         std::process::id(),
         sequence,
         sanitize_filename(mail.to.first().map_or("unknown", String::as_str))
@@ -2784,7 +2791,7 @@ fn render_eml(mail: &Mail) -> String {
         out.push('\n');
     }
     out.push_str("Date: ");
-    out.push_str(&crate::time::ambient_now().to_rfc2822());
+    out.push_str(&crate::time::ambient_now().to_chrono().to_rfc2822());
     out.push('\n');
     out.push_str("Message-Id: <");
     out.push_str(&uuid::Uuid::new_v4().to_string());

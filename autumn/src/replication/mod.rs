@@ -56,6 +56,11 @@ pub mod status;
 pub mod uri;
 pub mod wal;
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 pub use uri::{DatabaseTarget, database_target, file_uri, no_create_uri};
 
 use std::fmt;
@@ -429,7 +434,7 @@ pub fn build(
             lag_alert_after: config.rpo().saturating_mul(LAG_ALERT_MULTIPLIER),
             startup_grace: STARTUP_GRACE,
         },
-        started_at,
+        started_at.to_chrono(),
     ));
     let replicator = Replicator::new(
         settings.clone(),

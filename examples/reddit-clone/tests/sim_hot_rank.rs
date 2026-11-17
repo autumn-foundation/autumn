@@ -34,6 +34,11 @@
 //! The second form is the replay line `#[sim_test]` prints on failure: the
 //! scores below are drawn from `sim.rng()`, so a seed reproduces a run exactly.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::ChronoBridge as _;
 use std::time::Duration;
 
 use autumn_web::entropy::SeededEntropy;
@@ -81,7 +86,7 @@ async fn hot_rank(Path(score): Path<i64>, clock: Clock) -> String {
     let created_at = SIM_EPOCH
         .parse::<chrono::NaiveDateTime>()
         .expect("SIM_EPOCH is a valid naive timestamp");
-    calculate_hot_rank(score, created_at, clock.now().naive_utc()).to_string()
+    calculate_hot_rank(score, created_at, clock.now().to_chrono().naive_utc()).to_string()
 }
 
 /// Draw a deterministic score inside `band` from the sim's seeded RNG.

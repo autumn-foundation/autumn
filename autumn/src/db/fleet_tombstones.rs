@@ -32,6 +32,16 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::JiffBridge as _;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone as _, Utc};
@@ -351,7 +361,7 @@ mod store {
         /// The clock that stamps the rows.
         #[must_use]
         pub fn now(&self) -> DateTime<Utc> {
-            self.clock.now()
+            self.clock.now().to_chrono()
         }
 
         /// A connection to the control database, with the table made. A delete
@@ -806,7 +816,7 @@ mod tests {
     #[tokio::test]
     async fn a_row_goes_from_pending_to_confirmed_to_removed() {
         let tmp = tempfile::tempdir().unwrap();
-        let clock = crate::time::TickingClock::starting_at(at(1_000));
+        let clock = crate::time::TickingClock::starting_at(at(1_000).to_jiff());
         let store = store(tmp.path(), &clock);
         let retention = Duration::from_secs(60);
         store
@@ -853,7 +863,7 @@ mod tests {
         // A re-create or a restore in another process took the key between
         // the removal and the confirm: no cutoff may cover the new database.
         let tmp = tempfile::tempdir().unwrap();
-        let clock = crate::time::TickingClock::starting_at(at(1_000));
+        let clock = crate::time::TickingClock::starting_at(at(1_000).to_jiff());
         let store = store(tmp.path(), &clock);
         store
             .record("tenant:acme", Duration::ZERO, false, "test")
@@ -875,7 +885,7 @@ mod tests {
         // Process A removed the file and has not confirmed yet. Process B
         // finds no file: its refusal must not drop A's row.
         let tmp = tempfile::tempdir().unwrap();
-        let clock = crate::time::TickingClock::starting_at(at(1_000));
+        let clock = crate::time::TickingClock::starting_at(at(1_000).to_jiff());
         let store = store(tmp.path(), &clock);
         store
             .record("tenant:acme", Duration::ZERO, true, "a")
@@ -903,7 +913,7 @@ mod tests {
     #[tokio::test]
     async fn a_list_pages_past_the_first_batch() {
         let tmp = tempfile::tempdir().unwrap();
-        let clock = crate::time::TickingClock::starting_at(at(1_000));
+        let clock = crate::time::TickingClock::starting_at(at(1_000).to_jiff());
         let store = store(tmp.path(), &clock);
         for i in 0..5 {
             store
@@ -930,7 +940,7 @@ mod tests {
     #[tokio::test]
     async fn a_failure_is_durable_and_listed() {
         let tmp = tempfile::tempdir().unwrap();
-        let clock = crate::time::TickingClock::starting_at(at(1_000));
+        let clock = crate::time::TickingClock::starting_at(at(1_000).to_jiff());
         let store = store(tmp.path(), &clock);
         store
             .record("slot:00007", Duration::ZERO, false, "test")
@@ -1158,7 +1168,7 @@ mod tests {
         }
 
         fn clock() -> crate::time::TickingClock {
-            crate::time::TickingClock::starting_at(at(1_800_000_000_000))
+            crate::time::TickingClock::starting_at(at(1_800_000_000_000).to_jiff())
         }
 
         #[tokio::test]
@@ -1452,8 +1462,9 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let destination = Switchable::new(&tmp.path().join("replicas"));
             let clock = clock();
-            let ahead =
-                crate::time::TickingClock::starting_at(clock.now() + chrono::Duration::hours(1));
+            let ahead = crate::time::TickingClock::starting_at(
+                (clock.now().to_chrono() + chrono::Duration::hours(1)).to_jiff(),
+            );
             let setup = Setup {
                 volume: tmp.path(),
                 destination: &destination,
@@ -1755,7 +1766,7 @@ mod tests {
             // database's generation.
             let old = Tombstone::new(
                 &key.name(),
-                clock.now() - chrono::Duration::hours(1),
+                clock.now().to_chrono() - chrono::Duration::hours(1),
                 Duration::ZERO,
                 true,
             );
@@ -1775,8 +1786,9 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let destination = Switchable::new(&tmp.path().join("replicas"));
             let clock = clock();
-            let ahead =
-                crate::time::TickingClock::starting_at(clock.now() + chrono::Duration::hours(1));
+            let ahead = crate::time::TickingClock::starting_at(
+                (clock.now().to_chrono() + chrono::Duration::hours(1)).to_jiff(),
+            );
             let setup = Setup {
                 volume: tmp.path(),
                 destination: &destination,
@@ -2011,11 +2023,12 @@ mod tests {
             let before = destination.keys(&key);
             let replication = Arc::clone(&host.replication);
             let purge_key = key.clone();
-            let deleted =
-                crate::time::spawn_blocking(move || replication.purge_replica(&purge_key, cutoff))
-                    .await
-                    .unwrap()
-                    .unwrap();
+            let deleted = crate::time::spawn_blocking(move || {
+                replication.purge_replica(&purge_key, cutoff.to_chrono())
+            })
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(deleted, 0);
             assert_eq!(destination.keys(&key), before);
         }

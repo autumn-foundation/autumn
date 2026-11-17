@@ -5,6 +5,11 @@
 //! moves that commit to each clock read of the tick in turn. A commit that
 //! lands after the caught-up check must not be covered.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -87,7 +92,7 @@ impl HookClock {
 }
 
 impl ClockSource for HookClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> autumn_web::time::Timestamp {
         let value = {
             let mut now = self.now.lock().expect("clock");
             *now += chrono::Duration::seconds(1);
@@ -105,7 +110,7 @@ impl ClockSource for HookClock {
         if let Some(hook) = hook {
             hook(value);
         }
-        value
+        value.to_jiff()
     }
 }
 

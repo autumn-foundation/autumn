@@ -56,6 +56,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -441,7 +446,7 @@ pub(crate) fn plan_from_listing(
         .cloned()
     else {
         return Err(RestoreError::TargetBeforeRetention {
-            target: target.unwrap_or_else(crate::time::ambient_now),
+            target: target.unwrap_or_else(|| crate::time::ambient_now().to_chrono()),
             oldest: ms_to_utc(oldest_ms),
         });
     };

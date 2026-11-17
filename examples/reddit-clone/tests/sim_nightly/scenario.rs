@@ -15,6 +15,11 @@
 //! 7. A crash at a seeded await, then a restart on the same store.
 //! 8. Settle, then check the end state, the fault ledger and the logs.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -527,7 +532,7 @@ async fn age_posts(sim: &Sim) {
         let system = ambient_system_time();
         let unix = clock_unix_duration(&AmbientClock);
         sim.advance(SWEEP_EVERY).await;
-        always!(ambient_now() - now == TimeDelta::from_std(SWEEP_EVERY).expect("small"));
+        always!(ambient_now() - now == TimeDelta::from_std(SWEEP_EVERY).expect("small").to_jiff());
         always!(ambient_monotonic().saturating_duration_since(mono) == SWEEP_EVERY);
         always!(ambient_instant().duration_since(instant) == SWEEP_EVERY);
         always!(ambient_system_time().duration_since(system).ok() == Some(SWEEP_EVERY));
@@ -845,9 +850,9 @@ fn check_end_state(sim: &Sim, shared: &Shared, net: &SimNet) {
 pub async fn rank_bands(sim: &mut Sim) {
     let hot_score = 400 + i64::try_from(sim.rng().next_u64() % 500).expect("small");
     let cold_score = 10 + i64::try_from(sim.rng().next_u64() % 190).expect("small");
-    let created = ambient_now().naive_utc();
+    let created = ambient_now().to_chrono().naive_utc();
     sim.advance(Duration::from_secs(24 * 3600)).await;
-    let now = ambient_now().naive_utc();
+    let now = ambient_now().to_chrono().naive_utc();
     for score in [hot_score, cold_score] {
         let rank = calculate_hot_rank(score, created, now);
         sometimes!(

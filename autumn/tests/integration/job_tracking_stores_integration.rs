@@ -9,6 +9,11 @@
 //! cargo test -p autumn-web --features redis,db --test integration_tests job_tracking_stores -- --ignored
 //! ```
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -397,6 +402,11 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
 /// expiry. A writer's clock must not change a record's TTL.
 #[cfg(feature = "db")]
 mod pg_clock_skew {
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use autumn_web::time::bridge::JiffBridge as _;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -442,7 +452,7 @@ mod pg_clock_skew {
 
     fn skewed(pool: &PgPool, ttl_secs: u64, skew: chrono::TimeDelta) -> PgJobTrackingStore {
         PgJobTrackingStore::new(pool.clone(), ttl_secs)
-            .with_clock(Arc::new(FixedClock::at(Utc::now() + skew)))
+            .with_clock(Arc::new(FixedClock::at((Utc::now() + skew).to_jiff())))
     }
 
     #[tokio::test]

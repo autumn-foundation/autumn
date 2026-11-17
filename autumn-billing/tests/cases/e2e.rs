@@ -4,6 +4,11 @@
 //! Fixtures live in `tests/fixtures/stripe/` and use the ids `cus_test_1`,
 //! `sub_test_1`, `price_pro_monthly` and `in_test_1`.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,7 +59,7 @@ fn now() -> DateTime<Utc> {
 
 fn e2e_app(store: Arc<MemoryBillingStore>) -> Harness {
     support::harness(store, FakeProvider::new(), |app: TestApp| {
-        app.with_clock(FixedClock::at(now()))
+        app.with_clock(FixedClock::at(now().to_jiff()))
             .routes(routes![pro, unread])
     })
 }
@@ -63,7 +68,7 @@ fn e2e_app(store: Arc<MemoryBillingStore>) -> Harness {
 /// the notification test route.
 fn e2e_app_ticking(store: Arc<MemoryBillingStore>) -> Harness {
     support::harness(store, FakeProvider::new(), |app: TestApp| {
-        app.with_clock(TickingClock::starting_at(now()))
+        app.with_clock(TickingClock::starting_at(now().to_jiff()))
             .routes(routes![pro, unread])
             .routes(notification_routes())
     })
@@ -457,7 +462,7 @@ async fn ledger_dedupes_when_replay_protection_is_off() {
         MemoryBillingStore::shared(),
         FakeProvider::new(),
         |app: TestApp| {
-            app.with_clock(FixedClock::at(now()))
+            app.with_clock(FixedClock::at(now().to_jiff()))
                 .routes(routes![pro, unread])
         },
     );

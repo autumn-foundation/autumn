@@ -14,6 +14,11 @@
 use autumn_web::config::AutumnConfig;
 use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 
 // ── Handlers ──────────────────────────────────────────────────
 
@@ -202,7 +207,7 @@ async fn cookie_jar_expires_check_uses_virtual_clock_future() {
     // cookie proves the jar consulted the virtual clock, not `Utc::now()`.
     let client = TestApp::new()
         .with_clock(FixedClock::at(
-            Utc.with_ymd_and_hms(2021, 6, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2021, 6, 1, 0, 0, 0).unwrap().to_jiff(),
         ))
         .routes(routes![emit_expiring_cookie, echo_cookie])
         .build();
@@ -223,7 +228,7 @@ async fn cookie_jar_expires_check_uses_virtual_clock_past() {
     // Pin the clock *after* the cookie's `Expires` (2022): the jar must drop it.
     let client = TestApp::new()
         .with_clock(FixedClock::at(
-            Utc.with_ymd_and_hms(2023, 6, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2023, 6, 1, 0, 0, 0).unwrap().to_jiff(),
         ))
         .routes(routes![emit_expiring_cookie, echo_cookie])
         .build();
@@ -262,7 +267,7 @@ async fn live_cookie_max_age_expires_against_virtual_clock() {
 
     let client = TestApp::new()
         .with_clock(TickingClock::starting_at(
-            Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap().to_jiff(),
         ))
         .routes(routes![emit_live_cookie, echo_cookie])
         .build();

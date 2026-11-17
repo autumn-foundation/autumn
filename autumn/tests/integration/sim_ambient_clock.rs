@@ -4,6 +4,11 @@
 //! `time::ambient_now` and its siblings. They read the running `Sim`'s virtual
 //! clock on this thread, and the system clock otherwise.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::time::Duration;
 
 use autumn_web::sim::Sim;
@@ -21,14 +26,17 @@ fn sim_epoch() -> chrono::DateTime<Utc> {
 
 #[sim_test]
 async fn sim_ambient_clock_reads_virtual_time(sim: Sim) {
-    assert_eq!(ambient_now(), sim_epoch());
-    assert_eq!(AmbientClock.now(), sim_epoch());
+    assert_eq!(ambient_now(), sim_epoch().to_jiff());
+    assert_eq!(AmbientClock.now(), sim_epoch().to_jiff());
     let mono = ambient_monotonic();
     let instant = ambient_instant();
 
     sim.advance(HOUR).await;
 
-    assert_eq!(ambient_now(), sim_epoch() + chrono::Duration::hours(1));
+    assert_eq!(
+        ambient_now(),
+        (sim_epoch() + chrono::Duration::hours(1)).to_jiff()
+    );
     assert_eq!(ambient_monotonic().saturating_duration_since(mono), HOUR);
     assert_eq!(ambient_instant().saturating_duration_since(instant), HOUR);
     let unix = ambient_system_time()
@@ -43,23 +51,27 @@ async fn sim_ambient_clock_is_restored_when_the_sim_drops(sim: Sim) {
     inner.advance(HOUR).await;
     assert_eq!(
         ambient_now(),
-        sim_epoch() + chrono::Duration::hours(1),
+        (sim_epoch() + chrono::Duration::hours(1)).to_jiff(),
         "the newest sim on the thread wins"
     );
     drop(inner);
-    assert_eq!(ambient_now(), sim_epoch(), "the outer sim is back");
+    assert_eq!(
+        ambient_now(),
+        sim_epoch().to_jiff(),
+        "the outer sim is back"
+    );
 }
 
 #[test]
 fn sim_ambient_clock_outside_a_sim_is_the_system_clock() {
     let before = Utc::now();
     let now = ambient_now();
-    assert!(now >= before && now - before < chrono::Duration::seconds(5));
+    assert!(now >= before.to_jiff() && now.to_chrono() - before < chrono::Duration::seconds(5));
     let sim = Sim::from_seed(0);
-    assert_eq!(ambient_now(), sim_epoch());
+    assert_eq!(ambient_now(), sim_epoch().to_jiff());
     drop(sim);
     assert!(
-        ambient_now() >= before,
+        ambient_now() >= before.to_jiff(),
         "real time again after the sim drops"
     );
 }
@@ -125,7 +137,10 @@ async fn sim_ambient_clock_outer_advance_during_a_nested_sim_is_kept(sim: Sim) {
     inner.advance(HOUR).await;
     sim.advance(HOUR).await;
     drop(inner);
-    assert_eq!(ambient_now(), sim_epoch() + chrono::Duration::hours(1));
+    assert_eq!(
+        ambient_now(),
+        (sim_epoch() + chrono::Duration::hours(1)).to_jiff()
+    );
     assert_eq!(
         ambient_instant().saturating_duration_since(start),
         HOUR,
@@ -160,7 +175,7 @@ async fn sim_ambient_clock_outer_advance_leaves_the_inner_timeline_alone(sim: Si
     sim.advance(HOUR).await;
     assert_eq!(
         ambient_now(),
-        sim_epoch(),
+        sim_epoch().to_jiff(),
         "the inner wall clock did not move"
     );
     assert_eq!(
@@ -182,7 +197,11 @@ async fn sim_ambient_clock_inner_sim_dropped_on_another_thread(sim: Sim) {
     let inner = Sim::from_seed(sim.seed.wrapping_add(1));
     inner.advance(HOUR).await;
     std::thread::spawn(move || drop(inner)).join().unwrap();
-    assert_eq!(ambient_now(), sim_epoch(), "the outer sim is ambient again");
+    assert_eq!(
+        ambient_now(),
+        sim_epoch().to_jiff(),
+        "the outer sim is ambient again"
+    );
     assert_eq!(
         ambient_instant().saturating_duration_since(start),
         Duration::ZERO,
@@ -210,7 +229,10 @@ async fn sim_ambient_clock_cancelled_advance_counts_once(sim: Sim) {
 #[sim_test]
 async fn sim_ambient_clock_concurrent_advances_count_once_each(sim: Sim) {
     tokio::join!(sim.advance(HOUR), sim.advance(HOUR));
-    assert_eq!(ambient_now(), sim_epoch() + chrono::Duration::hours(2));
+    assert_eq!(
+        ambient_now(),
+        (sim_epoch() + chrono::Duration::hours(2)).to_jiff()
+    );
     assert_eq!(ambient_monotonic().since_origin(), 2 * HOUR);
 }
 

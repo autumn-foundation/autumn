@@ -47,6 +47,11 @@
 
 #![cfg(all(feature = "sqlite", feature = "test-support"))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::ChronoBridge as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -145,7 +150,7 @@ impl Plugin for SimJobsPlugin {
 /// `sim.build` mounted both the `SQLite` substrate and the sim clock.
 #[get("/now")]
 async fn now_route(clock: Clock) -> String {
-    clock.now().to_rfc3339()
+    clock.now().to_chrono().to_rfc3339()
 }
 
 #[derive(diesel::QueryableByName)]

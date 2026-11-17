@@ -9,6 +9,11 @@
 
 #[cfg(feature = "test-support")]
 mod docker {
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use autumn_web::time::bridge::JiffBridge as _;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -383,7 +388,7 @@ mod docker {
         let log = Log::default();
         let state = TestApp::new()
             .with_db(pool.clone())
-            .with_clock(autumn_web::time::FixedClock::at(now))
+            .with_clock(autumn_web::time::FixedClock::at(now.to_jiff()))
             .with_outbox(OutboxConfig::default())
             .outbox_handler("t", {
                 let log = log.clone();

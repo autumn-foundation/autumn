@@ -115,6 +115,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -800,7 +805,7 @@ impl FaultState {
             target: target.to_owned(),
             ordinal,
             target_ordinal,
-            at: self.clock.now(),
+            at: self.clock.now().to_chrono(),
             elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         };
         let in_window = self
@@ -1159,6 +1164,11 @@ mod tests {
         Decision, FaultEffect, FaultOutcome, FaultPlan, FaultState, FinalState, PlannedFault,
         sample_distinct,
     };
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use crate::time::bridge::JiffBridge as _;
     use crate::time::{ClockSource as _, TickingClock};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1175,7 +1185,7 @@ mod tests {
     /// to — `TickingClock` clones share one instant, exactly as
     /// `TestApp::with_clock` relies on.
     fn ticking_state(plan: &FaultPlan) -> (TickingClock, FaultState) {
-        let clock = TickingClock::starting_at(epoch());
+        let clock = TickingClock::starting_at(epoch().to_jiff());
         let started_at = clock.monotonic();
         let state = FaultState::new(plan, Arc::new(clock.clone()), started_at);
         (clock, state)

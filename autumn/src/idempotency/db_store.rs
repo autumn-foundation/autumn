@@ -10,6 +10,11 @@
 //!
 //! Times are Unix milliseconds from the app clock, so a `Sim` moves them.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
@@ -52,7 +57,7 @@ use autumn_idempotency_keys::dsl as keys;
 const SWEEP_EVERY: u64 = 128;
 
 fn now_ms() -> i64 {
-    crate::time::ambient_now().timestamp_millis()
+    crate::time::ambient_now().to_chrono().timestamp_millis()
 }
 
 /// The longest span the store writes, in milliseconds: about 18 million

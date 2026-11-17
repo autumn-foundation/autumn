@@ -10,6 +10,11 @@
 //! `ClusterNode` and the wire types are `pub(crate)`: the public integration
 //! tests use only the public surface.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::JiffBridge as _;
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -48,7 +53,8 @@ struct TestNode {
 
 fn test_clock() -> TickingClock {
     TickingClock::starting_at(
-        chrono::DateTime::<chrono::Utc>::from_timestamp(1_765_430_000, 0).unwrap_or_default(),
+        (chrono::DateTime::<chrono::Utc>::from_timestamp(1_765_430_000, 0).unwrap_or_default())
+            .to_jiff(),
     )
 }
 

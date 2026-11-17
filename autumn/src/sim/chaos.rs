@@ -49,10 +49,15 @@
 // The builders take `self` by value and clamp with runtime float ops, so they cannot be `const`.
 #![allow(clippy::missing_const_for_fn)]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::Duration as ChronoDuration;
 
 use crate::entropy::{Entropy, SeededEntropy};
 use crate::time::{ClockSource, TickingClock};
@@ -411,8 +416,8 @@ struct SkewClock {
 }
 
 impl ClockSource for SkewClock {
-    fn now(&self) -> DateTime<Utc> {
-        self.inner.now() + self.offset
+    fn now(&self) -> crate::time::Timestamp {
+        (self.inner.now().to_chrono() + self.offset).to_jiff()
     }
 
     /// Forwarded to the wrapped clock **unskewed**.

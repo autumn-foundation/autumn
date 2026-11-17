@@ -12,6 +12,11 @@
 //! 60 s of sim time later, and its drifted clock then reads a little more or
 //! less.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::JiffBridge as _;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -248,12 +253,13 @@ fn drift_nanos(since: Duration, ppm: i64) -> i128 {
 }
 
 impl ClockSource for NodeClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> crate::time::Timestamp {
         let (elapsed, since) = self.elapsed();
         let drift = i64::try_from(drift_nanos(since, self.inner.drift_ppm)).unwrap_or(0);
         let wall = self.inner.epoch + delta(elapsed);
         wall.checked_add_signed(add_delta(TimeDelta::nanoseconds(drift), *self.offset()))
             .unwrap_or(wall)
+            .to_jiff()
     }
 
     fn monotonic(&self) -> MonotonicInstant {
@@ -271,6 +277,11 @@ impl ClockSource for NodeClock {
 
 #[cfg(test)]
 mod tests {
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use crate::time::bridge::JiffBridge as _;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -281,7 +292,7 @@ mod tests {
 
     fn node(spec: &Replica) -> (TickingClock, NodeClock) {
         let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let base = TickingClock::starting_at(epoch);
+        let base = TickingClock::starting_at(epoch.to_jiff());
         let elapsed: Arc<dyn ClockSource> = Arc::new(base.clone());
         (base, NodeClock::new(elapsed, epoch, spec.resolve(0)))
     }
@@ -293,11 +304,11 @@ mod tests {
             .clock_behind(Duration::from_secs(2))
             .clock_drift_ppm(500_000);
         let (base, clock) = node(&spec);
-        assert_eq!(clock.now() - base.now(), TimeDelta::seconds(3));
+        assert_eq!(clock.now() - base.now(), TimeDelta::seconds(3).to_jiff());
         base.advance(Duration::from_secs(10));
         assert_eq!(
             clock.now() - base.now(),
-            TimeDelta::seconds(8),
+            TimeDelta::seconds(8).to_jiff(),
             "3 s offset + 5 s drift"
         );
         assert_eq!(
@@ -322,7 +333,7 @@ mod tests {
         let wall = clock.now();
         let mono = clock.monotonic();
         clock.step(TimeDelta::seconds(-30));
-        assert_eq!(wall - clock.now(), TimeDelta::seconds(30));
+        assert_eq!(wall - clock.now(), TimeDelta::seconds(30).to_jiff());
         assert_eq!(clock.monotonic(), mono);
         assert_eq!(clock.settings().offset(), TimeDelta::seconds(-30));
     }

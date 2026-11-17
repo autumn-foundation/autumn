@@ -57,6 +57,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -551,7 +556,12 @@ fn compare_and_record(
         record_divergence(&ctx.registry, &context.route, kind);
     }
 
-    let observed_at_ms = ctx.clock.now().timestamp_millis().unsigned_abs();
+    let observed_at_ms = ctx
+        .clock
+        .now()
+        .to_chrono()
+        .timestamp_millis()
+        .unsigned_abs();
     let recorded = ctx
         .registry
         .record_comparison(context, comparison, observed_at_ms);
@@ -1020,7 +1030,7 @@ mod tests {
             transport,
             Arc::new(ParameterFilter::default()),
             Arc::new(SeededEntropy::new(7)),
-            Arc::new(FixedClock::at(chrono::Utc::now())),
+            Arc::new(FixedClock::at(chrono::Utc::now().to_jiff())),
         )
     }
 

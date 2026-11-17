@@ -6,6 +6,11 @@
 //! lifecycle rules (expired → 401, revoked → 401) and the non-user-principal
 //! path through a policy.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::sync::Arc;
 
 use autumn_web::auth::{
@@ -156,8 +161,9 @@ async fn token_with_required_scope_is_allowed_and_missing_scope_is_forbidden() {
 #[tokio::test]
 async fn expired_token_is_rejected_401() {
     let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let store =
-        Arc::new(InMemoryApiTokenStore::default().with_clock(Arc::new(FixedClock::at(now))));
+    let store = Arc::new(
+        InMemoryApiTokenStore::default().with_clock(Arc::new(FixedClock::at(now.to_jiff()))),
+    );
     let raw = store
         .issue_scoped(IssueTokenSpec {
             principal_id: "service:ci",

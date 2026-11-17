@@ -54,6 +54,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -4408,7 +4413,7 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let dt = chrono::DateTime::parse_from_rfc2822(value).ok()?;
     let now = crate::time::ambient_now();
     let future = dt.with_timezone(&chrono::Utc);
-    let secs = u64::try_from((future - now).num_seconds().max(0)).unwrap_or(0);
+    let secs = u64::try_from((future - now.to_chrono()).num_seconds().max(0)).unwrap_or(0);
     Some(Duration::from_secs(secs))
 }
 

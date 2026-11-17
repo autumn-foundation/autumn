@@ -13,6 +13,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -78,7 +83,7 @@ impl AuditEvent {
         status: AuditStatus,
     ) -> Self {
         Self {
-            timestamp: crate::time::ambient_now(),
+            timestamp: crate::time::ambient_now().to_chrono(),
             actor_id: actor_id.into(),
             action: action.into(),
             target_resource_id: target_resource_id.into(),

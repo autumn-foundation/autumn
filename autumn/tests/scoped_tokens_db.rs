@@ -10,6 +10,11 @@
 
 #![cfg(feature = "db")]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::sync::Arc;
 
 use autumn_web::auth::{
@@ -120,7 +125,7 @@ async fn db_store_issue_list_revoke_rotate_round_trip() {
 async fn db_store_filters_expired_tokens_in_sql() {
     let (pool, _container) = setup_pool().await;
     let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let store = DbApiTokenStore::new(pool).with_clock(Arc::new(FixedClock::at(now)));
+    let store = DbApiTokenStore::new(pool).with_clock(Arc::new(FixedClock::at(now.to_jiff())));
 
     let raw = store
         .issue_scoped(IssueTokenSpec {
@@ -141,7 +146,7 @@ async fn db_store_filters_expired_tokens_in_sql() {
 async fn db_store_records_last_used_at() {
     let (pool, _container) = setup_pool().await;
     let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let store = DbApiTokenStore::new(pool).with_clock(Arc::new(FixedClock::at(now)));
+    let store = DbApiTokenStore::new(pool).with_clock(Arc::new(FixedClock::at(now.to_jiff())));
 
     let raw = store
         .issue_scoped(IssueTokenSpec {

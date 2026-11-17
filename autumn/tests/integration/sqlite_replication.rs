@@ -17,6 +17,11 @@
 //! clock by hand, so the point-in-time cases below are deterministic: no
 //! sleeping, no flaky clock windows.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -114,8 +119,8 @@ impl StepClock {
 }
 
 impl ClockSource for StepClock {
-    fn now(&self) -> DateTime<Utc> {
-        *self.0.lock().expect("clock")
+    fn now(&self) -> autumn_web::time::Timestamp {
+        self.0.lock().expect("clock").to_jiff()
     }
 }
 
@@ -592,11 +597,12 @@ fn generations_on(h: &Harness) -> std::collections::BTreeSet<String> {
 struct AdvancingClock(Mutex<DateTime<Utc>>);
 
 impl ClockSource for AdvancingClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> autumn_web::time::Timestamp {
         let mut current = self.0.lock().expect("clock");
         let reading = *current;
         *current = reading + chrono::Duration::seconds(1);
-        reading
+        drop(current);
+        reading.to_jiff()
     }
 }
 
@@ -649,13 +655,13 @@ fn an_artifact_is_stamped_after_its_contents_are_fenced() {
         .max()
         .expect("one segment");
 
-    let opening = before_opening.timestamp_millis();
+    let opening = before_opening.to_chrono().timestamp_millis();
     assert!(
         snapshot_ms > opening,
         "the snapshot must be stamped after the checkpoint that fenced the database file, \
          from a reading taken inside the tick ({snapshot_ms} vs {opening})"
     );
-    let shipping = before_shipping.timestamp_millis();
+    let shipping = before_shipping.to_chrono().timestamp_millis();
     assert!(
         segment_ms > shipping,
         "the segment must be stamped after its WAL bytes were read, from a reading taken \

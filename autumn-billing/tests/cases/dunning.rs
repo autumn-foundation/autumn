@@ -8,6 +8,11 @@
 //! provider call. Assert through the row and the provider's recorded calls,
 //! never through raw run counts.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +38,7 @@ use super::support::{
 const RECIPIENT: i64 = 42;
 
 fn clocked(app: TestApp) -> TestApp {
-    app.with_clock(TickingClock::starting_at(support::base_time()))
+    app.with_clock(TickingClock::starting_at(support::base_time().to_jiff()))
         .routes(notification_routes())
 }
 

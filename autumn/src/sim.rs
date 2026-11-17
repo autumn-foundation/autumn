@@ -82,6 +82,11 @@
 // not a breaking change.
 #![allow(clippy::missing_const_for_fn)]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::sync::Arc;
 
 use chrono::{DateTime, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
@@ -322,7 +327,7 @@ impl Sim {
     pub fn from_seed(seed: u64) -> Self {
         // A clean registry per seed lets the sweep attribute `sometimes!` labels to one seed.
         assert::reset_sometimes_registry();
-        let clock = SimClock::new(TickingClock::starting_at(sim_epoch()));
+        let clock = SimClock::new(TickingClock::starting_at(sim_epoch().to_jiff()));
         let ambient_clock = Arc::new(AmbientSimClock {
             wall: std::sync::RwLock::new(Arc::new(clock.ticking())),
             own_advanced: std::sync::Mutex::new(std::time::Duration::ZERO),
@@ -1746,7 +1751,7 @@ impl SimClock {
     /// Read by [`Sim::advance_to`] to compute the forward delta to a zoned
     /// target.
     pub(crate) fn now(&self) -> DateTime<Utc> {
-        crate::time::ClockSource::now(&self.inner)
+        crate::time::ClockSource::now(&self.inner).to_chrono()
     }
 }
 
@@ -1947,7 +1952,7 @@ fn note_own_advance(sim: &AmbientSimClock, duration: std::time::Duration) {
 }
 
 impl crate::time::ClockSource for AmbientSimClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> crate::time::Timestamp {
         self.wall
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

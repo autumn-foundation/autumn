@@ -150,7 +150,7 @@ pub(crate) fn emit_retention(
                         use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
                         #[allow(unused_imports)]
                         use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                        let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
+                        let __now = ::autumn_web::time::bridge::naive_utc(::autumn_web::time::ClockSource::now(state.clock()));
                         ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
                             &mut *conn,
                             |conn| async move {
@@ -193,7 +193,7 @@ pub(crate) fn emit_retention(
                         )
                         .await?
                     } else {
-                        let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
+                        let __now = ::autumn_web::time::bridge::naive_utc(::autumn_web::time::ClockSource::now(state.clock()));
                         ::autumn_web::reexports::diesel::update(
                             #table_ident::table
                                 .filter(#table_ident::id.eq_any(ids))
@@ -298,8 +298,7 @@ pub(crate) fn emit_retention(
                 // even for a boot-validated `after`. `-` panics on overflow;
                 // this fails with the same actionable message boot validation
                 // uses for the config-level check.
-                let __age_cutoff = ::autumn_web::time::ClockSource::now(state.clock())
-                    .naive_utc()
+                let __age_cutoff = ::autumn_web::time::bridge::naive_utc(::autumn_web::time::ClockSource::now(state.clock()))
                     .checked_sub_signed(__age_chrono)
                     .expect(concat!(
                         "retention `after` duration is too large to compute a valid cutoff \
@@ -438,8 +437,7 @@ pub(crate) fn emit_retention(
                             // the age branch's identical cutoff computation
                             // for why a boot-validated duration can still
                             // underflow against a particular clock reading.
-                            let __cutoff = ::autumn_web::time::ClockSource::now(state.clock())
-                                .naive_utc()
+                            let __cutoff = ::autumn_web::time::bridge::naive_utc(::autumn_web::time::ClockSource::now(state.clock()))
                                 .checked_sub_signed(__purge_chrono)
                                 .expect(concat!(
                                     "retention `purge_deleted_after` duration is too large to \
@@ -608,8 +606,7 @@ pub(crate) fn emit_retention(
                                 #after,
                                 "\"))]"
                             ));
-                    ::autumn_web::time::ambient_now()
-                        .naive_utc()
+                    ::autumn_web::time::bridge::naive_utc(::autumn_web::time::ambient_now())
                         .checked_sub_signed(__chrono_duration)
                         .expect(concat!(
                             "retention `after` duration is too large to compute a valid \
@@ -641,8 +638,7 @@ pub(crate) fn emit_retention(
                                     #purge_after,
                                     "\"))]"
                                 ));
-                        ::autumn_web::time::ambient_now()
-                            .naive_utc()
+                        ::autumn_web::time::bridge::naive_utc(::autumn_web::time::ambient_now())
                             .checked_sub_signed(__chrono_duration)
                             .expect(concat!(
                                 "retention `purge_deleted_after` duration is too large to \

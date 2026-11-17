@@ -34,6 +34,16 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::JiffBridge as _;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
@@ -619,6 +629,11 @@ mod sql_rows {
 /// database of a `SQLite` app.
 #[cfg(feature = "sqlite")]
 mod sql_store {
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use crate::time::bridge::ChronoBridge as _;
     use diesel::RunQueryDsl as _;
     use diesel::sql_types::{BigInt, Integer, Text};
     use diesel_async::pooled_connection::deadpool::Pool;
@@ -679,7 +694,7 @@ mod sql_store {
             &self,
             decide: impl FnOnce(&mut OwnershipTable, i64) -> Result<T, OwnershipError> + Send + 'static,
         ) -> Result<T, OwnershipError> {
-            let now_ms = self.clock.now().timestamp_millis();
+            let now_ms = self.clock.now().to_chrono().timestamp_millis();
             let mut conn = self.pool.get().await.map_err(store_error)?;
             conn.spawn_blocking(move |conn| {
                 conn.immediate_transaction(|conn| {
@@ -791,6 +806,11 @@ pub use sql_store::SqlSlotOwnership;
 /// The Postgres store, for a Postgres control database.
 #[cfg(feature = "postgres")]
 mod pg_store {
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use crate::time::bridge::ChronoBridge as _;
     use diesel::sql_types::{BigInt, Integer, Text};
     use diesel_async::pooled_connection::deadpool::Pool;
     use diesel_async::{
@@ -881,7 +901,7 @@ mod pg_store {
             &self,
             decide: impl FnOnce(&mut OwnershipTable, i64) -> Result<T, OwnershipError> + Send + 'static,
         ) -> Result<T, OwnershipError> {
-            let now_ms = self.clock.now().timestamp_millis();
+            let now_ms = self.clock.now().to_chrono().timestamp_millis();
             let mut conn = self.pool.get().await.map_err(store_error)?;
             conn.transaction::<_, diesel::result::Error, _>(async move |conn| {
                 diesel::sql_query(LOCK).execute(conn).await?;
@@ -1568,7 +1588,7 @@ impl MemoryOwnership {
         &self,
         decide: impl FnOnce(&mut OwnershipTable, i64) -> Result<T, OwnershipError>,
     ) -> Result<T, OwnershipError> {
-        let now = self.clock.now().timestamp_millis();
+        let now = self.clock.now().to_chrono().timestamp_millis();
         let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
         let mut after = table.clone();
         let decided = decide(&mut after, now);
@@ -1870,7 +1890,11 @@ mod tests {
     }
 
     fn clock_at(ms: i64) -> crate::time::TickingClock {
-        crate::time::TickingClock::starting_at(chrono::DateTime::from_timestamp_millis(ms).unwrap())
+        crate::time::TickingClock::starting_at(
+            chrono::DateTime::from_timestamp_millis(ms)
+                .unwrap()
+                .to_jiff(),
+        )
     }
 
     async fn store(dir: &std::path::Path, clock: &crate::time::TickingClock) -> SqlSlotOwnership {
@@ -3464,7 +3488,7 @@ mod tests {
                 .replicated_through(&key)
                 .expect("A shipped under its epoch");
             assert!(
-                committed.iter().any(|(_, at)| *at > through),
+                committed.iter().any(|(_, at)| *at > through.to_jiff()),
                 "the last writes are not shipped yet"
             );
 
@@ -3474,7 +3498,7 @@ mod tests {
             let db_b = b.fleet.open(&key).await.unwrap();
             let restored = bodies(&db_b).await;
             for (body, at) in &committed {
-                if *at <= through {
+                if *at <= through.to_jiff() {
                     assert!(
                         restored.contains(body),
                         "{body} at {at} <= {through}: {restored:?}"

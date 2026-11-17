@@ -61,6 +61,11 @@
 
 #![cfg(feature = "mcp")]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::Write as _;
@@ -1741,14 +1746,20 @@ fn serve_task_method(
     // A task of another caller gives the same error as an unknown task, so a
     // caller cannot find out that the ID exists.
     let found = match method {
-        "tasks/get" => server.tasks.get(task_id, &owner, now),
-        "tasks/cancel" => server.tasks.cancel(task_id, &owner, now).then(ack),
+        "tasks/get" => server.tasks.get(task_id, &owner, now.to_chrono()),
+        "tasks/cancel" => server
+            .tasks
+            .cancel(task_id, &owner, now.to_chrono())
+            .then(ack),
         // `inputResponses` is required. Autumn never asks for input, so no
         // key is outstanding. The spec says to ignore such keys.
         _ if !params.get("inputResponses").is_some_and(Value::is_object) => {
             return error(id, -32602, "`inputResponses` must be a JSON object");
         }
-        _ => server.tasks.contains(task_id, &owner, now).then(ack),
+        _ => server
+            .tasks
+            .contains(task_id, &owner, now.to_chrono())
+            .then(ack),
     };
     found.map_or_else(
         || {
@@ -1812,7 +1823,12 @@ fn check_rate_cap(server: &McpServer, tool: &McpTool) -> Result<(), String> {
     };
     server
         .rate_limiter
-        .check(grant.name, grant.location, cap, server.state.clock().now())
+        .check(
+            grant.name,
+            grant.location,
+            cap,
+            server.state.clock().now().to_chrono(),
+        )
         .map_err(|wait| {
             format!(
                 "rate cap {rate} for grant {} exceeded; retry in {wait}s",
@@ -2815,7 +2831,10 @@ fn reserve_task(
         .or_else(|| ctx.peer.map(|peer| peer.ip()))
         .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string());
     let now = server.state.clock().now();
-    let Some(created) = server.tasks.create(&task_id, owner, &quota, now) else {
+    let Some(created) = server
+        .tasks
+        .create(&task_id, owner, &quota, now.to_chrono())
+    else {
         tracing::warn!(
             tool = %tool,
             "MCP task store is full; the tool call runs as a blocking call"
@@ -2853,7 +2872,7 @@ fn spawn_task(
             let state = tasks::TaskState::Failed(error, "The task TTL ended.".to_owned());
             server
                 .tasks
-                .finish(&job_id, state, server.state.clock().now());
+                .finish(&job_id, state, server.state.clock().now().to_chrono());
             return;
         };
         let Ok((mut result, mut outcome, disposition, permit)) = ran else {
@@ -2863,7 +2882,7 @@ fn spawn_task(
             let state = tasks::TaskState::Failed(error, "The tool handler panicked.".to_owned());
             server
                 .tasks
-                .finish(&job_id, state, server.state.clock().now());
+                .finish(&job_id, state, server.state.clock().now().to_chrono());
             return;
         };
         // The reference client reads `resultType` on the result.
@@ -2875,7 +2894,7 @@ fn spawn_task(
         let state = tasks::TaskState::Completed(Arc::new(result));
         server
             .tasks
-            .finish(&job_id, state, server.state.clock().now());
+            .finish(&job_id, state, server.state.clock().now().to_chrono());
         drop(permit);
         outcome.record(disposition).await;
     });
@@ -2885,7 +2904,9 @@ fn spawn_task(
     let sweep_server = Arc::clone(server);
     tokio::spawn(async move {
         tokio::time::sleep(ttl).await;
-        sweep_server.tasks.sweep(sweep_server.state.clock().now());
+        sweep_server
+            .tasks
+            .sweep(sweep_server.state.clock().now().to_chrono());
     });
 }
 

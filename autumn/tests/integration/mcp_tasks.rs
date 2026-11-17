@@ -5,6 +5,11 @@
 
 #![cfg(feature = "mcp")]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -505,7 +510,10 @@ async fn update_needs_an_input_responses_object() {
 async fn expired_task_is_not_found() {
     use chrono::TimeZone as _;
     let clock = autumn_web::time::TickingClock::starting_at(
-        chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .unwrap()
+            .to_jiff(),
     );
     let client = TestApp::new()
         .routes(routes![build_report])

@@ -991,6 +991,11 @@ pub mod test_support {
         AppInfo, BindValue, CAPSULE_FORMAT_VERSION, Capsule, CapsuleBody, CapsuleDb,
         CapsuleEffects, CapsuleOutcome, CapsuleRequest, ConnectionTape, Exchange, ExchangeProtocol,
     };
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use crate::time::bridge::ChronoBridge as _;
 
     /// An extended-protocol exchange with prebuilt backend frames.
     #[must_use]
@@ -1058,7 +1063,7 @@ pub mod test_support {
         Capsule {
             format_version: CAPSULE_FORMAT_VERSION,
             id: "fixture".to_owned(),
-            captured_at: crate::time::ambient_now(),
+            captured_at: crate::time::ambient_now().to_chrono(),
             autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
             app: AppInfo::default(),
             request,

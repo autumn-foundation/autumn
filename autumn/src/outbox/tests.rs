@@ -1,4 +1,9 @@
 use super::*;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 
 #[test]
 fn sqlite_placeholders_follow_bind_order() {
@@ -159,7 +164,8 @@ mod sqlite {
     async fn fixture(config: OutboxConfig, handlers: OutboxHandlers) -> Fixture {
         let substrate = SqliteSubstrate::new().expect("substrate");
         ensure_schema(&substrate.pool()).await.expect("schema");
-        let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
+        let clock =
+            TickingClock::starting_at(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap().to_jiff());
         let state = AppState::for_test()
             .with_pool(substrate.pool())
             .with_clock(Arc::new(clock.clone()))
@@ -1084,7 +1090,7 @@ mod sqlite {
         handlers.insert("t", |_, _| async { Ok(()) });
         let fx = fixture(OutboxConfig::default(), handlers).await;
         let pool = fx.state.pool().unwrap().clone();
-        let now = to_millis(fx.clock.now()).to_string();
+        let now = to_millis(fx.clock.now().to_chrono()).to_string();
         let mut conn = pool.get().await.unwrap();
         if !with_claim_index {
             conn.batch_execute("DROP INDEX IF EXISTS idx_autumn_outbox_claim")

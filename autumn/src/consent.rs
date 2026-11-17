@@ -67,6 +67,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::convert::Infallible;
 
 use axum::extract::FromRequestParts;
@@ -359,7 +364,7 @@ pub fn reject_non_essential_cookie(policy_version: u32) -> String {
 }
 
 fn build_consent_cookie(categories: &[&str], policy_version: u32) -> String {
-    let decided_at = crate::time::ambient_now().to_rfc3339();
+    let decided_at = crate::time::ambient_now().to_chrono().to_rfc3339();
     let value = encode_cookie_value(policy_version, &decided_at, categories);
     format!(
         "{CONSENT_COOKIE_NAME}={value}; Path=/; Max-Age={MAX_AGE_SECS}; HttpOnly; Secure; SameSite=Lax"

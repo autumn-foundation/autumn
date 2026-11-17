@@ -32,6 +32,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -713,7 +718,7 @@ impl SqliteJobTrackingStore {
     }
 
     fn now_ms(&self) -> i64 {
-        self.clock.now().timestamp_millis()
+        self.clock.now().to_chrono().timestamp_millis()
     }
 
     fn expires_at_ms(&self, now_ms: i64) -> i64 {
@@ -820,7 +825,7 @@ impl SqliteJobTrackingStore {
         // One clock sample for the record's `updated_at` and the column: `reset_for_retry`
         // compares the two, so samples straddling a millisecond would break its swap.
         let now = self.clock.now();
-        let now_ms = now.timestamp_millis();
+        let now_ms = now.to_chrono().timestamp_millis();
         let mut conn = self.conn().await?;
         let row = diesel::sql_query(
             "SELECT record, version FROM autumn_job_tracking \
@@ -853,7 +858,7 @@ impl SqliteJobTrackingStore {
             return Ok(true);
         }
         f(&mut record);
-        record.updated_at = now;
+        record.updated_at = now.to_chrono();
         let payload = serde_json::to_string(&record).map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "job tracking serialize failed: {error}"
@@ -909,8 +914,8 @@ impl JobTrackingStore for SqliteJobTrackingStore {
             use diesel_async::RunQueryDsl as _;
 
             let now = self.clock.now();
-            let now_ms = now.timestamp_millis();
-            let payload = Self::pending_record(owner, now)?;
+            let now_ms = now.to_chrono().timestamp_millis();
+            let payload = Self::pending_record(owner, now.to_chrono())?;
             let mut conn = self.conn().await?;
             diesel::sql_query(
                 "INSERT INTO autumn_job_tracking (key, record, updated_at, expires_at, version) \
@@ -954,8 +959,8 @@ impl JobTrackingStore for SqliteJobTrackingStore {
             use diesel_async::RunQueryDsl as _;
 
             let now = self.clock.now();
-            let now_ms = now.timestamp_millis();
-            let payload = Self::pending_record(owner, now)?;
+            let now_ms = now.to_chrono().timestamp_millis();
+            let payload = Self::pending_record(owner, now.to_chrono())?;
             let mut conn = self.conn().await?;
             // Compare-and-swap, so a retry that settles before this call returns is not clobbered.
             diesel::sql_query(
@@ -1561,9 +1566,9 @@ impl InMemoryJobTrackingStore {
     pub fn new(ttl_secs: u64) -> Self {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
-            // `TimeDelta::seconds` panics above `i64::MAX / 1_000`, so a plain
-            // `try_from(..).unwrap_or(i64::MAX)` would crash on a huge `ttl_secs`.
-            ttl: crate::time_math::saturating_time_delta_secs(ttl_secs),
+            // A huge `ttl_secs` clamps to the longest duration instead of
+            // wrapping.
+            ttl: crate::time_math::saturating_duration_secs(ttl_secs).to_chrono(),
             clock: Arc::new(SystemClock),
             creates_since_sweep: Arc::new(AtomicU64::new(0)),
         }
@@ -1581,7 +1586,7 @@ impl InMemoryJobTrackingStore {
     }
 
     fn is_live(&self, entry: &MemoryEntry) -> bool {
-        entry.expires_at > self.clock.now()
+        entry.expires_at > self.clock.now().to_chrono()
     }
 
     #[cfg(test)]
@@ -1605,7 +1610,8 @@ impl InMemoryJobTrackingStore {
             key.to_owned(),
             MemoryEntry {
                 record,
-                expires_at: crate::time_math::saturating_dt_add(now, self.ttl),
+                expires_at: crate::time_math::saturating_ts_add(now.to_jiff(), self.ttl.to_jiff())
+                    .to_chrono(),
                 version,
             },
         );
@@ -1632,8 +1638,10 @@ impl InMemoryJobTrackingStore {
             && self.is_live(entry)
         {
             f(&mut entry.record);
-            entry.record.updated_at = now;
-            entry.expires_at = crate::time_math::saturating_dt_add(now, self.ttl);
+            entry.record.updated_at = now.to_chrono();
+            entry.expires_at =
+                crate::time_math::saturating_ts_add(now.to_chrono().to_jiff(), self.ttl.to_jiff())
+                    .to_chrono();
             entry.version = entry.version.saturating_add(1);
         }
     }
@@ -1665,9 +1673,13 @@ impl InMemoryJobTrackingStore {
                         result: None,
                         error: None,
                         owner,
-                        updated_at: now,
+                        updated_at: now.to_chrono(),
                     },
-                    expires_at: crate::time_math::saturating_dt_add(now, self.ttl),
+                    expires_at: crate::time_math::saturating_ts_add(
+                        now.to_chrono().to_jiff(),
+                        self.ttl.to_jiff(),
+                    )
+                    .to_chrono(),
                     version,
                 },
             );
@@ -1686,9 +1698,9 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
                 result: None,
                 error: None,
                 owner,
-                updated_at: now,
+                updated_at: now.to_chrono(),
             };
-            self.insert_and_maybe_sweep(key, record, now);
+            self.insert_and_maybe_sweep(key, record, now.to_chrono());
             Ok(())
         })
     }
@@ -1836,7 +1848,7 @@ impl RedisJobTrackingStore {
                 return Ok(());
             };
             f(&mut record);
-            record.updated_at = crate::time::ambient_now();
+            record.updated_at = crate::time::ambient_now().to_chrono();
             if self
                 .write_if_unchanged(key, RetryToken::new(version), &record)
                 .await?
@@ -1902,7 +1914,7 @@ impl JobTrackingStore for RedisJobTrackingStore {
                 result: None,
                 error: None,
                 owner,
-                updated_at: crate::time::ambient_now(),
+                updated_at: crate::time::ambient_now().to_chrono(),
             };
             // A fresh token, so a reset holding the old record's one no-ops.
             let version = self
@@ -1935,7 +1947,7 @@ impl JobTrackingStore for RedisJobTrackingStore {
                 result: None,
                 error: None,
                 owner,
-                updated_at: crate::time::ambient_now(),
+                updated_at: crate::time::ambient_now().to_chrono(),
             };
             self.write_if_unchanged(key, expected, &record)
                 .await
@@ -2082,7 +2094,7 @@ impl PgJobTrackingStore {
                 ))
             })?;
         f(&mut record);
-        record.updated_at = now;
+        record.updated_at = now.to_chrono();
         let payload = serde_json::to_string(&record).map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "job tracking serialize failed: {error}"
@@ -2097,7 +2109,7 @@ impl PgJobTrackingStore {
         )
         .bind::<diesel::sql_types::Text, _>(key)
         .bind::<diesel::sql_types::Text, _>(&payload)
-        .bind::<diesel::sql_types::Timestamptz, _>(now)
+        .bind::<diesel::sql_types::Timestamptz, _>(now.to_chrono())
         .bind::<diesel::sql_types::BigInt, _>(self.ttl_secs_clamped())
         .execute(&mut *conn)
         .await
@@ -2122,7 +2134,7 @@ impl JobTrackingStore for PgJobTrackingStore {
                 result: None,
                 error: None,
                 owner,
-                updated_at: now,
+                updated_at: now.to_chrono(),
             };
             let payload = serde_json::to_string(&record).map_err(|error| {
                 AutumnError::internal_server_error_msg(format!(
@@ -2141,7 +2153,7 @@ impl JobTrackingStore for PgJobTrackingStore {
             )
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Text, _>(&payload)
-            .bind::<diesel::sql_types::Timestamptz, _>(now)
+            .bind::<diesel::sql_types::Timestamptz, _>(now.to_chrono())
             .bind::<diesel::sql_types::BigInt, _>(self.ttl_secs_clamped())
             .execute(&mut *conn)
             .await
@@ -2179,7 +2191,7 @@ impl JobTrackingStore for PgJobTrackingStore {
                 result: None,
                 error: None,
                 owner,
-                updated_at: now,
+                updated_at: now.to_chrono(),
             };
             let payload = serde_json::to_string(&record).map_err(|error| {
                 AutumnError::internal_server_error_msg(format!(
@@ -2196,7 +2208,7 @@ impl JobTrackingStore for PgJobTrackingStore {
             )
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Text, _>(&payload)
-            .bind::<diesel::sql_types::Timestamptz, _>(now)
+            .bind::<diesel::sql_types::Timestamptz, _>(now.to_chrono())
             .bind::<diesel::sql_types::BigInt, _>(self.ttl_secs_clamped())
             .bind::<diesel::sql_types::BigInt, _>(token_to_db(expected))
             .execute(&mut *conn)
@@ -2344,15 +2356,15 @@ mod tests {
 
     #[test]
     fn extreme_ttl_secs_clamps_to_a_representable_time_delta() {
-        // The shared helper is what keeps `TimeDelta::seconds`' panic out of
-        // the tracking store's constructors.
+        // The shared helper keeps a huge TTL from wrapping in the tracking
+        // store's constructors.
         assert_eq!(
-            crate::time_math::saturating_time_delta_secs(86_400),
-            chrono::TimeDelta::seconds(86_400)
+            crate::time_math::saturating_duration_secs(86_400),
+            crate::time::SignedDuration::from_secs(86_400)
         );
         assert_eq!(
-            crate::time_math::saturating_time_delta_secs(u64::MAX),
-            chrono::TimeDelta::MAX
+            crate::time_math::saturating_duration_secs(u64::MAX),
+            crate::time::SignedDuration::MAX
         );
     }
 
@@ -2429,7 +2441,8 @@ mod tests {
     #[tokio::test]
     async fn reset_for_retry_is_a_no_op_after_a_write_under_a_frozen_clock() {
         let at = chrono::Utc::now();
-        let store = InMemoryJobTrackingStore::new(60).with_clock(Arc::new(FixedClock::at(at)));
+        let store =
+            InMemoryJobTrackingStore::new(60).with_clock(Arc::new(FixedClock::at(at.to_jiff())));
         store
             .create("k1", TrackedJobOwner::Anonymous)
             .await
@@ -2808,14 +2821,14 @@ mod tests {
     async fn record_expires_after_ttl() {
         let start = chrono::Utc::now();
         let store = InMemoryJobTrackingStore::new(10)
-            .with_clock(std::sync::Arc::new(FixedClock::at(start)));
+            .with_clock(std::sync::Arc::new(FixedClock::at(start.to_jiff())));
         store
             .create("k1", TrackedJobOwner::Anonymous)
             .await
             .unwrap();
 
         let store = store.with_clock(std::sync::Arc::new(FixedClock::at(
-            start + chrono::TimeDelta::seconds(11),
+            (start + chrono::TimeDelta::seconds(11)).to_jiff(),
         )));
         assert!(store.get("k1").await.unwrap().is_none());
     }
@@ -2824,7 +2837,7 @@ mod tests {
     async fn terminal_write_refreshes_expiry() {
         let start = chrono::Utc::now();
         let store = InMemoryJobTrackingStore::new(10)
-            .with_clock(std::sync::Arc::new(FixedClock::at(start)));
+            .with_clock(std::sync::Arc::new(FixedClock::at(start.to_jiff())));
         store
             .create("k1", TrackedJobOwner::Anonymous)
             .await
@@ -2832,7 +2845,7 @@ mod tests {
 
         // Completing at t=8s must push expiry from t=10s to t=18s.
         let store = store.with_clock(std::sync::Arc::new(FixedClock::at(
-            start + chrono::TimeDelta::seconds(8),
+            (start + chrono::TimeDelta::seconds(8)).to_jiff(),
         )));
         store
             .complete("k1", serde_json::json!({"download_url": "/blob/abc.csv"}))
@@ -2841,7 +2854,7 @@ mod tests {
 
         // t=15s: past the original TTL, but within the refreshed window.
         let store = store.with_clock(std::sync::Arc::new(FixedClock::at(
-            start + chrono::TimeDelta::seconds(15),
+            (start + chrono::TimeDelta::seconds(15)).to_jiff(),
         )));
         let record = store.get("k1").await.unwrap();
         assert!(
@@ -2853,15 +2866,15 @@ mod tests {
     #[tokio::test]
     async fn write_to_expired_key_is_a_no_op() {
         let start = chrono::Utc::now();
-        let store =
-            InMemoryJobTrackingStore::new(5).with_clock(std::sync::Arc::new(FixedClock::at(start)));
+        let store = InMemoryJobTrackingStore::new(5)
+            .with_clock(std::sync::Arc::new(FixedClock::at(start.to_jiff())));
         store
             .create("k1", TrackedJobOwner::Anonymous)
             .await
             .unwrap();
 
         let store = store.with_clock(std::sync::Arc::new(FixedClock::at(
-            start + chrono::TimeDelta::seconds(6),
+            (start + chrono::TimeDelta::seconds(6)).to_jiff(),
         )));
         // Expired: reads see it as gone, and writes must not resurrect it.
         store.set_progress("k1", 50, None).await.unwrap();
@@ -2871,15 +2884,15 @@ mod tests {
     #[tokio::test]
     async fn expired_entries_are_evicted_not_just_filtered() {
         let start = chrono::Utc::now();
-        let store =
-            InMemoryJobTrackingStore::new(1).with_clock(std::sync::Arc::new(FixedClock::at(start)));
+        let store = InMemoryJobTrackingStore::new(1)
+            .with_clock(std::sync::Arc::new(FixedClock::at(start.to_jiff())));
         store
             .create("expired-key", TrackedJobOwner::Anonymous)
             .await
             .unwrap();
 
         let store = store.with_clock(std::sync::Arc::new(FixedClock::at(
-            start + chrono::TimeDelta::seconds(2),
+            (start + chrono::TimeDelta::seconds(2)).to_jiff(),
         )));
         assert!(
             store.get("expired-key").await.unwrap().is_none(),

@@ -258,6 +258,11 @@
 //! | [`acting_as`](TestClient::acting_as) / [`login_as`](TestClient::login_as) | `actingAs` | `sign_in` | `force_login` | `log_in_user` |
 //! | [`log_out`](TestClient::log_out) | `Auth::logout` | `sign_out` | `logout` | `log_out_user` |
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt;
@@ -1828,16 +1833,17 @@ impl TestApp {
     ///
     /// ```rust,no_run
     /// use autumn_web::test::TestApp;
-    /// use autumn_web::time::{FixedClock, TickingClock};
-    /// use chrono::{TimeZone, Utc};
+    /// use autumn_web::time::{FixedClock, TickingClock, Timestamp};
+    ///
+    /// let start: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
     ///
     /// // Pin to a fixed instant:
     /// let _client = TestApp::new()
-    ///     .with_clock(FixedClock::at(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap()))
+    ///     .with_clock(FixedClock::at(start))
     ///     .build();
     ///
     /// // Step forward in time:
-    /// let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
+    /// let clock = TickingClock::starting_at(start);
     /// let client = TestApp::new()
     ///     .with_clock(clock.clone())
     ///     .build();
@@ -2985,13 +2991,13 @@ impl TestClient {
     ///
     /// ```rust,no_run
     /// use autumn_web::test::TestApp;
-    /// use autumn_web::time::TickingClock;
-    /// use chrono::{TimeZone, Utc};
+    /// use autumn_web::time::{TickingClock, Timestamp};
     /// use std::time::Duration;
     ///
     /// # #[tokio::main]
     /// # async fn main() {
-    /// let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
+    /// let start: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
+    /// let clock = TickingClock::starting_at(start);
     /// let client = TestApp::new().with_clock(clock).build();
     ///
     /// client.advance_clock(Duration::from_secs(86400)); // advance 1 day
@@ -3876,7 +3882,7 @@ impl RequestBuilder {
                 .map_or_else(crate::time::ambient_now, |c| c.now());
             let cookie_header = {
                 let mut jar = jar.lock().expect("cookie jar mutex poisoned");
-                jar.retain(|_, cookie| cookie.expires_at.is_none_or(|t| t > now));
+                jar.retain(|_, cookie| cookie.expires_at.is_none_or(|t| t > now.to_chrono()));
                 jar.iter()
                     .map(|(name, cookie)| format!("{name}={}", cookie.value))
                     .collect::<Vec<_>>()
@@ -3954,7 +3960,7 @@ impl RequestBuilder {
             let mut jar = jar.lock().expect("cookie jar mutex poisoned");
             for (name, value) in &headers {
                 if name.eq_ignore_ascii_case("set-cookie") {
-                    apply_set_cookie(&mut jar, value, now);
+                    apply_set_cookie(&mut jar, value, now.to_chrono());
                 }
             }
         }

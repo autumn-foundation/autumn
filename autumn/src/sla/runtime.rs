@@ -1,5 +1,10 @@
 //! The plugin, the extractor and the jobs of the SLA engine.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -265,7 +270,7 @@ impl Sla {
     /// The current instant of the injected clock.
     #[must_use]
     pub fn now(&self) -> DateTime<Utc> {
-        self.state.clock().now()
+        self.state.clock().now().to_chrono()
     }
 
     /// The calendar called `name`.

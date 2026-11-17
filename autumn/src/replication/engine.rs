@@ -73,6 +73,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -462,7 +467,7 @@ impl Replicator {
             .iter()
             .filter_map(|key| segment::parse_epoch_marker_key(&root, key))
             .max();
-        self.fence_checked_at = Some(self.clock.now());
+        self.fence_checked_at = Some(self.clock.now().to_chrono());
         match newest {
             Some(newest) if newest > epoch => {
                 self.fenced_by = Some(newest);
@@ -498,6 +503,7 @@ impl Replicator {
             && self.fence_checked_at.is_none_or(|at| {
                 self.clock
                     .now()
+                    .to_chrono()
                     .signed_duration_since(at)
                     .to_std()
                     // A clock that stepped back checks now.
@@ -533,7 +539,8 @@ impl Replicator {
 
             if let Some(interval) = self.settings.verify_interval {
                 let due = now
-                    .signed_duration_since(last_verify)
+                    .to_chrono()
+                    .signed_duration_since(last_verify.to_chrono())
                     .to_std()
                     .is_ok_and(|elapsed| elapsed >= interval);
                 if due {
@@ -602,8 +609,9 @@ impl Replicator {
         if let Err(e) = &result {
             let now = self.clock.now();
             // A reading at or below the bound: the clock stepped back.
-            self.status.forget_if_ahead_of(now);
-            self.status.record_tick_error(e.to_string(), now);
+            self.status.forget_if_ahead_of(now.to_chrono());
+            self.status
+                .record_tick_error(e.to_string(), now.to_chrono());
         }
         result
     }
@@ -666,11 +674,11 @@ impl Replicator {
         let (pending, caught_up) = (tail.pending, tail.caught_up);
         report.pending_bytes = pending;
         // A reading at or below the bound: the clock stepped back.
-        self.status.forget_if_ahead_of(through);
+        self.status.forget_if_ahead_of(through.to_chrono());
         if tail.proven
             && caught_up
             && self.fenced_by.is_none()
-            && let Some(bound) = status::bound_below(through)
+            && let Some(bound) = status::bound_below(through.to_chrono())
         {
             self.status.record_replicated_through(bound);
         }
@@ -682,18 +690,19 @@ impl Replicator {
         let now = self.clock.now();
         let mut index_rotated = false;
         report.checkpointed =
-            self.maybe_checkpoint(&db, &wal_path, pending, now, &mut index_rotated)?;
+            self.maybe_checkpoint(&db, &wal_path, pending, now.to_chrono(), &mut index_rotated)?;
         report.index_rotated = index_rotated;
 
         // Prune every tick, since on a quiet database one generation outlives many ticks. A prune
         // failure does not fail the tick: the data is still offsite, and the next tick retries.
-        match self.prune(now) {
+        match self.prune(now.to_chrono()) {
             Ok(pruned) => report.pruned_generations = pruned,
             Err(e) => tracing::warn!(error = %e, "SQLite replica retention sweep failed"),
         }
 
         if caught_up {
-            self.status.record_tick_ok(pending, self.clock.now());
+            self.status
+                .record_tick_ok(pending, self.clock.now().to_chrono());
         } else {
             self.status.record_tick_behind(pending);
         }
@@ -894,7 +903,7 @@ impl Replicator {
                         "SQLite replica verification FAILED — the replica may not be restorable"
                     );
                 }
-                status.record_verification(result, clock.now());
+                status.record_verification(result, clock.now().to_chrono());
             });
         if let Err(e) = spawned {
             tracing::warn!("could not start the SQLite replica verification thread: {e}");
@@ -1000,6 +1009,7 @@ impl Replicator {
         // newest generation at the destination, which also holds across a restart.
         let floor_ms = self.newest_generation_ms()?;
         let created_ms = now
+            .to_chrono()
             .timestamp_millis()
             .max(floor_ms.map_or(i64::MIN, |ms| ms.saturating_add(1)));
         let id = segment::generation_id(created_ms, rand::random::<u64>());
@@ -1025,7 +1035,7 @@ impl Replicator {
         let meta = SnapshotMeta {
             version: segment::LAYOUT_VERSION,
             generation: id.clone(),
-            created_at: now.to_rfc3339(),
+            created_at: now.to_chrono().to_rfc3339(),
             created_ms,
             sha256,
             uncompressed_len,
@@ -1044,13 +1054,13 @@ impl Replicator {
             destination = %self.destination.describe(),
             "opened a new SQLite replication generation"
         );
-        self.status.record_generation(&id, now);
+        self.status.record_generation(&id, now.to_chrono());
         self.state = Some(GenerationState {
             id,
             index: 0,
             salt: None,
             page_size: 0,
-            started_at: now,
+            started_at: now.to_chrono(),
             next_seq: 0,
             shipped_offset: 0,
             cursor: None,
@@ -1132,8 +1142,8 @@ impl Replicator {
             db_size_pages: outcome.last_commit_db_pages,
             salt1: header.salt1,
             salt2: header.salt2,
-            created_at: now.to_rfc3339(),
-            created_ms: now.timestamp_millis(),
+            created_at: now.to_chrono().to_rfc3339(),
+            created_ms: now.to_chrono().timestamp_millis(),
             sha256: segment::sha256_hex(raw),
             uncompressed_len: raw.len() as u64,
         };
@@ -1167,7 +1177,7 @@ impl Replicator {
         state.shipped_offset = outcome.last_commit_end;
         state.cursor = Some(outcome.last_commit_cursor);
         state.next_seq = state.next_seq.saturating_add(1);
-        self.status.record_segment(bytes, now);
+        self.status.record_segment(bytes, now.to_chrono());
         Ok((1, bytes))
     }
 

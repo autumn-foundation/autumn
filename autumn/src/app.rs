@@ -32,6 +32,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::any::{Any, TypeId};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -10285,7 +10290,7 @@ pub(crate) fn start_task_scheduler_with_config(
                     loop {
                         state.task_registry.record_next_run_at(
                             &name,
-                            &format_next_task_run_after(state.clock().now(), delay),
+                            &format_next_task_run_after(state.clock().now().to_chrono(), delay),
                         );
                         tokio::select! {
                             // Fixed branch order, so a sim replays it (#3067).
@@ -10374,7 +10379,7 @@ fn send_ws_sys_task_msg(
         let mut msg = serde_json::json!({
             "event": event,
             "task": name,
-            "timestamp": state.clock().now().to_rfc3339(),
+            "timestamp": state.clock().now().to_chrono().to_rfc3339(),
         });
         if let Some(map) = msg.as_object_mut() {
             for (k, v) in extra {
@@ -10913,11 +10918,11 @@ async fn run_cron_task_loop(
             )
         })
         .unwrap_or(chrono_tz::UTC);
-    let mut cursor = state.clock().now().with_timezone(&timezone);
+    let mut cursor = state.clock().now().to_chrono().with_timezone(&timezone);
     let deferring = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
-        let now = state.clock().now().with_timezone(&timezone);
+        let now = state.clock().now().to_chrono().with_timezone(&timezone);
         let scheduled_at = match next_cron_occurrence_after(&cron, &cursor, &now) {
             Ok(scheduled_at) => scheduled_at,
             Err(error) => {
@@ -10929,13 +10934,13 @@ async fn run_cron_task_loop(
             &name,
             &scheduled_at.with_timezone(&chrono::Utc).to_rfc3339(),
         );
-        let sleep_for = cron_sleep_duration_until(state.clock().now(), &scheduled_at);
+        let sleep_for = cron_sleep_duration_until(state.clock().now().to_chrono(), &scheduled_at);
         tokio::select! {
             // Fixed branch order, so a sim replays it (#3067).
             biased;
             () = shutdown.cancelled() => break,
             () = tokio::time::sleep(sleep_for) => {
-                let woke_at = state.clock().now().with_timezone(&timezone);
+                let woke_at = state.clock().now().to_chrono().with_timezone(&timezone);
                 match cron_occurrence_is_overdue(&cron, &scheduled_at, &woke_at) {
                     Ok(true) => {
                         tracing::warn!(
@@ -16357,7 +16362,7 @@ mod fleet_boot_tests {
         let rows = store.rows().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert!(
-            rows[0].lease_expires_ms <= state.clock().now().timestamp_millis(),
+            rows[0].lease_expires_ms <= state.clock().now().to_chrono().timestamp_millis(),
             "released at shutdown"
         );
     }
@@ -16416,7 +16421,7 @@ mod fleet_boot_tests {
         runtime.ownership.expect("ownership runs").finish().await;
         let rows = store.rows().await.unwrap();
         assert!(
-            rows[0].lease_expires_ms <= state.clock().now().timestamp_millis(),
+            rows[0].lease_expires_ms <= state.clock().now().to_chrono().timestamp_millis(),
             "released on the installed store"
         );
     }
@@ -16473,7 +16478,7 @@ mod fleet_boot_tests {
         let store = SqlSlotOwnership::new(state.pool().cloned().unwrap(), state.clock_arc());
         let rows = store.rows().await.unwrap();
         assert!(
-            rows[0].lease_expires_ms > state.clock().now().timestamp_millis(),
+            rows[0].lease_expires_ms > state.clock().now().to_chrono().timestamp_millis(),
             "not released: the leases lapse"
         );
         shutdown.cancel();
@@ -24821,7 +24826,9 @@ mount = ["service"]
     /// `1_700_000_000`, so the window check lets the occurrence run.
     fn cron_test_state() -> AppState {
         AppState::for_test().with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
-            chrono::DateTime::from_timestamp(1_700_000_001, 0).expect("a valid timestamp"),
+            chrono::DateTime::from_timestamp(1_700_000_001, 0)
+                .expect("a valid timestamp")
+                .to_jiff(),
         )))
     }
 

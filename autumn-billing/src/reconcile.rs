@@ -27,6 +27,11 @@
 //! steps (dunning row, job) but not notifications or hooks.
 
 use autumn_web::AppState;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::ChronoBridge as _;
 use chrono::{DateTime, Utc};
 
 use crate::dunning;
@@ -82,7 +87,7 @@ pub async fn apply(
     service: &BillingService,
     event: BillingEvent,
 ) -> Result<ReconcileOutcome, BillingError> {
-    let now = state.clock().now();
+    let now = state.clock().now().to_chrono();
     let store = service.store();
     let kind = event.kind.label();
     let claim = store

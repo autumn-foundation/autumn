@@ -65,6 +65,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use lru::LruCache;
 use std::future::Future;
 use std::net::IpAddr;
@@ -775,7 +780,9 @@ impl Limiter {
     #[allow(clippy::unused_async)]
     async fn decide(&self, key: &str, burst: f64, rps: f64) -> Option<Decision> {
         match &self.backend {
-            BucketBackend::Memory(store) => Some(store.decide(key, self.clock.now(), burst, rps)),
+            BucketBackend::Memory(store) => {
+                Some(store.decide(key, self.clock.now().to_chrono(), burst, rps))
+            }
             #[cfg(feature = "redis")]
             BucketBackend::Redis(store) => store.decide(key, burst, rps).await,
         }
@@ -4526,7 +4533,7 @@ mod tests {
     async fn quota_headers_carry_exact_decimal_values_when_allowed_and_when_denied() {
         let now = Utc.timestamp_opt(1_748_736_000, 0).unwrap();
         let layer = RateLimitLayer::from_config(&cfg(true, 0.5, 2))
-            .with_clock(Arc::new(crate::time::FixedClock::at(now)));
+            .with_clock(Arc::new(crate::time::FixedClock::at(now.to_jiff())));
         let app = Router::new()
             .route("/", get(|| async { "ok" }))
             .layer(layer);

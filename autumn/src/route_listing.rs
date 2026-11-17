@@ -12,6 +12,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::JiffBridge as _;
 use serde::{Deserialize, Serialize};
 
 use crate::capacity::{POOL_DB, ResourceShape};
@@ -663,8 +668,8 @@ pub fn collect_route_infos(
                     })
                 },
                 |av| {
-                    let is_sunset = av.sunset_at.is_some_and(|s| now >= s);
-                    let is_dep = av.deprecated_at.is_some_and(|d| now >= d);
+                    let is_sunset = av.sunset_at.is_some_and(|s| now >= s.to_jiff());
+                    let is_dep = av.deprecated_at.is_some_and(|d| now >= d.to_jiff());
                     let status = if is_sunset {
                         "sunset"
                     } else if is_dep {

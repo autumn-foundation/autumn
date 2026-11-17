@@ -18,6 +18,11 @@
 //! than a coincidence, so a future drifting or jittering skew cannot quietly
 //! break it.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::ChronoBridge as _;
 use std::time::Duration;
 
 use autumn_web::prelude::*;
@@ -36,7 +41,7 @@ const ADVANCE: Duration = Duration::from_hours(24);
 /// Reads the injected (skewed) wall clock.
 #[get("/now")]
 async fn now_route(clock: Clock) -> String {
-    clock.now().to_rfc3339()
+    clock.now().to_chrono().to_rfc3339()
 }
 
 #[sim_test]

@@ -46,6 +46,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use chrono::{DateTime, Utc};
 
 use crate::session::Session;
@@ -94,7 +99,10 @@ impl Default for StepUpGlobalConfig {
 /// Call this after a successful initial login **and** after a successful
 /// re-authentication (reauth form submission).
 pub async fn set_last_strong_auth_at(session: &Session) {
-    let now = crate::time::ambient_now().timestamp().to_string();
+    let now = crate::time::ambient_now()
+        .to_chrono()
+        .timestamp()
+        .to_string();
     session.insert(STEP_UP_SESSION_KEY, now).await;
 }
 
@@ -127,7 +135,7 @@ pub async fn check_step_up(session: &Session, max_age_secs: u64) -> crate::Autum
     let last_auth: DateTime<Utc> = DateTime::from_timestamp(ts, 0)
         .ok_or_else(|| crate::AutumnError::unauthorized_msg("step-up authentication required"))?;
 
-    let age_secs = (crate::time::ambient_now() - last_auth).num_seconds();
+    let age_secs = (crate::time::ambient_now().to_chrono() - last_auth).num_seconds();
     // A negative age (timestamp in the future, e.g. clock skew) counts as expired.
     if u64::try_from(age_secs).map_or(true, |age| age > max_age_secs) {
         return Err(crate::AutumnError::unauthorized_msg(

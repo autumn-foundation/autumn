@@ -49,6 +49,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -223,7 +228,7 @@ fn admin_time(ms: Option<i64>) -> Option<String> {
 
 /// Current wall time in epoch milliseconds, from the injected clock.
 fn now_ms(state: &AppState) -> i64 {
-    state.clock().now().timestamp_millis()
+    state.clock().now().to_chrono().timestamp_millis()
 }
 
 /// Handle to the durable `SQLite` queue: the pool, plus a one-time schema
@@ -428,7 +433,7 @@ pub(super) async fn enqueue_job_at(
     let payload_str = serde_json::to_string(&payload).map_err(|error| {
         AutumnError::internal_server_error_msg(format!("serialize job payload: {error}"))
     })?;
-    let now = clock.now().timestamp_millis();
+    let now = clock.now().to_chrono().timestamp_millis();
     let run_at_ms = run_at.map_or(now, |due| due.timestamp_millis());
     let unique_ttl_ms = match constraints.unique_window {
         Some(JobUniquenessWindow::TtlMs(ms)) => Some(i64::try_from(ms).unwrap_or(i64::MAX)),
@@ -1170,7 +1175,7 @@ async fn renew_claim(
     };
     // Read the time after the connection wait so the wait does not age the claim. `MAX` keeps a
     // late renewal (stuck on the write lock, or from an earlier attempt) from moving it back.
-    let now = clock.now().timestamp_millis();
+    let now = clock.now().to_chrono().timestamp_millis();
     match diesel::sql_query(format!(
         "UPDATE autumn_jobs SET claimed_at = MAX(COALESCE(claimed_at, 0), ?) \
          WHERE id = ? AND claimed_by = ? AND status = '{STATUS_RUNNING}'"
@@ -1763,7 +1768,7 @@ impl SqliteJobAdminBackend {
             AutumnError::internal_server_error_msg(format!("sqlite admin pool error: {error}"))
         })?;
         let per_page = i64::try_from(query.per_page.clamp(1, 100)).unwrap_or(10);
-        let now = self.clock.now().timestamp_millis();
+        let now = self.clock.now().to_chrono().timestamp_millis();
 
         // `enqueued` and `scheduled` split one status by due time.
         let enqueued = admin_page(
@@ -1870,7 +1875,7 @@ impl SqliteJobAdminBackend {
         })?;
         // Restore a `pending`-window dedup key: claiming moved it to `pending_unique_key`, and
         // without it the retried job would wait undeduplicated.
-        let now = self.clock.now().timestamp_millis();
+        let now = self.clock.now().to_chrono().timestamp_millis();
         let updated = diesel::sql_query(format!(
             "UPDATE autumn_jobs \
              SET status = '{STATUS_ENQUEUED}', attempt = 1, run_at = ?, enqueued_at = ?, \
@@ -1935,7 +1940,7 @@ impl SqliteJobAdminBackend {
             "UPDATE autumn_jobs SET status = '{STATUS_DISCARDED}', finished_at = ? \
              WHERE id = ? AND status = '{STATUS_FAILED}'"
         ))
-        .bind::<diesel::sql_types::BigInt, _>(self.clock.now().timestamp_millis())
+        .bind::<diesel::sql_types::BigInt, _>(self.clock.now().to_chrono().timestamp_millis())
         .bind::<diesel::sql_types::Text, _>(id)
         .execute(&mut *conn)
         .await
@@ -1957,7 +1962,7 @@ impl SqliteJobAdminBackend {
         let mut conn = self.queue.ready().await?.get().await.map_err(|error| {
             AutumnError::internal_server_error_msg(format!("sqlite admin pool error: {error}"))
         })?;
-        let now = self.clock.now().timestamp_millis();
+        let now = self.clock.now().to_chrono().timestamp_millis();
         // The `enqueued` guard touches only unclaimed rows, so the gauge decrement below cannot
         // double-count the cancel a claimed job records at ack time.
         let cancelled = diesel::sql_query(format!(

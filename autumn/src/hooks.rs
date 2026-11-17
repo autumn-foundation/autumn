@@ -54,6 +54,11 @@
 //! - [`MutationContext`] -- carries actor identity, request ID, and
 //!   timestamp into every hook invocation.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::borrow::Cow;
 
 use serde::de::Deserializer;
@@ -127,7 +132,7 @@ impl MutationContext {
             // A `before_*` hook can still override this: hooks run after construction.
             actor: crate::current::Current::actor(),
             request_id: Some(uuid::Uuid::new_v4().to_string()),
-            now: crate::time::ambient_now(),
+            now: crate::time::ambient_now().to_chrono(),
             invalidate_keys: Vec::new(),
             idempotency_key: None,
         }

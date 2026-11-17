@@ -5,6 +5,11 @@
 //! transition correctly, with any timer due inside the crossed wall-clock window
 //! firing in virtual time.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::ChronoBridge as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -21,7 +26,7 @@ use chrono_tz::America::New_York;
 /// clock has advanced to.
 #[get("/now")]
 async fn now_route(clock: Clock) -> String {
-    clock.now().to_rfc3339()
+    clock.now().to_chrono().to_rfc3339()
 }
 
 /// `advance_to` a plain future UTC target moves the sim clock to *exactly* that

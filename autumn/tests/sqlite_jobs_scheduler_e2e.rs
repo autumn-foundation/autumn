@@ -50,6 +50,11 @@
 //! ```
 #![cfg(feature = "sqlite")]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -1721,7 +1726,9 @@ async fn sqlite_tracking_store_swaps_on_a_version_not_a_timestamp() {
 
     // A clock frozen at one instant: `updated_at` is identical for every write.
     let clock = std::sync::Arc::new(autumn_web::time::FixedClock::at(
-        chrono::DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid instant"),
+        chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+            .expect("valid instant")
+            .to_jiff(),
     ));
     let store = SqliteJobTrackingStore::new(pool.clone(), 3_600).with_clock(clock);
 
@@ -1804,7 +1811,9 @@ async fn sqlite_retry_reset_is_a_no_op_after_a_write_under_a_frozen_clock() {
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let pool = build_sqlite_pool(&tmp);
     let clock = std::sync::Arc::new(autumn_web::time::FixedClock::at(
-        chrono::DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid instant"),
+        chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+            .expect("valid instant")
+            .to_jiff(),
     ));
     let store = SqliteJobTrackingStore::new(pool, 3_600).with_clock(clock);
 
@@ -2807,10 +2816,11 @@ async fn sqlite_fixed_delay_tick_stays_claimed_for_its_delay() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let clock = autumn_web::time::TickingClock::starting_at(
-        chrono::Utc
+        (chrono::Utc
             .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
             .single()
-            .expect("valid date"),
+            .expect("valid date"))
+        .to_jiff(),
     );
     let coordinator = scheduler::SqliteLeaseSchedulerCoordinator::new(
         build_sqlite_pool(&tmp),
@@ -2865,10 +2875,11 @@ async fn sqlite_release_and_free_frees_only_its_own_row() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let clock = autumn_web::time::TickingClock::starting_at(
-        chrono::Utc
+        (chrono::Utc
             .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
             .single()
-            .expect("valid date"),
+            .expect("valid date"))
+        .to_jiff(),
     );
     let pool = build_sqlite_pool(&tmp);
     let build = |replica: &str| {
@@ -2935,10 +2946,11 @@ async fn sqlite_a_freed_deferred_tick_runs_on_one_replica() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let clock = autumn_web::time::TickingClock::starting_at(
-        chrono::Utc
+        (chrono::Utc
             .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
             .single()
-            .expect("valid date"),
+            .expect("valid date"))
+        .to_jiff(),
     );
     let pool = build_sqlite_pool(&tmp);
     let build = |replica: &str| {

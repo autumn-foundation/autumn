@@ -31,6 +31,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -630,7 +635,7 @@ async fn run_one_dataset(
     let cutoff = effective
         .window
         .and_then(|window| chrono::Duration::from_std(window).ok())
-        .map(|window| crate::time::ambient_now() - window);
+        .map(|window| crate::time::ambient_now().to_chrono() - window);
 
     let mut report = RetentionDatasetReport {
         dataset: dataset.key().to_owned(),

@@ -9,6 +9,11 @@
 
 #![cfg(all(feature = "sqlite", feature = "test-support", feature = "http-client"))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::ChronoBridge as _;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -455,7 +460,7 @@ fn inbox_request(
         .post(outbox::INBOX_PATH)
         .header("content-type", "application/json");
     if let Some(secret) = secret {
-        let timestamp = autumn_web::time::ambient_now().timestamp();
+        let timestamp = autumn_web::time::ambient_now().to_chrono().timestamp();
         request = request.header(
             outbox::SIGNATURE_HEADER,
             &outbox::inbox_signature(secret, timestamp, &body),
@@ -483,7 +488,7 @@ async fn inbox_rejects_a_bad_signature_and_an_unknown_topic_as_retryable() {
     .await
     .assert_status(401);
     // A changed body breaks the signature.
-    let timestamp = autumn_web::time::ambient_now().timestamp();
+    let timestamp = autumn_web::time::ambient_now().to_chrono().timestamp();
     client
         .post(outbox::INBOX_PATH)
         .header(

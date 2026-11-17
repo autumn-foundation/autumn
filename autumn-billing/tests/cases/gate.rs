@@ -2,6 +2,11 @@
 //!
 //! The store is seeded directly. No webhook runs here.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::time::Duration;
 
 use autumn_billing::SubscriptionStatus;
@@ -60,7 +65,7 @@ const fn hours(n: i64) -> chrono::Duration {
 }
 
 fn gate_routes(app: TestApp) -> TestApp {
-    app.with_clock(FixedClock::at(now()))
+    app.with_clock(FixedClock::at(now().to_jiff()))
         .routes(routes![pro, sso, any_plan])
 }
 

@@ -53,6 +53,11 @@
 //! `401 Unauthorized` before they reach the handler. It checks for the
 //! presence of a session key (default: `"user_id"`).
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 #[cfg(feature = "oauth2")]
 use std::collections::HashMap;
 use std::future::Future;
@@ -2097,7 +2102,7 @@ impl InMemoryApiTokenStore {
             principal_id: spec.principal_id.to_owned(),
             name: spec.name.to_owned(),
             scopes: spec.scopes.to_vec(),
-            created_at: self.clock.now(),
+            created_at: self.clock.now().to_chrono(),
             expires_at: spec.expires_at,
             last_used_at: None,
             revoked_at: None,
@@ -2113,7 +2118,7 @@ impl InMemoryApiTokenStore {
     /// Returns `None` for unknown, revoked, or expired tokens.
     fn resolve_used(&self, raw_token: &str) -> Option<VerifiedToken> {
         let hash = hash_api_token(raw_token);
-        let now = self.clock.now();
+        let now = self.clock.now().to_chrono();
         let mut guard = self.tokens.write().expect("api token store lock poisoned");
         let stored = guard.get_mut(&hash)?;
         if stored.revoked_at.is_some() || stored.expires_at.is_some_and(|exp| exp <= now) {
@@ -2157,7 +2162,7 @@ impl ApiTokenStore for InMemoryApiTokenStore {
     ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>> {
         Box::pin(async move {
             let hash = hash_api_token(raw_token);
-            let now = self.clock.now();
+            let now = self.clock.now().to_chrono();
             let mut guard = self.tokens.write().expect("api token store lock poisoned");
             if let Some(stored) = guard.get_mut(&hash) {
                 stored.revoked_at.get_or_insert(now);
@@ -2599,6 +2604,11 @@ pub const API_TOKEN_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 // The store is typed on `AsyncPgConnection`, so it needs the Postgres client.
 #[cfg(feature = "postgres")]
 mod db_store {
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use crate::time::bridge::ChronoBridge as _;
     use std::future::Future;
     use std::pin::Pin;
 
@@ -2762,7 +2772,7 @@ mod db_store {
         ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>> {
             Box::pin(async move {
                 let hash = hash_api_token(raw_token);
-                let now = self.clock.now().naive_utc();
+                let now = self.clock.now().to_chrono().naive_utc();
                 let mut conn = self.conn().await?;
                 diesel::update(api_tokens::table)
                     .filter(api_tokens::token_hash.eq(&hash))
@@ -2813,7 +2823,7 @@ mod db_store {
                 let old_hash = hash_api_token(raw_token);
                 let new_raw = generate_raw_token();
                 let new_hash = hash_api_token(&new_raw);
-                let now = self.clock.now().naive_utc();
+                let now = self.clock.now().to_chrono().naive_utc();
                 let mut conn = self.conn().await?;
                 // One statement, so revoke and replace are atomic. An unknown or revoked old hash
                 // updates no rows, inserts nothing and counts 0 (None). $3 is the store clock's
@@ -2854,7 +2864,7 @@ mod db_store {
         {
             Box::pin(async move {
                 let hash = hash_api_token(raw_token);
-                let now = self.clock.now().naive_utc();
+                let now = self.clock.now().to_chrono().naive_utc();
                 let mut conn = self.conn().await?;
                 // Live tokens only: not revoked, and either no expiry or not yet expired.
                 let row: Option<(
@@ -4265,6 +4275,11 @@ mod http_interceptor_task_local_tests {
 
 #[cfg(test)]
 mod api_token_tests {
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use crate::time::bridge::JiffBridge as _;
     use std::sync::Arc;
 
     use http::StatusCode;
@@ -4567,7 +4582,8 @@ mod api_token_tests {
     #[tokio::test]
     async fn expired_token_verifies_as_none() {
         let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let store = InMemoryApiTokenStore::default().with_clock(Arc::new(FixedClock::at(now)));
+        let store =
+            InMemoryApiTokenStore::default().with_clock(Arc::new(FixedClock::at(now.to_jiff())));
         let granted = scopes(&["posts:read"]);
         let raw = store
             .issue_scoped(IssueTokenSpec {
@@ -4586,7 +4602,7 @@ mod api_token_tests {
     #[tokio::test]
     async fn unexpired_token_verifies_then_records_last_used_at() {
         let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let clock = TickingClock::starting_at(start);
+        let clock = TickingClock::starting_at(start.to_jiff());
         let store = InMemoryApiTokenStore::default().with_clock(Arc::new(clock));
         let granted = scopes(&["posts:read"]);
         let raw = store

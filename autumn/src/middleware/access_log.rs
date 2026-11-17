@@ -683,8 +683,8 @@ mod tests {
     struct CountingClock(Arc<std::sync::atomic::AtomicUsize>);
 
     impl crate::time::ClockSource for CountingClock {
-        fn now(&self) -> chrono::DateTime<chrono::Utc> {
-            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+        fn now(&self) -> crate::time::Timestamp {
+            crate::time::Timestamp::UNIX_EPOCH
         }
 
         fn monotonic(&self) -> crate::time::MonotonicInstant {

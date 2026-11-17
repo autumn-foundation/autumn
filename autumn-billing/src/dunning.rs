@@ -7,6 +7,11 @@
 //! attempt, and the settle is last. A reconcile that settles the row while a
 //! retry is in flight wins.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::ChronoBridge as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -170,7 +175,7 @@ async fn run_retry(
         return Ok(());
     };
     if row.state == DunningState::Running {
-        if !is_stale_running(&row, now) {
+        if !is_stale_running(&row, now.to_chrono()) {
             // In flight elsewhere. Check again once it could be abandoned.
             tracing::debug!(
                 invoice_id,
@@ -183,8 +188,8 @@ async fn run_retry(
         }
         let mut reset = row.clone();
         reset.state = DunningState::Pending;
-        reset.next_attempt_at = now;
-        reset.updated_at = now;
+        reset.next_attempt_at = now.to_chrono();
+        reset.updated_at = now.to_chrono();
         if !store
             .settle_dunning(
                 invoice_id,
@@ -215,7 +220,7 @@ async fn run_retry(
         );
         return Ok(());
     }
-    if row.next_attempt_at > now {
+    if row.next_attempt_at > now.to_chrono() {
         tracing::debug!(
             invoice_id,
             due = %row.next_attempt_at,
@@ -224,7 +229,7 @@ async fn run_retry(
         return schedule(state, invoice_id, row.next_attempt_at).await;
     }
     if !store
-        .claim_dunning_attempt(invoice_id, row.attempt, now)
+        .claim_dunning_attempt(invoice_id, row.attempt, now.to_chrono())
         .await?
     {
         tracing::debug!(
@@ -235,8 +240,8 @@ async fn run_retry(
         return Ok(());
     }
     row.state = DunningState::Running;
-    row.updated_at = now;
-    match attempt(state, service, &row, now).await {
+    row.updated_at = now.to_chrono();
+    match attempt(state, service, &row, now.to_chrono()).await {
         Ok(()) => Ok(()),
         Err(error) => {
             tracing::warn!(
@@ -245,7 +250,7 @@ async fn run_retry(
                 error = %error,
                 "🍂 Autumn Billing: retry failed after the claim; row restored to pending"
             );
-            if let Err(restore) = restore_pending(service, &row, now).await {
+            if let Err(restore) = restore_pending(service, &row, now.to_chrono()).await {
                 tracing::error!(
                     invoice_id,
                     error = %restore,
@@ -706,7 +711,7 @@ async fn rearm_rows(state: &AppState, rows: &[DunningAttempt]) -> usize {
 /// Delete applied ledger rows older than [`EVENT_RETENTION`].
 async fn prune_events(state: &AppState, service: &BillingService) {
     let now = state.clock().now();
-    let Some(cutoff) = before(now, EVENT_RETENTION) else {
+    let Some(cutoff) = before(now.to_chrono(), EVENT_RETENTION) else {
         return;
     };
     match service.store().prune_events(cutoff).await {

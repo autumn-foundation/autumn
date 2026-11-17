@@ -17,6 +17,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::JiffBridge as _;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1741,7 +1746,7 @@ mod tests {
         state.job_registry().register_on_queue("probe", "default");
 
         let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let _ = state.with_clock(Arc::new(crate::time::FixedClock::at(epoch)));
+        let _ = state.with_clock(Arc::new(crate::time::FixedClock::at(epoch.to_jiff())));
     }
 
     /// A state's clock and the gauges it judges must never come apart.
@@ -1763,7 +1768,8 @@ mod tests {
         // Behind real time, like a sim epoch: the direction where a stale
         // judgement calls a not-yet-due job ready.
         let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let virtual_state = real_state.with_clock(Arc::new(crate::time::FixedClock::at(epoch)));
+        let virtual_state =
+            real_state.with_clock(Arc::new(crate::time::FixedClock::at(epoch.to_jiff())));
 
         // A job the virtual state's runtime would stamp: due a minute after its
         // epoch, so not yet ready *on that state's clock*.

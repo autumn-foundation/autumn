@@ -6,6 +6,11 @@
 use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
 use autumn_web::time::FixedClock;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use autumn_web::time_zone::{TimeZone, local_datetime};
 use chrono::{TimeZone as ChrTz, Utc};
 
@@ -14,7 +19,7 @@ use chrono::{TimeZone as ChrTz, Utc};
 /// Renders a fixed UTC timestamp as local time in the request's zone.
 #[get("/local")]
 async fn show_local(clock: Clock, tz: TimeZone) -> Markup {
-    html! { p { (local_datetime(clock.now(), *tz)) } }
+    html! { p { (local_datetime(clock.now().to_chrono(), *tz)) } }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -25,7 +30,7 @@ async fn three_zones_produce_distinct_local_times() {
     let pinned = Utc.with_ymd_and_hms(2025, 6, 14, 12, 0, 0).unwrap();
     let client = TestApp::new()
         .routes(routes![show_local])
-        .with_clock(FixedClock::at(pinned))
+        .with_clock(FixedClock::at(pinned.to_jiff()))
         .build();
 
     let utc_body = client.get("/local?tz=UTC").send().await.assert_ok().text();
@@ -61,7 +66,7 @@ async fn clock_and_time_zone_compose_deterministically() {
     let pinned = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
     let client = TestApp::new()
         .routes(routes![show_local])
-        .with_clock(FixedClock::at(pinned))
+        .with_clock(FixedClock::at(pinned.to_jiff()))
         .build();
 
     // Tokyo is UTC+9, so midnight UTC = 09:00 Tokyo on Jan 1
@@ -82,7 +87,7 @@ async fn falls_back_to_utc_when_no_zone_provided() {
     let pinned = Utc.with_ymd_and_hms(2025, 6, 14, 15, 30, 0).unwrap();
     let client = TestApp::new()
         .routes(routes![show_local])
-        .with_clock(FixedClock::at(pinned))
+        .with_clock(FixedClock::at(pinned.to_jiff()))
         .build();
 
     let body = client.get("/local").send().await.assert_ok().text();

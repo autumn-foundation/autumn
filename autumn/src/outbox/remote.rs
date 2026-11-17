@@ -16,6 +16,11 @@
 //! HMAC-SHA256. The id, topic and aggregate are in the signed body, so a
 //! replay cannot change them.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 #[cfg(feature = "http-client")]
 use std::sync::Arc;
 
@@ -176,7 +181,7 @@ async fn deliver(
     .map_err(|error| AutumnError::internal_server_error_msg(error.to_string()))?;
     // The receiver checks `t=` against its own clock: real time outside a
     // `Sim`, the sim clock inside one.
-    let timestamp = crate::time::ambient_now().timestamp();
+    let timestamp = crate::time::ambient_now().to_chrono().timestamp();
     let signature = inbox_signature(&destination.secret, timestamp, &body);
     // Named by its URL, as webhook delivery is: a test mocks the destination
     // with `TestApp::http_mock(url)`.
@@ -407,6 +412,11 @@ pub(super) async fn run_inbox_listener(
 mod endpoint_tests {
     use super::{INBOX_PATH, InboxVerifier, SIGNATURE_HEADER, accept, inbox_signature};
     use crate::config::OutboxInboxConfig;
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use crate::time::bridge::ChronoBridge as _;
     use crate::{AppState, AutumnResult};
 
     const SECRET: &str = "endpoint-test-secret-0123456789abcdef";
@@ -425,7 +435,7 @@ mod endpoint_tests {
     }
 
     fn now() -> i64 {
-        crate::time::ambient_now().timestamp()
+        crate::time::ambient_now().to_chrono().timestamp()
     }
 
     async fn post(

@@ -27,6 +27,11 @@
 //! least one entitled subscription that satisfies the rule gives access
 //! (issue #3114).
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::ChronoBridge as _;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -286,7 +291,7 @@ impl Billing {
             .unwrap_or(chrono::Duration::MAX);
         let now = self.state.clock().now();
         end.checked_add_signed(grace)
-            .is_none_or(|deadline| deadline >= now)
+            .is_none_or(|deadline| deadline >= now.to_chrono())
     }
 }
 

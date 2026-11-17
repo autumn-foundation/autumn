@@ -12,6 +12,11 @@
 //!   * request bodies are bounded and capsule files are owner-only;
 //!   * the retention cap prunes oldest-first.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -319,7 +324,7 @@ async fn capsule_records_clock_reads_in_order() {
         .expect("valid timestamp");
     let client = TestApp::new()
         .config(capture_config(dir.path()))
-        .with_clock(autumn_web::time::TickingClock::starting_at(start))
+        .with_clock(autumn_web::time::TickingClock::starting_at(start.to_jiff()))
         .routes(routes![clock_fail])
         .build();
 

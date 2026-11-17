@@ -69,6 +69,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::collections::BTreeMap;
 
 #[cfg(feature = "openapi")]
@@ -1640,7 +1645,7 @@ fn flatten_ref_entries(entry: &SchemaEntry) -> Vec<&SchemaEntry> {
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec {
-    generate_spec_at(config, routes, crate::time::ambient_now())
+    generate_spec_at(config, routes, crate::time::ambient_now().to_chrono())
 }
 
 #[cfg(feature = "openapi")]

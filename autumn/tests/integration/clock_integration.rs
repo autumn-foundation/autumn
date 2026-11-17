@@ -5,6 +5,11 @@
 
 use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use autumn_web::time::{Clock, FixedClock, TickingClock};
 use chrono::{TimeZone, Utc};
 use std::time::Duration;
@@ -14,7 +19,7 @@ use std::time::Duration;
 /// Returns the framework clock's current UTC timestamp as text.
 #[get("/now")]
 async fn current_time(clock: Clock) -> String {
-    clock.now().to_rfc3339()
+    clock.now().to_chrono().to_rfc3339()
 }
 
 /// Pretends a token issued at a fixed date expires after 30 days.
@@ -23,7 +28,7 @@ async fn current_time(clock: Clock) -> String {
 async fn token_check(clock: Clock) -> axum::http::StatusCode {
     let issued_at = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
     let expires_at = issued_at + chrono::Duration::days(30);
-    if clock.now() < expires_at {
+    if clock.now() < expires_at.to_jiff() {
         axum::http::StatusCode::OK
     } else {
         axum::http::StatusCode::UNAUTHORIZED
@@ -51,7 +56,7 @@ async fn fixed_clock_pins_time() {
 
     let client = TestApp::new()
         .routes(routes![current_time])
-        .with_clock(FixedClock::at(pinned))
+        .with_clock(FixedClock::at(pinned.to_jiff()))
         .build();
 
     let body = client.get("/now").send().await.assert_ok().text();
@@ -64,7 +69,7 @@ async fn fixed_clock_pins_time() {
 #[tokio::test]
 async fn ticking_clock_advances_between_requests() {
     let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
-    let clock = TickingClock::starting_at(start);
+    let clock = TickingClock::starting_at(start.to_jiff());
 
     let client = TestApp::new()
         .routes(routes![current_time])
@@ -95,7 +100,7 @@ async fn token_expires_after_30_days_no_sleep() {
     let issued_at = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
     let client = TestApp::new()
         .routes(routes![token_check])
-        .with_clock(TickingClock::starting_at(issued_at))
+        .with_clock(TickingClock::starting_at(issued_at.to_jiff()))
         .build();
 
     // Token is valid right after issue.
@@ -131,7 +136,7 @@ async fn advance_clock_with_fixed_clock_is_noop() {
     let pinned = Utc.with_ymd_and_hms(2025, 3, 1, 0, 0, 0).unwrap();
     let client = TestApp::new()
         .routes(routes![current_time])
-        .with_clock(FixedClock::at(pinned))
+        .with_clock(FixedClock::at(pinned.to_jiff()))
         .build();
 
     // advance_clock should not panic even for a FixedClock
@@ -151,7 +156,7 @@ async fn scheduler_tick_key_is_deterministic_with_clock() {
     use autumn_web::time::{FixedClock, clock_unix_secs};
 
     let pinned = Utc.with_ymd_and_hms(2024, 3, 15, 10, 30, 0).unwrap();
-    let clock = FixedClock::at(pinned);
+    let clock = FixedClock::at(pinned.to_jiff());
 
     let secs = clock_unix_secs(&clock);
     // Same clock → same tick key, regardless of real wall time.

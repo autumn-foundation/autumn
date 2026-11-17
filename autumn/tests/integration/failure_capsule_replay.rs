@@ -18,6 +18,11 @@
 //!     refused with exit code 2;
 //!   * a 401 replayed from a recorded 5xx points at redaction as the cause.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::ChronoBridge as _;
 use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone as _, Utc};
@@ -360,7 +365,11 @@ async fn denied() -> Result<&'static str, AutumnError> {
 async fn clock_twice(State(state): State<AppState>) -> String {
     let first = state.clock().now();
     let second = state.clock().now();
-    format!("{}|{}", first.to_rfc3339(), second.to_rfc3339())
+    format!(
+        "{}|{}",
+        first.to_chrono().to_rfc3339(),
+        second.to_chrono().to_rfc3339()
+    )
 }
 
 // ── Harness ─────────────────────────────────────────────────────────────────
@@ -379,7 +388,7 @@ fn test_config() -> AutumnConfig {
 struct SharedClock(Arc<ReplayClock>);
 
 impl autumn_web::time::ClockSource for SharedClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> autumn_web::time::Timestamp {
         self.0.now()
     }
 }

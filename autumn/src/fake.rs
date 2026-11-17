@@ -49,6 +49,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
 use chrono::{DateTime, Utc};
@@ -330,7 +335,7 @@ pub fn recent_datetime() -> DateTime<Utc> {
     let base = if is_deterministic() {
         DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::seconds(DETERMINISTIC_BASE_EPOCH_SECS)
     } else {
-        crate::time::ambient_now()
+        crate::time::ambient_now().to_chrono()
     };
     base - chrono::Duration::seconds(offset)
 }

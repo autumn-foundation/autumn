@@ -1,5 +1,10 @@
 //! Capsule registration, manifest, and error types.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -243,7 +248,7 @@ impl CapsuleManifest {
             format: DATA_CAPSULE_FORMAT.to_owned(),
             format_version: DATA_CAPSULE_FORMAT_VERSION,
             subject: subject.to_owned(),
-            generated_at: crate::time::ambient_now().to_rfc3339(),
+            generated_at: crate::time::ambient_now().to_chrono().to_rfc3339(),
             framework_version: env!("CARGO_PKG_VERSION").to_owned(),
             models: Vec::new(),
             blobs: Vec::new(),

@@ -11,6 +11,11 @@
 //! day of virtual time, a genuine real-time leak trips the guard with an
 //! actionable panic, and the guard is off unless explicitly enabled.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::ChronoBridge as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -28,7 +33,7 @@ use std::panic::AssertUnwindSafe;
 /// clock advanced a full day in virtual time.
 #[get("/now")]
 async fn now_route(clock: Clock) -> String {
-    clock.now().to_rfc3339()
+    clock.now().to_chrono().to_rfc3339()
 }
 
 /// A clean virtual run with the guard **on** does not trip it: advancing a full

@@ -1,3 +1,8 @@
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -829,9 +834,13 @@ async fn as_of_takes_each_tenant_at_or_before_the_target() {
     host.fleet.close(&key).await;
     ship(&host, "later", &[NOTES]).await;
 
-    let snapshot = lake(&host).as_of(target).materialize().await.unwrap();
+    let snapshot = lake(&host)
+        .as_of(target.to_chrono())
+        .materialize()
+        .await
+        .unwrap();
     assert_eq!(ids(&snapshot), ["acme"]);
-    assert!(snapshot.tenants()[0].effective <= target);
+    assert!(snapshot.tenants()[0].effective <= target.to_chrono());
     assert_eq!(
         skip_of(&snapshot, "later"),
         Some(SkipReason::AbsentAtTarget)

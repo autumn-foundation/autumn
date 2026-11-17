@@ -1,6 +1,11 @@
 use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
 use autumn_web::time::TickingClock;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use chrono::{TimeZone, Utc};
 use std::time::Duration;
 
@@ -34,7 +39,7 @@ async fn test_api_versioning_integration() {
     let deprecated_at = Utc.with_ymd_and_hms(2026, 6, 2, 0, 0, 0).unwrap();
     let sunset_at = Utc.with_ymd_and_hms(2026, 6, 3, 0, 0, 0).unwrap();
 
-    let clock = TickingClock::starting_at(start_time);
+    let clock = TickingClock::starting_at(start_time.to_jiff());
 
     let client = TestApp::new()
         .routes(routes![
@@ -234,7 +239,7 @@ async fn test_api_versioning_auth_preservation() {
     let deprecated_at = Utc.with_ymd_and_hms(2026, 6, 2, 0, 0, 0).unwrap();
     let sunset_at = Utc.with_ymd_and_hms(2026, 6, 3, 0, 0, 0).unwrap();
 
-    let clock = TickingClock::starting_at(start_time);
+    let clock = TickingClock::starting_at(start_time.to_jiff());
     let store = MemoryStore::new();
 
     // Seed session data

@@ -52,6 +52,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -198,7 +203,7 @@ pub(crate) fn persist_pinned(
     prune(
         &dir,
         retained_before_write(settings.max_capsules),
-        crate::time::ambient_now(),
+        crate::time::ambient_now().to_chrono(),
     );
     let pin = pin_for_reporting(&path);
     if let Err(error) = write_atomically(&dir, &path, &json) {
@@ -324,7 +329,7 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     Some(Capsule {
         format_version: CAPSULE_FORMAT_VERSION,
         id: scope.id().to_owned(),
-        captured_at: crate::time::ambient_now(),
+        captured_at: crate::time::ambient_now().to_chrono(),
         autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
         app: AppInfo {
             name: settings.app_name.clone(),

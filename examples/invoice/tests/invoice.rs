@@ -7,6 +7,11 @@
 use autumn_web::routes;
 use autumn_web::test::TestApp;
 use autumn_web::time::FixedClock;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use chrono::{TimeZone, Utc};
 
 fn client() -> autumn_web::test::TestClient {
@@ -16,7 +21,7 @@ fn client() -> autumn_web::test::TestClient {
     // `__autumn_route_info_*` companion function relative to the same path.
     TestApp::new()
         .routes(routes![invoice::invoice_detail, invoice::invoice_pdf])
-        .with_clock(FixedClock::at(fixed))
+        .with_clock(FixedClock::at(fixed.to_jiff()))
         .build()
 }
 

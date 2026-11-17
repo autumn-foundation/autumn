@@ -73,6 +73,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use diesel::sql_types::{BigInt, Nullable, Text, Timestamp};
 use diesel_async::RunQueryDsl as _;
 use scoped_futures::ScopedFutureExt as _;
@@ -2144,7 +2149,7 @@ async fn delete_subtree(
              WHERE {pk} IN ({id_list}) AND {deleted_at} IS NULL",
             ph(1),
         ))
-        .bind::<Timestamp, _>(crate::time::ambient_now().naive_utc())
+        .bind::<Timestamp, _>(crate::time::ambient_now().to_chrono().naive_utc())
         .execute(conn)
         .await
         .map_err(AutumnError::from)?;

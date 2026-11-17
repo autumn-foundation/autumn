@@ -880,6 +880,11 @@ mod tests {
     use super::{PUSH_FLOOR_MIN, push_floor, seed_incarnation, target_addresses};
     use crate::cluster::membership::{ClusterState, MemberRecord};
     use crate::time::FixedClock;
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use crate::time::bridge::JiffBridge as _;
     use std::time::Duration;
 
     fn document(records: &[(&str, MemberRecord)]) -> ClusterState {
@@ -986,8 +991,9 @@ mod tests {
     #[test]
     fn incarnation_is_seeded_from_unix_milliseconds() {
         let clock = FixedClock::at(
-            chrono::DateTime::<chrono::Utc>::from_timestamp(1_765_430_000, 250_000_000)
-                .unwrap_or_default(),
+            (chrono::DateTime::<chrono::Utc>::from_timestamp(1_765_430_000, 250_000_000)
+                .unwrap_or_default())
+            .to_jiff(),
         );
 
         assert_eq!(
@@ -999,8 +1005,9 @@ mod tests {
         );
 
         let one_ms_later = FixedClock::at(
-            chrono::DateTime::<chrono::Utc>::from_timestamp(1_765_430_000, 251_000_000)
-                .unwrap_or_default(),
+            (chrono::DateTime::<chrono::Utc>::from_timestamp(1_765_430_000, 251_000_000)
+                .unwrap_or_default())
+            .to_jiff(),
         );
         assert!(
             seed_incarnation(&one_ms_later) > seed_incarnation(&clock),
@@ -1010,7 +1017,9 @@ mod tests {
         // A pre-epoch clock saturates at 0 rather than wrapping. Two boots on such
         // a clock do collide; see `seed_incarnation`.
         let pre_epoch = FixedClock::at(
-            chrono::DateTime::<chrono::Utc>::from_timestamp(-10, 0).unwrap_or_default(),
+            chrono::DateTime::<chrono::Utc>::from_timestamp(-10, 0)
+                .unwrap_or_default()
+                .to_jiff(),
         );
         assert_eq!(
             seed_incarnation(&pre_epoch),

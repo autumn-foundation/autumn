@@ -628,6 +628,11 @@ pub use self::db_store::DbPushSubscriptionStore;
 mod db_store {
     use super::{PUSH_SUBSCRIPTIONS_TABLE, PushError, PushSubscriptionStore, StoredSubscription};
     use crate::db::RuntimeConnection;
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use crate::time::bridge::ChronoBridge as _;
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use chrono::{DateTime, Utc};
@@ -855,7 +860,7 @@ mod db_store {
                     endpoint: endpoint.clone(),
                     p256dh: p256dh.clone(),
                     auth: auth.clone(),
-                    created_at: crate::time::ambient_now(),
+                    created_at: crate::time::ambient_now().to_chrono(),
                 })
                 .on_conflict(dsl::endpoint)
                 .do_update()

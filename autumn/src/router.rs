@@ -13,6 +13,16 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::JiffBridge as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1086,7 +1096,7 @@ async fn serve_openapi_spec(
     use axum::response::IntoResponse;
     let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
     let now = state.clock().now();
-    let spec = crate::openapi::generate_spec_at(&config, &refs, now);
+    let spec = crate::openapi::generate_spec_at(&config, &refs, now.to_chrono());
     // Adds `x-payment-info` (MPP discovery) to priced operations.
     let spec_json = state.extension::<AutumnConfig>().map_or_else(
         || serde_json::to_string_pretty(&spec),
@@ -16677,8 +16687,8 @@ async fn api_versioning_middleware(
         return next.run(request).await;
     };
 
-    let is_deprecated = version.deprecated_at.is_some_and(|d| now >= d);
-    let is_sunset = version.sunset_at.is_some_and(|s| now >= s);
+    let is_deprecated = version.deprecated_at.is_some_and(|d| now >= d.to_jiff());
+    let is_sunset = version.sunset_at.is_some_and(|s| now >= s.to_jiff());
 
     if is_sunset && !meta.sunset_opt_out {
         if meta.has_policy {
@@ -16774,7 +16784,7 @@ pub fn check_sunset(
         .and_then(|v| v.0.iter().find(|av| av.version == meta.version));
 
     let version = matching_version?;
-    let is_sunset = version.sunset_at.is_some_and(|s| now >= s);
+    let is_sunset = version.sunset_at.is_some_and(|s| now >= s.to_jiff());
 
     if is_sunset && !meta.sunset_opt_out {
         let err = crate::error::AutumnError::gone_msg(format!(

@@ -1,6 +1,11 @@
 //! Tests for reconcile: one event applied once, ordering, customer linking,
 //! dunning open/close and notifications.
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use autumn_web::time::bridge::JiffBridge as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +36,7 @@ async fn linked_harness() -> Harness {
         MemoryBillingStore::shared(),
         FakeProvider::with_parser(FakeParser::BillingEventJson),
         |app| {
-            app.with_clock(TickingClock::starting_at(support::base_time()))
+            app.with_clock(TickingClock::starting_at(support::base_time().to_jiff()))
                 .routes(notification_routes())
         },
     );
@@ -274,7 +279,7 @@ async fn race_harness_with_hooks(
         SubscriptionSnapshot::new("sub_1", "cus_1", live).with_price(PRO_PRICE),
     );
     let h = harness_dyn_hooks(support::config(), hooks, store.clone(), provider, |app| {
-        app.with_clock(TickingClock::starting_at(support::base_time()))
+        app.with_clock(TickingClock::starting_at(support::base_time().to_jiff()))
     });
     inner
         .upsert_customer(
@@ -730,7 +735,7 @@ async fn redelivery_after_schedule_failure_completes_the_side_effects() {
         store.clone(),
         FakeProvider::with_parser(FakeParser::BillingEventJson),
         |app| {
-            app.with_clock(TickingClock::starting_at(support::base_time()))
+            app.with_clock(TickingClock::starting_at(support::base_time().to_jiff()))
                 .routes(notification_routes())
         },
     );
@@ -862,7 +867,7 @@ async fn dunning_disabled_notifies_without_a_job() {
         MemoryBillingStore::shared(),
         FakeProvider::with_parser(FakeParser::BillingEventJson),
         |app| {
-            app.with_clock(TickingClock::starting_at(support::base_time()))
+            app.with_clock(TickingClock::starting_at(support::base_time().to_jiff()))
                 .routes(notification_routes())
         },
     );
@@ -892,7 +897,7 @@ async fn hooks_fire_and_a_missing_recipient_skips_notifications() {
         MemoryBillingStore::shared(),
         FakeProvider::with_parser(FakeParser::BillingEventJson),
         |app| {
-            app.with_clock(TickingClock::starting_at(support::base_time()))
+            app.with_clock(TickingClock::starting_at(support::base_time().to_jiff()))
                 .routes(notification_routes())
         },
     );
@@ -949,7 +954,7 @@ async fn failed_apply_releases_claim_so_redelivery_applies() {
         store.clone(),
         FakeProvider::with_parser(FakeParser::BillingEventJson),
         |app| {
-            app.with_clock(TickingClock::starting_at(support::base_time()))
+            app.with_clock(TickingClock::starting_at(support::base_time().to_jiff()))
                 .routes(notification_routes())
         },
     );
@@ -1050,7 +1055,7 @@ async fn redelivery_during_a_failing_first_attempt_is_retried() {
         store.clone(),
         FakeProvider::with_parser(FakeParser::BillingEventJson),
         |app| {
-            app.with_clock(TickingClock::starting_at(support::base_time()))
+            app.with_clock(TickingClock::starting_at(support::base_time().to_jiff()))
                 .routes(notification_routes())
         },
     );

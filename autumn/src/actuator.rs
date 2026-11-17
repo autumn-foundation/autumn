@@ -15,6 +15,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
@@ -1116,7 +1121,7 @@ impl JobRegistry {
             .clock
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        u64::try_from(clock.now().timestamp_millis()).unwrap_or(0)
+        u64::try_from(clock.now().to_chrono().timestamp_millis()).unwrap_or(0)
     }
 
     /// Whether any job name has been registered against this registry.
@@ -2015,7 +2020,7 @@ impl TaskRegistry {
             return;
         };
         task.status = "idle".to_string();
-        let now = crate::time::ambient_now().to_rfc3339();
+        let now = crate::time::ambient_now().to_chrono().to_rfc3339();
         task.last_run = Some(now.clone());
         task.last_fired_at = Some(now);
         task.last_duration_ms = Some(duration_ms);
@@ -2033,7 +2038,7 @@ impl TaskRegistry {
             return;
         };
         task.status = "idle".to_string();
-        let now = crate::time::ambient_now().to_rfc3339();
+        let now = crate::time::ambient_now().to_chrono().to_rfc3339();
         task.last_run = Some(now.clone());
         task.last_fired_at = Some(now);
         task.last_duration_ms = Some(duration_ms);
@@ -5256,7 +5261,7 @@ fn reset_webhook_replay_log(
     log.last_error = None;
     log.response_status = None;
     log.response_body = None;
-    log.timestamp = crate::time::ambient_now();
+    log.timestamp = crate::time::ambient_now().to_chrono();
     log
 }
 
@@ -5898,7 +5903,9 @@ mod tests {
         // a real-clock reading, so a clone reading real time would call it ready while the injected
         // clock calls it scheduled. An epoch ahead of real time would prove nothing.
         let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let registry = registry.with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+        let registry = registry.with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
+            epoch.to_jiff(),
+        )));
 
         // A job due a minute after the injected epoch: scheduled, not ready.
         let ready_at = u64::try_from(epoch.timestamp_millis()).unwrap() + 60_000;
@@ -5943,8 +5950,9 @@ mod tests {
         // real-vs-injected subtraction cannot coincidentally pass.
         for year in [1999, 2036] {
             let epoch = Utc.with_ymd_and_hms(year, 6, 1, 12, 0, 0).unwrap();
-            let registry = JobRegistry::new()
-                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+            let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
+                crate::time::FixedClock::at(epoch.to_jiff()),
+            ));
             registry.register_on_queue("probe", "default");
 
             let registry_now = u64::try_from(epoch.timestamp_millis()).unwrap();
@@ -5996,8 +6004,9 @@ mod tests {
         for year in [1999, 2036] {
             let epoch = Utc.with_ymd_and_hms(year, 6, 1, 12, 0, 0).unwrap();
             let epoch_ms = u64::try_from(epoch.timestamp_millis()).unwrap();
-            let registry = JobRegistry::new()
-                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+            let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
+                crate::time::FixedClock::at(epoch.to_jiff()),
+            ));
             registry.register_on_queue("immediate_job", "mail");
             registry.register_on_queue("relative_job", "mail");
             registry.register_on_queue("absolute_job", "mail");
@@ -6205,9 +6214,10 @@ mod tests {
     fn note_pg_job_mark_eviction_judges_a_real_timeline_mark_against_real_time_only() {
         use chrono::{TimeZone, Utc};
 
-        let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
-            crate::time::FixedClock::at(Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap()),
-        ));
+        let registry =
+            JobRegistry::new().with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
+                Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap().to_jiff(),
+            )));
         registry.register_on_queue("skewed", "mail");
 
         let real_now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
@@ -6266,9 +6276,10 @@ mod tests {
     fn note_pg_job_mark_eviction_judges_a_real_timeline_mark_even_when_the_registry_clock_lags() {
         use chrono::{TimeZone, Utc};
 
-        let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
-            crate::time::FixedClock::at(Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap()),
-        ));
+        let registry =
+            JobRegistry::new().with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
+                Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap().to_jiff(),
+            )));
         registry.register_on_queue("lagging", "mail");
 
         let real_now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();

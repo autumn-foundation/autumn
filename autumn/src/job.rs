@@ -32,6 +32,11 @@
 // cfg-gating dozens of pg-only items.
 #![cfg_attr(feature = "sqlite", allow(dead_code))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -1789,7 +1794,7 @@ impl JobAdminMemoryBackend {
 
         let was_scheduled = record.status == JobAdminStatus::Scheduled;
         record.status = JobAdminStatus::Enqueued;
-        record.enqueued_at = Some(self.clock.now());
+        record.enqueued_at = Some(self.clock.now().to_chrono());
         record.scheduled_for = None;
         record.started_at = None;
         record.finished_at = None;
@@ -1809,7 +1814,7 @@ impl JobAdminMemoryBackend {
         match record.status {
             JobAdminStatus::Enqueued | JobAdminStatus::Scheduled => {
                 record.status = JobAdminStatus::Running;
-                record.started_at = Some(self.clock.now());
+                record.started_at = Some(self.clock.now().to_chrono());
                 record.scheduled_for = None;
                 record.finished_at = None;
                 record.attempt = attempt;
@@ -1821,7 +1826,7 @@ impl JobAdminMemoryBackend {
             JobAdminStatus::Running | JobAdminStatus::Retrying if record.attempt < attempt => {
                 let superseded = record.status == JobAdminStatus::Running;
                 record.status = JobAdminStatus::Running;
-                record.started_at = Some(self.clock.now());
+                record.started_at = Some(self.clock.now().to_chrono());
                 record.finished_at = None;
                 record.attempt = attempt;
                 if superseded {
@@ -1906,7 +1911,7 @@ impl JobAdminMemoryBackend {
         };
 
         record.status = JobAdminStatus::Completed;
-        record.finished_at = Some(self.clock.now());
+        record.finished_at = Some(self.clock.now().to_chrono());
         record.last_error = None;
         prune_job_admin_history(&mut inner);
     }
@@ -1920,7 +1925,7 @@ impl JobAdminMemoryBackend {
         };
 
         record.status = JobAdminStatus::Retrying;
-        record.finished_at = Some(self.clock.now());
+        record.finished_at = Some(self.clock.now().to_chrono());
         record.last_error = Some(error.to_owned());
     }
 
@@ -1942,7 +1947,7 @@ impl JobAdminMemoryBackend {
             return false;
         }
         record.status = JobAdminStatus::Retrying;
-        record.finished_at = Some(self.clock.now());
+        record.finished_at = Some(self.clock.now().to_chrono());
         record.last_error = Some(error.to_owned());
         true
     }
@@ -1965,7 +1970,7 @@ impl JobAdminMemoryBackend {
             return;
         }
         record.status = JobAdminStatus::Enqueued;
-        record.enqueued_at = Some(self.clock.now());
+        record.enqueued_at = Some(self.clock.now().to_chrono());
         record.started_at = None;
         record.finished_at = None;
         record.attempt = new_attempt;
@@ -1999,14 +2004,14 @@ impl JobAdminMemoryBackend {
         record.last_error = Some(error.to_owned());
         if immediate {
             record.status = JobAdminStatus::Enqueued;
-            record.enqueued_at = Some(now);
+            record.enqueued_at = Some(now.to_chrono());
             record.scheduled_for = None;
             record.started_at = None;
             record.finished_at = None;
             record.attempt = new_attempt;
         } else {
             record.status = JobAdminStatus::Retrying;
-            record.finished_at = Some(now);
+            record.finished_at = Some(now.to_chrono());
         }
         RedisRecoveredRequeue::Requeued
     }
@@ -2020,7 +2025,7 @@ impl JobAdminMemoryBackend {
         };
 
         record.status = JobAdminStatus::Failed;
-        record.finished_at = Some(self.clock.now());
+        record.finished_at = Some(self.clock.now().to_chrono());
         record.last_error = Some(error);
         prune_job_admin_history(&mut inner);
     }
@@ -2034,7 +2039,7 @@ impl JobAdminMemoryBackend {
         };
 
         record.status = JobAdminStatus::Canceled;
-        record.finished_at = Some(self.clock.now());
+        record.finished_at = Some(self.clock.now().to_chrono());
     }
 
     fn record_deduplicated(&self, id: &str) {
@@ -2046,7 +2051,7 @@ impl JobAdminMemoryBackend {
         };
 
         record.status = JobAdminStatus::Deduplicated;
-        record.finished_at = Some(self.clock.now());
+        record.finished_at = Some(self.clock.now().to_chrono());
         prune_job_admin_history(&mut inner);
     }
 
@@ -2066,7 +2071,7 @@ impl JobAdminMemoryBackend {
         }
         let retry = (record.name.clone(), record.payload.clone());
         record.status = JobAdminStatus::Retried;
-        record.finished_at = Some(self.clock.now());
+        record.finished_at = Some(self.clock.now().to_chrono());
         drop(inner);
         Ok(retry)
     }
@@ -2081,7 +2086,7 @@ impl JobAdminMemoryBackend {
 
         if record.status == JobAdminStatus::Retried {
             record.status = JobAdminStatus::Failed;
-            record.finished_at = Some(self.clock.now());
+            record.finished_at = Some(self.clock.now().to_chrono());
         }
     }
 
@@ -2119,7 +2124,7 @@ impl JobAdminMemoryBackend {
             ));
         }
         record.status = JobAdminStatus::Discarded;
-        record.finished_at = Some(self.clock.now());
+        record.finished_at = Some(self.clock.now().to_chrono());
         drop(inner);
         Ok(())
     }
@@ -2143,7 +2148,7 @@ impl JobAdminMemoryBackend {
         }
         record.status = JobAdminStatus::Canceled;
         record.scheduled_for = None;
-        record.finished_at = Some(self.clock.now());
+        record.finished_at = Some(self.clock.now().to_chrono());
         let canceler = inner.delay_cancelers.remove(id);
         drop(inner);
         // Fire outside the lock so the timer task can release the unique lock without
@@ -2211,20 +2216,26 @@ impl JobAdminMemoryBackend {
             completed: paginate_job_admin_records(
                 &inner,
                 JobAdminStatus::Completed,
-                Some(crate::time_math::saturating_dt_add(
-                    now,
-                    chrono::TimeDelta::hours(-24),
-                )),
+                Some(
+                    crate::time_math::saturating_ts_add(
+                        now.to_chrono().to_jiff(),
+                        crate::time::SignedDuration::from_hours(-24),
+                    )
+                    .to_chrono(),
+                ),
                 query.completed_page,
                 per_page,
             ),
             failed: paginate_job_admin_records(
                 &inner,
                 JobAdminStatus::Failed,
-                Some(crate::time_math::saturating_dt_add(
-                    now,
-                    chrono::TimeDelta::days(-7),
-                )),
+                Some(
+                    crate::time_math::saturating_ts_add(
+                        now.to_chrono().to_jiff(),
+                        crate::time::SignedDuration::from_hours(-168),
+                    )
+                    .to_chrono(),
+                ),
                 query.failed_page,
                 per_page,
             ),
@@ -2255,7 +2266,7 @@ impl JobAdminMemoryBackend {
             attempt,
             max_attempts,
             None,
-            self.clock.now(),
+            self.clock.now().to_chrono(),
         );
         id
     }
@@ -3884,7 +3895,7 @@ fn due_origin_for(
         )]
         return chrono::Utc::now();
     }
-    clock.now()
+    clock.now().to_chrono()
 }
 
 /// Convert a relative delay into an absolute due instant, measured from `now`.
@@ -4647,7 +4658,7 @@ impl JobClient {
                     // so interceptor time is not added. `signed_duration_since` is total
                     // for two representable `DateTime<Utc>` values.
                     let delay = due
-                        .signed_duration_since(self.clock.now())
+                        .signed_duration_since(self.clock.now().to_chrono())
                         .to_std()
                         .unwrap_or(std::time::Duration::ZERO);
                     let sender = sender.clone();
@@ -5914,6 +5925,11 @@ struct LocalUniqueHold {
 mod local_unique_hold_clock_tests {
     use super::{JobUniquenessWindow, LocalJobCoordination};
     use crate::time::TickingClock;
+    #[allow(
+        unused_imports,
+        reason = "temporary chrono bridge; some callers are feature- or test-gated"
+    )]
+    use crate::time::bridge::JiffBridge as _;
     use chrono::{TimeZone, Utc};
     use std::sync::Arc;
     use std::time::Duration;
@@ -5928,7 +5944,7 @@ mod local_unique_hold_clock_tests {
     #[test]
     fn unique_hold_ttl_expires_on_the_injected_clock() {
         let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let clock = TickingClock::starting_at(epoch);
+        let clock = TickingClock::starting_at(epoch.to_jiff());
         let coordination = LocalJobCoordination::with_clock(Arc::new(clock.clone()));
         let window = JobUniquenessWindow::TtlMs(300_000); // five minutes
 
@@ -5963,7 +5979,7 @@ mod local_unique_hold_clock_tests {
         let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let window = JobUniquenessWindow::TtlMs(1_000);
         let outcome = |steps: &[u64]| {
-            let clock = TickingClock::starting_at(epoch);
+            let clock = TickingClock::starting_at(epoch.to_jiff());
             let coordination = LocalJobCoordination::with_clock(Arc::new(clock.clone()));
             let mut seen = Vec::new();
             seen.push(coordination.try_acquire_unique("p", "k", "a", window));
@@ -12246,7 +12262,8 @@ async fn pg_settle_outcome(
                 // so the local gauge tracks the retry as scheduled until it is
                 // actually claimable. A zero backoff is due-now (`None`).
                 let ready_at_ms = (delay_ms > 0).then(|| {
-                    let now_ms = u64::try_from(state.clock().now().timestamp_millis()).unwrap_or(0);
+                    let now_ms = u64::try_from(state.clock().now().to_chrono().timestamp_millis())
+                        .unwrap_or(0);
                     now_ms.saturating_add(delay_ms)
                 });
                 PgLifecycleRecord::Retry {
@@ -12593,10 +12610,13 @@ impl PgJobAdminBackend {
             &mut conn,
             PG_STATUS_COMPLETED,
             "finished_at",
-            Some(crate::time_math::saturating_dt_add(
-                now,
-                chrono::TimeDelta::hours(-24),
-            )),
+            Some(
+                crate::time_math::saturating_ts_add(
+                    now.to_chrono().to_jiff(),
+                    crate::time::SignedDuration::from_hours(-24),
+                )
+                .to_chrono(),
+            ),
             query.completed_page,
             per_page,
         )
@@ -12605,10 +12625,13 @@ impl PgJobAdminBackend {
             &mut conn,
             PG_STATUS_FAILED,
             "finished_at",
-            Some(crate::time_math::saturating_dt_add(
-                now,
-                chrono::TimeDelta::days(-7),
-            )),
+            Some(
+                crate::time_math::saturating_ts_add(
+                    now.to_chrono().to_jiff(),
+                    crate::time::SignedDuration::from_hours(-168),
+                )
+                .to_chrono(),
+            ),
             query.failed_page,
             per_page,
         )
@@ -13765,8 +13788,9 @@ mod tests {
         // A local-backed client: the injected (2020) clock decides dueness, so
         // the delay is measured from it.
         let (tx, _rx) = tokio::sync::mpsc::channel::<QueuedJob>(1);
-        let mut local =
-            JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+        let mut local = JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(
+            epoch.to_jiff(),
+        )));
         local.local_sender = Some(tx);
         assert_eq!(
             local.due_origin(),
@@ -13776,8 +13800,9 @@ mod tests {
 
         // With no backend installed at all there is nothing comparing against a
         // database, so the injected clock still governs.
-        let bare =
-            JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
+        let bare = JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(
+            epoch.to_jiff(),
+        )));
         assert_eq!(
             bare.due_origin(),
             epoch,
@@ -13786,7 +13811,7 @@ mod tests {
 
         // The Postgres arm, reachable here only because the decision is split
         // out of the clock read — through `JobClient` it needs a live pool.
-        let clock = crate::time::FixedClock::at(epoch);
+        let clock = crate::time::FixedClock::at(epoch.to_jiff());
         let before = chrono::Utc::now();
         let pg_origin = due_origin_for(true, &clock);
         let after = chrono::Utc::now();
@@ -13844,7 +13869,7 @@ mod tests {
         }
 
         fn clock() -> Arc<dyn crate::time::ClockSource> {
-            Arc::new(crate::time::FixedClock::at(chrono::Utc::now()))
+            Arc::new(crate::time::FixedClock::at(chrono::Utc::now().to_jiff()))
         }
 
         // A deadpool `Pool` dials only on `.get()`, and `can_batch_enqueue` only checks
@@ -13986,7 +14011,7 @@ mod tests {
         // A clock pinned a decade ahead of real time — the case that breaks when
         // the stamp and the filter disagree.
         let ahead = Utc.with_ymd_and_hms(2036, 1, 1, 0, 0, 0).unwrap();
-        let clock = crate::time::FixedClock::at(ahead);
+        let clock = crate::time::FixedClock::at(ahead.to_jiff());
         let delay = std::time::Duration::from_secs(60);
 
         for durable_is_pg in [true, false] {
@@ -14037,7 +14062,7 @@ mod tests {
                 per_job_settings: HashMap::new(),
                 interceptor: None,
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-                clock: std::sync::Arc::new(crate::time::FixedClock::at(epoch)),
+                clock: std::sync::Arc::new(crate::time::FixedClock::at(epoch.to_jiff())),
                 resilience_config: None,
                 #[cfg(feature = "postgres")]
                 shard_local: false,
@@ -20199,7 +20224,7 @@ mod tests {
             let state = AppState::for_test()
                 .with_profile("dev")
                 .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
-                    Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap(),
+                    Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap().to_jiff(),
                 )));
             state.job_registry().register_on_queue("slow_retry", "work");
             state.job_registry().record_enqueue("slow_retry");
@@ -20212,7 +20237,7 @@ mod tests {
             // `state.clock().now() + backoff`, as the retry site computes it: long past in real
             // time, but still inside its backoff on the frozen registry clock.
             let registry_now_ms =
-                u64::try_from(state.clock().now().timestamp_millis()).unwrap_or(0);
+                u64::try_from(state.clock().now().to_chrono().timestamp_millis()).unwrap_or(0);
             let retry_mark = registry_now_ms + 60_000;
 
             assert!(record_pg_lifecycle_ack_result(
@@ -21828,7 +21853,9 @@ mod tests {
             pg_run_migration(&pool).await;
 
             let registry = crate::actuator::JobRegistry::new().with_clock(std::sync::Arc::new(
-                crate::time::FixedClock::at(Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap()),
+                crate::time::FixedClock::at(
+                    Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap().to_jiff(),
+                ),
             ));
             registry.register_on_queue("send_email", "mail");
             registry.register_on_queue("nightly_report", "mail");
@@ -23416,12 +23443,12 @@ mod tests {
     }
 
     impl crate::time::ClockSource for OrderSpyClock {
-        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        fn now(&self) -> crate::time::Timestamp {
             self.calls
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push("now");
-            chrono::Utc::now()
+            crate::time::Timestamp::now()
         }
 
         fn monotonic(&self) -> crate::time::MonotonicInstant {

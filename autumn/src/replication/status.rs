@@ -38,6 +38,11 @@
     )
 )]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -371,7 +376,7 @@ impl HealthIndicator for ReplicationHealthIndicator {
     fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
         Box::pin(async move {
             let snapshot = self.status.snapshot();
-            self.evaluate(&snapshot, crate::time::ambient_now())
+            self.evaluate(&snapshot, crate::time::ambient_now().to_chrono())
         })
     }
 

@@ -55,6 +55,11 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -661,7 +666,7 @@ pub async fn append_version_history(
     {
         use diesel::sql_types::TimestamptzSqlite;
 
-        let recorded_at = crate::time::ambient_now();
+        let recorded_at = crate::time::ambient_now().to_chrono();
 
         diesel::sql_query(SQLITE_INSERT_SQL)
             .bind::<Text, _>(write.table_name)
@@ -779,7 +784,7 @@ pub async fn append_version_history_many(
             let mut query = diesel::sql_query(sql).into_boxed();
             for row in chunk {
                 // The same bind as the single-row path: see `append_version_history`.
-                let recorded_at = crate::time::ambient_now();
+                let recorded_at = crate::time::ambient_now().to_chrono();
                 query = query
                     .bind::<Text, _>(table_name)
                     .bind::<Nullable<Text>, _>(row.tenant_id)
