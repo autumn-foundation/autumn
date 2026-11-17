@@ -24,17 +24,17 @@ Diesel/`diesel-async` (Postgres), and Maud for HTML.
   `benchmarks/agentic-habit-tracker/phase2/archive_hidden_test.py` — they are
   evaluator-only. You may instead use an **absolute** path to
   this checkout's `autumn/` directory, or depend on the published crate
-  (`autumn-web = "0.10"`). In your app `Cargo.toml`:
+  (`autumn-web = "0.11"`). In your app `Cargo.toml`:
   ```toml
   [package]
   edition = "2024"
 
   [dependencies]
   # Relative path from runs/<id>/app/ to <repo-root>/autumn (five levels up).
-  # Or use an absolute path from `git rev-parse --show-toplevel`, or `autumn-web = "0.10"`.
+  # Or use an absolute path from `git rev-parse --show-toplevel`, or `autumn-web = "0.11"`.
   autumn-web = { path = "../../../../../autumn", features = ["seed"] }
   diesel = { version = "2", features = ["postgres", "chrono"] }
-  diesel-async = { version = "0.9", features = ["postgres"] }
+  diesel-async = { version = "0.10", features = ["postgres"] }
   diesel_migrations = "2"
   maud = { version = "0.27", features = ["axum"] }
   serde = { version = "1", features = ["derive"] }

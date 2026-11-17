@@ -25,8 +25,8 @@ builder chain and printed these lines for you):
 
 ```toml
 [dependencies]
-autumn-web        = { version = "0.10", features = ["storage"] }
-autumn-storage-s3 = "0.10"
+autumn-web        = { version = "0.11", features = ["storage"] }
+autumn-storage-s3 = "0.11"
 ```
 
 ## Quick Start

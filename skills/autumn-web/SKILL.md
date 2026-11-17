@@ -4,7 +4,7 @@ description: >
   Use when building, debugging, documenting, or upgrading Rust web applications
   with autumn-web, autumn-cli, or first-party Autumn crates; also use for
   Autumn route/model/repository/job/webhook/admin macros, AppBuilder setup,
-  Maud + htmx server-rendered UI, Diesel async Postgres, and Autumn 0.10.x
+  Maud + htmx server-rendered UI, Diesel async Postgres, and Autumn 0.11.x
   migration or release work.
 ---
 
@@ -12,20 +12,21 @@ description: >
 
 **Repository**: https://github.com/autumn-foundation/autumn
 **Branch**: `trunk-dev`
-**Latest release**: 0.10.0 | **Edition**: 2024 | **MSRV**: 1.97.0
+**Latest release**: 0.11.0 | **Edition**: 2024 | **MSRV**: 1.97.0
 
 **Version identity trip wire**: the workspace on `trunk-dev` is versioned
-0.10.0, and `v0.10.0` is the current release line — `autumn-web = "0.10"`,
-`cargo install autumn-cli --version 0.10.0`. Features below carry the release
-they arrived in — **(0.10.0)** is **absent from 0.9.x and earlier**,
+0.11.0, and `v0.11.0` is the current release line — `autumn-web = "0.11"`,
+`cargo install autumn-cli --version 0.11.0`. Features below carry the release
+they arrived in — **(0.11.0)** is **absent from 0.10.x and earlier**,
+**(0.10.0)** is absent from 0.9.x and earlier,
 **(0.9.0)** is absent from 0.8.x and earlier, **(0.8.0)** is absent from 0.7.x
 and earlier, **(0.7.0)** is absent from 0.6.x and earlier, and **(0.6.0)** is
 absent from 0.5.x: if an app pins an older line, check
 [`CHANGELOG.md`](../../CHANGELOG.md) before using them. Unmarked features
-predate 0.6.0. An app moving up from 0.9.x follows
-[`docs/migrations/0.10.0.md`](../../docs/migrations/0.10.0.md); one moving up
-from 0.8.x follows [`docs/migrations/0.9.0.md`](../../docs/migrations/0.9.0.md)
-and then the 0.10.0 guide. 0.10.0 needs Rust 1.97.0. Run `autumn upgrade`
+predate 0.6.0. An app moving up from 0.10.x follows
+[`docs/migrations/0.11.0.md`](../../docs/migrations/0.11.0.md); one moving up
+from 0.9.x follows [`docs/migrations/0.10.0.md`](../../docs/migrations/0.10.0.md)
+and then the 0.11.0 guide. 0.11.0 needs Rust 1.97.0. Run `autumn upgrade`
 first.
 
 autumn-web is a Spring Boot-style web framework for Rust, built on Axum. It
@@ -45,7 +46,7 @@ when their details matter:
   exists and nothing that does not.
 - `references/api-reference.md` - release-line API map, proc macros,
   feature flags, AppBuilder methods, config env names, and dependency versions.
-- `references/examples.md` - official 0.10.0 example patterns for minimal apps,
+- `references/examples.md` - official 0.11.0 example patterns for minimal apps,
   CRUD, production-ish jobs, Redis channels, S3 storage plugins, and signed
   webhooks. Use this before generating full app code.
 - `docs/guide/accessibility.md` - accessible-by-construction UI. Prefer the
@@ -111,17 +112,17 @@ the framework almost certainly already generates or ships it:
 | A punishingly low global rate limit to protect one abuse-prone endpoint (login, search, export) | `#[throttle(limit = 5, per = "1m", key = "ip")]` sits alongside `#[get]`/`#[post]`; `#[throttle("login")]` reads `[security.rate_limit.named.login]` from config (0.6.0, issue #1350, see `docs/guide/rate-limiting.md`) |
 | Hand-assembled `<form>` markup with manual value re-fill and error display | `autumn_web::form::form_for(&changeset, action, method)` + the `#[model]`-derived `FormModel` (0.6.0) renders the whole form — CSRF, `_method` override, one pre-filled control per column, inline errors, submit — in one call; see "Whole-form rendering" below. Compose the per-field helpers only when its escape hatches don't fit: `form_tag`, `method_input`, `text_input` (published); `number_input`, `datetime_input`, `date_input`, `checkbox_input`, `select_input` + `Changeset` 422 re-render (0.6.0). For a hint, `required`, `placeholder`/`autocomplete`/`data-*`/`hx-*`, use the `*_with` helper + `FieldOptions` (or `FormFor::field_options`) — never hand-write the input to add one attribute |
 | `find_all()` + a loop (or raw Diesel `LIMIT`/`OFFSET` paging) to sweep a whole table in a task/job/backfill | `repo.find_in_batches(n)` / `repo.find_each(n)` (0.6.0) — bounded-memory primary-key keyset iteration. See "Generated repository surface" below and `docs/guide/pagination.md` |
-| Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work, `app.background_task(name, capability, ..)` for a long-running loop placed by role (#3545) |
+| Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work, `app.background_task(name, capability, ..)` (0.11.0, #3545) for a long-running loop placed by role (#3545) |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
 | A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.8.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. Sweeps run on Postgres and SQLite. See `docs/guide/data-retention.md` |
 | A hand-written script that copies production data and masks PII for staging, on Postgres or SQLite | `autumn db scrub` (`--check`, `--dry-run`, `--artifact`, `--output`). A `sqlite://` target or `.sqlite` backup scrubs in one transaction, then `VACUUM`s. An unclassified column aborts the run; declare columns in `scrub.toml`. `--sample` is Postgres-only. See `docs/guide/data-scrubbing.md` |
-| A `custom_setup` hook or raw `PRAGMA mmap_size` / `PRAGMA cache_size` to speed up reads on a large SQLite file | `[database] mmap_size` (bytes) and `cache_size_kib` (KiB), both `0` = off; `[database.fleet]` has its own pair. Env `AUTUMN_DATABASE__MMAP_SIZE`, `..._CACHE_SIZE_KIB`. mmap halves random and range reads on a large, read-heavy file, does nothing for small fleet files, and turns an I/O error into `SIGBUS`. See `docs/guide/sqlite-in-production.md` ("Memory-mapped reads and the page cache") |
+| A `custom_setup` hook or raw `PRAGMA mmap_size` / `PRAGMA cache_size` to speed up reads on a large SQLite file | `[database] mmap_size` (bytes) and `cache_size_kib` (KiB) (0.11.0, #3571), both `0` = off; `[database.fleet]` has its own pair. Env `AUTUMN_DATABASE__MMAP_SIZE`, `..._CACHE_SIZE_KIB`. mmap halves random and range reads on a large, read-heavy file, does nothing for small fleet files, and turns an I/O error into `SIGBUS`. See `docs/guide/sqlite-in-production.md` ("Memory-mapped reads and the page cache") |
 | A hand-written GDPR export job that zips CSV/JSON a user cannot open, verify, or import again | `GdprRegistry::capsule(CapsuleModel::new(table, subject_column).belongs_to(..))` + `autumn data capsule export --subject <id> --out <dir>` (issue #1811) — one signed directory with records, a `manifest.json`, blobs, and an offline HTML viewer; `autumn data capsule import` verifies every file, then imports with no loss of data. Use `.exclude(column)` for secrets. See `docs/guide/data-capsules.md` |
 | Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0); `.stale_if_error(window)` serves the last value when a fill fails |
 | Calling `cache.invalidate(key)` by hand after a repository write | `#[repository(Model, invalidates(cached_fn))]`: each generated write drops the read after it commits (#3056). Async code uses `Cache::invalidate_async`, which returns the error |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
 | `Db` taken before a body extractor (`Form`/`Json`/`Multipart`) in the same handler — pins a pooled connection for as long as the client takes to send the body | `LazyDb` in the same argument spot; call `.checkout().await?` after the body extractor runs — for `Form`/`Json` that means right at handler entry, but `Multipart` doesn't buffer anything during extraction, so checkout must wait until every field this handler needs has been read from the `next_field()` loop, not before it (issue #2264) |
-| Reading `/actuator/metrics` `db_queries["<route> SELECT"]` as a slow `SELECT` — the `Db` extractor writes its connection hold time there (checkout to release, all work in the hold), also on routes that only write | `db_connection_holds["<route>"]` for the hold; `db_queries` for statements timed with `run_instrumented`. The `Db` write to `"<route> SELECT"` is deprecated and stops next release (issue #3579). A long hold with fast statements is work outside the database: take `LazyDb` and check out late. See `docs/guide/metrics.md` |
+| Reading `/actuator/metrics` `db_queries["<route> SELECT"]` as a slow `SELECT` — the `Db` extractor writes its connection hold time there (checkout to release, all work in the hold), also on routes that only write | `db_connection_holds["<route>"]` (0.11.0, #3579) for the hold; `db_queries` for statements timed with `run_instrumented`. The `Db` write to `"<route> SELECT"` is deprecated and stops next release (issue #3579). A long hold with fast statements is work outside the database: take `LazyDb` and check out late. See `docs/guide/metrics.md` |
 | Hand-rolled HMAC verification for Stripe/GitHub/Slack callbacks | `SignedWebhook` extractor + `[webhooks.<name>]` config |
 | Hand-rolled pager markup (page-number windows, prev/next links) | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` (0.6.0) |
 | Hand-rolled cross-module notifications (calling every reaction inline) | `#[event]` + `#[listener]` typed event bus, `.listeners(listeners![...])` (0.6.0) |
@@ -239,10 +240,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-autumn-web = { version = "0.10", features = ["db", "htmx", "maud"] }
+autumn-web = { version = "0.11", features = ["db", "htmx", "maud"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
-diesel-async = { version = "0.8", features = ["postgres"] }
+diesel-async = { version = "0.10", features = ["postgres"] }
 diesel_migrations = "2"
 maud = { version = "0.27", features = ["axum"] }
 serde = { version = "1", features = ["derive"] }
@@ -256,7 +257,7 @@ when avoiding a system libpq install.
 
 For a reddit-clone-style app with live feeds, file uploads, and blob variants:
 ```toml
-autumn-web = { version = "0.10", features = [
+autumn-web = { version = "0.11", features = [
     "mail",       # transactional email + mailer previews
     "ws",         # WebSocket routes, SSE, broadcast channels
     "presence",   # Presence extractor for online-user tracking
@@ -296,8 +297,8 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `offline-sync` | Offline-first local `SQLite` store plus a background sync engine |
 | `collab` | `#[collaborative]` text fields merged by an in-tree CRDT, with live sessions over the channel/presence seams — see [collaboration](../../docs/guide/collaboration.md) |
 
-For S3 storage add `autumn-storage-s3 = "0.10"`; `storage-s3` is no longer an
-`autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.10"`.
+For S3 storage add `autumn-storage-s3 = "0.11"`; `storage-s3` is no longer an
+`autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.11"`.
 For keyword + vector search with lifecycle-synced indexes add `autumn-search`.
 
 ## main.rs pattern
@@ -1732,7 +1733,7 @@ this is *provider-reported* failure.
   the store and `with_mail_suppression_store` above are not:
 
   ```toml
-  autumn-web = { version = "0.10", features = ["mail", "inbound-mail"] }
+  autumn-web = { version = "0.11", features = ["mail", "inbound-mail"] }
   ```
 
   ```rust
@@ -1945,15 +1946,15 @@ can fan out without inline coupling: `#[event]` on a struct, publish via the
 register with `.listeners(listeners![...])`. Do not also list durable
 listeners in `jobs![...]`. See `docs/guide/events.md`.
 
-Event wire contracts: `#[event(name = "contact.updated", version = 2)]` sets
+Event wire contracts (0.11.0): `#[event(name = "contact.updated", version = 2)]` sets
 the topic (`contact.updated.v2`) and derives `WireShape` (do not derive it
 again). A `#[listener]` that reads a field the event does not send fails the
 build. Put `#[event_consumer(E)]` on an outbox topic handler for the same
 check. `#[event(opaque)]` turns the check off for a payload `WireShape`
 refuses. `autumn contracts check` covers events across releases.
 
-Send an event to another Autumn service with an outbox destination, not a
-hand-written HTTP call. The producer sets `[outbox.destinations.<name>]`
+Send an event to another Autumn service with an outbox destination
+(0.11.0), not a hand-written HTTP call. The producer sets `[outbox.destinations.<name>]`
 (`url`, `signing_secret = "${VAR}"`, `topics`) and writes the event with
 `outbox.write(conn, aggregate, Event::NAME, &event)` in its transaction. Each
 topic must be an `#[event(name = "...")]`, or the boot fails. The receiver
@@ -2061,7 +2062,7 @@ fn contract(&self) -> Option<PluginContract> {
     Some(
         PluginContract::new(env!("CARGO_PKG_NAME"))
             .plugin_version(env!("CARGO_PKG_VERSION"))
-            .autumn_web("0.10")           // Cargo requirement: "0.10", ">=0.9, <0.11", "=0.10.1"
+            .autumn_web("0.11")           // Cargo requirement: "0.11", ">=0.10, <0.12", "=0.11.1"
             .uses_experimental("AppBuilder::with_edge_kv"),  // only if you actually do
     )
 }
@@ -2191,8 +2192,8 @@ reports leftovers as `plugin_residue` — see the doctor skill.
 For local or pluggable file storage:
 
 ```toml
-autumn-web = { version = "0.10", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.10" # when storage.backend = "s3"
+autumn-web = { version = "0.11", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.11" # when storage.backend = "s3"
 ```
 
 ```rust
@@ -2205,7 +2206,7 @@ autumn_web::app().with_blob_store(store).run().await;
 For keyword **and** vector search with an index that stays in sync:
 
 ```toml
-autumn-search = "0.10"
+autumn-search = "0.11"
 ```
 
 ```rust
@@ -2246,8 +2247,8 @@ let hits = search.similar::<Article>("how do I add auth?", 5).await?; // k-NN
 For shared Redis cache:
 
 ```toml
-autumn-web = { version = "0.10", features = ["redis"] }
-autumn-cache-redis = "0.10"
+autumn-web = { version = "0.11", features = ["redis"] }
+autumn-cache-redis = "0.11"
 ```
 
 ```rust
@@ -2449,7 +2450,7 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
 - `#[derive(WireShape)]` refuses generics, enums, tuple structs,
   `#[serde(flatten)]` and split renames rather than describing them wrongly.
 
-- Across releases: `autumn contracts export --out contracts.json` writes a
+- Across releases (0.11.0): `autumn contracts export --out contracts.json` writes a
   sorted, byte-stable bundle; store it with each release.
   `autumn contracts check --against <bundle|url|git-ref>` checks both deploy
   windows (new callees with deployed callers, new callers with deployed
@@ -2475,7 +2476,7 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
   is a removed route. For a handler of another crate, write its crate path
   (`routes![mesh_catalog::get_item]`), so the check judges that crate. `autumn contracts export --from <dir>` joins an existing
   descriptor directory with no build. `--from <file>` reads a bundle file.
-- Outside the workspace: `autumn contracts export --proto --out contracts/proto/`
+- Outside the workspace (0.11.0): `autumn contracts export --proto --out contracts/proto/`
   writes `.proto` schemas (one file per service, one per crate for events, a
   `buf.yaml`). `json_name` is the serde wire name. `proto.lock` (beside
   `--out`) keeps field numbers; commit it, and run `--check` in CI (exit 1
@@ -2484,7 +2485,7 @@ async fn show(id: Path<String>, http: Client) -> AutumnResult<Markup> {
   Autumn's, so a consumer unwraps by hand. `--http-annotations` adds
   `google.api.http` options. `--well-known-types` maps `date-time` to
   `Timestamp`.
-- Events for data pipelines: `autumn contracts export --avro --out contracts/avro/`
+- Events for data pipelines (0.11.0): `autumn contracts export --avro --out contracts/avro/`
   writes one `.avsc` per topic (a new version is a new subject). Field names
   are wire names; `#[serde(alias)]` is an Avro alias; nested types are named
   records; an opaque event is `bytes`. It refuses `u64`/`usize`/128-bit
@@ -2676,7 +2677,7 @@ subset of queues — all config-only, no app-code change:
   `serves_http`).
   Gate on the field that matches the work. `/actuator/info` shows the set
   (0.10.0, issue #3542). See `docs/guide/jobs.md#role-capabilities`.
-- **Background tasks (issue #3545)** — do not `tokio::spawn` a loop in
+- **Background tasks (0.11.0, issue #3545)** — do not `tokio::spawn` a loop in
   `on_startup`: every role runs it. Use
   `app.background_task("media.reaper", Capability::Maintenance, |state, shutdown| async move { .. })`.
   The framework starts it only where the role runs the capability and waits
@@ -2688,7 +2689,7 @@ subset of queues — all config-only, no app-code change:
   switch (wins, with a warning). `/actuator/tasks` (`background_tasks`) and
   `autumn graph` (`background_task` nodes) list the roles that run each task.
   See `docs/guide/jobs.md#background-tasks-for-plugins-and-apps`.
-- **In-repo plugin tasks (issue #3546)** — `autumn-media-plugin` registers
+- **In-repo plugin tasks (0.11.0, issue #3546)** — `autumn-media-plugin` registers
   `media.room_reaper` (`db` store: `media.maintenance`, on `combined`/`worker`;
   `memory` store: `serves_http`, on `combined`/`web`) and
   `media.recording_retention` (`media.retention` + the media queue). For a
@@ -2928,7 +2929,7 @@ in a `--release` binary with the cargo env unset at runtime. Sample payload:
 ```json
 {
   "app":     { "name": "my_app", "version": "1.4.2" },
-  "autumn":  { "version": "0.10.0", "profile": "prod" },
+  "autumn":  { "version": "0.11.0", "profile": "prod" },
   "runtime": { "uptime": "3h 12m" },
   "build": {
     "version": "1.4.2",
@@ -3162,7 +3163,7 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `delete` (`410` meanwhile), `backup` (`VACUUM INTO`), `import` (copy a
   file into the fleet: check, migrate, publish; `409` when the key has a
   file, `422` for a bad file), `restore_from_file(&key, &src,
-  LocalRestore::new())` (replace a live database with a local backup; no
+  LocalRestore::new())` (0.11.0, #3537; replace a live database with a local backup; no
   replication needed; openers wait for the swap; another key's backup or a
   deleted key is refused unless `allow_rekey` / `clear_tombstone`),
   `restore`, `list`, `each`, `migrate_all`, `stats`. Health: `db:fleet`.
@@ -3174,12 +3175,12 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   A burst can open far more files than `max_open`. Size `ulimit -n` for the
   peak (about `2 × pool_size + 1` fds per open database). `db:fleet` reports
   `peak_open`, `over_cap_opens_total` and `refused_total`.
-- `[database.fleet] max_open_policy = "wait"` or `"refuse"` makes `max_open`
+- `[database.fleet] max_open_policy = "wait"` or `"refuse"` (0.11.0, #3538) makes `max_open`
   hard: open and closing databases never pass it. `wait` parks an open for
   at most `database.connect_timeout_secs`, then answers `503`. `refuse`
   answers `503` with `Retry-After` when no idle database can close. Check the
   tenant id before `open`: the cap counts any key.
-- `max_resident_bytes` (default `0`, off) is a soft memory budget with the
+- `max_resident_bytes` (0.11.0, #3642; default `0`, off) is a soft memory budget with the
   same rules as `max_open`. The SQLite engine counts about 2 MB per open
   connection. The fleet keeps one database open. `db:fleet` reports
   `resident_bytes`.
@@ -3201,7 +3202,7 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   database).
 - A write that spans two databases (move a row: upsert into `dst`, delete
   from `src`): do the second half only after the first is in the replica.
-  `fleet.wait_replicated(&dst, committed_at, timeout)` with `committed_at`
+  `fleet.wait_replicated(&dst, committed_at, timeout)` (0.11.0, #3658) with `committed_at`
   read from the app clock after the commit; `fleet.replicated_through(&key)`
   gives the instant itself. Errors: `NotReplicating`, `Fenced`, `TimedOut`
   (not a loss: keep the source row, retry). Do not use `worst_lag_seconds`
@@ -3269,7 +3270,7 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   own; `[database] mmap_size` does not reach the fleet. Keep them `0` for
   small tenant files. Guide: "Memory-mapped reads" in
   `docs/guide/sqlite-fleet.md`.
-- Another engine (ADR 0040): the fleet core is `DatabaseFleet<E: FleetEngine>`
+- Another engine (0.11.0, #3642, ADR 0040): the fleet core is `DatabaseFleet<E: FleetEngine>`
   (`autumn_web::db::fleet_engine`, experimental surface). With `sqlite`,
   `DatabaseFleet` means `DatabaseFleet<SqliteEngine>`, so SQLite code does
   not change. An engine plugin implements `FleetEngine` (async `open` that
@@ -3374,7 +3375,7 @@ async fn build_report() -> AutumnResult<String> {
   (idle eviction) — both `0` by default, both enforced lazily on cell insert.
   The quota is stored atomically and refreshed on every access (retune-ready;
   no config-reload path exists yet).
-- `[tenancy] source` defaults to `"session"`. `source = "header"` needs
+- `[tenancy] source` defaults to `"session"` (0.11.0). `source = "header"` needs
   `header_trust = "trusted_proxy"` (a gateway sets the header) or
   `"any_client"` (unsafe), or the app does not start. A session that holds
   `session_key` binds the tenant: a header, host or token for another tenant
@@ -3496,7 +3497,7 @@ Rollouts `AnalysisTemplate`, Flagger `MetricTemplate`s and Helm values. Route
 and latency SLOs read the request-duration histogram (issue #3064).
 
 To act on a burning budget inside the app, use
-`autumn_web::slo_meter::BurnMeter` (`slo` feature). Build it from a validated
+`autumn_web::slo_meter::BurnMeter` (`slo` feature, 0.11.0). Build it from a validated
 `Slo`, call `record(good)` per event, and check `firing(&BURN_WINDOWS[0])`
 (both windows over the factor, as in the generated alert) or
 `burn_tenths_at(now, window)`. Memory is `retention / bucket` slots:
@@ -3521,7 +3522,7 @@ Kubernetes: `autumn release init --target kubernetes` writes a Helm chart
 canaries. Each role gets its own workload (`roles:` in `values.yaml`, one
 Kustomize component per role); only HTTP roles get a Service and an Ingress.
 `--roles` picks the roles. `--target fly` writes one `[processes]` entry per
-role. A fleet sets a role per host group with a `[[deploy.groups]]` table
+role (0.11.0, #3547). A fleet sets a role per host group with a `[[deploy.groups]]` table
 (`role = "worker"` and `hosts = ["10.0.0.3"]`). `autumn doctor` warns when a
 manifest names an undeclared role. See `docs/guide/slo.md`, `docs/guide/kubernetes.md` and
 `docs/guide/fleet-deploys.md`.
@@ -3771,7 +3772,7 @@ Guide: `docs/guide/sandboxed-plugins.md`. Trust model: `docs/plugins.md`.
 ## CLI
 
 ```bash
-cargo install autumn-cli --version 0.10.0
+cargo install autumn-cli --version 0.11.0
 
 autumn new my-app
 autumn setup
@@ -3854,7 +3855,7 @@ autumn migrate new add_widget_archived_at   # collision-free migration dir: pref
 autumn migrate check-collisions             # CI gate: fails if this branch's migration version collides with the default branch, another pushed branch, or the framework's own migrations
 autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (0.8.0, issue #1615)
 autumn sbom --output sbom.cdx.json --locked        # write it; --locked fails when Cargo.lock disagrees with the manifests
-autumn sbom --verify sbom.cdx.json --expect-version 0.10.0   # regenerate + compare component-by-component, and pin the root version; exit 1 with a named diff on drift
+autumn sbom --verify sbom.cdx.json --expect-version 0.11.0   # regenerate + compare component-by-component, and pin the root version; exit 1 with a named diff on drift
 autumn sbom --binary /usr/local/bin/my-app         # crate versions compiled INTO a binary (cargo-auditable `.dep-v0`; ELF/Mach-O/PE) — no source tree, no lockfile
 autumn build --auditable         # compile through `cargo auditable` so the binary carries its own dependency list (the generated release Dockerfile passes this) (0.8.0, issue #1615)
 autumn upgrade                   # preview BOTH halves as per-file diffs, writing nothing: each release's mechanical app-code migrations (renames), and drift between the project's framework-owned files and this release's scaffold (#1629, #1593)
@@ -3884,7 +3885,7 @@ autumn graph show --manifest architecture-graph.json --check architecture-graph.
 # `--check` also names a changed secondary mount and a changed declared plugin mount (`completeness.declared_mounts`); after upgrading, run `autumn graph show --manifest <file>` once to refresh a committed graph (#2520)
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
 autumn graph check-boundaries    # fail when one boundary queries a table another boundary owns (0.10.0, #3549)
-autumn db grants --apply         # GRANT/REVOKE so each boundary `role` reads only its own tables and exceptions; `autumn doctor --strict` checks it as each role
+autumn db grants --apply         # GRANT/REVOKE so each boundary `role` reads only its own tables and exceptions; `autumn doctor --strict` checks it as each role (0.11.0, #3550)
 autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
 autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
 autumn openapi export --check openapi.json --strict   # CI gate: fail on contract drift (compares parsed JSON, naming the operations added/removed/changed), and on any component schema that exports as an opaque `{"type":"object"}`
@@ -3920,7 +3921,7 @@ To keep one module out of another module's tables, declare boundaries in
 `boundaries.toml` and run `autumn graph check-boundaries`. A baseline holds
 today's violations, so an existing app can adopt it. See
 `docs/guide/table-ownership.md`. To make the database refuse
-the same queries, give a boundary `schema` and `role`, connect it with
+the same queries (0.11.0, #3550), give a boundary `schema` and `role`, connect it with
 `[database.roles.<boundary>]`, and use `state.pool_for::<B>()` or
 `BoundaryDb<B>`. Put a model in the schema with
 `#[model(managed, schema = "marketing")]`. Run a repository as the role with
@@ -4740,7 +4741,7 @@ Full API: `skills/autumn-web/references/api-reference.md`; guide:
 ## 0.7.0 release traps
 
 - `AUTUMN_SECURITY__SIGNING_SECRET` is required in `prod` / `production`.
-- Use `autumn-storage-s3 = "0.10"` and `autumn-cache-redis = "0.10"`; these
+- Use `autumn-storage-s3 = "0.11"` and `autumn-cache-redis = "0.11"`; these
   are companion crates, not `autumn-web` feature names.
 - Repository-generated APIs require a policy in production unless
   `security.allow_unauthorized_repository_api = true` is explicit.
@@ -4764,7 +4765,7 @@ Full API: `skills/autumn-web/references/api-reference.md`; guide:
 ## Release and PR workflow
 
 - Base branch is `trunk-dev`, not `trunk`.
-- Release tag for this line is `v0.10.0`.
+- Release tag for this line is `v0.11.0`.
 - Published crates are released together at the same workspace version:
   `autumn-macros`, `autumn-web`, `autumn-cli`, `autumn-admin-plugin`,
   `autumn-storage-s3`, `autumn-cache-redis`, and `autumn-search`.

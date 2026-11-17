@@ -643,5 +643,5 @@ The wizard subcommand has stricter naming rules than other generators:
 
 If `autumn generate` exits nonzero, show the stderr output and diagnose:
 - File conflict: offer to show the conflicting file
-- Missing autumn-cli: instruct `cargo install autumn-cli --version 0.5.0`
+- Missing autumn-cli: instruct `cargo install autumn-cli --version 0.11.0`
 - Schema error: check `src/schema.rs` is up to date (`autumn migrate`)

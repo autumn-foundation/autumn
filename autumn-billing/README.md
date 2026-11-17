@@ -22,7 +22,7 @@ Or add the dependency by hand:
 
 ```toml
 [dependencies]
-autumn-billing = "0.10.0"
+autumn-billing = "0.11.0"
 ```
 
 ## Mount
