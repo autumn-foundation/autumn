@@ -516,6 +516,7 @@ rand = "0.10"
 rand_chacha = "0.10"
 chrono = { workspace = true }
 chrono-tz.workspace = true
+jiff.workspace = true
 # `serde` is a default feature, named here because `SqliteDecimal` depends on it.
 rust_decimal = { workspace = true, features = ["serde"] }
 croner = "4.0.2"
