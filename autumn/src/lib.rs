@@ -590,6 +590,7 @@ pub mod paths;
 /// Enable with the Cargo feature `pdf`.
 #[cfg(feature = "pdf")]
 pub mod pdf;
+pub mod phi_accrual;
 /// Eager-loading (preload) runtime for `#[model]` associations.
 ///
 /// See [`preload`] for [`preload::Preloaded`], [`preload::NotLoaded`], and the

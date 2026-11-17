@@ -706,6 +706,16 @@ delete actions remain last-write-wins.
   ceiling)`, `with_max_hedges`), using `initial` until 20 samples are in.
   Keep one per upstream, in shared state.
 
+## Failure detection (`autumn_web::phi_accrual`)
+
+- `PhiDetector::new(expected_interval)` is a phi accrual failure detector for
+  one peer. Call `heartbeat_at(now)` on each heartbeat; `phi_at(now)` is the
+  suspicion level (`-log10` of the chance the peer is still alive) and
+  `is_available_at(now, threshold)` compares it to a threshold
+  (`DEFAULT_THRESHOLD` = 8.0). It learns the mean and jitter of the last 1000
+  intervals (`with_window`, `with_min_std_dev` default 100 ms,
+  `with_acceptable_pause`). Time is passed in, so tests replay it exactly.
+
 ## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
 
 Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
