@@ -49,6 +49,9 @@ pub const DEFAULT_WINDOW: usize = 1000;
 pub const DEFAULT_MIN_STD_DEV: Duration = Duration::from_millis(100);
 /// The suspicion level Akka and Cassandra treat as "down" by default.
 pub const DEFAULT_THRESHOLD: f64 = 8.0;
+/// The smallest standard deviation used, whatever `min_std_dev` says, so a
+/// perfectly regular window never divides by zero.
+const STD_DEV_FLOOR_SECS: f64 = 1e-6;
 
 /// A phi accrual failure detector for one peer. See the [module docs](self).
 #[derive(Debug, Clone)]
@@ -84,7 +87,8 @@ impl PhiDetector {
         self
     }
 
-    /// Never model the intervals as tighter than `min_std_dev`.
+    /// Never model the intervals as tighter than `min_std_dev`. Values under
+    /// 1 µs are treated as 1 µs.
     #[must_use]
     pub const fn with_min_std_dev(mut self, min_std_dev: Duration) -> Self {
         self.min_std_dev = min_std_dev;
@@ -160,7 +164,8 @@ impl PhiDetector {
             .map(|d| (d.as_secs_f64() - mean).powi(2))
             .sum::<f64>()
             / n;
-        (mean, variance.sqrt().max(self.min_std_dev.as_secs_f64()))
+        let floor = self.min_std_dev.as_secs_f64().max(STD_DEV_FLOOR_SECS);
+        (mean, variance.sqrt().max(floor))
     }
 
     fn trim(&mut self) {
@@ -315,6 +320,20 @@ mod tests {
         detector.heartbeat_at(start);
         assert_eq!(detector.samples(), samples);
         assert!(detector.is_available_at(last + 100 * MS, DEFAULT_THRESHOLD));
+    }
+
+    #[test]
+    fn zero_min_std_dev_on_a_perfect_rhythm_stays_defined() {
+        let start = Instant::now();
+        let mut detector = PhiDetector::new(100 * MS)
+            .with_window(1)
+            .with_min_std_dev(Duration::ZERO);
+        let last = steady(&mut detector, start, 100 * MS, 3);
+        let on_time = detector.phi_at(last + 100 * MS);
+        assert!(on_time.is_finite(), "{on_time}");
+        assert!(detector.is_available_at(last + 100 * MS, DEFAULT_THRESHOLD));
+        let late = detector.phi_at(last + Duration::from_hours(1));
+        assert!(late.is_finite() && late > DEFAULT_THRESHOLD, "{late}");
     }
 
     #[test]
