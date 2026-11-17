@@ -269,6 +269,8 @@ mod mcp_structured_query;
 #[cfg(feature = "mcp")]
 mod mcp_tasks;
 #[cfg(feature = "mcp")]
+mod mcp_tenant_header_trust;
+#[cfg(feature = "mcp")]
 mod mcp_throttle_guard;
 mod middleware_introspection;
 mod middleware_pipeline;
