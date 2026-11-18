@@ -569,11 +569,11 @@ mod tests {
     fn a_log_from_a_nested_timeline_ages_out_on_the_outer_one() {
         use std::sync::Arc;
 
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
-        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let hour = Duration::from_secs(3600);
         let log = PluginActivityLog::new();
         let outer = TickingClock::starting_at(epoch);
@@ -605,15 +605,12 @@ mod tests {
         // at the last drop: it may over-report, never under-report.
         use std::sync::Arc;
 
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
         let minute = Duration::from_secs(60);
         let clock = TickingClock::starting_at(
-            chrono::Utc
-                .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
-                .single()
+            "2020-01-01T00:00:00Z"
+                .parse::<crate::time::Timestamp>()
                 .expect("a valid date"),
         );
         let _clock = install_ambient(Arc::new(clock.clone()));
@@ -857,11 +854,11 @@ mod tests {
     fn an_event_keeps_the_time_it_happened() {
         use std::sync::Arc;
 
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
-        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let hour = Duration::from_secs(3600);
         let clock = TickingClock::starting_at(epoch);
         let _guard = install_ambient(Arc::new(clock.clone()));
@@ -882,11 +879,11 @@ mod tests {
     fn a_full_dropped_ledger_keeps_every_count() {
         use std::sync::Arc;
 
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
-        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let clock = TickingClock::starting_at(epoch);
         let _guard = install_ambient(Arc::new(clock.clone()));
         let log = PluginActivityLog::new();
@@ -905,11 +902,11 @@ mod tests {
     fn the_dropped_ledger_evicts_the_oldest_time_not_the_oldest_insert() {
         use std::sync::Arc;
 
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
-        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let hour = Duration::from_secs(3600);
         let clock = TickingClock::starting_at(epoch);
         let _guard = install_ambient(Arc::new(clock.clone()));
@@ -947,14 +944,14 @@ mod tests {
     fn a_steady_dropper_does_not_stretch_one_record_across_hours() {
         use std::sync::Arc;
 
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
         // One drop every 300 ms for five hours. Each lands inside the bucket
         // of the previous one, so coalescing never opens a new record. The
         // record must still age: its time may not follow the newest drop.
-        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let clock = TickingClock::starting_at(epoch);
         let _guard = install_ambient(Arc::new(clock.clone()));
         let log = PluginActivityLog::new();
@@ -1003,11 +1000,11 @@ mod tests {
     fn the_ring_evicts_the_oldest_event_by_time_not_by_arrival() {
         use std::sync::Arc;
 
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
-        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let hour = Duration::from_secs(3600);
         let clock = TickingClock::starting_at(epoch);
         let _guard = install_ambient(Arc::new(clock.clone()));
@@ -1032,11 +1029,11 @@ mod tests {
     fn folded_counts_leave_the_window_with_their_hour() {
         use std::sync::Arc;
 
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
-        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let hour = Duration::from_secs(3600);
         let clock = TickingClock::starting_at(epoch);
         let _guard = install_ambient(Arc::new(clock.clone()));
@@ -1063,11 +1060,11 @@ mod tests {
     fn a_fold_from_before_the_first_overflow_keeps_its_own_hour() {
         use std::sync::Arc;
 
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
-        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let hour = Duration::from_secs(3600);
         let clock = TickingClock::starting_at(epoch);
         let _guard = install_ambient(Arc::new(clock.clone()));
@@ -1121,11 +1118,11 @@ mod tests {
     fn a_truncation_leaves_the_window_with_its_time() {
         use std::sync::Arc;
 
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
-        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let hour = Duration::from_secs(3600);
         let clock = TickingClock::starting_at(epoch);
         let _guard = install_ambient(Arc::new(clock.clone()));
@@ -1142,11 +1139,11 @@ mod tests {
     fn truncation_is_exact_at_the_window_edge_and_reaches_every_plugin() {
         use std::sync::Arc;
 
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
-        let epoch = chrono::Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let hour = Duration::from_secs(3600);
         let clock = TickingClock::starting_at(epoch);
         let _guard = install_ambient(Arc::new(clock.clone()));

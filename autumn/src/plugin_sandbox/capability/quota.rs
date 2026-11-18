@@ -259,14 +259,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use chrono::{TimeZone, Utc};
-
     use super::{CapabilityRateLimiter, SandboxCapability};
     use crate::time::{TickingClock, install_ambient};
 
     #[test]
     fn a_bucket_from_a_nested_timeline_refills_on_the_outer_one() {
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let capability = SandboxCapability::ALL[0];
         let outer = TickingClock::starting_at(epoch);
         let _outer = install_ambient(Arc::new(outer.clone()));

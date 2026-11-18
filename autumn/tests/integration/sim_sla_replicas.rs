@@ -5,11 +5,6 @@
 //! check job at the deadline. A barrier holds both checks after they read the
 //! store, so both try to claim. Only one escalation may fire.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::ChronoBridge as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -566,7 +561,7 @@ async fn sim_sla_a_stale_calendar_does_not_claim_before_the_stored_deadline() {
     let check = serde_json::json!({ "key": ob.key(), "generation": generation, "due_at": old_due });
     let client = app.state().extension::<job::JobClient>().unwrap();
     client
-        .enqueue_due(autumn_web::sla::CHECK_JOB, check, Some(old_due.to_chrono()))
+        .enqueue_due(autumn_web::sla::CHECK_JOB, check, Some(old_due))
         .await
         .unwrap();
 

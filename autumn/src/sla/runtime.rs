@@ -1,6 +1,5 @@
 //! The plugin, the extractor and the jobs of the SLA engine.
 
-use crate::time::bridge::ChronoBridge;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -548,7 +547,7 @@ impl Sla {
             .ok_or(SlaError::NoJobRuntime)?;
         let payload = serde_json::to_value(args).map_err(|err| SlaError::Job(err.to_string()))?;
         client
-            .enqueue_due(name, payload, due_at.map(ChronoBridge::to_chrono))
+            .enqueue_due(name, payload, due_at)
             .await
             .map_err(|err| SlaError::Job(err.to_string()))
     }

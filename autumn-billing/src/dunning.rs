@@ -11,7 +11,7 @@
     unused_imports,
     reason = "temporary chrono bridge; some callers are feature- or test-gated"
 )]
-use autumn_web::time::bridge::ChronoBridge as _;
+use autumn_web::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -141,7 +141,7 @@ pub(crate) async fn schedule(
     })
     .map_err(|error| BillingError::store(format!("dunning args: {error}")))?;
     match client
-        .enqueue_due(RETRY_JOB_NAME, payload, Some(when))
+        .enqueue_due(RETRY_JOB_NAME, payload, Some(when.to_jiff()))
         .await
     {
         Ok(()) => Ok(()),
@@ -681,7 +681,7 @@ async fn rearm_rows(state: &AppState, rows: &[DunningAttempt]) -> usize {
         }) {
             Ok(payload) => {
                 invoice_ids.push(row.invoice_id.as_str());
-                items.push((payload, Some(when)));
+                items.push((payload, Some(when.to_jiff())));
             }
             Err(error) => tracing::warn!(
                 invoice_id = %row.invoice_id,
