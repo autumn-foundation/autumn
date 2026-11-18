@@ -2873,6 +2873,7 @@ use autumn_web::auth::{{
 use autumn_web::extract::Query;
 use autumn_web::form::{{FieldOptions, password_input_with}};
 use autumn_web::prelude::*;
+use autumn_web::time::bridge::JiffBridge as _;
 use axum::extract::Path;
 use axum::response::{{IntoResponse, Response}};
 use diesel::prelude::*;
@@ -3107,8 +3108,8 @@ fn to_remember_record(r: &{pascal_name}RememberToken) -> RememberRecord {{
         series: r.series.clone(),
         token_hash: r.token_hash.clone(),
         previous_token_hash: r.previous_token_hash.clone(),
-        rotated_at: r.rotated_at.map(|t| t.and_utc()),
-        expires_at: r.expires_at_utc(),
+        rotated_at: r.rotated_at.map(|t| t.and_utc().to_jiff()),
+        expires_at: r.expires_at_utc().to_jiff(),
     }}
 }}
 
@@ -3219,7 +3220,7 @@ pub async fn remember_me(
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     let evaluated = record.as_ref().map(to_remember_record);
 
-    match evaluate_remember(&token, evaluated.as_ref(), now, grace) {{
+    match evaluate_remember(&token, evaluated.as_ref(), now.to_jiff(), grace) {{
         RememberDecision::Rotate => {{
             let row = record.expect("Rotate is only returned for a present record");
 
@@ -3266,7 +3267,7 @@ pub async fn remember_me(
                 // state before deciding.
                 let record2 = find_remember_token(&mut *conn, &series).await.ok().flatten();
                 let evaluated2 = record2.as_ref().map(to_remember_record);
-                match evaluate_remember(&token, evaluated2.as_ref(), now, grace) {{
+                match evaluate_remember(&token, evaluated2.as_ref(), now.to_jiff(), grace) {{
                     RememberDecision::Accept | RememberDecision::Rotate => {{
                         // Within grace (or somehow still current): authenticate
                         // WITHOUT rotating again or re-cookieing.

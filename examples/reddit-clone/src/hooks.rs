@@ -1,5 +1,6 @@
 use autumn_web::AutumnResult;
 use autumn_web::hooks::{MutationContext, MutationHooks, UpdateDraft};
+use autumn_web::time::bridge::ChronoBridge as _;
 
 use crate::models::{NewPost, NewSubreddit, Post, Subreddit, UpdatePost, UpdateSubreddit};
 use autumn_web::{contains_letter_or_number, slugify};
@@ -90,7 +91,7 @@ impl MutationHooks for PostHooks {
         // `ctx.now` is the framework's injected mutation timestamp, so this
         // stays deterministic under `#[sim_test]`; `chrono::Utc::now()` would
         // not (see the determinism seam gate in `clippy.toml`).
-        draft.after.updated_at = ctx.now.naive_utc();
+        draft.after.updated_at = ctx.now.to_chrono().naive_utc();
 
         Ok(())
     }
@@ -132,6 +133,7 @@ impl MutationHooks for SubredditHooks {
 #[cfg(test)]
 mod tests {
     use autumn_web::hooks::MutationOp;
+    use autumn_web::time::bridge::JiffBridge as _;
     use chrono::TimeZone as _;
 
     use super::*;
@@ -164,7 +166,8 @@ mod tests {
         ctx.now = chrono::Utc
             .with_ymd_and_hms(year, month, day, 9, 30, 0)
             .single()
-            .expect("valid timestamp");
+            .expect("valid timestamp")
+            .to_jiff();
         ctx
     }
 
@@ -316,7 +319,7 @@ mod tests {
 
         assert_eq!(
             draft.after.updated_at,
-            ctx.now.naive_utc(),
+            ctx.now.to_chrono().naive_utc(),
             "an edit must advance posts.updated_at -- /sitemap.xml publishes it as <lastmod>",
         );
         assert_ne!(
@@ -347,7 +350,7 @@ mod tests {
             .await
             .expect("hook succeeds");
 
-        assert_eq!(draft.after.updated_at, ctx.now.naive_utc());
+        assert_eq!(draft.after.updated_at, ctx.now.to_chrono().naive_utc());
     }
 
     #[tokio::test]
