@@ -904,7 +904,6 @@ dependencies = [
  "bytes",
  "chromiumoxide",
  "chrono",
- "chrono-tz",
  "criterion",
  "croner",
  "css-inline",
