@@ -6,11 +6,6 @@
 
 #![cfg(all(feature = "postgres", not(feature = "sqlite")))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::JiffBridge as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,11 +47,7 @@ fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
 }
 
 fn clock() -> TickingClock {
-    TickingClock::starting_at(
-        chrono::DateTime::from_timestamp_millis(1_000_000)
-            .unwrap()
-            .to_jiff(),
-    )
+    TickingClock::starting_at(autumn_web::time::Timestamp::from_millisecond(1_000_000).unwrap())
 }
 
 /// A store on its own pool: one host.

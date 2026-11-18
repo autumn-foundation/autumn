@@ -428,8 +428,8 @@ fn resolve_ref(root: &serde_json::Value, value: &serde_json::Value) -> serde_jso
 struct ScalarArgs {
     id: uuid::Uuid,
     price: rust_decimal::Decimal,
-    placed_at: chrono::DateTime<chrono::Utc>,
-    due_on: chrono::NaiveDate,
+    placed_at: autumn_web::time::Timestamp,
+    due_on: autumn_web::time::civil::Date,
 }
 
 #[post("/api/scalar-body")]

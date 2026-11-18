@@ -33,7 +33,11 @@ struct Article {
     pub title: String,
     pub slug: String,
     pub status: String,
-    pub published_at: Option<chrono::NaiveDateTime>,
+    #[diesel(
+        serialize_as = autumn_web::db::SqlNullableDateTime,
+        deserialize_as = autumn_web::db::SqlNullableDateTime
+    )]
+    pub published_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -170,7 +174,7 @@ async fn before_update_rewrites_derived_field() {
 
     // Persist the change using AsChangeset.
     diesel::update(test_articles::table.find(inserted.id))
-        .set(&draft.after)
+        .set(draft.after.clone())
         .execute(&mut conn)
         .await
         .unwrap();
@@ -244,7 +248,7 @@ async fn draft_field_accessors_match_persisted_diff() {
 
     // Persist via AsChangeset.
     diesel::update(test_articles::table.find(original.id))
-        .set(&draft.after)
+        .set(draft.after.clone())
         .execute(&mut conn)
         .await
         .unwrap();

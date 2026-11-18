@@ -131,7 +131,7 @@ pub struct AuditedDoc {
     #[searchable]
     pub body: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(AuditedDoc, table = "search_def_audited")]
@@ -147,7 +147,7 @@ pub struct ArchivedDoc {
     #[searchable]
     pub body: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(ArchivedDoc, table = "search_def_archived", soft_delete)]

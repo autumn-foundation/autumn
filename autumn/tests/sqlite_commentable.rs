@@ -108,7 +108,7 @@ pub struct SqcAudit {
     pub title: String,
     #[default]
     pub comment_count: i64,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(SqcAudit, table = "sqc_audits")]
@@ -129,7 +129,7 @@ mod twins {
         pub title: String,
         #[default]
         pub comment_count: i64,
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<autumn_web::time::civil::DateTime>,
     }
 
     #[autumn_web::repository(SqcTwinA, table = "sqc_audits")]
@@ -143,7 +143,7 @@ mod twins {
         pub title: String,
         #[default]
         pub comment_count: i64,
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<autumn_web::time::civil::DateTime>,
     }
 
     #[autumn_web::repository(SqcTwinB, table = "sqc_audits")]
@@ -158,7 +158,7 @@ mod twins {
         pub title: String,
         #[default]
         pub comment_count: i64,
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<autumn_web::time::civil::DateTime>,
     }
 
     #[autumn_web::repository(SqcMixedPlain, table = "sqc_audits")]
@@ -172,7 +172,7 @@ mod twins {
         pub title: String,
         #[default]
         pub comment_count: i64,
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<autumn_web::time::civil::DateTime>,
     }
 
     #[autumn_web::repository(SqcMixedSoft, table = "sqc_audits", soft_delete)]
@@ -188,7 +188,7 @@ pub struct SqcDual {
     pub title: String,
     #[default]
     pub comment_count: i64,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(SqcDual, table = "sqc_duals", soft_delete)]

@@ -29,11 +29,6 @@
     )
 )]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -784,7 +779,7 @@ impl SqliteLeaseSchedulerCoordinator {
 
     /// Current wall time in milliseconds, read from the injected clock.
     fn now_ms(&self) -> i64 {
-        self.clock.now().to_chrono().timestamp_millis()
+        self.clock.now().as_millisecond()
     }
 }
 

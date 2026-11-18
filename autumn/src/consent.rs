@@ -67,11 +67,6 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::convert::Infallible;
 
 use axum::extract::FromRequestParts;
@@ -194,7 +189,7 @@ impl Consent {
         let mut parts = decoded.splitn(3, '|');
         let version: u32 = parts.next()?.parse().ok()?;
         let decided_at = parts.next()?;
-        if decided_at.is_empty() || chrono::DateTime::parse_from_rfc3339(decided_at).is_err() {
+        if decided_at.is_empty() || decided_at.parse::<jiff::Timestamp>().is_err() {
             return None;
         }
         let categories_field = parts.next().unwrap_or("");
@@ -364,7 +359,7 @@ pub fn reject_non_essential_cookie(policy_version: u32) -> String {
 }
 
 fn build_consent_cookie(categories: &[&str], policy_version: u32) -> String {
-    let decided_at = crate::time::ambient_now().to_chrono().to_rfc3339();
+    let decided_at = crate::time::compat::rfc3339(crate::time::ambient_now());
     let value = encode_cookie_value(policy_version, &decided_at, categories);
     format!(
         "{CONSENT_COOKIE_NAME}={value}; Path=/; Max-Age={MAX_AGE_SECS}; HttpOnly; Secure; SameSite=Lax"

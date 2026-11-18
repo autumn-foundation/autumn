@@ -8,11 +8,6 @@
 
 #![cfg(feature = "cache-moka")]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::JiffBridge as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
@@ -736,13 +731,10 @@ async fn works_through_arc_dyn_cache_raw_bytes_backend() {
 
 /// A clock that moves only when the test moves it, so freshness is exact.
 fn ticking_clock() -> autumn_web::time::TickingClock {
-    use chrono::TimeZone as _;
     autumn_web::time::TickingClock::starting_at(
-        (chrono::Utc
-            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
-            .single()
-            .expect("valid instant"))
-        .to_jiff(),
+        "2026-01-01T00:00:00Z"
+            .parse::<autumn_web::time::Timestamp>()
+            .expect("valid instant"),
     )
 }
 

@@ -46,22 +46,23 @@
 //! ```rust,ignore
 //! use autumn_web::prelude::*;
 //! use autumn_web::pagination::{CursorPage, CursorRequest};
-//! use chrono::{DateTime, Utc};
+//! use autumn_web::db::AsSqlTime as _;
+//! use autumn_web::time::Timestamp;
 //! use diesel::prelude::*;
 //! use diesel_async::RunQueryDsl;
 //! use serde::{Deserialize, Serialize};
 //!
 //! // Sort key — created_at + id is the stable, deterministic tie-breaker.
 //! #[derive(Serialize, Deserialize)]
-//! struct PostCursor { created_at: DateTime<Utc>, id: i64 }
+//! struct PostCursor { created_at: Timestamp, id: i64 }
 //!
 //! #[get("/api/feed")]
 //! async fn feed(cur: CursorRequest, mut db: Db) -> AutumnResult<Json<CursorPage<Post>>> {
 //!     let mut q = posts::table.into_boxed();
 //!     if let Some(c) = cur.decode::<PostCursor>() {
 //!         q = q.filter(
-//!             posts::created_at.lt(c.created_at)
-//!                 .or(posts::created_at.eq(c.created_at).and(posts::id.lt(c.id))),
+//!             posts::created_at.lt(c.created_at.as_sql_time())
+//!                 .or(posts::created_at.eq(c.created_at.as_sql_time()).and(posts::id.lt(c.id))),
 //!         );
 //!     }
 //!     let items: Vec<Post> = q

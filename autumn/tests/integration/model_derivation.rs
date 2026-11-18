@@ -198,7 +198,7 @@ pub struct DvRevision {
     pub page_id: i64,
     pub published: bool,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(DvRevision, table = "dv_revisions", soft_delete)]

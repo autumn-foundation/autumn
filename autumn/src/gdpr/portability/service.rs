@@ -1,10 +1,5 @@
 //! One export and import path for the actuator and the CLI.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -201,9 +196,7 @@ impl CapsuleService {
     pub fn capsule_name() -> String {
         static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let time = crate::time::ambient_now()
-            .to_chrono()
-            .format("%Y%m%dT%H%M%S%6f");
+        let time = crate::time::ambient_now().strftime("%Y%m%dT%H%M%S%6f");
         format!("capsule-{time}-{count}")
     }
 

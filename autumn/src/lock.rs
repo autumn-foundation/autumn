@@ -724,11 +724,6 @@ mod db_impl {
 /// `PostgreSQL` lock a caller can observe.
 #[cfg(feature = "sqlite")]
 mod sqlite_impl {
-    #[allow(
-        unused_imports,
-        reason = "temporary chrono bridge; some callers are feature- or test-gated"
-    )]
-    use crate::time::bridge::ChronoBridge as _;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -886,7 +881,7 @@ mod sqlite_impl {
         }
 
         fn now_ms(&self) -> i64 {
-            self.clock.now().to_chrono().timestamp_millis()
+            self.clock.now().as_millisecond()
         }
 
         /// Check out a connection, creating the lock table on first use.
@@ -1198,11 +1193,7 @@ mod sqlite_impl {
                     let Ok(mut conn) = pool.get().await else {
                         continue;
                     };
-                    let expires_at = clock
-                        .now()
-                        .to_chrono()
-                        .timestamp_millis()
-                        .saturating_add(ttl_ms);
+                    let expires_at = clock.now().as_millisecond().saturating_add(ttl_ms);
                     let renewed = diesel::sql_query(
                         "UPDATE autumn_locks SET expires_at = ? \
                          WHERE lock_key = ? AND owner = ?",

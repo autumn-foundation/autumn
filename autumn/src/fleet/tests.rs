@@ -1,11 +1,6 @@
 //! A test engine with a hand-written extractor over [`resolve`]. The tests
 //! do not need `sqlite`.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::JiffBridge as _;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -382,9 +377,7 @@ async fn lifecycle_hooks_see_the_epoch_the_database_opened_under() {
     let hook = Arc::new(EpochHook::default());
     fleet.add_lifecycle(Arc::clone(&hook) as Arc<dyn FleetLifecycle<TextEngine>>);
     let clock = crate::time::TickingClock::starting_at(
-        chrono::DateTime::from_timestamp_millis(1_000_000)
-            .unwrap()
-            .to_jiff(),
+        jiff::Timestamp::from_millisecond(1_000_000).unwrap(),
     );
     let store = Arc::new(MemoryOwnership::new(Arc::new(clock.clone())));
     let a = host(&store, "host-a", SlotRange::ALL);

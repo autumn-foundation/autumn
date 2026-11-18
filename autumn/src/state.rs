@@ -17,11 +17,6 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::JiffBridge as _;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1739,14 +1734,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "construction-time builder")]
     fn re_clocking_an_initialized_state_is_refused() {
-        use chrono::{TimeZone, Utc};
-
         let state = AppState::detached();
         // What `job::start_runtime` does: register the app's job names.
         state.job_registry().register_on_queue("probe", "default");
 
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let _ = state.with_clock(Arc::new(crate::time::FixedClock::at(epoch.to_jiff())));
+        let epoch: jiff::Timestamp = "2020-01-01T00:00:00Z".parse().unwrap();
+        let _ = state.with_clock(Arc::new(crate::time::FixedClock::at(epoch)));
     }
 
     /// A state's clock and the gauges it judges must never come apart.
@@ -1760,20 +1753,17 @@ mod tests {
     /// instead, so each state keeps a matched pair.
     #[test]
     fn re_clocking_a_state_keeps_its_gauges_on_its_own_clock() {
-        use chrono::{TimeZone, Utc};
-
         let real_state = AppState::detached();
         let cloned_before = real_state.clone();
 
         // Behind real time, like a sim epoch: the direction where a stale
         // judgement calls a not-yet-due job ready.
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let virtual_state =
-            real_state.with_clock(Arc::new(crate::time::FixedClock::at(epoch.to_jiff())));
+        let epoch: jiff::Timestamp = "2020-01-01T00:00:00Z".parse().unwrap();
+        let virtual_state = real_state.with_clock(Arc::new(crate::time::FixedClock::at(epoch)));
 
         // A job the virtual state's runtime would stamp: due a minute after its
         // epoch, so not yet ready *on that state's clock*.
-        let ready_at = u64::try_from(epoch.timestamp_millis()).unwrap() + 60_000;
+        let ready_at = u64::try_from(epoch.as_millisecond()).unwrap() + 60_000;
         virtual_state
             .job_registry()
             .register_on_queue("probe", "default");

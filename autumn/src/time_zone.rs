@@ -32,11 +32,6 @@
 //! }
 //! ```
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use jiff::Timestamp;
 use jiff::tz::{AmbiguousOffset, TimeZone as Tz};
 use serde::Deserialize;

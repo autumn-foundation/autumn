@@ -9,11 +9,6 @@
 //! cargo test -p autumn-web --features redis,db --test integration_tests job_tracking_stores -- --ignored
 //! ```
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::JiffBridge as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -402,17 +397,11 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
 /// expiry. A writer's clock must not change a record's TTL.
 #[cfg(feature = "db")]
 mod pg_clock_skew {
-    #[allow(
-        unused_imports,
-        reason = "temporary chrono bridge; some callers are feature- or test-gated"
-    )]
-    use autumn_web::time::bridge::JiffBridge as _;
     use std::sync::Arc;
     use std::time::Duration;
 
     use autumn_web::job_tracking::{JobTrackingStore as _, PgJobTrackingStore, TrackedJobOwner};
-    use autumn_web::time::FixedClock;
-    use chrono::Utc;
+    use autumn_web::time::{FixedClock, SignedDuration, Timestamp};
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use diesel_async::pooled_connection::deadpool::Pool;
     use diesel_async::{AsyncPgConnection, SimpleAsyncConnection as _};
@@ -450,16 +439,16 @@ mod pg_clock_skew {
         (container, pool)
     }
 
-    fn skewed(pool: &PgPool, ttl_secs: u64, skew: chrono::TimeDelta) -> PgJobTrackingStore {
+    fn skewed(pool: &PgPool, ttl_secs: u64, skew: SignedDuration) -> PgJobTrackingStore {
         PgJobTrackingStore::new(pool.clone(), ttl_secs)
-            .with_clock(Arc::new(FixedClock::at((Utc::now() + skew).to_jiff())))
+            .with_clock(Arc::new(FixedClock::at(Timestamp::now() + skew)))
     }
 
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn lagging_writer_clock_does_not_expire_a_record_early() {
         let (_container, pool) = start_pool().await;
-        let writer = skewed(&pool, 60, -chrono::TimeDelta::hours(1));
+        let writer = skewed(&pool, 60, -SignedDuration::from_hours(1));
         writer
             .create("lag", TrackedJobOwner::Anonymous)
             .await
@@ -478,7 +467,7 @@ mod pg_clock_skew {
     #[ignore = "requires Docker (testcontainers)"]
     async fn leading_writer_clock_does_not_extend_a_record() {
         let (_container, pool) = start_pool().await;
-        let writer = skewed(&pool, 1, chrono::TimeDelta::hours(1));
+        let writer = skewed(&pool, 1, SignedDuration::from_hours(1));
         writer
             .create("lead", TrackedJobOwner::Anonymous)
             .await
@@ -500,7 +489,7 @@ mod pg_clock_skew {
     #[ignore = "requires Docker (testcontainers)"]
     async fn retry_reset_is_a_no_op_after_a_write_under_a_frozen_clock() {
         let (_container, pool) = start_pool().await;
-        let store = skewed(&pool, 60, chrono::TimeDelta::zero());
+        let store = skewed(&pool, 60, SignedDuration::ZERO);
         store
             .create("frozen", TrackedJobOwner::Anonymous)
             .await
@@ -530,7 +519,7 @@ mod pg_clock_skew {
     #[ignore = "requires Docker (testcontainers)"]
     async fn retry_reset_uses_the_database_clock_for_expiry() {
         let (_container, pool) = start_pool().await;
-        let writer = skewed(&pool, 60, -chrono::TimeDelta::hours(1));
+        let writer = skewed(&pool, 60, -SignedDuration::from_hours(1));
         writer
             .create("retry", TrackedJobOwner::Anonymous)
             .await

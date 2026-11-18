@@ -12,16 +12,9 @@
 //!   * request bodies are bounded and capsule files are owner-only;
 //!   * the retention cap prunes oldest-first.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::JiffBridge as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use chrono::TimeZone as _;
 
 use autumn_web::AppState;
 use autumn_web::capsule::{Capsule, CapsuleBody, CapsuleOutcome};
@@ -147,8 +140,9 @@ async fn await_capsules(dir: &Path, expected: usize) -> Vec<PathBuf> {
 /// name, so a seeded name is all it takes to make a file look old — no clock
 /// mocking, no `filetime`.
 fn write_aged_capsule(dir: &Path, age_secs: i64, sequence: u32) -> PathBuf {
-    let stamp =
-        (chrono::Utc::now() - chrono::Duration::seconds(age_secs)).format("%Y%m%dT%H%M%S%.6f");
+    let stamp = (autumn_web::time::Timestamp::now()
+        - autumn_web::time::SignedDuration::from_secs(age_secs))
+    .strftime("%Y%m%dT%H%M%S%.6f");
     let path = dir.join(format!("{stamp}-{sequence:06}-seeded.json"));
     std::fs::write(&path, b"{}").expect("seeded capsule writes");
     path
@@ -318,13 +312,11 @@ async fn four_xx_persists_no_capsule() {
 #[tokio::test]
 async fn capsule_records_clock_reads_in_order() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let start = chrono::Utc
-        .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
-        .single()
-        .expect("valid timestamp");
+    let start: autumn_web::time::Timestamp =
+        "2026-01-01T00:00:00Z".parse().expect("valid timestamp");
     let client = TestApp::new()
         .config(capture_config(dir.path()))
-        .with_clock(autumn_web::time::TickingClock::starting_at(start.to_jiff()))
+        .with_clock(autumn_web::time::TickingClock::starting_at(start))
         .routes(routes![clock_fail])
         .build();
 

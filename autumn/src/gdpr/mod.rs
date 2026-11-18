@@ -29,11 +29,6 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -225,7 +220,7 @@ impl ExportArchive {
         Self {
             manifest: ExportManifest {
                 user_id: user_id.into(),
-                generated_at: crate::time::ambient_now().to_chrono().to_rfc3339(),
+                generated_at: crate::time::compat::rfc3339(crate::time::ambient_now()),
                 framework_version: env!("CARGO_PKG_VERSION").to_owned(),
                 ..Default::default()
             },

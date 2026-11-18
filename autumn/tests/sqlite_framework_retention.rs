@@ -97,7 +97,7 @@ async fn values(pool: &SqlitePool, sql: &str) -> Vec<String> {
 }
 
 fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    autumn_web::time::Timestamp::now().as_millisecond()
 }
 
 async fn insert_job(pool: &SqlitePool, id: &str, status: &str, age_days: i64) {
@@ -281,13 +281,16 @@ async fn the_report_cutoff_is_the_window_before_now() {
     let reports = run_retention(&state, &options(Some("job_history"), true))
         .await
         .expect("run");
-    let cutoff =
-        chrono::DateTime::parse_from_rfc3339(reports[0].cutoff.as_deref().expect("cutoff"))
-            .expect("rfc3339")
-            .with_timezone(&chrono::Utc);
-    let expected = chrono::Utc::now() - chrono::Duration::days(30);
+    let cutoff: autumn_web::time::Timestamp = reports[0]
+        .cutoff
+        .as_deref()
+        .expect("cutoff")
+        .parse()
+        .expect("rfc3339");
+    let expected =
+        autumn_web::time::Timestamp::now() - autumn_web::time::SignedDuration::from_hours(30 * 24);
     assert!(
-        (cutoff - expected).num_seconds().abs() < 5,
+        cutoff.duration_since(expected).as_secs().abs() < 5,
         "{cutoff} vs {expected}"
     );
 }
