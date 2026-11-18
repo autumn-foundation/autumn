@@ -7547,7 +7547,6 @@ dependencies = [
  "aws-sdk-s3",
  "axum",
  "bytes",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",

@@ -1946,7 +1946,7 @@ mod tests {
             creator_id: 1,
             subscriber_count: 0,
             comment_count: 0,
-            created_at: chrono::NaiveDateTime::default(),
+            created_at: autumn_web::time::civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
         }];
         let rendered = submit_form_markup(&blank_submit_form(), &subs, None).into_string();
 

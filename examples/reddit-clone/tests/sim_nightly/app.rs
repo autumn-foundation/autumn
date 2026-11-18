@@ -13,11 +13,6 @@
 //! number of times. Thus the races of the real app can occur here, and the
 //! seed selects which race occurs.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::ChronoBridge as _;
 use std::sync::Arc;
 
 use autumn_web::app::AppBuilder;
@@ -262,14 +257,14 @@ async fn vote(
 pub struct HotRow {
     pub id: i64,
     pub score: i64,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
     pub rank: f64,
 }
 
 /// The front page, ranked at the clock of this app.
 #[get("/hot")]
 async fn hot(clock: Clock, State(state): State<AppState>) -> Json<Vec<HotRow>> {
-    let now = clock.now().to_chrono().naive_utc();
+    let now = autumn_web::time::tz::Offset::UTC.to_datetime(clock.now());
     let mut rows: Vec<HotRow> = reddit(&state)
         .shared
         .store
@@ -362,7 +357,7 @@ async fn submit(
         author_id,
         &title,
         &slug,
-        clock.now().to_chrono().naive_utc(),
+        autumn_web::time::tz::Offset::UTC.to_datetime(clock.now()),
     );
     let jobs = state
         .extension::<JobClient>()
@@ -408,7 +403,7 @@ pub struct PostArgs {
 /// Rank one post with the real formula.
 #[job(name = "rank_post", max_attempts = 8, backoff_ms = 1000)]
 async fn rank_post(state: AppState, args: PostArgs) -> AutumnResult<()> {
-    let now = state.clock().now().to_chrono().naive_utc();
+    let now = autumn_web::time::tz::Offset::UTC.to_datetime(state.clock().now());
     reddit(&state).shared.store.with(|t| {
         if let Some(post) = t.posts.get_mut(&args.post_id) {
             post.hot_rank = calculate_hot_rank(post.score, post.created_at, now);
@@ -478,7 +473,7 @@ async fn notify_hooks(state: AppState, args: PostArgs) -> AutumnResult<()> {
 /// does in SQL), and enqueue the jobs that a crash lost.
 #[scheduled(every = "15m", name = "rank-sweep")]
 async fn rank_sweep(state: AppState) -> AutumnResult<()> {
-    let now = state.clock().now().to_chrono().naive_utc();
+    let now = autumn_web::time::tz::Offset::UTC.to_datetime(state.clock().now());
     let lost: Vec<(i64, &'static str)> = reddit(&state).shared.store.with(|t| {
         t.sweep_runs += 1;
         let mut lost = Vec::new();

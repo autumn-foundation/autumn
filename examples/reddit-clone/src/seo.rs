@@ -40,7 +40,7 @@ struct PostSitemapRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     post_slug: String,
     #[diesel(sql_type = diesel::sql_types::Timestamp)]
-    last_modified: chrono::NaiveDateTime,
+    last_modified: autumn_web::db::SqlDateTime,
 }
 
 /// The maximum number of posts in `/sitemap.xml`.
@@ -358,7 +358,7 @@ impl RedditSitemapSource {
         for row in rows {
             entries.push(
                 SitemapEntry::new(format!("{base}/r/{}/posts/{}", row.sub_slug, row.post_slug))
-                    .lastmod(row.last_modified.format("%Y-%m-%d").to_string())
+                    .lastmod(row.last_modified.strftime("%Y-%m-%d").to_string())
                     .changefreq(SitemapChangefreq::Weekly)
                     .priority(0.6),
             );
