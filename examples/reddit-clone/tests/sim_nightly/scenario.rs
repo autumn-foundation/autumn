@@ -558,11 +558,9 @@ async fn age_posts(sim: &Sim) {
     }
     let tomorrow = autumn_web::time::civil::date(2020, 1, 2);
     sim.advance_to(
-        tomorrow
-            .at(9, 0, 0, 0)
-            .to_zoned(autumn_web::time::tz::TimeZone::UTC)
-            .expect("a time in range")
-            .timestamp(),
+        autumn_web::time::tz::TimeZone::UTC
+            .to_timestamp(tomorrow.at(9, 0, 0, 0))
+            .expect("a time in range"),
     )
     .await;
     let new_york_winter = autumn_web::time::tz::TimeZone::fixed(autumn_web::time::tz::offset(-5));
