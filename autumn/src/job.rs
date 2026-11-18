@@ -3555,7 +3555,7 @@ fn fill_after_commit_enqueue(
             name: name.to_owned(),
             payload: capsule_job_payload(&slot.payload),
             delay_secs,
-            due_at: due_at.map(crate::time::bridge::ChronoBridge::to_chrono),
+            due_at,
             requested_due_at: None,
             // `message`, not `Display`: recorded on the capsule tape.
             error: error.map(AutumnError::message),
@@ -3768,11 +3768,9 @@ fn fill_enqueue(
             // Not `-`: the panic gate denies `arithmetic_side_effects`, and `Timestamp`
             // subtraction is not total.
             delay_secs: due_at.map(|due| recorded_delay(due.duration_since(now))),
-            due_at: due_at.map(crate::time::bridge::ChronoBridge::to_chrono),
+            due_at,
             // Kept only when the deadline had passed and the job ran at once.
-            requested_due_at: due_at
-                .map_or(slot.requested_due_at, |_| None)
-                .map(crate::time::bridge::ChronoBridge::to_chrono),
+            requested_due_at: due_at.map_or(slot.requested_due_at, |_| None),
             // `message`, not `Display`: recorded on the capsule tape.
             error: error.map(crate::AutumnError::message),
             error_status: error.map(|error| error.status().as_u16()),

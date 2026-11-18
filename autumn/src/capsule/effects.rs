@@ -716,7 +716,6 @@ impl ReplayEffects {
             // Capture runs a past deadline at once with `due_at: None` and keeps the requested
             // deadline in `requested_due_at`, so replay compares that one.
             crate::job::EnqueueSchedule::At(deadline) => {
-                let deadline = crate::time::bridge::ChronoBridge::to_chrono(deadline);
                 next.due_at != Some(deadline)
                     && !(next.due_at.is_none() && next.requested_due_at == Some(deadline))
             }
@@ -2384,7 +2383,7 @@ mod tests {
             ..JobEffect::default()
         };
         let future = JobEffect {
-            due_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            due_at: Some(crate::time::ambient_now() + jiff::SignedDuration::from_hours(1)),
             ..delayed.clone()
         };
         for recorded in [delayed, future] {
@@ -2426,7 +2425,7 @@ mod tests {
     /// the same deadline.
     #[test]
     fn a_past_deadline_enqueue_at_matches_its_normalized_recording() {
-        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let past = crate::time::ambient_now() - jiff::SignedDuration::from_hours(1);
         let recorded = JobEffect {
             name: "send_receipt".to_owned(),
             payload: serde_json::json!({}),
@@ -2441,7 +2440,7 @@ mod tests {
             tape.next_job(
                 "send_receipt",
                 &serde_json::json!({}),
-                crate::job::EnqueueSchedule::At(crate::time::bridge::JiffBridge::to_jiff(past))
+                crate::job::EnqueueSchedule::At(past)
             ),
             EnqueueVerdict::Queued,
             "{:?}",
@@ -2469,9 +2468,7 @@ mod tests {
             tape.next_job(
                 "send_receipt",
                 &serde_json::json!({}),
-                crate::job::EnqueueSchedule::At(crate::time::bridge::JiffBridge::to_jiff(
-                    past - chrono::Duration::hours(1)
-                ))
+                crate::job::EnqueueSchedule::At(past - jiff::SignedDuration::from_hours(1))
             ),
             EnqueueVerdict::Diverged
         );
@@ -3152,9 +3149,7 @@ mod tests {
     #[test]
     fn a_moved_absolute_deadline_is_a_divergence() {
         use crate::job::EnqueueSchedule;
-        let deadline = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .expect("parses")
-            .with_timezone(&chrono::Utc);
+        let deadline: crate::time::Timestamp = "2026-01-01T00:00:00Z".parse().expect("parses");
         let recorded = JobEffect {
             name: "send_receipt".to_owned(),
             payload: serde_json::json!({}),
@@ -3170,9 +3165,7 @@ mod tests {
             tape.next_job(
                 "send_receipt",
                 &serde_json::json!({}),
-                EnqueueSchedule::At(crate::time::bridge::JiffBridge::to_jiff(
-                    deadline + chrono::Duration::hours(1)
-                ))
+                EnqueueSchedule::At(deadline + jiff::SignedDuration::from_hours(1))
             ),
             EnqueueVerdict::Diverged,
             "a job rescheduled to a different instant is a behaviour change"
@@ -3181,7 +3174,7 @@ mod tests {
             tape.next_job(
                 "send_receipt",
                 &serde_json::json!({}),
-                EnqueueSchedule::At(crate::time::bridge::JiffBridge::to_jiff(deadline))
+                EnqueueSchedule::At(deadline)
             ),
             EnqueueVerdict::Queued,
             "and the same instant still replays, whatever the clock now reads"

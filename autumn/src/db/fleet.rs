@@ -182,7 +182,7 @@ mod replica {
         pub(super) async fn replace_from_replica(
             &self,
             key: &FleetDbKey,
-            _: Option<chrono::DateTime<chrono::Utc>>,
+            _: Option<crate::time::Timestamp>,
         ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
             if !matches!(self.inner.engine.ship_mode(), ShipMode::Rebuild) {
                 return Err(FleetError::NotReplicated { name: key.name() });
@@ -2936,7 +2936,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     pub(crate) async fn restore_to_point(
         &self,
         key: &FleetDbKey,
-        target: Option<chrono::DateTime<chrono::Utc>>,
+        target: Option<crate::time::Timestamp>,
     ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
         self.check_key(key)?;
         let (fleet, key, name) = (self.clone(), key.clone(), key.name());
@@ -2955,7 +2955,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     async fn restore_owned(
         &self,
         key: &FleetDbKey,
-        target: Option<chrono::DateTime<chrono::Utc>>,
+        target: Option<crate::time::Timestamp>,
     ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
         self.with_exclusive(key, self.replace_from_replica(key, target))
             .await

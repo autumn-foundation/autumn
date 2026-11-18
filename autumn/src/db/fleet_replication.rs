@@ -38,18 +38,13 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use crate::actuator::{HealthCheckOutput, HealthIndicator};
 use crate::entropy::Entropy;
@@ -103,7 +98,7 @@ const fn pause_after(interval: Duration, took: Duration) -> Duration {
 
 /// The keys, the oldest time first. A pass ships in this order, so the
 /// database with the most lag ships first.
-fn oldest_first(mut entries: Vec<(FleetDbKey, DateTime<Utc>)>) -> Vec<FleetDbKey> {
+fn oldest_first(mut entries: Vec<(FleetDbKey, Timestamp)>) -> Vec<FleetDbKey> {
     entries.sort_by_key(|entry| entry.1);
     entries.into_iter().map(|(key, _)| key).collect()
 }
@@ -182,7 +177,7 @@ struct ActiveReplica {
     /// for a tick in destination I/O.
     epoch: AtomicU64,
     status: Arc<ReplicationStatus>,
-    registered_at: DateTime<Utc>,
+    registered_at: Timestamp,
 }
 
 impl ActiveReplica {
@@ -395,7 +390,7 @@ pub struct FleetReplication {
     wait_poll: Duration,
     /// The last bound of each closed database, and when it closed. Cleared
     /// at the next open, a delete, a restore, or after [`CLOSED_BOUND_TTL`].
-    closed: Mutex<HashMap<FleetDbKey, (ClosedBound, DateTime<Utc>)>>,
+    closed: Mutex<HashMap<FleetDbKey, (ClosedBound, Timestamp)>>,
     /// The epoch at which this host serves a key now. `None`: its lease
     /// lapsed. The fleet installs it with its ownership.
     serving_hook: Mutex<Option<ServingHook>>,
@@ -404,7 +399,7 @@ pub struct FleetReplication {
 /// The bound of one database, for [`FleetReplication::replicated_through`].
 enum Bound {
     /// Every commit at or before it is in the replica.
-    At(DateTime<Utc>),
+    At(Timestamp),
     /// Replicated here, but no bound is proved now.
     Unknown,
     /// A newer owner fenced the replica.
@@ -422,10 +417,7 @@ pub(crate) enum ClosedBound {
         epoch: u64,
     },
     /// Its replica caught up, or its last generation shipped.
-    At {
-        at: Option<DateTime<Utc>>,
-        epoch: u64,
-    },
+    At { at: Option<Timestamp>, epoch: u64 },
     /// Its last generation ships from this slot, also in a retry after the
     /// close: read the slot.
     Slot(Arc<GenerationSlot>),
@@ -480,11 +472,11 @@ pub enum ReplicatedWaitError {
         /// The database name.
         name: String,
         /// The instant the caller waited for.
-        committed_at: DateTime<Utc>,
+        committed_at: Timestamp,
         /// How long the caller waited.
         timeout: Duration,
         /// The bound when the wait ended.
-        through: Option<DateTime<Utc>>,
+        through: Option<Timestamp>,
     },
 }
 
@@ -493,7 +485,7 @@ pub enum ReplicatedWaitError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RestoreCheckReport {
     /// When the check ran (app clock).
-    pub checked_at: Option<DateTime<Utc>>,
+    pub checked_at: Option<Timestamp>,
     /// Databases whose replica restored, passed `PRAGMA integrity_check`
     /// and carries the right identity row.
     pub passed: Vec<String>,
@@ -660,8 +652,8 @@ impl FleetReplication {
     }
 
     /// The app clock.
-    pub(crate) fn now(&self) -> DateTime<Utc> {
-        self.clock.now().to_chrono()
+    pub(crate) fn now(&self) -> Timestamp {
+        self.clock.now()
     }
 
     /// Tell `hook` when a replicator sees a newer epoch. The fleet installs
@@ -763,7 +755,7 @@ impl FleetReplication {
     /// A new ship slot for `key`, at an open. It replaces the slot of an
     /// earlier open.
     pub(crate) fn open_generation_slot(&self, key: &FleetDbKey, epoch: u64) -> Arc<GenerationSlot> {
-        let slot = Arc::new(GenerationSlot::new(self.clock.now().to_chrono(), epoch));
+        let slot = Arc::new(GenerationSlot::new(self.clock.now(), epoch));
         self.slots().insert(key.clone(), Arc::clone(&slot));
         // After the insert: a waiter never sees the key in neither map.
         self.forget_closed(key);
@@ -980,10 +972,7 @@ impl FleetReplication {
     /// # Errors
     ///
     /// The destination failed.
-    pub(crate) fn newest_generation(
-        &self,
-        key: &FleetDbKey,
-    ) -> Result<Option<DateTime<Utc>>, String> {
+    pub(crate) fn newest_generation(&self, key: &FleetDbKey) -> Result<Option<Timestamp>, String> {
         let root = self.root_for(key);
         Ok(self
             .destination
@@ -992,7 +981,7 @@ impl FleetReplication {
             .iter()
             .filter_map(|object| segment::generation_of_key(&root, object))
             .filter_map(|generation| segment::parse_generation_id(&generation))
-            .filter_map(|info| DateTime::from_timestamp_millis(info.created_ms))
+            .map(|info| segment::timestamp_from_ms(info.created_ms))
             .max())
     }
 
@@ -1042,7 +1031,7 @@ impl FleetReplication {
     /// # Errors
     ///
     /// The destination failed. Some objects can be gone: call again.
-    pub fn purge_replica(&self, key: &FleetDbKey, cutoff: DateTime<Utc>) -> Result<usize, String> {
+    pub fn purge_replica(&self, key: &FleetDbKey, cutoff: Timestamp) -> Result<usize, String> {
         self.quiesce_released(key);
         let root = self.root_for(key);
         // The slash: `tenant/acme` is not a prefix of `tenant/acme2`.
@@ -1053,7 +1042,7 @@ impl FleetReplication {
         let dated = |scope: &str, object: &str| {
             segment::generation_of_key(scope, object)
                 .and_then(|generation| segment::parse_generation_id(&generation))
-                .and_then(|info| DateTime::from_timestamp_millis(info.created_ms))
+                .map(|info| segment::timestamp_from_ms(info.created_ms))
         };
         // A sidecar object is dated by its own `generations/<id>/`. An
         // object with no date can be of the deleted database: it goes.
@@ -1581,7 +1570,7 @@ impl FleetReplication {
     /// A closed database keeps its last bound for an hour, or until it opens
     /// again, a delete or a restore in this process.
     #[must_use]
-    pub fn replicated_through(&self, key: &FleetDbKey) -> Option<DateTime<Utc>> {
+    pub fn replicated_through(&self, key: &FleetDbKey) -> Option<Timestamp> {
         match self.bound(key) {
             Bound::At(at) => Some(at),
             Bound::Unknown | Bound::Fenced | Bound::NotReplicating => None,
@@ -1605,7 +1594,7 @@ impl FleetReplication {
     pub async fn wait_replicated(
         &self,
         key: &FleetDbKey,
-        committed_at: DateTime<Utc>,
+        committed_at: Timestamp,
         timeout: Duration,
     ) -> Result<(), ReplicatedWaitError> {
         let deadline = tokio::time::Instant::now()
@@ -1654,7 +1643,7 @@ impl FleetReplication {
         if matches!(bound, ClosedBound::At { at: None, .. }) {
             closed.remove(key);
         } else {
-            closed.insert(key.clone(), (bound, now.to_chrono()));
+            closed.insert(key.clone(), (bound, now));
         }
     }
 
@@ -1669,10 +1658,7 @@ impl FleetReplication {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|key, (bound, at)| {
-                let old = now
-                    .to_chrono()
-                    .signed_duration_since(*at)
-                    .to_std()
+                let old = Duration::try_from(now.duration_since(*at))
                     .is_ok_and(|age| age >= CLOSED_BOUND_TTL);
                 let epoch = match bound {
                     ClosedBound::Live { .. } => return true,
@@ -1709,11 +1695,9 @@ impl FleetReplication {
     /// - this host does not serve the key at that epoch now: a new owner may
     ///   restore before an old ship lands;
     /// - `at` is not below the clock now: the clock stepped back.
-    fn bound_at(&self, key: &FleetDbKey, at: Option<DateTime<Utc>>, epoch: u64) -> Bound {
+    fn bound_at(&self, key: &FleetDbKey, at: Option<Timestamp>, epoch: u64) -> Bound {
         match at {
-            Some(at) if at < self.clock.now().to_chrono() && self.serves(key, epoch) => {
-                Bound::At(at)
-            }
+            Some(at) if at < self.clock.now() && self.serves(key, epoch) => Bound::At(at),
             _ => Bound::Unknown,
         }
     }
@@ -1777,7 +1761,7 @@ impl FleetReplication {
     pub fn restore_to(
         &self,
         key: &FleetDbKey,
-        target: Option<DateTime<Utc>>,
+        target: Option<Timestamp>,
         output: &Path,
     ) -> Result<RestoreOutcome, RestoreError> {
         crate::replication::restore::restore(
@@ -1829,10 +1813,8 @@ impl FleetReplication {
             }
             // Before the first successful tick, lag runs from registration, so
             // a database that never ships still trips the threshold.
-            let lag = snapshot.lag(now.to_chrono()).unwrap_or_else(|| {
-                now.to_chrono()
-                    .signed_duration_since(replica.registered_at)
-                    .to_std()
+            let lag = snapshot.lag(now).unwrap_or_else(|| {
+                Duration::try_from(now.duration_since(replica.registered_at))
                     .unwrap_or(Duration::ZERO)
             });
             if worst.as_ref().is_none_or(|(w, _)| lag > *w) {
@@ -1885,7 +1867,7 @@ impl FleetReplication {
             true
         };
         let restore_ok = self.lifecycle_details(&mut details);
-        let generations_ok = self.ship_details(&mut details, now.to_chrono());
+        let generations_ok = self.ship_details(&mut details, now);
         // A database whose lock cannot be taken is never replicated. A
         // replica that does not restore is not a backup.
         let healthy = lag_ok && lock_failures.is_empty() && restore_ok && generations_ok;
@@ -1902,7 +1884,7 @@ impl FleetReplication {
     fn ship_details(
         &self,
         details: &mut HashMap<String, serde_json::Value>,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> bool {
         let ship = self.ship_info();
         details.insert("ship_mode".to_owned(), ship.mode.into());
@@ -1930,10 +1912,7 @@ impl FleetReplication {
                 failing += 1;
                 last_error = error;
             }
-            let lag = now
-                .signed_duration_since(since)
-                .to_std()
-                .unwrap_or(Duration::ZERO);
+            let lag = Duration::try_from(now.duration_since(since)).unwrap_or(Duration::ZERO);
             if worst.as_ref().is_none_or(|(w, _)| lag > *w) {
                 worst = Some((lag, key.name()));
             }
@@ -1989,7 +1968,7 @@ impl FleetReplication {
             details.insert(
                 "restore_check".to_owned(),
                 serde_json::json!({
-                    "checked_at": check.checked_at.map(|at| at.to_rfc3339()),
+                    "checked_at": check.checked_at.map(crate::time::compat::rfc3339),
                     "passed": check.passed.len(),
                     "unreplicated": check.unreplicated.len(),
                     "failed": failed,
@@ -2068,7 +2047,7 @@ impl FleetReplication {
             epoch: AtomicU64::new(epoch.unwrap_or(0)),
             path: db.path().to_path_buf(),
             status,
-            registered_at: self.clock.now().to_chrono(),
+            registered_at: self.clock.now(),
         });
         // Another process may own it. The loop claims it when that one lets go.
         replica.claim(db.key());
@@ -2495,11 +2474,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let replicas = tmp.path().join("replicas");
         let (fleet, _replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
-        let clock = crate::time::TickingClock::starting_at(
-            DateTime::from_timestamp_millis(1_000_000)
-                .unwrap()
-                .to_jiff(),
-        );
+        let clock =
+            crate::time::TickingClock::starting_at(Timestamp::from_millisecond(1_000_000).unwrap());
         let store = Arc::new(MemoryOwnership::new(Arc::new(clock.clone())));
         let host = |owner: &str| {
             Arc::new(
@@ -2550,7 +2526,7 @@ mod tests {
         let (fleet, replication) = replicated_fleet(&tmp.path().join("fleet"), &replicas, false);
         let key = fleet.key_for("acme").unwrap();
         let root = "app/test/fleet/tenant/acme";
-        let cutoff = DateTime::from_timestamp_millis(2_000_000).unwrap();
+        let cutoff = Timestamp::from_millisecond(2_000_000).unwrap();
         let (old, new) = (generation_id(1_000_000, 1), generation_id(3_000_000, 2));
         let destination = Arc::clone(replication.destination());
         let objects = [
@@ -4114,7 +4090,7 @@ mod tests {
 
     #[test]
     fn a_pass_takes_the_most_lagging_database_first() {
-        let at = |secs| DateTime::from_timestamp(secs, 0).unwrap();
+        let at = |secs| Timestamp::from_second(secs).unwrap();
         let order = oldest_first(vec![
             (FleetDbKey::Slot(1), at(30)),
             (FleetDbKey::Slot(2), at(10)),
@@ -4135,8 +4111,8 @@ mod tests {
         fn a_pass_order_is_every_database_once_oldest_first(
             times in proptest::collection::vec(0_i64..1_000, 0..64)
         ) {
-            let at = |secs| DateTime::from_timestamp(secs, 0).unwrap();
-            let entries: Vec<(FleetDbKey, DateTime<Utc>)> = times
+            let at = |secs| Timestamp::from_second(secs).unwrap();
+            let entries: Vec<(FleetDbKey, Timestamp)> = times
                 .iter()
                 .enumerate()
                 .map(|(slot, secs)| (FleetDbKey::Slot(u16::try_from(slot).unwrap()), at(*secs)))
@@ -4147,7 +4123,7 @@ mod tests {
             let mut keys: Vec<FleetDbKey> = entries.iter().map(|(key, _)| key.clone()).collect();
             keys.sort();
             proptest::prop_assert_eq!(sorted, keys, "every key once");
-            let when: HashMap<FleetDbKey, DateTime<Utc>> = entries.into_iter().collect();
+            let when: HashMap<FleetDbKey, Timestamp> = entries.into_iter().collect();
             for pair in order.windows(2) {
                 proptest::prop_assert!(when[&pair[0]] <= when[&pair[1]]);
             }
@@ -4398,23 +4374,23 @@ mod tests {
     // ── replicated_through ──────────────────────────────────────────────────
 
     /// A clock a test sets, back as well as forward.
-    struct SetClock(Mutex<DateTime<Utc>>);
+    struct SetClock(Mutex<Timestamp>);
 
     impl SetClock {
         fn new() -> Arc<Self> {
             Arc::new(Self(Mutex::new(
-                DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                Timestamp::from_second(1_700_000_000).unwrap(),
             )))
         }
 
         fn advance(&self, secs: i64) {
-            *self.0.lock().unwrap() += chrono::Duration::seconds(secs);
+            *self.0.lock().unwrap() += jiff::SignedDuration::from_secs(secs);
         }
     }
 
     impl ClockSource for SetClock {
         fn now(&self) -> crate::time::Timestamp {
-            self.0.lock().unwrap().to_jiff()
+            *self.0.lock().unwrap()
         }
     }
 
@@ -4435,12 +4411,12 @@ mod tests {
 
     /// The system clock after a commit, and a wait until it moves past that
     /// reading. A coarse clock then cannot give the next tick the same value.
-    fn wall_after_commit() -> DateTime<Utc> {
+    fn wall_after_commit() -> Timestamp {
         let at = crate::time::ClockSource::now(&crate::time::SystemClock);
         while crate::time::ClockSource::now(&crate::time::SystemClock) <= at {
             std::thread::yield_now();
         }
-        at.to_chrono()
+        at
     }
 
     #[tokio::test]
@@ -4459,28 +4435,21 @@ mod tests {
         assert!(
             replication
                 .replicated_through(&key)
-                .is_none_or(|through| through < committed_at.to_chrono()),
+                .is_none_or(|through| through < committed_at),
             "a reading equal to the commit time does not cover it"
         );
         clock.advance(1);
         tick(&replication).await;
         let through = replication.replicated_through(&key).expect("caught up");
-        assert!(
-            through >= committed_at.to_chrono(),
-            "{through} < {committed_at}"
-        );
+        assert!(through >= committed_at, "{through} < {committed_at}");
         assert_eq!(fleet.replicated_through(&key), Some(through));
         fleet
-            .wait_replicated(&key, committed_at.to_chrono(), Duration::ZERO)
+            .wait_replicated(&key, committed_at, Duration::ZERO)
             .await
             .expect("already covered: no wait");
         assert!(matches!(
             fleet
-                .wait_replicated(
-                    &fleet.key_for("other").unwrap(),
-                    committed_at.to_chrono(),
-                    NOT_STUCK
-                )
+                .wait_replicated(&fleet.key_for("other").unwrap(), committed_at, NOT_STUCK)
                 .await,
             Err(ReplicatedWaitError::NotReplicating { .. })
         ));
@@ -4506,9 +4475,9 @@ mod tests {
         let through = replication
             .replicated_through(&key)
             .expect("closed, caught up");
-        assert!(through >= committed_at.to_chrono());
+        assert!(through >= committed_at);
         replication
-            .wait_replicated(&key, committed_at.to_chrono(), Duration::ZERO)
+            .wait_replicated(&key, committed_at, Duration::ZERO)
             .await
             .expect("the close shipped it");
 
@@ -4525,7 +4494,7 @@ mod tests {
         assert_eq!(replication.replicated_through(&key), None);
         assert!(matches!(
             replication
-                .wait_replicated(&key, committed_at.to_chrono(), NOT_STUCK)
+                .wait_replicated(&key, committed_at, NOT_STUCK)
                 .await,
             Err(ReplicatedWaitError::NotReplicating { .. })
         ));
@@ -4658,13 +4627,13 @@ mod tests {
 
         // No tick: the wait times out and names the bound it saw.
         let waited = replication
-            .wait_replicated(&key, committed_at.to_chrono(), Duration::from_millis(50))
+            .wait_replicated(&key, committed_at, Duration::from_millis(50))
             .await;
         assert!(
             matches!(
                 &waited,
                 Err(ReplicatedWaitError::TimedOut { through: Some(through), .. })
-                    if *through < committed_at.to_chrono()
+                    if *through < committed_at
             ),
             "{waited:?}"
         );
@@ -4678,7 +4647,7 @@ mod tests {
             })
         };
         replication
-            .wait_replicated(&key, committed_at.to_chrono(), NOT_STUCK)
+            .wait_replicated(&key, committed_at, NOT_STUCK)
             .await
             .expect("the pass covers the commit and wakes the wait");
         ticker.join().unwrap();

@@ -73,11 +73,6 @@
     )
 )]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -86,7 +81,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection as _;
 use diesel::prelude::*;
@@ -98,7 +92,7 @@ use super::segment::{self, SegmentError, SegmentHeader, SnapshotMeta};
 use super::sqlite::{self, CheckpointOutcome, SqliteError};
 use super::status::{self, ReplicationStatus};
 use super::wal::{self, ScanCursor, WalError, WalHeader};
-use crate::time::{ClockSource, SystemClock};
+use crate::time::{ClockSource, SystemClock, Timestamp};
 
 /// How long the loop sleeps between shutdown checks while waiting for the next
 /// tick. Short enough that shutdown is prompt, long enough to be free.
@@ -308,7 +302,7 @@ struct GenerationState {
     /// Database page size, from the WAL header.
     page_size: u32,
     /// When the generation opened.
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
     /// Sequence number for the next segment.
     next_seq: u64,
     /// `-wal` bytes already shipped. Starts at `0`, so segment `0` carries the
@@ -378,7 +372,7 @@ pub struct Replicator {
     /// The ownership epoch this replicator ships under (issue #3233).
     epoch: Option<u64>,
     /// When the destination's epochs were last read.
-    fence_checked_at: Option<DateTime<Utc>>,
+    fence_checked_at: Option<Timestamp>,
     /// The newer epoch that stopped this replicator.
     fenced_by: Option<u64>,
 }
@@ -467,7 +461,7 @@ impl Replicator {
             .iter()
             .filter_map(|key| segment::parse_epoch_marker_key(&root, key))
             .max();
-        self.fence_checked_at = Some(self.clock.now().to_chrono());
+        self.fence_checked_at = Some(self.clock.now());
         match newest {
             Some(newest) if newest > epoch => {
                 self.fenced_by = Some(newest);
@@ -501,11 +495,7 @@ impl Replicator {
         }
         self.epoch.is_some()
             && self.fence_checked_at.is_none_or(|at| {
-                self.clock
-                    .now()
-                    .to_chrono()
-                    .signed_duration_since(at)
-                    .to_std()
+                Duration::try_from(self.clock.now().duration_since(at))
                     // A clock that stepped back checks now.
                     .map_or(true, |age| age >= FENCE_CHECK_INTERVAL)
             })
@@ -538,10 +528,7 @@ impl Replicator {
             self.tick_and_record();
 
             if let Some(interval) = self.settings.verify_interval {
-                let due = now
-                    .to_chrono()
-                    .signed_duration_since(last_verify.to_chrono())
-                    .to_std()
+                let due = Duration::try_from(now.duration_since(last_verify))
                     .is_ok_and(|elapsed| elapsed >= interval);
                 if due {
                     last_verify = now;
@@ -609,9 +596,8 @@ impl Replicator {
         if let Err(e) = &result {
             let now = self.clock.now();
             // A reading at or below the bound: the clock stepped back.
-            self.status.forget_if_ahead_of(now.to_chrono());
-            self.status
-                .record_tick_error(e.to_string(), now.to_chrono());
+            self.status.forget_if_ahead_of(now);
+            self.status.record_tick_error(e.to_string(), now);
         }
         result
     }
@@ -674,11 +660,11 @@ impl Replicator {
         let (pending, caught_up) = (tail.pending, tail.caught_up);
         report.pending_bytes = pending;
         // A reading at or below the bound: the clock stepped back.
-        self.status.forget_if_ahead_of(through.to_chrono());
+        self.status.forget_if_ahead_of(through);
         if tail.proven
             && caught_up
             && self.fenced_by.is_none()
-            && let Some(bound) = status::bound_below(through.to_chrono())
+            && let Some(bound) = status::bound_below(through)
         {
             self.status.record_replicated_through(bound);
         }
@@ -690,19 +676,18 @@ impl Replicator {
         let now = self.clock.now();
         let mut index_rotated = false;
         report.checkpointed =
-            self.maybe_checkpoint(&db, &wal_path, pending, now.to_chrono(), &mut index_rotated)?;
+            self.maybe_checkpoint(&db, &wal_path, pending, now, &mut index_rotated)?;
         report.index_rotated = index_rotated;
 
         // Prune every tick, since on a quiet database one generation outlives many ticks. A prune
         // failure does not fail the tick: the data is still offsite, and the next tick retries.
-        match self.prune(now.to_chrono()) {
+        match self.prune(now) {
             Ok(pruned) => report.pruned_generations = pruned,
             Err(e) => tracing::warn!(error = %e, "SQLite replica retention sweep failed"),
         }
 
         if caught_up {
-            self.status
-                .record_tick_ok(pending, self.clock.now().to_chrono());
+            self.status.record_tick_ok(pending, self.clock.now());
         } else {
             self.status.record_tick_behind(pending);
         }
@@ -802,7 +787,7 @@ impl Replicator {
         db: &Path,
         wal_path: &Path,
         pending: u64,
-        now: DateTime<Utc>,
+        now: Timestamp,
         index_rotated: &mut bool,
     ) -> Result<bool, ReplicationError> {
         let expired = self.generation_expired(now);
@@ -903,7 +888,7 @@ impl Replicator {
                         "SQLite replica verification FAILED — the replica may not be restorable"
                     );
                 }
-                status.record_verification(result, clock.now().to_chrono());
+                status.record_verification(result, clock.now());
             });
         if let Err(e) = spawned {
             tracing::warn!("could not start the SQLite replica verification thread: {e}");
@@ -1009,8 +994,7 @@ impl Replicator {
         // newest generation at the destination, which also holds across a restart.
         let floor_ms = self.newest_generation_ms()?;
         let created_ms = now
-            .to_chrono()
-            .timestamp_millis()
+            .as_millisecond()
             .max(floor_ms.map_or(i64::MIN, |ms| ms.saturating_add(1)));
         let id = segment::generation_id(created_ms, rand::random::<u64>());
 
@@ -1035,7 +1019,7 @@ impl Replicator {
         let meta = SnapshotMeta {
             version: segment::LAYOUT_VERSION,
             generation: id.clone(),
-            created_at: now.to_chrono().to_rfc3339(),
+            created_at: crate::time::compat::rfc3339(now),
             created_ms,
             sha256,
             uncompressed_len,
@@ -1054,13 +1038,13 @@ impl Replicator {
             destination = %self.destination.describe(),
             "opened a new SQLite replication generation"
         );
-        self.status.record_generation(&id, now.to_chrono());
+        self.status.record_generation(&id, now);
         self.state = Some(GenerationState {
             id,
             index: 0,
             salt: None,
             page_size: 0,
-            started_at: now.to_chrono(),
+            started_at: now,
             next_seq: 0,
             shipped_offset: 0,
             cursor: None,
@@ -1142,8 +1126,8 @@ impl Replicator {
             db_size_pages: outcome.last_commit_db_pages,
             salt1: header.salt1,
             salt2: header.salt2,
-            created_at: now.to_chrono().to_rfc3339(),
-            created_ms: now.to_chrono().timestamp_millis(),
+            created_at: crate::time::compat::rfc3339(now),
+            created_ms: now.as_millisecond(),
             sha256: segment::sha256_hex(raw),
             uncompressed_len: raw.len() as u64,
         };
@@ -1177,20 +1161,18 @@ impl Replicator {
         state.shipped_offset = outcome.last_commit_end;
         state.cursor = Some(outcome.last_commit_cursor);
         state.next_seq = state.next_seq.saturating_add(1);
-        self.status.record_segment(bytes, now.to_chrono());
+        self.status.record_segment(bytes, now);
         Ok((1, bytes))
     }
 
     /// Whether the current generation has outlived the snapshot interval, so the
     /// next checkpoint should start a new one with a fresh base snapshot rather
     /// than another index.
-    fn generation_expired(&self, now: DateTime<Utc>) -> bool {
+    fn generation_expired(&self, now: Timestamp) -> bool {
         self.state.as_ref().is_some_and(|state| {
-            let elapsed = now.signed_duration_since(state.started_at);
+            let elapsed = now.duration_since(state.started_at);
             // A clock that stepped back counts as expired, so it cannot pin a generation open.
-            elapsed
-                .to_std()
-                .map_or(true, |age| age >= self.settings.snapshot_interval)
+            Duration::try_from(elapsed).map_or(true, |age| age >= self.settings.snapshot_interval)
         })
     }
 
@@ -1199,14 +1181,11 @@ impl Replicator {
     /// The newest generation that opened at or before the cutoff is **kept**:
     /// without it the start of the window is not reconstructable. Returns how
     /// many generations were removed.
-    fn prune(&self, now: DateTime<Utc>) -> Result<u64, ReplicationError> {
-        let Ok(retention) = chrono::Duration::from_std(self.settings.retention) else {
+    fn prune(&self, now: Timestamp) -> Result<u64, ReplicationError> {
+        let Ok(retention) = jiff::SignedDuration::try_from(self.settings.retention) else {
             return Ok(0);
         };
-        let cutoff_ms = now
-            .checked_sub_signed(retention)
-            .unwrap_or(now)
-            .timestamp_millis();
+        let cutoff_ms = now.checked_sub(retention).unwrap_or(now).as_millisecond();
         let keys = self
             .destination
             .list(&segment::generations_prefix(&self.settings.root))?;

@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use crate::entropy::Entropy;
 use crate::fleet_layout::{FleetDbKey, TenantDbId};
@@ -85,7 +85,8 @@ pub struct LakeGeneration {
     pub segment: Option<(u32, u64)>,
     /// The ship time of the last segment, or of the snapshot when there is
     /// no segment.
-    pub effective: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub effective: Timestamp,
 }
 
 impl LakeGeneration {
@@ -215,7 +216,7 @@ pub struct LakeTenant {
     /// The replica generation the lake restored.
     pub generation: String,
     /// The instant the restored state is current as of.
-    pub effective: DateTime<Utc>,
+    pub effective: Timestamp,
 }
 
 /// Why the lake did not load a database it found in object storage.
@@ -351,7 +352,7 @@ pub struct FleetLake {
     tombstones: Option<Arc<FleetTombstones>>,
     markers_only: bool,
     skip_failed: bool,
-    as_of: Option<DateTime<Utc>>,
+    as_of: Option<Timestamp>,
     tables: Option<Vec<String>>,
     scratch: Option<PathBuf>,
     workers: usize,
@@ -422,7 +423,7 @@ impl FleetLake {
     /// Restore each tenant at its newest state at or before `at`. The
     /// tenants are not restored at one common instant.
     #[must_use]
-    pub const fn as_of(mut self, at: DateTime<Utc>) -> Self {
+    pub const fn as_of(mut self, at: Timestamp) -> Self {
         self.as_of = Some(at);
         self
     }
@@ -863,7 +864,7 @@ enum MarkerRead {
     /// The listing has one, and it is gone now.
     Gone,
     /// Its `deleted_at`.
-    At(DateTime<Utc>),
+    At(Timestamp),
 }
 
 /// The databases one listing of `<base>/fleet/` finds.
@@ -946,12 +947,12 @@ fn slot_key(name: &str) -> Option<FleetDbKey> {
 }
 
 /// When the newest complete generation under `root` was created.
-fn newest_generation(root: &str, keys: &[String]) -> Option<DateTime<Utc>> {
+fn newest_generation(root: &str, keys: &[String]) -> Option<Timestamp> {
     keys.iter()
         .filter(|key| key.ends_with(segment::SNAPSHOT_META_OBJECT))
         .filter_map(|key| segment::generation_of_key(root, key))
         .filter_map(|generation| segment::parse_generation_id(&generation))
-        .filter_map(|info| DateTime::from_timestamp_millis(info.created_ms))
+        .map(|info| segment::timestamp_from_ms(info.created_ms))
         .max()
 }
 
@@ -974,11 +975,7 @@ pub(crate) enum Skip {
 /// `marker`: the marker's `deleted_at`. `newest`: when the newest complete
 /// generation was created. A marker with no generation newer than it is a
 /// delete, or a purge in progress.
-pub(crate) fn decide(
-    row: bool,
-    marker: Option<DateTime<Utc>>,
-    newest: Option<DateTime<Utc>>,
-) -> Decision {
+pub(crate) fn decide(row: bool, marker: Option<Timestamp>, newest: Option<Timestamp>) -> Decision {
     match newest {
         _ if row => Decision::Skip(Skip::Deleted),
         Some(newest) if restore_allowed(false, marker, newest) => Decision::Plan,

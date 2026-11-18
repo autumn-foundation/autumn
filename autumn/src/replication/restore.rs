@@ -56,16 +56,11 @@
     )
 )]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use super::destination::{DestinationError, ReplicaDestination};
 use super::segment::{self, SegmentError, SegmentHeader, SnapshotMeta};
@@ -86,9 +81,9 @@ pub enum RestoreError {
     /// The requested instant predates every replicated generation.
     TargetBeforeRetention {
         /// The instant that was asked for.
-        target: DateTime<Utc>,
+        target: Timestamp,
         /// The oldest instant the replica can reconstruct.
-        oldest: DateTime<Utc>,
+        oldest: Timestamp,
     },
     /// A segment is missing from the middle of a generation's sequence.
     SegmentGap {
@@ -276,7 +271,7 @@ pub struct PlannedSegment {
     /// Position inside that index.
     pub seq: u64,
     /// When the segment was shipped.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// What a restore will download and reconstruct.
@@ -285,7 +280,7 @@ pub struct RestorePlan {
     /// The generation the restore is built from.
     pub generation: String,
     /// When that generation's base snapshot was taken.
-    pub generation_started_at: DateTime<Utc>,
+    pub generation_started_at: Timestamp,
     /// Key of the base snapshot.
     pub snapshot_key: String,
     /// Key of the snapshot's metadata / commit marker.
@@ -293,10 +288,10 @@ pub struct RestorePlan {
     /// The segments to replay, in order.
     pub segments: Vec<PlannedSegment>,
     /// The instant that was asked for (`None` = "the latest available").
-    pub requested: Option<DateTime<Utc>>,
+    pub requested: Option<Timestamp>,
     /// The instant the restore will actually land on: the ship time of the last
     /// replayed segment, or the snapshot time when none is replayed.
-    pub effective: DateTime<Utc>,
+    pub effective: Timestamp,
 }
 
 /// What a completed restore produced.
@@ -314,8 +309,8 @@ pub struct RestoreOutcome {
 
 /// Convert epoch milliseconds to a UTC instant, clamping an unrepresentable
 /// value rather than failing a restore over a clock artifact.
-fn ms_to_utc(ms: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
+fn ms_to_utc(ms: i64) -> Timestamp {
+    segment::timestamp_from_ms(ms)
 }
 
 /// Refuse a latest restore whose chain stops short of the generation's head.
@@ -384,7 +379,7 @@ pub(crate) fn generation_epochs(
 pub fn plan(
     destination: &dyn ReplicaDestination,
     root: &str,
-    target: Option<DateTime<Utc>>,
+    target: Option<Timestamp>,
 ) -> Result<RestorePlan, RestoreError> {
     let keys = destination.list(&segment::generations_prefix(root))?;
     plan_from_listing(destination, root, &keys, target)
@@ -402,7 +397,7 @@ pub(crate) fn plan_from_listing(
     destination: &dyn ReplicaDestination,
     root: &str,
     keys: &[String],
-    target: Option<DateTime<Utc>>,
+    target: Option<Timestamp>,
 ) -> Result<RestorePlan, RestoreError> {
     let generations = segment::generations_prefix(root);
     let keys: Vec<String> = keys
@@ -438,7 +433,7 @@ pub(crate) fn plan_from_listing(
         });
     };
 
-    let target_ms = target.map_or(i64::MAX, |t| t.timestamp_millis());
+    let target_ms = target.map_or(i64::MAX, Timestamp::as_millisecond);
     let Some((_, generation_ms, generation)) = complete
         .iter()
         .rev()
@@ -446,7 +441,7 @@ pub(crate) fn plan_from_listing(
         .cloned()
     else {
         return Err(RestoreError::TargetBeforeRetention {
-            target: target.unwrap_or_else(|| crate::time::ambient_now().to_chrono()),
+            target: target.unwrap_or_else(crate::time::ambient_now),
             oldest: ms_to_utc(oldest_ms),
         });
     };
@@ -615,7 +610,7 @@ pub fn apply(
 pub fn restore(
     destination: &dyn ReplicaDestination,
     root: &str,
-    target: Option<DateTime<Utc>>,
+    target: Option<Timestamp>,
     output: &Path,
 ) -> Result<RestoreOutcome, RestoreError> {
     let plan = plan(destination, root, target)?;
@@ -982,8 +977,8 @@ mod tests {
         id
     }
 
-    fn at(ms: i64) -> Option<DateTime<Utc>> {
-        DateTime::from_timestamp_millis(ms)
+    fn at(ms: i64) -> Option<Timestamp> {
+        Timestamp::from_millisecond(ms).ok()
     }
 
     #[test]

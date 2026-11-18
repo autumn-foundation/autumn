@@ -44,18 +44,13 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone as _, Utc};
+use crate::time::Timestamp;
 use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel_async::RunQueryDsl as _;
 use diesel_async::SimpleAsyncConnection as _;
@@ -161,7 +156,7 @@ pub struct PendingEntry {
     /// The kind of work.
     pub kind: PendingKind,
     /// When the row was written (app clock).
-    pub since: DateTime<Utc>,
+    pub since: Timestamp,
 }
 
 /// The size of the index.
@@ -172,7 +167,7 @@ pub struct Backlog {
     /// Rows.
     pub entries: usize,
     /// The oldest row.
-    pub oldest: Option<DateTime<Utc>>,
+    pub oldest: Option<Timestamp>,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -243,10 +238,8 @@ fn index_error(context: &str, error: impl std::fmt::Display) -> AutumnError {
     AutumnError::service_unavailable_msg(format!("fleet pending index: {context}: {error}"))
 }
 
-fn from_millis(millis: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(millis)
-        .single()
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+fn from_millis(millis: i64) -> Timestamp {
+    crate::replication::segment::timestamp_from_ms(millis)
 }
 
 impl FleetPendingIndex {
@@ -302,7 +295,7 @@ impl FleetPendingIndex {
                 "UPDATE {PENDING_TABLE} SET visit_after = MIN(visit_after, ?), attempts = 0 \
                  WHERE key = ? AND kind = ?"
             ))
-            .bind::<BigInt, _>(self.clock.now().to_chrono().timestamp_millis())
+            .bind::<BigInt, _>(self.clock.now().as_millisecond())
             .bind::<Text, _>(key)
             .bind::<Text, _>(kind.as_str())
             .execute(&mut *conn)
@@ -322,7 +315,7 @@ impl FleetPendingIndex {
         key: &str,
         kind: PendingKind,
     ) -> AutumnResult<()> {
-        let now = self.clock.now().to_chrono().timestamp_millis();
+        let now = self.clock.now().as_millisecond();
         diesel::sql_query(format!(
             "INSERT INTO {PENDING_TABLE} (key, kind, since, visit_after) VALUES (?, ?, ?, ?) \
              ON CONFLICT (key, kind) DO UPDATE \
@@ -363,7 +356,7 @@ impl FleetPendingIndex {
     /// order they became due. A row with no backoff is due on any clock, so
     /// the clock of the process that wrote it changes only its place.
     async fn due(&self, keys: Option<&[String]>, limit: usize) -> AutumnResult<Vec<Due>> {
-        let now = self.clock.now().to_chrono().timestamp_millis();
+        let now = self.clock.now().as_millisecond();
         let mut conn = self.conn().await?;
         let Some(keys) = keys else {
             let rows: Vec<DueRow> = diesel::sql_query(format!(
@@ -410,7 +403,7 @@ impl FleetPendingIndex {
                  attempts = attempts + 1 \
              WHERE key = ?"
         ))
-        .bind::<BigInt, _>(self.clock.now().to_chrono().timestamp_millis())
+        .bind::<BigInt, _>(self.clock.now().as_millisecond())
         .bind::<BigInt, _>(max)
         .bind::<Text, _>(key)
         .execute(&mut *self.conn().await?)
@@ -425,7 +418,7 @@ impl FleetPendingIndex {
         diesel::sql_query(format!(
             "UPDATE {PENDING_TABLE} SET visit_after = ?, attempts = 0 WHERE key = ?"
         ))
-        .bind::<BigInt, _>(self.clock.now().to_chrono().timestamp_millis())
+        .bind::<BigInt, _>(self.clock.now().as_millisecond())
         .bind::<Text, _>(key)
         .execute(&mut *self.conn().await?)
         .await
@@ -1191,10 +1184,7 @@ impl FleetSweeper {
         let plan = PassPlan {
             open: &open,
             relay,
-            hooks_before: hooks_cutoff(
-                inner.state.clock().now().to_chrono(),
-                inner.options.hook_grace,
-            ),
+            hooks_before: hooks_cutoff(inner.state.clock().now(), inner.options.hook_grace),
             budget: inner.options.max_databases_per_pass,
             room: inner.fleet.max_open().saturating_sub(open.len()),
             owned: &owned,
@@ -1412,7 +1402,7 @@ struct PassPlan<'a> {
     relay: bool,
     /// In a closed database, a worker does not take a hook row written after
     /// this time: the process that has it open drains it.
-    hooks_before: DateTime<Utc>,
+    hooks_before: Timestamp,
     /// Databases per pass, at most.
     budget: usize,
     /// Closed databases the fleet can open now.
@@ -1493,11 +1483,8 @@ impl PassPlan<'_> {
 }
 
 /// The time before which a hook row is old enough for a worker to take it.
-fn hooks_cutoff(now: DateTime<Utc>, grace: Duration) -> DateTime<Utc> {
-    chrono::Duration::from_std(grace)
-        .ok()
-        .and_then(|grace| now.checked_sub_signed(grace))
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+fn hooks_cutoff(now: Timestamp, grace: Duration) -> Timestamp {
+    now.saturating_sub(grace).unwrap_or(Timestamp::MIN)
 }
 
 // ── Health ──────────────────────────────────────────────────────────────────
@@ -1535,7 +1522,7 @@ impl crate::actuator::HealthIndicator for SweeperHealth {
                     details.insert("backlog".to_owned(), backlog.databases.into());
                     details.insert("entries".to_owned(), backlog.entries.into());
                     let age = backlog.oldest.map(|oldest| {
-                        u64::try_from((self.clock.now().to_chrono() - oldest).num_seconds())
+                        u64::try_from(self.clock.now().duration_since(oldest).as_secs())
                             .unwrap_or(0)
                     });
                     details.insert("oldest_pending_secs".to_owned(), age.into());
@@ -1570,8 +1557,7 @@ mod tests {
     }
 
     async fn index(dir: &Path, at: i64) -> FleetPendingIndex {
-        let clock: Arc<dyn ClockSource> =
-            Arc::new(crate::time::FixedClock::at(from_millis(at).to_jiff()));
+        let clock: Arc<dyn ClockSource> = Arc::new(crate::time::FixedClock::at(from_millis(at)));
         let index = FleetPendingIndex::new(control(dir), clock);
         index.ensure_schema().await.unwrap();
         index
@@ -1604,7 +1590,7 @@ mod tests {
     }
 
     async fn ticking_index(dir: &Path, at: i64) -> (FleetPendingIndex, crate::time::TickingClock) {
-        let clock = crate::time::TickingClock::starting_at(from_millis(at).to_jiff());
+        let clock = crate::time::TickingClock::starting_at(from_millis(at));
         let index = FleetPendingIndex::new(control(dir), Arc::new(clock.clone()));
         index.ensure_schema().await.unwrap();
         (index, clock)
@@ -1614,7 +1600,7 @@ mod tests {
         PassPlan {
             open,
             relay: true,
-            hooks_before: DateTime::<Utc>::MAX_UTC,
+            hooks_before: Timestamp::MAX,
             budget,
             room,
             owned: &|_| true,
@@ -1662,14 +1648,14 @@ mod tests {
         // A later mark of the same kind keeps the row and its time.
         let later = FleetPendingIndex::new(
             index.control.clone(),
-            Arc::new(crate::time::FixedClock::at(from_millis(9_000).to_jiff())),
+            Arc::new(crate::time::FixedClock::at(from_millis(9_000))),
         );
         later.mark("slot:00001", PendingKind::Outbox).await.unwrap();
         later.mark("slot:00002", PendingKind::Hooks).await.unwrap();
         let rows = index.pending(10).await.unwrap();
         assert_eq!(
             rows.iter()
-                .map(|e| (e.key.as_str(), e.kind, e.since.timestamp_millis()))
+                .map(|e| (e.key.as_str(), e.kind, e.since.as_millisecond()))
                 .collect::<Vec<_>>(),
             vec![
                 ("slot:00001", PendingKind::Outbox, 1_000),
@@ -1679,7 +1665,7 @@ mod tests {
         );
         let backlog = index.backlog().await.unwrap();
         assert_eq!((backlog.databases, backlog.entries), (2, 2));
-        assert_eq!(backlog.oldest.map(|t| t.timestamp_millis()), Some(1_000));
+        assert_eq!(backlog.oldest.map(Timestamp::as_millisecond), Some(1_000));
 
         // Reconcile: outbox done, a backfill found.
         index
@@ -1838,7 +1824,7 @@ mod tests {
         // The clock is pinned: the backoff is 1 s, then 2 s.
         let later = FleetPendingIndex::new(
             index.control.clone(),
-            Arc::new(crate::time::FixedClock::at(from_millis(11_000).to_jiff())),
+            Arc::new(crate::time::FixedClock::at(from_millis(11_000))),
         );
         assert_eq!(later.due(None, 10).await.unwrap().len(), 2, "1 s passed");
         later.defer("slot:00001").await.unwrap();
@@ -1993,7 +1979,7 @@ mod tests {
         let worker = index(tmp.path(), 10_000).await;
         let web = FleetPendingIndex::new(
             worker.control.clone(),
-            Arc::new(crate::time::FixedClock::at(from_millis(70_000).to_jiff())),
+            Arc::new(crate::time::FixedClock::at(from_millis(70_000))),
         );
         web.mark("slot:00001", PendingKind::Outbox).await.unwrap();
         assert_eq!(worker.due(None, 10).await.unwrap().len(), 1);
@@ -2012,7 +1998,7 @@ mod tests {
             from_millis(5_000)
         );
         let huge = Duration::from_secs(u64::from(u32::MAX) * 3_600);
-        assert_eq!(hooks_cutoff(now, huge), DateTime::<Utc>::MIN_UTC);
-        assert_eq!(hooks_cutoff(now, Duration::MAX), DateTime::<Utc>::MIN_UTC);
+        assert_eq!(hooks_cutoff(now, huge), Timestamp::MIN);
+        assert_eq!(hooks_cutoff(now, Duration::MAX), Timestamp::MIN);
     }
 }

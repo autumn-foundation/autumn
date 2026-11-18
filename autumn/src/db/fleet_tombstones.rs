@@ -32,19 +32,9 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::JiffBridge as _;
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone as _, Utc};
+use crate::time::Timestamp;
 
 /// The tombstone table on the control database.
 pub const TOMBSTONE_TABLE: &str = "_autumn_fleet_tombstones";
@@ -73,15 +63,18 @@ pub struct Tombstone {
     /// The purge cutoff: when the files were removed, or the newest
     /// generation of the deleted database when that is later. A generation
     /// created later belongs to a new database with the same key.
-    pub deleted_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub deleted_at: Timestamp,
     /// `false` while the delete still removes the files.
     pub confirmed: bool,
     /// The earliest purge: the time of the confirm plus the retention.
-    pub purge_after: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub purge_after: Timestamp,
     /// Failed purges so far.
     pub attempts: u32,
     /// The earliest next purge attempt.
-    pub next_attempt_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub next_attempt_at: Timestamp,
     /// Why the last purge failed.
     pub last_error: Option<String>,
     /// The marker object is written. Until then, the retry task writes it.
@@ -94,14 +87,14 @@ pub struct Tombstone {
 impl Tombstone {
     /// A new row for `key`, deleted at `now` (`fresh` in the model).
     #[must_use]
-    pub fn new(key: &str, now: DateTime<Utc>, retention: Duration, confirmed: bool) -> Self {
+    pub fn new(key: &str, now: Timestamp, retention: Duration, confirmed: bool) -> Self {
         Self {
             key: key.to_owned(),
             deleted_at: now,
             confirmed,
             purge_after: add(now, retention),
             attempts: 0,
-            next_attempt_at: DateTime::<Utc>::UNIX_EPOCH,
+            next_attempt_at: Timestamp::UNIX_EPOCH,
             last_error: None,
             marked: false,
             owner: String::new(),
@@ -110,13 +103,13 @@ impl Tombstone {
 
     /// `is_due` in the model. A pending row is never due.
     #[must_use]
-    pub fn is_due(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_due(&self, now: Timestamp) -> bool {
         self.confirmed && now >= self.purge_after && now >= self.next_attempt_at
     }
 
     /// `after_failure` in the model: one more attempt, and a wait.
     #[must_use]
-    pub fn after_failure(self, now: DateTime<Utc>, error: &str) -> Self {
+    pub fn after_failure(self, now: Timestamp, error: &str) -> Self {
         Self {
             next_attempt_at: add(now, retry_delay(self.attempts)),
             attempts: self.attempts.saturating_add(1),
@@ -141,7 +134,7 @@ pub fn retry_delay(attempts: u32) -> Duration {
 /// the `deleted_at` of the marker object. `newest`: when the generation a
 /// restore takes was created.
 #[must_use]
-pub fn restore_allowed(row: bool, marker: Option<DateTime<Utc>>, newest: DateTime<Utc>) -> bool {
+pub fn restore_allowed(row: bool, marker: Option<Timestamp>, newest: Timestamp) -> bool {
     !row && marker.is_none_or(|deleted_at| newest > deleted_at)
 }
 
@@ -151,7 +144,7 @@ pub fn restore_allowed(row: bool, marker: Option<DateTime<Utc>>, newest: DateTim
 /// blocks a create on demand too (issue #3516). Only an explicit
 /// `provision` ends the window early.
 #[must_use]
-pub fn create_on_demand_allowed(row: Option<&Tombstone>, now: DateTime<Utc>) -> bool {
+pub fn create_on_demand_allowed(row: Option<&Tombstone>, now: Timestamp) -> bool {
     row.is_none_or(|row| row.confirmed && now >= row.purge_after)
 }
 
@@ -161,19 +154,12 @@ pub fn create_on_demand_allowed(row: Option<&Tombstone>, now: DateTime<Utc>) -> 
 /// object outside a generation (epochs, the marker). `newer_exists`: a
 /// generation newer than `cutoff` is in the replica.
 #[must_use]
-pub fn purge_deletes(
-    generation: Option<DateTime<Utc>>,
-    cutoff: DateTime<Utc>,
-    newer_exists: bool,
-) -> bool {
+pub fn purge_deletes(generation: Option<Timestamp>, cutoff: Timestamp, newer_exists: bool) -> bool {
     generation.map_or(!newer_exists, |created| created <= cutoff)
 }
 
-fn add(at: DateTime<Utc>, by: Duration) -> DateTime<Utc> {
-    chrono::Duration::from_std(by)
-        .ok()
-        .and_then(|by| at.checked_add_signed(by))
-        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+fn add(at: Timestamp, by: Duration) -> Timestamp {
+    at.saturating_add(by).unwrap_or(Timestamp::MAX)
 }
 
 /// The body of the marker object `<root>/tombstone`. Hosts that do not
@@ -189,22 +175,22 @@ pub struct Marker {
 impl Marker {
     /// The marker of `tombstone`.
     #[must_use]
-    pub const fn of(tombstone: &Tombstone) -> Self {
+    pub fn of(tombstone: &Tombstone) -> Self {
         Self {
-            deleted_at_ms: tombstone.deleted_at.timestamp_millis(),
-            purge_after_ms: tombstone.purge_after.timestamp_millis(),
+            deleted_at_ms: tombstone.deleted_at.as_millisecond(),
+            purge_after_ms: tombstone.purge_after.as_millisecond(),
         }
     }
 
     /// [`Tombstone::deleted_at`].
     #[must_use]
-    pub fn deleted_at(&self) -> DateTime<Utc> {
+    pub fn deleted_at(&self) -> Timestamp {
         from_millis(self.deleted_at_ms)
     }
 
     /// [`Tombstone::purge_after`].
     #[must_use]
-    pub fn purge_after(&self) -> DateTime<Utc> {
+    pub fn purge_after(&self) -> Timestamp {
         from_millis(self.purge_after_ms)
     }
 }
@@ -227,11 +213,9 @@ pub struct PurgeReport {
     pub last_error: Option<String>,
 }
 
-/// A time from epoch milliseconds. A value out of range is the earliest time.
-fn from_millis(millis: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(millis)
-        .single()
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+/// A time from epoch milliseconds, clamped to the range of [`Timestamp`].
+fn from_millis(millis: i64) -> Timestamp {
+    crate::replication::segment::timestamp_from_ms(millis)
 }
 
 // ── Store ───────────────────────────────────────────────────────────────────
@@ -247,7 +231,7 @@ mod store {
     use diesel_async::SimpleAsyncConnection as _;
     use diesel_async::pooled_connection::deadpool::Pool;
 
-    use super::*;
+    use super::{Duration, TOMBSTONE_TABLE, Timestamp, Tombstone, from_millis};
     use crate::db::RuntimeConnection;
     use crate::time::ClockSource;
 
@@ -360,8 +344,8 @@ mod store {
 
         /// The clock that stamps the rows.
         #[must_use]
-        pub fn now(&self) -> DateTime<Utc> {
-            self.clock.now().to_chrono()
+        pub fn now(&self) -> Timestamp {
+            self.clock.now()
         }
 
         /// A connection to the control database, with the table made. A delete
@@ -444,8 +428,8 @@ mod store {
                  ON CONFLICT (key) {conflict}"
             ))
             .bind::<Text, _>(&row.key)
-            .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
-            .bind::<BigInt, _>(row.purge_after.timestamp_millis())
+            .bind::<BigInt, _>(row.deleted_at.as_millisecond())
+            .bind::<BigInt, _>(row.purge_after.as_millisecond())
             .bind::<Text, _>(owner)
             .execute(&mut *conn.0)
             .await
@@ -470,11 +454,11 @@ mod store {
                  owner = excluded.owner"
             ))
             .bind::<Text, _>(&row.key)
-            .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
+            .bind::<BigInt, _>(row.deleted_at.as_millisecond())
             .bind::<Integer, _>(i32::from(row.confirmed))
-            .bind::<BigInt, _>(row.purge_after.timestamp_millis())
+            .bind::<BigInt, _>(row.purge_after.as_millisecond())
             .bind::<Integer, _>(i32::try_from(row.attempts).unwrap_or(i32::MAX))
-            .bind::<BigInt, _>(row.next_attempt_at.timestamp_millis())
+            .bind::<BigInt, _>(row.next_attempt_at.as_millisecond())
             .bind::<Nullable<Text>, _>(row.last_error.as_deref())
             .bind::<Integer, _>(i32::from(row.marked))
             .bind::<Text, _>(&row.owner)
@@ -498,7 +482,7 @@ mod store {
             &self,
             key: &str,
             retention: Duration,
-            floor: Option<DateTime<Utc>>,
+            floor: Option<Timestamp>,
         ) -> Result<Option<Tombstone>, TombstoneError> {
             let now = self.now();
             // The retention runs from now; the cutoff can be later.
@@ -510,8 +494,8 @@ mod store {
                  attempts = 0, next_attempt = 0, last_error = NULL \
                  WHERE key = ? AND confirmed = 0"
             ))
-            .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
-            .bind::<BigInt, _>(row.purge_after.timestamp_millis())
+            .bind::<BigInt, _>(row.deleted_at.as_millisecond())
+            .bind::<BigInt, _>(row.purge_after.as_millisecond())
             .bind::<Text, _>(&row.key)
             .execute(&mut *conn)
             .await
@@ -645,7 +629,7 @@ mod store {
                  WHERE key = ?"
             ))
             .bind::<Integer, _>(i32::try_from(row.attempts).unwrap_or(i32::MAX))
-            .bind::<BigInt, _>(row.next_attempt_at.timestamp_millis())
+            .bind::<BigInt, _>(row.next_attempt_at.as_millisecond())
             .bind::<Nullable<Text>, _>(row.last_error.as_deref())
             .bind::<Text, _>(&row.key)
             .execute(&mut *conn)
@@ -671,7 +655,7 @@ mod tests {
     use proptest::prelude::*;
     use std::sync::Arc;
 
-    fn at(ms: i64) -> DateTime<Utc> {
+    fn at(ms: i64) -> Timestamp {
         from_millis(ms)
     }
 
@@ -765,7 +749,7 @@ mod tests {
             let row = Tombstone::new("k", at(deleted), retention, true);
             // inv: purge_after = deleted_at + retention.
             prop_assert_eq!(
-                row.purge_after.timestamp_millis(),
+                row.purge_after.as_millisecond(),
                 deleted + i64::try_from(retention_ms).unwrap()
             );
             // retention_is_kept.
@@ -816,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn a_row_goes_from_pending_to_confirmed_to_removed() {
         let tmp = tempfile::tempdir().unwrap();
-        let clock = crate::time::TickingClock::starting_at(at(1_000).to_jiff());
+        let clock = crate::time::TickingClock::starting_at(at(1_000));
         let store = store(tmp.path(), &clock);
         let retention = Duration::from_secs(60);
         store
@@ -863,7 +847,7 @@ mod tests {
         // A re-create or a restore in another process took the key between
         // the removal and the confirm: no cutoff may cover the new database.
         let tmp = tempfile::tempdir().unwrap();
-        let clock = crate::time::TickingClock::starting_at(at(1_000).to_jiff());
+        let clock = crate::time::TickingClock::starting_at(at(1_000));
         let store = store(tmp.path(), &clock);
         store
             .record("tenant:acme", Duration::ZERO, false, "test")
@@ -885,7 +869,7 @@ mod tests {
         // Process A removed the file and has not confirmed yet. Process B
         // finds no file: its refusal must not drop A's row.
         let tmp = tempfile::tempdir().unwrap();
-        let clock = crate::time::TickingClock::starting_at(at(1_000).to_jiff());
+        let clock = crate::time::TickingClock::starting_at(at(1_000));
         let store = store(tmp.path(), &clock);
         store
             .record("tenant:acme", Duration::ZERO, true, "a")
@@ -913,7 +897,7 @@ mod tests {
     #[tokio::test]
     async fn a_list_pages_past_the_first_batch() {
         let tmp = tempfile::tempdir().unwrap();
-        let clock = crate::time::TickingClock::starting_at(at(1_000).to_jiff());
+        let clock = crate::time::TickingClock::starting_at(at(1_000));
         let store = store(tmp.path(), &clock);
         for i in 0..5 {
             store
@@ -940,7 +924,7 @@ mod tests {
     #[tokio::test]
     async fn a_failure_is_durable_and_listed() {
         let tmp = tempfile::tempdir().unwrap();
-        let clock = crate::time::TickingClock::starting_at(at(1_000).to_jiff());
+        let clock = crate::time::TickingClock::starting_at(at(1_000));
         let store = store(tmp.path(), &clock);
         store
             .record("slot:00007", Duration::ZERO, false, "test")
@@ -1168,7 +1152,7 @@ mod tests {
         }
 
         fn clock() -> crate::time::TickingClock {
-            crate::time::TickingClock::starting_at(at(1_800_000_000_000).to_jiff())
+            crate::time::TickingClock::starting_at(at(1_800_000_000_000))
         }
 
         #[tokio::test]
@@ -1463,7 +1447,7 @@ mod tests {
             let destination = Switchable::new(&tmp.path().join("replicas"));
             let clock = clock();
             let ahead = crate::time::TickingClock::starting_at(
-                (clock.now().to_chrono() + chrono::Duration::hours(1)).to_jiff(),
+                clock.now() + jiff::SignedDuration::from_hours(1),
             );
             let setup = Setup {
                 volume: tmp.path(),
@@ -1766,7 +1750,7 @@ mod tests {
             // database's generation.
             let old = Tombstone::new(
                 &key.name(),
-                clock.now().to_chrono() - chrono::Duration::hours(1),
+                clock.now() - jiff::SignedDuration::from_hours(1),
                 Duration::ZERO,
                 true,
             );
@@ -1787,7 +1771,7 @@ mod tests {
             let destination = Switchable::new(&tmp.path().join("replicas"));
             let clock = clock();
             let ahead = crate::time::TickingClock::starting_at(
-                (clock.now().to_chrono() + chrono::Duration::hours(1)).to_jiff(),
+                clock.now() + jiff::SignedDuration::from_hours(1),
             );
             let setup = Setup {
                 volume: tmp.path(),
@@ -2023,12 +2007,11 @@ mod tests {
             let before = destination.keys(&key);
             let replication = Arc::clone(&host.replication);
             let purge_key = key.clone();
-            let deleted = crate::time::spawn_blocking(move || {
-                replication.purge_replica(&purge_key, cutoff.to_chrono())
-            })
-            .await
-            .unwrap()
-            .unwrap();
+            let deleted =
+                crate::time::spawn_blocking(move || replication.purge_replica(&purge_key, cutoff))
+                    .await
+                    .unwrap()
+                    .unwrap();
             assert_eq!(deleted, 0);
             assert_eq!(destination.keys(&key), before);
         }
@@ -2273,7 +2256,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(store.get("tenant:acme").await.unwrap(), Some(row.clone()));
-            assert!(!row.is_due(DateTime::<Utc>::MAX_UTC - chrono::Duration::days(1)));
+            assert!(!row.is_due(Timestamp::MAX - jiff::SignedDuration::from_hours(24)));
         }
 
         fn walk(dir: &Path) -> Vec<std::path::PathBuf> {

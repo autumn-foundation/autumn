@@ -36,7 +36,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -409,12 +409,12 @@ fn local_files(dir: &Path, files: &[PathBuf]) -> Result<Vec<LocalFile>, String> 
 #[derive(Debug)]
 pub struct GenerationTrack {
     /// When the database opened.
-    pub registered_at: DateTime<Utc>,
+    pub registered_at: Timestamp,
     /// The last ship that worked, also one that found no change.
-    pub last_ok: Option<DateTime<Utc>>,
+    pub last_ok: Option<Timestamp>,
     /// Every commit at or before it is in the replica: the instant before the
     /// snapshot of the last ship that worked. `None` after a fence.
-    pub replicated_through: Option<DateTime<Utc>>,
+    pub replicated_through: Option<Timestamp>,
     /// A ship found a newer epoch at the replica.
     pub fenced: bool,
     /// Failed ships in a row.
@@ -425,7 +425,7 @@ pub struct GenerationTrack {
 
 impl GenerationTrack {
     /// The track of a database that opened at `now`.
-    pub const fn new(now: DateTime<Utc>) -> Self {
+    pub const fn new(now: Timestamp) -> Self {
         Self {
             registered_at: now,
             last_ok: None,
@@ -452,7 +452,7 @@ pub struct GenerationSlot {
 impl GenerationSlot {
     /// The slot of a database that opened at `now` under `epoch` (0 without
     /// ownership).
-    pub fn new(now: DateTime<Utc>, epoch: u64) -> Self {
+    pub fn new(now: Timestamp, epoch: u64) -> Self {
         Self {
             turn: tokio::sync::Mutex::new(()),
             upload: Mutex::new(()),
@@ -489,7 +489,7 @@ impl GenerationSlot {
 fn newest(
     replication: &FleetReplication,
     key: &FleetDbKey,
-    target: Option<DateTime<Utc>>,
+    target: Option<Timestamp>,
     honor_marker: bool,
 ) -> Result<Option<(Complete, Manifest)>, String> {
     let root = replication.root_for(key);
@@ -497,7 +497,7 @@ fn newest(
         .destination()
         .list(&segment::generations_prefix(&root))
         .map_err(|e| e.to_string())?;
-    let target_ms = target.map_or(i64::MAX, |t| t.timestamp_millis());
+    let target_ms = target.map_or(i64::MAX, Timestamp::as_millisecond);
     let Some(chosen) = complete_generations(&root, &keys)
         .into_iter()
         .rev()
@@ -507,7 +507,7 @@ fn newest(
     };
     if honor_marker {
         let marker = replication.marker(key)?;
-        let created = DateTime::from_timestamp_millis(chosen.created_ms).unwrap_or_default();
+        let created = segment::timestamp_from_ms(chosen.created_ms);
         if !restore_allowed(false, marker.map(|m| m.deleted_at()), created) {
             tracing::info!(database = %key, "fleet database was deleted: its generations are not restored");
             return Ok(None);
@@ -897,10 +897,10 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let floor_ms = replication
             .newest_generation(key)
             .map_err(unavailable)?
-            .map(|at| at.timestamp_millis());
+            .map(Timestamp::as_millisecond);
         let created_ms = replication
             .now()
-            .timestamp_millis()
+            .as_millisecond()
             .max(floor_ms.map_or(i64::MIN, |ms| ms.saturating_add(1)));
         let id = segment::generation_id(created_ms, replication.entropy().next_u64());
         let Some(planned) = plan_ship(prev.as_ref(), &files, &id) else {
@@ -1138,7 +1138,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         &self,
         replication: &FleetReplication,
         key: &FleetDbKey,
-        target: Option<DateTime<Utc>>,
+        target: Option<Timestamp>,
         path: &Path,
         above: Option<u64>,
     ) -> Result<bool, FleetError> {

@@ -281,8 +281,8 @@ fn copy_tenant(
     diesel::sql_query(format!("INSERT INTO {MANIFEST_TABLE} VALUES (?, ?, ?, ?)"))
         .bind::<diesel::sql_types::Text, _>(tenant.as_str())
         .bind::<diesel::sql_types::Text, _>(&generation.id)
-        .bind::<diesel::sql_types::Text, _>(generation.effective.to_rfc3339())
-        .bind::<diesel::sql_types::BigInt, _>(generation.effective.timestamp_millis())
+        .bind::<diesel::sql_types::Text, _>(crate::time::compat::rfc3339(generation.effective))
+        .bind::<diesel::sql_types::BigInt, _>(generation.effective.as_millisecond())
         .execute(conn)
         .map_err(failed)?;
     Ok(())

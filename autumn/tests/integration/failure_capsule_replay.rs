@@ -18,14 +18,7 @@
 //!     refused with exit code 2;
 //!   * a 401 replayed from a recorded 5xx points at redaction as the cause.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::ChronoBridge as _;
 use std::sync::Arc;
-
-use chrono::{DateTime, TimeZone as _, Utc};
 
 use autumn_web::AppState;
 use autumn_web::capsule::{
@@ -37,6 +30,8 @@ use autumn_web::capsule::{
 use autumn_web::config::AutumnConfig;
 use autumn_web::db::Db;
 use autumn_web::test::TestApp;
+use autumn_web::time::Timestamp;
+use autumn_web::time::compat::rfc3339;
 use autumn_web::{AutumnError, get, routes};
 use axum::extract::State;
 use diesel_async::RunQueryDsl as _;
@@ -182,7 +177,7 @@ fn capsule(request: CapsuleRequest, outcome: CapsuleOutcome) -> Capsule {
     Capsule {
         format_version: CAPSULE_FORMAT_VERSION,
         id: "fixture".to_owned(),
-        captured_at: Utc::now(),
+        captured_at: autumn_web::time::ambient_now(),
         autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
         app: AppInfo::default(),
         request,
@@ -365,11 +360,7 @@ async fn denied() -> Result<&'static str, AutumnError> {
 async fn clock_twice(State(state): State<AppState>) -> String {
     let first = state.clock().now();
     let second = state.clock().now();
-    format!(
-        "{}|{}",
-        first.to_chrono().to_rfc3339(),
-        second.to_chrono().to_rfc3339()
-    )
+    format!("{}|{}", rfc3339(first), rfc3339(second))
 }
 
 // ── Harness ─────────────────────────────────────────────────────────────────
@@ -395,9 +386,9 @@ impl autumn_web::time::ClockSource for SharedClock {
 
 /// A recorded instant, far enough in the past that it cannot be confused with
 /// a reading that leaked in from the real wall clock.
-fn at(second: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2001, 3, 4, 5, 6, second)
-        .single()
+fn at(second: i8) -> Timestamp {
+    autumn_web::time::tz::TimeZone::UTC
+        .to_timestamp(autumn_web::time::civil::date(2001, 3, 4).at(5, 6, second, 0))
         .expect("valid timestamp")
 }
 
@@ -937,11 +928,7 @@ async fn replay_serves_clock_reads_from_the_capsule() {
     let (first, second) = body
         .split_once('|')
         .unwrap_or_else(|| panic!("handler must report two readings, got {body:?}"));
-    let recorded_readings: Vec<String> = recorded
-        .clock
-        .iter()
-        .map(chrono::DateTime::to_rfc3339)
-        .collect();
+    let recorded_readings: Vec<String> = recorded.clock.iter().copied().map(rfc3339).collect();
     assert!(
         recorded_readings.iter().any(|reading| reading == first),
         "the first reading {first:?} must come from the capsule, not the wall clock"

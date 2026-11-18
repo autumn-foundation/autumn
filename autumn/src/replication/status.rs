@@ -38,16 +38,11 @@
     )
 )]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use crate::actuator::{HealthCheckOutput, HealthIndicator, HealthStatus, IndicatorGroup};
 
@@ -63,7 +58,7 @@ pub struct ReplicationSnapshot {
     pub generation: Option<String>,
     /// Last tick that completed without an error — the point the replica is
     /// known to be current to.
-    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_success_at: Option<Timestamp>,
     /// Every transaction committed at or before this instant is in the
     /// replica, under the current generation. `None` before the first
     /// caught-up tick of the generation, after a new epoch, and after a
@@ -71,9 +66,9 @@ pub struct ReplicationSnapshot {
     /// measures the tail. Thus the bound never covers a commit after the
     /// check. The bound assumes a clock that does not step back. If the clock
     /// steps back, the bound follows it back.
-    pub replicated_through: Option<DateTime<Utc>>,
+    pub replicated_through: Option<Timestamp>,
     /// Last tick that actually shipped bytes.
-    pub last_shipped_at: Option<DateTime<Utc>>,
+    pub last_shipped_at: Option<Timestamp>,
     /// Segments shipped since the process started.
     pub segments_shipped: u64,
     /// Base snapshots taken since the process started.
@@ -85,11 +80,11 @@ pub struct ReplicationSnapshot {
     /// The most recent failure, if the replicator is not currently healthy.
     pub last_error: Option<String>,
     /// When that failure happened.
-    pub last_error_at: Option<DateTime<Utc>>,
+    pub last_error_at: Option<Timestamp>,
     /// Consecutive failing ticks. Reset by any successful tick.
     pub consecutive_failures: u32,
     /// Last time a **real restore** of this replica succeeded.
-    pub last_verified_at: Option<DateTime<Utc>>,
+    pub last_verified_at: Option<Timestamp>,
     /// Why the last verification failed, when it did.
     pub last_verify_error: Option<String>,
 }
@@ -98,23 +93,19 @@ impl ReplicationSnapshot {
     /// How far behind the replica is as of `now`: the time since the last tick
     /// that completed cleanly. `None` before the first successful tick.
     #[must_use]
-    pub fn lag(&self, now: DateTime<Utc>) -> Option<Duration> {
+    pub fn lag(&self, now: Timestamp) -> Option<Duration> {
         let last = self.last_success_at?;
         // A clock that moved backwards is not a stale replica. Report zero lag, not `None`,
         // which the health indicator reads as "never shipped".
-        Some(
-            now.signed_duration_since(last)
-                .to_std()
-                .unwrap_or(Duration::ZERO),
-        )
+        Some(Duration::try_from(now.duration_since(last)).unwrap_or(Duration::ZERO))
     }
 }
 
 /// The bound a clock reading proves: one step below it. A commit read at
 /// the same instant may follow the measurement.
 #[must_use]
-pub(crate) fn bound_below(read: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    read.checked_sub_signed(chrono::TimeDelta::nanoseconds(1))
+pub(crate) fn bound_below(read: Timestamp) -> Option<Timestamp> {
+    read.checked_sub(jiff::SignedDuration::from_nanos(1)).ok()
 }
 
 /// Shared, mutable replication state.
@@ -147,7 +138,7 @@ impl ReplicationStatus {
     }
 
     /// Record that a base snapshot opened `generation`.
-    pub fn record_generation(&self, generation: &str, at: DateTime<Utc>) {
+    pub fn record_generation(&self, generation: &str, at: Timestamp) {
         self.with(|s| {
             s.generation = Some(generation.to_owned());
             // The new generation proves its own bound.
@@ -161,7 +152,7 @@ impl ReplicationStatus {
     }
 
     /// Record a segment landing on the destination.
-    pub fn record_segment(&self, bytes: u64, at: DateTime<Utc>) {
+    pub fn record_segment(&self, bytes: u64, at: Timestamp) {
         self.with(|s| {
             s.segments_shipped = s.segments_shipped.saturating_add(1);
             s.bytes_shipped = s.bytes_shipped.saturating_add(bytes);
@@ -180,7 +171,7 @@ impl ReplicationStatus {
     }
 
     /// Record a tick that completed with nothing left un-shipped.
-    pub fn record_tick_ok(&self, pending_bytes: u64, at: DateTime<Utc>) {
+    pub fn record_tick_ok(&self, pending_bytes: u64, at: Timestamp) {
         self.with(|s| {
             s.pending_bytes = pending_bytes;
             s.last_success_at = Some(at);
@@ -196,20 +187,20 @@ impl ReplicationStatus {
     /// after the clock steps back, that value would cover new commits that
     /// are not shipped. With a clock that does not step back, the bound never
     /// moves back.
-    pub fn record_replicated_through(&self, at: DateTime<Utc>) {
+    pub fn record_replicated_through(&self, at: Timestamp) {
         self.with(|s| s.replicated_through = Some(at));
     }
 
     /// The bound of [`ReplicationSnapshot::replicated_through`], without a
     /// copy of the whole snapshot.
     #[must_use]
-    pub fn replicated_through(&self) -> Option<DateTime<Utc>> {
+    pub fn replicated_through(&self) -> Option<Timestamp> {
         self.with(|s| s.replicated_through)
     }
 
     /// Forget the bound when it is not below `reading`: the clock stepped
     /// back, and the bound would cover new commits that are not shipped.
-    pub fn forget_if_ahead_of(&self, reading: DateTime<Utc>) {
+    pub fn forget_if_ahead_of(&self, reading: Timestamp) {
         self.with(|s| {
             if s.replicated_through.is_some_and(|at| at >= reading) {
                 s.replicated_through = None;
@@ -224,7 +215,7 @@ impl ReplicationStatus {
 
     /// Record a failed tick. Does **not** advance `last_success_at`, so lag keeps
     /// growing for as long as shipping is broken.
-    pub fn record_tick_error(&self, error: impl Into<String>, at: DateTime<Utc>) {
+    pub fn record_tick_error(&self, error: impl Into<String>, at: Timestamp) {
         self.with(|s| {
             s.last_error = Some(error.into());
             s.last_error_at = Some(at);
@@ -233,7 +224,7 @@ impl ReplicationStatus {
     }
 
     /// Record the outcome of a periodic restore verification.
-    pub fn record_verification(&self, result: Result<(), String>, at: DateTime<Utc>) {
+    pub fn record_verification(&self, result: Result<(), String>, at: Timestamp) {
         self.with(|s| match result {
             Ok(()) => {
                 s.last_verified_at = Some(at);
@@ -264,7 +255,7 @@ pub struct HealthThresholds {
 pub struct ReplicationHealthIndicator {
     status: Arc<ReplicationStatus>,
     thresholds: HealthThresholds,
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
 }
 
 impl ReplicationHealthIndicator {
@@ -273,7 +264,7 @@ impl ReplicationHealthIndicator {
     pub const fn new(
         status: Arc<ReplicationStatus>,
         thresholds: HealthThresholds,
-        started_at: DateTime<Utc>,
+        started_at: Timestamp,
     ) -> Self {
         Self {
             status,
@@ -287,11 +278,7 @@ impl ReplicationHealthIndicator {
     /// Pure, so the decision table is unit-testable without a clock or a running
     /// replicator.
     #[must_use]
-    pub fn evaluate(
-        &self,
-        snapshot: &ReplicationSnapshot,
-        now: DateTime<Utc>,
-    ) -> HealthCheckOutput {
+    pub fn evaluate(&self, snapshot: &ReplicationSnapshot, now: Timestamp) -> HealthCheckOutput {
         let mut details: HashMap<String, serde_json::Value> = HashMap::new();
         details.insert(
             "destination".to_owned(),
@@ -320,14 +307,14 @@ impl ReplicationHealthIndicator {
         if let Some(at) = snapshot.last_verified_at {
             details.insert(
                 "last_verified_at".to_owned(),
-                serde_json::Value::String(at.to_rfc3339()),
+                serde_json::Value::String(crate::time::compat::rfc3339(at)),
             );
         }
 
         let lag = snapshot.lag(now).or_else(|| {
             // Before the first successful tick, measure from process start so a
             // replicator that never got going still trips the threshold.
-            now.signed_duration_since(self.started_at).to_std().ok()
+            Duration::try_from(now.duration_since(self.started_at)).ok()
         });
         if let Some(lag) = lag {
             details.insert(
@@ -376,7 +363,7 @@ impl HealthIndicator for ReplicationHealthIndicator {
     fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
         Box::pin(async move {
             let snapshot = self.status.snapshot();
-            self.evaluate(&snapshot, crate::time::ambient_now().to_chrono())
+            self.evaluate(&snapshot, crate::time::ambient_now())
         })
     }
 
@@ -391,7 +378,7 @@ mod tests {
 
     fn indicator(
         status: &Arc<ReplicationStatus>,
-        started_at: DateTime<Utc>,
+        started_at: Timestamp,
     ) -> ReplicationHealthIndicator {
         ReplicationHealthIndicator::new(
             Arc::clone(status),
@@ -403,8 +390,8 @@ mod tests {
         )
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("timestamp")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(1_700_000_000 + secs).expect("timestamp")
     }
 
     #[test]

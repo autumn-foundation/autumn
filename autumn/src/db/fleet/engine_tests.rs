@@ -1,11 +1,6 @@
 //! Tests of the engine-agnostic fleet core, run on [`TextEngine`]. They
 //! compile without `sqlite`.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::JiffBridge as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -430,9 +425,7 @@ async fn a_fence_retires_a_database_that_is_still_draining() {
     let tmp = tempfile::tempdir().unwrap();
     let fleet = fleet(tmp.path(), 8, 0);
     let clock = crate::time::TickingClock::starting_at(
-        chrono::DateTime::from_timestamp_millis(1_000_000)
-            .unwrap()
-            .to_jiff(),
+        crate::time::Timestamp::from_millisecond(1_000_000).unwrap(),
     );
     let store = Arc::new(MemoryOwnership::new(Arc::new(clock.clone())));
     let host = |owner: &str| {

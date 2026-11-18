@@ -1,11 +1,6 @@
 //! Tests of generation shipping and restore, run on [`TextEngine`] in
 //! `ShipMode::Generations`.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1209,12 +1204,12 @@ async fn a_record_whose_files_are_gone_ships_nothing() {
 
 /// The system clock after a commit, and a wait until it moves past that
 /// reading. A coarse clock then cannot give the next ship the same value.
-fn wall_after_commit() -> chrono::DateTime<chrono::Utc> {
+fn wall_after_commit() -> crate::time::Timestamp {
     let at = crate::time::ClockSource::now(&crate::time::SystemClock);
     while crate::time::ClockSource::now(&crate::time::SystemClock) <= at {
         std::thread::yield_now();
     }
-    at.to_chrono()
+    at
 }
 
 #[tokio::test]

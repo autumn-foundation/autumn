@@ -35,7 +35,7 @@
     )
 )]
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// Version of the capsule document format understood by this build.
@@ -123,6 +123,36 @@ impl std::fmt::Display for CapsuleError {
 
 impl std::error::Error for CapsuleError {}
 
+/// Serde adapter for [`Capsule::clock`]: each reading is written the way
+/// [`serde_autosi`](crate::time::compat::serde_autosi) writes one timestamp,
+/// so a capsule keeps the clock text it had before the move to `jiff`.
+mod serde_autosi_vec {
+    use crate::time::Timestamp;
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    /// One reading, written through `serde_autosi`.
+    struct Reading<'a>(&'a Timestamp);
+
+    impl serde::Serialize for Reading<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            crate::time::compat::serde_autosi::serialize(self.0, serializer)
+        }
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        readings: &[Timestamp],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(readings.iter().map(Reading))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Timestamp>, D::Error> {
+        Vec::<Timestamp>::deserialize(deserializer)
+    }
+}
+
 /// A recorded failure: one request, everything it observed, and how it ended.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capsule {
@@ -131,7 +161,8 @@ pub struct Capsule {
     /// Capsule identifier — the request id when one was available.
     pub id: String,
     /// When the capsule was written.
-    pub captured_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub captured_at: Timestamp,
     /// `autumn-web` version of the build that recorded it.
     pub autumn_version: String,
     /// Identity of the recording application.
@@ -142,8 +173,8 @@ pub struct Capsule {
     /// What the client received.
     pub outcome: CapsuleOutcome,
     /// Clock readings taken during the request, in the order they were read.
-    #[serde(default)]
-    pub clock: Vec<DateTime<Utc>>,
+    #[serde(default, with = "serde_autosi_vec")]
+    pub clock: Vec<Timestamp>,
     /// Monotonic clock readings taken during the request, in read order, as
     /// microseconds since the recording clock's origin. Serves
     /// `ClockSource::monotonic` during replay the way `clock` serves `now()`.
@@ -637,16 +668,24 @@ pub struct JobEffect {
     /// and the delay recorded for it would differ between capture and replay
     /// purely because time passed. Comparing an absolute enqueue on its own
     /// terms is what lets a changed deadline be noticed at all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub due_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::time::compat::serde_autosi_option"
+    )]
+    pub due_at: Option<Timestamp>,
     /// The absolute instant the caller asked for, when it was already past.
     ///
     /// An enqueue runs a past deadline at once, so capture records `due_at:
     /// None` and keeps the deadline here. Replay compares the deadline the
     /// caller gave against this field. An `*_after_commit` registration keeps
     /// its deadline in `due_at`, and leaves this field empty.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub requested_due_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::time::compat::serde_autosi_option"
+    )]
+    pub requested_due_at: Option<Timestamp>,
     /// The error the backend returned, when the enqueue **failed**.
     ///
     /// A handler whose recorded 500 was caused by `enqueue(..).await?` — the
@@ -991,11 +1030,6 @@ pub mod test_support {
         AppInfo, BindValue, CAPSULE_FORMAT_VERSION, Capsule, CapsuleBody, CapsuleDb,
         CapsuleEffects, CapsuleOutcome, CapsuleRequest, ConnectionTape, Exchange, ExchangeProtocol,
     };
-    #[allow(
-        unused_imports,
-        reason = "temporary chrono bridge; some callers are feature- or test-gated"
-    )]
-    use crate::time::bridge::ChronoBridge as _;
 
     /// An extended-protocol exchange with prebuilt backend frames.
     #[must_use]
@@ -1063,7 +1097,7 @@ pub mod test_support {
         Capsule {
             format_version: CAPSULE_FORMAT_VERSION,
             id: "fixture".to_owned(),
-            captured_at: crate::time::ambient_now().to_chrono(),
+            captured_at: crate::time::ambient_now(),
             autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
             app: AppInfo::default(),
             request,
@@ -1107,7 +1141,7 @@ mod tests {
         ];
         capsule.request.body = CapsuleBody::Text("{\"a\":1}".to_owned());
         capsule.request.redacted_keys = vec!["header:authorization".to_owned()];
-        capsule.clock = vec![Utc::now()];
+        capsule.clock = vec![crate::time::ambient_now()];
         capsule.notes = vec!["db capture unavailable".to_owned()];
         capsule = test_support::with_connections(
             capsule,

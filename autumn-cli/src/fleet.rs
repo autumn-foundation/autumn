@@ -1231,7 +1231,7 @@ mod imp {
             lake = lake.skip_failed_tenants();
         }
         if let Some(at) = at {
-            lake = lake.as_of(at);
+            lake = lake.as_of(autumn_web::time::bridge::JiffBridge::to_jiff(at));
         }
         if !args.tables.is_empty() {
             lake = lake.with_tables(args.tables.iter().cloned());

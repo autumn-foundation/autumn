@@ -52,15 +52,12 @@
     )
 )]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::SignedDuration;
+
+use crate::time::{Timestamp, civil};
 
 use crate::capsule::capture::CaptureScope;
 use crate::capsule::redact::RedactedValues;
@@ -78,7 +75,7 @@ use crate::log::filter::ParameterFilter;
 /// see — a second app process sharing the capsule directory pins in its own
 /// memory, and pruning a file that process wrote a second ago would break the
 /// path its reporters are about to follow.
-const PRUNE_GRACE: TimeDelta = TimeDelta::minutes(1);
+const PRUNE_GRACE: SignedDuration = SignedDuration::from_mins(1);
 
 /// Why a capsule is refused after the parameter filter removed a resolved
 /// client-identity field the request actually had.
@@ -203,7 +200,7 @@ pub(crate) fn persist_pinned(
     prune(
         &dir,
         retained_before_write(settings.max_capsules),
-        crate::time::ambient_now().to_chrono(),
+        crate::time::ambient_now(),
     );
     let pin = pin_for_reporting(&path);
     if let Err(error) = write_atomically(&dir, &path, &json) {
@@ -329,7 +326,7 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     Some(Capsule {
         format_version: CAPSULE_FORMAT_VERSION,
         id: scope.id().to_owned(),
-        captured_at: crate::time::ambient_now().to_chrono(),
+        captured_at: crate::time::ambient_now(),
         autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
         app: AppInfo {
             name: settings.app_name.clone(),
@@ -411,7 +408,7 @@ pub(crate) fn scrub_outcome(outcome: CapsuleOutcome, redacted: &RedactedValues) 
 fn file_name(capsule: &Capsule) -> String {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let stamp = capsule.captured_at.format("%Y%m%dT%H%M%S%.6f");
+    let stamp = capsule.captured_at.strftime("%Y%m%dT%H%M%S%.6f");
     let id = sanitize_id(&capsule.id);
     format!("{stamp}-{sequence:06}-{id}.json")
 }
@@ -473,7 +470,7 @@ fn retained_before_write(max_capsules: usize) -> usize {
 /// deliberately newest-first: when a storm forces a choice among recent
 /// files, the ones most likely to still be in a reporter's hands (in another
 /// process, whose pins this one cannot see) are the newest.
-fn prune(dir: &Path, keep: usize, now: DateTime<Utc>) {
+fn prune(dir: &Path, keep: usize, now: Timestamp) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -510,9 +507,10 @@ fn prune(dir: &Path, keep: usize, now: DateTime<Utc>) {
 
 /// Whether a capsule file's name says it was written less than
 /// [`PRUNE_GRACE`] ago.
-fn written_within_grace(path: &Path, now: DateTime<Utc>) -> bool {
+fn written_within_grace(path: &Path, now: Timestamp) -> bool {
     capsule_stamp(path)
-        .is_some_and(|written| now.signed_duration_since(written.and_utc()) < PRUNE_GRACE)
+        .and_then(|written| jiff::tz::TimeZone::UTC.to_timestamp(written).ok())
+        .is_some_and(|written| now.duration_since(written) < PRUNE_GRACE)
 }
 
 /// Whether any header a resolved-identity field could come from is filtered.
@@ -534,14 +532,14 @@ fn identity_source_is_filtered(filter: &ParameterFilter, sources: &[&str]) -> bo
 /// checked — `<timestamp>-<6-digit sequence>-<id>.json` — not just a `.json`
 /// extension, because `[failure_capture] dir` points wherever the user says
 /// and pruning must never eat a file some other writer put there.
-fn capsule_stamp(path: &Path) -> Option<chrono::NaiveDateTime> {
+fn capsule_stamp(path: &Path) -> Option<civil::DateTime> {
     let name = path.file_name()?.to_str()?.strip_suffix(".json")?;
     let (stamp, rest) = name.split_once('-')?;
     let (sequence, id) = rest.split_once('-')?;
     if sequence.len() != 6 || !sequence.bytes().all(|b| b.is_ascii_digit()) || id.is_empty() {
         return None;
     }
-    chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S%.f").ok()
+    civil::DateTime::strptime("%Y%m%dT%H%M%S%.f", stamp).ok()
 }
 
 /// Read a capsule back from disk.
@@ -582,7 +580,7 @@ mod tests {
         let capsule = dir.path().join("20200101T000000.000000-000001-aaa.json");
         std::fs::write(&capsule, b"{}").expect("write");
 
-        prune(dir.path(), 0, Utc::now());
+        prune(dir.path(), 0, crate::time::ambient_now());
 
         assert!(!capsule.exists(), "the real capsule is over the cap");
         for name in foreign {
@@ -603,7 +601,7 @@ mod tests {
         std::fs::write(&prunable, b"{}").expect("write");
 
         let guard = pin_for_reporting(&pinned);
-        prune(dir.path(), 0, Utc::now());
+        prune(dir.path(), 0, crate::time::ambient_now());
         assert!(
             pinned.exists(),
             "a capsule a reporter chain still holds must not be pruned"
@@ -614,7 +612,7 @@ mod tests {
         );
 
         drop(guard);
-        prune(dir.path(), 0, Utc::now());
+        prune(dir.path(), 0, crate::time::ambient_now());
         assert!(
             !pinned.exists(),
             "dropping the pin makes the capsule prunable again"
@@ -627,9 +625,9 @@ mod tests {
     #[test]
     fn a_sub_minute_storm_cannot_grow_the_directory_unbounded() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let now = Utc::now();
+        let now = crate::time::ambient_now();
         // Twenty capsules stamped within the last few seconds.
-        let stamp = (now - TimeDelta::seconds(5)).format("%Y%m%dT%H%M%S%.6f");
+        let stamp = (now - SignedDuration::from_secs(5)).strftime("%Y%m%dT%H%M%S%.6f");
         for sequence in 0..20 {
             let name = format!("{stamp}-{sequence:06}-storm.json");
             std::fs::write(dir.path().join(name), b"{}").expect("write");
@@ -904,7 +902,11 @@ mod tests {
             "the file must already be pinned when persist_pinned returns"
         );
         // A concurrent prune with zero retention, an hour past the grace window.
-        prune(dir.path(), 0, Utc::now() + TimeDelta::hours(1));
+        prune(
+            dir.path(),
+            0,
+            crate::time::ambient_now() + SignedDuration::from_hours(1),
+        );
         assert!(
             reference.path.exists(),
             "a pinned capsule survives a concurrent prune even past the grace"
@@ -938,7 +940,7 @@ mod tests {
 
     #[test]
     fn file_age_comes_from_the_name_the_writer_stamped() {
-        let now = Utc::now();
+        let now = crate::time::ambient_now();
         let capsule = test_capsule();
         let fresh = PathBuf::from(file_name(&capsule));
         assert!(
@@ -947,7 +949,7 @@ mod tests {
         );
 
         let old = PathBuf::from(file_name(&Capsule {
-            captured_at: now - TimeDelta::hours(1),
+            captured_at: now - SignedDuration::from_hours(1),
             ..test_capsule()
         }));
         assert!(

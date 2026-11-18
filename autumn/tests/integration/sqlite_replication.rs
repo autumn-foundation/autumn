@@ -17,11 +17,6 @@
 //! clock by hand, so the point-in-time cases below are deterministic: no
 //! sleeping, no flaky clock windows.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,8 +28,7 @@ use autumn_web::replication::{
     FileDestination, HealthThresholds, ReplicationHealthIndicator, ReplicationSettings,
     ReplicationStatus, Replicator, TickReport, restore, segment,
 };
-use autumn_web::time::ClockSource;
-use chrono::{DateTime, TimeZone as _, Utc};
+use autumn_web::time::{ClockSource, SignedDuration, Timestamp, ambient_now};
 use diesel::connection::SimpleConnection as _;
 use diesel::sql_types::{BigInt, Text};
 use diesel::{Connection as _, QueryableByName, RunQueryDsl as _, SqliteConnection, sql_query};
@@ -90,13 +84,11 @@ fn values(rows: &[Row]) -> Vec<String> {
 
 /// A fixture instant, deliberately in the **past** (2023-11-14 + `secs`).
 ///
-/// Anything that compares a replication timestamp against `Utc::now()` — lag,
+/// Anything that compares a replication timestamp against the wall clock — lag,
 /// retention — must see these as history, so the suite's meaning cannot change
 /// on a calendar date.
-fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_700_000_000 + secs, 0)
-        .single()
-        .expect("timestamp")
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_second(1_700_000_000 + secs).expect("timestamp")
 }
 
 /// A clock the suite steps by hand.
@@ -106,21 +98,21 @@ fn at(secs: i64) -> DateTime<Utc> {
 /// the WAL read for a segment — so the timestamps a point-in-time restore
 /// selects on cannot be passed in from the outside. Injecting a clock the test
 /// owns keeps that ordering honest *and* the fixture times deterministic.
-struct StepClock(Mutex<DateTime<Utc>>);
+struct StepClock(Mutex<Timestamp>);
 
 impl StepClock {
     fn new() -> Arc<Self> {
         Arc::new(Self(Mutex::new(at(0))))
     }
 
-    fn set(&self, now: DateTime<Utc>) {
+    fn set(&self, now: Timestamp) {
         *self.0.lock().expect("clock") = now;
     }
 }
 
 impl ClockSource for StepClock {
     fn now(&self) -> autumn_web::time::Timestamp {
-        self.0.lock().expect("clock").to_jiff()
+        *self.0.lock().expect("clock")
     }
 }
 
@@ -230,7 +222,7 @@ impl Harness {
         assert!(!self.db.exists(), "the database must really be gone");
     }
 
-    fn restore_to(&self, target: Option<DateTime<Utc>>) -> PathBuf {
+    fn restore_to(&self, target: Option<Timestamp>) -> PathBuf {
         let output = self
             .replica_root
             .parent()
@@ -594,15 +586,15 @@ fn generations_on(h: &Harness) -> std::collections::BTreeSet<String> {
 ///
 /// Makes the *order* in which the replicator reads time observable: each
 /// artifact's timestamp says exactly which reading stamped it.
-struct AdvancingClock(Mutex<DateTime<Utc>>);
+struct AdvancingClock(Mutex<Timestamp>);
 
 impl ClockSource for AdvancingClock {
     fn now(&self) -> autumn_web::time::Timestamp {
         let mut current = self.0.lock().expect("clock");
         let reading = *current;
-        *current = reading + chrono::Duration::seconds(1);
+        *current = reading + SignedDuration::from_secs(1);
         drop(current);
-        reading.to_jiff()
+        reading
     }
 }
 
@@ -655,13 +647,13 @@ fn an_artifact_is_stamped_after_its_contents_are_fenced() {
         .max()
         .expect("one segment");
 
-    let opening = before_opening.to_chrono().timestamp_millis();
+    let opening = before_opening.as_millisecond();
     assert!(
         snapshot_ms > opening,
         "the snapshot must be stamped after the checkpoint that fenced the database file, \
          from a reading taken inside the tick ({snapshot_ms} vs {opening})"
     );
-    let shipping = before_shipping.to_chrono().timestamp_millis();
+    let shipping = before_shipping.as_millisecond();
     assert!(
         segment_ms > shipping,
         "the segment must be stamped after its WAL bytes were read, from a reading taken \
@@ -1240,9 +1232,9 @@ fn a_failed_verification_reaches_the_status_the_health_indicator_reads() {
             lag_alert_after: Duration::from_secs(30),
             startup_grace: Duration::from_secs(60),
         },
-        Utc::now(),
+        ambient_now(),
     );
-    let output = indicator.evaluate(&h.status.snapshot(), Utc::now());
+    let output = indicator.evaluate(&h.status.snapshot(), ambient_now());
     assert_eq!(output.status, HealthStatus::Down);
     assert!(output.details.contains_key("verification_error"));
 }
@@ -1261,7 +1253,7 @@ fn the_replication_indicator_registers_and_reports_down_through_the_registry() {
             lag_alert_after: Duration::from_secs(30),
             startup_grace: Duration::from_secs(60),
         },
-        Utc::now(),
+        ambient_now(),
     ));
     let registry = HealthIndicatorRegistry::new();
     registry
@@ -1272,8 +1264,8 @@ fn the_replication_indicator_registers_and_reports_down_through_the_registry() {
         )
         .expect("register the replication indicator");
 
-    status.record_tick_ok(0, Utc::now());
-    status.record_verification(Err("integrity check failed".to_owned()), Utc::now());
+    status.record_tick_ok(0, ambient_now());
+    status.record_verification(Err("integrity check failed".to_owned()), ambient_now());
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1292,7 +1284,7 @@ fn the_replication_indicator_registers_and_reports_down_through_the_registry() {
     assert_eq!(result.group, IndicatorGroup::HealthOnly);
 
     // …and recovers once a verification succeeds again.
-    status.record_verification(Ok(()), Utc::now());
+    status.record_verification(Ok(()), ambient_now());
     let recovered = runtime.block_on(registry.run_all());
     assert!(
         recovered.iter().all(|r| r.output.status.is_healthy()),
