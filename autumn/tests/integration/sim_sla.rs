@@ -22,17 +22,27 @@ use autumn_web::sla::{
     SlaBreach, SlaPlugin,
 };
 use autumn_web::test::TestApp;
-use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike, Utc, Weekday};
-use chrono_tz::Tz;
+use autumn_web::time::compat;
+use autumn_web::time::tz::TimeZone;
+use autumn_web::time::{SignedDuration, Timestamp, civil};
 
-type Fired = Arc<Mutex<Vec<(SlaBreach, DateTime<Utc>)>>>;
+type Fired = Arc<Mutex<Vec<(SlaBreach, Timestamp)>>>;
 
-fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(y, m, d, h, min, 0).unwrap()
+fn utc(y: i16, m: i8, d: i8, h: i8, min: i8) -> Timestamp {
+    civil::date(y, m, d)
+        .at(h, min, 0, 0)
+        .to_zoned_datetime(TimeZone::UTC)
+        .unwrap()
+        .timestamp()
 }
 
-const fn date(y: i32, m: u32, d: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(y, m, d).unwrap()
+const fn date(y: i16, m: i8, d: i8) -> civil::Date {
+    civil::date(y, m, d)
+}
+
+/// Move the sim clock forward to `at`.
+async fn advance_to(sim: &Sim, at: Timestamp) {
+    sim.advance_to(&at.to_chrono()).await;
 }
 
 /// A plugin with a "support" calendar and a breach handler that records
@@ -46,7 +56,7 @@ fn support_plugin(calendar: BusinessCalendar) -> (SlaPlugin, Fired) {
             let sink = Arc::clone(&sink);
             async move {
                 let now = state.clock().now();
-                sink.lock().unwrap().push((breach, now.to_chrono()));
+                sink.lock().unwrap().push((breach, now));
                 Ok(())
             }
         },
@@ -71,7 +81,7 @@ async fn open_ticket(sla: Sla, Path(id): Path<u32>) -> AutumnResult<String> {
         .within("2 business days".parse()?)
         .calendar("support");
     let status = sla.track(&obligation).await?;
-    Ok(status.due_at.map(|d| d.to_rfc3339()).unwrap_or_default())
+    Ok(status.due_at.map(compat::rfc3339).unwrap_or_default())
 }
 
 #[get("/tickets/{id}/sla")]
@@ -122,32 +132,32 @@ async fn sim_sla_clock_pauses_on_weekend_and_holiday_then_escalates_once(mut sim
     sim.build(desk_app(plugin));
 
     // Friday 15:00: 2h on Friday, the holiday, 8h on Tuesday, 6h on Wednesday.
-    sim.advance_to(&utc(2020, 1, 3, 15, 0)).await;
+    advance_to(&sim, utc(2020, 1, 3, 15, 0)).await;
     let due = post(&sim, "/tickets/1").await;
-    assert_eq!(due, utc(2020, 1, 8, 15, 0).to_rfc3339());
+    assert_eq!(due, "2020-01-08T15:00:00+00:00");
     post(&sim, "/tickets/2").await;
     assert_eq!(body(&sim, "/tickets/1/sla").await, "Running 57600");
 
     // The clock stops over the weekend and on the holiday.
-    sim.advance_to(&utc(2020, 1, 4, 12, 0)).await;
+    advance_to(&sim, utc(2020, 1, 4, 12, 0)).await;
     sim.run_to_idle().await;
     assert_eq!(body(&sim, "/tickets/1/sla").await, "Paused 50400");
-    sim.advance_to(&utc(2020, 1, 6, 12, 0)).await;
+    advance_to(&sim, utc(2020, 1, 6, 12, 0)).await;
     sim.run_to_idle().await;
     assert_eq!(body(&sim, "/tickets/1/sla").await, "Paused 50400");
 
     // Ticket 2 gets a response on Tuesday.
-    sim.advance_to(&utc(2020, 1, 7, 10, 0)).await;
+    advance_to(&sim, utc(2020, 1, 7, 10, 0)).await;
     assert_eq!(post(&sim, "/tickets/2/respond").await, "Met");
 
     // One minute before the deadline: no escalation.
-    sim.advance_to(&utc(2020, 1, 8, 14, 59)).await;
+    advance_to(&sim, utc(2020, 1, 8, 14, 59)).await;
     sim.run_to_idle().await;
     assert!(fired_keys(&fired).is_empty());
     assert_eq!(body(&sim, "/tickets/1/sla").await, "Running 60");
 
     // After the deadline: ticket 1 escalates once, ticket 2 does not.
-    sim.advance_to(&utc(2020, 1, 8, 15, 1)).await;
+    advance_to(&sim, utc(2020, 1, 8, 15, 1)).await;
     sim.run_to_idle().await;
     assert_eq!(fired_keys(&fired), ["first_response/ticket:1"]);
     assert_eq!(body(&sim, "/tickets/1/sla").await, "Breached 0");
@@ -178,21 +188,21 @@ async fn sim_sla_repeated_track_and_duplicate_checks_escalate_once(mut sim: Sim)
     sim.build(desk_app(plugin));
 
     // Wednesday 2020-01-01 is a working day on this calendar.
-    sim.advance_to(&utc(2020, 1, 1, 9, 0)).await;
+    advance_to(&sim, utc(2020, 1, 1, 9, 0)).await;
     for _ in 0..3 {
         post(&sim, "/tickets/7").await;
     }
     sim.run_to_idle().await;
 
     // Due Thursday 17:00. Go past it.
-    sim.advance_to(&utc(2020, 1, 2, 17, 30)).await;
+    advance_to(&sim, utc(2020, 1, 2, 17, 30)).await;
     sim.run_to_idle().await;
     assert_eq!(fired_keys(&fired), ["first_response/ticket:7"]);
 
     // A replica that runs the same check again must not escalate again.
     let payload = serde_json::json!({
         "key": "first_response/ticket:7",
-        "due_at": utc(2020, 1, 2, 17, 0),
+        "due_at": "2020-01-02T17:00:00Z",
     });
     job::enqueue(CHECK_JOB, payload.clone()).await.unwrap();
     job::enqueue(CHECK_JOB, payload).await.unwrap();
@@ -213,7 +223,7 @@ async fn sim_sla_forget_and_track_again_escalates_the_new_record(mut sim: Sim) {
     let calendar = BusinessCalendar::weekdays("09:00-17:00".parse().unwrap());
     let (plugin, fired) = support_plugin(calendar);
     sim.build(desk_app(plugin));
-    sim.advance_to(&utc(2020, 1, 1, 9, 0)).await;
+    advance_to(&sim, utc(2020, 1, 1, 9, 0)).await;
 
     let sla = Sla::from_state(sim.client().state()).unwrap();
     let ob = Obligation::new("first_response", "ticket:8")
@@ -221,7 +231,7 @@ async fn sim_sla_forget_and_track_again_escalates_the_new_record(mut sim: Sim) {
         .calendar("support")
         .starting_at(utc(2020, 1, 1, 9, 0));
     sla.track(&ob).await.unwrap();
-    sim.advance_to(&utc(2020, 1, 1, 11, 0)).await;
+    advance_to(&sim, utc(2020, 1, 1, 11, 0)).await;
     sim.run_to_idle().await;
     assert_eq!(fired_keys(&fired).len(), 1);
 
@@ -244,7 +254,7 @@ async fn sim_sla_status_is_readable_without_tracking(mut sim: Sim) {
     let calendar = BusinessCalendar::weekdays("09:00-17:00".parse().unwrap());
     let (plugin, _fired) = support_plugin(calendar);
     sim.build(desk_app(plugin));
-    sim.advance_to(&utc(2020, 1, 3, 16, 0)).await;
+    advance_to(&sim, utc(2020, 1, 3, 16, 0)).await;
 
     let sla = Sla::from_state(sim.client().state()).unwrap();
     let ob = Obligation::new("first_response", "ticket:9")
@@ -276,11 +286,11 @@ async fn sim_sla_zone_resolves_from_obligation_then_calendar_then_app(mut sim: S
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let ny: Tz = "America/New_York".parse().unwrap();
-    let tokyo: Tz = "Asia/Tokyo".parse().unwrap();
+    let ny = TimeZone::get("America/New_York").unwrap();
+    let tokyo = TimeZone::get("Asia/Tokyo").unwrap();
     let hours = "09:00-17:00".parse().unwrap();
     let plugin = SlaPlugin::new()
-        .calendar("home", BusinessCalendar::weekdays(hours).zone(ny))
+        .calendar("home", BusinessCalendar::weekdays(hours).zone(ny.clone()))
         .calendar("plain", BusinessCalendar::weekdays(hours));
     sim.build(TestApp::new().plugin(plugin));
 
@@ -291,11 +301,14 @@ async fn sim_sla_zone_resolves_from_obligation_then_calendar_then_app(mut sim: S
             .calendar(calendar)
     };
     // 1. The zone of the obligation wins.
-    assert_eq!(sla.status(&ob("home").zone(tokyo)).unwrap().zone, tokyo);
+    assert_eq!(
+        sla.status(&ob("home").zone(tokyo.clone())).unwrap().zone,
+        tokyo
+    );
     // 2. Then the home zone of the calendar.
     assert_eq!(sla.status(&ob("home")).unwrap().zone, ny);
     // 3. Then the app default (`[time_zone]`, UTC here).
-    assert_eq!(sla.status(&ob("plain")).unwrap().zone, Tz::UTC);
+    assert_eq!(sla.status(&ob("plain")).unwrap().zone, TimeZone::UTC);
 
     // `track` keeps the zone it found.
     let tracked = sla.track(&ob("home")).await.unwrap();
@@ -351,8 +364,8 @@ async fn sim_sla_track_refuses_obligations_that_cannot_escalate(mut sim: Sim) {
 #[derive(Debug, Clone)]
 struct Ticket {
     id: u32,
-    opened_at: DateTime<Utc>,
-    responded_at: Option<DateTime<Utc>>,
+    opened_at: Timestamp,
+    responded_at: Option<Timestamp>,
     customer_zone: String,
 }
 
@@ -360,19 +373,23 @@ const Q1_HOLIDAYS: [(u32, u32); 3] = [(1, 1), (1, 20), (2, 17)];
 
 /// An independent oracle: step one minute at a time and count the minutes
 /// in working hours (Mon-Fri 09:00-17:00 local, not a holiday).
-fn oracle_due(opened: DateTime<Utc>, zone: Tz, holidays: &[(u32, u32)]) -> DateTime<Utc> {
+fn oracle_due(opened: Timestamp, zone: &TimeZone, holidays: &[(u32, u32)]) -> Timestamp {
     let mut at = opened;
     let mut minutes_left = 8 * 60;
     loop {
-        let local = at.with_timezone(&zone);
+        let local = zone.to_datetime(at);
         let weekday = local.weekday();
-        let working = !matches!(weekday, Weekday::Sat | Weekday::Sun)
-            && !holidays.contains(&(local.month(), local.day()))
+        let month_day = (
+            local.month().unsigned_abs().into(),
+            local.day().unsigned_abs().into(),
+        );
+        let working = !matches!(weekday, civil::Weekday::Saturday | civil::Weekday::Sunday)
+            && !holidays.contains(&month_day)
             && (9..17).contains(&local.hour());
         if working {
             minutes_left -= 1;
         }
-        at += chrono::Duration::minutes(1);
+        at += SignedDuration::from_mins(1);
         if minutes_left == 0 {
             return at;
         }
@@ -395,16 +412,16 @@ async fn sim_sla_support_desk_quarter(mut sim: Sim) {
     // Replies: after 1 hour, never, or after 60 hours.
     let zones = ["UTC", "America/New_York"];
     let mut tickets = BTreeMap::new();
-    let mut events: Vec<(DateTime<Utc>, u32)> = Vec::new();
+    let mut events: Vec<(Timestamp, u32)> = Vec::new();
     let mut day = utc(2020, 1, 1, 14, 0);
     let mut id = 0_u32;
     while day < utc(2020, 4, 1, 0, 0) {
         for zone in zones {
             id += 1;
             let reply = match id % 3 {
-                0 => Some(day + chrono::Duration::hours(1)),
+                0 => Some(day + SignedDuration::from_hours(1)),
                 1 => None,
-                _ => Some(day + chrono::Duration::hours(60)),
+                _ => Some(day + SignedDuration::from_hours(60)),
             };
             tickets.insert(
                 id,
@@ -423,7 +440,7 @@ async fn sim_sla_support_desk_quarter(mut sim: Sim) {
                 events.push((reply, id));
             }
         }
-        day += chrono::Duration::days(1);
+        day += SignedDuration::from_hours(24);
     }
     events.sort();
 
@@ -431,9 +448,9 @@ async fn sim_sla_support_desk_quarter(mut sim: Sim) {
     let mut expected = BTreeMap::new();
     let mut holiday_matters = false;
     for (ticket, reply) in tickets.values() {
-        let zone: Tz = ticket.customer_zone.parse().unwrap();
-        let due = oracle_due(ticket.opened_at, zone, &Q1_HOLIDAYS);
-        holiday_matters |= due != oracle_due(ticket.opened_at, zone, &[]);
+        let zone = TimeZone::get(&ticket.customer_zone).unwrap();
+        let due = oracle_due(ticket.opened_at, &zone, &Q1_HOLIDAYS);
+        holiday_matters |= due != oracle_due(ticket.opened_at, &zone, &[]);
         if reply.is_none_or(|r| r > due) {
             expected.insert(format!("first_response/ticket:{}", ticket.id), due);
         }
@@ -444,7 +461,7 @@ async fn sim_sla_support_desk_quarter(mut sim: Sim) {
     let sla = Sla::from_state(sim.client().state()).unwrap();
     let wall_start = Instant::now();
     for (at, id) in events {
-        sim.advance_to(&at).await;
+        advance_to(&sim, at).await;
         let (ticket, _) = tickets.get_mut(&id).unwrap();
         if ticket.opened_at < at {
             // No drain first: a late reply is still a breach, even when
@@ -455,7 +472,7 @@ async fn sim_sla_support_desk_quarter(mut sim: Sim) {
             .await
             .unwrap();
     }
-    sim.advance_to(&utc(2020, 4, 30, 0, 0)).await;
+    advance_to(&sim, utc(2020, 4, 30, 0, 0)).await;
     sim.run_to_idle().await;
     let wall = wall_start.elapsed();
 
@@ -475,7 +492,7 @@ async fn sim_sla_support_desk_quarter(mut sim: Sim) {
         // The sim steps from event to event (at most one day apart), so the
         // claim happens at the first step after the deadline.
         assert!(
-            breach.escalated_at <= breach.due_at + chrono::Duration::days(1),
+            breach.escalated_at <= breach.due_at + SignedDuration::from_hours(24),
             "{} escalated late, at {}",
             breach.key,
             breach.escalated_at

@@ -3,8 +3,8 @@
 //! Autumn exposes a [`TimeZone`] extractor so handlers can render timestamps in the
 //! requesting user's local time instead of always serving UTC. It mirrors the
 //! [`Clock`](crate::time::Clock) extractor pattern — deterministic, injected,
-//! testable — and reuses the existing `chrono-tz` dependency (already required by
-//! the scheduler).
+//! testable. Zones come from the IANA database that `jiff` bundles, so lookup
+//! gives the same answer on every host.
 //!
 //! # Resolution order
 //!
@@ -28,13 +28,17 @@
 //! #[get("/events")]
 //! async fn index(clock: Clock, tz: TimeZone) -> Markup {
 //!     let now = clock.now();
-//!     html! { p { (local_datetime(now, *tz)) } }
+//!     html! { p { (local_datetime(now, &tz)) } }
 //! }
 //! ```
 
-use chrono::TimeZone as _;
-use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
+#[allow(
+    unused_imports,
+    reason = "temporary chrono bridge; some callers are feature- or test-gated"
+)]
+use crate::time::bridge::ChronoBridge as _;
+use jiff::Timestamp;
+use jiff::tz::{AmbiguousOffset, TimeZone as Tz};
 use serde::Deserialize;
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -150,7 +154,7 @@ impl TimeZoneConfig {
         Ok(())
     }
 
-    /// Returns the configured default [`Tz`], or `UTC` if the identifier is
+    /// Returns the configured default zone, or `UTC` if the identifier is
     /// somehow invalid (should not happen after validation).
     #[must_use]
     pub fn default_tz(&self) -> Tz {
@@ -168,9 +172,11 @@ impl TimeZoneConfig {
 ///
 /// ```rust,ignore
 /// // In your auth / current-user middleware:
-/// parts.extensions.insert(UserTimeZone(user.time_zone.parse::<Tz>().unwrap()));
+/// if let Some(zone) = parse_iana(&user.time_zone) {
+///     parts.extensions.insert(UserTimeZone(zone));
+/// }
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserTimeZone(pub Tz);
 
 // ── Session key ───────────────────────────────────────────────────────────────
@@ -192,10 +198,10 @@ pub const TIME_ZONE_SESSION_KEY: &str = "autumn_time_zone";
 ///
 /// async fn handler(clock: Clock, tz: TimeZone) -> String {
 ///     let local = tz.convert(clock.now());
-///     local.format("%Y-%m-%d %H:%M %Z").to_string()
+///     local.strftime("%Y-%m-%d %H:%M %Z").to_string()
 /// }
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeZone(pub Tz);
 
 impl TimeZone {
@@ -205,23 +211,25 @@ impl TimeZone {
         Self(tz)
     }
 
-    /// Returns the wrapped [`Tz`].
+    /// Returns the wrapped [`jiff::tz::TimeZone`].
     #[must_use]
-    pub const fn tz(&self) -> Tz {
-        self.0
+    pub const fn tz(&self) -> &Tz {
+        &self.0
     }
 
     /// Returns the IANA identifier string (e.g. `"America/New_York"`).
+    ///
+    /// A zone with no IANA name, such as a fixed offset built with
+    /// [`jiff::tz::TimeZone::fixed`], returns an empty string.
     #[must_use]
-    pub fn iana(&self) -> &'static str {
-        self.0.name()
+    pub fn iana(&self) -> &str {
+        self.0.iana_name().unwrap_or_default()
     }
 
     /// Convert a UTC timestamp into this zone's local time.
     #[must_use]
-    pub fn convert(&self, dt: DateTime<Utc>) -> chrono::DateTime<Tz> {
-        use chrono::TimeZone as _;
-        self.0.from_utc_datetime(&dt.naive_utc())
+    pub fn convert(&self, ts: Timestamp) -> jiff::ZonedDateTime {
+        ts.to_zoned_datetime(self.0.clone())
     }
 }
 
@@ -255,7 +263,10 @@ impl axum::extract::FromRequestParts<crate::state::AppState> for TimeZone {
 
 async fn resolve_source(parts: &axum::http::request::Parts, source: &Source) -> Option<Tz> {
     match source {
-        Source::User => parts.extensions.get::<UserTimeZone>().map(|utz| utz.0),
+        Source::User => parts
+            .extensions
+            .get::<UserTimeZone>()
+            .map(|utz| utz.0.clone()),
         Source::Session => {
             let session = parts.extensions.get::<crate::session::Session>().cloned()?;
             let value: String = session.get(TIME_ZONE_SESSION_KEY).await?;
@@ -341,10 +352,23 @@ fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
 /// Parse and validate an IANA time zone identifier.
 ///
 /// Returns `None` for unknown or malformed identifiers so callers can fall
-/// through to the next resolution source.
+/// through to the next resolution source. The match ignores case
+/// (`america/new_york` finds `America/New_York`); read the canonical name
+/// back with [`jiff::tz::TimeZone::iana_name`]. Only the IANA database bundled
+/// into the binary is consulted, never the host file system.
 #[must_use]
 pub fn parse_iana(s: &str) -> Option<Tz> {
-    s.trim().parse::<Tz>().ok()
+    let name = s.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Tz::get(name).ok()
+}
+
+/// `ts` in `tz`, formatted with `pattern`. An invalid pattern gives an empty
+/// string instead of a panic.
+fn format_local(ts: Timestamp, tz: &Tz, pattern: &str) -> String {
+    jiff::fmt::strtime::format(pattern, &ts.to_zoned_datetime(tz.clone())).unwrap_or_default()
 }
 
 // ── Session & cookie helpers ──────────────────────────────────────────────────
@@ -397,14 +421,13 @@ fn push_pct_encoded(out: &mut String, byte: u8) {
 /// visible text uses the given zone.
 ///
 /// ```rust,ignore
-/// let markup = local_datetime(clock.now(), *tz);
+/// let markup = local_datetime(clock.now(), &tz);
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn local_datetime(dt: DateTime<Utc>, tz: Tz) -> maud::Markup {
-    let local = tz.from_utc_datetime(&dt.naive_utc());
-    let display = local.format("%Y-%m-%d %H:%M %Z").to_string();
-    let rfc = dt.to_rfc3339();
+pub fn local_datetime(dt: Timestamp, tz: &Tz) -> maud::Markup {
+    let display = format_local(dt, tz, "%Y-%m-%d %H:%M %Z");
+    let rfc = crate::time::compat::rfc3339(dt);
     maud::html! {
         time datetime=(rfc) { (display) }
     }
@@ -413,10 +436,9 @@ pub fn local_datetime(dt: DateTime<Utc>, tz: Tz) -> maud::Markup {
 /// A semantic `<time>` element showing the local date (no time component).
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn local_date(dt: DateTime<Utc>, tz: Tz) -> maud::Markup {
-    let local = tz.from_utc_datetime(&dt.naive_utc());
-    let display = local.format("%Y-%m-%d").to_string();
-    let rfc = dt.to_rfc3339();
+pub fn local_date(dt: Timestamp, tz: &Tz) -> maud::Markup {
+    let display = format_local(dt, tz, "%Y-%m-%d");
+    let rfc = crate::time::compat::rfc3339(dt);
     maud::html! {
         time datetime=(rfc) { (display) }
     }
@@ -428,15 +450,14 @@ pub fn local_date(dt: DateTime<Utc>, tz: Tz) -> maud::Markup {
 /// tests can control it deterministically.
 ///
 /// ```rust,ignore
-/// let markup = time_ago(event.created_at, clock.now(), *tz);
+/// let markup = time_ago(event.created_at, clock.now(), &tz);
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn time_ago(dt: DateTime<Utc>, now: DateTime<Utc>, tz: Tz) -> maud::Markup {
-    let relative = crate::format::relative_time_words(dt, now);
-    let rfc = dt.to_rfc3339();
-    let local = tz.from_utc_datetime(&dt.naive_utc());
-    let display = local.format("%Y-%m-%d %H:%M %Z").to_string();
+pub fn time_ago(dt: Timestamp, now: Timestamp, tz: &Tz) -> maud::Markup {
+    let relative = crate::format::relative_time_words(dt.to_chrono(), now.to_chrono());
+    let rfc = crate::time::compat::rfc3339(dt);
+    let display = format_local(dt, tz, "%Y-%m-%d %H:%M %Z");
     maud::html! {
         time datetime=(rfc) title=(display) { (relative) }
     }
@@ -474,28 +495,30 @@ pub enum TimeZoneError {
 /// Returns [`TimeZoneError::InvalidFormat`] for unparseable input and
 /// [`TimeZoneError::AmbiguousLocalTime`] for a non-existent local time
 /// (e.g. a DST gap when clocks spring forward).
-pub fn parse_local_datetime(input: &str, tz: Tz) -> Result<DateTime<Utc>, TimeZoneError> {
-    use chrono::NaiveDateTime;
-    let naive = NaiveDateTime::parse_from_str(input.trim(), "%Y-%m-%dT%H:%M").map_err(|_| {
+pub fn parse_local_datetime(input: &str, tz: &Tz) -> Result<Timestamp, TimeZoneError> {
+    let local = jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M", input.trim()).map_err(|_| {
         TimeZoneError::InvalidFormat {
             input: input.to_owned(),
         }
     })?;
-    tz.from_local_datetime(&naive)
-        .earliest()
-        .ok_or_else(|| TimeZoneError::AmbiguousLocalTime {
-            input: input.to_owned(),
-            zone: tz.name().to_owned(),
-        })
-        .map(|dt| dt.with_timezone(&Utc))
+    let nonexistent = || TimeZoneError::AmbiguousLocalTime {
+        input: input.to_owned(),
+        zone: tz.iana_name().unwrap_or_default().to_owned(),
+    };
+    let ambiguous = tz.to_ambiguous_timestamp(local);
+    // `earlier` would move a time in a gap forward; a time that never
+    // occurs on the wall clock is an input error instead.
+    if matches!(ambiguous.offset(), AmbiguousOffset::Gap { .. }) {
+        return Err(nonexistent());
+    }
+    ambiguous.earlier().map_err(|_| nonexistent())
 }
 
 /// Format a UTC timestamp as a `datetime-local` input value (`YYYY-MM-DDTHH:MM`)
 /// in the given zone. Suitable for populating an `<input type="datetime-local">`.
 #[must_use]
-pub fn to_local_input_value(dt: DateTime<Utc>, tz: Tz) -> String {
-    let local = tz.from_utc_datetime(&dt.naive_utc());
-    local.format("%Y-%m-%dT%H:%M").to_string()
+pub fn to_local_input_value(dt: Timestamp, tz: &Tz) -> String {
+    format_local(dt, tz, "%Y-%m-%dT%H:%M")
 }
 
 /// Maud helper that renders a `<input type="datetime-local">` pre-filled with
@@ -505,8 +528,8 @@ pub fn to_local_input_value(dt: DateTime<Utc>, tz: Tz) -> String {
 pub fn datetime_local_input(
     name: &str,
     label: &str,
-    dt: Option<DateTime<Utc>>,
-    tz: Tz,
+    dt: Option<Timestamp>,
+    tz: &Tz,
 ) -> maud::Markup {
     let value = dt.map(|d| to_local_input_value(d, tz)).unwrap_or_default();
     maud::html! {
@@ -529,7 +552,7 @@ tokio::task_local! {
 /// that was active when the request was handled:
 ///
 /// ```rust,ignore
-/// with_request_time_zone(tz.tz(), async move {
+/// with_request_time_zone(tz.tz().clone(), async move {
 ///     mail.deliver_later(&state).await;
 /// })
 /// .await;
@@ -545,7 +568,7 @@ where
 /// none is set.
 #[must_use]
 pub fn ambient_time_zone() -> Tz {
-    AMBIENT_TZ.try_with(|tz| *tz).unwrap_or(Tz::UTC)
+    AMBIENT_TZ.try_with(Tz::clone).unwrap_or(Tz::UTC)
 }
 
 #[cfg(test)]
@@ -553,7 +576,10 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use chrono::Timelike;
+
+    fn zone(name: &str) -> Tz {
+        Tz::get(name).unwrap()
+    }
 
     fn parts(uri: &str, headers: &[(&str, &str)]) -> axum::http::request::Parts {
         let mut req = Request::builder().uri(uri);
@@ -683,7 +709,7 @@ mod tests {
     fn query_param_resolves_valid_zone() {
         let p = parts("/?tz=Asia/Tokyo", &[]);
         let result = resolve_from_query(&p);
-        assert_eq!(result, Some(Tz::Asia__Tokyo));
+        assert_eq!(result, Some(zone("Asia/Tokyo")));
     }
 
     #[test]
@@ -701,14 +727,14 @@ mod tests {
     #[test]
     fn query_param_percent_encoded_slash() {
         let p = parts("/?tz=America%2FNew_York", &[]);
-        assert_eq!(resolve_from_query(&p), Some(Tz::America__New_York));
+        assert_eq!(resolve_from_query(&p), Some(zone("America/New_York")));
     }
 
     #[test]
     fn query_param_percent_encoded_plus() {
         // Etc/GMT+5 contains a literal '+'; fully percent-encoded form must parse.
         let p = parts("/?tz=Etc%2FGMT%2B5", &[]);
-        assert_eq!(resolve_from_query(&p), Some(Tz::Etc__GMTPlus5));
+        assert_eq!(resolve_from_query(&p), Some(zone("Etc/GMT+5")));
     }
 
     #[test]
@@ -743,7 +769,7 @@ mod tests {
     fn cookie_resolves_valid_zone() {
         let p = parts("/", &[("Cookie", "autumn_time_zone=America/Chicago")]);
         let result = resolve_from_cookie(&p);
-        assert_eq!(result, Some(Tz::America__Chicago));
+        assert_eq!(result, Some(zone("America/Chicago")));
     }
 
     #[test]
@@ -772,7 +798,7 @@ mod tests {
     fn cookie_percent_encoded_value() {
         // Frontend libraries often encodeURIComponent cookie values.
         let p = parts("/", &[("Cookie", "autumn_time_zone=America%2FNew_York")]);
-        assert_eq!(resolve_from_cookie(&p), Some(Tz::America__New_York));
+        assert_eq!(resolve_from_cookie(&p), Some(zone("America/New_York")));
     }
 
     // ── Cookie helper ─────────────────────────────────────────────────────────
@@ -796,8 +822,8 @@ mod tests {
 
     #[test]
     fn user_time_zone_newtype_roundtrips() {
-        let utz = UserTimeZone(Tz::Asia__Tokyo);
-        assert_eq!(utz.0, Tz::Asia__Tokyo);
+        let utz = UserTimeZone(zone("Asia/Tokyo"));
+        assert_eq!(utz.0, zone("Asia/Tokyo"));
     }
 
     // ── TimeZone struct ───────────────────────────────────────────────────────
@@ -805,21 +831,20 @@ mod tests {
     #[test]
     fn time_zone_new_constructor() {
         let tz = TimeZone::new(Tz::UTC);
-        assert_eq!(tz.tz(), Tz::UTC);
+        assert_eq!(tz.tz(), &Tz::UTC);
         assert_eq!(*tz, Tz::UTC);
     }
 
     #[test]
     fn time_zone_iana_returns_name() {
-        let tz = TimeZone::new(Tz::America__New_York);
+        let tz = TimeZone::new(zone("America/New_York"));
         assert_eq!(tz.iana(), "America/New_York");
     }
 
     #[test]
     fn time_zone_convert_uses_given_zone() {
-        use chrono::TimeZone as ChrTz;
-        let utc = chrono::Utc.with_ymd_and_hms(2025, 6, 14, 12, 0, 0).unwrap();
-        let tz = TimeZone::new(Tz::America__New_York);
+        let utc: Timestamp = "2025-06-14T12:00:00Z".parse().unwrap();
+        let tz = TimeZone::new(zone("America/New_York"));
         let local = tz.convert(utc);
         // New York is UTC-4 in June (EDT)
         assert_eq!(local.hour(), 8);
@@ -830,45 +855,65 @@ mod tests {
     #[test]
     fn parse_local_datetime_tokyo() {
         // 15:30 in Tokyo (UTC+9) → 06:30 UTC
-        let result = parse_local_datetime("2025-06-14T15:30", Tz::Asia__Tokyo).unwrap();
-        assert_eq!(result.hour(), 6);
-        assert_eq!(result.minute(), 30);
+        let result = parse_local_datetime("2025-06-14T15:30", &zone("Asia/Tokyo")).unwrap();
+        assert_eq!(result.to_string(), "2025-06-14T06:30:00Z");
     }
 
     #[test]
     fn parse_local_datetime_new_york_summer() {
         // 12:00 in New York (UTC-4 in summer) → 16:00 UTC
-        let result = parse_local_datetime("2025-06-14T12:00", Tz::America__New_York).unwrap();
-        assert_eq!(result.hour(), 16);
-        assert_eq!(result.minute(), 0);
+        let result = parse_local_datetime("2025-06-14T12:00", &zone("America/New_York")).unwrap();
+        assert_eq!(result.to_string(), "2025-06-14T16:00:00Z");
     }
 
     #[test]
     fn parse_local_datetime_invalid_format() {
-        let err = parse_local_datetime("not-a-date", Tz::UTC).unwrap_err();
+        let err = parse_local_datetime("not-a-date", &Tz::UTC).unwrap_err();
         assert!(matches!(err, TimeZoneError::InvalidFormat { .. }));
     }
 
     #[test]
+    fn parse_local_datetime_rejects_a_time_in_a_dst_gap() {
+        // 2024-03-10 02:30 does not exist in New York: clocks jump 02:00 → 03:00.
+        let err = parse_local_datetime("2024-03-10T02:30", &zone("America/New_York")).unwrap_err();
+        assert!(
+            matches!(&err, TimeZoneError::AmbiguousLocalTime { zone, .. } if zone == "America/New_York"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn parse_local_datetime_takes_the_earlier_time_in_a_fold() {
+        // 2024-11-03 01:30 occurs twice in New York; the first is EDT (UTC-4).
+        let result = parse_local_datetime("2024-11-03T01:30", &zone("America/New_York")).unwrap();
+        assert_eq!(result.to_string(), "2024-11-03T05:30:00Z");
+    }
+
+    #[test]
+    fn parse_iana_ignores_case_and_keeps_the_canonical_name() {
+        let tz = parse_iana("america/new_york").unwrap();
+        assert_eq!(tz.iana_name(), Some("America/New_York"));
+    }
+
+    #[test]
     fn to_local_input_value_roundtrip() {
-        let zones = [Tz::UTC, Tz::America__New_York, Tz::Asia__Tokyo];
+        let zones = [Tz::UTC, zone("America/New_York"), zone("Asia/Tokyo")];
         for tz in zones {
             let original = "2025-06-14T15:30";
-            let utc = parse_local_datetime(original, tz).unwrap();
-            let back = to_local_input_value(utc, tz);
-            assert_eq!(back, original, "roundtrip failed for {}", tz.name());
+            let utc = parse_local_datetime(original, &tz).unwrap();
+            let back = to_local_input_value(utc, &tz);
+            assert_eq!(back, original, "roundtrip failed for {tz:?}");
         }
     }
 
     #[test]
     fn to_local_input_value_formats_correctly() {
-        use chrono::TimeZone as ChrTz;
-        let utc = chrono::Utc.with_ymd_and_hms(2025, 6, 14, 6, 30, 0).unwrap();
+        let utc: Timestamp = "2025-06-14T06:30:00Z".parse().unwrap();
         assert_eq!(
-            to_local_input_value(utc, Tz::Asia__Tokyo),
+            to_local_input_value(utc, &zone("Asia/Tokyo")),
             "2025-06-14T15:30"
         );
-        assert_eq!(to_local_input_value(utc, Tz::UTC), "2025-06-14T06:30");
+        assert_eq!(to_local_input_value(utc, &Tz::UTC), "2025-06-14T06:30");
     }
 
     // ── Maud view helpers ─────────────────────────────────────────────────────
@@ -876,19 +921,22 @@ mod tests {
     #[cfg(feature = "maud")]
     mod maud_tests {
         use super::*;
-        use chrono::TimeZone as ChrTz;
 
         #[allow(clippy::many_single_char_names)]
-        fn utc(y: i32, mo: u32, d: u32, h: u32, m: u32, s: u32) -> DateTime<Utc> {
-            chrono::Utc.with_ymd_and_hms(y, mo, d, h, m, s).unwrap()
+        fn utc(y: i16, mo: i8, d: i8, h: i8, m: i8, s: i8) -> Timestamp {
+            jiff::civil::date(y, mo, d)
+                .at(h, m, s, 0)
+                .to_zoned_datetime(Tz::UTC)
+                .unwrap()
+                .timestamp()
         }
 
         #[test]
         fn local_datetime_uses_zone() {
             let dt = utc(2025, 6, 14, 12, 0, 0);
-            let utc_html = local_datetime(dt, Tz::UTC).into_string();
-            let tokyo_html = local_datetime(dt, Tz::Asia__Tokyo).into_string();
-            let ny_html = local_datetime(dt, Tz::America__New_York).into_string();
+            let utc_html = local_datetime(dt, &Tz::UTC).into_string();
+            let tokyo_html = local_datetime(dt, &zone("Asia/Tokyo")).into_string();
+            let ny_html = local_datetime(dt, &zone("America/New_York")).into_string();
             assert!(utc_html.contains("12:00"), "UTC: {utc_html}");
             assert!(tokyo_html.contains("21:00"), "Tokyo: {tokyo_html}");
             assert!(ny_html.contains("08:00"), "New York: {ny_html}");
@@ -897,7 +945,7 @@ mod tests {
         #[test]
         fn local_datetime_datetime_attr_is_utc() {
             let dt = utc(2025, 6, 14, 12, 0, 0);
-            let html = local_datetime(dt, Tz::Asia__Tokyo).into_string();
+            let html = local_datetime(dt, &zone("Asia/Tokyo")).into_string();
             assert!(
                 html.contains("2025-06-14T12:00:00"),
                 "datetime attr must be UTC: {html}"
@@ -907,8 +955,8 @@ mod tests {
         #[test]
         fn local_date_uses_zone() {
             let dt = utc(2025, 6, 14, 23, 30, 0); // Jun 14 23:30 UTC = Jun 15 08:30 Tokyo
-            let utc_html = local_date(dt, Tz::UTC).into_string();
-            let tokyo_html = local_date(dt, Tz::Asia__Tokyo).into_string();
+            let utc_html = local_date(dt, &Tz::UTC).into_string();
+            let tokyo_html = local_date(dt, &zone("Asia/Tokyo")).into_string();
             assert!(utc_html.contains("2025-06-14"), "UTC: {utc_html}");
             assert!(tokyo_html.contains("2025-06-15"), "Tokyo: {tokyo_html}");
         }
@@ -917,7 +965,7 @@ mod tests {
         fn time_ago_seconds() {
             let now = utc(2025, 6, 14, 12, 0, 30);
             let dt = utc(2025, 6, 14, 12, 0, 0);
-            let html = time_ago(dt, now, Tz::UTC).into_string();
+            let html = time_ago(dt, now, &Tz::UTC).into_string();
             assert!(html.contains("seconds ago"), "{html}");
         }
 
@@ -925,7 +973,7 @@ mod tests {
         fn time_ago_minutes() {
             let now = utc(2025, 6, 14, 12, 5, 0);
             let dt = utc(2025, 6, 14, 12, 0, 0);
-            let html = time_ago(dt, now, Tz::UTC).into_string();
+            let html = time_ago(dt, now, &Tz::UTC).into_string();
             assert!(html.contains("minutes ago"), "{html}");
         }
 
@@ -933,7 +981,7 @@ mod tests {
         fn time_ago_hours() {
             let now = utc(2025, 6, 14, 14, 0, 0);
             let dt = utc(2025, 6, 14, 12, 0, 0);
-            let html = time_ago(dt, now, Tz::UTC).into_string();
+            let html = time_ago(dt, now, &Tz::UTC).into_string();
             assert!(html.contains("hours ago"), "{html}");
         }
 
@@ -941,7 +989,7 @@ mod tests {
         fn time_ago_days() {
             let now = utc(2025, 6, 16, 12, 0, 0);
             let dt = utc(2025, 6, 14, 12, 0, 0);
-            let html = time_ago(dt, now, Tz::UTC).into_string();
+            let html = time_ago(dt, now, &Tz::UTC).into_string();
             assert!(html.contains("days ago"), "{html}");
         }
 
@@ -949,7 +997,7 @@ mod tests {
         fn time_ago_future_minutes() {
             let now = utc(2025, 6, 14, 12, 0, 0);
             let dt = utc(2025, 6, 14, 12, 5, 0);
-            let html = time_ago(dt, now, Tz::UTC).into_string();
+            let html = time_ago(dt, now, &Tz::UTC).into_string();
             assert!(html.contains("in "), "{html}");
             assert!(html.contains("minutes"), "{html}");
         }
@@ -958,7 +1006,7 @@ mod tests {
         fn time_ago_preserves_utc_datetime_attr() {
             let now = utc(2025, 6, 14, 12, 5, 0);
             let dt = utc(2025, 6, 14, 12, 0, 0);
-            let html = time_ago(dt, now, Tz::UTC).into_string();
+            let html = time_ago(dt, now, &Tz::UTC).into_string();
             assert!(html.contains("datetime="), "{html}");
         }
     }
@@ -972,16 +1020,17 @@ mod tests {
 
     #[tokio::test]
     async fn with_request_time_zone_sets_ambient() {
-        let result = with_request_time_zone(Tz::Asia__Tokyo, async { ambient_time_zone() }).await;
-        assert_eq!(result, Tz::Asia__Tokyo);
+        let result =
+            with_request_time_zone(zone("Asia/Tokyo"), async { ambient_time_zone() }).await;
+        assert_eq!(result, zone("Asia/Tokyo"));
     }
 
     #[tokio::test]
     async fn ambient_returns_utc_outside_scope() {
         let inside =
-            with_request_time_zone(Tz::America__New_York, async { ambient_time_zone() }).await;
+            with_request_time_zone(zone("America/New_York"), async { ambient_time_zone() }).await;
         let outside = ambient_time_zone();
-        assert_eq!(inside, Tz::America__New_York);
+        assert_eq!(inside, zone("America/New_York"));
         assert_eq!(outside, Tz::UTC);
     }
 }

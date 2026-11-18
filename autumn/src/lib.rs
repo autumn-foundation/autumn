@@ -2043,8 +2043,8 @@ pub use autumn_macros::lifecycle;
 /// )]
 /// pub struct Ticket {
 ///     pub id: i64,
-///     pub opened_at: chrono::DateTime<chrono::Utc>,
-///     pub responded_at: Option<chrono::DateTime<chrono::Utc>>,
+///     pub opened_at: autumn_web::time::Timestamp,
+///     pub responded_at: Option<autumn_web::time::Timestamp>,
 ///     pub customer_zone: String,
 /// }
 ///

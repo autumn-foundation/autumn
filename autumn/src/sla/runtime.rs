@@ -1,16 +1,12 @@
 //! The plugin, the extractor and the jobs of the SLA engine.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
+use crate::time::bridge::ChronoBridge;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use serde_json::Value;
@@ -67,11 +63,14 @@ pub struct SlaBreach {
     /// [`ObligationRecord::generation`].
     pub generation: uuid::Uuid,
     /// The start instant.
-    pub started_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub started_at: Timestamp,
     /// The deadline.
-    pub due_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub due_at: Timestamp,
     /// The instant when the escalation was claimed.
-    pub escalated_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub escalated_at: Timestamp,
     /// A random token for this escalation. See
     /// [`ObligationStore::begin_dispatch`].
     pub token: uuid::Uuid,
@@ -85,7 +84,8 @@ struct CheckArgs {
     /// stops. `None` checks any record for the key.
     #[serde(default)]
     generation: Option<uuid::Uuid>,
-    due_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    due_at: Timestamp,
     /// How many times an early check put itself on the queue again. It is
     /// part of the unique key, so a requeue from a running check is not
     /// merged into that check.
@@ -269,8 +269,8 @@ impl Sla {
 
     /// The current instant of the injected clock.
     #[must_use]
-    pub fn now(&self) -> DateTime<Utc> {
-        self.state.clock().now().to_chrono()
+    pub fn now(&self) -> Timestamp {
+        self.state.clock().now()
     }
 
     /// The calendar called `name`.
@@ -287,7 +287,7 @@ impl Sla {
     pub fn status(&self, obligation: &Obligation) -> Result<ObligationStatus, SlaError> {
         let calendar = self.calendar_of(obligation)?;
         let zone = self.zone_of(obligation, calendar);
-        Ok(obligation.status_with(calendar, zone, self.now()))
+        Ok(obligation.status_with(calendar, &zone, self.now()))
     }
 
     /// Track `obligation` and schedule its breach check.
@@ -316,12 +316,12 @@ impl Sla {
         let zone = self.zone_of(obligation, calendar);
         let resolved = obligation
             .clone()
-            .zone(zone)
+            .zone(zone.clone())
             .starting_at(obligation.started_at().unwrap_or(now));
         let key = resolved.key();
         // Refuse before the insert, so a refused obligation leaves no record.
         let Some(due_at) =
-            super::store::real_deadline(resolved.status_with(calendar, zone, now).due_at)
+            super::store::real_deadline(resolved.status_with(calendar, &zone, now).due_at)
         else {
             return Err(SlaError::NoDeadline(key));
         };
@@ -349,7 +349,7 @@ impl Sla {
         &self,
         key: &str,
         record: &ObligationRecord,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<ObligationStatus, SlaError> {
         let status = self.status_of(record, now)?;
         let Some(due) = status.due_at else {
@@ -476,10 +476,11 @@ impl Sla {
     }
 
     /// The zone of the obligation, then of the calendar, then the app default.
-    fn zone_of(&self, obligation: &Obligation, calendar: &BusinessCalendar) -> chrono_tz::Tz {
+    fn zone_of(&self, obligation: &Obligation, calendar: &BusinessCalendar) -> jiff::tz::TimeZone {
         obligation
             .time_zone()
             .or_else(|| calendar.home_zone())
+            .cloned()
             .unwrap_or_else(|| self.state.config_arc().time_zone.default_tz())
     }
 
@@ -487,11 +488,11 @@ impl Sla {
     fn calendar_status(
         &self,
         record: &ObligationRecord,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<ObligationStatus, SlaError> {
         let calendar = self.calendar_of(&record.obligation)?;
         let zone = self.zone_of(&record.obligation, calendar);
-        let mut status = record.obligation.status_with(calendar, zone, now);
+        let mut status = record.obligation.status_with(calendar, &zone, now);
         status.escalated_at = record.escalated_at;
         Ok(status)
     }
@@ -502,7 +503,7 @@ impl Sla {
     fn status_of(
         &self,
         record: &ObligationRecord,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<ObligationStatus, SlaError> {
         let Some(due) = record.due_at else {
             return self.calendar_status(record, now);
@@ -510,9 +511,9 @@ impl Sla {
         let calendar = self.calendar_of(&record.obligation)?;
         let zone = self.zone_of(&record.obligation, calendar);
         let mut status = if due == super::store::no_deadline() {
-            record.obligation.status_without_due(calendar, zone, now)
+            record.obligation.status_without_due(calendar, &zone, now)
         } else {
-            record.obligation.status_with_due(calendar, zone, now, due)
+            record.obligation.status_with_due(calendar, &zone, now, due)
         };
         status.escalated_at = record.escalated_at;
         Ok(status)
@@ -522,7 +523,7 @@ impl Sla {
         &self,
         key: &str,
         generation: uuid::Uuid,
-        due_at: DateTime<Utc>,
+        due_at: Timestamp,
         revision: u64,
     ) -> Result<(), SlaError> {
         let args = CheckArgs {
@@ -539,7 +540,7 @@ impl Sla {
         &self,
         name: &str,
         args: &T,
-        due_at: Option<DateTime<Utc>>,
+        due_at: Option<Timestamp>,
     ) -> Result<(), SlaError> {
         let client = self
             .state
@@ -547,7 +548,7 @@ impl Sla {
             .ok_or(SlaError::NoJobRuntime)?;
         let payload = serde_json::to_value(args).map_err(|err| SlaError::Job(err.to_string()))?;
         client
-            .enqueue_due(name, payload, due_at)
+            .enqueue_due(name, payload, due_at.map(ChronoBridge::to_chrono))
             .await
             .map_err(|err| SlaError::Job(err.to_string()))
     }
@@ -559,10 +560,7 @@ impl Sla {
     /// requeue uses no retry attempt, so a large clock difference does not
     /// send the check to the dead letters.
     async fn requeue_if_early(&self, args: &CheckArgs) -> Result<bool, SlaError> {
-        let Some(early) = args
-            .due_at
-            .signed_duration_since(self.now())
-            .to_std()
+        let Some(early) = std::time::Duration::try_from(args.due_at.duration_since(self.now()))
             .ok()
             .filter(|early| !early.is_zero())
         else {
@@ -600,7 +598,7 @@ impl Sla {
         &self,
         key: &str,
         generation: Option<uuid::Uuid>,
-        due_hint: DateTime<Utc>,
+        due_hint: Timestamp,
     ) -> Result<(), SlaError> {
         let now = self.now();
         let store = &self.engine.store;
@@ -644,7 +642,7 @@ impl Sla {
             obligation: obligation.name().to_owned(),
             subject: obligation.subject().to_owned(),
             calendar: obligation.calendar_name().to_owned(),
-            zone: status.zone.name().to_owned(),
+            zone: super::obligation::zone_label(&status.zone).into_owned(),
             generation: record.generation,
             started_at: status.started_at,
             due_at,
@@ -758,7 +756,7 @@ pub(super) async fn release_claim(
     store: &dyn ObligationStore,
     key: &str,
     generation: uuid::Uuid,
-    claimed_at: DateTime<Utc>,
+    claimed_at: Timestamp,
 ) -> Result<(), SlaError> {
     let mut delay = RELEASE_BACKOFF;
     for attempt in 1..RELEASE_ATTEMPTS {

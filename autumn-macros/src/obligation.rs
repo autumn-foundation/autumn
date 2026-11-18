@@ -4,7 +4,7 @@
 //!
 //! ```ignore
 //! #[obligation(name = first_response, within = "2 business days", starts = opened_at)]
-//! pub struct Ticket { pub id: i64, pub opened_at: DateTime<Utc> }
+//! pub struct Ticket { pub id: i64, pub opened_at: Timestamp }
 //!
 //! // expands to the struct and:
 //! impl Ticket {
