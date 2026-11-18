@@ -253,7 +253,7 @@ pub fn plan_pull(
         plan.modify(repos_dir.join("mod.rs"), repos_mod);
     }
 
-    // The `#[model]` expansion needs diesel/serde/chrono/uuid, and the macro is exported only
+    // The `#[model]` expansion needs diesel/serde/uuid, and the macro is exported only
     // behind autumn-web's `db` feature, which `autumn new --daemon` disables. `db` needs a
     // backend (#2605); `db pull` reads Postgres, so enable `postgres`.
     let cargo_path = project_root.join("Cargo.toml");
@@ -909,7 +909,9 @@ mod tests {
         assert!(model.contains("pub id: i64,"), "i64 PK must be preserved");
         assert!(model.contains("pub title: String,"));
         assert!(model.contains("pub published: bool,"));
-        assert!(model.contains("#[default]\n    pub created_at: chrono::NaiveDateTime,"));
+        assert!(
+            model.contains("#[default]\n    pub created_at: autumn_web::time::civil::DateTime,")
+        );
     }
 
     #[test]
@@ -1284,7 +1286,9 @@ mod tests {
         assert!(model.contains("    pub status: String,"));
         assert!(!model.contains("#[default]\n    pub status:"));
         assert!(model.contains("#[default]\n    pub search: String,"));
-        assert!(model.contains("#[default]\n    pub created_at: chrono::NaiveDateTime,"));
+        assert!(
+            model.contains("#[default]\n    pub created_at: autumn_web::time::civil::DateTime,")
+        );
         // The PK must not be doubly annotated.
         assert!(!model.contains("#[id]\n    #[default]"));
         assert!(model.contains("    pub label: String,"));

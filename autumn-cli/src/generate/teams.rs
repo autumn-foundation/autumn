@@ -51,7 +51,7 @@
 //!   `maud` matters even on non-`--api` projects, which already have it, but
 //!   is required for `--api` projects, whose starter strips it), and ensures
 //!   the generated code's own direct dependencies (`diesel`, `diesel-async`,
-//!   `chrono`, `serde`, `serde_json`, `validator`, `maud`, plus `pq-sys` on
+//!   `serde`, `serde_json`, `validator`, `maud`, plus `pq-sys` on
 //!   Postgres or `libsqlite3-sys` on `SQLite`) are
 //!   present. Works on either backend: the migration DDL is emitted in the
 //!   app's own dialect (issue #1927).
@@ -91,11 +91,7 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 /// Postgres only — [`TEAMS_DEPS_SQLITE`] is the `SQLite` set and
 /// [`teams_deps`] picks between them (issue #1927).
 const TEAMS_DEPS: &[(&str, &str)] = &[
-    ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
-    (
-        "diesel",
-        "{ version = \"2\", features = [\"postgres\", \"chrono\"] }",
-    ),
+    ("diesel", "{ version = \"2\", features = [\"postgres\"] }"),
     (
         "diesel-async",
         "{ version = \"0.10\", features = [\"postgres\"] }",
@@ -129,10 +125,9 @@ const TEAMS_DEPS: &[(&str, &str)] = &[
 /// matches what `autumn-web`'s own `sqlite` feature enables, so the app and the
 /// framework never disagree about `RETURNING` support.
 const TEAMS_DEPS_SQLITE: &[(&str, &str)] = &[
-    ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
     (
         "diesel",
-        "{ version = \"2\", features = [\"sqlite\", \"chrono\", \"serde_json\", \
+        "{ version = \"2\", features = [\"sqlite\", \"serde_json\", \
          \"returning_clauses_for_sqlite_3_35\"] }",
     ),
     (
@@ -564,7 +559,7 @@ pub struct Organization {
     #[validate(length(min = 1, max = 200))]
     pub name: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // ── Membership ───────────────────────────────────────────────────────────
@@ -590,7 +585,7 @@ pub struct Membership {
     pub user_id: i64,
     pub role: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // ── Invitation ───────────────────────────────────────────────────────────
@@ -613,9 +608,9 @@ pub struct Invitation {
     // also sets it explicitly.
     pub status: String,
     pub invited_by_user_id: i64,
-    pub expires_at: chrono::NaiveDateTime,
+    pub expires_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // ── Forms ────────────────────────────────────────────────────────────────
@@ -1466,6 +1461,15 @@ use super::{csrf_value, minimal_page};
 
 const INVITATION_TTL_DAYS: i64 = 7;
 
+/// When an invitation minted now expires, as the UTC wall-clock value the
+/// `expires_at` column stores.
+fn invitation_expiry() -> autumn_web::db::SqlDateTime {
+    autumn_web::db::SqlDateTime::from(
+        autumn_web::time::ambient_civil_utc()
+            + autumn_web::time::SignedDuration::from_hours(INVITATION_TTL_DAYS * 24),
+    )
+}
+
 // Raw-insert struct for `resend_invitation`'s hand-rolled `db.tx`
 // transaction (revoke old + create new in one atomic step) — the generated
 // `tenant_scoped` repository's CRUD methods each acquire their own pooled
@@ -1480,7 +1484,7 @@ struct InsertInvitation {
     token_hash: String,
     status: String,
     invited_by_user_id: i64,
-    expires_at: chrono::NaiveDateTime,
+    expires_at: autumn_web::db::SqlDateTime,
 }
 
 // A minimal, read-only view onto your app's own `users` table — just enough
@@ -1666,8 +1670,7 @@ pub async fn create_invitation(
                         token_hash,
                         status: "pending".to_owned(),
                         invited_by_user_id: inviter_id,
-                        expires_at: chrono::Utc::now().naive_utc()
-                            + chrono::Duration::days(INVITATION_TTL_DAYS),
+                        expires_at: invitation_expiry(),
                     })
                     .execute(conn)
                     .await?;
@@ -1774,7 +1777,7 @@ fn invitation_status_error(invitation: &Invitation) -> Option<&'static str> {
     match invitation.status.as_str() {
         "accepted" => Some("This invitation has already been used."),
         "revoked" => Some("This invitation was revoked."),
-        _ if invitation.expires_at <= chrono::Utc::now().naive_utc() => {
+        _ if invitation.expires_at <= autumn_web::time::ambient_civil_utc() => {
             Some("This invitation has expired.")
         }
         _ => None,
@@ -1993,7 +1996,7 @@ pub async fn accept_invitation(
                 // review finding).
                 if invitation.status == "revoked"
                     || (invitation.status == "pending"
-                        && invitation.expires_at <= chrono::Utc::now().naive_utc())
+                        && invitation.expires_at <= autumn_web::time::ambient_civil_utc())
                 {
                     return Err(AutumnError::gone_msg(
                         "This invitation is no longer available",
@@ -2276,8 +2279,7 @@ pub async fn resend_invitation(
                         token_hash,
                         status: "pending".to_owned(),
                         invited_by_user_id: inviter_id,
-                        expires_at: chrono::Utc::now().naive_utc()
-                            + chrono::Duration::days(INVITATION_TTL_DAYS),
+                        expires_at: invitation_expiry(),
                     })
                     .returning(Invitation::as_returning())
                     .get_result(conn)

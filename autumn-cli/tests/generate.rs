@@ -2053,7 +2053,7 @@ fn generate_model_help_shows_example() {
 /// The `SQLite` counterpart of [`generated_scaffold_cargo_checks`], and the only
 /// machine proof of issue #1924: a `SQLite`-configured app scaffolded with every
 /// field kind that needed a `SQLite` conversion — `Uuid`, `Option<Uuid>`,
-/// `decimal{p,s}`, `enum{…}`, `DateTime<Utc>`, `Attachment`, `json` — actually
+/// `decimal{p,s}`, `enum{…}`, `DateTime` (`Timestamp`), `Attachment`, `json` — actually
 /// compiles.
 ///
 /// Two halves have to be right for this to pass, and neither is visible to a
@@ -2321,7 +2321,6 @@ fn generated_scaffold_cargo_checks() {
     // The generator must have added every dep its emitted code needs.
     let cargo_toml_after = fs::read_to_string(&cargo_toml_path).unwrap();
     for dep in [
-        "chrono",
         "diesel",
         "diesel-async",
         "maud",
@@ -5236,7 +5235,7 @@ fn generated_auth_passkeys_cargo_checks() {
     run_autumn(&project, &["generate", "auth", "User", "--passkeys"]);
 
     let cargo_after = fs::read_to_string(project.join("Cargo.toml")).unwrap();
-    for dep in ["webauthn-rs", "uuid", "serde", "diesel", "maud", "chrono"] {
+    for dep in ["webauthn-rs", "uuid", "serde", "diesel", "maud"] {
         assert!(
             cargo_after.contains(&format!("{dep} =")),
             "Cargo.toml missing '{dep}' after `generate auth --passkeys`"
@@ -5376,7 +5375,7 @@ fn generated_auth_totp_cargo_checks() {
     run_autumn(&project, &["generate", "auth", "User", "--totp"]);
 
     let cargo_after = fs::read_to_string(project.join("Cargo.toml")).unwrap();
-    for dep in ["totp-rs", "aes-gcm", "base64", "diesel", "maud", "chrono"] {
+    for dep in ["totp-rs", "aes-gcm", "base64", "diesel", "maud"] {
         assert!(
             cargo_after.contains(&format!("{dep} =")),
             "Cargo.toml missing '{dep}' after `generate auth --totp`"
@@ -5676,7 +5675,6 @@ fn generated_scaffold_config_cargo_checks() {
 
     let cargo_toml = fs::read_to_string(project.join("Cargo.toml")).unwrap();
     for dep in [
-        "chrono",
         "diesel",
         "diesel-async",
         "maud",
@@ -6223,7 +6221,7 @@ fn generate_auth_confirmation_model_fields_and_signup_not_logged_in() {
 
     let model = fs::read_to_string(project.join("src/models/user.rs")).unwrap();
     assert!(
-        model.contains("pub email_confirmed_at: Option<chrono::NaiveDateTime>"),
+        model.contains("pub email_confirmed_at: Option<autumn_web::time::civil::DateTime>"),
         "model missing email_confirmed_at field"
     );
     assert!(
@@ -6231,7 +6229,7 @@ fn generate_auth_confirmation_model_fields_and_signup_not_logged_in() {
         "model missing confirm_token_digest field"
     );
     assert!(
-        model.contains("pub confirm_token_expires_at: Option<chrono::NaiveDateTime>"),
+        model.contains("pub confirm_token_expires_at: Option<autumn_web::time::civil::DateTime>"),
         "model missing confirm_token_expires_at field"
     );
 
@@ -6294,11 +6292,11 @@ fn generate_auth_confirmation_token_expires_24h() {
 
     let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
     assert!(
-        routes.contains("hours(24)"),
+        routes.contains("from_hours(24)"),
         "confirmation token must default to 24-hour expiry"
     );
     assert!(
-        routes.contains("confirm_token_expires_at.gt(now)"),
+        routes.contains("confirm_token_expires_at.gt(autumn_web::db::SqlDateTime::from(now))"),
         "confirm handler must reject tokens past confirm_token_expires_at"
     );
 }
@@ -6543,7 +6541,7 @@ fn generate_auth_sessions_migration_schema_and_model() {
     );
     for needle in [
         "pub token_digest: String",
-        "pub last_seen_at: chrono::NaiveDateTime",
+        "pub last_seen_at: autumn_web::time::civil::DateTime",
         "pub label: Option<String>",
         "pub async fn sessions(",
         "pub async fn revoke_session(",

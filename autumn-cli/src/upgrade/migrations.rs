@@ -1180,6 +1180,16 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         guide: "docs/migrations/0.11.0.md#release-regenerated-kubernetes-output-has-one-workload-per-role",
         rewrite: Rewrite::GuideOnly,
     },
+    // The chrono-to-jiff move changes types, not names: every site needs a type chosen by a
+    // human (instant or wall clock), so it is `GuideOnly`.
+    AppMigration {
+        id: "0.12.0-chrono-to-jiff",
+        version: "0.12.0",
+        title: "Dates and times: chrono is replaced by jiff (`autumn_web::time`)",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/next.md#dates-and-times-chrono-is-replaced-by-jiff",
+        rewrite: Rewrite::GuideOnly,
+    },
 ];
 
 /// The full registry.
