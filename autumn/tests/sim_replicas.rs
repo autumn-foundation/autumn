@@ -9,11 +9,6 @@
 
 #![cfg(all(feature = "sqlite", feature = "test-support"))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::ChronoBridge as _;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -28,7 +23,7 @@ use autumn_web::sim::{DbFaultKind, Replica, Sim};
 use autumn_web::sim_test;
 use autumn_web::test::TestApp;
 use autumn_web::time::Clock;
-use chrono::TimeDelta;
+use autumn_web::time::{SignedDuration, Timestamp};
 use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::deadpool::Pool;
 use serde::{Deserialize, Serialize};
@@ -63,14 +58,12 @@ fn replica_config(name: &str) -> AutumnConfig {
 
 #[get("/now")]
 async fn now_route(clock: Clock) -> String {
-    clock.now().to_chrono().to_rfc3339()
+    autumn_web::time::compat::rfc3339(clock.now())
 }
 
-async fn now_of(sim: &Sim, replica: &str) -> chrono::DateTime<chrono::Utc> {
+async fn now_of(sim: &Sim, replica: &str) -> Timestamp {
     let body = sim.replica(replica).get("/now").send().await.text();
-    chrono::DateTime::parse_from_rfc3339(&body)
-        .expect("rfc3339")
-        .with_timezone(&chrono::Utc)
+    body.parse::<Timestamp>().expect("rfc3339")
 }
 
 // ── Clocks ───────────────────────────────────────────────────────────────────
@@ -89,20 +82,20 @@ async fn sim_replicas_share_one_clock_with_their_own_offsets(mut sim: Sim) {
     assert_eq!(sim.replica_names(), vec!["a", "b", "c"]);
 
     let a0 = now_of(&sim, "a").await;
-    assert_eq!(a0 - now_of(&sim, "b").await, TimeDelta::seconds(3));
+    assert_eq!(a0 - now_of(&sim, "b").await, SignedDuration::from_secs(3));
     assert_eq!(now_of(&sim, "c").await, a0, "drift starts at zero");
 
     sim.run_for(Duration::from_secs(10)).await;
 
-    assert_eq!(now_of(&sim, "a").await - a0, TimeDelta::seconds(10));
+    assert_eq!(now_of(&sim, "a").await - a0, SignedDuration::from_secs(10));
     assert_eq!(
         now_of(&sim, "b").await - a0,
-        TimeDelta::seconds(7),
+        SignedDuration::from_secs(7),
         "b keeps its offset"
     );
     assert_eq!(
         now_of(&sim, "c").await - a0,
-        TimeDelta::seconds(11),
+        SignedDuration::from_secs(11),
         "c runs 10% fast"
     );
 }
@@ -111,14 +104,14 @@ async fn sim_replicas_share_one_clock_with_their_own_offsets(mut sim: Sim) {
 async fn sim_replica_clock_step_moves_one_replica_only(mut sim: Sim) {
     sim.mount_replica("a", TestApp::new().routes(routes![now_route]));
     sim.mount_replica("b", TestApp::new().routes(routes![now_route]));
-    sim.step_replica_clock("b", TimeDelta::seconds(5));
+    sim.step_replica_clock("b", SignedDuration::from_secs(5));
     assert_eq!(
         now_of(&sim, "b").await - now_of(&sim, "a").await,
-        TimeDelta::seconds(5)
+        SignedDuration::from_secs(5)
     );
     assert_eq!(
         sim.replica_clock("b").expect("b is mounted").offset(),
-        TimeDelta::seconds(5)
+        SignedDuration::from_secs(5)
     );
 }
 
@@ -154,9 +147,12 @@ fn sim_seeded_replica_clocks_replay_from_the_seed_and_stay_in_bounds() {
     let mut seen = std::collections::BTreeSet::new();
     for seed in 0..32 {
         let clock = draw(seed);
-        assert!(clock.offset().abs() <= TimeDelta::seconds(1), "{clock:?}");
+        assert!(
+            clock.offset().abs() <= SignedDuration::from_secs(1),
+            "{clock:?}"
+        );
         assert!(clock.drift_ppm().abs() <= 500, "{clock:?}");
-        seen.insert(clock.offset().num_milliseconds());
+        seen.insert(clock.offset().as_millis());
     }
     assert!(seen.len() > 16, "offsets vary by seed: {seen:?}");
 }
@@ -324,7 +320,7 @@ async fn sim_cron_tick_runs_once_when_a_replica_clock_steps_forward(mut sim: Sim
     // wakes 3 s after a ran the tick.
     let ((), trace) = autumn_web::sim::trace::capture(async {
         sim.run_for(Duration::from_secs(30)).await;
-        sim.step_replica_clock("b", TimeDelta::seconds(5));
+        sim.step_replica_clock("b", SignedDuration::from_secs(5));
         sim.run_for(Duration::from_secs(150)).await;
     })
     .await;

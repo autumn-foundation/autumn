@@ -8,11 +8,6 @@
 //! the injected wall clock in lockstep), then `run_to_idle` drains the retry —
 //! all in microseconds of real time.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::ChronoBridge as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -65,7 +60,7 @@ impl Plugin for BackoffJobPlugin {
 /// Reads the injected (virtual) wall clock, so the test can prove it advanced.
 #[get("/now")]
 async fn now_route(clock: Clock) -> String {
-    clock.now().to_chrono().to_rfc3339()
+    autumn_web::time::compat::rfc3339(clock.now())
 }
 
 #[sim_test]

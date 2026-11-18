@@ -3,11 +3,6 @@
 //! Each test moves business time across weekends and holidays with the
 //! injected clock. No test sleeps.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::ChronoBridge as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,7 +37,7 @@ const fn date(y: i16, m: i8, d: i8) -> civil::Date {
 
 /// Move the sim clock forward to `at`.
 async fn advance_to(sim: &Sim, at: Timestamp) {
-    sim.advance_to(&at.to_chrono()).await;
+    sim.advance_to(at).await;
 }
 
 /// A plugin with a "support" calendar and a breach handler that records
