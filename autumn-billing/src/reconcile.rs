@@ -27,12 +27,7 @@
 //! steps (dunning row, job) but not notifications or hooks.
 
 use autumn_web::AppState;
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::ChronoBridge as _;
-use chrono::{DateTime, Utc};
+use autumn_web::time::Timestamp;
 
 use crate::dunning;
 use crate::error::BillingError;
@@ -87,7 +82,7 @@ pub async fn apply(
     service: &BillingService,
     event: BillingEvent,
 ) -> Result<ReconcileOutcome, BillingError> {
-    let now = state.clock().now().to_chrono();
+    let now = state.clock().now();
     let store = service.store();
     let kind = event.kind.label();
     let claim = store
@@ -138,7 +133,7 @@ pub async fn apply(
 struct Ctx<'a> {
     state: &'a AppState,
     service: &'a BillingService,
-    now: DateTime<Utc>,
+    now: Timestamp,
 }
 
 impl Ctx<'_> {
@@ -225,7 +220,7 @@ impl Ctx<'_> {
         customer: &Customer,
         snapshot: &SubscriptionSnapshot,
         status: SubscriptionStatus,
-        occurred_at: DateTime<Utc>,
+        occurred_at: Timestamp,
     ) -> SubscriptionUpsert {
         let mut upsert = SubscriptionUpsert::new(
             self.new_id(),
@@ -276,7 +271,7 @@ impl Ctx<'_> {
         customer: &Customer,
         snapshot: &SubscriptionSnapshot,
         status: SubscriptionStatus,
-        occurred_at: DateTime<Utc>,
+        occurred_at: Timestamp,
     ) -> Result<(StoreWrite<Subscription>, Option<Subscription>), BillingError> {
         let store = self.service.store();
         let upsert = self.subscription_upsert(customer, snapshot, status, occurred_at);
@@ -304,7 +299,7 @@ impl Ctx<'_> {
         &self,
         snapshot: &SubscriptionSnapshot,
         status: SubscriptionStatus,
-        occurred_at: DateTime<Utc>,
+        occurred_at: Timestamp,
     ) -> Result<(), BillingError> {
         let store = self.service.store();
         let customer = self.customer(&snapshot.provider_customer_id, None).await?;
@@ -381,7 +376,7 @@ impl Ctx<'_> {
     async fn upsert_invoice(
         &self,
         snapshot: &InvoiceSnapshot,
-        occurred_at: DateTime<Utc>,
+        occurred_at: Timestamp,
     ) -> Result<(Customer, StoreWrite<Invoice>), BillingError> {
         let store = self.service.store();
         let customer = self.customer(&snapshot.provider_customer_id, None).await?;
@@ -447,7 +442,7 @@ impl Ctx<'_> {
     async fn payment_failed(
         &self,
         snapshot: &InvoiceSnapshot,
-        occurred_at: DateTime<Utc>,
+        occurred_at: Timestamp,
     ) -> Result<(), BillingError> {
         let (customer, write) = self.upsert_invoice(snapshot, occurred_at).await?;
         let (invoice, applied) = match write {
@@ -575,7 +570,7 @@ impl Ctx<'_> {
     async fn paid(
         &self,
         snapshot: &InvoiceSnapshot,
-        occurred_at: DateTime<Utc>,
+        occurred_at: Timestamp,
     ) -> Result<(), BillingError> {
         let (customer, write) = self.upsert_invoice(snapshot, occurred_at).await?;
         let (StoreWrite::Applied(invoice) | StoreWrite::Unchanged(invoice)) = write else {

@@ -8,7 +8,7 @@ use autumn_billing::provider::{
 };
 use autumn_billing::{BillingError, InvoiceStatus, ProviderId, StripeProvider, SubscriptionStatus};
 use autumn_web::test::{TestApp, TestClient};
-use chrono::{DateTime, Utc};
+use autumn_web::time::Timestamp;
 use serde_json::{Value, json};
 
 use super::support::{self, TEST_SECRET_KEY, fixture};
@@ -20,8 +20,8 @@ const T3D: i64 = 1_789_257_600;
 /// Period end of the test subscription: 2026-10-10T00:00:00Z.
 const PERIOD_END: i64 = 1_791_590_400;
 
-const fn at(unix: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp(unix, 0).unwrap()
+fn at(unix: i64) -> Timestamp {
+    Timestamp::from_second(unix).unwrap()
 }
 
 fn parse(name: &str) -> BillingEvent {

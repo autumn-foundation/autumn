@@ -7,18 +7,13 @@
 //! attempt, and the settle is last. A reconcile that settles the row while a
 //! retry is in flight wins.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_web::background::{BackgroundTask, PluginCapability};
 use autumn_web::job::{JobClient, JobInfo};
+use autumn_web::time::{SignedDuration, Timestamp};
 use autumn_web::{AppState, AutumnResult, Capability, job};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::BillingService;
@@ -83,30 +78,30 @@ pub fn job_infos() -> Vec<JobInfo> {
 /// # Errors
 ///
 /// Returns [`BillingError::Config`] when the delay does not fit the calendar.
-pub(crate) fn due_at(now: DateTime<Utc>, delay: Duration) -> Result<DateTime<Utc>, BillingError> {
-    let delta = chrono::Duration::from_std(delay)
+pub(crate) fn due_at(now: Timestamp, delay: Duration) -> Result<Timestamp, BillingError> {
+    let delta = SignedDuration::try_from(delay)
         .map_err(|error| BillingError::Config(format!("dunning delay out of range: {error}")))?;
-    now.checked_add_signed(delta)
-        .ok_or_else(|| BillingError::Config("dunning delay overflows the calendar".to_owned()))
+    now.checked_add(delta)
+        .map_err(|_| BillingError::Config("dunning delay overflows the calendar".to_owned()))
 }
 
 /// `at - delay`, or `None` when it does not fit the calendar.
-fn before(at: DateTime<Utc>, delay: Duration) -> Option<DateTime<Utc>> {
-    chrono::Duration::from_std(delay)
+fn before(at: Timestamp, delay: Duration) -> Option<Timestamp> {
+    SignedDuration::try_from(delay)
         .ok()
-        .and_then(|delta| at.checked_sub_signed(delta))
+        .and_then(|delta| at.checked_sub(delta).ok())
 }
 
 /// When a `Running` row may be reclaimed: `updated_at + RUNNING_STALE_AFTER`.
-fn reclaim_at(row: &DunningAttempt) -> Option<DateTime<Utc>> {
-    chrono::Duration::from_std(RUNNING_STALE_AFTER)
+fn reclaim_at(row: &DunningAttempt) -> Option<Timestamp> {
+    SignedDuration::try_from(RUNNING_STALE_AFTER)
         .ok()
-        .and_then(|delta| row.updated_at.checked_add_signed(delta))
+        .and_then(|delta| row.updated_at.checked_add(delta).ok())
 }
 
 /// `true` when a `Running` row was abandoned: not updated since before
 /// `now - RUNNING_STALE_AFTER`.
-fn is_stale_running(row: &DunningAttempt, now: DateTime<Utc>) -> bool {
+fn is_stale_running(row: &DunningAttempt, now: Timestamp) -> bool {
     row.state == DunningState::Running
         && before(now, RUNNING_STALE_AFTER).is_some_and(|cutoff| row.updated_at < cutoff)
 }
@@ -133,7 +128,7 @@ pub(crate) fn job_client(state: &AppState) -> Result<Arc<JobClient>, BillingErro
 pub(crate) async fn schedule(
     state: &AppState,
     invoice_id: &str,
-    when: DateTime<Utc>,
+    when: Timestamp,
 ) -> Result<(), BillingError> {
     let client = job_client(state)?;
     let payload = serde_json::to_value(DunningRetryArgs {
@@ -141,7 +136,7 @@ pub(crate) async fn schedule(
     })
     .map_err(|error| BillingError::store(format!("dunning args: {error}")))?;
     match client
-        .enqueue_due(RETRY_JOB_NAME, payload, Some(when.to_jiff()))
+        .enqueue_due(RETRY_JOB_NAME, payload, Some(when))
         .await
     {
         Ok(()) => Ok(()),
@@ -175,7 +170,7 @@ async fn run_retry(
         return Ok(());
     };
     if row.state == DunningState::Running {
-        if !is_stale_running(&row, now.to_chrono()) {
+        if !is_stale_running(&row, now) {
             // In flight elsewhere. Check again once it could be abandoned.
             tracing::debug!(
                 invoice_id,
@@ -188,8 +183,8 @@ async fn run_retry(
         }
         let mut reset = row.clone();
         reset.state = DunningState::Pending;
-        reset.next_attempt_at = now.to_chrono();
-        reset.updated_at = now.to_chrono();
+        reset.next_attempt_at = now;
+        reset.updated_at = now;
         if !store
             .settle_dunning(
                 invoice_id,
@@ -220,7 +215,7 @@ async fn run_retry(
         );
         return Ok(());
     }
-    if row.next_attempt_at > now.to_chrono() {
+    if row.next_attempt_at > now {
         tracing::debug!(
             invoice_id,
             due = %row.next_attempt_at,
@@ -229,7 +224,7 @@ async fn run_retry(
         return schedule(state, invoice_id, row.next_attempt_at).await;
     }
     if !store
-        .claim_dunning_attempt(invoice_id, row.attempt, now.to_chrono())
+        .claim_dunning_attempt(invoice_id, row.attempt, now)
         .await?
     {
         tracing::debug!(
@@ -240,8 +235,8 @@ async fn run_retry(
         return Ok(());
     }
     row.state = DunningState::Running;
-    row.updated_at = now.to_chrono();
-    match attempt(state, service, &row, now.to_chrono()).await {
+    row.updated_at = now;
+    match attempt(state, service, &row, now).await {
         Ok(()) => Ok(()),
         Err(error) => {
             tracing::warn!(
@@ -250,7 +245,7 @@ async fn run_retry(
                 error = %error,
                 "🍂 Autumn Billing: retry failed after the claim; row restored to pending"
             );
-            if let Err(restore) = restore_pending(service, &row, now.to_chrono()).await {
+            if let Err(restore) = restore_pending(service, &row, now).await {
                 tracing::error!(
                     invoice_id,
                     error = %restore,
@@ -267,7 +262,7 @@ async fn attempt(
     state: &AppState,
     service: &BillingService,
     row: &DunningAttempt,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), BillingError> {
     let store = service.store();
     let invoice_id = row.invoice_id.as_str();
@@ -341,7 +336,7 @@ async fn settle(
 async fn restore_pending(
     service: &BillingService,
     row: &DunningAttempt,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<bool, BillingError> {
     let mut pending = row.clone();
     pending.state = DunningState::Pending;
@@ -363,7 +358,7 @@ async fn recovered(
     service: &BillingService,
     row: &DunningAttempt,
     invoice: Invoice,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), BillingError> {
     let store = service.store();
     let mut paid = InvoiceUpsert::new(
@@ -412,7 +407,7 @@ async fn declined(
     row: &DunningAttempt,
     invoice: Invoice,
     reason: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), BillingError> {
     let store = service.store();
     let policy = &service.config().dunning;
@@ -470,7 +465,7 @@ async fn exhausted(
     row: &DunningAttempt,
     invoice: Invoice,
     reason: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), BillingError> {
     let store = service.store();
     let mut exhausted = row.clone();
@@ -573,7 +568,7 @@ async fn undo_unpaid(
     service: &BillingService,
     subscription_id: &str,
     previous: Option<Subscription>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), BillingError> {
     let store = service.store();
     let restore = previous
@@ -681,7 +676,7 @@ async fn rearm_rows(state: &AppState, rows: &[DunningAttempt]) -> usize {
         }) {
             Ok(payload) => {
                 invoice_ids.push(row.invoice_id.as_str());
-                items.push((payload, Some(when.to_jiff())));
+                items.push((payload, Some(when)));
             }
             Err(error) => tracing::warn!(
                 invoice_id = %row.invoice_id,
@@ -711,7 +706,7 @@ async fn rearm_rows(state: &AppState, rows: &[DunningAttempt]) -> usize {
 /// Delete applied ledger rows older than [`EVENT_RETENTION`].
 async fn prune_events(state: &AppState, service: &BillingService) {
     let now = state.clock().now();
-    let Some(cutoff) = before(now.to_chrono(), EVENT_RETENTION) else {
+    let Some(cutoff) = before(now, EVENT_RETENTION) else {
         return;
     };
     match service.store().prune_events(cutoff).await {

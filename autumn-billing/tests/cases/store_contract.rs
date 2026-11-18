@@ -17,13 +17,11 @@ use autumn_billing::store::{CustomerUpsert, EventClaim, InvoiceUpsert, Subscript
 use autumn_billing::{
     BillingStore, Currency, MemoryBillingStore, Money, PlanId, ProviderId, SubscriptionStatus,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use autumn_web::time::Timestamp;
 
 /// A fixed instant plus `secs`.
-pub fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_700_000_000 + secs, 0)
-        .single()
-        .expect("valid timestamp")
+pub fn at(secs: i64) -> Timestamp {
+    Timestamp::from_second(1_700_000_000 + secs).expect("valid timestamp")
 }
 
 const STALE: Duration = Duration::from_secs(300);
@@ -1757,7 +1755,7 @@ impl BillingStore for LegacyStoreWithoutRelink {
         &'a self,
         _event_id: &'a str,
         _kind: &'a str,
-        _now: DateTime<Utc>,
+        _now: Timestamp,
         _stale_after: Duration,
     ) -> autumn_billing::store::StoreFuture<'a, EventClaim> {
         unimplemented!()
@@ -1765,7 +1763,7 @@ impl BillingStore for LegacyStoreWithoutRelink {
     fn finish_event<'a>(
         &'a self,
         _event_id: &'a str,
-        _now: DateTime<Utc>,
+        _now: Timestamp,
     ) -> autumn_billing::store::StoreFuture<'a, ()> {
         unimplemented!()
     }
@@ -1834,7 +1832,7 @@ impl BillingStore for LegacyStoreWithoutRelink {
         &'a self,
         _id: &'a str,
         _status: SubscriptionStatus,
-        _now: DateTime<Utc>,
+        _now: Timestamp,
     ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Subscription>> {
         unimplemented!()
     }
@@ -1873,7 +1871,7 @@ impl BillingStore for LegacyStoreWithoutRelink {
         &'a self,
         _invoice_id: &'a str,
         _attempt: i64,
-        _now: DateTime<Utc>,
+        _now: Timestamp,
     ) -> autumn_billing::store::StoreFuture<'a, bool> {
         unimplemented!()
     }
@@ -1895,7 +1893,7 @@ impl BillingStore for LegacyStoreWithoutRelink {
     ) -> autumn_billing::store::StoreFuture<'a, bool> {
         unimplemented!()
     }
-    fn prune_events(&self, _before: DateTime<Utc>) -> autumn_billing::store::StoreFuture<'_, u64> {
+    fn prune_events(&self, _before: Timestamp) -> autumn_billing::store::StoreFuture<'_, u64> {
         unimplemented!()
     }
 }

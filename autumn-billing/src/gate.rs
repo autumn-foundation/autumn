@@ -27,15 +27,11 @@
 //! least one entitled subscription that satisfies the rule gives access
 //! (issue #3114).
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::ChronoBridge as _;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 use autumn_web::session::Session;
+use autumn_web::time::SignedDuration;
 use autumn_web::{AppState, AutumnError};
 use axum_core_reexport::FromRequestParts;
 use serde::{Deserialize, Serialize};
@@ -287,11 +283,12 @@ impl Billing {
         let end = subscription
             .current_period_end
             .unwrap_or(subscription.last_event_at);
-        let grace = chrono::Duration::from_std(self.service.config().grace_period)
-            .unwrap_or(chrono::Duration::MAX);
+        let grace = SignedDuration::try_from(self.service.config().grace_period)
+            .unwrap_or(SignedDuration::MAX);
         let now = self.state.clock().now();
-        end.checked_add_signed(grace)
-            .is_none_or(|deadline| deadline >= now.to_chrono())
+        end.checked_add(grace)
+            .ok()
+            .is_none_or(|deadline| deadline >= now)
     }
 }
 
@@ -595,18 +592,20 @@ mod tenant_scope_tests {
 
 #[cfg(test)]
 mod best_satisfying_tests {
-    use chrono::{DateTime, TimeZone, Utc};
+    use autumn_web::time::{Timestamp, civil, tz};
 
     use super::{PlanRule, SubscriptionView, best_satisfying};
     use crate::model::{Subscription, SubscriptionStatus};
     use crate::money::{Currency, Money};
     use crate::plan::{BillingInterval, Plan};
 
-    fn at(hour: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 9, 10, hour, 0, 0).unwrap()
+    fn at(hour: i8) -> Timestamp {
+        tz::Offset::UTC
+            .to_timestamp(civil::date(2026, 9, 10).at(hour, 0, 0, 0))
+            .unwrap()
     }
 
-    fn view(id: &str, plan: &str, hour: u32, entitled: bool) -> SubscriptionView {
+    fn view(id: &str, plan: &str, hour: i8, entitled: bool) -> SubscriptionView {
         let row = Subscription::new(
             id,
             "cust",

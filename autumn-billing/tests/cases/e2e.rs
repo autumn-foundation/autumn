@@ -4,11 +4,6 @@
 //! Fixtures live in `tests/fixtures/stripe/` and use the ids `cus_test_1`,
 //! `sub_test_1`, `price_pro_monthly` and `in_test_1`.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::JiffBridge as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,8 +16,7 @@ use autumn_billing::{ProviderId, SubscriptionStatus};
 use autumn_web::notifications::Notifications;
 use autumn_web::prelude::*;
 use autumn_web::test::{TestApp, TestClient};
-use autumn_web::time::{FixedClock, TickingClock};
-use chrono::{DateTime, TimeZone, Utc};
+use autumn_web::time::{FixedClock, SignedDuration, TickingClock, Timestamp};
 use serde_json::Value;
 
 use super::support::{
@@ -53,13 +47,13 @@ async fn unread(notifications: Notifications) -> AutumnResult<Json<u64>> {
 
 /// The pinned app clock. Fixture period ends must be later than this minus
 /// the 72h grace.
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 9, 10, 12, 0, 0).unwrap()
+fn now() -> Timestamp {
+    "2026-09-10T12:00:00Z".parse().unwrap()
 }
 
 fn e2e_app(store: Arc<MemoryBillingStore>) -> Harness {
     support::harness(store, FakeProvider::new(), |app: TestApp| {
-        app.with_clock(FixedClock::at(now().to_jiff()))
+        app.with_clock(FixedClock::at(now()))
             .routes(routes![pro, unread])
     })
 }
@@ -68,7 +62,7 @@ fn e2e_app(store: Arc<MemoryBillingStore>) -> Harness {
 /// the notification test route.
 fn e2e_app_ticking(store: Arc<MemoryBillingStore>) -> Harness {
     support::harness(store, FakeProvider::new(), |app: TestApp| {
-        app.with_clock(TickingClock::starting_at(now().to_jiff()))
+        app.with_clock(TickingClock::starting_at(now()))
             .routes(routes![pro, unread])
             .routes(notification_routes())
     })
@@ -218,7 +212,10 @@ async fn payment_failed_opens_dunning_and_invoice_paid_recovers() {
         .expect("dunning row");
     assert_eq!(dunning.state, DunningState::Pending);
     assert_eq!(dunning.attempt, 1);
-    assert_eq!(dunning.next_attempt_at, now() + chrono::Duration::hours(1));
+    assert_eq!(
+        dunning.next_attempt_at,
+        now() + SignedDuration::from_hours(1)
+    );
     h.client.assert_job_enqueued(RETRY_JOB_NAME);
     assert_eq!(
         unread_count(&h.client).await,
@@ -462,7 +459,7 @@ async fn ledger_dedupes_when_replay_protection_is_off() {
         MemoryBillingStore::shared(),
         FakeProvider::new(),
         |app: TestApp| {
-            app.with_clock(FixedClock::at(now().to_jiff()))
+            app.with_clock(FixedClock::at(now()))
                 .routes(routes![pro, unread])
         },
     );

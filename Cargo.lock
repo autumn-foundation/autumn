@@ -637,9 +637,9 @@ name = "autumn-billing"
 version = "0.11.0"
 dependencies = [
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
+ "jiff 1.0.0",
  "serde",
  "serde_json",
  "serde_urlencoded",

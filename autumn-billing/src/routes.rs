@@ -29,11 +29,6 @@
 //! Redirect URLs come from the config only. Body fields with the same names
 //! are ignored.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::ChronoBridge as _;
 use std::sync::Arc;
 
 use autumn_web::negotiate::{Format, Negotiate};
@@ -199,13 +194,8 @@ async fn customer_for(
     let now = state.clock().now();
     let customer = store
         .upsert_customer(
-            CustomerUpsert::new(
-                local_id,
-                provider.name(),
-                provider_customer_id.clone(),
-                now.to_chrono(),
-            )
-            .with_user(user_id),
+            CustomerUpsert::new(local_id, provider.name(), provider_customer_id.clone(), now)
+                .with_user(user_id),
         )
         .await?;
     // A concurrent checkout linked the user first. Its row is the customer;
