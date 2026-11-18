@@ -627,15 +627,9 @@ pub use self::db_store::DbPushSubscriptionStore;
 #[cfg(feature = "db")]
 mod db_store {
     use super::{PUSH_SUBSCRIPTIONS_TABLE, PushError, PushSubscriptionStore, StoredSubscription};
-    use crate::db::RuntimeConnection;
-    #[allow(
-        unused_imports,
-        reason = "temporary chrono bridge; some callers are feature- or test-gated"
-    )]
-    use crate::time::bridge::ChronoBridge as _;
+    use crate::db::{RuntimeConnection, SqlTimestamp};
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use chrono::{DateTime, Utc};
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::deadpool::Pool;
@@ -691,7 +685,7 @@ mod db_store {
         endpoint: String,
         p256dh: String,
         auth: String,
-        created_at: DateTime<Utc>,
+        created_at: SqlTimestamp,
     }
 
     impl TryFrom<SubscriptionRow> for StoredSubscription {
@@ -860,7 +854,7 @@ mod db_store {
                     endpoint: endpoint.clone(),
                     p256dh: p256dh.clone(),
                     auth: auth.clone(),
-                    created_at: crate::time::ambient_now().to_chrono(),
+                    created_at: crate::time::ambient_now().into(),
                 })
                 .on_conflict(dsl::endpoint)
                 .do_update()

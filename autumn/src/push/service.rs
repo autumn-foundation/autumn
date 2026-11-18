@@ -19,11 +19,6 @@
 //! }
 //! ```
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::sync::Arc;
 
 use futures::StreamExt as _;
@@ -528,7 +523,7 @@ impl WebPush {
         payload: &[u8],
     ) -> Result<PushRequest, PushError> {
         let body = encryption::encrypt(payload, subscription.p256dh(), subscription.auth())?;
-        let issued_at = u64::try_from(self.clock.now().to_chrono().timestamp()).unwrap_or(0);
+        let issued_at = u64::try_from(self.clock.now().as_second()).unwrap_or(0);
         let authorization =
             vapid.authorization_header(subscription.endpoint(), &self.subject, issued_at)?;
         Ok(PushRequest {
@@ -1601,14 +1596,10 @@ mod tests {
     async fn the_jwt_exp_is_anchored_to_the_frameworks_clock() {
         // A broken clock (or the `unwrap_or(0)` in `build_request` firing) puts `exp` in 1970,
         // so push services reject every send while signatures still verify.
-        use chrono::{TimeZone as _, Utc};
-
-        let issued = Utc.timestamp_opt(1_800_000_000, 0).single().expect("time");
+        let issued = crate::time::Timestamp::from_second(1_800_000_000).expect("time");
         let transport = RecordingPushTransport::new();
         let (push, _) = web_push_with(transport.clone());
-        let push = push.with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
-            issued.to_jiff(),
-        )));
+        let push = push.with_clock(std::sync::Arc::new(crate::time::FixedClock::at(issued)));
         push.subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
             .await
             .expect("subscribe");

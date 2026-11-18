@@ -13,12 +13,7 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -84,7 +79,8 @@ pub struct WebhookDeliveryLog {
     pub max_attempts: u32,
     pub is_dlq: bool,
     pub last_error: Option<String>,
-    pub timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub timestamp: Timestamp,
 }
 
 /// `true` when [`OutboundWebhookHandler::log_delivery`] must ignore `new`:
@@ -582,7 +578,7 @@ impl WebhookOutboundManager {
                 max_attempts: self.max_attempts,
                 is_dlq: false,
                 last_error: None,
-                timestamp: crate::time::ambient_now().to_chrono(),
+                timestamp: crate::time::ambient_now(),
             });
 
             if existing.is_none()
@@ -652,7 +648,7 @@ impl WebhookOutboundManager {
     ) -> AutumnError {
         log.is_dlq = true;
         log.last_error = Some(message.clone());
-        log.timestamp = crate::time::ambient_now().to_chrono();
+        log.timestamp = crate::time::ambient_now();
 
         if let Err(e) = self.handler.replace_delivery_log(log).await {
             tracing::error!(
@@ -788,7 +784,7 @@ pub fn deliver_webhook_job(
         if sub.status == WebhookSubscriptionStatus::Disabled {
             tracing::info!(subscription_id = %sub.id, "Webhook subscription is disabled; skipping delivery");
             log.last_error = Some("Subscription is disabled".to_owned());
-            log.timestamp = crate::time::ambient_now().to_chrono();
+            log.timestamp = crate::time::ambient_now();
             if is_replay {
                 log.is_dlq = true;
             }
@@ -799,7 +795,7 @@ pub fn deliver_webhook_job(
         if sub.status == WebhookSubscriptionStatus::Failed && !is_replay {
             tracing::info!(subscription_id = %sub.id, "Webhook subscription has failed; skipping delivery");
             log.last_error = Some("Subscription has failed due to consecutive errors".to_owned());
-            log.timestamp = crate::time::ambient_now().to_chrono();
+            log.timestamp = crate::time::ambient_now();
             manager.store().log_delivery(log).await?;
             return Ok(());
         }
@@ -809,7 +805,7 @@ pub fn deliver_webhook_job(
 
         // Stripe-style `t=<timestamp>,v1=<signature>`. The receiver checks `t=` against its real
         // clock, so sign with the ambient clock: real time outside a `Sim` (#2967).
-        let timestamp = crate::time::ambient_now().to_chrono().timestamp();
+        let timestamp = crate::time::ambient_now().as_second();
         let signing_payload = format!("{timestamp}.{}", log.payload);
         let signature = crate::security::config::hmac_sha256_hex(
             sub.secret.as_bytes(),
@@ -863,7 +859,7 @@ pub fn deliver_webhook_job(
         );
 
         log.elapsed_ms = elapsed;
-        log.timestamp = crate::time::ambient_now().to_chrono();
+        log.timestamp = crate::time::ambient_now();
         log.request_headers = request_headers;
 
         match response {
@@ -1177,7 +1173,7 @@ mod tests {
             max_attempts: 5,
             is_dlq: false,
             last_error: None,
-            timestamp: Utc::now(),
+            timestamp: crate::time::ambient_now(),
         }
     }
 

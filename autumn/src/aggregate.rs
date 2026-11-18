@@ -27,7 +27,7 @@
 //!     .await?;
 //!
 //! // A day-bucketed time series over a bounded window.
-//! let per_day: Vec<(chrono::NaiveDateTime, i64)> = repo
+//! let per_day: Vec<(autumn_web::time::civil::DateTime, i64)> = repo
 //!     .count_grouped_by_created_at()
 //!     .bucket(DateBucket::Day)
 //!     .filter_range(window_start, window_end)
@@ -271,21 +271,22 @@ impl<'a, K, V> GroupedAggregate<'a, K, V> {
 /// `date_trunc(unit, bigint)` query is rejected by the type system instead of
 /// failing at runtime.
 ///
-/// Only `NaiveDateTime` (`timestamp`) and `DateTime<Utc>` (`timestamptz`) are
-/// bucketable. `NaiveDate` (`date`) is intentionally excluded: Postgres
-/// `date_trunc(unit, date)` returns a `timestamp`, which would not match a
-/// `NaiveDate` result row.
-impl<V> GroupedAggregate<'_, ::chrono::NaiveDateTime, V> {
+/// Only [`civil::DateTime`](crate::time::civil::DateTime) (`timestamp`) and
+/// [`Timestamp`](crate::time::Timestamp) (`timestamptz`) are bucketable.
+/// [`civil::Date`](crate::time::civil::Date) (`date`) is intentionally
+/// excluded: Postgres `date_trunc(unit, date)` returns a `timestamp`, which
+/// would not match a `civil::Date` result row.
+impl<V> GroupedAggregate<'_, crate::time::civil::DateTime, V> {
     /// Group by `date_trunc('<unit>', <group_col>)` instead of the raw column,
     /// producing a time series keyed by bucket start (AC5).
     ///
     /// Available **only** when the group column is a timestamp type
-    /// (`NaiveDateTime` / `DateTime<Utc>`); non-temporal group keys have no
+    /// (`civil::DateTime` / `Timestamp`); non-temporal group keys have no
     /// `.bucket()` method.
     ///
-    /// For a `NaiveDateTime` (Postgres `timestamp WITHOUT time zone`) key the
-    /// bucket truncates on the **stored wall-clock** value: `date_trunc` on a
-    /// plain `timestamp` is a deterministic field truncation that ignores the
+    /// For a `civil::DateTime` (Postgres `timestamp WITHOUT time zone`) key
+    /// the bucket truncates on the **stored wall-clock** value: `date_trunc` on
+    /// a plain `timestamp` is a deterministic field truncation that ignores the
     /// session `TimeZone`, so buckets are stable regardless of deployment.
     #[must_use]
     pub const fn bucket(mut self, bucket: DateBucket) -> Self {
@@ -294,21 +295,44 @@ impl<V> GroupedAggregate<'_, ::chrono::NaiveDateTime, V> {
     }
 }
 
-impl<V> GroupedAggregate<'_, ::chrono::DateTime<::chrono::Utc>, V> {
+impl<V> GroupedAggregate<'_, crate::time::Timestamp, V> {
     /// Group by `date_trunc('<unit>', <group_col>)` instead of the raw column,
     /// producing a time series keyed by bucket start (AC5).
     ///
     /// Available **only** when the group column is a timestamp type
-    /// (`NaiveDateTime` / `DateTime<Utc>`); non-temporal group keys have no
+    /// (`civil::DateTime` / `Timestamp`); non-temporal group keys have no
     /// `.bucket()` method.
     ///
-    /// For a `DateTime<Utc>` (Postgres `timestamptz`) key the bucket is
-    /// computed **in UTC** — the generated SQL uses the 3-arg
-    /// `date_trunc('<unit>', <col>, 'UTC')`, consistent with the `DateTime<Utc>`
-    /// key type. Truncating in an explicit zone keeps bucket boundaries stable
-    /// across deployments; the 2-arg form would truncate in the DB session
-    /// `TimeZone`, so a non-UTC session would shift UTC-midnight events into the
-    /// wrong local-date bucket (#1364).
+    /// For a `Timestamp` (Postgres `timestamptz`) key the bucket is computed
+    /// **in UTC** — the generated SQL uses the 3-arg
+    /// `date_trunc('<unit>', <col>, 'UTC')`, consistent with the UTC
+    /// `Timestamp` key type. Truncating in an explicit zone keeps bucket
+    /// boundaries stable across deployments; the 2-arg form would truncate in
+    /// the DB session `TimeZone`, so a non-UTC session would shift
+    /// UTC-midnight events into the wrong local-date bucket (#1364).
+    #[must_use]
+    pub const fn bucket(mut self, bucket: DateBucket) -> Self {
+        self.opts.bucket = Some(bucket);
+        self
+    }
+}
+
+/// `.bucket()` for repositories that still declare a `chrono` group key
+/// (`NaiveDateTime` is a `timestamp` key, `DateTime<Utc>` a `timestamptz`
+/// key), with the same SQL as the `civil::DateTime` and `Timestamp` impls.
+impl<V> GroupedAggregate<'_, ::chrono::NaiveDateTime, V> {
+    /// Group by `date_trunc('<unit>', <group_col>)` instead of the raw column.
+    /// See the `civil::DateTime` impl.
+    #[must_use]
+    pub const fn bucket(mut self, bucket: DateBucket) -> Self {
+        self.opts.bucket = Some(bucket);
+        self
+    }
+}
+
+impl<V> GroupedAggregate<'_, ::chrono::DateTime<::chrono::Utc>, V> {
+    /// Group by `date_trunc('<unit>', <group_col>, 'UTC')` instead of the raw
+    /// column. See the `Timestamp` impl.
     #[must_use]
     pub const fn bucket(mut self, bucket: DateBucket) -> Self {
         self.opts.bucket = Some(bucket);

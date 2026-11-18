@@ -9,11 +9,6 @@
 
 #[cfg(feature = "test-support")]
 mod docker {
-    #[allow(
-        unused_imports,
-        reason = "temporary chrono bridge; some callers are feature- or test-gated"
-    )]
-    use autumn_web::time::bridge::JiffBridge as _;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -313,7 +308,6 @@ mod docker {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn pg_outbox_claim_reads_pending_rows_only() {
-        use chrono::TimeZone as _;
         use diesel_async::pooled_connection::AsyncDieselConnectionManager;
         use diesel_async::{
             AsyncConnection as _, AsyncPgConnection, RunQueryDsl as _, SimpleAsyncConnection as _,
@@ -348,8 +342,8 @@ mod docker {
         .unwrap();
         outbox::ensure_schema(&pool).await.unwrap();
 
-        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let ms = now.timestamp_millis();
+        let now: autumn_web::time::Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+        let ms = now.as_millisecond();
         let mut conn = pool.get().await.unwrap();
         conn.batch_execute(&format!(
             "INSERT INTO autumn_outbox \
@@ -388,7 +382,7 @@ mod docker {
         let log = Log::default();
         let state = TestApp::new()
             .with_db(pool.clone())
-            .with_clock(autumn_web::time::FixedClock::at(now.to_jiff()))
+            .with_clock(autumn_web::time::FixedClock::at(now))
             .with_outbox(OutboxConfig::default())
             .outbox_handler("t", {
                 let log = log.clone();
@@ -465,7 +459,7 @@ mod docker_webhook_store {
                 max_attempts: 5,
                 is_dlq: n == 49,
                 last_error: Some("500".to_owned()),
-                timestamp: chrono::Utc::now(),
+                timestamp: autumn_web::time::ambient_now(),
             };
             store.log_delivery(log).await.unwrap();
         }

@@ -22853,8 +22853,13 @@ mod tests {
             ),
             (serde_json::json!({ "name": "test_job", "args": {} }), None),
         ] {
-            let message =
-                crate::outbox::OutboxMessage::new("m", "", "autumn.job", body, chrono::Utc::now());
+            let message = crate::outbox::OutboxMessage::new(
+                "m",
+                "",
+                "autumn.job",
+                body,
+                crate::time::ambient_now(),
+            );
             crate::outbox::run_job_enqueue(state.clone(), message)
                 .await
                 .expect("relay enqueue");

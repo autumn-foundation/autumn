@@ -98,22 +98,17 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{AutumnError, AutumnResult};
 use crate::pagination::{ListQuery, Page, PageRequest, SortDir};
 use crate::state::AppState;
+use crate::time::Timestamp;
 
 /// The `notifications` table name shared by [`DbNotificationStore`] and the
 /// `autumn generate notifications` scaffolding.
@@ -133,9 +128,11 @@ pub struct Notification {
     /// Application-defined JSON payload.
     pub payload: Value,
     /// When the notification was marked read; `None` while unread.
-    pub read_at: Option<DateTime<Utc>>,
+    #[serde(with = "crate::time::compat::serde_autosi_option")]
+    pub read_at: Option<Timestamp>,
     /// Creation time.
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub created_at: Timestamp,
 }
 
 impl Notification {
@@ -546,7 +543,7 @@ impl NotificationStore for MemoryNotificationStore {
             kind,
             payload,
             read_at: None,
-            created_at: crate::time::ambient_now().to_chrono(),
+            created_at: crate::time::ambient_now(),
         };
         inner.rows.push((tenant, notification.clone()));
         drop(inner);
@@ -620,7 +617,7 @@ impl NotificationStore for MemoryNotificationStore {
             .filter(|(t, n)| *t == tenant && n.id == id)
             .filter(|(_, n)| recipient_id.is_none_or(|rid| n.recipient_id == rid))
             .filter(|(_, n)| n.read_at.is_none())
-            .map(|(_, n)| n.read_at = Some(now.to_chrono()))
+            .map(|(_, n)| n.read_at = Some(now))
             .count();
         drop(inner);
         Ok(marked as u64)
@@ -635,7 +632,7 @@ impl NotificationStore for MemoryNotificationStore {
             .iter_mut()
             .filter(|(t, n)| *t == tenant && n.recipient_id == recipient_id)
             .filter(|(_, n)| n.read_at.is_none())
-            .map(|(_, n)| n.read_at = Some(now.to_chrono()))
+            .map(|(_, n)| n.read_at = Some(now))
             .count();
         drop(inner);
         Ok(marked as u64)
@@ -700,13 +697,8 @@ mod db_store {
         FeedSort, ListFilter, Notification, NotificationStore, NotificationStoreError, Value,
     };
     use crate::db::RuntimeConnection;
+    use crate::db::SqlTimestamp;
     use crate::pagination::{ListQuery, Page, PageRequest, SortDir};
-    #[allow(
-        unused_imports,
-        reason = "temporary chrono bridge; some callers are feature- or test-gated"
-    )]
-    use crate::time::bridge::ChronoBridge as _;
-    use chrono::{DateTime, Utc};
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::deadpool::Pool;
@@ -751,8 +743,8 @@ mod db_store {
         recipient_id: i64,
         kind: String,
         payload: String,
-        read_at: Option<DateTime<Utc>>,
-        created_at: DateTime<Utc>,
+        read_at: Option<SqlTimestamp>,
+        created_at: SqlTimestamp,
     }
 
     impl From<NotificationRow> for Notification {
@@ -768,8 +760,8 @@ mod db_store {
                 recipient_id: row.recipient_id,
                 kind: row.kind,
                 payload,
-                read_at: row.read_at,
-                created_at: row.created_at,
+                read_at: row.read_at.map(Into::into),
+                created_at: row.created_at.into(),
             }
         }
     }
@@ -781,7 +773,7 @@ mod db_store {
         recipient_id: i64,
         kind: String,
         payload: String,
-        created_at: DateTime<Utc>,
+        created_at: SqlTimestamp,
     }
 
     /// [`NotificationStore`] backed by the app's database pool.
@@ -849,7 +841,7 @@ mod db_store {
                     recipient_id,
                     kind,
                     payload,
-                    created_at: crate::time::ambient_now().to_chrono(),
+                    created_at: crate::time::ambient_now().into(),
                 })
                 .returning(NotificationRow::as_returning())
                 .get_result(&mut conn)
@@ -940,7 +932,7 @@ mod db_store {
         ) -> Result<u64, NotificationStoreError> {
             use notifications::dsl;
             let mut conn = self.conn().await?;
-            let now = crate::time::ambient_now().to_chrono();
+            let now = SqlTimestamp::from(crate::time::ambient_now());
             // `read_at IS NULL` in the predicate makes the update idempotent:
             // an already-read row matches zero rows and keeps its original
             // timestamp.
@@ -982,7 +974,7 @@ mod db_store {
                     .filter(dsl::recipient_id.eq(recipient_id))
                     .filter(dsl::read_at.is_null()),
             )
-            .set(dsl::read_at.eq(Some(crate::time::ambient_now().to_chrono())))
+            .set(dsl::read_at.eq(Some(SqlTimestamp::from(crate::time::ambient_now()))))
             .execute(&mut conn)
             .await
             .map_err(|e| store_err(&e))?;

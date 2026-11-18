@@ -39,18 +39,12 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone as _, Utc};
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
@@ -64,7 +58,7 @@ use crate::config::OutboxConfig;
 use crate::db::RuntimeConnection;
 use crate::entropy::Entropy;
 use crate::events::Event;
-use crate::time::ClockSource;
+use crate::time::{ClockSource, Timestamp};
 use crate::{AppState, AutumnError, AutumnResult};
 
 /// Topic of a durable event listener call. See [`Outbox::publish`].
@@ -389,14 +383,12 @@ fn sql_error(context: &str, error: &diesel::result::Error) -> AutumnError {
     AutumnError::internal_server_error_msg(format!("{context}: {error}"))
 }
 
-const fn to_millis(time: DateTime<Utc>) -> i64 {
-    time.timestamp_millis()
+fn to_millis(time: Timestamp) -> i64 {
+    time.as_millisecond()
 }
 
-fn from_millis(millis: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(millis)
-        .single()
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+fn from_millis(millis: i64) -> Timestamp {
+    Timestamp::from_millisecond(millis).unwrap_or(Timestamp::MIN)
 }
 
 fn duration_millis(duration: Duration) -> i64 {
@@ -421,7 +413,8 @@ pub struct OutboxMessage {
     /// attempts made.
     pub attempt: u32,
     /// When the message was written (app clock).
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub created_at: Timestamp,
 }
 
 impl OutboxMessage {
@@ -432,7 +425,7 @@ impl OutboxMessage {
         aggregate: impl Into<String>,
         topic: impl Into<String>,
         payload: Value,
-        created_at: DateTime<Utc>,
+        created_at: Timestamp,
     ) -> Self {
         Self {
             id: id.into(),
@@ -471,7 +464,7 @@ pub struct DeadLetter {
     /// The error of the last attempt.
     pub last_error: Option<String>,
     /// When the relay stopped the message (app clock).
-    pub dead_at: DateTime<Utc>,
+    pub dead_at: Timestamp,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -799,7 +792,7 @@ impl Outbox {
     /// Returns an error when the update fails.
     pub async fn requeue(&self, conn: &mut RuntimeConnection, id: &str) -> AutumnResult<bool> {
         let changed = diesel::sql_query(sql(REQUEUE_SQL))
-            .bind::<BigInt, _>(to_millis(self.state.clock().now().to_chrono()))
+            .bind::<BigInt, _>(to_millis(self.state.clock().now()))
             .bind::<Text, _>(id)
             .execute(&mut *conn)
             .await
@@ -841,7 +834,7 @@ async fn insert_message_with_id(
     topic: &str,
     payload: &Value,
 ) -> AutumnResult<String> {
-    let now = to_millis(clock.now().to_chrono());
+    let now = to_millis(clock.now());
     diesel::sql_query(sql(INSERT_SQL))
         .bind::<Text, _>(&id)
         .bind::<Text, _>(aggregate.unwrap_or(&id))
@@ -895,7 +888,7 @@ impl Inbox {
         let inserted = diesel::sql_query(sql(INBOX_INSERT_SQL))
             .bind::<Text, _>(&self.consumer)
             .bind::<Text, _>(message_id)
-            .bind::<BigInt, _>(to_millis(crate::time::ambient_now().to_chrono()))
+            .bind::<BigInt, _>(to_millis(crate::time::ambient_now()))
             .execute(conn)
             .await
             .map_err(|error| sql_error("inbox", &error))?;
@@ -1214,8 +1207,8 @@ pub(crate) async fn relay_fleet_database(
         None => drain.await?,
     };
     let retention = duration_millis(Duration::from_millis(relay.config.retention_ms));
-    let outbox_cutoff = to_millis(state.clock().now().to_chrono()).saturating_sub(retention);
-    let inbox_cutoff = to_millis(crate::time::ambient_now().to_chrono()).saturating_sub(retention);
+    let outbox_cutoff = to_millis(state.clock().now()).saturating_sub(retention);
+    let inbox_cutoff = to_millis(crate::time::ambient_now()).saturating_sub(retention);
     purge_pool(pool, outbox_cutoff, inbox_cutoff).await?;
     Ok(handled)
 }
@@ -1313,7 +1306,7 @@ async fn drain_pool(
     while handled < max {
         let batch = (max - handled).min(relay.config.batch_size.max(1));
         let claim_token = state.entropy().uuid_v4().to_string();
-        let lease_end = to_millis(state.clock().now().to_chrono()).saturating_add(lease);
+        let lease_end = to_millis(state.clock().now()).saturating_add(lease);
         let mut rows = claim(relay, pool, state, &claim_token, batch).await?;
         if rows.is_empty() {
             break;
@@ -1324,7 +1317,7 @@ async fn drain_pool(
         for row in &rows {
             // After the lease, another relay can own the rest of the batch.
             // On shutdown, the next process sends it.
-            let remaining = lease_end.saturating_sub(to_millis(state.clock().now().to_chrono()));
+            let remaining = lease_end.saturating_sub(to_millis(state.clock().now()));
             if remaining <= 0 || shutdown.is_some_and(CancellationToken::is_cancelled) {
                 break;
             }
@@ -1349,7 +1342,7 @@ async fn claim(
     claim_token: &str,
     batch: usize,
 ) -> AutumnResult<Vec<ClaimedRow>> {
-    let now = to_millis(state.clock().now().to_chrono());
+    let now = to_millis(state.clock().now());
     let lease = duration_millis(Duration::from_millis(relay.config.lease_ms));
     let mut conn = pool.get().await.map_err(|error| {
         AutumnError::service_unavailable_msg(format!("outbox claim: no connection: {error}"))
@@ -1506,7 +1499,7 @@ async fn mark_sent(
         AutumnError::service_unavailable_msg(format!("outbox mark: no connection: {error}"))
     })?;
     diesel::sql_query(sql(MARK_SENT_SQL))
-        .bind::<BigInt, _>(to_millis(state.clock().now().to_chrono()))
+        .bind::<BigInt, _>(to_millis(state.clock().now()))
         .bind::<BigInt, _>(seq)
         .bind::<Text, _>(claim_token)
         .execute(&mut conn)
@@ -1528,7 +1521,7 @@ async fn dead_letter_exhausted(
     diesel::sql_query(sql(EXHAUSTED_SQL))
         .bind::<Integer, _>(i32::try_from(relay.config.max_attempts).unwrap_or(i32::MAX))
         .bind::<Text, _>("no attempts left: earlier attempts ended in a crash or an expired lease")
-        .bind::<BigInt, _>(to_millis(state.clock().now().to_chrono()))
+        .bind::<BigInt, _>(to_millis(state.clock().now()))
         .bind::<BigInt, _>(seq)
         .bind::<Text, _>(claim_token)
         .execute(&mut conn)
@@ -1548,7 +1541,7 @@ async fn nack(
     dead: bool,
     error: &AutumnError,
 ) -> AutumnResult<()> {
-    let now = to_millis(state.clock().now().to_chrono());
+    let now = to_millis(state.clock().now());
     let delay = retry_delay_ms(&relay.config, attempt, state.entropy());
     let mut conn = pool.get().await.map_err(|error| {
         AutumnError::service_unavailable_msg(format!("outbox nack: no connection: {error}"))
@@ -1591,8 +1584,8 @@ pub async fn purge(state: &AppState) -> AutumnResult<(usize, usize)> {
         .extension::<OutboxRelay>()
         .ok_or_else(|| AutumnError::internal_server_error_msg("outbox relay is not installed"))?;
     let retention = duration_millis(Duration::from_millis(relay.config.retention_ms));
-    let outbox_cutoff = to_millis(state.clock().now().to_chrono()).saturating_sub(retention);
-    let inbox_cutoff = to_millis(crate::time::ambient_now().to_chrono()).saturating_sub(retention);
+    let outbox_cutoff = to_millis(state.clock().now()).saturating_sub(retention);
+    let inbox_cutoff = to_millis(crate::time::ambient_now()).saturating_sub(retention);
     let pools = relay_pools(state)?;
     let (mut outbox, mut inbox) = (0, 0);
     let mut failures = Vec::new();

@@ -478,9 +478,8 @@ impl CommentView {
 
 /// The comment's stored UTC wall-clock time.
 #[cfg(feature = "db")]
-fn comment_time(comment: &crate::commentable::Comment) -> jiff::civil::DateTime {
-    use crate::time::bridge::JiffBridge as _;
-    comment.created_at.to_jiff()
+const fn comment_time(comment: &crate::commentable::Comment) -> jiff::civil::DateTime {
+    comment.created_at
 }
 
 /// The comment's creation instant, or `None` at the very edge of the civil
@@ -1610,9 +1609,7 @@ mod tests {
                     parent_id: None,
                     author_id: 7,
                     body: "b".to_owned(),
-                    created_at: chrono::DateTime::parse_from_rfc3339("2026-06-21T17:10:33Z")
-                        .expect("timestamp")
-                        .naive_utc(),
+                    created_at: "2026-06-21T17:10:33".parse().expect("timestamp"),
                     author_name: author_name.map(str::to_owned),
                 },
                 depth: 0,

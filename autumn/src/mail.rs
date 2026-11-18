@@ -22,11 +22,6 @@
     )
 )]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -2764,12 +2759,26 @@ fn file_transport_filename(mail: &Mail) -> String {
     let sequence = FILE_TRANSPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
         "{}-{}-{:016x}-{}.eml",
-        crate::time::ambient_now()
-            .to_chrono()
-            .format("%Y%m%d%H%M%S%6f"),
+        file_transport_stamp(crate::time::ambient_now()),
         std::process::id(),
         sequence,
         sanitize_filename(mail.to.first().map_or("unknown", String::as_str))
+    )
+}
+
+/// `ts` in UTC as `YYYYmmddHHMMSS` followed by six microsecond digits, so
+/// file names sort in send order.
+fn file_transport_stamp(ts: crate::time::Timestamp) -> String {
+    let dt = jiff::tz::Offset::UTC.to_datetime(ts);
+    let micros = dt.subsec_nanosecond().div_euclid(1_000);
+    format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}{micros:06}",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
     )
 }
 
@@ -2791,7 +2800,7 @@ fn render_eml(mail: &Mail) -> String {
         out.push('\n');
     }
     out.push_str("Date: ");
-    out.push_str(&crate::time::ambient_now().to_chrono().to_rfc2822());
+    out.push_str(&crate::time::compat::rfc2822(crate::time::ambient_now()));
     out.push('\n');
     out.push_str("Message-Id: <");
     out.push_str(&uuid::Uuid::new_v4().to_string());
@@ -3388,8 +3397,15 @@ fn trim_body(body: &str) -> String {
 }
 
 fn format_system_time(time: SystemTime) -> String {
-    let datetime: chrono::DateTime<chrono::Utc> = time.into();
-    datetime.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    // A time outside the representable range saturates to the nearest end.
+    let ts = crate::time::Timestamp::try_from(time).unwrap_or_else(|_| {
+        if time < UNIX_EPOCH {
+            crate::time::Timestamp::MIN
+        } else {
+            crate::time::Timestamp::MAX
+        }
+    });
+    crate::time::compat::rfc3339_opts(ts, crate::time::compat::Digits::Secs, true)
 }
 
 fn render_mail_index(
@@ -4766,7 +4782,7 @@ pub mod db_suppression {
     #[cfg(all(test, feature = "sqlite"))]
     mod sqlite_tests {
         use super::*;
-        use chrono::{DateTime, Utc};
+        use crate::db::SqlTimestamp;
         use diesel_async::SimpleAsyncConnection;
 
         const DDL: &str = "CREATE TABLE mail_unsubscribes (
@@ -4814,14 +4830,14 @@ pub mod db_suppression {
             let (store, _dir) = store().await;
             store.suppress("a@x.test", "news").await.unwrap();
             let mut conn = store.pool.get().await.expect("connection");
-            let at: Vec<DateTime<Utc>> = mail_unsubscribes::table
+            let at: Vec<SqlTimestamp> = mail_unsubscribes::table
                 .select(mail_unsubscribes::unsubscribed_at)
                 .load(&mut conn)
                 .await
                 .expect("typed read of unsubscribed_at");
             assert_eq!(at.len(), 1);
-            let age = Utc::now() - at[0];
-            assert!(age.num_seconds().abs() < 60, "default is not recent: {age}");
+            let age = crate::time::ambient_now().duration_since(at[0].0);
+            assert!(age.as_secs().abs() < 60, "default is not recent: {age:?}");
         }
     }
 }
@@ -7064,7 +7080,7 @@ mod tests {
         let missing_key = format!(
             "AUTUMN_TEST_MISSING_SMTP_PASSWORD_{}_{}",
             std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            crate::time::ambient_now().as_nanosecond()
         );
         let Err(error) = SmtpTransport::new(
             SmtpConfig {

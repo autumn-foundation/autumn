@@ -5261,7 +5261,7 @@ fn reset_webhook_replay_log(
     log.last_error = None;
     log.response_status = None;
     log.response_body = None;
-    log.timestamp = crate::time::ambient_now().to_chrono();
+    log.timestamp = crate::time::ambient_now();
     log
 }
 
@@ -6911,7 +6911,7 @@ mod tests {
             max_attempts: 5,
             is_dlq: true,
             last_error: Some("server returned status: 503".to_string()),
-            timestamp: chrono::Utc::now(),
+            timestamp: crate::time::ambient_now(),
         }
     }
 
