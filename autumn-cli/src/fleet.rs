@@ -155,6 +155,8 @@ mod imp {
     use autumn_web::fleet_layout::FleetDbKey;
     use autumn_web::migrate::MigrationScope;
     use autumn_web::replication::ReplicationSettings;
+    use autumn_web::time::bridge::JiffBridge;
+    use autumn_web::time::compat;
 
     use super::FleetCommand;
     use crate::db::replica;
@@ -860,7 +862,7 @@ mod imp {
                  (database.fleet.replica_retention_after_delete). Until that time, `autumn \
                  fleet restore {key} --force` brings it back. After that time, the app \
                  purges it.",
-                row.purge_after.to_rfc3339()
+                compat::rfc3339(row.purge_after)
             ),
             Ok(Some(row)) => eprintln!(
                 "  \u{26A0} Its replica is not purged yet: {}.\n    A tombstone records it: \
@@ -977,7 +979,7 @@ mod imp {
             .map_err(|_| "the fleet already replicates".to_owned())?;
 
         let outcome = runtime()?
-            .block_on(fleet.restore(&key, at))
+            .block_on(fleet.restore(&key, at.map(JiffBridge::to_jiff)))
             .map_err(|e| match e {
                 FleetError::NotFound { .. } => {
                     format!("{key} has no replica under {prefix}.")
@@ -996,7 +998,7 @@ mod imp {
             outcome.bytes,
             outcome.output.display(),
             outcome.frames_replayed,
-            outcome.plan.effective.to_rfc3339()
+            compat::rfc3339(outcome.plan.effective)
         );
         Ok(())
     }
@@ -1416,8 +1418,8 @@ mod imp {
         ) {
             eprintln!(
                 "  \u{2139} each tenant is current as of its own instant: oldest {}, newest {}",
-                oldest.to_rfc3339(),
-                newest.to_rfc3339()
+                compat::rfc3339(oldest),
+                compat::rfc3339(newest)
             );
         }
         eprintln!(
