@@ -26,15 +26,15 @@ use crate::{
 // ── Backend portability (issue #2108) ────────────────────────────────────────
 //
 // `changed_at` is a `timestamptz` column. The table and the model declare the
-// portable `Timestamp` type with a `NaiveDateTime` field. Do not write
+// portable `Timestamp` type with a `civil::DateTime` field. Do not write
 // `Timestamptz` here. Diesel implements `HasSqlType<Timestamptz>` for `Pg`
 // only, so the generated DSL stops compiling under `autumn-web/sqlite`.
 //
 // This does not change what Postgres returns. Postgres sends `timestamp` and
 // `timestamptz` in the same binary form: microseconds from 2000-01-01 UTC. A
 // `Timestamp` read of a `timestamptz` column gives the UTC wall clock. The
-// session time zone has no effect. `and_utc()` adds the offset again at the
-// JSON boundary. `tests/experiment_admin_db.rs` asserts this on a non-UTC
+// session time zone has no effect. `utc_rfc3339` adds the offset again at
+// the JSON boundary. `tests/experiment_admin_db.rs` asserts this on a non-UTC
 // session.
 //
 // The write direction is safe too. `#[default]` keeps `changed_at` out of
@@ -64,7 +64,7 @@ pub struct ExperimentChange {
     pub mutation: String,
     pub actor: Option<String>,
     #[default]
-    pub changed_at: chrono::NaiveDateTime,
+    pub changed_at: autumn_web::time::civil::DateTime,
 }
 
 #[autumn_web::repository(ExperimentChange, table = "autumn_experiment_changes")]
@@ -836,8 +836,11 @@ struct ExperimentRow {
     variants: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     winner: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamp)]
-    updated_at: chrono::NaiveDateTime,
+    #[diesel(
+        sql_type = diesel::sql_types::Timestamp,
+        deserialize_as = autumn_web::db::SqlDateTime
+    )]
+    updated_at: autumn_web::time::civil::DateTime,
 }
 
 impl ExperimentRow {
@@ -849,7 +852,7 @@ impl ExperimentRow {
             "state": self.state,
             "variants": self.variants.map(decode_variants),
             "winner": self.winner,
-            "updated_at": self.updated_at.and_utc().to_rfc3339(),
+            "updated_at": crate::traits::utc_rfc3339(self.updated_at),
         })
     }
 }
@@ -885,8 +888,11 @@ struct ExperimentDetailRow {
     winner: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     exclusion_group: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamp)]
-    updated_at: chrono::NaiveDateTime,
+    #[diesel(
+        sql_type = diesel::sql_types::Timestamp,
+        deserialize_as = autumn_web::db::SqlDateTime
+    )]
+    updated_at: autumn_web::time::civil::DateTime,
 }
 
 impl ExperimentDetailRow {
@@ -899,7 +905,7 @@ impl ExperimentDetailRow {
             "variants": self.variants.map(decode_variants),
             "winner": self.winner,
             "exclusion_group": self.exclusion_group,
-            "updated_at": self.updated_at.and_utc().to_rfc3339(),
+            "updated_at": crate::traits::utc_rfc3339(self.updated_at),
         })
     }
 }
@@ -908,7 +914,7 @@ impl ExperimentDetailRow {
 // `history_row_to_entry` below are structurally identical to their namesakes
 // in `feature_flags.rs` — same columns, same `actor` default. They have
 // co-changed twice (commit 3d318b55: `changed_at` Timestamptz→Timestamp +
-// `.and_utc()`; commit 10e9538e: pool type), but the surrounding query is not
+// read as UTC; commit 10e9538e: pool type), but the surrounding query is not
 // a clone: `feature_flags.rs::get_history` walks a rename-ancestry recursive
 // CTE this model has no equivalent for, so the two `get_history` bodies are a
 // real, documented divergence, not an oversight. Two instances with no
@@ -924,8 +930,11 @@ struct HistoryRow {
     op: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     actor: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamp)]
-    changed_at: chrono::NaiveDateTime,
+    #[diesel(
+        sql_type = diesel::sql_types::Timestamp,
+        deserialize_as = autumn_web::db::SqlDateTime
+    )]
+    changed_at: autumn_web::time::civil::DateTime,
 }
 
 fn history_row_to_entry(r: HistoryRow) -> crate::AdminHistoryEntry {
@@ -935,7 +944,7 @@ fn history_row_to_entry(r: HistoryRow) -> crate::AdminHistoryEntry {
         op: r.op,
         request_id: None,
         changes: vec![],
-        recorded_at: r.changed_at.and_utc(),
+        recorded_at: crate::traits::utc_instant(r.changed_at),
     }
 }
 
@@ -963,7 +972,7 @@ mod tests {
             id: 1,
             op: "update".to_owned(),
             actor: None,
-            changed_at: chrono::Utc::now().naive_utc(),
+            changed_at: autumn_web::time::ambient_civil_utc(),
         };
         assert_eq!(history_row_to_entry(row).actor, "cli");
     }
