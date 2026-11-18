@@ -455,7 +455,7 @@ pub fn local_date(dt: Timestamp, tz: &Tz) -> maud::Markup {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn time_ago(dt: Timestamp, now: Timestamp, tz: &Tz) -> maud::Markup {
-    let relative = crate::format::relative_time_words(dt.to_chrono(), now.to_chrono());
+    let relative = crate::format::relative_time_words(dt, now);
     let rfc = crate::time::compat::rfc3339(dt);
     let display = format_local(dt, tz, "%Y-%m-%d %H:%M %Z");
     maud::html! {

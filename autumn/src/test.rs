@@ -258,11 +258,6 @@
 //! | [`acting_as`](TestClient::acting_as) / [`login_as`](TestClient::login_as) | `actingAs` | `sign_in` | `force_login` | `log_in_user` |
 //! | [`log_out`](TestClient::log_out) | `Auth::logout` | `sign_out` | `logout` | `log_out_user` |
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt;
@@ -2897,7 +2892,7 @@ pub struct TestClient {
 #[derive(Clone)]
 struct StoredCookie {
     value: String,
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    expires_at: Option<jiff::Timestamp>,
 }
 
 /// Shared per-client cookie store: cookie name → stored cookie (value + expiry).
@@ -3693,7 +3688,7 @@ impl TestClient {
 fn apply_set_cookie(
     jar: &mut std::collections::HashMap<String, StoredCookie>,
     header: &str,
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) {
     let mut parts = header.split(';');
     let Some(pair) = parts.next() else {
@@ -3712,8 +3707,8 @@ fn apply_set_cookie(
     // `Expires` deletions are best-effort: only RFC 2822 dates are parsed.
     let mut deletes = false;
     // `Max-Age` wins over `Expires` (RFC 6265), so track both and resolve at the end.
-    let mut max_age_expiry: Option<chrono::DateTime<chrono::Utc>> = None;
-    let mut expires_expiry: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut max_age_expiry: Option<jiff::Timestamp> = None;
+    let mut expires_expiry: Option<jiff::Timestamp> = None;
     let mut saw_max_age = false;
     for attr in parts {
         let attr = attr.trim();
@@ -3725,13 +3720,17 @@ fn apply_set_cookie(
                 if secs <= 0 {
                     deletes = true;
                 } else {
-                    max_age_expiry = now.checked_add_signed(chrono::Duration::seconds(secs));
+                    max_age_expiry = Some(
+                        now.checked_add(jiff::SignedDuration::from_secs(secs))
+                            .unwrap_or(jiff::Timestamp::MAX),
+                    );
                 }
             }
         } else if prefix.is_some_and(|p| p.eq_ignore_ascii_case("Expires="))
-            && let Ok(when) = chrono::DateTime::parse_from_rfc2822(attr[8..].trim())
+            && let Ok(when) = jiff::fmt::rfc2822::DateTimeParser::new()
+                .relaxed_weekday(true)
+                .parse_timestamp(attr[8..].trim())
         {
-            let when = when.with_timezone(&chrono::Utc);
             if when <= now {
                 deletes = true;
             } else {
@@ -3882,7 +3881,7 @@ impl RequestBuilder {
                 .map_or_else(crate::time::ambient_now, |c| c.now());
             let cookie_header = {
                 let mut jar = jar.lock().expect("cookie jar mutex poisoned");
-                jar.retain(|_, cookie| cookie.expires_at.is_none_or(|t| t > now.to_chrono()));
+                jar.retain(|_, cookie| cookie.expires_at.is_none_or(|t| t > now));
                 jar.iter()
                     .map(|(name, cookie)| format!("{name}={}", cookie.value))
                     .collect::<Vec<_>>()
@@ -3960,7 +3959,7 @@ impl RequestBuilder {
             let mut jar = jar.lock().expect("cookie jar mutex poisoned");
             for (name, value) in &headers {
                 if name.eq_ignore_ascii_case("set-cookie") {
-                    apply_set_cookie(&mut jar, value, now.to_chrono());
+                    apply_set_cookie(&mut jar, value, now);
                 }
             }
         }
@@ -5081,6 +5080,43 @@ pub async fn drain_ready_repository_commit_hooks(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn set_cookie_expiry_follows_max_age_then_expires() {
+        let now: jiff::Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+        let mut jar = std::collections::HashMap::new();
+
+        super::apply_set_cookie(&mut jar, "a=1; Max-Age=60", now);
+        assert_eq!(
+            jar["a"].expires_at,
+            Some("2026-01-01T00:01:00Z".parse().unwrap())
+        );
+
+        // Max-Age wins over Expires.
+        super::apply_set_cookie(
+            &mut jar,
+            "b=2; Expires=Thu, 01 Jan 2026 00:00:10 GMT; Max-Age=30",
+            now,
+        );
+        assert_eq!(
+            jar["b"].expires_at,
+            Some("2026-01-01T00:00:30Z".parse().unwrap())
+        );
+
+        super::apply_set_cookie(&mut jar, "c=3; Expires=Thu, 01 Jan 2026 00:00:10 GMT", now);
+        assert_eq!(
+            jar["c"].expires_at,
+            Some("2026-01-01T00:00:10Z".parse().unwrap())
+        );
+
+        // A huge Max-Age saturates instead of overflowing.
+        super::apply_set_cookie(&mut jar, "d=4; Max-Age=9223372036854775807", now);
+        assert_eq!(jar["d"].expires_at, Some(jiff::Timestamp::MAX));
+
+        // An Expires date in the past deletes the cookie.
+        super::apply_set_cookie(&mut jar, "a=1; Expires=Wed, 31 Dec 2025 00:00:00 GMT", now);
+        assert!(!jar.contains_key("a"));
+    }
+
     #[cfg(all(feature = "db", feature = "test-support"))]
     #[test]
     fn plain_identifiers_are_accepted() {

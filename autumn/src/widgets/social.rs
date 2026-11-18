@@ -462,17 +462,34 @@ impl CommentView {
                     .clone()
                     .unwrap_or_else(|| format!("user #{}", node.comment.author_id)),
                 body: node.comment.body.clone(),
-                datetime: Some(
-                    node.comment
-                        .created_at
-                        .and_utc()
-                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                ),
-                timestamp: node.comment.created_at.format("%Y-%m-%d %H:%M").to_string(),
+                datetime: comment_instant(&node.comment).map(|at| {
+                    crate::time::compat::rfc3339_opts(at, crate::time::compat::Digits::Secs, true)
+                }),
+                timestamp: jiff::fmt::strtime::format(
+                    "%Y-%m-%d %H:%M",
+                    comment_time(&node.comment),
+                )
+                .unwrap_or_default(),
                 replies: Self::from_thread(&node.replies),
             })
             .collect()
     }
+}
+
+/// The comment's stored UTC wall-clock time.
+#[cfg(feature = "db")]
+fn comment_time(comment: &crate::commentable::Comment) -> jiff::civil::DateTime {
+    use crate::time::bridge::JiffBridge as _;
+    comment.created_at.to_jiff()
+}
+
+/// The comment's creation instant, or `None` at the very edge of the civil
+/// range where no UTC instant exists.
+#[cfg(feature = "db")]
+fn comment_instant(comment: &crate::commentable::Comment) -> Option<jiff::Timestamp> {
+    jiff::tz::Offset::UTC
+        .to_timestamp(comment_time(comment))
+        .ok()
 }
 
 /// Configuration for a [`comment_thread`] widget.

@@ -20,15 +20,9 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -273,9 +267,11 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LogCaptureLayer {
         let message = visitor.message.unwrap_or_default();
         let level = event.metadata().level().as_str().to_owned();
         let target = event.metadata().target().to_owned();
-        let timestamp = crate::time::ambient_now()
-            .to_chrono()
-            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        let timestamp = crate::time::compat::rfc3339_opts(
+            crate::time::ambient_now(),
+            crate::time::compat::Digits::Millis,
+            true,
+        );
 
         let filter = self.buffer.filter();
         let mut fields = visitor.fields;

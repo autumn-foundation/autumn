@@ -5,11 +5,6 @@
 
 #![cfg(feature = "mcp")]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::JiffBridge as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -189,7 +184,7 @@ fn task_id(created: &Value) -> String {
 fn is_iso8601(value: &Value) -> bool {
     value
         .as_str()
-        .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
+        .is_some_and(|s| s.parse::<autumn_web::time::Timestamp>().is_ok())
 }
 
 // ── Capability negotiation ────────────────────────────────────────────
@@ -508,13 +503,8 @@ async fn update_needs_an_input_responses_object() {
 
 #[tokio::test]
 async fn expired_task_is_not_found() {
-    use chrono::TimeZone as _;
-    let clock = autumn_web::time::TickingClock::starting_at(
-        chrono::Utc
-            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
-            .unwrap()
-            .to_jiff(),
-    );
+    let clock =
+        autumn_web::time::TickingClock::starting_at("2026-01-01T00:00:00Z".parse().unwrap());
     let client = TestApp::new()
         .routes(routes![build_report])
         .with_clock(clock)

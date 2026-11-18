@@ -12,16 +12,12 @@
 //! ```rust
 //! use autumn_web::format::{number_to_currency, pluralize, time_ago_in_words};
 //! use autumn_web::time::{ClockSource, FixedClock};
-//! use chrono::{TimeZone, Utc};
 //! use maud::html;
 //! use rust_decimal::Decimal;
 //!
 //! let price: Decimal = "1234.5".parse().unwrap();
-//! let posted_at = Utc.with_ymd_and_hms(2026, 1, 1, 11, 58, 0).unwrap();
-//! # use autumn_web::time::bridge::ChronoBridge as _;
-//! let now = FixedClock::at("2026-01-01T12:00:00Z".parse().unwrap())
-//!     .now()
-//!     .to_chrono();
+//! let posted_at = "2026-01-01T11:58:00Z".parse().unwrap();
+//! let now = FixedClock::at("2026-01-01T12:00:00Z".parse().unwrap()).now();
 //!
 //! let markup = html! {
 //!     (number_to_currency(price))
@@ -34,12 +30,7 @@
 //! assert_eq!(markup.into_string(), "$1,234.50 — 3 comments — 2 minutes ago");
 //! ```
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rust_decimal::Decimal;
 
 // ── Currency ───────────────────────────────────────────────────────────────
@@ -392,15 +383,17 @@ pub fn truncate_words_with(text: &str, n: usize, omission: &str) -> maud::Markup
 /// output.
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn time_ago_in_words(dt: DateTime<Utc>, now: DateTime<Utc>) -> maud::Markup {
+pub fn time_ago_in_words(dt: Timestamp, now: Timestamp) -> maud::Markup {
     let text = relative_time_words(dt, now);
     maud::html! { (text) }
 }
 
 /// Render the relative-time phrase shared with [`crate::time_zone::time_ago`]
 /// (which additionally wraps it in a localized `<time>` element).
-pub(crate) fn relative_time_words(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let secs = now.signed_duration_since(dt).num_seconds();
+///
+/// The distance is counted in whole seconds, truncated toward zero.
+pub(crate) fn relative_time_words(dt: Timestamp, now: Timestamp) -> String {
+    let secs = now.duration_since(dt).as_secs();
     if secs < 0 {
         format!("in {}", duration_words(secs.unsigned_abs()))
     } else {
@@ -423,19 +416,26 @@ fn duration_words(secs: u64) -> String {
     format!("{n} {word}")
 }
 
-/// Render `dt` (UTC) using a `chrono` strftime-style absolute format string.
+/// Render `dt` in UTC using a strftime-style absolute format string, as
+/// [`jiff::fmt::strtime`] reads it. `%Z` prints `UTC`.
+///
+/// A pattern `jiff` cannot format falls back to RFC 3339 in whole seconds
+/// (`2026-06-07T14:32:01Z`) instead of panicking.
 ///
 /// ```rust
 /// use autumn_web::format::format_datetime;
-/// use chrono::{TimeZone, Utc};
+/// use autumn_web::time::Timestamp;
 ///
-/// let dt = Utc.with_ymd_and_hms(2026, 6, 7, 14, 32, 1).unwrap();
+/// let dt: Timestamp = "2026-06-07T14:32:01Z".parse().unwrap();
 /// assert_eq!(format_datetime(dt, "%Y-%m-%d").into_string(), "2026-06-07");
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn format_datetime(dt: DateTime<Utc>, fmt: &str) -> maud::Markup {
-    let text = dt.format(fmt).to_string();
+pub fn format_datetime(dt: Timestamp, fmt: &str) -> maud::Markup {
+    let text = jiff::fmt::strtime::format(fmt, &dt.to_zoned_datetime(jiff::tz::TimeZone::UTC))
+        .unwrap_or_else(|_| {
+            crate::time::compat::rfc3339_opts(dt, crate::time::compat::Digits::Secs, true)
+        });
     maud::html! { (text) }
 }
 
@@ -445,7 +445,12 @@ pub fn format_datetime(dt: DateTime<Utc>, fmt: &str) -> maud::Markup {
 mod tests {
     use super::*;
     use crate::time::{ClockSource, FixedClock};
-    use chrono::TimeZone;
+
+    fn utc(y: i16, mo: i8, d: i8, h: i8, mi: i8, s: i8) -> Timestamp {
+        jiff::tz::Offset::UTC
+            .to_timestamp(jiff::civil::date(y, mo, d).at(h, mi, s, 0))
+            .unwrap()
+    }
 
     fn dec(s: &str) -> Decimal {
         s.parse().unwrap()
@@ -772,66 +777,66 @@ mod tests {
 
     #[test]
     fn time_ago_seconds() {
-        let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 30).unwrap();
-        let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now.to_jiff());
+        let now = utc(2026, 1, 1, 12, 0, 30);
+        let dt = utc(2026, 1, 1, 12, 0, 0);
+        let clock = FixedClock::at(now);
         assert_eq!(
-            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
+            time_ago_in_words(dt, clock.now()).into_string(),
             "30 seconds ago"
         );
     }
 
     #[test]
     fn time_ago_one_minute_is_singular() {
-        let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 1, 0).unwrap();
-        let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now.to_jiff());
+        let now = utc(2026, 1, 1, 12, 1, 0);
+        let dt = utc(2026, 1, 1, 12, 0, 0);
+        let clock = FixedClock::at(now);
         assert_eq!(
-            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
+            time_ago_in_words(dt, clock.now()).into_string(),
             "1 minute ago"
         );
     }
 
     #[test]
     fn time_ago_minutes() {
-        let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 3, 0).unwrap();
-        let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now.to_jiff());
+        let now = utc(2026, 1, 1, 12, 3, 0);
+        let dt = utc(2026, 1, 1, 12, 0, 0);
+        let clock = FixedClock::at(now);
         assert_eq!(
-            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
+            time_ago_in_words(dt, clock.now()).into_string(),
             "3 minutes ago"
         );
     }
 
     #[test]
     fn time_ago_hours() {
-        let now = Utc.with_ymd_and_hms(2026, 1, 1, 14, 0, 0).unwrap();
-        let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now.to_jiff());
+        let now = utc(2026, 1, 1, 14, 0, 0);
+        let dt = utc(2026, 1, 1, 12, 0, 0);
+        let clock = FixedClock::at(now);
         assert_eq!(
-            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
+            time_ago_in_words(dt, clock.now()).into_string(),
             "2 hours ago"
         );
     }
 
     #[test]
     fn time_ago_days() {
-        let now = Utc.with_ymd_and_hms(2026, 1, 3, 12, 0, 0).unwrap();
-        let dt = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now.to_jiff());
+        let now = utc(2026, 1, 3, 12, 0, 0);
+        let dt = utc(2026, 1, 1, 12, 0, 0);
+        let clock = FixedClock::at(now);
         assert_eq!(
-            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
+            time_ago_in_words(dt, clock.now()).into_string(),
             "2 days ago"
         );
     }
 
     #[test]
     fn time_ago_future() {
-        let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
-        let dt = Utc.with_ymd_and_hms(2026, 1, 3, 12, 0, 0).unwrap();
-        let clock = FixedClock::at(now.to_jiff());
+        let now = utc(2026, 1, 1, 12, 0, 0);
+        let dt = utc(2026, 1, 3, 12, 0, 0);
+        let clock = FixedClock::at(now);
         assert_eq!(
-            time_ago_in_words(dt, clock.now().to_chrono()).into_string(),
+            time_ago_in_words(dt, clock.now()).into_string(),
             "in 2 days"
         );
     }
@@ -840,7 +845,7 @@ mod tests {
 
     #[test]
     fn format_datetime_custom_format() {
-        let dt = Utc.with_ymd_and_hms(2026, 6, 7, 14, 32, 1).unwrap();
+        let dt = utc(2026, 6, 7, 14, 32, 1);
         assert_eq!(
             format_datetime(dt, "%Y-%m-%d %H:%M:%S").into_string(),
             "2026-06-07 14:32:01"
@@ -849,7 +854,35 @@ mod tests {
 
     #[test]
     fn format_datetime_date_only() {
-        let dt = Utc.with_ymd_and_hms(2026, 6, 7, 14, 32, 1).unwrap();
+        let dt = utc(2026, 6, 7, 14, 32, 1);
         assert_eq!(format_datetime(dt, "%Y-%m-%d").into_string(), "2026-06-07");
+    }
+
+    #[test]
+    fn format_datetime_names_the_utc_zone() {
+        let dt = utc(2026, 6, 7, 14, 32, 1);
+        assert_eq!(
+            format_datetime(dt, "%a, %d %b %Y %H:%M %Z").into_string(),
+            "Sun, 07 Jun 2026 14:32 UTC"
+        );
+    }
+
+    #[test]
+    fn format_datetime_falls_back_on_a_bad_pattern() {
+        let dt = utc(2026, 6, 7, 14, 32, 1);
+        assert_eq!(
+            format_datetime(dt, "%Y-%m-%d %").into_string(),
+            "2026-06-07T14:32:01Z"
+        );
+    }
+
+    #[test]
+    fn time_ago_truncates_partial_seconds() {
+        let dt = utc(2026, 1, 1, 12, 0, 0);
+        let now = dt
+            .checked_add(jiff::SignedDuration::from_millis(1_999))
+            .unwrap();
+        assert_eq!(time_ago_in_words(dt, now).into_string(), "1 second ago");
+        assert_eq!(time_ago_in_words(now, dt).into_string(), "in 1 second");
     }
 }

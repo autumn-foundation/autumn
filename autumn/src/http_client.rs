@@ -54,11 +54,6 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -4410,10 +4405,13 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         return Some(Duration::from_secs(secs));
     }
     // HTTP-date format per RFC 9110 (e.g. "Tue, 01 Jan 2030 00:00:00 GMT").
-    let dt = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    // The weekday is not checked against the date.
+    let future = jiff::fmt::rfc2822::DateTimeParser::new()
+        .relaxed_weekday(true)
+        .parse_timestamp(value)
+        .ok()?;
     let now = crate::time::ambient_now();
-    let future = dt.with_timezone(&chrono::Utc);
-    let secs = u64::try_from((future - now.to_chrono()).num_seconds().max(0)).unwrap_or(0);
+    let secs = u64::try_from(future.duration_since(now).as_secs().max(0)).unwrap_or(0);
     Some(Duration::from_secs(secs))
 }
 
@@ -5484,6 +5482,21 @@ mod tests {
             duration.unwrap().as_secs() > 0,
             "future date should yield positive delay"
         );
+    }
+
+    #[test]
+    fn retry_after_past_http_date_is_zero() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::HeaderName::from_static("retry-after"),
+            HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
+        headers.insert(
+            reqwest::header::HeaderName::from_static("retry-after"),
+            HeaderValue::from_static("soon"),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
     }
 
     #[tokio::test]
