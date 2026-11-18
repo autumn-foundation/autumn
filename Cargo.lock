@@ -1773,7 +1773,6 @@ version = "0.1.0"
 dependencies = [
  "autumn-admin-plugin",
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -1899,7 +1898,6 @@ name = "bookmarks"
 version = "0.11.0"
 dependencies = [
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -1920,7 +1918,6 @@ version = "0.11.0"
 dependencies = [
  "autumn-cache-redis",
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -1944,7 +1941,6 @@ name = "bookmarks-sharded"
 version = "0.11.0"
 dependencies = [
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -4946,7 +4942,6 @@ name = "invoice"
 version = "0.1.0"
 dependencies = [
  "autumn-web",
- "chrono",
  "example-e2e",
  "maud",
  "tokio",
@@ -7522,7 +7517,6 @@ dependencies = [
  "async-graphql",
  "autumn-web",
  "axum",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -9177,7 +9171,6 @@ name = "teams"
 version = "0.1.0"
 dependencies = [
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -9510,7 +9503,6 @@ version = "0.1.0"
 dependencies = [
  "autumn-web",
  "base64 0.23.1",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -10740,7 +10732,6 @@ version = "0.11.0"
 dependencies = [
  "autumn-search",
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",

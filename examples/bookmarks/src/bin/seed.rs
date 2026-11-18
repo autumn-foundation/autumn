@@ -52,7 +52,7 @@ pub struct Bookmark {
     #[default]
     pub alive: bool,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[autumn_web::main]
