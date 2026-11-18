@@ -49,14 +49,9 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use chrono::{DateTime, Utc};
+use jiff::{SignedDuration, Timestamp};
 use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rust_decimal::Decimal;
@@ -328,16 +323,18 @@ pub fn decimal_f64() -> f64 {
 /// (`2024-01-01T00:00:00Z`) so golden data is reproducible; otherwise it is
 /// subtracted from [`ambient_now`](crate::time::ambient_now).
 #[must_use]
-pub fn recent_datetime() -> DateTime<Utc> {
+pub fn recent_datetime() -> Timestamp {
     const THIRTY_DAYS_SECS: i64 = 30 * 24 * 60 * 60;
     let offset = with_rng(|r| r.random_range(0..THIRTY_DAYS_SECS));
-    // `UNIX_EPOCH + N seconds` cannot overflow for this constant, so it cannot panic.
+    // The base constant is in range, so the fallback never runs.
     let base = if is_deterministic() {
-        DateTime::<Utc>::UNIX_EPOCH + chrono::Duration::seconds(DETERMINISTIC_BASE_EPOCH_SECS)
+        Timestamp::from_second(DETERMINISTIC_BASE_EPOCH_SECS).unwrap_or(Timestamp::UNIX_EPOCH)
     } else {
-        crate::time::ambient_now().to_chrono()
+        crate::time::ambient_now()
     };
-    base - chrono::Duration::seconds(offset)
+    // Only a clock within 30 days of `Timestamp::MIN` underflows; saturate there.
+    base.checked_sub(SignedDuration::from_secs(offset))
+        .unwrap_or(Timestamp::MIN)
 }
 
 /// A random v4 UUID drawn from the seeded RNG (so it is reproducible under a

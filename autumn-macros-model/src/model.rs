@@ -6915,6 +6915,154 @@ fn ty_last_generic_ident(ty: &syn::Type) -> Option<String> {
     None
 }
 
+/// A `jiff` date or time value, recognised by a field's type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JiffTime {
+    /// A value `#[model]` stores in a column, through an `autumn_web::db`
+    /// wrapper.
+    Column(TimeColumn),
+    /// `jiff::ZonedDateTime`: a form value in the server's zone, with no
+    /// column type of its own.
+    Zoned,
+}
+
+/// A date or time column type, and the `autumn_web::db` wrapper Diesel binds
+/// and loads it through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimeColumn {
+    /// `jiff::Timestamp` (`TIMESTAMPTZ`).
+    Timestamp,
+    /// `jiff::civil::DateTime` (`TIMESTAMP`).
+    DateTime,
+    /// `jiff::civil::Date` (`DATE`).
+    Date,
+    /// `jiff::civil::Time` (`TIME`).
+    Time,
+}
+
+impl TimeColumn {
+    /// The wrapper path for a column of this type, nullable or not.
+    fn wrapper(self, nullable: bool) -> TokenStream {
+        let name = match (self, nullable) {
+            (Self::Timestamp, false) => "SqlTimestamp",
+            (Self::DateTime, false) => "SqlDateTime",
+            (Self::Date, false) => "SqlDate",
+            (Self::Time, false) => "SqlTime",
+            (Self::Timestamp, true) => "SqlNullableTimestamp",
+            (Self::DateTime, true) => "SqlNullableDateTime",
+            (Self::Date, true) => "SqlNullableDate",
+            (Self::Time, true) => "SqlNullableTime",
+        };
+        let ident = format_ident!("{name}");
+        quote! { ::autumn_web::db::#ident }
+    }
+}
+
+/// The `jiff` time type `ty` names, read off its last path segment and the
+/// segment before it. `Option` is not unwrapped.
+///
+/// - `Timestamp` and `ZonedDateTime`: bare, or after `jiff::` or `time::`
+///   (`autumn_web::time::Timestamp`).
+/// - `DateTime` with no generic arguments, `Date` and `Time`: bare, or after
+///   `civil::`. A `DateTime<Tz>` is `chrono`'s.
+///
+/// Any other qualifier leaves the type alone, so an application type that
+/// shares one of these names opts out by being written with its path
+/// (`crate::Date`, `self::Time`).
+fn jiff_time_type(ty: &syn::Type) -> Option<JiffTime> {
+    let syn::Type::Path(tp) = ty else {
+        return None;
+    };
+    if tp.qself.is_some() {
+        return None;
+    }
+    let last = tp.path.segments.last()?;
+    if !matches!(last.arguments, syn::PathArguments::None) {
+        return None;
+    }
+    let parent = tp
+        .path
+        .segments
+        .iter()
+        .rev()
+        .nth(1)
+        .map(|segment| segment.ident.to_string());
+    let instant_path = matches!(parent.as_deref(), None | Some("jiff" | "time"));
+    let civil_path = matches!(parent.as_deref(), None | Some("civil"));
+    match last.ident.to_string().as_str() {
+        "Timestamp" if instant_path => Some(JiffTime::Column(TimeColumn::Timestamp)),
+        "ZonedDateTime" if instant_path => Some(JiffTime::Zoned),
+        "DateTime" if civil_path => Some(JiffTime::Column(TimeColumn::DateTime)),
+        "Date" if civil_path => Some(JiffTime::Column(TimeColumn::Date)),
+        "Time" if civil_path => Some(JiffTime::Column(TimeColumn::Time)),
+        _ => None,
+    }
+}
+
+/// The time column a field of type `ty` stores, and whether it is nullable
+/// (`Option<…>`).
+fn time_column(ty: &syn::Type) -> Option<(TimeColumn, bool)> {
+    let (inner, nullable) = option_inner_type(ty).map_or((ty, false), |inner| (inner, true));
+    match jiff_time_type(inner)? {
+        JiffTime::Column(column) => Some((column, nullable)),
+        JiffTime::Zoned => None,
+    }
+}
+
+/// The Diesel mapping for a time field: its value is bound and loaded
+/// through the matching `autumn_web::db` wrapper. `read` adds
+/// `deserialize_as` for the model's own struct, which Diesel also loads
+/// rows into; the write-only structs need `serialize_as` alone.
+fn time_column_diesel_attr(ty: &syn::Type, read: bool) -> Option<TokenStream> {
+    let (column, nullable) = time_column(ty)?;
+    let wrapper = column.wrapper(nullable);
+    Some(if read {
+        quote! { #[diesel(serialize_as = #wrapper, deserialize_as = #wrapper)] }
+    } else {
+        quote! { #[diesel(serialize_as = #wrapper)] }
+    })
+}
+
+/// Whether [`legacy_chrono_time_hint`] turns a `chrono` field type into a
+/// compile error. While it is `false`, a `chrono` column still compiles
+/// through Diesel's own `chrono` support.
+const REJECT_CHRONO_TIME_FIELDS: bool = false;
+
+/// For a field typed with a `chrono` date or time (optionally in an
+/// `Option`), the message naming the `jiff` type to use instead.
+fn legacy_chrono_time_hint(ty: &syn::Type) -> Option<String> {
+    let inner = option_inner_type(ty).unwrap_or(ty);
+    let syn::Type::Path(tp) = inner else {
+        return None;
+    };
+    let last = tp.path.segments.last()?;
+    let generic = !matches!(last.arguments, syn::PathArguments::None);
+    let replacement = match last.ident.to_string().as_str() {
+        "NaiveDateTime" => "`autumn_web::time::civil::DateTime`",
+        "NaiveDate" => "`autumn_web::time::civil::Date`",
+        "NaiveTime" => "`autumn_web::time::civil::Time`",
+        "DateTime" if generic => {
+            "`autumn_web::time::Timestamp` (or `autumn_web::time::ZonedDateTime` for a \
+             form-only value in the server's zone)"
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "`#[model]` stores dates and times as `jiff` values: use {replacement} \
+         instead of the `chrono` type"
+    ))
+}
+
+/// Reject a `chrono` date or time field when [`REJECT_CHRONO_TIME_FIELDS`]
+/// is on.
+fn validate_time_field(field: &syn::Field) -> syn::Result<()> {
+    if !REJECT_CHRONO_TIME_FIELDS {
+        return Ok(());
+    }
+    legacy_chrono_time_hint(&field.ty)
+        .map_or(Ok(()), |hint| Err(syn::Error::new_spanned(&field.ty, hint)))
+}
+
 /// The inner type `T` of an `Option<T>`, if `ty` is an `Option`.
 fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     if let syn::Type::Path(tp) = ty {
@@ -7064,22 +7212,57 @@ fn fake_expr_core(
             |(p, s)| quote! { ::autumn_web::fake::decimal_with(#p, #s).into() },
         )),
         "SqliteUuid" => Some(quote! { ::autumn_web::fake::uuid().into() }),
-        // `recent_datetime()` yields `DateTime<Utc>`, so only fake a `DateTime`
-        // whose timezone parameter is `Utc`. Other zones (e.g. `Local`,
-        // `FixedOffset`) fall through to Default to avoid a type mismatch.
-        "DateTime" if ty_last_generic_ident(ty).as_deref() == Some("Utc") => {
-            Some(quote! { ::autumn_web::fake::recent_datetime() })
-        }
-        "NaiveDateTime" => Some(quote! { ::autumn_web::fake::recent_datetime().naive_utc() }),
-        "NaiveDate" => Some(quote! { ::autumn_web::fake::recent_datetime().date_naive() }),
-        // Issue #3405: a scaffold `time` column. Whole seconds, so the edit
-        // form shows the stored value without a fraction.
+        _ if jiff_time_type(ty).is_some() => jiff_time_fake_expr(ty),
+        // `recent_datetime()` yields a `Timestamp`; a `chrono` field takes it
+        // converted. Only a `DateTime` whose timezone parameter is `Utc` is
+        // faked. Other zones (e.g. `Local`, `FixedOffset`) fall through to
+        // Default to avoid a type mismatch.
+        "DateTime" if ty_last_generic_ident(ty).as_deref() == Some("Utc") => Some(quote! {
+            ::autumn_web::time::bridge::ChronoBridge::to_chrono(
+                ::autumn_web::fake::recent_datetime(),
+            )
+        }),
+        "NaiveDateTime" => Some(quote! {
+            ::autumn_web::time::bridge::naive_utc(::autumn_web::fake::recent_datetime())
+        }),
+        "NaiveDate" => Some(quote! {
+            ::autumn_web::time::bridge::naive_utc(::autumn_web::fake::recent_datetime()).date()
+        }),
         "NaiveTime" => Some(quote! {{
-            let __autumn_time = ::autumn_web::fake::recent_datetime().time();
+            let __autumn_time = ::autumn_web::time::bridge::naive_utc(
+                ::autumn_web::fake::recent_datetime(),
+            )
+            .time();
             ::autumn_web::reexports::chrono::Timelike::with_nanosecond(&__autumn_time, 0)
                 .unwrap_or(__autumn_time)
         }}),
         _ => None,
+    }
+}
+
+/// The fake value for a `jiff` time field (see [`jiff_time_type`]), drawn
+/// from `fake::recent_datetime()` read as UTC.
+fn jiff_time_fake_expr(ty: &syn::Type) -> Option<TokenStream> {
+    let civil = quote! {
+        ::autumn_web::time::tz::TimeZone::UTC.to_datetime(::autumn_web::fake::recent_datetime())
+    };
+    match jiff_time_type(ty)? {
+        JiffTime::Column(TimeColumn::Timestamp) => {
+            Some(quote! { ::autumn_web::fake::recent_datetime() })
+        }
+        JiffTime::Column(TimeColumn::DateTime) => Some(civil),
+        JiffTime::Column(TimeColumn::Date) => Some(quote! { #civil.date() }),
+        // Issue #3405: a scaffold `time` column. Whole seconds, so the edit
+        // form shows the stored value without a fraction.
+        JiffTime::Column(TimeColumn::Time) => Some(quote! {{
+            let __autumn_time = #civil.time();
+            __autumn_time
+                .with()
+                .subsec_nanosecond(0)
+                .build()
+                .unwrap_or(__autumn_time)
+        }}),
+        JiffTime::Zoned => None,
     }
 }
 
@@ -7243,28 +7426,28 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
                 step: ::core::option::Option::Some(::std::string::String::from("any")),
             }
         },
+        // `<input type="datetime-local">` posts an offsetless wall-clock value. Each
+        // `jiff` type that gets the picker has a sound reading of that shape, wired to
+        // a matching tolerant deserializer (see `datetime_local_serde_attr`): UTC for a
+        // `Timestamp`, the server's zone for a `ZonedDateTime`, and the value itself
+        // for a civil date-time. `<input type="time">` posts `HH:MM`, which
+        // `civil::Time` reads (#3405).
+        _ if jiff_time_type(inner_ty).is_some() => match jiff_time_type(inner_ty) {
+            Some(JiffTime::Column(TimeColumn::Date)) => {
+                quote! { ::autumn_web::form::FieldControl::Date }
+            }
+            Some(JiffTime::Column(TimeColumn::Time)) => {
+                quote! { ::autumn_web::form::FieldControl::Time }
+            }
+            _ => quote! { ::autumn_web::form::FieldControl::DateTime },
+        },
         "NaiveDate" => quote! { ::autumn_web::form::FieldControl::Date },
         "NaiveDateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
-        // `<input type="time">` posts `HH:MM`, which chrono reads (#3405).
         "NaiveTime" => quote! { ::autumn_web::form::FieldControl::Time },
-        // `<input type="datetime-local">` posts an offsetless wall-clock value, so only
-        // zone parameters with a sound interpretation of that shape get the picker:
-        // `Utc` and the server's `Local`, each wired to a matching tolerant deserializer
-        // (see `datetime_local_serde_attr`). Any other zone — `FixedOffset`, a chrono-tz
-        // zone, or a bare `DateTime` alias whose zone the derive cannot see — falls back
-        // to a text input, pre-filled with the field's serialized RFC 3339 string, which
-        // chrono's default `Deserialize` round-trips as-is. Plainer, but honest, rather
-        // than a picker whose submission 400s.
-        "DateTime" => {
-            let picker_zone =
-                autumn_macros_support::schema::unwrap_single_generic(inner_ty, "DateTime")
-                    .is_some_and(|tz| matches!(type_name_str(&tz).as_str(), "Utc" | "Local"));
-            if picker_zone {
-                quote! { ::autumn_web::form::FieldControl::DateTime }
-            } else {
-                quote! { ::autumn_web::form::FieldControl::Text }
-            }
-        }
+        // A `chrono` `DateTime<Tz>` falls back to a text input, pre-filled with the
+        // field's serialized RFC 3339 string, which its own `Deserialize` round-trips
+        // as-is. Plainer, but honest, rather than a picker whose offsetless
+        // submission 400s.
         // `String`/`str`/`Uuid` render as text, and so do unknown types
         // (user enums, JSON, custom newtypes) as a safe fallback; promote
         // via `.override_field(...)` where a richer control is known.
@@ -7288,19 +7471,18 @@ fn widen_decimals_tokens(body: &TokenStream) -> TokenStream {
 /// `autumn_web::form`.
 ///
 /// `<input type="datetime-local">` posts an offsetless value (and not always
-/// with seconds), which chrono's default `Deserialize` for `DateTime<Utc>`
-/// rejects — so a `form_for` submission would 400 before validation even when
-/// the pre-filled value is untouched. The referenced helpers accept both the
-/// browser shape (`YYYY-MM-DDTHH:MM[:SS[.f]]`, interpreted as UTC for
-/// `DateTime<Utc>` columns and as the server's local wall clock for
-/// `DateTime<Local>` ones) *and* RFC 3339 (offset converted to the field's
-/// zone), so JSON API create bodies posted to the same `NewX` keep decoding.
+/// with seconds), which the default `Deserialize` for `Timestamp` rejects —
+/// so a `form_for` submission would 400 before validation even when the
+/// pre-filled value is untouched. The referenced helpers accept the browser
+/// shape (`YYYY-MM-DDTHH:MM[:SS[.f]]`, interpreted as UTC for `Timestamp`
+/// columns, as the server's wall clock for `ZonedDateTime` fields, and as is
+/// for `civil::DateTime` columns); the first two also accept RFC 3339, so
+/// JSON API create bodies posted to the same `NewX` keep decoding.
 ///
-/// Returns `None` for non-datetime fields, and for `DateTime<Tz>` with a
-/// zone parameter other than `Utc`/`Local` — those columns don't render a
-/// `datetime-local` control in the first place (`form_control_tokens` falls
-/// back to a text input whose RFC 3339 value chrono's default `Deserialize`
-/// round-trips), so they keep that default.
+/// Returns `None` for every other field, including a `chrono` `DateTime<Tz>`:
+/// that column does not render a `datetime-local` control in the first place
+/// (`form_control_tokens` falls back to a text input whose RFC 3339 value its
+/// own `Deserialize` round-trips), so it keeps that default.
 fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
     let nullable = is_option_type(ty);
     let inner = if nullable {
@@ -7308,17 +7490,11 @@ fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
     } else {
         ty.clone()
     };
-    let base = match type_name_str(&inner).as_str() {
-        "NaiveDateTime" => "deserialize_naive_datetime_local",
-        "DateTime" => {
-            let tz = autumn_macros_support::schema::unwrap_single_generic(&inner, "DateTime")?;
-            match type_name_str(&tz).as_str() {
-                "Utc" => "deserialize_datetime_local_utc",
-                "Local" => "deserialize_datetime_local_local",
-                _ => return None,
-            }
-        }
-        _ => return None,
+    let base = match jiff_time_type(&inner)? {
+        JiffTime::Column(TimeColumn::DateTime) => "deserialize_naive_datetime_local",
+        JiffTime::Column(TimeColumn::Timestamp) => "deserialize_datetime_local_utc",
+        JiffTime::Zoned => "deserialize_datetime_local_local",
+        JiffTime::Column(TimeColumn::Date | TimeColumn::Time) => return None,
     };
     // `deserialize_with`'s value is a string serde parses into a path itself
     // (it never passes through this crate's own generic `::autumn_web`
@@ -8842,6 +9018,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         if let Err(err) = validate_encrypted_field(f) {
             return err.to_compile_error();
         }
+        if let Err(err) = validate_time_field(f) {
+            return err.to_compile_error();
+        }
         match parse_field_encrypted(f) {
             Ok(spec) if spec.is_encrypted() => {
                 let col = f.ident.as_ref().unwrap().to_string();
@@ -9154,15 +9333,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Diesel's `AsChangeset`/`Insertable` derives expand `column.eq(value)` in
     // the model's module scope when `serialize_as` is present, which needs
     // `ExpressionMethods` in scope. Bring it in anonymously (only for models with
-    // encrypted columns) so app authors don't have to add the import themselves.
-    let encrypted_use = if encrypted_columns.is_empty() && classified_columns.is_empty() {
-        quote! {}
-    } else {
-        quote! {
-            #[allow(unused_imports)]
-            use ::autumn_web::reexports::diesel::ExpressionMethods as _;
-        }
-    };
+    // encrypted, classified or time columns) so app authors don't have to add the
+    // import themselves.
+    let has_time_columns = all_fields.iter().any(|f| time_column(&f.ty).is_some());
+    let encrypted_use =
+        if encrypted_columns.is_empty() && classified_columns.is_empty() && !has_time_columns {
+            quote! {}
+        } else {
+            quote! {
+                #[allow(unused_imports)]
+                use ::autumn_web::reexports::diesel::ExpressionMethods as _;
+            }
+        };
     // Encrypt encrypted columns in the durable commit-hook payload so secrets are
     // never persisted in plaintext to `autumn_repository_commit_hooks` (#805).
     let commit_hook_encrypt_stmt = if encrypted_columns.is_empty() {
@@ -9444,7 +9626,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                 },
             );
-            quote! { #(#val_attrs)* #(#attrs)* #enc #classified_diesel #private pub #ident: #ident_ty }
+            let time_diesel = time_column_diesel_attr(ty, true);
+            quote! { #(#val_attrs)* #(#attrs)* #enc #classified_diesel #time_diesel #private pub #ident: #ident_ty }
         })
         .collect();
 
@@ -9471,11 +9654,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .then(|| quote! { #[serde(default)] });
             // Datetime columns render as `<input type="datetime-local">` in
             // `form_for`, whose submitted value carries no timezone offset —
-            // chrono's default `Deserialize` for `DateTime<Utc>` would reject
-            // even an unchanged pre-filled value as a 400. Wire the tolerant
+            // the default `Deserialize` for `Timestamp` would reject even an
+            // unchanged pre-filled value as a 400. Wire the tolerant
             // deserializer (which also still accepts RFC 3339 JSON bodies);
             // see `datetime_local_serde_attr`.
             let datetime_local = datetime_local_serde_attr(ty);
+            let time_diesel = time_column_diesel_attr(ty, false);
             // #1654 (review round 2): the write structs carry the taint wrapper too.
             // Taking personal data in is not a release — `Classified` keeps its
             // `Deserialize`, and the declarative validators see through it (see
@@ -9498,7 +9682,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                 },
             );
-            quote! { #(#val_attrs)* #enc #classified_diesel #bool_default #datetime_local #classified_skip pub #ident: #new_ty }
+            quote! { #(#val_attrs)* #enc #classified_diesel #time_diesel #bool_default #datetime_local #classified_skip pub #ident: #new_ty }
         })
         .collect();
 
@@ -10130,7 +10314,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                 },
             );
-            quote! { #enc #classified_diesel pub #ident: Option<#changeset_ty> }
+            // A time column binds through its `autumn_web::db` wrapper; for
+            // the outer `Option`, Diesel applies the wrapper to the value
+            // inside it, so the wrapper follows the column's own type.
+            let time_diesel = time_column_diesel_attr(ty, false);
+            quote! { #enc #classified_diesel #time_diesel pub #ident: Option<#changeset_ty> }
         })
         .collect();
     // The lock_version column must be in the changeset so the UPDATE can
@@ -11377,6 +11565,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // absent: its column is TEXT, so SQL would order it
                 // lexicographically ("9" after "10") and the header would lie.
                 | "SqliteUuid"
+                | "Timestamp"
+                | "Date"
+                | "Time"
                 | "NaiveDateTime"
                 | "NaiveDate"
                 | "NaiveTime"
@@ -12255,17 +12446,38 @@ mod tests {
     }
 
     #[test]
-    fn naive_time_fake_expr_takes_the_time_of_a_recent_datetime() {
+    fn time_fake_expr_takes_the_whole_second_time_of_a_recent_datetime() {
         let ident: syn::Ident = syn::parse_quote!(opens);
         for ty in [
-            syn::parse_quote!(chrono::NaiveTime),
-            syn::parse_quote!(Option<chrono::NaiveTime>),
+            syn::parse_quote!(autumn_web::time::civil::Time),
+            syn::parse_quote!(Option<civil::Time>),
         ] {
             let expr = fake_expr_for_field(&ident, &ty, None)
-                .expect("NaiveTime should infer a fake expr")
+                .expect("civil::Time should infer a fake expr")
                 .to_string();
-            assert!(expr.contains("recent_datetime () . time ()"), "{expr}");
+            assert!(expr.contains("recent_datetime ()) . time ()"), "{expr}");
+            assert!(expr.contains("subsec_nanosecond (0)"), "{expr}");
         }
+    }
+
+    #[test]
+    fn jiff_fake_exprs_draw_from_recent_datetime() {
+        let ident: syn::Ident = syn::parse_quote!(at);
+        let expr = |ty: syn::Type| {
+            fake_expr_for_field(&ident, &ty, None)
+                .expect("a jiff time infers a fake expr")
+                .to_string()
+        };
+        let ts = expr(syn::parse_quote!(autumn_web::time::Timestamp));
+        assert!(
+            ts.contains(":: autumn_web :: fake :: recent_datetime ()"),
+            "{ts}"
+        );
+        let civil = expr(syn::parse_quote!(civil::DateTime));
+        assert!(civil.contains("TimeZone :: UTC . to_datetime"), "{civil}");
+        let date = expr(syn::parse_quote!(Option<civil::Date>));
+        assert!(date.contains(". date ()"), "{date}");
+        assert!(date.starts_with("Some") || date.contains("Some"), "{date}");
     }
 
     #[test]
@@ -20806,40 +21018,46 @@ mod tests {
         );
     }
 
-    // ── Datetime control/deserializer selection per zone parameter (#1135) ─
+    // ── Datetime control/deserializer selection per type (#1135) ─────────
 
-    /// Regression test (Codex P2 on #1587): only `DateTime<Utc>` and
-    /// `DateTime<Local>` — the zones whose offsetless `datetime-local`
-    /// submission has a matching tolerant deserializer — may render the
-    /// datetime picker. Any other zone parameter (`FixedOffset`, chrono-tz
-    /// zones, a bare un-parameterized `DateTime` alias) must fall back to a
-    /// text control whose RFC 3339 value round-trips through chrono's
-    /// default `Deserialize`; giving them the picker would 400 every
-    /// submission.
+    /// Every `jiff` type the picker serves has a matching tolerant
+    /// deserializer. A `chrono` `DateTime<Tz>` has none, so it falls back to a
+    /// text control whose RFC 3339 value its own `Deserialize` round-trips;
+    /// giving it the picker would 400 every submission.
     #[test]
-    fn form_control_tokens_gates_datetime_picker_on_zone_param() {
+    fn form_control_tokens_gives_the_picker_to_jiff_date_times_only() {
         let control = |ty: syn::Type| form_control_tokens(&ty, false).to_string();
 
-        let utc = control(syn::parse_quote!(chrono::DateTime<chrono::Utc>));
-        assert!(utc.contains("FieldControl :: DateTime"), "{utc}");
-        let local = control(syn::parse_quote!(chrono::DateTime<chrono::Local>));
-        assert!(local.contains("FieldControl :: DateTime"), "{local}");
+        for ty in [
+            syn::parse_quote!(autumn_web::time::Timestamp),
+            syn::parse_quote!(Timestamp),
+            syn::parse_quote!(jiff::civil::DateTime),
+            syn::parse_quote!(civil::DateTime),
+            syn::parse_quote!(jiff::ZonedDateTime),
+        ] {
+            let got = control(ty);
+            assert!(got.contains("FieldControl :: DateTime"), "{got}");
+        }
+        let date = control(syn::parse_quote!(civil::Date));
+        assert!(date.contains("FieldControl :: Date"), "{date}");
 
-        let fixed = control(syn::parse_quote!(chrono::DateTime<chrono::FixedOffset>));
-        assert!(fixed.contains("FieldControl :: Text"), "{fixed}");
-        let tz = control(syn::parse_quote!(chrono::DateTime<chrono_tz::Tz>));
-        assert!(tz.contains("FieldControl :: Text"), "{tz}");
-        // A bare alias hides the zone from the derive — no picker either.
-        let bare = control(syn::parse_quote!(DateTime));
-        assert!(bare.contains("FieldControl :: Text"), "{bare}");
+        for ty in [
+            syn::parse_quote!(chrono::DateTime<chrono::Utc>),
+            syn::parse_quote!(chrono::DateTime<chrono::FixedOffset>),
+            syn::parse_quote!(sea_orm::prelude::DateTime),
+        ] {
+            let got = control(ty);
+            assert!(got.contains("FieldControl :: Text"), "{got}");
+        }
     }
 
-    /// Issue #3405: a `NaiveTime` column renders the native time input.
+    /// Issue #3405: a time-of-day column renders the native time input.
     #[test]
-    fn form_control_tokens_maps_naive_time_to_a_time_input() {
+    fn form_control_tokens_maps_a_time_of_day_to_a_time_input() {
         for ty in [
+            syn::parse_quote!(autumn_web::time::civil::Time),
+            syn::parse_quote!(civil::Time),
             syn::parse_quote!(chrono::NaiveTime),
-            syn::parse_quote!(NaiveTime),
         ] {
             let control = form_control_tokens(&ty, false).to_string();
             assert!(control.contains("FieldControl :: Time"), "{control}");
@@ -20847,36 +21065,167 @@ mod tests {
     }
 
     /// The deserializer wiring must stay in lockstep with the control choice
-    /// above: `Utc`/`Local` get their zone-matching tolerant deserializer
-    /// (`_option` for nullable), everything else keeps chrono's default
-    /// `Deserialize` (fine — those columns render as text, whose RFC 3339
-    /// value the default parses).
+    /// above: each picker type gets its tolerant deserializer (`_option` for
+    /// nullable), everything else keeps its own `Deserialize`.
     #[test]
-    fn datetime_local_serde_attr_matches_zone_param() {
+    fn datetime_local_serde_attr_matches_the_field_type() {
         let attr = |ty: syn::Type| datetime_local_serde_attr(&ty).map(|t| t.to_string());
 
-        let utc = attr(syn::parse_quote!(chrono::DateTime<chrono::Utc>)).unwrap();
+        let utc = attr(syn::parse_quote!(autumn_web::time::Timestamp)).unwrap();
         assert!(utc.contains("deserialize_datetime_local_utc"), "{utc}");
 
-        let local = attr(syn::parse_quote!(chrono::DateTime<chrono::Local>)).unwrap();
+        let local = attr(syn::parse_quote!(jiff::ZonedDateTime)).unwrap();
         assert!(
             local.contains("deserialize_datetime_local_local"),
             "{local}"
         );
         assert!(!local.contains("_option"), "{local}");
 
-        let nullable = attr(syn::parse_quote!(Option<chrono::DateTime<chrono::Local>>)).unwrap();
+        let nullable = attr(syn::parse_quote!(Option<jiff::ZonedDateTime>)).unwrap();
         assert!(
             nullable.contains("deserialize_datetime_local_local_option"),
             "{nullable}"
         );
         assert!(nullable.contains("default"), "{nullable}");
 
-        assert_eq!(
-            attr(syn::parse_quote!(chrono::DateTime<chrono::FixedOffset>)),
-            None
+        let civil = attr(syn::parse_quote!(civil::DateTime)).unwrap();
+        assert!(
+            civil.contains("deserialize_naive_datetime_local"),
+            "{civil}"
         );
-        assert_eq!(attr(syn::parse_quote!(DateTime)), None);
+
+        assert_eq!(attr(syn::parse_quote!(civil::Date)), None);
+        assert_eq!(attr(syn::parse_quote!(chrono::DateTime<chrono::Utc>)), None);
+        assert_eq!(attr(syn::parse_quote!(chrono::NaiveDateTime)), None);
+    }
+
+    // ── Time columns bind through the `autumn_web::db` wrappers ───────────
+
+    #[test]
+    fn jiff_time_type_reads_the_name_and_its_qualifier() {
+        let kind = |ty: syn::Type| jiff_time_type(&ty);
+        let column = |c| Some(JiffTime::Column(c));
+        assert_eq!(
+            kind(syn::parse_quote!(Timestamp)),
+            column(TimeColumn::Timestamp)
+        );
+        assert_eq!(
+            kind(syn::parse_quote!(jiff::Timestamp)),
+            column(TimeColumn::Timestamp)
+        );
+        assert_eq!(
+            kind(syn::parse_quote!(autumn_web::time::Timestamp)),
+            column(TimeColumn::Timestamp)
+        );
+        assert_eq!(
+            kind(syn::parse_quote!(DateTime)),
+            column(TimeColumn::DateTime)
+        );
+        assert_eq!(
+            kind(syn::parse_quote!(autumn_web::time::civil::DateTime)),
+            column(TimeColumn::DateTime)
+        );
+        assert_eq!(
+            kind(syn::parse_quote!(civil::Date)),
+            column(TimeColumn::Date)
+        );
+        assert_eq!(kind(syn::parse_quote!(Time)), column(TimeColumn::Time));
+        assert_eq!(
+            kind(syn::parse_quote!(jiff::ZonedDateTime)),
+            Some(JiffTime::Zoned)
+        );
+
+        // Another crate's type of the same name, a qualified application
+        // type, and `chrono`'s generic `DateTime` are left alone.
+        for ty in [
+            syn::parse_quote!(prost_types::Timestamp),
+            syn::parse_quote!(time::Date),
+            syn::parse_quote!(crate::Date),
+            syn::parse_quote!(sea_orm::prelude::DateTime),
+            syn::parse_quote!(chrono::DateTime<chrono::Utc>),
+            syn::parse_quote!(chrono::NaiveDateTime),
+        ] {
+            assert_eq!(kind(ty), None);
+        }
+    }
+
+    #[test]
+    fn time_column_diesel_attr_names_the_wrapper_for_the_column_type() {
+        let attr =
+            |ty: syn::Type, read: bool| time_column_diesel_attr(&ty, read).map(|t| t.to_string());
+        let ts = attr(syn::parse_quote!(autumn_web::time::Timestamp), true).unwrap();
+        assert!(
+            ts.contains("serialize_as = :: autumn_web :: db :: SqlTimestamp"),
+            "{ts}"
+        );
+        assert!(
+            ts.contains("deserialize_as = :: autumn_web :: db :: SqlTimestamp"),
+            "{ts}"
+        );
+
+        let nullable = attr(syn::parse_quote!(Option<civil::DateTime>), false).unwrap();
+        assert!(
+            nullable.contains("serialize_as = :: autumn_web :: db :: SqlNullableDateTime"),
+            "{nullable}"
+        );
+        assert!(!nullable.contains("deserialize_as"), "{nullable}");
+
+        let date = attr(syn::parse_quote!(civil::Date), false).unwrap();
+        assert!(date.contains("SqlDate"), "{date}");
+        let time = attr(syn::parse_quote!(Option<civil::Time>), true).unwrap();
+        assert!(time.contains("SqlNullableTime"), "{time}");
+
+        // A zoned value and every non-time type have no column wrapper.
+        assert_eq!(attr(syn::parse_quote!(jiff::ZonedDateTime), true), None);
+        assert_eq!(attr(syn::parse_quote!(String), true), None);
+        assert_eq!(attr(syn::parse_quote!(chrono::NaiveDateTime), true), None);
+    }
+
+    #[test]
+    fn legacy_chrono_time_hint_names_the_jiff_replacement() {
+        let hint = |ty: syn::Type| legacy_chrono_time_hint(&ty);
+        let naive = hint(syn::parse_quote!(chrono::NaiveDateTime)).unwrap();
+        assert!(
+            naive.contains("autumn_web::time::civil::DateTime"),
+            "{naive}"
+        );
+        let date = hint(syn::parse_quote!(Option<NaiveDate>)).unwrap();
+        assert!(date.contains("autumn_web::time::civil::Date"), "{date}");
+        let time = hint(syn::parse_quote!(NaiveTime)).unwrap();
+        assert!(time.contains("autumn_web::time::civil::Time"), "{time}");
+        let zoned = hint(syn::parse_quote!(DateTime<Utc>)).unwrap();
+        assert!(zoned.contains("autumn_web::time::Timestamp"), "{zoned}");
+
+        assert_eq!(hint(syn::parse_quote!(civil::DateTime)), None);
+        assert_eq!(hint(syn::parse_quote!(Timestamp)), None);
+        assert_eq!(hint(syn::parse_quote!(String)), None);
+    }
+
+    #[test]
+    fn a_model_with_a_time_column_wraps_it_on_every_generated_struct() {
+        let input: syn::ItemStruct = syn::parse_quote! {
+            pub struct Event {
+                #[id]
+                pub id: i64,
+                pub starts_at: autumn_web::time::Timestamp,
+                pub ends_at: Option<autumn_web::time::Timestamp>,
+            }
+        };
+        let generated = model_macro(quote! {}, quote! { #input }).to_string();
+        assert!(
+            generated.contains(
+                "serialize_as = :: autumn_web :: db :: SqlTimestamp , deserialize_as = :: autumn_web :: db :: SqlTimestamp"
+            ),
+            "the read struct loads through the wrapper: {generated}"
+        );
+        assert!(
+            generated.contains("serialize_as = :: autumn_web :: db :: SqlNullableTimestamp"),
+            "a nullable column uses the nullable wrapper: {generated}"
+        );
+        assert!(
+            generated.contains("ExpressionMethods as _"),
+            "the derives' `column.eq(..)` needs the trait in scope: {generated}"
+        );
     }
 
     // ── Rename-pipeline contract (#1828) ────────────────────────────────────

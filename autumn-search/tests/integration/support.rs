@@ -55,7 +55,7 @@ pub struct TenantArticle {
     pub body: String,
     pub tenant_id: Option<String>,
     #[default]
-    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 /// `TenantArticle`'s repository genuinely opts into **both** scopes, so its
@@ -96,7 +96,7 @@ pub struct AuditArticle {
     #[searchable(weight = "B", embed)]
     pub body: String,
     #[default]
-    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(AuditArticle, table = "search_audit_articles")]

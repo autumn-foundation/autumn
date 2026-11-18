@@ -69,11 +69,6 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::collections::BTreeMap;
 
 #[cfg(feature = "openapi")]
@@ -550,22 +545,31 @@ impl_scalar_schema!(
     serde_json::json!({ "type": "string", "format": "uuid" })
 );
 impl_scalar_schema!(
-    chrono::DateTime<chrono::Utc>,
+    jiff::Timestamp,
     "date-time",
     serde_json::json!({ "type": "string", "format": "date-time" })
 );
 impl_scalar_schema!(
-    chrono::NaiveDate,
+    jiff::civil::Date,
     "date",
     serde_json::json!({ "type": "string", "format": "date" })
 );
-// No `format`. A naive value has no UTC offset, so `date-time` is wrong.
+// No `format`. A civil value has no UTC offset, so `date-time` and `time`
+// are wrong.
 impl_scalar_schema!(
-    chrono::NaiveDateTime,
+    jiff::civil::DateTime,
     "naive-date-time",
     serde_json::json!({
         "type": "string",
         "description": "ISO 8601 date-time with no UTC offset, e.g. 2026-09-06T18:00:00",
+    })
+);
+impl_scalar_schema!(
+    jiff::civil::Time,
+    "naive-time",
+    serde_json::json!({
+        "type": "string",
+        "description": "ISO 8601 time with no UTC offset, e.g. 18:00:00",
     })
 );
 impl_scalar_schema!(rust_decimal::Decimal, "decimal", decimal_scalar_schema());
@@ -1645,7 +1649,7 @@ fn flatten_ref_entries(entry: &SchemaEntry) -> Vec<&SchemaEntry> {
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec {
-    generate_spec_at(config, routes, crate::time::ambient_now().to_chrono())
+    generate_spec_at(config, routes, crate::time::ambient_now())
 }
 
 #[cfg(feature = "openapi")]
@@ -1653,7 +1657,7 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
 pub fn generate_spec_at(
     config: &OpenApiConfig,
     routes: &[&ApiDoc],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> OpenApiSpec {
     let mut paths: BTreeMap<String, PathItem> = BTreeMap::new();
 
@@ -1757,7 +1761,7 @@ pub fn generate_spec_at(
 fn operation_for(
     api_doc: &ApiDoc,
     api_versions: &[crate::app::ApiVersion],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     index: &SchemaComponentIndex,
 ) -> Operation {
     let mut tags = if api_doc.tags.is_empty() {
@@ -1777,8 +1781,8 @@ fn operation_for(
             .iter()
             .find(|av| av.version == version)
             .is_some_and(|av| {
-                let is_dep = av.deprecated_at.is_some_and(|d| now >= d.to_chrono());
-                let is_sun = av.sunset_at.is_some_and(|s| now >= s.to_chrono());
+                let is_dep = av.deprecated_at.is_some_and(|d| now >= d);
+                let is_sun = av.sunset_at.is_some_and(|s| now >= s);
                 is_dep || is_sun
             })
     });
@@ -3219,23 +3223,27 @@ mod scalar_schema_tests {
                 json!({"type": "string", "format": "uuid"}),
             ),
             (
-                <chrono::DateTime<chrono::Utc> as OpenApiSchema>::schema(),
+                <jiff::Timestamp as OpenApiSchema>::schema(),
                 json!({"type": "string", "format": "date-time"}),
             ),
             (
-                <chrono::NaiveDate as OpenApiSchema>::schema(),
+                <jiff::civil::Date as OpenApiSchema>::schema(),
                 json!({"type": "string", "format": "date"}),
             ),
         ];
         for (got, want) in cases {
             assert_eq!(got, want);
         }
-        let naive = <chrono::NaiveDateTime as OpenApiSchema>::schema();
-        assert_eq!(naive["type"], "string");
-        assert!(
-            naive.get("format").is_none(),
-            "naive has no offset: {naive}"
-        );
+        for civil in [
+            <jiff::civil::DateTime as OpenApiSchema>::schema(),
+            <jiff::civil::Time as OpenApiSchema>::schema(),
+        ] {
+            assert_eq!(civil["type"], "string");
+            assert!(
+                civil.get("format").is_none(),
+                "civil has no offset: {civil}"
+            );
+        }
     }
 
     #[test]

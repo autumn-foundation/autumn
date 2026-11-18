@@ -13,11 +13,6 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1091,7 +1086,7 @@ async fn serve_openapi_spec(
     use axum::response::IntoResponse;
     let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
     let now = state.clock().now();
-    let spec = crate::openapi::generate_spec_at(&config, &refs, now.to_chrono());
+    let spec = crate::openapi::generate_spec_at(&config, &refs, now);
     // Adds `x-payment-info` (MPP discovery) to priced operations.
     let spec_json = state.extension::<AutumnConfig>().map_or_else(
         || serde_json::to_string_pretty(&spec),

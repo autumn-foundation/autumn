@@ -333,9 +333,17 @@ macro_rules! wrapper_display {
 wrapper_display!(SqlTimestamp, SqlDateTime, SqlDate, SqlTime);
 
 /// Conversions between a nullable wrapper and `Option` of its non-null
-/// wrapper.
+/// wrapper, and from a present value. The last one lets a `#[model]`
+/// changeset bind the value inside its outer "set this column" `Option`
+/// through the nullable wrapper.
 macro_rules! nullable_option_conversions {
-    ($nullable:ident => $wrapper:ident) => {
+    ($nullable:ident => $wrapper:ident($inner:ty)) => {
+        impl From<$inner> for $nullable {
+            fn from(value: $inner) -> Self {
+                Self(Some(value))
+            }
+        }
+
         impl From<Option<$wrapper>> for $nullable {
             fn from(value: Option<$wrapper>) -> Self {
                 Self(value.map(|v| v.0))
@@ -350,10 +358,10 @@ macro_rules! nullable_option_conversions {
     };
 }
 
-nullable_option_conversions!(SqlNullableTimestamp => SqlTimestamp);
-nullable_option_conversions!(SqlNullableDateTime => SqlDateTime);
-nullable_option_conversions!(SqlNullableDate => SqlDate);
-nullable_option_conversions!(SqlNullableTime => SqlTime);
+nullable_option_conversions!(SqlNullableTimestamp => SqlTimestamp(Timestamp));
+nullable_option_conversions!(SqlNullableDateTime => SqlDateTime(civil::DateTime));
+nullable_option_conversions!(SqlNullableDate => SqlDate(civil::Date));
+nullable_option_conversions!(SqlNullableTime => SqlTime(civil::Time));
 
 /// `ToSql`/`FromSql` for one SQL type on one backend, for a wrapper and its
 /// nullable twin, from an `encode` and a `decode` function over the wrapped
