@@ -5,9 +5,9 @@
 //! feed pollers get a `304 Not Modified` when the feed hasn't changed.
 
 use autumn_web::feed::{Feed, FeedEntry};
-use autumn_web::time::bridge::JiffBridge as _;
 use autumn_web::reexports::axum::response::Response;
 use autumn_web::reexports::http::HeaderMap;
+use autumn_web::time::bridge::JiffBridge as _;
 use autumn_web::{AutumnResult, Db, get};
 
 use crate::models::Post;
