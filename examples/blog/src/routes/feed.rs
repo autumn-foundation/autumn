@@ -5,6 +5,7 @@
 //! feed pollers get a `304 Not Modified` when the feed hasn't changed.
 
 use autumn_web::feed::{Feed, FeedEntry};
+use autumn_web::time::bridge::JiffBridge as _;
 use autumn_web::reexports::axum::response::Response;
 use autumn_web::reexports::http::HeaderMap;
 use autumn_web::{AutumnResult, Db, get};
@@ -29,8 +30,8 @@ pub async fn feed_xml(mut db: Db, headers: HeaderMap) -> AutumnResult<Response> 
             let url = format!("{SITE_URL}/posts/{}", p.slug);
             FeedEntry::new(url.clone(), p.title.as_str(), url)
                 .summary(p.body.as_str())
-                .published(p.created_at.and_utc())
-                .updated(p.updated_at.and_utc())
+                .published(p.created_at.and_utc().to_jiff())
+                .updated(p.updated_at.and_utc().to_jiff())
         }));
 
     Ok(feed.conditional(&headers))
