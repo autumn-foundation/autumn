@@ -61,11 +61,6 @@
 
 #![cfg(feature = "mcp")]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::fmt::Write as _;
@@ -1817,12 +1812,7 @@ fn check_rate_cap(server: &McpServer, tool: &McpTool) -> Result<(), String> {
     };
     server
         .rate_limiter
-        .check(
-            grant.name,
-            grant.location,
-            cap,
-            server.state.clock().now().to_chrono(),
-        )
+        .check(grant.name, grant.location, cap, server.state.clock().now())
         .map_err(|wait| {
             format!(
                 "rate cap {rate} for grant {} exceeded; retry in {wait}s",

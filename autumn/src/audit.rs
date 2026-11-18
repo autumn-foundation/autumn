@@ -13,24 +13,19 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::state::AppState;
+use crate::time::Timestamp;
 
 /// Outcome of an audited action.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,7 +41,8 @@ pub enum AuditStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditEvent {
     /// UTC timestamp recorded when the event was created.
-    pub timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub timestamp: Timestamp,
     /// Actor identifier (user ID, service account ID, or API key ID).
     pub actor_id: String,
     /// Canonical action name (for example, `"user.role.update"`).
@@ -83,7 +79,7 @@ impl AuditEvent {
         status: AuditStatus,
     ) -> Self {
         Self {
-            timestamp: crate::time::ambient_now().to_chrono(),
+            timestamp: crate::time::ambient_now(),
             actor_id: actor_id.into(),
             action: action.into(),
             target_resource_id: target_resource_id.into(),
@@ -220,7 +216,7 @@ pub trait AuditSink: Send + Sync + 'static {
     ///
     /// Returns [`AuditError`] when the sink supports purging but the
     /// underlying storage could not be read or rewritten.
-    fn purge_before(&self, cutoff: DateTime<Utc>, dry_run: bool) -> AuditPurgeFuture<'_> {
+    fn purge_before(&self, cutoff: Timestamp, dry_run: bool) -> AuditPurgeFuture<'_> {
         let _ = (cutoff, dry_run);
         Box::pin(async { Ok(AuditPurgeOutcome::unsupported()) })
     }
@@ -300,7 +296,7 @@ impl AuditLogger {
     /// report can say so instead of implying an empty archive.
     ///
     /// Every sink is attempted even after one fails, matching [`Self::write`].
-    pub async fn purge_before(&self, cutoff: DateTime<Utc>, dry_run: bool) -> AuditPurgeSummary {
+    pub async fn purge_before(&self, cutoff: Timestamp, dry_run: bool) -> AuditPurgeSummary {
         let mut summary = AuditPurgeSummary::default();
         for sink in &self.sinks {
             match sink.purge_before(cutoff, dry_run).await {
@@ -373,7 +369,7 @@ impl JsonlFileAuditSink {
 ///
 /// A line that does not decode as an [`AuditEvent`] is kept, never counted
 /// as stale.
-fn keep_entries_since(existing: &str, cutoff: DateTime<Utc>) -> (String, u64) {
+fn keep_entries_since(existing: &str, cutoff: Timestamp) -> (String, u64) {
     let mut kept = String::with_capacity(existing.len());
     let mut removed: u64 = 0;
     for line in existing.lines() {
@@ -452,7 +448,7 @@ impl AuditSink for JsonlFileAuditSink {
     /// buffered alongside it — peak usage is roughly twice the archive size.
     /// Keep the JSONL archive rotated by external tooling if it can grow to a
     /// size that matters on your host.
-    fn purge_before(&self, cutoff: DateTime<Utc>, dry_run: bool) -> AuditPurgeFuture<'_> {
+    fn purge_before(&self, cutoff: Timestamp, dry_run: bool) -> AuditPurgeFuture<'_> {
         Box::pin(async move {
             let _guard = self.write_lock.lock().await;
             // Resolve the link first: `rename` replaces a symlink, not its target, so a link (for
@@ -629,7 +625,16 @@ pub async fn write_from_state(state: &AppState, event: AuditEvent) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time::SignedDuration;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn now() -> Timestamp {
+        crate::time::ambient_now()
+    }
+
+    fn days_ago(days: i64) -> Timestamp {
+        now() - SignedDuration::from_hours(days * 24)
+    }
 
     #[derive(Default)]
     struct FailingSink;
@@ -659,7 +664,7 @@ mod tests {
     /// Build a JSONL archive whose lines carry the given timestamps.
     async fn archive_with_timestamps(
         path: &std::path::Path,
-        timestamps: &[DateTime<Utc>],
+        timestamps: &[Timestamp],
     ) -> JsonlFileAuditSink {
         let sink = JsonlFileAuditSink::new(path);
         for (index, timestamp) in timestamps.iter().enumerate() {
@@ -722,11 +727,11 @@ mod tests {
     async fn jsonl_sink_purge_removes_only_entries_older_than_the_cutoff() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("audit.log");
-        let old = Utc::now() - chrono::Duration::days(400);
-        let recent = Utc::now() - chrono::Duration::days(1);
+        let old = days_ago(400);
+        let recent = days_ago(1);
         let sink = archive_with_timestamps(&path, &[old, recent, old]).await;
 
-        let cutoff = Utc::now() - chrono::Duration::days(30);
+        let cutoff = days_ago(30);
         let outcome = sink.purge_before(cutoff, false).await.expect("purge");
 
         assert!(outcome.supported);
@@ -744,11 +749,11 @@ mod tests {
         let target = tmp.path().join("real.log");
         let link = tmp.path().join("audit.log");
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
-        let old = Utc::now() - chrono::Duration::days(400);
-        let recent = Utc::now() - chrono::Duration::days(1);
+        let old = days_ago(400);
+        let recent = days_ago(1);
         let sink = archive_with_timestamps(&link, &[old, recent]).await;
 
-        let cutoff = Utc::now() - chrono::Duration::days(30);
+        let cutoff = days_ago(30);
         let outcome = sink.purge_before(cutoff, false).await.expect("purge");
 
         assert_eq!(outcome.entries_removed, 1);
@@ -771,15 +776,15 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("audit.log");
-        let old = Utc::now() - chrono::Duration::days(400);
-        let recent = Utc::now() - chrono::Duration::days(1);
+        let old = days_ago(400);
+        let recent = days_ago(1);
         let sink = archive_with_timestamps(&path, &[old, recent]).await;
         let (uid, gid) = (12_345, 54_321);
         if std::os::unix::fs::chown(&path, Some(uid), Some(gid)).is_err() {
             return; // Not root: the process cannot give a file away.
         }
 
-        let cutoff = Utc::now() - chrono::Duration::days(30);
+        let cutoff = days_ago(30);
         sink.purge_before(cutoff, false).await.expect("purge");
 
         let meta = std::fs::metadata(&path).expect("metadata");
@@ -792,7 +797,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let sink = JsonlFileAuditSink::new(tmp.path());
         let error = sink
-            .purge_before(Utc::now(), false)
+            .purge_before(now(), false)
             .await
             .expect_err("a directory is not an archive");
         assert!(
@@ -805,18 +810,18 @@ mod tests {
     async fn jsonl_sink_purge_of_a_missing_archive_is_a_no_op() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let sink = JsonlFileAuditSink::new(tmp.path().join("absent.log"));
-        let outcome = sink.purge_before(Utc::now(), false).await.expect("no-op");
+        let outcome = sink.purge_before(now(), false).await.expect("no-op");
         assert_eq!(outcome.entries_removed, 0);
     }
 
     #[test]
     fn keep_entries_since_keeps_undecodable_lines() {
-        let old = Utc::now() - chrono::Duration::days(400);
+        let old = days_ago(400);
         let mut event = AuditEvent::new("a", "x", "t", None, AuditStatus::Success);
         event.timestamp = old;
         let stale = serde_json::to_string(&event).expect("json");
         let input = format!("{stale}\nnot json\n\n");
-        let (kept, removed) = keep_entries_since(&input, Utc::now());
+        let (kept, removed) = keep_entries_since(&input, now());
         assert_eq!((kept.as_str(), removed), ("not json\n", 1));
     }
 
@@ -824,14 +829,11 @@ mod tests {
     async fn jsonl_sink_purge_dry_run_counts_without_writing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("audit.log");
-        let old = Utc::now() - chrono::Duration::days(400);
+        let old = days_ago(400);
         let sink = archive_with_timestamps(&path, &[old, old]).await;
         let before = tokio::fs::read_to_string(&path).await.expect("read");
 
-        let outcome = sink
-            .purge_before(Utc::now(), true)
-            .await
-            .expect("dry-run purge");
+        let outcome = sink.purge_before(now(), true).await.expect("dry-run purge");
 
         assert_eq!(outcome.entries_removed, 2);
         let after = tokio::fs::read_to_string(&path).await.expect("read");
@@ -845,7 +847,7 @@ mod tests {
         // discarded by a retention sweep.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("audit.log");
-        let old = Utc::now() - chrono::Duration::days(400);
+        let old = days_ago(400);
         let sink = archive_with_timestamps(&path, &[old]).await;
         tokio::fs::write(
             &path,
@@ -858,7 +860,7 @@ mod tests {
         .await
         .expect("append junk");
 
-        let outcome = sink.purge_before(Utc::now(), false).await.expect("purge");
+        let outcome = sink.purge_before(now(), false).await.expect("purge");
 
         assert_eq!(outcome.entries_removed, 1);
         let content = tokio::fs::read_to_string(&path).await.expect("read back");
@@ -878,16 +880,13 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("audit.jsonl");
-        let old = Utc::now() - chrono::Duration::days(400);
-        let sink = archive_with_timestamps(&path, &[old, old, Utc::now()]).await;
+        let old = days_ago(400);
+        let sink = archive_with_timestamps(&path, &[old, old, now()]).await;
         tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .await
             .expect("harden the archive");
 
-        let outcome = sink
-            .purge_before(Utc::now() - chrono::Duration::days(30), false)
-            .await
-            .expect("purge");
+        let outcome = sink.purge_before(days_ago(30), false).await.expect("purge");
 
         assert_eq!(outcome.entries_removed, 2);
         let mode = tokio::fs::metadata(&path)
@@ -907,7 +906,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let sink = JsonlFileAuditSink::new(tmp.path().join("never-written.log"));
 
-        let outcome = sink.purge_before(Utc::now(), false).await.expect("purge");
+        let outcome = sink.purge_before(now(), false).await.expect("purge");
 
         assert!(outcome.supported);
         assert_eq!(outcome.entries_removed, 0);
@@ -977,7 +976,7 @@ mod tests {
     #[tokio::test]
     async fn a_sink_that_cannot_purge_reports_unsupported() {
         let outcome = TracingAuditSink
-            .purge_before(Utc::now(), false)
+            .purge_before(now(), false)
             .await
             .expect("default purge");
         assert!(!outcome.supported);
@@ -987,7 +986,7 @@ mod tests {
     #[tokio::test]
     async fn logger_purge_sums_across_sinks_and_reports_support() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let old = Utc::now() - chrono::Duration::days(400);
+        let old = days_ago(400);
         let first = tmp.path().join("a.log");
         let second = tmp.path().join("b.log");
         archive_with_timestamps(&first, &[old, old]).await;
@@ -998,7 +997,7 @@ mod tests {
             .with_sink(Arc::new(JsonlFileAuditSink::new(&first)))
             .with_sink(Arc::new(JsonlFileAuditSink::new(&second)));
 
-        let summary = logger.purge_before(Utc::now(), false).await;
+        let summary = logger.purge_before(now(), false).await;
 
         assert_eq!(summary.entries_removed, 3);
         assert!(
@@ -1012,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn logger_purge_with_no_purgeable_sinks_reports_unsupported() {
         let logger = AuditLogger::new().with_sink(Arc::new(TracingAuditSink));
-        let summary = logger.purge_before(Utc::now(), false).await;
+        let summary = logger.purge_before(now(), false).await;
         assert!(!summary.supported);
         assert_eq!(summary.entries_removed, 0);
         assert!(summary.errors.is_empty());
@@ -1026,7 +1025,7 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn purge_before(&self, _cutoff: DateTime<Utc>, _dry_run: bool) -> AuditPurgeFuture<'_> {
+        fn purge_before(&self, _cutoff: Timestamp, _dry_run: bool) -> AuditPurgeFuture<'_> {
             Box::pin(async { Err(AuditError::new("sink offline")) })
         }
     }
@@ -1036,7 +1035,7 @@ mod tests {
         // A partial purge has already deleted entries. Dropping the count with the error would
         // report `rows_removed = 0` for entries that are gone.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let old = Utc::now() - chrono::Duration::days(400);
+        let old = days_ago(400);
         let path = tmp.path().join("a.log");
         archive_with_timestamps(&path, &[old, old]).await;
 
@@ -1044,7 +1043,7 @@ mod tests {
             .with_sink(Arc::new(JsonlFileAuditSink::new(&path)))
             .with_sink(Arc::new(UnpurgeableSink));
 
-        let summary = logger.purge_before(Utc::now(), false).await;
+        let summary = logger.purge_before(now(), false).await;
 
         assert_eq!(
             summary.entries_removed, 2,

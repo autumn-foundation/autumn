@@ -65,11 +65,6 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use lru::LruCache;
 use std::future::Future;
 use std::net::IpAddr;
@@ -78,9 +73,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use crate::time::{ClockSource, SystemClock};
+use crate::time::{ClockSource, SystemClock, Timestamp};
 use axum::http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
-use chrono::{DateTime, Utc};
 use http::header::{CONTENT_TYPE, HeaderName, RETRY_AFTER};
 use tower::{Layer, Service};
 
@@ -187,10 +181,10 @@ enum Decision {
 struct Bucket {
     tokens: f64,
     /// Wall-clock instant of the last refill, read from the injected
-    /// [`ClockSource`]. Stored as a `DateTime<Utc>` (rather than a monotonic
+    /// [`ClockSource`]. Stored as a [`Timestamp`] (rather than a monotonic
     /// `Instant`) so deterministic test/sim clocks can drive refill under
     /// virtual time.
-    last_refill: DateTime<Utc>,
+    last_refill: Timestamp,
 }
 
 /// Per-key token bucket state stored in-process.
@@ -217,9 +211,9 @@ impl MemoryStore {
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    fn decide(&self, key: &str, now: DateTime<Utc>, burst: f64, refill_per_sec: f64) -> Decision {
+    fn decide(&self, key: &str, now: Timestamp, burst: f64, refill_per_sec: f64) -> Decision {
         // From the injected clock, not `SystemTime::now()`, so a test clock drives the headers.
-        let now_unix = u64::try_from(now.timestamp()).unwrap_or(0);
+        let now_unix = u64::try_from(now.as_second()).unwrap_or(0);
 
         let tokens_after = {
             let mut buckets = match self.buckets.lock() {
@@ -234,8 +228,7 @@ impl MemoryStore {
             });
 
             // A backwards wall-clock jump yields no refill, matching the Lua's `math.max(0, …)`.
-            let elapsed = (now - bucket.last_refill)
-                .to_std()
+            let elapsed = std::time::Duration::try_from(now.duration_since(bucket.last_refill))
                 .unwrap_or(std::time::Duration::ZERO)
                 .as_secs_f64();
             bucket.tokens = elapsed.mul_add(refill_per_sec, bucket.tokens).min(burst);
@@ -780,9 +773,7 @@ impl Limiter {
     #[allow(clippy::unused_async)]
     async fn decide(&self, key: &str, burst: f64, rps: f64) -> Option<Decision> {
         match &self.backend {
-            BucketBackend::Memory(store) => {
-                Some(store.decide(key, self.clock.now().to_chrono(), burst, rps))
-            }
+            BucketBackend::Memory(store) => Some(store.decide(key, self.clock.now(), burst, rps)),
             #[cfg(feature = "redis")]
             BucketBackend::Redis(store) => store.decide(key, burst, rps).await,
         }
@@ -1805,11 +1796,11 @@ pub async fn __check_throttle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time::SignedDuration;
     use axum::Router;
     use axum::body::Body;
     use axum::extract::ConnectInfo;
     use axum::routing::get;
-    use chrono::TimeZone;
     use std::net::{IpAddr, SocketAddr};
     use std::time::Duration;
     use tower::ServiceExt;
@@ -2100,7 +2091,7 @@ mod tests {
     #[test]
     fn memory_store_retry_after_calculation() {
         let store = MemoryStore::new();
-        let now = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let now: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
         // Burst 1.0, Refill 0.1 tokens/sec (10 sec per token)
         let _ = store.decide("ip1", now, 1.0, 0.1); // Consumes 1.0, bucket.tokens = 0.0
 
@@ -2113,7 +2104,7 @@ mod tests {
         }
 
         // 5 seconds later, bucket.tokens = 0.5. Deficit = 0.5. Secs = 0.5 / 0.1 = 5.0
-        let later = now + chrono::Duration::seconds(5);
+        let later = now + SignedDuration::from_secs(5);
         match store.decide("ip1", later, 1.0, 0.1) {
             Decision::Denied {
                 retry_after_secs, ..
@@ -2122,7 +2113,7 @@ mod tests {
         }
 
         // 9.5 seconds later, bucket.tokens = 0.95. Deficit = 0.05. Secs = 0.05 / 0.1 = 0.5 -> ceil -> 1.0
-        let even_later = now + chrono::Duration::milliseconds(9500);
+        let even_later = now + SignedDuration::from_millis(9500);
         match store.decide("ip1", even_later, 1.0, 0.1) {
             Decision::Denied {
                 retry_after_secs, ..
@@ -2138,7 +2129,7 @@ mod tests {
                 NonZeroUsize::new(2).expect("2 is non-zero"),
             ))),
         };
-        let now = chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let now: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
         assert!(matches!(
             store.decide("a", now, 2.0, 0.1),
             Decision::Allowed { remaining: 1, .. }
@@ -4531,9 +4522,9 @@ mod tests {
 
     #[tokio::test]
     async fn quota_headers_carry_exact_decimal_values_when_allowed_and_when_denied() {
-        let now = Utc.timestamp_opt(1_748_736_000, 0).unwrap();
+        let now = Timestamp::from_second(1_748_736_000).unwrap();
         let layer = RateLimitLayer::from_config(&cfg(true, 0.5, 2))
-            .with_clock(Arc::new(crate::time::FixedClock::at(now.to_jiff())));
+            .with_clock(Arc::new(crate::time::FixedClock::at(now)));
         let app = Router::new()
             .route("/", get(|| async { "ok" }))
             .layer(layer);

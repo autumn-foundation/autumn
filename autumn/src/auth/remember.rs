@@ -116,9 +116,9 @@ pub struct RememberRecord {
     /// When the **current** token was minted (i.e. the moment of the last
     /// rotation). Combined with the grace duration this bounds how long the
     /// [`previous_token_hash`](Self::previous_token_hash) stays acceptable.
-    pub rotated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub rotated_at: Option<crate::time::Timestamp>,
     /// Absolute expiry of this series.
-    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: crate::time::Timestamp,
 }
 
 /// Outcome of evaluating a presented remember cookie against the stored record.
@@ -263,13 +263,13 @@ pub fn build_remember_clear_cookie(config: &RememberConfig) -> String {
 /// truth for callers (e.g. the generated middleware).
 pub const DEFAULT_ROTATION_GRACE_SECS: i64 = 60;
 
-/// The default rotation grace window as a [`chrono::Duration`].
+/// The default rotation grace window as a [`SignedDuration`](crate::time::SignedDuration).
 ///
 /// Convenience wrapper over [`DEFAULT_ROTATION_GRACE_SECS`] so callers share one
 /// source of truth for the grace window.
 #[must_use]
-pub const fn default_rotation_grace() -> chrono::Duration {
-    chrono::Duration::seconds(DEFAULT_ROTATION_GRACE_SECS)
+pub const fn default_rotation_grace() -> crate::time::SignedDuration {
+    crate::time::SignedDuration::from_secs(DEFAULT_ROTATION_GRACE_SECS)
 }
 
 /// Evaluate a presented remember token against the stored record for its series.
@@ -292,8 +292,8 @@ pub const fn default_rotation_grace() -> chrono::Duration {
 pub fn evaluate_remember(
     presented_token: &str,
     record: Option<&RememberRecord>,
-    now: chrono::DateTime<chrono::Utc>,
-    grace: chrono::Duration,
+    now: crate::time::Timestamp,
+    grace: crate::time::SignedDuration,
 ) -> RememberDecision {
     let Some(record) = record else {
         return RememberDecision::Reject;
@@ -306,7 +306,7 @@ pub fn evaluate_remember(
     }
     if let (Some(prev), Some(rotated_at)) = (&record.previous_token_hash, record.rotated_at)
         && verify_remember_token(presented_token, prev)
-        && now - rotated_at <= grace
+        && now.duration_since(rotated_at) <= grace
     {
         return RememberDecision::Accept;
     }
@@ -316,15 +316,15 @@ pub fn evaluate_remember(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
+    use crate::time::{SignedDuration, Timestamp};
 
-    fn ts(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(secs, 0).expect("valid timestamp")
+    fn ts(secs: i64) -> Timestamp {
+        Timestamp::from_second(secs).expect("valid timestamp")
     }
 
     /// A fixed 60-second grace window for the evaluation tests.
-    fn grace() -> chrono::Duration {
-        chrono::Duration::seconds(60)
+    fn grace() -> SignedDuration {
+        SignedDuration::from_secs(60)
     }
 
     #[test]
@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(DEFAULT_ROTATION_GRACE_SECS, 60);
         assert_eq!(
             default_rotation_grace(),
-            chrono::Duration::seconds(DEFAULT_ROTATION_GRACE_SECS)
+            SignedDuration::from_secs(DEFAULT_ROTATION_GRACE_SECS)
         );
     }
 

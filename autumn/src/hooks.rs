@@ -54,11 +54,6 @@
 //! - [`MutationContext`] -- carries actor identity, request ID, and
 //!   timestamp into every hook invocation.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::borrow::Cow;
 
 use serde::de::Deserializer;
@@ -109,7 +104,8 @@ pub struct MutationContext {
     /// Correlation / request ID for tracing.
     pub request_id: Option<String>,
     /// Timestamp of the mutation.
-    pub now: chrono::DateTime<chrono::Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub now: crate::time::Timestamp,
     /// Cache keys to invalidate after the mutation.
     pub invalidate_keys: Vec<String>,
     /// Framework-scoped idempotency key for this mutation, when the mutation
@@ -132,7 +128,7 @@ impl MutationContext {
             // A `before_*` hook can still override this: hooks run after construction.
             actor: crate::current::Current::actor(),
             request_id: Some(uuid::Uuid::new_v4().to_string()),
-            now: crate::time::ambient_now().to_chrono(),
+            now: crate::time::ambient_now(),
             invalidate_keys: Vec::new(),
             idempotency_key: None,
         }

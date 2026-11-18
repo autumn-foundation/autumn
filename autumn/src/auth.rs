@@ -53,11 +53,6 @@
 //! `401 Unauthorized` before they reach the handler. It checks for the
 //! presence of a session key (default: `"user_id"`).
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 #[cfg(feature = "oauth2")]
 use std::collections::HashMap;
 use std::future::Future;
@@ -1732,7 +1727,7 @@ pub struct VerifiedToken {
     pub name: String,
     /// Expiry carried through so [`ApiTokenStore::rotate`] can preserve it on
     /// the replacement token instead of issuing a non-expiring one.
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<crate::time::Timestamp>,
 }
 
 /// Non-secret metadata for an issued token, returned by
@@ -1751,13 +1746,13 @@ pub struct TokenMetadata {
     /// Flat permission strings granted to this token.
     pub scopes: Vec<String>,
     /// When the token was issued.
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: crate::time::Timestamp,
     /// Optional expiry; `None` means the token never expires.
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<crate::time::Timestamp>,
     /// Last successful authentication, recorded on use.
-    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_used_at: Option<crate::time::Timestamp>,
     /// Revocation timestamp; `None` means the token is still active.
-    pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub revoked_at: Option<crate::time::Timestamp>,
 }
 
 /// Parameters for minting a scoped token via
@@ -1771,7 +1766,7 @@ pub struct IssueTokenSpec<'a> {
     /// Flat permission strings to grant.
     pub scopes: &'a [String],
     /// Optional expiry; `None` mints a non-expiring token.
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub expires_at: Option<crate::time::Timestamp>,
 }
 
 /// Backend trait for storing and verifying API bearer tokens.
@@ -1955,10 +1950,10 @@ struct StoredToken {
     principal_id: String,
     name: String,
     scopes: Vec<String>,
-    created_at: chrono::DateTime<chrono::Utc>,
-    expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    last_used_at: Option<chrono::DateTime<chrono::Utc>>,
-    revoked_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: crate::time::Timestamp,
+    expires_at: Option<crate::time::Timestamp>,
+    last_used_at: Option<crate::time::Timestamp>,
+    revoked_at: Option<crate::time::Timestamp>,
 }
 
 #[derive(Clone)]
@@ -2102,7 +2097,7 @@ impl InMemoryApiTokenStore {
             principal_id: spec.principal_id.to_owned(),
             name: spec.name.to_owned(),
             scopes: spec.scopes.to_vec(),
-            created_at: self.clock.now().to_chrono(),
+            created_at: self.clock.now(),
             expires_at: spec.expires_at,
             last_used_at: None,
             revoked_at: None,
@@ -2118,7 +2113,7 @@ impl InMemoryApiTokenStore {
     /// Returns `None` for unknown, revoked, or expired tokens.
     fn resolve_used(&self, raw_token: &str) -> Option<VerifiedToken> {
         let hash = hash_api_token(raw_token);
-        let now = self.clock.now().to_chrono();
+        let now = self.clock.now();
         let mut guard = self.tokens.write().expect("api token store lock poisoned");
         let stored = guard.get_mut(&hash)?;
         if stored.revoked_at.is_some() || stored.expires_at.is_some_and(|exp| exp <= now) {
@@ -2162,7 +2157,7 @@ impl ApiTokenStore for InMemoryApiTokenStore {
     ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>> {
         Box::pin(async move {
             let hash = hash_api_token(raw_token);
-            let now = self.clock.now().to_chrono();
+            let now = self.clock.now();
             let mut guard = self.tokens.write().expect("api token store lock poisoned");
             if let Some(stored) = guard.get_mut(&hash) {
                 stored.revoked_at.get_or_insert(now);
@@ -2604,17 +2599,11 @@ pub const API_TOKEN_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
 // The store is typed on `AsyncPgConnection`, so it needs the Postgres client.
 #[cfg(feature = "postgres")]
 mod db_store {
-    #[allow(
-        unused_imports,
-        reason = "temporary chrono bridge; some callers are feature- or test-gated"
-    )]
-    use crate::time::bridge::ChronoBridge as _;
     use std::future::Future;
     use std::pin::Pin;
 
     use std::sync::Arc;
 
-    use chrono::{DateTime, NaiveDateTime, Utc};
     use diesel::OptionalExtension as _;
     use diesel::prelude::*;
     use diesel_async::AsyncPgConnection;
@@ -2625,8 +2614,9 @@ mod db_store {
         ApiTokenStore, IssueTokenSpec, TokenMetadata, VerifiedToken, generate_raw_token,
         hash_api_token, scopes_from_json,
     };
+    use crate::db::SqlDateTime;
     use crate::error::AutumnError;
-    use crate::time::{ClockSource, SystemClock};
+    use crate::time::{ClockSource, SignedDuration, SystemClock, Timestamp, civil, tz};
 
     diesel::table! {
         api_tokens (id) {
@@ -2649,7 +2639,7 @@ mod db_store {
         principal_id: &'a str,
         name: &'a str,
         scopes: serde_json::Value,
-        expires_at: Option<NaiveDateTime>,
+        expires_at: Option<SqlDateTime>,
     }
 
     /// Row shape returned by [`DbApiTokenStore::list`].
@@ -2659,14 +2649,29 @@ mod db_store {
         name: String,
         principal_id: String,
         scopes: serde_json::Value,
-        created_at: NaiveDateTime,
-        expires_at: Option<NaiveDateTime>,
-        last_used_at: Option<NaiveDateTime>,
-        revoked_at: Option<NaiveDateTime>,
+        created_at: SqlDateTime,
+        expires_at: Option<SqlDateTime>,
+        last_used_at: Option<SqlDateTime>,
+        revoked_at: Option<SqlDateTime>,
     }
 
-    const fn to_utc(naive: NaiveDateTime) -> DateTime<Utc> {
-        DateTime::from_naive_utc_and_offset(naive, Utc)
+    /// The UTC wall-clock value the `TIMESTAMP` columns store for `ts`.
+    fn to_column(ts: Timestamp) -> SqlDateTime {
+        SqlDateTime(tz::Offset::UTC.to_datetime(ts))
+    }
+
+    /// A stored UTC wall-clock value as an instant. A value past either end
+    /// of [`Timestamp`]'s range saturates to [`Timestamp::MAX`] /
+    /// [`Timestamp::MIN`].
+    fn to_utc(value: SqlDateTime) -> Timestamp {
+        let dt: civil::DateTime = value.0;
+        tz::Offset::UTC.to_timestamp(dt).unwrap_or_else(|_| {
+            if dt.year() < 0 {
+                Timestamp::MIN
+            } else {
+                Timestamp::MAX
+            }
+        })
     }
 
     fn scopes_to_json(scopes: &[String]) -> serde_json::Value {
@@ -2772,7 +2777,7 @@ mod db_store {
         ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>> {
             Box::pin(async move {
                 let hash = hash_api_token(raw_token);
-                let now = self.clock.now().to_chrono().naive_utc();
+                let now = to_column(self.clock.now());
                 let mut conn = self.conn().await?;
                 diesel::update(api_tokens::table)
                     .filter(api_tokens::token_hash.eq(&hash))
@@ -2799,7 +2804,7 @@ mod db_store {
                         principal_id: spec.principal_id,
                         name: spec.name,
                         scopes: scopes_to_json(spec.scopes),
-                        expires_at: spec.expires_at.map(|dt| dt.naive_utc()),
+                        expires_at: spec.expires_at.map(to_column),
                     })
                     .execute(&mut conn)
                     .await
@@ -2823,7 +2828,7 @@ mod db_store {
                 let old_hash = hash_api_token(raw_token);
                 let new_raw = generate_raw_token();
                 let new_hash = hash_api_token(&new_raw);
-                let now = self.clock.now().to_chrono().naive_utc();
+                let now = to_column(self.clock.now());
                 let mut conn = self.conn().await?;
                 // One statement, so revoke and replace are atomic. An unknown or revoked old hash
                 // updates no rows, inserts nothing and counts 0 (None). $3 is the store clock's
@@ -2864,40 +2869,39 @@ mod db_store {
         {
             Box::pin(async move {
                 let hash = hash_api_token(raw_token);
-                let now = self.clock.now().to_chrono().naive_utc();
+                let now = to_column(self.clock.now());
                 let mut conn = self.conn().await?;
                 // Live tokens only: not revoked, and either no expiry or not yet expired.
-                let row: Option<(
-                    i64,
-                    String,
-                    String,
-                    Option<NaiveDateTime>,
-                    serde_json::Value,
-                )> = api_tokens::table
-                    .filter(api_tokens::token_hash.eq(&hash))
-                    .filter(api_tokens::revoked_at.is_null())
-                    .filter(
-                        api_tokens::expires_at
-                            .is_null()
-                            .or(api_tokens::expires_at.gt(now)),
-                    )
-                    .select((
-                        api_tokens::id,
-                        api_tokens::principal_id,
-                        api_tokens::name,
-                        api_tokens::expires_at,
-                        api_tokens::scopes,
-                    ))
-                    .first(&mut conn)
-                    .await
-                    .optional()
-                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                let row: Option<(i64, String, String, Option<SqlDateTime>, serde_json::Value)> =
+                    api_tokens::table
+                        .filter(api_tokens::token_hash.eq(&hash))
+                        .filter(api_tokens::revoked_at.is_null())
+                        .filter(
+                            api_tokens::expires_at
+                                .is_null()
+                                .or(api_tokens::expires_at.gt(now)),
+                        )
+                        .select((
+                            api_tokens::id,
+                            api_tokens::principal_id,
+                            api_tokens::name,
+                            api_tokens::expires_at,
+                            api_tokens::scopes,
+                        ))
+                        .first(&mut conn)
+                        .await
+                        .optional()
+                        .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
 
                 let Some((id, principal_id, name, expires_at_naive, scopes_json)) = row else {
                     return Ok(None);
                 };
                 // Stamp `last_used_at` at most every 5 minutes, not on every request.
-                let threshold = now - chrono::Duration::minutes(5);
+                let threshold = SqlDateTime(
+                    now.0
+                        .checked_sub(SignedDuration::from_mins(5))
+                        .unwrap_or(civil::DateTime::MIN),
+                );
                 let _ = diesel::update(
                     api_tokens::table.filter(api_tokens::id.eq(id)).filter(
                         api_tokens::last_used_at
@@ -4275,11 +4279,6 @@ mod http_interceptor_task_local_tests {
 
 #[cfg(test)]
 mod api_token_tests {
-    #[allow(
-        unused_imports,
-        reason = "temporary chrono bridge; some callers are feature- or test-gated"
-    )]
-    use crate::time::bridge::JiffBridge as _;
     use std::sync::Arc;
 
     use http::StatusCode;
@@ -4505,8 +4504,7 @@ mod api_token_tests {
         __check_secured_scopes, ApiTokenScopes, IssueTokenSpec, issue_scoped_api_token,
         list_api_tokens, rotate_api_token,
     };
-    use crate::time::{FixedClock, TickingClock};
-    use chrono::{Duration as ChronoDuration, TimeZone as _, Utc};
+    use crate::time::{FixedClock, SignedDuration, TickingClock, Timestamp};
 
     fn scopes(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| (*x).to_owned()).collect()
@@ -4581,16 +4579,15 @@ mod api_token_tests {
 
     #[tokio::test]
     async fn expired_token_verifies_as_none() {
-        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let store =
-            InMemoryApiTokenStore::default().with_clock(Arc::new(FixedClock::at(now.to_jiff())));
+        let now: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+        let store = InMemoryApiTokenStore::default().with_clock(Arc::new(FixedClock::at(now)));
         let granted = scopes(&["posts:read"]);
         let raw = store
             .issue_scoped(IssueTokenSpec {
                 principal_id: "service:ci",
                 name: "ci",
                 scopes: &granted,
-                expires_at: Some(now - ChronoDuration::seconds(1)),
+                expires_at: Some(now - SignedDuration::from_secs(1)),
             })
             .await
             .unwrap();
@@ -4601,8 +4598,8 @@ mod api_token_tests {
 
     #[tokio::test]
     async fn unexpired_token_verifies_then_records_last_used_at() {
-        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let clock = TickingClock::starting_at(start.to_jiff());
+        let start: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
+        let clock = TickingClock::starting_at(start);
         let store = InMemoryApiTokenStore::default().with_clock(Arc::new(clock));
         let granted = scopes(&["posts:read"]);
         let raw = store
@@ -4610,7 +4607,7 @@ mod api_token_tests {
                 principal_id: "service:ci",
                 name: "ci",
                 scopes: &granted,
-                expires_at: Some(start + ChronoDuration::days(30)),
+                expires_at: Some(start + SignedDuration::from_hours(30 * 24)),
             })
             .await
             .unwrap();

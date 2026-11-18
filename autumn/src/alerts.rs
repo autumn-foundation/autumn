@@ -68,20 +68,15 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
+use crate::time::{SignedDuration, Timestamp};
 
 // ── Core value types ────────────────────────────────────────────────────────
 
@@ -294,7 +289,8 @@ pub struct Alert {
     /// Longer human-readable detail (the underlying error, counts, etc.).
     pub summary: String,
     /// When the alert was produced (UTC).
-    pub timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub timestamp: Timestamp,
     /// Host / replica identity the alert originated from.
     pub host: String,
     /// Where the operator should look next (an actuator endpoint or a log
@@ -340,7 +336,7 @@ impl AlertBuilder {
                 event,
                 title: String::new(),
                 summary: String::new(),
-                timestamp: crate::time::ambient_now().to_chrono(),
+                timestamp: crate::time::ambient_now(),
                 host: host_id(),
                 where_to_look: condition.where_to_look().to_owned(),
                 details: HashMap::new(),
@@ -508,7 +504,7 @@ struct KeyState {
     /// Whether a trigger is currently outstanding (used to gate recovery).
     active: bool,
     /// When we last *delivered* a trigger for this key.
-    last_sent: DateTime<Utc>,
+    last_sent: Timestamp,
 }
 
 /// Bounds alert volume for sustained/repeating conditions and gates recovery
@@ -522,7 +518,7 @@ struct KeyState {
 /// when a previously-alerted key clears, and never for a key that never fired.
 #[derive(Debug)]
 pub struct AlertDeduplicator {
-    window: chrono::Duration,
+    window: SignedDuration,
     keys: HashMap<String, KeyState>,
 }
 
@@ -531,16 +527,16 @@ impl AlertDeduplicator {
     #[must_use]
     pub fn new(window: std::time::Duration) -> Self {
         Self {
-            window: chrono::Duration::from_std(window)
-                .unwrap_or_else(|_| chrono::Duration::seconds(900)),
+            window: SignedDuration::try_from(window)
+                .unwrap_or_else(|_| SignedDuration::from_secs(900)),
             keys: HashMap::new(),
         }
     }
 
     /// Decide whether a trigger for `key` at `now` should be delivered.
-    pub fn on_trigger(&mut self, key: &str, now: DateTime<Utc>) -> DedupDecision {
+    pub fn on_trigger(&mut self, key: &str, now: Timestamp) -> DedupDecision {
         match self.keys.get_mut(key) {
-            Some(state) if state.active && (now - state.last_sent) < self.window => {
+            Some(state) if state.active && now.duration_since(state.last_sent) < self.window => {
                 // Still firing inside the window.
                 DedupDecision::Suppress
             }
@@ -1068,7 +1064,7 @@ impl MailAlertChannel {
             alert.event,
             alert.condition.as_str(),
             alert.host,
-            alert.timestamp.to_rfc3339(),
+            crate::time::compat::rfc3339(alert.timestamp),
             alert.where_to_look,
             alert.summary,
         );
@@ -1161,7 +1157,7 @@ impl AlertChannel for WebhookAlertChannel {
                 .post(&self.url)
                 .header("Content-Type", "application/json");
             if let Some(secret) = self.secret.as_ref() {
-                let timestamp = crate::time::ambient_now().to_chrono().timestamp();
+                let timestamp = crate::time::ambient_now().as_second();
                 let signing_payload = format!("{timestamp}.{body}");
                 let signature = crate::security::config::hmac_sha256_hex(
                     secret.as_bytes(),
@@ -1256,7 +1252,7 @@ pub fn pagerduty_event_payload(alert: &Alert, routing_key: &str) -> serde_json::
             "summary": alert.title,
             "source": alert.host,
             "severity": pagerduty_severity(alert.severity),
-            "timestamp": alert.timestamp.to_rfc3339(),
+            "timestamp": crate::time::compat::rfc3339(alert.timestamp),
             "component": alert.condition.as_str(),
             "custom_details": serde_json::Value::Object(custom),
         },
@@ -1353,7 +1349,11 @@ fn slack_message_text(alert: &Alert) -> String {
         AlertEventKind::Resolve => ("\u{2705}", "RECOVERED"),
     };
     let mut body = format!("{icon} *[{label}] {}*\n", alert.title);
-    let _ = writeln!(body, "*When:* {}", alert.timestamp.to_rfc3339());
+    let _ = writeln!(
+        body,
+        "*When:* {}",
+        crate::time::compat::rfc3339(alert.timestamp)
+    );
     let _ = writeln!(body, "*Host/replica:* {}", alert.host);
     let _ = writeln!(body, "*Condition:* {}", alert.condition.as_str());
     let _ = writeln!(body, "*Where to look:* {}", alert.where_to_look);
@@ -1907,7 +1907,7 @@ fn spawn_evaluation_loop(state: AppState, alerter: Alerter) {
     let settings = alerter.settings().clone();
     tokio::spawn(async move {
         // When each indicator first went unhealthy; removed once it recovers.
-        let mut down_since: HashMap<String, DateTime<Utc>> = HashMap::new();
+        let mut down_since: HashMap<String, Timestamp> = HashMap::new();
         // Prime the cumulative counters so the first tick measures a delta.
         let (mut last_requests, mut last_5xx) = {
             let snap = state.metrics().snapshot();
@@ -2060,12 +2060,12 @@ async fn evaluate_health(
     alerter: &Alerter,
     state: &AppState,
     settings: &AlerterSettings,
-    down_since: &mut HashMap<String, DateTime<Utc>>,
+    down_since: &mut HashMap<String, Timestamp>,
 ) {
     let results = state.health_indicator_registry().run_all().await;
-    let now = crate::time::ambient_now().to_chrono();
-    let grace = chrono::Duration::from_std(settings.health_grace)
-        .unwrap_or_else(|_| chrono::Duration::seconds(60));
+    let now = crate::time::ambient_now();
+    let grace = SignedDuration::try_from(settings.health_grace)
+        .unwrap_or_else(|_| SignedDuration::from_secs(60));
 
     let host = host_id();
     for result in &results {
@@ -2076,8 +2076,9 @@ async fn evaluate_health(
             HealthTransition::Trigger => {
                 let status = result.output.status;
                 let first = *down_since.entry(result.name.clone()).or_insert(now);
-                if now - first >= grace {
-                    let secs = (now - first).num_seconds().max(0);
+                let down_for = now.duration_since(first);
+                if down_for >= grace {
+                    let secs = down_for.as_secs().max(0);
                     let alert = Alert::trigger(AlertCondition::HealthIndicatorDown, key)
                         .title(format!("Health indicator '{}' is {status:?}", result.name))
                         .summary(format!(
@@ -2125,8 +2126,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    fn ts(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("valid timestamp")
+    fn ts(secs: i64) -> Timestamp {
+        Timestamp::from_second(1_700_000_000 + secs).expect("valid timestamp")
     }
 
     // ── Dedup window bounding ────────────────────────────────────────────────
@@ -2243,11 +2244,11 @@ mod tests {
     /// given grace period, and reporting what happened on the FINAL tick. Proves
     /// both directions of the unified rule: any non-healthy status triggers, and
     /// recovery is gated on a genuinely healthy status (not merely `!= Down`).
-    fn health_tick_for_sequence(statuses: &[HealthStatus], grace: chrono::Duration) -> HealthTick {
+    fn health_tick_for_sequence(statuses: &[HealthStatus], grace: SignedDuration) -> HealthTick {
         let name = "db";
         let key = format!("health_indicator_down:{name}");
         let mut dedup = AlertDeduplicator::new(std::time::Duration::from_mins(15));
-        let mut down_since: HashMap<String, DateTime<Utc>> = HashMap::new();
+        let mut down_since: HashMap<String, Timestamp> = HashMap::new();
         let mut last = HealthTick::Idle;
         for (i, status) in statuses.iter().enumerate() {
             last = HealthTick::Idle;
@@ -2255,7 +2256,7 @@ mod tests {
             match classify_health_transition(*status) {
                 HealthTransition::Trigger => {
                     let first = *down_since.entry(name.to_owned()).or_insert(now);
-                    if now - first >= grace {
+                    if now.duration_since(first) >= grace {
                         last = HealthTick::Triggered(dedup.on_trigger(&key, now));
                     }
                 }
@@ -2273,7 +2274,7 @@ mod tests {
     /// period (so a single non-healthy tick alerts immediately). Used by the
     /// recovery-focused sequences below.
     fn recovery_tick_for_sequence(statuses: &[HealthStatus]) -> HealthTick {
-        health_tick_for_sequence(statuses, chrono::Duration::seconds(0))
+        health_tick_for_sequence(statuses, SignedDuration::ZERO)
     }
 
     #[test]
@@ -2324,7 +2325,7 @@ mod tests {
         // triggers, so the following resolve is suppressed.
         let tick = health_tick_for_sequence(
             &[HealthStatus::OutOfService, HealthStatus::Up],
-            chrono::Duration::seconds(60),
+            SignedDuration::from_secs(60),
         );
         assert_eq!(
             tick,
@@ -2899,7 +2900,7 @@ mod tests {
         assert!(text.contains(&alert.host), "host: {text}");
         assert!(text.contains("/actuator/metrics"), "where_to_look: {text}");
         assert!(
-            text.contains(&alert.timestamp.to_rfc3339()),
+            text.contains(&crate::time::compat::rfc3339(alert.timestamp)),
             "timestamp: {text}"
         );
         assert!(text.contains("rate: 0.1200"), "details: {text}");

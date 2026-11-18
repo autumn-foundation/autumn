@@ -31,11 +31,6 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::ChronoBridge as _;
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -857,7 +852,7 @@ async fn apply_archive_purge(
     };
     // One pass: on a real run `entries_removed` is what was eligible, and the archive can be
     // too large to read twice.
-    let summary = logger.purge_before(cutoff.to_chrono(), dry_run).await;
+    let summary = logger.purge_before(cutoff, dry_run).await;
     // Record what was removed even when a sink failed: a partial purge has already deleted it.
     if summary.supported {
         report.eligible_rows = Some(summary.entries_removed);
