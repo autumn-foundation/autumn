@@ -60,7 +60,11 @@ mod schema {
     }
 }
 
+use autumn_web::time::civil;
 use schema::{audit_items, plain_items, scoped_items, soft_items};
+
+/// The `deleted_at` stamp the fixtures use for a soft-deleted row.
+const DELETED_AT: civil::DateTime = civil::date(1970, 1, 1).at(0, 0, 0, 0);
 
 #[autumn_web::model(table = "scoped_items")]
 pub struct ScopedItem {
@@ -69,7 +73,7 @@ pub struct ScopedItem {
     pub name: String,
     pub tenant_id: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 // Repository opts into both scopes → preload scopes `ScopedItem`.
@@ -83,7 +87,7 @@ pub struct AuditItem {
     pub name: String,
     pub tenant_id: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 // Repository does NOT opt into soft_delete / tenant_scoped, even though the
@@ -98,7 +102,7 @@ pub struct SoftItem {
     pub id: i64,
     pub name: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(SoftItem, table = "soft_items", soft_delete)]
@@ -116,7 +120,7 @@ fn item(id: i64, tenant: &str, deleted: bool) -> ScopedItem {
         id,
         name: format!("item-{id}"),
         tenant_id: tenant.to_string(),
-        deleted_at: deleted.then(chrono::NaiveDateTime::default),
+        deleted_at: deleted.then_some(DELETED_AT),
     }
 }
 
@@ -125,7 +129,7 @@ fn audit(id: i64, tenant: &str, deleted: bool) -> AuditItem {
         id,
         name: format!("audit-{id}"),
         tenant_id: tenant.to_string(),
-        deleted_at: deleted.then(chrono::NaiveDateTime::default),
+        deleted_at: deleted.then_some(DELETED_AT),
     }
 }
 
@@ -245,7 +249,7 @@ fn soft_delete_only_drops_deleted_without_tenant_context() {
         SoftItem {
             id: 2,
             name: "b".into(),
-            deleted_at: Some(chrono::NaiveDateTime::default()),
+            deleted_at: Some(DELETED_AT),
         },
         SoftItem {
             id: 3,

@@ -16,7 +16,8 @@
 use autumn_web::config::DatabaseConfig;
 use autumn_web::db::{RuntimeConnection, create_pool};
 use autumn_web::ledger::LedgerError;
-use autumn_web::reexports::{chrono, diesel, diesel_async};
+use autumn_web::reexports::{diesel, diesel_async};
+use autumn_web::time::civil;
 use diesel_async::SimpleAsyncConnection as _;
 use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -141,7 +142,7 @@ pub struct LgoPost {
     #[default]
     pub comment_count: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(LgoPost, table = "lgo_posts", soft_delete, ledgered = true)]
@@ -192,7 +193,7 @@ pub struct LgoDelChild {
     pub id: i64,
     pub parent_id: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(LgoDelChild, table = "lgo_del_children", soft_delete, ledgered = true)]
@@ -220,7 +221,7 @@ pub struct LgoNulChild {
     pub id: i64,
     pub parent_id: Option<i64>,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(LgoNulChild, table = "lgo_nul_children", soft_delete, ledgered = true)]
@@ -267,7 +268,7 @@ pub struct LgoVotePost {
     #[default]
     pub score: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(LgoVotePost, table = "lgo_vote_posts", soft_delete, ledgered = true)]
@@ -298,9 +299,9 @@ pub struct LgoNoteComment {
     pub author_id: i64,
     pub body: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: civil::DateTime,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -336,7 +337,7 @@ pub trait LgoLikePostRepository {}
 /// The edge table, ledgered. Its own module: `#[votable]` declares a hidden
 /// table of the same name.
 mod likes {
-    use autumn_web::reexports::chrono;
+    use autumn_web::time::civil;
 
     autumn_web::reexports::diesel::table! {
         lgo_post_likes (id) {
@@ -354,7 +355,7 @@ mod likes {
         pub voter_id: i64,
         pub post_id: i64,
         #[default]
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<civil::DateTime>,
     }
 
     #[autumn_web::repository(LgoPostLike, table = "lgo_post_likes", soft_delete, ledgered = true)]
@@ -365,7 +366,7 @@ mod likes {
 
 mod shadow {
     use super::schema::lgo_posts;
-    use autumn_web::reexports::chrono;
+    use autumn_web::time::civil;
 
     #[autumn_web::model(table = "lgo_posts")]
     pub struct LgoShadowPost {
@@ -375,7 +376,7 @@ mod shadow {
         #[default]
         pub comment_count: i64,
         #[default]
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<civil::DateTime>,
     }
 
     #[autumn_web::repository(LgoShadowPost, table = "lgo_posts")]
@@ -386,7 +387,7 @@ mod shadow {
 /// `destroy` cascade.
 mod shadow_children {
     use super::schema::lgo_del_children;
-    use autumn_web::reexports::chrono;
+    use autumn_web::time::civil;
 
     #[autumn_web::model(table = "lgo_del_children")]
     pub struct LgoShadowChild {
@@ -394,7 +395,7 @@ mod shadow_children {
         pub id: i64,
         pub parent_id: i64,
         #[default]
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<civil::DateTime>,
     }
 
     #[autumn_web::repository(LgoShadowChild, table = "lgo_del_children", soft_delete)]

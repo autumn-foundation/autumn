@@ -800,7 +800,7 @@ impl From<autumn_web::version_history::VersionEntry> for AdminHistoryEntry {
                 .into_iter()
                 .map(|c| serde_json::to_value(&c).unwrap_or(serde_json::Value::Null))
                 .collect(),
-            recorded_at: e.recorded_at,
+            recorded_at: autumn_web::time::bridge::ChronoBridge::to_chrono(e.recorded_at),
         }
     }
 }
@@ -1595,8 +1595,6 @@ mod tests {
     #[test]
     fn version_page_converts_to_admin_history_page() {
         use autumn_web::version_history::{ColumnChange, VersionEntry, VersionOp, VersionPage};
-        use chrono::Utc;
-
         let entry = VersionEntry {
             id: 1,
             table_name: "posts".to_owned(),
@@ -1609,7 +1607,7 @@ mod tests {
                 Some(serde_json::json!("old")),
                 Some(serde_json::json!("new")),
             )],
-            recorded_at: Utc::now(),
+            recorded_at: autumn_web::time::Timestamp::UNIX_EPOCH,
         };
         let vp = VersionPage {
             entries: vec![entry],
@@ -1634,8 +1632,6 @@ mod tests {
     #[test]
     fn version_entry_converts_to_admin_history_entry() {
         use autumn_web::version_history::{ColumnChange, VersionEntry, VersionOp};
-        use chrono::Utc;
-
         let entry = VersionEntry {
             id: 7,
             table_name: "users".to_owned(),
@@ -1644,7 +1640,7 @@ mod tests {
             actor: "system".to_owned(),
             request_id: None,
             changes: vec![ColumnChange::sensitive("password_digest")],
-            recorded_at: Utc::now(),
+            recorded_at: autumn_web::time::Timestamp::UNIX_EPOCH,
         };
 
         let admin_entry = AdminHistoryEntry::from(entry);
