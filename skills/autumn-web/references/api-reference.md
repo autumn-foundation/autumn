@@ -706,6 +706,11 @@ delete actions remain last-write-wins.
   (`with_quantile`, `with_window`, `with_warm_up`, `with_bounds(floor,
   ceiling)`, `with_max_hedges`), using `initial` until 20 samples are in.
   Keep one per upstream, in shared state.
+- `hot_keys::HotKeys::new(capacity)` counts the heaviest keys (IPs, tenants,
+  routes) in at most `capacity` counters: `record(key)`,
+  `record_weighted(key, w)`, `top(n)`, `heavy_hitters(ppm)` (by the
+  guaranteed `count - error`, no false positives), `decay()` on a timer to
+  age out old traffic. Not synchronised; share it behind a `Mutex`.
 
 ## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
 
