@@ -13,7 +13,6 @@ use autumn_web::feed::{Feed, FeedEntry};
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
 use autumn_web::reexports::http::HeaderMap;
-use autumn_web::time::bridge::JiffBridge as _;
 
 use crate::models::Post;
 use crate::repositories::TermRepository as _;
@@ -150,8 +149,8 @@ async fn build(
         }
         if let Some(published) = post.published_at {
             entry = entry
-                .published(published.and_utc().to_jiff())
-                .updated(post.updated_at.max(published).and_utc().to_jiff());
+                .published(crate::settings::utc_instant(published))
+                .updated(crate::settings::utc_instant(post.updated_at.max(published)));
         }
         feed = feed.entry(entry);
     }

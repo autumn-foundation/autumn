@@ -75,10 +75,11 @@ pub async fn sitemap(repos: Repos, State(state): State<AppState>) -> AutumnResul
             // `escape_xml` below.
             let path = crate::routes::site::permalink_from(&post, &ancestors, &settings);
             let lastmod = post.published_at.map(|published| {
-                post.updated_at
-                    .max(published)
-                    .and_utc()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                autumn_web::time::compat::rfc3339_opts(
+                    crate::settings::utc_instant(post.updated_at.max(published)),
+                    autumn_web::time::compat::Digits::Secs,
+                    true,
+                )
             });
             urls.push((format!("{base}{path}"), lastmod));
         }

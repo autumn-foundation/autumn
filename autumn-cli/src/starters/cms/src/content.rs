@@ -10,6 +10,7 @@ use std::collections::HashSet;
 
 use autumn_web::AutumnError;
 use autumn_web::AutumnResult;
+use autumn_web::db::AsSqlTime as _;
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection as _, AsyncPgConnection, RunQueryDsl};
 use scoped_futures::ScopedFutureExt;
@@ -194,7 +195,7 @@ pub async fn update_post_with_revision(
         // check only fires on a status change.
         crate::hooks::validate_post_update(&before, &mut post)?;
 
-        post.updated_at = chrono::Utc::now().naive_utc();
+        post.updated_at = autumn_web::time::ambient_civil_utc();
         post.lock_version += 1;
 
         let saved: Post = diesel::update(posts::table.find(post_id))
@@ -210,9 +211,9 @@ pub async fn update_post_with_revision(
                 posts::comment_status.eq(&post.comment_status),
                 posts::password.eq(&post.password),
                 posts::sticky.eq(post.sticky),
-                posts::published_at.eq(post.published_at),
+                posts::published_at.eq(post.published_at.as_sql_time()),
                 posts::lock_version.eq(post.lock_version),
-                posts::updated_at.eq(post.updated_at),
+                posts::updated_at.eq(post.updated_at.as_sql_time()),
             ))
             .returning(Post::as_returning())
             .get_result(conn)
@@ -424,16 +425,16 @@ pub async fn transition_status(
         // Stamp the first publish date, and never move it afterwards — an
         // unpublish/republish cycle must not reorder the blog index.
         let published_at = match (post.published_at, new_status.as_str()) {
-            (None, "publish" | "private") => Some(chrono::Utc::now().naive_utc()),
+            (None, "publish" | "private") => Some(autumn_web::time::ambient_civil_utc()),
             (existing, _) => existing,
         };
 
         let saved: Post = diesel::update(posts::table.find(post_id))
             .set((
                 posts::status.eq(&new_status),
-                posts::published_at.eq(published_at),
+                posts::published_at.eq(published_at.as_sql_time()),
                 posts::lock_version.eq(post.lock_version + 1),
-                posts::updated_at.eq(chrono::Utc::now().naive_utc()),
+                posts::updated_at.eq(autumn_web::time::ambient_civil_utc().as_sql_time()),
             ))
             .returning(Post::as_returning())
             .get_result(conn)
@@ -527,9 +528,9 @@ pub async fn restore_revision(
                 posts::slug.eq(&merged.slug),
                 posts::excerpt.eq(&merged.excerpt),
                 posts::body.eq(&merged.body),
-                posts::published_at.eq(merged.published_at),
+                posts::published_at.eq(merged.published_at.as_sql_time()),
                 posts::lock_version.eq(post.lock_version + 1),
-                posts::updated_at.eq(chrono::Utc::now().naive_utc()),
+                posts::updated_at.eq(autumn_web::time::ambient_civil_utc().as_sql_time()),
             ))
             .returning(Post::as_returning())
             .get_result(conn)
@@ -1283,12 +1284,11 @@ pub fn to_comment_views(
             id: node.comment.id,
             author: node.author.clone(),
             body: node.comment.body.clone(),
-            datetime: Some(
-                node.comment
-                    .created_at
-                    .and_utc()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            ),
+            datetime: Some(autumn_web::time::compat::rfc3339_opts(
+                crate::settings::utc_instant(node.comment.created_at),
+                autumn_web::time::compat::Digits::Secs,
+                true,
+            )),
             timestamp: settings.format_datetime(node.comment.created_at),
             replies: to_comment_views(&node.replies, settings),
         })
@@ -1845,7 +1845,7 @@ pub async fn update_user(
                     users::display_name.eq(display_name),
                     users::bio.eq(bio),
                     users::website.eq(website),
-                    users::updated_at.eq(chrono::Utc::now().naive_utc()),
+                    users::updated_at.eq(autumn_web::time::ambient_civil_utc().as_sql_time()),
                 ))
                 .execute(conn)
                 .await?;
@@ -2107,8 +2107,8 @@ pub async fn published_posts_in_term(
 pub async fn published_posts_in_period(
     conn: &mut AsyncPgConnection,
     post_type: &str,
-    from: chrono::NaiveDateTime,
-    until: chrono::NaiveDateTime,
+    from: autumn_web::time::civil::DateTime,
+    until: autumn_web::time::civil::DateTime,
     offset: i64,
     limit: i64,
 ) -> AutumnResult<(Vec<Post>, i64)> {
@@ -2121,8 +2121,8 @@ pub async fn published_posts_in_period(
     let total: i64 = posts::table
         .filter(posts::post_type.eq(post_type))
         .filter(posts::status.eq("publish"))
-        .filter(posts::published_at.ge(from))
-        .filter(posts::published_at.lt(until))
+        .filter(posts::published_at.ge(from.as_sql_time()))
+        .filter(posts::published_at.lt(until.as_sql_time()))
         .count()
         .get_result(conn)
         .await?;
@@ -2130,8 +2130,8 @@ pub async fn published_posts_in_period(
     let rows: Vec<Post> = posts::table
         .filter(posts::post_type.eq(post_type))
         .filter(posts::status.eq("publish"))
-        .filter(posts::published_at.ge(from))
-        .filter(posts::published_at.lt(until))
+        .filter(posts::published_at.ge(from.as_sql_time()))
+        .filter(posts::published_at.lt(until.as_sql_time()))
         .order((posts::published_at.desc(), posts::id.desc()))
         .offset(offset.max(0))
         .limit(limit.max(0))
@@ -2382,13 +2382,13 @@ pub fn is_reserved_path(slug: &str) -> bool {
 /// between the check and the write.
 pub fn require_future_publish_date(
     status: &str,
-    scheduled_for: Option<chrono::NaiveDateTime>,
+    scheduled_for: Option<autumn_web::time::civil::DateTime>,
 ) -> AutumnResult<()> {
     if status != "future" {
         return Ok(());
     }
     match scheduled_for {
-        Some(when) if when > chrono::Utc::now().naive_utc() => Ok(()),
+        Some(when) if when > autumn_web::time::ambient_civil_utc() => Ok(()),
         Some(_) => Err(AutumnError::unprocessable_msg(
             "A scheduled post needs a publish date in the future",
         )),
@@ -3886,7 +3886,7 @@ pub struct ImportedRevision {
     pub body: String,
     pub status: String,
     pub summary: String,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 /// Restore a post's revision history.
@@ -3978,7 +3978,7 @@ pub async fn import_revisions(
                     revisions::summary.eq(&revision.summary),
                     // Explicit, like a comment's: a history whose timestamps all
                     // say "the moment of the restore" is not a history.
-                    revisions::created_at.eq(revision.created_at),
+                    revisions::created_at.eq(revision.created_at.as_sql_time()),
                 )
             })
             .collect();
@@ -4772,7 +4772,7 @@ async fn insert_with_unique_slug(
                         .await?;
                 let row = crate::models::NewPost { slug, ..attempt };
                 let saved: Post = diesel::insert_into(posts::table)
-                    .values(&row)
+                    .values(row)
                     .returning(Post::as_returning())
                     .get_result(conn)
                     .await?;
@@ -4828,7 +4828,7 @@ pub struct ImportedComment {
     pub author_url: String,
     pub body: String,
     pub status: String,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
     pub replies: Vec<ImportedComment>,
 }
 
@@ -4938,7 +4938,7 @@ pub async fn import_comments(
                     row.author_url.clone(),
                     row.status.clone(),
                     row.body.trim().to_owned(),
-                    row.created_at.and_utc().timestamp_micros(),
+                    crate::settings::utc_instant(row.created_at).as_microsecond(),
                 ))
                 .or_default()
                 .push(row.id);
@@ -5002,7 +5002,7 @@ pub async fn import_comments(
                         new.author_url.clone(),
                         new.status.clone(),
                         new.body.clone(),
-                        comment.created_at.and_utc().timestamp_micros(),
+                        crate::settings::utc_instant(comment.created_at).as_microsecond(),
                     ))
                     .and_then(Vec::pop)
                 {
@@ -5039,7 +5039,7 @@ pub async fn import_comments(
                         comments::author_ip.eq(&new.author_ip),
                         comments::body.eq(&new.body),
                         comments::status.eq(&new.status),
-                        comments::created_at.eq(comment.created_at),
+                        comments::created_at.eq(comment.created_at.as_sql_time()),
                     ))
                     .returning(Comment::as_returning())
                     .get_result(conn)
@@ -5737,9 +5737,9 @@ pub async fn approved_thread_page_of(
         .filter(comments::parent_id.is_null())
         .filter(
             comments::created_at
-                .lt(current.created_at)
+                .lt(current.created_at.as_sql_time())
                 .or(comments::created_at
-                    .eq(current.created_at)
+                    .eq(current.created_at.as_sql_time())
                     .and(comments::id.lt(current.id))),
         )
         .count()
@@ -5867,7 +5867,7 @@ pub async fn due_scheduled_posts(
 ) -> AutumnResult<Vec<Post>> {
     Ok(posts::table
         .filter(posts::status.eq("future"))
-        .filter(posts::published_at.le(chrono::Utc::now().naive_utc()))
+        .filter(posts::published_at.le(autumn_web::time::ambient_civil_utc().as_sql_time()))
         .order((posts::published_at.asc(), posts::id.asc()))
         .limit(limit.max(0))
         .select(Post::as_select())
@@ -5892,14 +5892,14 @@ pub async fn due_scheduled_posts(
 pub async fn publish_due_post(
     conn: &mut AsyncPgConnection,
     post_id: i64,
-    observed_published_at: Option<chrono::NaiveDateTime>,
+    observed_published_at: Option<autumn_web::time::civil::DateTime>,
     new_status: &str,
 ) -> AutumnResult<bool> {
     use diesel_async::AsyncConnection as _;
 
     let new_status = new_status.to_owned();
     conn.transaction(async |conn| {
-        let now = chrono::Utc::now().naive_utc();
+        let now = autumn_web::time::ambient_civil_utc();
 
         // The claim is a locking *read* rather than a blind `UPDATE`, so the
         // row can be snapshotted in the state it is being moved out of. The
@@ -5910,8 +5910,8 @@ pub async fn publish_due_post(
         let Some(scheduled) = posts::table
             .find(post_id)
             .filter(posts::status.eq("future"))
-            .filter(posts::published_at.eq(observed_published_at))
-            .filter(posts::published_at.le(now))
+            .filter(posts::published_at.eq(observed_published_at.as_sql_time()))
+            .filter(posts::published_at.le(now.as_sql_time()))
             .select(Post::as_select())
             .for_update()
             .first(conn)
@@ -5940,7 +5940,7 @@ pub async fn publish_due_post(
         diesel::update(posts::table.find(post_id))
             .set((
                 posts::status.eq(&new_status),
-                posts::updated_at.eq(now),
+                posts::updated_at.eq(now.as_sql_time()),
                 posts::lock_version.eq(posts::lock_version + 1),
             ))
             .execute(conn)

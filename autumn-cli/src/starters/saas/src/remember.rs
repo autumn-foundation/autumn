@@ -29,12 +29,12 @@ use autumn_web::auth::{
     build_remember_cookie, default_rotation_grace, evaluate_remember, generate_remember_credential,
     generate_token, hash_remember_token, parse_remember_cookie_value,
 };
+use autumn_web::db::{AsSqlTime as _, SqlNullableTimestamp, SqlTimestamp};
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::extract::Request;
 use autumn_web::reexports::axum::http::{HeaderMap, HeaderValue, header};
 use autumn_web::reexports::axum::middleware::Next;
 use autumn_web::reexports::axum::response::Response;
-use autumn_web::time::bridge::JiffBridge;
 use diesel::prelude::*;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -84,16 +84,20 @@ pub struct RememberToken {
     pub previous_token_hash: Option<String>,
     /// When the current token was minted (the last rotation). Bounds how long
     /// `previous_token_hash` stays acceptable.
-    pub rotated_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(deserialize_as = SqlNullableTimestamp)]
+    pub rotated_at: Option<autumn_web::time::Timestamp>,
+    #[diesel(deserialize_as = SqlTimestamp)]
+    pub expires_at: autumn_web::time::Timestamp,
     pub ip: String,
     pub user_agent: String,
     pub ua_family: String,
     pub ua_os: String,
     pub ua_device: String,
     pub label: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = SqlTimestamp)]
+    pub created_at: autumn_web::time::Timestamp,
+    #[diesel(deserialize_as = SqlNullableTimestamp)]
+    pub last_used_at: Option<autumn_web::time::Timestamp>,
 }
 
 /// Insert shape for a new remember chain. `created_at`/`last_used_at` fall back
@@ -105,7 +109,8 @@ pub struct NewRememberToken {
     pub user_id: i64,
     pub tenant_id: String,
     pub token_hash: String,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
+    #[diesel(serialize_as = SqlTimestamp)]
+    pub expires_at: autumn_web::time::Timestamp,
     pub ip: String,
     pub user_agent: String,
     pub ua_family: String,
@@ -118,7 +123,7 @@ pub struct NewRememberToken {
 /// Persist a new remember chain.
 pub async fn insert_remember_token(
     conn: &mut AsyncPgConnection,
-    row: &NewRememberToken,
+    row: NewRememberToken,
 ) -> Result<(), diesel::result::Error> {
     diesel::insert_into(remember_tokens::table)
         .values(row)
@@ -151,8 +156,8 @@ pub async fn rotate_remember_token(
     series: &str,
     old_hash: &str,
     new_hash: &str,
-    new_expiry: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
+    new_expiry: autumn_web::time::Timestamp,
+    now: autumn_web::time::Timestamp,
 ) -> Result<usize, diesel::result::Error> {
     diesel::update(
         remember_tokens::table
@@ -162,9 +167,9 @@ pub async fn rotate_remember_token(
     .set((
         remember_tokens::previous_token_hash.eq(old_hash),
         remember_tokens::token_hash.eq(new_hash),
-        remember_tokens::rotated_at.eq(now),
-        remember_tokens::expires_at.eq(new_expiry),
-        remember_tokens::last_used_at.eq(now),
+        remember_tokens::rotated_at.eq(now.as_sql_time()),
+        remember_tokens::expires_at.eq(new_expiry.as_sql_time()),
+        remember_tokens::last_used_at.eq(now.as_sql_time()),
     ))
     .execute(conn)
     .await
@@ -265,11 +270,11 @@ fn append_set_cookie(response: &mut Response, value: &str) {
 /// and saturating (rather than panicking) on an absurd configured duration.
 fn sliding_expiry(
     config: &RememberConfig,
-    now: chrono::DateTime<chrono::Utc>,
-) -> chrono::DateTime<chrono::Utc> {
+    now: autumn_web::time::Timestamp,
+) -> autumn_web::time::Timestamp {
     let secs = i64::try_from(config.duration_secs).unwrap_or(2_592_000);
-    now.checked_add_signed(chrono::Duration::seconds(secs))
-        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+    now.checked_add(autumn_web::time::SignedDuration::from_secs(secs))
+        .unwrap_or(autumn_web::time::Timestamp::MAX)
 }
 
 // ── Issue on login ───────────────────────────────────────────────────────────
@@ -291,14 +296,14 @@ pub async fn issue_remember_cookie(
         user_id,
         tenant_id: tenant_id.to_owned(),
         token_hash: hash_remember_token(&cred.token),
-        expires_at: sliding_expiry(config, chrono::Utc::now()),
+        expires_at: sliding_expiry(config, autumn_web::time::ambient_now()),
         ip: dev.ip,
         user_agent: dev.user_agent,
         ua_family: dev.ua_family,
         ua_os: dev.ua_os,
         ua_device: dev.ua_device,
     };
-    insert_remember_token(conn, &row).await.map_err(|e| {
+    insert_remember_token(conn, row).await.map_err(|e| {
         AutumnError::internal_server_error_msg(format!("Failed to persist remember token: {e}"))
     })?;
     Ok(build_remember_cookie(
@@ -338,8 +343,8 @@ fn to_remember_record(r: &RememberToken) -> RememberRecord {
         series: r.series.clone(),
         token_hash: r.token_hash.clone(),
         previous_token_hash: r.previous_token_hash.clone(),
-        rotated_at: r.rotated_at.map(JiffBridge::to_jiff),
-        expires_at: r.expires_at.to_jiff(),
+        rotated_at: r.rotated_at,
+        expires_at: r.expires_at,
     }
 }
 
@@ -416,12 +421,12 @@ pub async fn remember_me_middleware(session: Session, request: Request, next: Ne
         }
     };
 
-    let now = chrono::Utc::now();
+    let now = autumn_web::time::ambient_now();
     let secure = request_is_secure(request.headers());
     let grace = default_rotation_grace();
     let evaluated = record.as_ref().map(to_remember_record);
 
-    match evaluate_remember(&token, evaluated.as_ref(), now.to_jiff(), grace) {
+    match evaluate_remember(&token, evaluated.as_ref(), now, grace) {
         RememberDecision::Rotate => {
             let row = record.expect("Rotate is only returned for a present record");
 
@@ -464,7 +469,7 @@ pub async fn remember_me_middleware(session: Session, request: Request, next: Ne
                 // state before deciding.
                 let record2 = find_remember_token(&mut conn, &series).await.ok().flatten();
                 let evaluated2 = record2.as_ref().map(to_remember_record);
-                match evaluate_remember(&token, evaluated2.as_ref(), now.to_jiff(), grace) {
+                match evaluate_remember(&token, evaluated2.as_ref(), now, grace) {
                     RememberDecision::Accept | RememberDecision::Rotate => {
                         // Within grace (or somehow still current): authenticate
                         // WITHOUT rotating again or re-cookieing — the browser
