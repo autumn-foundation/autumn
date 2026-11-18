@@ -11188,8 +11188,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             } else {
+                // A `jiff` time column is written in the text `chrono`'s serde
+                // wrote for the type it replaced (`.120`, not `.12`), so a
+                // ledger head written before the move still compares equal to
+                // the unchanged live row, and its hash still covers the same
+                // bytes.
+                let value = if time_column(ty).is_some() {
+                    quote! { ::autumn_web::time::compat::ChronoJson(&self.#ident) }
+                } else {
+                    quote! { &self.#ident }
+                };
                 quote! {
-                    ::autumn_web::reexports::serde_json::to_value(&self.#ident)
+                    ::autumn_web::reexports::serde_json::to_value(#value)
                         .map_err(|__error| {
                             ::autumn_web::AutumnError::internal_server_error_msg(format!(
                                 "serialize repository commit hook record field {}.{}: {}",
@@ -19552,6 +19562,46 @@ mod tests {
         assert!(
             generated.contains("\"reset_token\""),
             "commit hook codec must serialize skip fields instead of defaulting them: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_commit_hook_codec_writes_time_columns_in_chrono_text() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Stamp {
+                    #[id]
+                    pub id: i64,
+                    pub at: Timestamp,
+                    pub maybe_at: Option<jiff::Timestamp>,
+                    pub local: civil::DateTime,
+                    pub clock: Option<civil::Time>,
+                    pub day: civil::Date,
+                    pub label: String,
+                }
+            },
+        )
+        .to_string();
+        let start = output
+            .find("fn __autumn_commit_hook_to_value")
+            .expect("the codec is emitted");
+        let end = output[start..]
+            .find("fn __autumn_ledger_non_finite_column")
+            .map_or(output.len(), |offset| start + offset);
+        let codec = &output[start..end];
+        for field in ["at", "maybe_at", "local", "clock", "day"] {
+            let call = format!(
+                "to_value (:: autumn_web :: time :: compat :: ChronoJson (& self . {field}))"
+            );
+            assert!(
+                codec.contains(&call),
+                "`{field}` must go through ChronoJson: {codec}"
+            );
+        }
+        assert!(
+            codec.contains("to_value (& self . label)") && codec.contains("to_value (& self . id)"),
+            "non-time columns keep their own serde: {codec}"
         );
     }
 
