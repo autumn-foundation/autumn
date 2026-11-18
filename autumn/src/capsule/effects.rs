@@ -716,6 +716,7 @@ impl ReplayEffects {
             // Capture runs a past deadline at once with `due_at: None` and keeps the requested
             // deadline in `requested_due_at`, so replay compares that one.
             crate::job::EnqueueSchedule::At(deadline) => {
+                let deadline = crate::time::bridge::ChronoBridge::to_chrono(deadline);
                 next.due_at != Some(deadline)
                     && !(next.due_at.is_none() && next.requested_due_at == Some(deadline))
             }
@@ -2440,7 +2441,7 @@ mod tests {
             tape.next_job(
                 "send_receipt",
                 &serde_json::json!({}),
-                crate::job::EnqueueSchedule::At(past)
+                crate::job::EnqueueSchedule::At(crate::time::bridge::JiffBridge::to_jiff(past))
             ),
             EnqueueVerdict::Queued,
             "{:?}",
@@ -2468,7 +2469,9 @@ mod tests {
             tape.next_job(
                 "send_receipt",
                 &serde_json::json!({}),
-                crate::job::EnqueueSchedule::At(past - chrono::Duration::hours(1))
+                crate::job::EnqueueSchedule::At(crate::time::bridge::JiffBridge::to_jiff(
+                    past - chrono::Duration::hours(1)
+                ))
             ),
             EnqueueVerdict::Diverged
         );
@@ -3167,7 +3170,9 @@ mod tests {
             tape.next_job(
                 "send_receipt",
                 &serde_json::json!({}),
-                EnqueueSchedule::At(deadline + chrono::Duration::hours(1))
+                EnqueueSchedule::At(crate::time::bridge::JiffBridge::to_jiff(
+                    deadline + chrono::Duration::hours(1)
+                ))
             ),
             EnqueueVerdict::Diverged,
             "a job rescheduled to a different instant is a behaviour change"
@@ -3176,7 +3181,7 @@ mod tests {
             tape.next_job(
                 "send_receipt",
                 &serde_json::json!({}),
-                EnqueueSchedule::At(deadline)
+                EnqueueSchedule::At(crate::time::bridge::JiffBridge::to_jiff(deadline))
             ),
             EnqueueVerdict::Queued,
             "and the same instant still replays, whatever the clock now reads"

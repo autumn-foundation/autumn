@@ -5,7 +5,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -32,11 +32,6 @@
 // cfg-gating dozens of pg-only items.
 #![cfg_attr(feature = "sqlite", allow(dead_code))]
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use crate::time::bridge::{ChronoBridge as _, JiffBridge as _};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
@@ -49,6 +44,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::job_tracking::PendingSettle;
+use crate::time::{SignedDuration, Timestamp};
 use crate::{AppState, AutumnError, AutumnResult};
 
 pub use crate::job_tracking::{
@@ -817,11 +813,11 @@ struct BatchEnqueueRow {
     result_index: usize,
     id: String,
     payload_json: String,
-    due_at: Option<chrono::DateTime<chrono::Utc>>,
+    due_at: Option<Timestamp>,
     unique_key: Option<String>,
     concurrency_key: Option<String>,
     slot: Option<EnqueueSlot>,
-    now: chrono::DateTime<chrono::Utc>,
+    now: Timestamp,
     #[cfg(feature = "telemetry-otlp")]
     traceparent: Option<String>,
     #[cfg(feature = "telemetry-otlp")]
@@ -836,7 +832,7 @@ struct BatchEnqueueRow {
 /// time rather than from the original API call time.
 #[derive(Debug, Clone, Copy)]
 enum AfterCommitDue {
-    At(Option<chrono::DateTime<chrono::Utc>>),
+    At(Option<Timestamp>),
     After(std::time::Duration),
 }
 
@@ -1625,10 +1621,10 @@ struct JobAdminStoredRecord {
     queue: String,
     payload: Value,
     status: JobAdminStatus,
-    enqueued_at: Option<chrono::DateTime<chrono::Utc>>,
-    scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
-    started_at: Option<chrono::DateTime<chrono::Utc>>,
-    finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    enqueued_at: Option<Timestamp>,
+    scheduled_for: Option<Timestamp>,
+    started_at: Option<Timestamp>,
+    finished_at: Option<Timestamp>,
     attempt: u32,
     max_attempts: u32,
     last_error: Option<String>,
@@ -1643,14 +1639,14 @@ impl JobAdminStoredRecord {
     /// A record with no timestamp at all sorts as if it were the newest thing
     /// in the list. That used to be spelled `unwrap_or_else(Utc::now)`, which
     /// both read the clock off-seam and made an ordering depend on when the
-    /// dashboard happened to be rendered; `MAX_UTC` expresses the same
+    /// dashboard happened to be rendered; `Timestamp::MAX` expresses the same
     /// "sorts newest" intent as a constant, since every real recorded timestamp
     /// is in the past.
-    fn sort_time(&self) -> chrono::DateTime<chrono::Utc> {
+    fn sort_time(&self) -> Timestamp {
         self.finished_at
             .or(self.started_at)
             .or(self.enqueued_at)
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+            .unwrap_or(Timestamp::MAX)
     }
 
     fn to_public(&self) -> JobAdminRecord {
@@ -1744,8 +1740,8 @@ impl JobAdminMemoryBackend {
         payload: Value,
         attempt: u32,
         max_attempts: u32,
-        due_at: Option<chrono::DateTime<chrono::Utc>>,
-        now: chrono::DateTime<chrono::Utc>,
+        due_at: Option<Timestamp>,
+        now: Timestamp,
     ) {
         let (principal_id, correlation_id) = job_payload_identity(&payload);
         let scheduled_for = due_at.filter(|due| *due > now);
@@ -1794,7 +1790,7 @@ impl JobAdminMemoryBackend {
 
         let was_scheduled = record.status == JobAdminStatus::Scheduled;
         record.status = JobAdminStatus::Enqueued;
-        record.enqueued_at = Some(self.clock.now().to_chrono());
+        record.enqueued_at = Some(self.clock.now());
         record.scheduled_for = None;
         record.started_at = None;
         record.finished_at = None;
@@ -1814,7 +1810,7 @@ impl JobAdminMemoryBackend {
         match record.status {
             JobAdminStatus::Enqueued | JobAdminStatus::Scheduled => {
                 record.status = JobAdminStatus::Running;
-                record.started_at = Some(self.clock.now().to_chrono());
+                record.started_at = Some(self.clock.now());
                 record.scheduled_for = None;
                 record.finished_at = None;
                 record.attempt = attempt;
@@ -1826,7 +1822,7 @@ impl JobAdminMemoryBackend {
             JobAdminStatus::Running | JobAdminStatus::Retrying if record.attempt < attempt => {
                 let superseded = record.status == JobAdminStatus::Running;
                 record.status = JobAdminStatus::Running;
-                record.started_at = Some(self.clock.now().to_chrono());
+                record.started_at = Some(self.clock.now());
                 record.finished_at = None;
                 record.attempt = attempt;
                 if superseded {
@@ -1911,7 +1907,7 @@ impl JobAdminMemoryBackend {
         };
 
         record.status = JobAdminStatus::Completed;
-        record.finished_at = Some(self.clock.now().to_chrono());
+        record.finished_at = Some(self.clock.now());
         record.last_error = None;
         prune_job_admin_history(&mut inner);
     }
@@ -1925,7 +1921,7 @@ impl JobAdminMemoryBackend {
         };
 
         record.status = JobAdminStatus::Retrying;
-        record.finished_at = Some(self.clock.now().to_chrono());
+        record.finished_at = Some(self.clock.now());
         record.last_error = Some(error.to_owned());
     }
 
@@ -1947,7 +1943,7 @@ impl JobAdminMemoryBackend {
             return false;
         }
         record.status = JobAdminStatus::Retrying;
-        record.finished_at = Some(self.clock.now().to_chrono());
+        record.finished_at = Some(self.clock.now());
         record.last_error = Some(error.to_owned());
         true
     }
@@ -1970,7 +1966,7 @@ impl JobAdminMemoryBackend {
             return;
         }
         record.status = JobAdminStatus::Enqueued;
-        record.enqueued_at = Some(self.clock.now().to_chrono());
+        record.enqueued_at = Some(self.clock.now());
         record.started_at = None;
         record.finished_at = None;
         record.attempt = new_attempt;
@@ -2004,14 +2000,14 @@ impl JobAdminMemoryBackend {
         record.last_error = Some(error.to_owned());
         if immediate {
             record.status = JobAdminStatus::Enqueued;
-            record.enqueued_at = Some(now.to_chrono());
+            record.enqueued_at = Some(now);
             record.scheduled_for = None;
             record.started_at = None;
             record.finished_at = None;
             record.attempt = new_attempt;
         } else {
             record.status = JobAdminStatus::Retrying;
-            record.finished_at = Some(now.to_chrono());
+            record.finished_at = Some(now);
         }
         RedisRecoveredRequeue::Requeued
     }
@@ -2025,7 +2021,7 @@ impl JobAdminMemoryBackend {
         };
 
         record.status = JobAdminStatus::Failed;
-        record.finished_at = Some(self.clock.now().to_chrono());
+        record.finished_at = Some(self.clock.now());
         record.last_error = Some(error);
         prune_job_admin_history(&mut inner);
     }
@@ -2039,7 +2035,7 @@ impl JobAdminMemoryBackend {
         };
 
         record.status = JobAdminStatus::Canceled;
-        record.finished_at = Some(self.clock.now().to_chrono());
+        record.finished_at = Some(self.clock.now());
     }
 
     fn record_deduplicated(&self, id: &str) {
@@ -2051,7 +2047,7 @@ impl JobAdminMemoryBackend {
         };
 
         record.status = JobAdminStatus::Deduplicated;
-        record.finished_at = Some(self.clock.now().to_chrono());
+        record.finished_at = Some(self.clock.now());
         prune_job_admin_history(&mut inner);
     }
 
@@ -2071,7 +2067,7 @@ impl JobAdminMemoryBackend {
         }
         let retry = (record.name.clone(), record.payload.clone());
         record.status = JobAdminStatus::Retried;
-        record.finished_at = Some(self.clock.now().to_chrono());
+        record.finished_at = Some(self.clock.now());
         drop(inner);
         Ok(retry)
     }
@@ -2086,7 +2082,7 @@ impl JobAdminMemoryBackend {
 
         if record.status == JobAdminStatus::Retried {
             record.status = JobAdminStatus::Failed;
-            record.finished_at = Some(self.clock.now().to_chrono());
+            record.finished_at = Some(self.clock.now());
         }
     }
 
@@ -2124,7 +2120,7 @@ impl JobAdminMemoryBackend {
             ));
         }
         record.status = JobAdminStatus::Discarded;
-        record.finished_at = Some(self.clock.now().to_chrono());
+        record.finished_at = Some(self.clock.now());
         drop(inner);
         Ok(())
     }
@@ -2148,7 +2144,7 @@ impl JobAdminMemoryBackend {
         }
         record.status = JobAdminStatus::Canceled;
         record.scheduled_for = None;
-        record.finished_at = Some(self.clock.now().to_chrono());
+        record.finished_at = Some(self.clock.now());
         let canceler = inner.delay_cancelers.remove(id);
         drop(inner);
         // Fire outside the lock so the timer task can release the unique lock without
@@ -2216,26 +2212,20 @@ impl JobAdminMemoryBackend {
             completed: paginate_job_admin_records(
                 &inner,
                 JobAdminStatus::Completed,
-                Some(
-                    crate::time_math::saturating_ts_add(
-                        now.to_chrono().to_jiff(),
-                        crate::time::SignedDuration::from_hours(-24),
-                    )
-                    .to_chrono(),
-                ),
+                Some(crate::time_math::saturating_ts_add(
+                    now,
+                    crate::time::SignedDuration::from_hours(-24),
+                )),
                 query.completed_page,
                 per_page,
             ),
             failed: paginate_job_admin_records(
                 &inner,
                 JobAdminStatus::Failed,
-                Some(
-                    crate::time_math::saturating_ts_add(
-                        now.to_chrono().to_jiff(),
-                        crate::time::SignedDuration::from_hours(-168),
-                    )
-                    .to_chrono(),
-                ),
+                Some(crate::time_math::saturating_ts_add(
+                    now,
+                    crate::time::SignedDuration::from_hours(-168),
+                )),
                 query.failed_page,
                 per_page,
             ),
@@ -2266,7 +2256,7 @@ impl JobAdminMemoryBackend {
             attempt,
             max_attempts,
             None,
-            self.clock.now().to_chrono(),
+            self.clock.now(),
         );
         id
     }
@@ -2361,8 +2351,8 @@ impl JobAdminBackend for JobAdminMemoryBackend {
     }
 }
 
-fn format_job_admin_time(time: chrono::DateTime<chrono::Utc>) -> String {
-    time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+fn format_job_admin_time(time: Timestamp) -> String {
+    crate::time::compat::rfc3339_opts(time, crate::time::compat::Digits::Secs, true)
 }
 
 fn prune_job_admin_history(inner: &mut JobAdminMemoryInner) {
@@ -2392,7 +2382,7 @@ fn prune_job_admin_history(inner: &mut JobAdminMemoryInner) {
 fn paginate_job_admin_records(
     inner: &JobAdminMemoryInner,
     status: JobAdminStatus,
-    since: Option<chrono::DateTime<chrono::Utc>>,
+    since: Option<Timestamp>,
     page: u64,
     per_page: u64,
 ) -> JobAdminPage {
@@ -3565,7 +3555,7 @@ fn fill_after_commit_enqueue(
             name: name.to_owned(),
             payload: capsule_job_payload(&slot.payload),
             delay_secs,
-            due_at,
+            due_at: due_at.map(crate::time::bridge::ChronoBridge::to_chrono),
             requested_due_at: None,
             // `message`, not `Display`: recorded on the capsule tape.
             error: error.map(AutumnError::message),
@@ -3620,7 +3610,7 @@ pub(crate) enum EnqueueSchedule {
     /// rounded up, and a v3 capsule recorded them cut off.
     After(std::time::Duration),
     /// Run at an absolute instant.
-    At(chrono::DateTime<chrono::Utc>),
+    At(Timestamp),
 }
 
 pub(crate) fn delay_seconds(delay: std::time::Duration) -> i64 {
@@ -3635,8 +3625,8 @@ pub(crate) fn delay_seconds(delay: std::time::Duration) -> i64 {
 /// The delay capture records for `due_at - now`: whole seconds, rounded up,
 /// as replay computes it in `delay_seconds`.
 #[cfg(any(test, feature = "reporting"))]
-const fn recorded_delay(delay: chrono::TimeDelta) -> i64 {
-    let secs = delay.num_seconds();
+const fn recorded_delay(delay: SignedDuration) -> i64 {
+    let secs = delay.as_secs();
     if delay.subsec_nanos() > 0 {
         secs.saturating_add(1)
     } else {
@@ -3697,8 +3687,8 @@ const fn reserve_enqueue(_payload: &Value) -> Option<EnqueueSlot> {
 const fn fill_enqueue(
     _slot: Option<EnqueueSlot>,
     _name: &str,
-    _due_at: Option<chrono::DateTime<chrono::Utc>>,
-    _now: chrono::DateTime<chrono::Utc>,
+    _due_at: Option<Timestamp>,
+    _now: Timestamp,
     _error: Option<&AutumnError>,
 ) {
 }
@@ -3717,15 +3707,12 @@ struct EnqueueSlot {
     payload: Value,
     /// The absolute deadline the caller gave, before a past one was run at
     /// once (#2351 item 18).
-    requested_due_at: Option<chrono::DateTime<chrono::Utc>>,
+    requested_due_at: Option<Timestamp>,
 }
 
 /// Reserve an enqueue slot that keeps the deadline the caller gave.
 #[cfg(feature = "reporting")]
-fn reserve_enqueue_due(
-    payload: &Value,
-    requested: Option<chrono::DateTime<chrono::Utc>>,
-) -> Option<EnqueueSlot> {
+fn reserve_enqueue_due(payload: &Value, requested: Option<Timestamp>) -> Option<EnqueueSlot> {
     let mut slot = reserve_enqueue(payload)?;
     slot.requested_due_at = requested;
     Some(slot)
@@ -3735,7 +3722,7 @@ fn reserve_enqueue_due(
 #[cfg(not(feature = "reporting"))]
 const fn reserve_enqueue_due(
     _payload: &Value,
-    _requested: Option<chrono::DateTime<chrono::Utc>>,
+    _requested: Option<Timestamp>,
 ) -> Option<EnqueueSlot> {
     None
 }
@@ -3763,8 +3750,8 @@ fn reserve_enqueue(payload: &Value) -> Option<EnqueueSlot> {
 fn fill_enqueue(
     slot: Option<EnqueueSlot>,
     name: &str,
-    due_at: Option<chrono::DateTime<chrono::Utc>>,
-    now: chrono::DateTime<chrono::Utc>,
+    due_at: Option<Timestamp>,
+    now: Timestamp,
     error: Option<&AutumnError>,
 ) {
     let Some(slot) = slot else {
@@ -3778,12 +3765,14 @@ fn fill_enqueue(
         crate::capsule::JobEffect {
             name: name.to_owned(),
             payload: capsule_job_payload(&slot.payload),
-            // Not `-`: the panic gate denies `arithmetic_side_effects`, and `DateTime`
+            // Not `-`: the panic gate denies `arithmetic_side_effects`, and `Timestamp`
             // subtraction is not total.
-            delay_secs: due_at.map(|due| recorded_delay(due.signed_duration_since(now))),
-            due_at,
+            delay_secs: due_at.map(|due| recorded_delay(due.duration_since(now))),
+            due_at: due_at.map(crate::time::bridge::ChronoBridge::to_chrono),
             // Kept only when the deadline had passed and the job ran at once.
-            requested_due_at: due_at.map_or(slot.requested_due_at, |_| None),
+            requested_due_at: due_at
+                .map_or(slot.requested_due_at, |_| None)
+                .map(crate::time::bridge::ChronoBridge::to_chrono),
             // `message`, not `Display`: recorded on the capsule tape.
             error: error.map(crate::AutumnError::message),
             error_status: error.map(|error| error.status().as_u16()),
@@ -3881,10 +3870,7 @@ fn require_job_client() -> AutumnResult<Arc<JobClient>> {
 /// Free function taking the decision as a parameter so both arms are reachable
 /// from a unit test — the Postgres arm otherwise needs a live pool. See
 /// [`JobClient::due_origin`] for why the two arms differ.
-fn due_origin_for(
-    durable_is_pg: bool,
-    clock: &dyn crate::time::ClockSource,
-) -> chrono::DateTime<chrono::Utc> {
+fn due_origin_for(durable_is_pg: bool, clock: &dyn crate::time::ClockSource) -> Timestamp {
     if durable_is_pg {
         #[allow(
             clippy::disallowed_methods,
@@ -3893,27 +3879,24 @@ fn due_origin_for(
                       same real timeline; the injected clock would put `run_at` years off \
                       the one it is compared to. See `JobClient::due_origin`."
         )]
-        return chrono::Utc::now();
+        return Timestamp::now();
     }
-    clock.now().to_chrono()
+    clock.now()
 }
 
 /// Convert a relative delay into an absolute due instant, measured from `now`.
 ///
-/// Saturates to `DateTime::MAX` on overflow (practically impossible).
+/// Saturates to `Timestamp::MAX` on overflow, which a delay of a few
+/// thousand years already reaches.
 ///
 /// The single home of the overflow clamp: every enqueue-side due-time
 /// computation reaches it, so a pathological delay can never panic on one
 /// path and clamp on another.
-pub(crate) fn due_at_from(
-    now: chrono::DateTime<chrono::Utc>,
-    delay: std::time::Duration,
-) -> chrono::DateTime<chrono::Utc> {
-    let Ok(delta) = chrono::TimeDelta::from_std(delay) else {
-        return chrono::DateTime::<chrono::Utc>::MAX_UTC;
+pub(crate) fn due_at_from(now: Timestamp, delay: std::time::Duration) -> Timestamp {
+    let Ok(delta) = SignedDuration::try_from(delay) else {
+        return Timestamp::MAX;
     };
-    now.checked_add_signed(delta)
-        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+    now.checked_add(delta).unwrap_or(Timestamp::MAX)
 }
 
 /// A relative delay, paired with the monotonic instant it was captured at.
@@ -4000,11 +3983,7 @@ pub async fn enqueue_in(
 /// Returns an internal error when the jobs runtime is not initialized, when
 /// `name` does not match a registered job, or when the active backend rejects
 /// the enqueue operation.
-pub async fn enqueue_at(
-    name: &str,
-    payload: Value,
-    when: chrono::DateTime<chrono::Utc>,
-) -> AutumnResult<()> {
+pub async fn enqueue_at(name: &str, payload: Value, when: Timestamp) -> AutumnResult<()> {
     if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::At(when)) {
         return answer;
     }
@@ -4100,7 +4079,7 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
 pub async fn enqueue_at_on_conn<A: serde::Serialize>(
     name: &str,
     args: A,
-    when: chrono::DateTime<chrono::Utc>,
+    when: Timestamp,
     conn: &mut diesel_async::AsyncPgConnection,
 ) -> AutumnResult<()> {
     let payload = serde_json::to_value(&args).map_err(|e| {
@@ -4213,7 +4192,7 @@ pub async fn enqueue_in_after_commit<A: serde::Serialize>(
 pub async fn enqueue_at_after_commit<A: serde::Serialize>(
     name: &str,
     args: A,
-    when: chrono::DateTime<chrono::Utc>,
+    when: Timestamp,
 ) -> AutumnResult<()> {
     let payload = serde_json::to_value(&args).map_err(|e| {
         AutumnError::internal_server_error(std::io::Error::other(format!(
@@ -4356,7 +4335,7 @@ impl JobClient {
     /// to carry into `run_at`. An **absolute** instant (`enqueue_at`) still
     /// passes through unchanged: it is a real-world deadline the caller
     /// chose, not one measured from this read.
-    fn due_origin(&self) -> chrono::DateTime<chrono::Utc> {
+    fn due_origin(&self) -> Timestamp {
         due_origin_for(self.durable_is_pg(), self.clock.as_ref())
     }
 
@@ -4395,9 +4374,7 @@ impl JobClient {
     /// not stretching `due_at`/`now` either (`due_origin` runs after the
     /// pause too) — silently adding the pause's length on top of the
     /// requested delay instead of counting it as part of the wait.
-    fn relative_delay_origins(
-        &self,
-    ) -> (crate::time::MonotonicInstant, chrono::DateTime<chrono::Utc>) {
+    fn relative_delay_origins(&self) -> (crate::time::MonotonicInstant, Timestamp) {
         let monotonic = self.monotonic_origin();
         let now = self.due_origin();
         (monotonic, now)
@@ -4454,7 +4431,7 @@ impl JobClient {
         &self,
         name: &str,
         payload: Value,
-        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        due_at: Option<Timestamp>,
     ) -> AutumnResult<()> {
         crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
         self.enqueue_with_outcome_due(name, payload, due_at)
@@ -4479,7 +4456,7 @@ impl JobClient {
         &self,
         name: &str,
         payload: Value,
-        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        due_at: Option<Timestamp>,
     ) -> AutumnResult<EnqueueOutcome> {
         // One clock reading serves every downstream decision (filter, admin status, local
         // sleep), so near-due jobs are not misclassified, and the capsule's clock tape gets
@@ -4564,8 +4541,8 @@ impl JobClient {
         &self,
         name: &str,
         payload: Value,
-        due_at: Option<chrono::DateTime<chrono::Utc>>,
-        now: chrono::DateTime<chrono::Utc>,
+        due_at: Option<Timestamp>,
+        now: Timestamp,
         relative_delay: Option<RelativeDelay>,
     ) -> AutumnResult<EnqueueOutcome> {
         let Some(settings) = self.per_job_settings.get(name) else {
@@ -4589,7 +4566,7 @@ impl JobClient {
         if self.durable_is_pg() {
             // Remembered by id so admin-cancel (`pg_cancel_enqueued`) removes exactly this
             // mark rather than guessing among co-queued marks on different timelines.
-            let ready_at_ms = due_at.map(|due| u64::try_from(due.timestamp_millis()).unwrap_or(0));
+            let ready_at_ms = due_at.map(|due| u64::try_from(due.as_millisecond()).unwrap_or(0));
             self.registry.record_pg_enqueue(
                 name,
                 &id,
@@ -4598,7 +4575,7 @@ impl JobClient {
             );
         } else if let Some(due) = due_at {
             // Not claimable until its timer fires, so it must not count toward ready depth.
-            let ready_at_ms = u64::try_from(due.timestamp_millis()).unwrap_or(0);
+            let ready_at_ms = u64::try_from(due.as_millisecond()).unwrap_or(0);
             self.registry.record_enqueue_scheduled(name, ready_at_ms);
         } else {
             self.registry.record_enqueue(name);
@@ -4655,11 +4632,9 @@ impl JobClient {
                 let send_result = if let Some(due) = due_at {
                     // A detached timer delivers the job at its due time; the delay is lost
                     // if the process restarts first. Computed here, after any interceptor,
-                    // so interceptor time is not added. `signed_duration_since` is total
-                    // for two representable `DateTime<Utc>` values.
-                    let delay = due
-                        .signed_duration_since(self.clock.now().to_chrono())
-                        .to_std()
+                    // so interceptor time is not added. `duration_since` is total for two
+                    // `Timestamp` values; a past due time is negative and runs at once.
+                    let delay = std::time::Duration::try_from(due.duration_since(self.clock.now()))
                         .unwrap_or(std::time::Duration::ZERO);
                     let sender = sender.clone();
                     let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -4837,7 +4812,7 @@ impl JobClient {
     pub async fn enqueue_many_due(
         &self,
         name: &str,
-        items: Vec<(Value, Option<chrono::DateTime<chrono::Utc>>)>,
+        items: Vec<(Value, Option<Timestamp>)>,
     ) -> Vec<AutumnResult<()>> {
         self.enqueue_many_with_outcome_due(name, items)
             .await
@@ -4852,7 +4827,7 @@ impl JobClient {
     pub(crate) async fn enqueue_many_with_outcome_due(
         &self,
         name: &str,
-        items: Vec<(Value, Option<chrono::DateTime<chrono::Utc>>)>,
+        items: Vec<(Value, Option<Timestamp>)>,
     ) -> Vec<AutumnResult<EnqueueOutcome>> {
         #[cfg(feature = "postgres")]
         if self.can_batch_enqueue(name) {
@@ -4906,7 +4881,7 @@ impl JobClient {
     async fn enqueue_many_pg(
         &self,
         name: &str,
-        items: Vec<(Value, Option<chrono::DateTime<chrono::Utc>>)>,
+        items: Vec<(Value, Option<Timestamp>)>,
     ) -> Vec<AutumnResult<EnqueueOutcome>> {
         let Some(settings) = self.per_job_settings.get(name) else {
             // `can_batch_enqueue` already checked this; answer as the single-row path does
@@ -4962,7 +4937,7 @@ impl JobClient {
 
             // Every item here is Postgres-backed, so record the mark by id as the single-row
             // path does; admin-cancel then finds it exactly instead of by nearest match.
-            let ready_at_ms = due_at.map(|due| u64::try_from(due.timestamp_millis()).unwrap_or(0));
+            let ready_at_ms = due_at.map(|due| u64::try_from(due.as_millisecond()).unwrap_or(0));
             self.registry.record_pg_enqueue(
                 name,
                 &id,
@@ -5193,7 +5168,7 @@ impl JobClient {
         &self,
         name: &str,
         payload: impl serde::Serialize,
-        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        due_at: Option<Timestamp>,
     ) -> AutumnResult<()> {
         self.enqueue_after_commit_inner(name, payload, AfterCommitDue::At(due_at))
             .await
@@ -5383,7 +5358,7 @@ impl JobClient {
         payload: Value,
         max_attempts: u32,
         backoff_ms: u64,
-        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        due_at: Option<Timestamp>,
         relative_delay: Option<RelativeDelay>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
@@ -5425,7 +5400,7 @@ impl JobClient {
         payload: Value,
         max_attempts: u32,
         backoff_ms: u64,
-        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        due_at: Option<Timestamp>,
         relative_delay: Option<RelativeDelay>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
@@ -5434,7 +5409,7 @@ impl JobClient {
         let _ = &relative_delay;
         #[cfg(feature = "redis")]
         if let Some(redis) = &self.redis {
-            let due_at_ms = due_at.map(|due| u64::try_from(due.timestamp_millis()).unwrap_or(0));
+            let due_at_ms = due_at.map(|due| u64::try_from(due.as_millisecond()).unwrap_or(0));
             return redis
                 .enqueue(
                     id,
@@ -5534,7 +5509,7 @@ impl JobClient {
         name: &str,
         payload: Value,
         conn: &mut diesel_async::AsyncPgConnection,
-        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        due_at: Option<Timestamp>,
     ) -> AutumnResult<()> {
         // Same origin that stamped the deadline — see `enqueue_with_outcome_due`.
         let now = self.due_origin();
@@ -5584,10 +5559,10 @@ impl JobClient {
         name: &str,
         payload: Value,
         conn: &mut diesel_async::AsyncPgConnection,
-        due_at: Option<chrono::DateTime<chrono::Utc>>,
-        now: chrono::DateTime<chrono::Utc>,
+        due_at: Option<Timestamp>,
+        now: Timestamp,
         relative_delay: Option<RelativeDelay>,
-        requested: Option<chrono::DateTime<chrono::Utc>>,
+        requested: Option<Timestamp>,
     ) -> AutumnResult<()> {
         // Failure-capsule seam (#1634): this path never reaches `enqueue_with_outcome_due`,
         // so without its own seam replay would report an unrecorded effect.
@@ -5629,7 +5604,7 @@ impl JobClient {
         name: &str,
         payload: Value,
         conn: &mut diesel_async::AsyncPgConnection,
-        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        due_at: Option<Timestamp>,
         relative_delay: Option<RelativeDelay>,
     ) -> AutumnResult<()> {
         crate::job_tracking::reject_reserved_envelope_marker(&payload)?;
@@ -5924,13 +5899,7 @@ struct LocalUniqueHold {
 #[cfg(test)]
 mod local_unique_hold_clock_tests {
     use super::{JobUniquenessWindow, LocalJobCoordination};
-    use crate::time::TickingClock;
-    #[allow(
-        unused_imports,
-        reason = "temporary chrono bridge; some callers are feature- or test-gated"
-    )]
-    use crate::time::bridge::JiffBridge as _;
-    use chrono::{TimeZone, Utc};
+    use crate::time::{TickingClock, Timestamp};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -5943,8 +5912,8 @@ mod local_unique_hold_clock_tests {
     /// which no injected clock — and no paused tokio runtime — can move.
     #[test]
     fn unique_hold_ttl_expires_on_the_injected_clock() {
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let clock = TickingClock::starting_at(epoch.to_jiff());
+        let epoch = "2020-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
+        let clock = TickingClock::starting_at(epoch);
         let coordination = LocalJobCoordination::with_clock(Arc::new(clock.clone()));
         let window = JobUniquenessWindow::TtlMs(300_000); // five minutes
 
@@ -5976,10 +5945,10 @@ mod local_unique_hold_clock_tests {
     /// reproducibility half of the same property.
     #[test]
     fn unique_hold_expiry_is_reproducible_across_identical_clocks() {
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
         let window = JobUniquenessWindow::TtlMs(1_000);
         let outcome = |steps: &[u64]| {
-            let clock = TickingClock::starting_at(epoch.to_jiff());
+            let clock = TickingClock::starting_at(epoch);
             let coordination = LocalJobCoordination::with_clock(Arc::new(clock.clone()));
             let mut seen = Vec::new();
             seen.push(coordination.try_acquire_unique("p", "k", "a", window));
@@ -7822,7 +7791,9 @@ fn redis_admin_operation_result(result: i64, id: &str, operation: &str) -> Autum
 #[cfg(feature = "redis")]
 fn redis_admin_time(ms: Option<u64>) -> Option<String> {
     let ms = i64::try_from(ms?).ok()?;
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map(format_job_admin_time)
+    Timestamp::from_millisecond(ms)
+        .ok()
+        .map(format_job_admin_time)
 }
 
 #[cfg(feature = "redis")]
@@ -10714,17 +10685,22 @@ struct PgJobRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     initial_backoff_ms: i64,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    enqueued_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = crate::db::SqlNullableTimestamp)]
+    enqueued_at: Option<Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    run_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = crate::db::SqlNullableTimestamp)]
+    run_at: Option<Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = crate::db::SqlNullableTimestamp)]
+    started_at: Option<Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = crate::db::SqlNullableTimestamp)]
+    finished_at: Option<Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     claimed_by: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = crate::db::SqlNullableTimestamp)]
+    claimed_at: Option<Timestamp>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     last_error: Option<String>,
     /// W3C `traceparent` captured at enqueue time.
@@ -10843,7 +10819,7 @@ async fn pg_evict_expired_unique_key(
 /// `RelativeMs` keeps a relative delay distinct from an absolute instant so
 /// the database computes `run_at` on its own clock (`NOW() + delay`) — the
 /// "natural follow-up" named in [`JobClient::due_origin`], closing the
-/// app-vs-database clock skew that stamping from `chrono::Utc::now()` and
+/// app-vs-database clock skew that stamping from `Timestamp::now()` and
 /// binding the result would carry. `Absolute` is a real-world deadline the
 /// caller chose (`enqueue_at`); it is inserted unchanged, exactly as before.
 #[cfg(feature = "postgres")]
@@ -10852,7 +10828,7 @@ enum PgDueAt {
     /// Run as soon as possible.
     Immediate,
     /// Run at this absolute instant.
-    Absolute(chrono::DateTime<chrono::Utc>),
+    Absolute(Timestamp),
     /// Run this many milliseconds after the database's own `NOW()`.
     RelativeMs(i64),
 }
@@ -10877,10 +10853,7 @@ const PG_MAX_RELATIVE_DELAY_MS: i64 = i64::MAX / 1_000_000;
 /// measured from the database's clock. Otherwise `due_at` is either an
 /// explicit `enqueue_at` instant or `None` (immediate).
 #[cfg(feature = "postgres")]
-fn pg_due_from(
-    relative_delay: Option<std::time::Duration>,
-    due_at: Option<chrono::DateTime<chrono::Utc>>,
-) -> PgDueAt {
+fn pg_due_from(relative_delay: Option<std::time::Duration>, due_at: Option<Timestamp>) -> PgDueAt {
     relative_delay.map_or_else(
         || due_at.map_or(PgDueAt::Immediate, PgDueAt::Absolute),
         |delay| {
@@ -10893,7 +10866,7 @@ fn pg_due_from(
             if ms > PG_MAX_RELATIVE_DELAY_MS {
                 // Matches `due_at_from`'s own overflow fallback so both paths
                 // clamp to the same, representable instant.
-                PgDueAt::Absolute(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                PgDueAt::Absolute(Timestamp::MAX)
             } else {
                 PgDueAt::RelativeMs(ms)
             }
@@ -10919,7 +10892,7 @@ async fn pg_insert_job(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
-    due_at: Option<chrono::DateTime<chrono::Utc>>,
+    due_at: Option<Timestamp>,
     relative_delay: Option<RelativeDelay>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
@@ -10980,6 +10953,7 @@ async fn pg_insert_job(
         PgDueAt::Absolute(at) => (Some(at), None),
         PgDueAt::RelativeMs(ms) => (None, Some(ms)),
     };
+    let run_at = crate::db::SqlNullableTimestamp(run_at);
 
     // `run_at` is an explicit instant (`enqueue_at`), else a relative delay from the database's
     // clock (`enqueue_in`), else now. Computing the delay in SQL removes app-vs-database clock
@@ -11106,8 +11080,10 @@ async fn pg_insert_jobs_many(
     // included, instead of copying the batch again.
     let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
     let payloads: Vec<&str> = rows.iter().map(|row| row.payload_json.as_str()).collect();
-    let run_ats: Vec<Option<chrono::DateTime<chrono::Utc>>> =
-        rows.iter().map(|row| row.due_at).collect();
+    let run_ats: Vec<crate::db::SqlNullableTimestamp> = rows
+        .iter()
+        .map(|row| crate::db::SqlNullableTimestamp(row.due_at))
+        .collect();
     let unique_keys: Vec<Option<&str>> = rows.iter().map(|row| row.unique_key.as_deref()).collect();
     let concurrency_keys: Vec<Option<&str>> = rows
         .iter()
@@ -11250,7 +11226,7 @@ async fn pg_enqueue_job_at(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
-    due_at: Option<chrono::DateTime<chrono::Utc>>,
+    due_at: Option<Timestamp>,
     relative_delay: Option<RelativeDelay>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
@@ -11291,7 +11267,7 @@ async fn pg_enqueue_on_conn_at(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
-    due_at: Option<chrono::DateTime<chrono::Utc>>,
+    due_at: Option<Timestamp>,
     relative_delay: Option<RelativeDelay>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
@@ -12200,7 +12176,7 @@ async fn pg_execute_job(
         payload,
         final_attempt,
         bounds,
-        durable_work_run(state, row.run_at.map(|at| at.timestamp_millis())),
+        durable_work_run(state, row.run_at.map(Timestamp::as_millisecond)),
     );
     let (outcome, pending) = tracing::Instrument::instrument(f, job_span).await;
     heartbeat
@@ -12262,8 +12238,7 @@ async fn pg_settle_outcome(
                 // so the local gauge tracks the retry as scheduled until it is
                 // actually claimable. A zero backoff is due-now (`None`).
                 let ready_at_ms = (delay_ms > 0).then(|| {
-                    let now_ms = u64::try_from(state.clock().now().to_chrono().timestamp_millis())
-                        .unwrap_or(0);
+                    let now_ms = u64::try_from(state.clock().now().as_millisecond()).unwrap_or(0);
                     now_ms.saturating_add(delay_ms)
                 });
                 PgLifecycleRecord::Retry {
@@ -12569,7 +12544,8 @@ struct PgCancelRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
-    run_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(deserialize_as = crate::db::SqlNullableTimestamp)]
+    run_at: Option<Timestamp>,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     offset_ms: i64,
 }
@@ -12610,13 +12586,10 @@ impl PgJobAdminBackend {
             &mut conn,
             PG_STATUS_COMPLETED,
             "finished_at",
-            Some(
-                crate::time_math::saturating_ts_add(
-                    now.to_chrono().to_jiff(),
-                    crate::time::SignedDuration::from_hours(-24),
-                )
-                .to_chrono(),
-            ),
+            Some(crate::time_math::saturating_ts_add(
+                now,
+                crate::time::SignedDuration::from_hours(-24),
+            )),
             query.completed_page,
             per_page,
         )
@@ -12625,13 +12598,10 @@ impl PgJobAdminBackend {
             &mut conn,
             PG_STATUS_FAILED,
             "finished_at",
-            Some(
-                crate::time_math::saturating_ts_add(
-                    now.to_chrono().to_jiff(),
-                    crate::time::SignedDuration::from_hours(-168),
-                )
-                .to_chrono(),
-            ),
+            Some(crate::time_math::saturating_ts_add(
+                now,
+                crate::time::SignedDuration::from_hours(-168),
+            )),
             query.failed_page,
             per_page,
         )
@@ -12790,10 +12760,10 @@ impl PgJobAdminBackend {
             reason = "must match the real-time reference `due_origin()` stamped a relative-delay \
                       job's own registry mark from — see `JobClient::due_origin`."
         )]
-        let real_reference_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+        let real_reference_ms = u64::try_from(Timestamp::now().as_millisecond()).unwrap_or(0);
         let absolute_ms = row
             .run_at
-            .and_then(|dt| u64::try_from(dt.timestamp_millis()).ok());
+            .and_then(|dt| u64::try_from(dt.as_millisecond()).ok());
         self.registry.record_cancel_at_backend_offset(
             &row.name,
             id,
@@ -12846,7 +12816,7 @@ async fn pg_admin_page(
     conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
     status: &str,
     sort_col: &'static str,
-    since: Option<chrono::DateTime<chrono::Utc>>,
+    since: Option<Timestamp>,
     page: u64,
     per_page: i64,
 ) -> AutumnResult<JobAdminPage> {
@@ -12871,7 +12841,7 @@ async fn pg_admin_page(
              WHERE status = $1 AND {sort_col} >= $2"
         ))
         .bind::<diesel::sql_types::Text, _>(status)
-        .bind::<diesel::sql_types::Timestamptz, _>(since)
+        .bind::<diesel::sql_types::Timestamptz, _>(crate::db::SqlTimestamp(since))
         .get_result::<PgCount>(&mut **conn)
         .await
         .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin count: {e}")))?
@@ -12884,7 +12854,7 @@ async fn pg_admin_page(
              LIMIT $3 OFFSET $4"
         ))
         .bind::<diesel::sql_types::Text, _>(status)
-        .bind::<diesel::sql_types::Timestamptz, _>(since)
+        .bind::<diesel::sql_types::Timestamptz, _>(crate::db::SqlTimestamp(since))
         .bind::<diesel::sql_types::BigInt, _>(per_page)
         .bind::<diesel::sql_types::BigInt, _>(offset)
         .load::<PgJobRow>(&mut **conn)
@@ -13781,16 +13751,13 @@ mod tests {
     /// it is ahead. Regression test for the P1 raised on #2192.
     #[test]
     fn due_origin_follows_the_backend_that_decides_dueness() {
-        use chrono::{TimeZone, Utc};
-
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
 
         // A local-backed client: the injected (2020) clock decides dueness, so
         // the delay is measured from it.
         let (tx, _rx) = tokio::sync::mpsc::channel::<QueuedJob>(1);
-        let mut local = JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(
-            epoch.to_jiff(),
-        )));
+        let mut local =
+            JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
         local.local_sender = Some(tx);
         assert_eq!(
             local.due_origin(),
@@ -13800,9 +13767,8 @@ mod tests {
 
         // With no backend installed at all there is nothing comparing against a
         // database, so the injected clock still governs.
-        let bare = JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(
-            epoch.to_jiff(),
-        )));
+        let bare =
+            JobClient::bare_for_test(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
         assert_eq!(
             bare.due_origin(),
             epoch,
@@ -13811,10 +13777,10 @@ mod tests {
 
         // The Postgres arm, reachable here only because the decision is split
         // out of the clock read — through `JobClient` it needs a live pool.
-        let clock = crate::time::FixedClock::at(epoch.to_jiff());
-        let before = chrono::Utc::now();
+        let clock = crate::time::FixedClock::at(epoch);
+        let before = Timestamp::now();
         let pg_origin = due_origin_for(true, &clock);
-        let after = chrono::Utc::now();
+        let after = Timestamp::now();
         assert!(
             pg_origin >= before && pg_origin <= after,
             "a Postgres-served delay must be measured from real time (the clock its \
@@ -13869,7 +13835,7 @@ mod tests {
         }
 
         fn clock() -> Arc<dyn crate::time::ClockSource> {
-            Arc::new(crate::time::FixedClock::at(chrono::Utc::now().to_jiff()))
+            Arc::new(crate::time::FixedClock::at(Timestamp::now()))
         }
 
         // A deadpool `Pool` dials only on `.get()`, and `can_batch_enqueue` only checks
@@ -14006,12 +13972,10 @@ mod tests {
     /// of functions both call sites now go through.
     #[test]
     fn a_stamped_deadline_survives_the_filter_that_judges_it() {
-        use chrono::{TimeZone, Utc};
-
         // A clock pinned a decade ahead of real time — the case that breaks when
         // the stamp and the filter disagree.
-        let ahead = Utc.with_ymd_and_hms(2036, 1, 1, 0, 0, 0).unwrap();
-        let clock = crate::time::FixedClock::at(ahead.to_jiff());
+        let ahead = "2036-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
+        let clock = crate::time::FixedClock::at(ahead);
         let delay = std::time::Duration::from_secs(60);
 
         for durable_is_pg in [true, false] {
@@ -14043,9 +14007,7 @@ mod tests {
     /// client that actually received the job.
     #[tokio::test]
     async fn relative_enqueue_reads_the_clock_of_the_client_it_submits_to() {
-        use chrono::{TimeZone, Utc};
-
-        fn client_at(epoch: chrono::DateTime<chrono::Utc>) -> JobClient {
+        fn client_at(epoch: Timestamp) -> JobClient {
             JobClient {
                 local_sender: None,
                 local_coordination: None,
@@ -14062,15 +14024,15 @@ mod tests {
                 per_job_settings: HashMap::new(),
                 interceptor: None,
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
-                clock: std::sync::Arc::new(crate::time::FixedClock::at(epoch.to_jiff())),
+                clock: std::sync::Arc::new(crate::time::FixedClock::at(epoch)),
                 resilience_config: None,
                 #[cfg(feature = "postgres")]
                 shard_local: false,
             }
         }
 
-        let epoch_a = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let epoch_b = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
+        let epoch_a = "2020-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
+        let epoch_b = "2030-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
 
         let _guard = global_job_runtime_test_lock().lock().await;
         clear_global_job_client();
@@ -14084,7 +14046,7 @@ mod tests {
         let when = due_at_from(held.due_origin(), std::time::Duration::from_secs(60));
         assert_eq!(
             when,
-            epoch_a + chrono::Duration::seconds(60),
+            epoch_a + SignedDuration::from_secs(60),
             "the due instant must come from the clock of the handle we submit \
              through (A), not from whichever client happens to be global now (B)"
         );
@@ -14098,7 +14060,7 @@ mod tests {
                     .due_origin(),
                 std::time::Duration::from_secs(60)
             ),
-            epoch_b + chrono::Duration::seconds(60),
+            epoch_b + SignedDuration::from_secs(60),
             "a fresh resolution sees B, confirming the global was swapped"
         );
 
@@ -14579,9 +14541,9 @@ mod tests {
         assert_eq!(delay_seconds(Duration::from_millis(500)), 1);
         assert_eq!(delay_seconds(Duration::from_secs(2)), 2);
         assert_eq!(delay_seconds(Duration::ZERO), 0);
-        assert_eq!(recorded_delay(chrono::TimeDelta::milliseconds(500)), 1);
-        assert_eq!(recorded_delay(chrono::TimeDelta::seconds(2)), 2);
-        assert_eq!(recorded_delay(chrono::TimeDelta::zero()), 0);
+        assert_eq!(recorded_delay(SignedDuration::from_millis(500)), 1);
+        assert_eq!(recorded_delay(SignedDuration::from_secs(2)), 2);
+        assert_eq!(recorded_delay(SignedDuration::ZERO), 0);
     }
 
     /// Codex review on #3222: a rejected enqueue replays with the status it
@@ -15094,7 +15056,7 @@ mod tests {
             &crate::config::JobQueuesConfig::default(),
         );
 
-        let when = chrono::Utc::now() - chrono::TimeDelta::seconds(60);
+        let when = Timestamp::now() - SignedDuration::from_secs(60);
         enqueue_at("past", serde_json::json!({}), when)
             .await
             .unwrap();
@@ -19760,9 +19722,7 @@ mod tests {
         /// bookkeeping instant, never the source of truth for the INSERT.
         #[test]
         fn pg_due_from_prefers_a_relative_delay_over_an_absolute_due_at() {
-            use chrono::{TimeZone, Utc};
-
-            let at = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+            let at = "2020-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
 
             assert_eq!(pg_due_from(None, None), PgDueAt::Immediate);
             assert_eq!(pg_due_from(None, Some(at)), PgDueAt::Absolute(at));
@@ -19784,7 +19744,7 @@ mod tests {
         fn pg_due_from_clamps_an_overflowing_delay_instead_of_overflowing_postgres() {
             assert_eq!(
                 pg_due_from(Some(Duration::from_secs(u64::MAX)), None),
-                PgDueAt::Absolute(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                PgDueAt::Absolute(Timestamp::MAX)
             );
         }
 
@@ -20082,7 +20042,7 @@ mod tests {
 
             // The nack UPDATE would set run_at ~60s out; carry that ready time.
             let ready_at_ms =
-                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0) + 60_000;
+                u64::try_from(Timestamp::now().as_millisecond()).unwrap_or(0) + 60_000;
             assert!(record_pg_lifecycle_ack_result(
                 Ok(true),
                 "slow_retry",
@@ -20219,12 +20179,10 @@ mod tests {
         /// measures it has not moved at all.
         #[test]
         fn pg_retry_with_backoff_mark_is_judged_on_the_registry_clock_not_real_time() {
-            use chrono::{TimeZone, Utc};
-
             let state = AppState::for_test()
                 .with_profile("dev")
                 .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
-                    Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap().to_jiff(),
+                    "2000-01-01T00:00:00Z".parse::<Timestamp>().unwrap(),
                 )));
             state.job_registry().register_on_queue("slow_retry", "work");
             state.job_registry().record_enqueue("slow_retry");
@@ -20236,8 +20194,7 @@ mod tests {
 
             // `state.clock().now() + backoff`, as the retry site computes it: long past in real
             // time, but still inside its backoff on the frozen registry clock.
-            let registry_now_ms =
-                u64::try_from(state.clock().now().to_chrono().timestamp_millis()).unwrap_or(0);
+            let registry_now_ms = u64::try_from(state.clock().now().as_millisecond()).unwrap_or(0);
             let retry_mark = registry_now_ms + 60_000;
 
             assert!(record_pg_lifecycle_ack_result(
@@ -20830,7 +20787,7 @@ mod tests {
 
             // An absolute due time (the `enqueue_at` shape), ~2s out.
             let job_id = uuid::Uuid::new_v4().to_string();
-            let due = chrono::Utc::now() + chrono::TimeDelta::seconds(2);
+            let due = Timestamp::now() + SignedDuration::from_secs(2);
             pg_enqueue_job_at(
                 &pool,
                 job_id.clone(),
@@ -20921,10 +20878,10 @@ mod tests {
             let row = pg_fetch_by_id(&pool, &job_id).await.expect("row exists");
             let enqueued_at = row.enqueued_at.expect("enqueued_at is set");
             let run_at = row.run_at.expect("run_at is set for a delayed enqueue");
-            let bound_delay = run_at.signed_duration_since(enqueued_at);
+            let bound_delay = run_at.duration_since(enqueued_at);
             assert!(
-                bound_delay >= chrono::TimeDelta::milliseconds(1_000)
-                    && bound_delay < chrono::TimeDelta::milliseconds(2_500),
+                bound_delay >= SignedDuration::from_millis(1_000)
+                    && bound_delay < SignedDuration::from_millis(2_500),
                 "run_at must be ~2s after enqueued_at, minus at most the pool-checkout/eviction \
                  gap before the INSERT (got {bound_delay}), computed by the database, not \
                  stamped from a Rust-side clock read"
@@ -20954,41 +20911,37 @@ mod tests {
             // sleep. Anchor on a clock read taken right before the call instead; a read after
             // `pg_fetch_by_id` would add commit and fetch latency.
             let call_time = conn
-                .transaction::<chrono::DateTime<chrono::Utc>, diesel::result::Error, _>(
-                    async move |conn| {
-                        // Long enough that a `NOW()`-based 2s delay would already be due.
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                        let call_time = chrono::Utc::now();
-                        let relative_delay = RelativeDelay::new(
-                            Duration::from_secs(2),
-                            crate::time::monotonic_now(),
-                        );
-                        pg_enqueue_on_conn_at(
-                            conn,
-                            job_id_for_insert,
-                            "send_email",
-                            "default",
-                            serde_json::json!({ "user_id": 7 }),
-                            5,
-                            250,
-                            None,
-                            Some(relative_delay),
-                            &ResolvedJobConstraints::default(),
-                        )
-                        .await
-                        .expect("relative-delay on-conn enqueue should succeed");
-                        Ok(call_time)
-                    },
-                )
+                .transaction::<Timestamp, diesel::result::Error, _>(async move |conn| {
+                    // Long enough that a `NOW()`-based 2s delay would already be due.
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let call_time = Timestamp::now();
+                    let relative_delay =
+                        RelativeDelay::new(Duration::from_secs(2), crate::time::monotonic_now());
+                    pg_enqueue_on_conn_at(
+                        conn,
+                        job_id_for_insert,
+                        "send_email",
+                        "default",
+                        serde_json::json!({ "user_id": 7 }),
+                        5,
+                        250,
+                        None,
+                        Some(relative_delay),
+                        &ResolvedJobConstraints::default(),
+                    )
+                    .await
+                    .expect("relative-delay on-conn enqueue should succeed");
+                    Ok(call_time)
+                })
                 .await
                 .expect("transaction should commit");
 
             let row = pg_fetch_by_id(&pool, &job_id).await.expect("row exists");
             let run_at = row.run_at.expect("run_at is set for a delayed enqueue");
-            let bound_delay = run_at.signed_duration_since(call_time);
+            let bound_delay = run_at.duration_since(call_time);
             assert!(
-                bound_delay >= chrono::TimeDelta::milliseconds(1_000)
-                    && bound_delay < chrono::TimeDelta::milliseconds(2_500),
+                bound_delay >= SignedDuration::from_millis(1_000)
+                    && bound_delay < SignedDuration::from_millis(2_500),
                 "run_at must be ~2s after the enqueue call (got {bound_delay}), not shrunk by \
                  the 3s the transaction was already open before that call"
             );
@@ -21842,7 +21795,6 @@ mod tests {
             //   - relative delay: real time, via `JobClient::due_origin` (#2111);
             //   - absolute `enqueue_at`: the caller's instant, matched exactly against `run_at`.
             // The registry clock is pinned far from real time so a wrong timeline shows.
-            use chrono::{TimeZone, Utc};
             use testcontainers::runners::AsyncRunner as _;
             use testcontainers_modules::postgres::Postgres;
 
@@ -21853,9 +21805,7 @@ mod tests {
             pg_run_migration(&pool).await;
 
             let registry = crate::actuator::JobRegistry::new().with_clock(std::sync::Arc::new(
-                crate::time::FixedClock::at(
-                    Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap().to_jiff(),
-                ),
+                crate::time::FixedClock::at("2100-01-01T00:00:00Z".parse::<Timestamp>().unwrap()),
             ));
             registry.register_on_queue("send_email", "mail");
             registry.register_on_queue("nightly_report", "mail");
@@ -21872,7 +21822,7 @@ mod tests {
                 crate::actuator::PgMarkTimeline::Registry,
             );
             // Relative delay: on real time.
-            let real_now_ms = u64::try_from(Utc::now().timestamp_millis()).unwrap();
+            let real_now_ms = u64::try_from(Timestamp::now().as_millisecond()).unwrap();
             let real_far_future_ms = real_now_ms + 3_600_000;
             registry.record_pg_enqueue(
                 "nightly_report",
@@ -21931,15 +21881,13 @@ mod tests {
             )
             .await
             .unwrap();
-            let absolute_due_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-                i64::try_from(absolute_due_ms).unwrap(),
-            )
-            .unwrap();
+            let absolute_due_at =
+                Timestamp::from_millisecond(i64::try_from(absolute_due_ms).unwrap()).unwrap();
             pg_exec(
                 &pool,
                 &format!(
                     "UPDATE autumn_jobs SET run_at = '{}' WHERE id = 'absolute-job'",
-                    absolute_due_at.to_rfc3339()
+                    crate::time::compat::rfc3339(absolute_due_at)
                 ),
             )
             .await;
@@ -21959,9 +21907,10 @@ mod tests {
                 .await
                 .expect("cancel should succeed");
             let registry_now_ms = u64::try_from(
-                Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0)
+                "2100-01-01T00:00:00Z"
+                    .parse::<Timestamp>()
                     .unwrap()
-                    .timestamp_millis(),
+                    .as_millisecond(),
             )
             .unwrap();
             assert_eq!(
@@ -23513,7 +23462,7 @@ mod tests {
 
     #[test]
     fn due_at_from_zero_delay_is_now() {
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         assert_eq!(
             due_at_from(now, std::time::Duration::ZERO),
             now,
@@ -23522,13 +23471,13 @@ mod tests {
     }
 
     #[test]
-    fn due_at_from_overflow_returns_max_utc() {
-        // u64::MAX seconds overflows i64 nanoseconds in TimeDelta::from_std.
+    fn due_at_from_overflow_returns_max() {
+        // u64::MAX seconds does not fit the i64 seconds of a SignedDuration.
         let huge = std::time::Duration::from_secs(u64::MAX);
         assert_eq!(
-            due_at_from(chrono::Utc::now(), huge),
-            chrono::DateTime::<chrono::Utc>::MAX_UTC,
-            "overflow duration must return MAX_UTC rather than panic"
+            due_at_from(Timestamp::now(), huge),
+            Timestamp::MAX,
+            "overflow duration must return Timestamp::MAX rather than panic"
         );
     }
 
@@ -23536,20 +23485,20 @@ mod tests {
     fn due_at_from_saturates_rather_than_wrapping_near_max() {
         // The other overflow door: the delta converts fine, but adding it to a
         // near-MAX `now` does not fit.
-        let near_max = chrono::DateTime::<chrono::Utc>::MAX_UTC - chrono::TimeDelta::seconds(1);
+        let near_max = Timestamp::MAX - SignedDuration::from_secs(1);
         assert_eq!(
             due_at_from(near_max, std::time::Duration::from_secs(3600)),
-            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            Timestamp::MAX,
             "adding past MAX must clamp, not wrap"
         );
     }
 
     #[test]
     fn due_at_from_small_delay_is_exactly_offset() {
-        let now = chrono::Utc::now();
+        let now = Timestamp::now();
         assert_eq!(
             due_at_from(now, std::time::Duration::from_secs(60)),
-            now + chrono::TimeDelta::seconds(60),
+            now + SignedDuration::from_secs(60),
             "a positive delay must land exactly `delay` after the given instant"
         );
     }
@@ -23589,7 +23538,7 @@ mod tests {
     #[test]
     fn record_requeued_returns_true_for_scheduled_job() {
         let backend = JobAdminMemoryBackend::new_for_test(32);
-        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let future_due = Timestamp::now() + SignedDuration::from_hours(1);
         let id = uuid::Uuid::new_v4().to_string();
         backend.record_enqueue_due(
             id.clone(),
@@ -23599,7 +23548,7 @@ mod tests {
             1,
             3,
             Some(future_due),
-            chrono::Utc::now(),
+            Timestamp::now(),
         );
 
         let snap = backend.snapshot_sync(&JobAdminQuery::default());
@@ -23779,7 +23728,7 @@ mod tests {
     #[test]
     fn try_record_start_accepts_scheduled_job() {
         let backend = JobAdminMemoryBackend::new_for_test(32);
-        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let future_due = Timestamp::now() + SignedDuration::from_hours(1);
         let id = uuid::Uuid::new_v4().to_string();
         backend.record_enqueue_due(
             id.clone(),
@@ -23789,7 +23738,7 @@ mod tests {
             1,
             3,
             Some(future_due),
-            chrono::Utc::now(),
+            Timestamp::now(),
         );
 
         let snap = backend.snapshot_sync(&JobAdminQuery::default());
@@ -23816,7 +23765,7 @@ mod tests {
             backend.record_success_for_test(&id);
         }
 
-        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let future_due = Timestamp::now() + SignedDuration::from_hours(1);
         let sched_id = uuid::Uuid::new_v4().to_string();
         backend.record_enqueue_due(
             sched_id.clone(),
@@ -23826,7 +23775,7 @@ mod tests {
             1,
             3,
             Some(future_due),
-            chrono::Utc::now(),
+            Timestamp::now(),
         );
 
         // Completing another job triggers a prune.
@@ -23859,7 +23808,7 @@ mod tests {
     fn register_delay_canceler_returns_true_when_already_canceled() {
         // The admin cancels between record_enqueue_due and register_delay_canceler.
         let backend = JobAdminMemoryBackend::new_for_test(32);
-        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let future_due = Timestamp::now() + SignedDuration::from_hours(1);
         let id = uuid::Uuid::new_v4().to_string();
         backend.record_enqueue_due(
             id.clone(),
@@ -23869,7 +23818,7 @@ mod tests {
             1,
             3,
             Some(future_due),
-            chrono::Utc::now(),
+            Timestamp::now(),
         );
 
         backend
@@ -23896,7 +23845,7 @@ mod tests {
     #[test]
     fn cancel_enqueued_scheduled_job_succeeds() {
         let backend = JobAdminMemoryBackend::new_for_test(32);
-        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let future_due = Timestamp::now() + SignedDuration::from_hours(1);
         let id = uuid::Uuid::new_v4().to_string();
         backend.record_enqueue_due(
             id.clone(),
@@ -23906,7 +23855,7 @@ mod tests {
             1,
             3,
             Some(future_due),
-            chrono::Utc::now(),
+            Timestamp::now(),
         );
 
         backend
@@ -24074,7 +24023,7 @@ mod tests {
             1,
             3,
             None,
-            chrono::Utc::now(),
+            Timestamp::now(),
         );
         let snap = backend.snapshot_sync(&JobAdminQuery::default());
         assert_eq!(
@@ -24091,7 +24040,7 @@ mod tests {
     fn record_enqueue_due_with_past_due_at_produces_enqueued_status() {
         let backend = JobAdminMemoryBackend::new_for_test(32);
         let id = uuid::Uuid::new_v4().to_string();
-        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        let past = Timestamp::now() - SignedDuration::from_hours(1);
         backend.record_enqueue_due(
             id,
             "myjob",
@@ -24100,7 +24049,7 @@ mod tests {
             1,
             3,
             Some(past),
-            chrono::Utc::now(),
+            Timestamp::now(),
         );
         let snap = backend.snapshot_sync(&JobAdminQuery::default());
         assert_eq!(
@@ -24138,7 +24087,7 @@ mod tests {
         use std::time::Duration;
         let (client, mut rx) = make_test_client();
 
-        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        let past = Timestamp::now() - SignedDuration::from_hours(1);
         client
             .enqueue_after_commit_due("test_job", serde_json::json!({"x": 20}), Some(past))
             .await
@@ -24160,7 +24109,7 @@ mod tests {
 
         let (client, mut rx) = make_test_client();
         let registry = Arc::new(Mutex::new(Vec::<CommitCallback>::new()));
-        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        let past = Timestamp::now() - SignedDuration::from_hours(1);
 
         AFTER_COMMIT_REGISTRY
             .scope(registry.clone(), async {
@@ -24230,7 +24179,7 @@ mod tests {
         let _guard = global_job_runtime_test_lock().lock().await;
         clear_global_job_client();
 
-        let when = chrono::Utc::now();
+        let when = Timestamp::now();
         let result = enqueue_at_after_commit("some_job", serde_json::json!({}), when).await;
         assert!(
             result.is_err(),
@@ -24318,7 +24267,7 @@ mod tests {
             shard_local: false,
         });
 
-        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        let past = Timestamp::now() - SignedDuration::from_hours(1);
         enqueue_at_after_commit("test_job", serde_json::json!({"x": 2}), past)
             .await
             .expect("enqueue_at_after_commit should succeed outside tx");
