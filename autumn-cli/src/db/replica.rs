@@ -23,8 +23,7 @@ use std::path::PathBuf;
 
 use autumn_web::config::{AutumnConfig, ReplicationConfig};
 use autumn_web::replication::{ReplicaDestination, restore, segment};
-use autumn_web::time::bridge::{ChronoBridge as _, JiffBridge};
-use chrono::{DateTime, Utc};
+use autumn_web::time::Timestamp;
 
 use crate::migrate;
 
@@ -321,10 +320,11 @@ fn fastrand_u64() -> u64 {
 }
 
 /// Parse `--timestamp` as RFC 3339.
-pub fn parse_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>, ReplicaError> {
+pub fn parse_timestamp(value: Option<&str>) -> Result<Option<Timestamp>, ReplicaError> {
     value.map_or(Ok(None), |raw| {
-        DateTime::parse_from_rfc3339(raw.trim())
-            .map(|t| Some(t.with_timezone(&Utc)))
+        raw.trim()
+            .parse::<Timestamp>()
+            .map(Some)
             .map_err(|_| ReplicaError::BadTimestamp {
                 value: raw.to_owned(),
             })
@@ -368,13 +368,10 @@ fn run_restore(
     eprintln!("  \u{2139} source: {}", remote.describe());
     eprintln!("  \u{2139} prefix: {}", loaded.root());
 
-    let plan = restore::plan(
-        remote.as_ref(),
-        &loaded.root(),
-        target.map(JiffBridge::to_jiff),
-    )
-    .map_err(|e| ReplicaError::Restore {
-        detail: e.to_string(),
+    let plan = restore::plan(remote.as_ref(), &loaded.root(), target).map_err(|e| {
+        ReplicaError::Restore {
+            detail: e.to_string(),
+        }
     })?;
     eprintln!(
         "  \u{2139} generation {} ({} segment(s)) \u{2192} {}",
@@ -415,9 +412,9 @@ fn run_status(profile: Option<&str>, json: bool) -> Result<(), ReplicaError> {
     let plan = restore::plan(remote.as_ref(), &root, None).map_err(|e| ReplicaError::Restore {
         detail: e.to_string(),
     })?;
-    let lag = Utc::now()
-        .signed_duration_since(plan.effective.to_chrono())
-        .num_seconds()
+    let lag = Timestamp::now()
+        .duration_since(plan.effective)
+        .as_secs()
         .max(0);
     if json {
         // JSON goes to stdout: this is the monitoring surface.

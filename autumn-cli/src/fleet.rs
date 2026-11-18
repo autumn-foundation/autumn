@@ -155,7 +155,6 @@ mod imp {
     use autumn_web::fleet_layout::FleetDbKey;
     use autumn_web::migrate::MigrationScope;
     use autumn_web::replication::ReplicationSettings;
-    use autumn_web::time::bridge::JiffBridge;
     use autumn_web::time::compat;
 
     use super::FleetCommand;
@@ -979,7 +978,7 @@ mod imp {
             .map_err(|_| "the fleet already replicates".to_owned())?;
 
         let outcome = runtime()?
-            .block_on(fleet.restore(&key, at.map(JiffBridge::to_jiff)))
+            .block_on(fleet.restore(&key, at))
             .map_err(|e| match e {
                 FleetError::NotFound { .. } => {
                     format!("{key} has no replica under {prefix}.")
@@ -1209,7 +1208,7 @@ mod imp {
         target: &Target,
         args: &LakeArgs<'_>,
         sql: &str,
-        at: Option<chrono::DateTime<chrono::Utc>>,
+        at: Option<autumn_web::time::Timestamp>,
         destination: Arc<dyn autumn_web::replication::ReplicaDestination>,
         base: String,
         out: Option<(&Path, std::fs::File)>,
@@ -1233,7 +1232,7 @@ mod imp {
             lake = lake.skip_failed_tenants();
         }
         if let Some(at) = at {
-            lake = lake.as_of(autumn_web::time::bridge::JiffBridge::to_jiff(at));
+            lake = lake.as_of(at);
         }
         if !args.tables.is_empty() {
             lake = lake.with_tables(args.tables.iter().cloned());

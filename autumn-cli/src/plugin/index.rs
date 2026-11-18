@@ -678,7 +678,7 @@ fn check_versions(listing: &Listing, out: &mut Vec<String>) {
             listing.conformance.autumn_web
         ));
     }
-    if chrono::NaiveDate::parse_from_str(&listing.conformance.checked, "%Y-%m-%d").is_err() {
+    if jiff::civil::Date::strptime("%Y-%m-%d", &listing.conformance.checked).is_err() {
         out.push(format!(
             "`conformance.checked` {:?} is not a YYYY-MM-DD date",
             listing.conformance.checked

@@ -22,11 +22,6 @@
 //! ordinary test lane; `offsite_backup.rs` covers the CLI's S3 transport against
 //! `MinIO`, and `autumn-web`'s `sqlite_replication_s3` covers replication's.
 
-#[allow(
-    unused_imports,
-    reason = "temporary chrono bridge; some callers are feature- or test-gated"
-)]
-use autumn_web::time::bridge::JiffBridge as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -36,8 +31,7 @@ use autumn_web::replication::{
     FileDestination, ReplicaDestination as _, ReplicationSettings, ReplicationStatus, Replicator,
     segment,
 };
-use autumn_web::time::ClockSource;
-use chrono::{DateTime, TimeZone as _, Utc};
+use autumn_web::time::{ClockSource, Timestamp};
 use diesel::connection::SimpleConnection as _;
 use diesel::sql_types::Text;
 use diesel::{Connection as _, QueryableByName, RunQueryDsl as _, SqliteConnection, sql_query};
@@ -81,13 +75,11 @@ fn run_autumn_ok(dir: &Path, args: &[&str]) -> (String, String) {
 
 /// A fixture instant, deliberately in the **past** (2023-11-14 + `secs`).
 ///
-/// Anything that compares a replication timestamp against `Utc::now()` — lag,
+/// Anything that compares a replication timestamp against the wall clock — lag,
 /// retention — must see these as history, so the suite's meaning cannot change
 /// on a calendar date.
-fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_700_000_000 + secs, 0)
-        .single()
-        .expect("timestamp")
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_second(1_700_000_000 + secs).expect("timestamp")
 }
 
 /// A clock the fixture steps by hand.
@@ -95,21 +87,21 @@ fn at(secs: i64) -> DateTime<Utc> {
 /// The replicator stamps every artifact from its own clock, at the moment that
 /// artifact's contents are fenced, so the instants a `--timestamp` restore
 /// selects on come from here rather than from a tick argument.
-struct StepClock(std::sync::Mutex<DateTime<Utc>>);
+struct StepClock(std::sync::Mutex<Timestamp>);
 
 impl StepClock {
     fn new() -> Arc<Self> {
         Arc::new(Self(std::sync::Mutex::new(at(0))))
     }
 
-    fn set(&self, now: DateTime<Utc>) {
+    fn set(&self, now: Timestamp) {
         *self.0.lock().expect("clock") = now;
     }
 }
 
 impl ClockSource for StepClock {
-    fn now(&self) -> autumn_web::time::Timestamp {
-        self.0.lock().expect("clock").to_jiff()
+    fn now(&self) -> Timestamp {
+        *self.0.lock().expect("clock")
     }
 }
 
@@ -267,7 +259,7 @@ fn a_timestamp_flag_restores_to_a_chosen_point_in_time() {
     let database = machine_b.join("app.db");
     write_machine_b(&machine_b, &replica, &database);
 
-    let target = at(150).to_rfc3339();
+    let target = autumn_web::time::compat::rfc3339(at(150));
     let (_, stderr) = run_autumn_ok(
         &machine_b,
         &["db", "replica", "restore", "--timestamp", &target],

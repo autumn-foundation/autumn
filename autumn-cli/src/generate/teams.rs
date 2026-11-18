@@ -3415,7 +3415,7 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
             #[diesel(sql_type = diesel::sql_types::BigInt)]
             id: i64,
             #[diesel(sql_type = diesel::sql_types::Timestamp)]
-            created_at: chrono::NaiveDateTime,
+            created_at: autumn_web::db::SqlDateTime,
         }
 
         let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
@@ -3440,7 +3440,9 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         assert_eq!(orgs.len(), 1);
         assert_eq!(orgs[0].id, 1, "id must be auto-assigned");
         assert!(
-            orgs[0].created_at.and_utc().timestamp() > 0,
+            jiff::tz::TimeZone::UTC
+                .to_timestamp(orgs[0].created_at.0)
+                .is_ok_and(|ts| ts.as_second() > 0),
             "created_at must be defaulted to a parseable timestamp by SQLite"
         );
 

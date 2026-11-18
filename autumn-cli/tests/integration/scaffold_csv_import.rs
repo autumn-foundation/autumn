@@ -1489,7 +1489,7 @@ fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
 /// back does not end the wait too early.
 fn wait_until_after(stamp: &str) {
     use std::time::{Duration, Instant};
-    let now = || chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let now = || jiff::Timestamp::now().strftime("%Y%m%d%H%M%S").to_string();
     let deadline = Instant::now() + Duration::from_secs(30);
     while now().as_str() <= stamp {
         assert!(
