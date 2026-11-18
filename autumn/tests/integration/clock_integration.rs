@@ -209,7 +209,7 @@ async fn signed_url_expiry_is_deterministic_with_clock() {
     let blob_key = "avatars/me.png";
 
     // Set a fixed start time and sign a URL that expires in 300 seconds.
-    let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    let start: autumn_web::time::Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
     let clock = TickingClock::starting_at(start);
 
     let now_unix = clock_unix_secs(&clock);

@@ -24992,7 +24992,7 @@ mount = ["service"]
         );
         assert_eq!(
             super::cron_occurrence_window(&cron, &next),
-            std::time::Duration::from_secs(23 * 3_600 + 30 * 60)
+            std::time::Duration::from_mins(23 * 60 + 30)
         );
         let after = super::next_cron_occurrence_after(&cron, &next, &next).expect("next");
         assert_eq!(

@@ -42,7 +42,7 @@ use autumn_web::time::{
     clock_unix_duration, clock_unix_secs,
 };
 use autumn_web::{always, sometimes};
-use chrono::{NaiveDate, TimeDelta, TimeZone as _, Utc};
+use chrono::TimeDelta;
 use futures::FutureExt as _;
 use proptest::strategy::Strategy;
 
@@ -556,15 +556,18 @@ async fn age_posts(sim: &Sim) {
         }
         previous = current;
     }
-    let tomorrow = NaiveDate::from_ymd_opt(2020, 1, 2).expect("a date");
-    sim.advance_to(&Utc.from_utc_datetime(&tomorrow.and_hms_opt(9, 0, 0).expect("a time")))
-        .await;
-    let new_york_winter = chrono::FixedOffset::west_opt(5 * 3600).expect("an offset");
-    sim.advance_to_local(
-        tomorrow.and_hms_opt(18, 0, 0).expect("a time"),
-        &new_york_winter,
+    let tomorrow = autumn_web::time::civil::date(2020, 1, 2);
+    sim.advance_to(
+        tomorrow
+            .at(9, 0, 0, 0)
+            .to_zoned(autumn_web::time::tz::TimeZone::UTC)
+            .expect("a time in range")
+            .timestamp(),
     )
     .await;
+    let new_york_winter = autumn_web::time::tz::TimeZone::fixed(autumn_web::time::tz::offset(-5));
+    sim.advance_to_local(tomorrow.at(18, 0, 0, 0), &new_york_winter)
+        .await;
     if let Err(stall) = sim.try_run_to_idle().await {
         panic!(
             "the app did not settle: seed {}, {} drain steps: {stall}",
@@ -745,7 +748,10 @@ async fn replicas(sim: &mut Sim, shared: &Arc<Shared>, posts: &[i64], plan: &Pla
         .clone();
     check_publish_order(&worker_log, shared, "the vote worker", false);
 
-    sim.step_replica_clock("web-b", TimeDelta::seconds(plan.step_b_secs));
+    sim.step_replica_clock(
+        "web-b",
+        autumn_web::time::SignedDuration::from_secs(plan.step_b_secs),
+    );
     sim.run_for(Duration::from_secs(30)).await;
     hot(sim.replica("web-b"), "web-b").await;
     for actor in &plan.actors {
