@@ -348,7 +348,7 @@ pub struct Post {
     #[default]
     pub published: bool,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 ```
 
@@ -630,10 +630,14 @@ CleanupJob.perform_later
 ```rust
 #[scheduled(every = "24h", name = "cleanup")]
 async fn cleanup(state: AppState) -> AutumnResult<()> {
+    use autumn_web::db::AsSqlTime as _;
+    use autumn_web::time::{SignedDuration, ambient_civil_utc};
+
     let mut db = state.db().await?;
-    diesel::delete(posts::table.filter(
-        posts::created_at.lt(chrono::Utc::now().naive_utc() - chrono::Duration::days(30))
-    )).execute(&mut *db).await?;
+    let cutoff = ambient_civil_utc().saturating_sub(SignedDuration::from_hours(24 * 30));
+    diesel::delete(posts::table.filter(posts::created_at.lt(cutoff.as_sql_time())))
+        .execute(&mut *db)
+        .await?;
     Ok(())
 }
 

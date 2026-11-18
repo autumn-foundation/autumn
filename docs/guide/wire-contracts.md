@@ -294,8 +294,9 @@ serves with the types of its release. The rules:
   count: `std::string::String` is `String`. A decoder may read `T` as
   `Option<T>`.
 * **Wire types.** A field's JSON form must not change. This is also true
-  when the Rust type stays the same, for example `DateTime<Utc>` that gets
-  `#[serde(with = "ts_seconds")]` and `#[wire(type = "integer")]`. A nullable
+  when the Rust type stays the same, for example a `Timestamp` that gets
+  `#[serde(with = "jiff::fmt::serde::timestamp::second::required")]` and
+  `#[wire(type = "integer")]`. A nullable
   form reads the form it wraps. `any` is not compared. See
   [Wire types](#wire-types).
 * **Duplicate keys.** One object must not hold a field's name and its alias.
@@ -483,7 +484,7 @@ A descriptor that is not true of the code is worse than none, so
 
 The export refuses a field whose type has no `WireShape` descriptor and is
 not a known leaf (a primitive, `String`, a standard container,
-`serde_json::Value`, `Uuid`, a `chrono` or `time` type, `Decimal`, `Url`,
+`serde_json::Value`, `Uuid`, a `jiff`, `chrono` or `time` type, `Decimal`, `Url`,
 and similar). An enum is the usual case. Mark such a field
 `#[wire(opaque)]` to compare it by type name only:
 
@@ -524,6 +525,9 @@ export can map it. The cross-release check compares both.
 | `HashMap<K, V>`, `BTreeMap<K, V>`, `IndexMap<K, V>`, `serde_json::Map` | `map` of `V`, when `K` is a string or an integer. Else `any` |
 | `Option<T>` | `nullable` of `T` |
 | `Box<T>`, `Rc<T>`, `Arc<T>`, `Cow<T>`, `Cell<T>`, `RefCell<T>`, `Reverse<T>`, `Wrapping<T>` | the wire type of `T` |
+| `Timestamp` (`jiff::Timestamp`, `autumn_web::time::Timestamp`) | `string`, format `date-time` |
+| `civil::DateTime`, `civil::Date`, `civil::Time` | `string`, format `local-date-time`, `date`, `local-time` |
+| `ZonedDateTime` | `string` |
 | `chrono::DateTime<Tz>` | `string`, format `date-time` |
 | `chrono::NaiveDateTime`, `NaiveDate`, `NaiveTime` | `string`, format `local-date-time`, `date`, `local-time` |
 | `uuid::Uuid` | `string`, format `uuid` |
@@ -534,8 +538,12 @@ export can map it. The cross-release check compares both.
 | a field with `#[serde(with)]`, `serialize_with` or `deserialize_with` | `any` in that direction |
 
 A `time` crate type is `any`: its JSON form depends on a feature of the
-`time` crate, which the macro cannot see. A `DateTime` with no time zone
-argument is not chrono's, so it is `any` too.
+`time` crate, which the macro cannot see. `jiff`'s `DateTime`, `Date` and
+`Time` are known only behind `civil::`, because other crates use those names
+for values with other JSON forms: write `civil::DateTime`, not a bare
+`DateTime`. A bare `DateTime` with no type arguments is `any`. A
+`ZonedDateTime` writes its offset and a bracketed zone name (RFC 9557), which
+no format names, so it is a plain `string`.
 
 The macro finds a type by its last name, as the export finds a known leaf.
 In a `#[wire(opaque)]` field, a type that the macro does not know, and
@@ -551,9 +559,9 @@ When the macro cannot see the JSON form, name it with `#[wire(type = …)]`:
 ```rust
 #[derive(serde::Serialize, serde::Deserialize, WireShape)]
 pub struct Item {
-    #[serde(with = "chrono::serde::ts_seconds")]
+    #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
     #[wire(type = "integer", format = "unix-seconds")]
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     #[wire(type = "string", nullable)]
     pub nickname: Nickname, // type Nickname = Option<String>;
 }

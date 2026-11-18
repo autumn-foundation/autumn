@@ -864,7 +864,7 @@ The key `K` must be the group column's **non-nullable** Rust type.
 #[repository(Order)]
 pub trait OrderRepository {
     fn sum_total_grouped_by_status() -> Vec<(String, Option<i64>)>;
-    fn count_grouped_by_created_at() -> Vec<(DateTime<Utc>, i64)>;
+    fn count_grouped_by_created_at() -> Vec<(Timestamp, i64)>;
 }
 
 let top = repo
@@ -889,11 +889,11 @@ Builder methods available on **every** aggregate builder regardless of key type:
 interpolated).
 
 `.bucket(bucket)` (`DateBucket::Day` / `Week` / `Month`) is **only** defined when
-the group key `K` is a timestamp type — `NaiveDateTime` or `DateTime<Utc>` — since
+the group key `K` is a timestamp type — `civil::DateTime` or `Timestamp` — since
 it swaps the raw group column for `date_trunc('<unit>', <col>)`. Calling it on a
 non-temporal aggregate (e.g. the `String`-keyed `sum_total_grouped_by_status()`
 above) is a compile error, because the method does not exist for that key. A
-`timestamptz` (`DateTime<Utc>`) bucket uses `date_trunc(.., 'UTC')` for
+`timestamptz` (`Timestamp`) bucket uses `date_trunc(.., 'UTC')` for
 timezone-stable buckets.
 
 **Gotchas:** on a sharded, tenant-scoped repo, *every* grouped aggregate —
@@ -1054,7 +1054,7 @@ impl SendPasswordResetJob {
 
     pub async fn enqueue(args: ResetArgs) -> AutumnResult<()> { ... }
     pub async fn enqueue_in(args: ResetArgs, delay: Duration) -> AutumnResult<()> { ... }
-    pub async fn enqueue_at(args: ResetArgs, when: DateTime<Utc>) -> AutumnResult<()> { ... }
+    pub async fn enqueue_at(args: ResetArgs, when: Timestamp) -> AutumnResult<()> { ... }
     pub async fn enqueue_tracked(args: ResetArgs) -> AutumnResult<TrackedJobHandle> { ... }
     pub async fn enqueue_tracked_for(args: ResetArgs, owner: TrackedJobOwner)
         -> AutumnResult<TrackedJobHandle> { ... }
