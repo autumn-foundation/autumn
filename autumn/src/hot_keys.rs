@@ -39,7 +39,8 @@ use std::hash::Hash;
 pub struct HotKey<K> {
     /// The key.
     pub key: K,
-    /// Estimated weight recorded for the key. Never below the true weight.
+    /// Estimated weight recorded for the key. Never below the true weight
+    /// unless it saturated at `u64::MAX`.
     pub count: u64,
     /// The most `count` can overstate the true weight by.
     pub error: u64,
@@ -59,7 +60,7 @@ pub struct HotKeys<K> {
     capacity: usize,
     slots: Vec<HotKey<K>>,
     index: HashMap<K, usize>,
-    total: u64,
+    total: u128,
 }
 
 impl<K: Eq + Hash + Clone> HotKeys<K> {
@@ -88,7 +89,7 @@ impl<K: Eq + Hash + Clone> HotKeys<K> {
         if weight == 0 {
             return;
         }
-        self.total = self.total.saturating_add(weight);
+        self.total = self.total.saturating_add(u128::from(weight));
         if let Some(&i) = self.index.get(&key) {
             let slot = &mut self.slots[i];
             slot.count = slot.count.saturating_add(weight);
@@ -135,7 +136,7 @@ impl<K: Eq + Hash + Clone> HotKeys<K> {
     /// be missed while its error is large.
     #[must_use]
     pub fn heavy_hitters(&self, ppm: u64) -> Vec<HotKey<K>> {
-        let line = u128::from(ppm) * u128::from(self.total);
+        let line = u128::from(ppm).saturating_mul(self.total);
         let mut out = self.top(self.slots.len());
         out.retain(|k| u128::from(k.guaranteed()) * 1_000_000 >= line);
         out
@@ -149,11 +150,14 @@ impl<K: Eq + Hash + Clone> HotKeys<K> {
 
     /// Halve every count, error and the total, and forget keys that reach
     /// zero. Call it on a timer to age out old traffic.
+    ///
+    /// Counts round down while errors and the total round up, so the
+    /// guaranteed count and every reported share stay on the safe side.
     pub fn decay(&mut self) {
-        self.total /= 2;
+        self.total = self.total.div_ceil(2);
         for slot in &mut self.slots {
             slot.count /= 2;
-            slot.error /= 2;
+            slot.error = slot.error.div_ceil(2).min(slot.count);
         }
         self.slots.retain(|s| s.count > 0);
         self.index.clear();
@@ -162,9 +166,10 @@ impl<K: Eq + Hash + Clone> HotKeys<K> {
         }
     }
 
-    /// Total weight recorded (after any decay).
+    /// Total weight recorded (after any decay). It is wider than a single
+    /// count so that many saturated keys still divide into true shares.
     #[must_use]
-    pub const fn total(&self) -> u64 {
+    pub const fn total(&self) -> u128 {
         self.total
     }
 
@@ -327,12 +332,36 @@ mod tests {
     }
 
     #[test]
+    fn saturated_counts_do_not_inflate_shares() {
+        let mut hot = HotKeys::new(2);
+        hot.record_weighted("a", u64::MAX);
+        hot.record_weighted("b", u64::MAX);
+        // Each key is half the weight, so neither is a 100% hitter.
+        assert!(hot.heavy_hitters(1_000_000).is_empty());
+        assert_eq!(hot.heavy_hitters(500_000).len(), 2);
+    }
+
+    #[test]
+    fn decay_keeps_the_guaranteed_count_conservative() {
+        let mut hot = HotKeys::new(1);
+        hot.record("a");
+        hot.record("b"); // b: count 2, error 1
+        hot.decay();
+        let b = hot.get(&"b").expect("b tracked");
+        assert_eq!(b.guaranteed(), 0);
+        assert!(b.error <= b.count);
+        assert!(hot.heavy_hitters(1_000_000).is_empty());
+    }
+
+    #[test]
     fn weights_saturate_instead_of_overflowing() {
         let mut hot = HotKeys::new(1);
         hot.record_weighted("a", u64::MAX);
         hot.record_weighted("a", 5);
         assert_eq!(hot.get(&"a").map(|k| k.count), Some(u64::MAX));
-        assert_eq!(hot.total(), u64::MAX);
-        assert_eq!(hot.heavy_hitters(1_000_000).len(), 1);
+        assert_eq!(hot.total(), u128::from(u64::MAX) + 5);
+        // The clipped count can no longer prove 100%, only just under it.
+        assert!(hot.heavy_hitters(1_000_000).is_empty());
+        assert_eq!(hot.heavy_hitters(999_999).len(), 1);
     }
 }
