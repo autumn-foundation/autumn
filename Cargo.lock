@@ -805,9 +805,9 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
- "chrono",
  "diesel",
  "diesel-async",
+ "jiff 1.0.0",
  "percent-encoding",
  "reqwest",
  "serde",
@@ -5534,7 +5534,6 @@ version = "0.1.0"
 dependencies = [
  "autumn-media-plugin",
  "autumn-web",
- "chrono",
  "example-e2e",
  "maud",
  "serde",
