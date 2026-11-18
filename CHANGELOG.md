@@ -49,7 +49,10 @@ For a narrative tour of this release, see the
   updates through `serialize_as`, so a hand-written `.values(&new_row)` or
   `.set(&changes)` passes the value owned. A hand-written Diesel query
   binds a jiff value through `autumn_web::db::SqlTimestamp`, `SqlDateTime`,
-  `SqlDate` or `SqlTime` (or `.as_sql()` from `AsSqlTime`). An app removes
+  `SqlDate` or `SqlTime` (or `.as_sql_time()` from `AsSqlTime`). A field
+  whose type is written as a bare `Timestamp`, `DateTime`, `Date` or `Time`
+  is read as the jiff type; an app type of the same name must be written
+  with its path (`crate::types::Date`). An app removes
   diesel's `chrono` feature from its own `Cargo.toml`, or chrono stays in its
   build ([migration guide](docs/migrations/0.11.0.md#dates-and-times-chrono-is-replaced-by-jiff)).
 
@@ -60,7 +63,11 @@ For a narrative tour of this release, see the
   `reap_stale`) takes `SignedDuration` and `Timestamp`. A third-party store
   for either trait changes its signatures. In `autumn-admin-plugin`,
   `AdminHistoryEntry.recorded_at` is a `Timestamp` and
-  `ExperimentChange.changed_at` is a `civil::DateTime`
+  `ExperimentChange.changed_at` is a `civil::DateTime`.
+  `autumn_schema_core::ColumnType::rust_type()` returns
+  `autumn_web::time::civil::DateTime` and `autumn_web::time::Timestamp` for
+  the two timestamp column types; `from_rust_type` still accepts the chrono
+  spellings
   ([migration guide](docs/migrations/0.11.0.md#dates-and-times-chrono-is-replaced-by-jiff)).
 
 - **cli:** **Breaking:** `autumn generate` (model, scaffold, auth, teams and
@@ -190,9 +197,9 @@ For a narrative tour of this release, see the
   `#[serde(with)]`. An unknown type is a compile error. `nullable` lets a
   request leave out a field whose type is an `Option` under another name.
 - **wire contracts:** `autumn contracts check` compares wire types. A new
-  JSON form with the same Rust type, for example `DateTime<Utc>` that gets
-  `#[serde(with = "ts_seconds")]` and `#[wire(type = "integer")]`, is
-  reported in both deploy windows. `any` is not compared.
+  JSON form with the same Rust type, for example a `Timestamp` that gets
+  `#[serde(with = "jiff::fmt::serde::timestamp::second::required")]` and
+  `#[wire(type = "integer")]`, is reported in both deploy windows. `any` is not compared.
 
 - **wire contracts:** `#[wire(opaque)]` on a `WireShape` field compares it by
   type name only. `autumn contracts export` stops on a field whose type has
@@ -549,9 +556,15 @@ For a narrative tour of this release, see the
   can change. Deserialization accepts every form chrono wrote. To keep
   chrono's 0, 3, 6 or 9 digits on a `Timestamp` field, annotate it with
   `#[serde(with = "autumn_web::time::compat::serde_autosi")]`
-  (`serde_autosi_option` for `Option<Timestamp>`). Framework-owned records
+  (`#[serde(default, with = "autumn_web::time::compat::serde_autosi_option")]`
+  for an `Option<Timestamp>`). Framework-owned records
   (jobs, audit, alerts, outbox, webhooks, sync, capsules, billing, media)
   already do, so their JSON does not change.
+
+- **time:** an IANA zone name matches without regard to case
+  (`america/new_york` finds `America/New_York`), and
+  `format::format_datetime` with a pattern jiff cannot format returns the
+  RFC 3339 text of the instant instead of panicking.
 
 - **scaffold:** the CSV export writes a date-time column with jiff's
   `Display`: `2026-08-26T12:00:00` for a `civil::DateTime` column and
