@@ -132,8 +132,9 @@ statement, one dead row version and two index entries (primary key and
   two results.
 * `idempotency_db_store`'s five Postgres tests (crash after commit replays,
   stale-owner fence, recovery point survives a crash, stale-cookie retry)
-  pass unchanged. So do the store's unit tests and `sim_idempotency_db` on
-  SQLite.
+  pass unchanged against Postgres 16. So do the 53 `idempotency` unit tests
+  and the 25 `sim_idempotency_db` tests on SQLite (crash after commit,
+  recovery points through two crashes, short and zero TTLs).
 * The one `now` reading replaces two that were microseconds apart. The old
   second reading could only see a lock as expired that the first saw as
   live, which gave the shorter expiry. The new write keeps the longer one,
@@ -142,9 +143,10 @@ statement, one dead row version and two index entries (primary key and
 ## Not changed (findings)
 
 * **`SELECT 1` six times per request, 28.6% of all statements.** The
-  statement is diesel-async's connection check on a pool checkout, so a
-  request checks out a connection six times: each store call takes its own.
-  Each check costs a round trip and no buffers. Fewer checkouts, or a different recycle method, is a pool
+  statement is diesel-async's `RecyclingMethod::Verified` check, the
+  default, which Autumn's pool keeps: one bound `SELECT 1` on every
+  checkout. So a request checks out a connection six times, because each
+  store call takes its own. Each check costs a round trip and no buffers. Fewer checkouts, or a different recycle method, is a pool
   change and needs a maintainer's decision.
 * **No-op probes.** For a new key, `try_lock`'s expired-key `DELETE` and
   `unlock`'s `DELETE` of a row with no record find nothing (4 and 5 buffers
