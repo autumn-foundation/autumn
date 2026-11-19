@@ -99,7 +99,10 @@ struct Slot {
 #[derive(Debug)]
 struct Table<K> {
     slots: HashMap<K, Slot>,
+    /// The total, rounded down after a decay.
     total: u64,
+    /// The total, rounded up after a decay.
+    total_ceiling: u64,
 }
 
 /// A thread-safe Space-Saving top-K tracker. See the [module docs](self).
@@ -123,6 +126,7 @@ impl<K: Eq + Hash> HotKeys<K> {
             table: Mutex::new(Table {
                 slots: HashMap::with_capacity(capacity),
                 total: 0,
+                total_ceiling: 0,
             }),
         }
     }
@@ -146,6 +150,7 @@ impl<K: Eq + Hash> HotKeys<K> {
         }
         let mut table = self.lock();
         table.total = table.total.saturating_add(weight);
+        table.total_ceiling = table.total_ceiling.saturating_add(weight);
         if let Some(slot) = table.slots.get_mut(&key) {
             slot.count = slot.count.saturating_add(weight);
             return;
@@ -184,7 +189,8 @@ impl<K: Eq + Hash> HotKeys<K> {
             })
     }
 
-    /// Every event counted, tracked key or not.
+    /// Every event counted, tracked key or not. After a [`decay`](Self::decay)
+    /// it is rounded down.
     #[must_use]
     pub fn total(&self) -> u64 {
         self.lock().total
@@ -202,24 +208,29 @@ impl<K: Eq + Hash> HotKeys<K> {
         self.lock().slots.is_empty()
     }
 
-    /// Halve every count and error, and forget keys whose count reaches 0.
+    /// Halve every count, and forget keys whose count was at most 1.
     ///
     /// Call it on a timer to age old traffic out: after `n` calls, an event
     /// weighs `1 / 2^n` of a new one.
+    ///
+    /// Halving an odd count leaves half an event. Each bound rounds away
+    /// from the true value: the count and the total's ceiling round up, the
+    /// guaranteed count and the total round down. So a decay can neither
+    /// hide a key from [`heavy_hitters`](Self::heavy_hitters) nor make one
+    /// `certain` that is not.
     pub fn decay(&self) {
         let mut table = self.lock();
         table.slots.retain(|_, slot| {
-            // Halve the bound on each side: the guaranteed count rounds
-            // down, so an uncertain count never becomes a certain one.
+            if slot.count <= 1 {
+                return false;
+            }
             let guaranteed = (slot.count - slot.error) / 2;
-            slot.count /= 2;
+            slot.count = slot.count.div_ceil(2);
             slot.error = slot.count - guaranteed;
-            slot.count > 0
+            true
         });
-        table.total = table
-            .slots
-            .values()
-            .fold(0, |sum: u64, slot| sum.saturating_add(slot.count));
+        table.total /= 2;
+        table.total_ceiling = table.total_ceiling.div_ceil(2);
     }
 
     /// Forget every key and the total.
@@ -227,6 +238,7 @@ impl<K: Eq + Hash> HotKeys<K> {
         let mut table = self.lock();
         table.slots.clear();
         table.total = 0;
+        table.total_ceiling = 0;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Table<K>> {
@@ -243,7 +255,7 @@ impl<K: Eq + Hash + Clone + Ord> HotKeys<K> {
     /// smaller error, then the smaller key.
     #[must_use]
     pub fn top(&self, n: usize) -> Vec<HotKey<K>> {
-        let (_, mut all) = self.snapshot();
+        let (_, _, mut all) = self.snapshot();
         all.truncate(n);
         all
     }
@@ -251,19 +263,20 @@ impl<K: Eq + Hash + Clone + Ord> HotKeys<K> {
     /// Keys whose estimated count is over `share_ppm` parts per million of
     /// [`total`](Self::total), highest first. A key is
     /// [`certain`](HeavyHitter::certain) when its guaranteed count is over
-    /// the share too.
+    /// the share of the total's ceiling too.
     ///
     /// No key is missed when `share_ppm` is at least `1_000_000 / capacity`.
     #[must_use]
     pub fn heavy_hitters(&self, share_ppm: u32) -> Vec<HeavyHitter<K>> {
-        let (total, ranked) = self.snapshot();
-        let total = u128::from(total);
-        let over = |count: u64| u128::from(count) * PPM > total * u128::from(share_ppm);
+        let (total, ceiling, ranked) = self.snapshot();
+        let over = |count: u64, total: u64| {
+            u128::from(count) * PPM > u128::from(total) * u128::from(share_ppm)
+        };
         ranked
             .into_iter()
-            .filter(|hot| over(hot.count))
+            .filter(|hot| over(hot.count, total))
             .map(|hot| HeavyHitter {
-                certain: over(hot.guaranteed()),
+                certain: over(hot.guaranteed(), ceiling),
                 key: hot.key,
                 count: hot.count,
                 error: hot.error,
@@ -271,10 +284,10 @@ impl<K: Eq + Hash + Clone + Ord> HotKeys<K> {
             .collect()
     }
 
-    /// The total and every tracked key, ranked, read under one lock so the
-    /// two agree. Sorting happens after the lock is released.
-    fn snapshot(&self) -> (u64, Vec<HotKey<K>>) {
-        let (total, mut all) = {
+    /// The total, its ceiling and every tracked key, ranked, read under one
+    /// lock so they agree. Sorting happens after the lock is released.
+    fn snapshot(&self) -> (u64, u64, Vec<HotKey<K>>) {
+        let (total, ceiling, mut all) = {
             let table = self.lock();
             let all: Vec<HotKey<K>> = table
                 .slots
@@ -285,7 +298,7 @@ impl<K: Eq + Hash + Clone + Ord> HotKeys<K> {
                     error: slot.error,
                 })
                 .collect();
-            (table.total, all)
+            (table.total, table.total_ceiling, all)
         };
         all.sort_by(|a, b| {
             b.count
@@ -293,7 +306,7 @@ impl<K: Eq + Hash + Clone + Ord> HotKeys<K> {
                 .then(a.error.cmp(&b.error))
                 .then_with(|| a.key.cmp(&b.key))
         });
-        (total, all)
+        (total, ceiling, all)
     }
 }
 
@@ -445,12 +458,33 @@ mod tests {
     #[test]
     fn heavy_hitters_reads_total_and_counts_from_one_snapshot() {
         let hot = HotKeys::new(4);
-        let (total, ranked) = hot.snapshot();
-        assert_eq!((total, ranked.len()), (0, 0));
+        let (total, ceiling, ranked) = hot.snapshot();
+        assert_eq!((total, ceiling, ranked.len()), (0, 0, 0));
         hot.record_weighted("a", 3);
-        let (total, ranked) = hot.snapshot();
-        assert_eq!(total, 3);
+        let (total, ceiling, ranked) = hot.snapshot();
+        assert_eq!((total, ceiling), (3, 3));
         assert_eq!(ranked[0].key, "a");
+    }
+
+    #[test]
+    fn decay_never_hides_a_key_still_over_the_share() {
+        // Decayed, a holds 1.5 of 2.5 events: 60%.
+        let hot = HotKeys::new(2);
+        hot.record_weighted("a", 3);
+        hot.record_weighted("b", 2);
+        hot.decay();
+        let hh = hot.heavy_hitters(550_000);
+        assert_eq!(hh.iter().map(|h| h.key).collect::<Vec<_>>(), vec!["a"]);
+    }
+
+    #[test]
+    fn decay_never_certifies_a_key_under_the_share() {
+        // Decayed, a holds 1 of 1.5 events: two thirds, under 75%.
+        let hot = HotKeys::new(2);
+        hot.record_weighted("a", 2);
+        hot.record("b");
+        hot.decay();
+        assert!(hot.heavy_hitters(750_000).iter().all(|h| !h.certain));
     }
 
     #[test]
