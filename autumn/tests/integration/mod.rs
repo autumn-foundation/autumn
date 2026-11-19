@@ -200,6 +200,8 @@ mod http_latency_histogram;
 mod i18n_integration;
 #[cfg(feature = "db")]
 mod idempotency_db_store;
+#[cfg(feature = "db")]
+mod idempotency_db_request_profile;
 mod idempotency_middleware;
 #[cfg(feature = "redis")]
 mod idempotency_redis_current_thread;
