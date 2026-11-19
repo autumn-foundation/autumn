@@ -283,7 +283,7 @@ fn run_step(
                 // object the operation mutates.
                 check_write_depth(operand, 1, ctx.depth, path.key("value"))?;
             }
-            // Search and shift walk the whole target.
+            // Search and shift walk the whole target, so charge for it.
             if matches!(
                 operation,
                 UpdateOperation::Remove | UpdateOperation::InsertAt | UpdateOperation::Splice
@@ -306,15 +306,10 @@ fn run_step(
             let segments = path_segments(&segments, ctx.depth);
             let value = eval(value, &eval_ctx(state, env, ctx), path.key("value"))?;
 
-            // The depth of the *structure*, not just of the walk. `set_at_path`
-            // is iterative, so writing through a long path is cheap — but it
-            // creates one nested object per segment, and `serde_json::Value`
-            // drops **recursively**. A 200 000-segment path would therefore
-            // overflow the stack when that state is eventually freed, long
-            // after the step that built it returned and somewhere with no
-            // connection to the document that caused it. Refusing the write is
-            // the only fix that holds: no legitimate UI addresses a field two
-            // hundred thousand levels down.
+            // Bounds the depth of the structure, not just the walk: `set_at_path`
+            // creates one nested object per segment and `serde_json::Value` drops
+            // recursively, so a very long path would overflow the stack later,
+            // whenever that state is freed.
             let Some(segments) = segments else {
                 return Err(ConstelaError::Render(Diagnostic::new(
                     path.key("path").to_string(),
@@ -947,11 +942,8 @@ mod tests {
 
     #[test]
     fn a_deep_path_is_written_iteratively() {
-        // 1 000 segments: far past any real UI, and far past what a recursive
-        // walk would survive in a debug build. Kept well under the depth guard
-        // in `run_step` so this exercises the walk rather than the refusal —
-        // and shallow enough that dropping the structure it builds is safe,
-        // which is the very thing the guard exists to protect.
+        // Deeper than a recursive walk survives in a debug build, but under the
+        // depth guard in `run_step`, and shallow enough to drop safely.
         let segments: Vec<String> = (0..1_000).map(|i| format!("s{i}")).collect();
         let mut slot = json!({});
         set_at_path(&mut slot, &segments, json!("deep"));

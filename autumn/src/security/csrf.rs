@@ -389,12 +389,8 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     // Constant-time length check — no early exit.
     let len_eq = a.len().ct_eq(&b.len());
 
-    // Iterate over `a` (the trusted stored token) so the loop count is fixed
-    // at the server-side token length, regardless of what the caller submits
-    // as `b`.  Callers pass the attacker-controlled value as `b`, so iterating
-    // over `a` ensures every submission — short or long — executes the same
-    // amount of work.  Out-of-range positions in `b` use the sentinel 0xFF,
-    // which can never match a valid ASCII/UTF-8 token byte.
+    // Iterate over `a`, the trusted stored token, so the work does not depend on the length of
+    // the attacker-controlled `b`. Past the end of `b`, 0xFF never matches a UTF-8 token byte.
     let mut bytes_eq = Choice::from(1u8);
     for (i, &a_byte) in a.iter().enumerate() {
         let b_byte = *b.get(i).unwrap_or(&0xFF);
@@ -424,9 +420,7 @@ fn extract_cookie_token(req_headers: &http::HeaderMap, cookie_name: &str) -> Opt
             }
 
             if found_token.is_some() {
-                // Multiple cookies with the same name found.
-                // This indicates a potential Cookie Tossing attack!
-                // Reject by returning None.
+                // A duplicate cookie of this name suggests cookie tossing: reject.
                 return None;
             }
 
@@ -435,6 +429,26 @@ fn extract_cookie_token(req_headers: &http::HeaderMap, cookie_name: &str) -> Opt
     }
 
     found_token
+}
+
+/// Whether `req` skips token verification: a safe method, a `WebSocket`
+/// upgrade, a request an outer layer marked [`CsrfNotApplicable`], or an
+/// exempt path.
+///
+/// The exempt-path term is last because it is the one that allocates: it
+/// builds the normalized path. A safe method never reaches it.
+fn request_is_safe(settings: &CsrfSettings, req: &Request<axum::body::Body>) -> bool {
+    settings.safe_methods.contains(req.method())
+        // The HTTP/2 `WebSocket` upgrade is safe, like the `GET` upgrade: a
+        // browser cannot add a CSRF header to it.
+        || crate::security::is_websocket_connect(req)
+        || req.extensions().get::<CsrfNotApplicable>().is_some()
+        // Match the normalized path so `/api/../submit` (or `%2e%2e`) cannot use an `/api/`
+        // exemption to reach another route.
+        || (!settings.exempt_paths.is_empty() && {
+            let clean = crate::security::path::clean_path(req.uri().path());
+            crate::security::path::is_exempt_path(clean.as_str(), &settings.exempt_paths)
+        })
 }
 
 impl<S, ResBody> Service<Request<axum::body::Body>> for CsrfService<S>
@@ -453,32 +467,14 @@ where
     }
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
-        // Match exemptions against the normalized path so dot-segment tricks
-        // like `/api/../submit` (or percent-encoded `%2e%2e` variants) cannot
-        // satisfy an `/api/` exemption prefix while targeting another route.
-        // With no exemptions configured (the default) nothing can match, so the
-        // normalized copy of the path is not built.
-        let is_exempt = !self.settings.exempt_paths.is_empty() && {
-            let clean = crate::security::path::clean_path(req.uri().path());
-            crate::security::path::is_exempt_path(clean.as_str(), &self.settings.exempt_paths)
-        };
-        // The HTTP/2 `WebSocket` upgrade is safe, like the `GET` upgrade: a
-        // browser cannot add a CSRF header to it.
-        let is_safe = is_exempt
-            || self.settings.safe_methods.contains(req.method())
-            || crate::security::is_websocket_connect(&req)
-            || req.extensions().get::<CsrfNotApplicable>().is_some();
+        let is_safe = request_is_safe(&self.settings, &req);
 
-        // When signing is active, discard any cookie that fails HMAC verification
-        // (unsigned pre-upgrade cookies, removed-key cookies, etc.) so a fresh signed
-        // token is minted and the Set-Cookie header refreshes the browser value.
-        // `validate_cookie_token_hmac` is `true` when signing is inactive.
+        // Drop a cookie that fails HMAC verification (unsigned, or signed by a removed key) so a
+        // fresh signed token is minted and set. Without signing every cookie passes.
         let cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name)
             .filter(|tok| validate_cookie_token_hmac(tok, &self.settings));
 
-        // Only a mutating request reads the cookie token again (to compare the
-        // submitted token against it), so only it keeps a copy. Every other
-        // request moves the cookie value straight into `CsrfToken`.
+        // Only a mutating request compares against the cookie token later, so only it keeps a copy.
         let verify_against = if is_safe { None } else { cookie_token.clone() };
 
         // Reuse the cookie's token, or mint one and the cookie that sets it.
@@ -501,8 +497,6 @@ where
             |token| (token, None),
         );
 
-        // Insert CsrfToken, the configured form field name, and the configured
-        // token header name into request extensions.
         req.extensions_mut().insert(CsrfToken(token));
         req.extensions_mut()
             .insert(CsrfFormField(self.settings.form_field.clone()));
@@ -510,54 +504,71 @@ where
             self.settings.token_header.as_str().to_owned(),
         ));
 
+        if is_safe {
+            // Nothing runs before the inner call, so the future does not have to own the
+            // service. Call the instance that was polled ready, in place: a clone of it copies
+            // every service below this one, for a request this layer only forwards.
+            let response = self.inner.call(req);
+            let Some(cookie) = set_cookie else {
+                return Box::pin(response);
+            };
+            return Box::pin(async move {
+                let mut response = response.await?;
+                append_set_cookie(&mut response, &cookie);
+                Ok(response)
+            });
+        }
+
+        // Verification reads the body before the inner call, so the future owns the service.
         let settings = Arc::clone(&self.settings);
         let mut inner = self.inner.clone();
 
-        // Swap to ensure correct poll_ready semantics
+        // Swap so the call uses the service that was polled ready.
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
-            if !is_safe {
-                let verdict =
-                    verify_csrf_token(&mut req, &settings, verify_against.as_deref()).await;
-                if !matches!(verdict, CsrfVerdict::Valid) {
-                    let request_id = req
-                        .extensions()
-                        .get::<crate::middleware::RequestId>()
-                        .map(std::string::ToString::to_string);
-                    let instance = Some(req.uri().path().to_owned());
-                    let prefers_problem = wants_problem_details(req.headers());
+            let verdict = verify_csrf_token(&mut req, &settings, verify_against.as_deref()).await;
+            if !matches!(verdict, CsrfVerdict::Valid) {
+                let request_id = req
+                    .extensions()
+                    .get::<crate::middleware::RequestId>()
+                    .map(std::string::ToString::to_string);
+                let instance = Some(req.uri().path().to_owned());
+                let prefers_problem = wants_problem_details(req.headers());
 
-                    // Missing/invalid token (including a token beyond the scanned
-                    // prefix) → 403. Genuinely oversized bodies stream through and
-                    // are rejected downstream by the real body / upload limits.
-                    let message = CSRF_FORBIDDEN_MESSAGE;
+                // A token beyond the scanned prefix counts as missing. Oversized bodies
+                // themselves are rejected downstream by the body and upload limits.
+                let message = CSRF_FORBIDDEN_MESSAGE;
 
-                    if prefers_problem {
-                        return Ok(csrf_problem_response(message, request_id, instance));
-                    }
-
-                    let mut response = Response::new(ResBody::from(message));
-                    *response.status_mut() = StatusCode::FORBIDDEN;
-                    response.headers_mut().insert(
-                        http::header::CONTENT_TYPE,
-                        http::HeaderValue::from_static("text/plain; charset=utf-8"),
-                    );
-                    return Ok(response);
+                if prefers_problem {
+                    return Ok(csrf_problem_response(message, request_id, instance));
                 }
+
+                let mut response = Response::new(ResBody::from(message));
+                *response.status_mut() = StatusCode::FORBIDDEN;
+                response.headers_mut().insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/plain; charset=utf-8"),
+                );
+                return Ok(response);
             }
 
-            // Validation passed (or method is safe)
             let mut response = inner.call(req).await?;
 
-            if let Some(cookie) = set_cookie
-                && let Ok(val) = http::header::HeaderValue::from_str(&cookie)
-            {
-                response.headers_mut().append(http::header::SET_COOKIE, val);
+            if let Some(cookie) = set_cookie {
+                append_set_cookie(&mut response, &cookie);
             }
 
             Ok(response)
         })
+    }
+}
+
+/// Append the `Set-Cookie` that carries a newly minted token. A cookie that is
+/// not a valid header value is left out.
+fn append_set_cookie<B>(response: &mut Response<B>, cookie: &str) {
+    if let Ok(val) = http::header::HeaderValue::from_str(cookie) {
+        response.headers_mut().append(http::header::SET_COOKIE, val);
     }
 }
 
@@ -619,7 +630,6 @@ async fn verify_csrf_token(
 ) -> CsrfVerdict {
     let mut token_found = false;
 
-    // 1. Check header
     let header_token = req
         .headers()
         .get(&settings.token_header)
@@ -637,7 +647,6 @@ async fn verify_csrf_token(
         return CsrfVerdict::Valid;
     }
 
-    // 1b. Check query parameter (e.g. `_csrf`) before falling back to body
     let query_token = req.uri().query().and_then(|q| {
         url::form_urlencoded::parse(q.as_bytes())
             .find(|(key, _)| key == "_csrf" || key == settings.form_field.as_str())
@@ -656,7 +665,6 @@ async fn verify_csrf_token(
         return CsrfVerdict::Valid;
     }
 
-    // 2. Check form field (if not found in header)
     let content_type = req
         .headers()
         .get(http::header::CONTENT_TYPE)
@@ -665,29 +673,17 @@ async fn verify_csrf_token(
 
     let is_urlencoded =
         crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded");
-    // Parse the boundary with `multer::parse_boundary` — the exact parser
-    // `axum::extract::Multipart` uses downstream (via `mime`) — so this CSRF
-    // guard and the extractor can never disagree about the boundary, and it
-    // matches the sibling `submit_token` replay guard. A hand-rolled
-    // `split(';')` diverges on quoted values: `mime` permits a `;` inside a
-    // quoted parameter value, so `boundary="x;y"` parses to the boundary `x;y`
-    // in the real extractor while a split truncates it to `x`, so the `_csrf`
-    // field is never located and a legitimate form is wrongly rejected (403).
-    // `parse_boundary` is case-insensitive on the media type / `boundary` param
-    // NAME and preserves the boundary VALUE's case (RFC 2046); it returns `Err`
-    // for a non-multipart type, so `.ok()` yields `None`.
+    // `multer::parse_boundary` is the parser `axum::extract::Multipart` uses, so the guard and the
+    // extractor agree on the boundary, including a quoted one with `;` (`boundary="x;y"`). It
+    // returns `Err` for a non-multipart type.
     let multipart_boundary = multer::parse_boundary(content_type).ok();
-    // NLL: content_type borrow ends here; req.body_mut() is safe to call below.
 
     if !is_urlencoded && multipart_boundary.is_none() {
         return CsrfVerdict::Missing;
     }
 
-    // Take the body, buffer at most `max_scan_bytes` of it into a scan prefix,
-    // and reconstruct the full, unmodified body so downstream handlers still
-    // receive every byte. When the body is larger than the cap, the tail is
-    // *streamed* through rather than buffered — the CSRF layer never forces a
-    // large upload into memory.
+    // Buffer at most `max_scan_bytes` to scan; the rest streams through, so a large upload is
+    // never held in memory.
     let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
 
     let (prefix, rebuilt) = match collect_body_prefix(body, settings.max_scan_bytes).await {
@@ -697,11 +693,8 @@ async fn verify_csrf_token(
         }
         CollectedBody::Oversized { prefix, body } => (prefix, body),
         CollectedBody::Errored(err) => {
-            // The body stream errored mid-read (e.g. a client disconnect). We
-            // cannot losslessly reconstruct it, and a token cannot be confirmed,
-            // so we preserve the pre-existing behavior of treating an unreadable
-            // body as a missing token (→ 403). The request is rejected and the
-            // handler never runs, so the discarded body is immaterial.
+            // A body that errored mid-read (e.g. a client disconnect) cannot be rebuilt or
+            // confirmed, so it counts as a missing token. The handler never runs.
             tracing::debug!(error = %err, "CSRF token scan: body read error, treating as missing token");
             return CsrfVerdict::Missing;
         }
@@ -735,8 +728,7 @@ async fn verify_csrf_token(
         }
     }
 
-    // Restore the full body so downstream handlers (e.g. the Multipart
-    // extractor) read it intact — identical bytes and framing.
+    // Downstream extractors read the full body with identical bytes and framing.
     *req.body_mut() = rebuilt;
 
     if token_found {
@@ -776,19 +768,13 @@ async fn collect_body_prefix(body: Body, limit: usize) -> CollectedBody {
             Some(Ok(chunk)) => {
                 let remaining = limit.saturating_sub(buf.len());
                 if chunk.len() > remaining {
-                    // Fill the scan prefix up to `limit` with the leading bytes
-                    // of the over-limit chunk, so a token at the front of the
-                    // form is still found even when the FIRST chunk already
-                    // exceeds the cap (e.g. an upstream middleware rebuilt the
-                    // body as one `Body::from(bytes)`, leaving `buf` empty here).
+                    // Fill the prefix from the over-limit chunk, so a leading token is found even
+                    // when the first chunk alone exceeds the cap (a body built by `Body::from`).
                     let mut prefix_buf = buf.clone();
                     prefix_buf.extend_from_slice(&chunk[..remaining]);
                     let prefix = Bytes::from(prefix_buf);
-                    // Replay the FULL body unchanged: the buffered prefix bytes
-                    // followed by the *complete* over-limit chunk (not just its
-                    // scanned head) and the rest of the stream. The prefix is
-                    // only for locating the token; the handler must receive every
-                    // byte, and the tail streams through unbuffered.
+                    // Replay the whole body: the buffered bytes, the complete over-limit chunk
+                    // (not just its scanned head), then the unbuffered rest of the stream.
                     let mut leading = Vec::with_capacity(2);
                     if !buf.is_empty() {
                         leading.push(Ok::<Bytes, axum::Error>(Bytes::from(buf)));
@@ -1418,9 +1404,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_with_large_urlencoded_body_token_first_streams_and_passes() {
-        // A urlencoded body far larger than the scan prefix, with `_csrf` FIRST.
-        // The token is located in the prefix (→ pass) and the full body still
-        // reaches the handler intact — the tail streams through unbuffered.
+        // The token is found in the prefix, and the handler still receives the full body.
         async fn echo_len(body: Body) -> String {
             let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
             bytes.len().to_string()
@@ -1528,10 +1512,7 @@ mod tests {
 
     #[test]
     fn with_max_scan_bytes_clamps_effective_scan_cap_below_prefix() {
-        // Operator lowered the global body limit (64 KiB) below the CSRF prefix
-        // cap (2 MiB default). The router clamps the effective scan cap to
-        // min(token_scan_bytes, max_request_size_bytes) = 64 KiB, so the CSRF
-        // layer never buffers more than the global body limit.
+        // A global body limit below the scan cap bounds it: CSRF never buffers more than that.
         let token_scan_bytes = default_csrf_config().token_scan_bytes; // 2 MiB
         let max_request_size_bytes = 64 * 1024; // 64 KiB
         let effective = token_scan_bytes.min(max_request_size_bytes);
@@ -1543,9 +1524,7 @@ mod tests {
 
     #[test]
     fn with_max_scan_bytes_preserves_small_prefix_in_normal_case() {
-        // Normal/high-upload case: a large max_request_size_bytes (32 MiB
-        // default) must NOT raise the effective cap — the small token_scan_bytes
-        // prefix (2 MiB) stays the primary bound via `min`.
+        // A large body limit does not raise the scan cap.
         let token_scan_bytes = default_csrf_config().token_scan_bytes; // 2 MiB
         let max_request_size_bytes = 32 * 1024 * 1024; // 32 MiB
         let effective = token_scan_bytes.min(max_request_size_bytes);
@@ -1566,7 +1545,7 @@ mod tests {
         assert_eq!(layer.settings.token_header.as_str(), "x-csrf-token");
     }
 
-    // ── Signed CSRF tokens (RED phase) ────────────────────────────────────
+    // ── Signed CSRF tokens ────────────────────────────────────────────────
 
     #[tokio::test]
     async fn csrf_token_is_hmac_signed_when_keys_set() {
@@ -1626,7 +1605,6 @@ mod tests {
             .route("/", post(|| async { "created" }))
             .layer(layer);
 
-        // Mint a valid signed token
         let config = SigningSecretConfig {
             secret: Some("k".repeat(32)),
             previous_secrets: vec![],
@@ -1778,8 +1756,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_multipart_csrf_field_after_other_field_passes() {
-        // Regression: skipping a non-matching part must not advance pos past
-        // the next part's headers (the +2 fix in scan_multipart_field).
+        // Skipping a non-matching part must not advance past the next part's headers.
         let token = "test-csrf-token-uuid-after";
         let boundary = "----WebKitFormBoundaryORDER";
         let body = multipart_body(boundary, &[("name", "alice"), ("_csrf", token)]);
@@ -2073,14 +2050,9 @@ mod tests {
 
     #[tokio::test]
     async fn post_mixed_case_multipart_content_type_with_valid_token_passes() {
-        // Media types are case-insensitive (RFC 9110 8.3.1); the Multipart
-        // extractor accepts `Multipart/Form-Data` with a `Boundary=` parameter.
-        // A valid `_csrf` field in such a body must be scanned and the request
-        // ACCEPTED — a case-sensitive `starts_with("multipart/form-data")` gate
-        // wrongly rejects it (403). The weird-case boundary VALUE is identical in
-        // the header and the body delimiters, which also proves the boundary
-        // VALUE stays case-sensitive (RFC 2046) while the media type / param NAME
-        // are matched case-insensitively.
+        // The media type and parameter name match case-insensitively (RFC 9110 8.3.1), as the
+        // Multipart extractor does. The mixed-case boundary value also appears verbatim in the
+        // body, so its case is preserved (RFC 2046).
         let token = "test-csrf-token-uuid-mixedmp";
         let boundary = "BoUnDaRy-XyZ-123";
         let body = multipart_body(boundary, &[("_csrf", token), ("name", "alice")]);
@@ -2110,11 +2082,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_mixed_case_urlencoded_content_type_with_valid_token_passes() {
-        // Media types are case-insensitive (RFC 9110 8.3.1). A urlencoded form
-        // POST carrying a valid `_csrf` field with an upper/mixed-case
-        // Content-Type (`Application/x-www-form-urlencoded`) must be ACCEPTED — a
-        // case-sensitive `starts_with("application/x-www-form-urlencoded")` gate
-        // wrongly rejects it (403), skipping body scanning entirely.
+        // Media types are case-insensitive (RFC 9110 8.3.1), so a mixed-case urlencoded type is
+        // still scanned.
         let token = "test-csrf-token-uuid-mixeduenc";
         let app = Router::new()
             .route("/submit", post(|| async { "created" }))
@@ -2139,13 +2108,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_multipart_quoted_boundary_with_semicolon_passes() {
-        // `mime` permits a `;` inside a QUOTED boundary parameter value, so
-        // `boundary="x;y"` parses to the boundary `x;y` in the real Multipart
-        // extractor (via `multer`). A hand-rolled `split(';')` truncates it to
-        // `x`, so the `_csrf` field is never located and the request is wrongly
-        // rejected (403). Parsing with `multer::parse_boundary` — the exact
-        // parser the extractor uses — keeps the guard and the extractor in
-        // agreement, so the valid token is found and the request ACCEPTED.
+        // A quoted boundary may contain `;`: the extractor reads `boundary="x;y"` as `x;y`, and so
+        // must the guard.
         let token = "test-csrf-token-uuid-quotedsemi";
         let boundary = "x;y";
         let body = multipart_body(boundary, &[("_csrf", token), ("name", "alice")]);
@@ -2171,5 +2135,464 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Requests the layer only forwards ────────────────────────────────────
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// What a [`Probe`] saw, shared by all of its clones.
+    #[derive(Default)]
+    struct ProbeLog {
+        clones: AtomicUsize,
+        calls: AtomicUsize,
+        unready_calls: AtomicUsize,
+    }
+
+    impl ProbeLog {
+        fn clones(&self) -> usize {
+            self.clones.load(Ordering::SeqCst)
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn unready_calls(&self) -> usize {
+            self.unready_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    /// An inner service that counts its clones and its calls, and the calls
+    /// made on an instance `poll_ready` did not ready. A clone is not ready.
+    ///
+    /// The response echoes the request: the token extension in
+    /// `x-seen-token`, the method in `x-seen-method`, and the request body.
+    /// It carries a `Set-Cookie` of its own.
+    struct Probe {
+        log: Arc<ProbeLog>,
+        ready: bool,
+        fail: bool,
+    }
+
+    impl Clone for Probe {
+        fn clone(&self) -> Self {
+            self.log.clones.fetch_add(1, Ordering::SeqCst);
+            Self {
+                log: Arc::clone(&self.log),
+                ready: false,
+                fail: self.fail,
+            }
+        }
+    }
+
+    impl Service<Request<Body>> for Probe {
+        type Response = Response<Body>;
+        type Error = &'static str;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.ready = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: Request<Body>) -> Self::Future {
+            self.log.calls.fetch_add(1, Ordering::SeqCst);
+            if !std::mem::take(&mut self.ready) {
+                self.log.unready_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            if self.fail {
+                return std::future::ready(Err("inner failed"));
+            }
+
+            let token = req
+                .extensions()
+                .get::<CsrfToken>()
+                .map(|t| t.token().to_owned())
+                .unwrap_or_default();
+            let has_field = req.extensions().get::<CsrfFormField>().is_some();
+            let has_header = req.extensions().get::<CsrfTokenHeader>().is_some();
+            let method = req.method().as_str().to_owned();
+
+            let response = Response::builder()
+                .header("x-seen-token", token)
+                .header("x-seen-method", method)
+                .header("x-seen-extensions", format!("{has_field},{has_header}"))
+                .header(http::header::SET_COOKIE, "inner=1")
+                .body(req.into_body())
+                .unwrap();
+            std::future::ready(Ok(response))
+        }
+    }
+
+    /// The CSRF service over a [`Probe`], and the probe's log.
+    fn probed(config: &CsrfConfig, fail: bool) -> (CsrfService<Probe>, Arc<ProbeLog>) {
+        let log = Arc::new(ProbeLog::default());
+        let probe = Probe {
+            log: Arc::clone(&log),
+            ready: false,
+            fail,
+        };
+        (CsrfLayer::from_config(config).layer(probe), log)
+    }
+
+    /// Ready the service, then call it, as a tower caller does.
+    async fn drive(
+        svc: &mut CsrfService<Probe>,
+        req: Request<Body>,
+    ) -> Result<Response<Body>, &'static str> {
+        ServiceExt::<Request<Body>>::ready(svc)
+            .await?
+            .call(req)
+            .await
+    }
+
+    fn request(method: &str, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn with_header(
+        mut req: Request<Body>,
+        name: &'static str,
+        value: &'static str,
+    ) -> Request<Body> {
+        req.headers_mut()
+            .insert(name, http::HeaderValue::from_static(value));
+        req
+    }
+
+    fn with_body(mut req: Request<Body>, body: &'static str) -> Request<Body> {
+        *req.body_mut() = Body::from(body);
+        req
+    }
+
+    fn websocket_connect(uri: &str) -> Request<Body> {
+        let mut req = request("CONNECT", uri);
+        req.extensions_mut()
+            .insert(hyper::ext::Protocol::from_static("websocket"));
+        req
+    }
+
+    fn not_applicable_post(uri: &str) -> Request<Body> {
+        let mut req = request("POST", uri);
+        req.extensions_mut().insert(CsrfNotApplicable);
+        req
+    }
+
+    /// A `POST` whose header token matches its cookie.
+    fn valid_post(uri: &str) -> Request<Body> {
+        let req = with_header(request("POST", uri), "cookie", "autumn-csrf=known-token");
+        with_header(req, "x-csrf-token", "known-token")
+    }
+
+    fn set_cookies(response: &Response<Body>) -> Vec<String> {
+        response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn seen<'a>(response: &'a Response<Body>, name: &str) -> &'a str {
+        response.headers().get(name).unwrap().to_str().unwrap()
+    }
+
+    async fn body_of(response: Response<Body>) -> Bytes {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+    }
+
+    fn exempt_api_config() -> CsrfConfig {
+        CsrfConfig {
+            enabled: true,
+            exempt_paths: vec!["/api/".to_owned()],
+            ..Default::default()
+        }
+    }
+
+    /// One request of every kind that skips verification, with no CSRF cookie.
+    fn forwarded_requests() -> Vec<(&'static str, Request<Body>)> {
+        vec![
+            ("GET", request("GET", "/page")),
+            ("HEAD", request("HEAD", "/page")),
+            ("OPTIONS", request("OPTIONS", "/page")),
+            ("TRACE", request("TRACE", "/page")),
+            ("exempt POST", request("POST", "/api/items")),
+            ("WebSocket CONNECT", websocket_connect("/ws")),
+            ("not-applicable POST", not_applicable_post("/paid")),
+        ]
+    }
+
+    #[tokio::test]
+    async fn forwarded_request_without_cookie_gets_a_token_and_no_inner_clone() {
+        for (name, req) in forwarded_requests() {
+            let (mut svc, log) = probed(&exempt_api_config(), false);
+            let method = req.method().as_str().to_owned();
+
+            let response = drive(&mut svc, req).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            assert_eq!(log.calls(), 1, "{name}: one inner call");
+            assert_eq!(log.unready_calls(), 0, "{name}: on the readied instance");
+            assert_eq!(log.clones(), 0, "{name}: no clone of the inner service");
+
+            // The inner service sees the minted token and both name extensions.
+            let token = seen(&response, "x-seen-token").to_owned();
+            assert!(Uuid::parse_str(&token).is_ok(), "{name}: {token}");
+            assert_eq!(seen(&response, "x-seen-extensions"), "true,true", "{name}");
+            assert_eq!(seen(&response, "x-seen-method"), method, "{name}");
+
+            // The inner `Set-Cookie` stays, and the minted one is appended after it.
+            assert_eq!(
+                set_cookies(&response),
+                [
+                    "inner=1".to_owned(),
+                    format!("autumn-csrf={token}; Path=/; SameSite=Lax; HttpOnly"),
+                ],
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_request_with_cookie_reuses_it_and_does_not_clone_inner() {
+        for (name, req) in forwarded_requests() {
+            let (mut svc, log) = probed(&exempt_api_config(), false);
+            let req = with_header(req, "cookie", "autumn-csrf=known-token");
+
+            let response = drive(&mut svc, req).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            assert_eq!(log.calls(), 1, "{name}: one inner call");
+            assert_eq!(log.unready_calls(), 0, "{name}: on the readied instance");
+            assert_eq!(log.clones(), 0, "{name}: no clone of the inner service");
+            assert_eq!(seen(&response, "x-seen-token"), "known-token", "{name}");
+            assert_eq!(set_cookies(&response), ["inner=1"], "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_request_keeps_its_body() {
+        let (mut svc, _log) = probed(&exempt_api_config(), false);
+        let req = with_body(request("POST", "/api/items"), "a=1&b=2");
+
+        let response = drive(&mut svc, req).await.unwrap();
+
+        assert_eq!(&body_of(response).await[..], b"a=1&b=2");
+    }
+
+    #[tokio::test]
+    async fn cookie_that_is_not_a_header_value_is_not_set() {
+        // A cookie name with a control character cannot be written as a header value: the
+        // response goes out without the CSRF cookie.
+        let config = CsrfConfig {
+            enabled: true,
+            cookie_name: "bad\nname".to_owned(),
+            ..Default::default()
+        };
+        let (mut svc, log) = probed(&config, false);
+
+        let response = drive(&mut svc, request("GET", "/")).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(set_cookies(&response), ["inner=1"]);
+        assert_eq!(log.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn refused_request_never_reaches_inner_and_sets_no_cookie() {
+        let (mut svc, log) = probed(&exempt_api_config(), false);
+        let refused = [
+            ("no token", request("POST", "/submit")),
+            (
+                "header token without a cookie",
+                with_header(request("POST", "/submit"), "x-csrf-token", "guess"),
+            ),
+            // A dot segment does not turn a protected route into an exempt one.
+            ("dot segment", request("POST", "/api/../submit")),
+            ("encoded dot segment", request("POST", "/api/%2e%2e/submit")),
+            // A plain `CONNECT` is not a `WebSocket` upgrade.
+            ("plain CONNECT", request("CONNECT", "/ws")),
+        ];
+
+        for (name, req) in refused {
+            let req = with_header(req, "accept", "text/html");
+
+            let response = drive(&mut svc, req).await.unwrap();
+
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{name}");
+            assert!(set_cookies(&response).is_empty(), "{name}");
+            assert_eq!(
+                &body_of(response).await[..],
+                CSRF_FORBIDDEN_MESSAGE.as_bytes(),
+                "{name}"
+            );
+        }
+        assert_eq!(log.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn verified_request_reaches_the_readied_inner_with_its_body() {
+        let (mut svc, log) = probed(&exempt_api_config(), false);
+        let form = "_csrf=known-token&name=alice";
+        let req = with_header(
+            request("POST", "/submit"),
+            "cookie",
+            "autumn-csrf=known-token",
+        );
+        let req = with_header(req, "content-type", "application/x-www-form-urlencoded");
+
+        let response = drive(&mut svc, with_body(req, form)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(log.calls(), 1);
+        assert_eq!(log.unready_calls(), 0);
+        assert_eq!(seen(&response, "x-seen-token"), "known-token");
+        assert_eq!(set_cookies(&response), ["inner=1"]);
+        assert_eq!(&body_of(response).await[..], form.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn one_service_serves_forwarded_and_verified_requests_in_turn() {
+        let (mut svc, log) = probed(&exempt_api_config(), false);
+        let requests = [
+            (request("GET", "/page"), StatusCode::OK),
+            (valid_post("/submit"), StatusCode::OK),
+            (request("GET", "/page"), StatusCode::OK),
+            (request("POST", "/submit"), StatusCode::FORBIDDEN),
+            (request("GET", "/page"), StatusCode::OK),
+            (valid_post("/submit"), StatusCode::OK),
+            (request("POST", "/api/items"), StatusCode::OK),
+        ];
+
+        for (i, (req, expected)) in requests.into_iter().enumerate() {
+            let response = drive(&mut svc, req).await.unwrap();
+            assert_eq!(response.status(), expected, "request {i}");
+        }
+
+        assert_eq!(log.calls(), 6);
+        assert_eq!(log.unready_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn clone_of_the_service_serves_a_forwarded_request() {
+        // A router clones the service for each request and drives the clone one time.
+        let (svc, log) = probed(&default_csrf_config(), false);
+
+        let response = svc.clone().oneshot(request("GET", "/page")).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(log.clones(), 1, "only the clone the caller made");
+        assert_eq!(log.unready_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn inner_error_is_returned_unchanged() {
+        let (mut svc, log) = probed(&exempt_api_config(), true);
+        let requests = [
+            ("forwarded, cookie minted", request("GET", "/")),
+            (
+                "forwarded, cookie reused",
+                with_header(request("GET", "/"), "cookie", "autumn-csrf=known-token"),
+            ),
+            ("verified", valid_post("/submit")),
+        ];
+
+        for (name, req) in requests {
+            let result = drive(&mut svc, req).await;
+            assert_eq!(result.unwrap_err(), "inner failed", "{name}");
+        }
+
+        assert_eq!(log.calls(), 3);
+        assert_eq!(log.unready_calls(), 0);
+    }
+
+    /// The safe-request test with the exempt-path term first, so the path is
+    /// normalized for every request once an exempt path is configured.
+    fn reference_request_is_safe(settings: &CsrfSettings, req: &Request<Body>) -> bool {
+        let is_exempt = !settings.exempt_paths.is_empty() && {
+            let clean = crate::security::path::clean_path(req.uri().path());
+            crate::security::path::is_exempt_path(clean.as_str(), &settings.exempt_paths)
+        };
+        is_exempt
+            || settings.safe_methods.contains(req.method())
+            || crate::security::is_websocket_connect(req)
+            || req.extensions().get::<CsrfNotApplicable>().is_some()
+    }
+
+    const METHODS: &[&str] = &[
+        "GET", "HEAD", "OPTIONS", "TRACE", "POST", "PUT", "PATCH", "DELETE", "CONNECT",
+    ];
+    const SEGMENTS: &[&str] = &[
+        "api",
+        "API",
+        "webhooks",
+        "stripe",
+        "stripe-admin",
+        "submit",
+        "..",
+        ".",
+        "%2e%2e",
+        "%2F",
+        "%C3%A9",
+        "",
+    ];
+    const EXEMPT_PATHS: &[&str] = &[
+        "/api/",
+        "/api",
+        "/webhooks/stripe",
+        "/%C3%A9",
+        "/",
+        "",
+        "submit",
+    ];
+    const PROTOCOLS: &[&str] = &["websocket", "WebSocket", "connect-udp"];
+
+    proptest::proptest! {
+        /// The order of the terms does not change which requests skip verification.
+        #[test]
+        fn request_is_safe_matches_reference(
+            method in proptest::sample::select(METHODS),
+            segments in proptest::collection::vec(proptest::sample::select(SEGMENTS), 0..6),
+            trailing_slash in proptest::prelude::any::<bool>(),
+            exempt_paths in
+                proptest::collection::vec(proptest::sample::select(EXEMPT_PATHS), 0..4),
+            safe_methods in proptest::collection::vec(proptest::sample::select(METHODS), 0..5),
+            protocol in proptest::option::of(proptest::sample::select(PROTOCOLS)),
+            not_applicable in proptest::prelude::any::<bool>(),
+        ) {
+            let config = CsrfConfig {
+                enabled: true,
+                exempt_paths: exempt_paths.iter().map(|p| (*p).to_owned()).collect(),
+                safe_methods: safe_methods.iter().map(|m| (*m).to_owned()).collect(),
+                ..Default::default()
+            };
+            let layer = CsrfLayer::from_config(&config);
+
+            let mut uri = format!("/{}", segments.join("/"));
+            if trailing_slash && !uri.ends_with('/') {
+                uri.push('/');
+            }
+            let mut req = request(method, &uri);
+            if let Some(protocol) = protocol {
+                req.extensions_mut()
+                    .insert(hyper::ext::Protocol::from_static(protocol));
+            }
+            if not_applicable {
+                req.extensions_mut().insert(CsrfNotApplicable);
+            }
+
+            proptest::prop_assert_eq!(
+                request_is_safe(&layer.settings, &req),
+                reference_request_is_safe(&layer.settings, &req),
+                "{} {}", method, uri
+            );
+        }
     }
 }

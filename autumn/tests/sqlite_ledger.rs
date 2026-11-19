@@ -37,11 +37,11 @@ use autumn_web::current::with_actor;
 use autumn_web::db::{RuntimeConnection, create_pool};
 use autumn_web::hooks::Patch;
 use autumn_web::ledger::{LedgerAsOf, LedgerBreak, LedgerPageRequest};
-use autumn_web::reexports::{chrono, diesel, diesel_async};
+use autumn_web::reexports::{diesel, diesel_async};
 use autumn_web::tenancy::with_tenant;
 use autumn_web::version_history::VersionOp;
 
-use chrono::{DateTime, Duration, Utc};
+use autumn_web::time::{SignedDuration, Timestamp, civil, tz};
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
 
@@ -170,7 +170,7 @@ pub struct LgInvoice {
     /// survives the canonicalization the hash depends on.
     pub metadata: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(LgInvoice, table = "lg_invoices", soft_delete, ledgered = true)]
@@ -185,7 +185,7 @@ pub struct LgTenantInvoice {
     #[default]
     pub tenant_id: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -206,7 +206,7 @@ pub struct LgMovableInvoice {
     pub reference: String,
     pub tenant_id: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -225,9 +225,9 @@ pub struct LgEffectiveNote {
     #[id]
     pub id: i64,
     pub body: String,
-    pub effective_at: chrono::NaiveDateTime,
+    pub effective_at: civil::DateTime,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -246,7 +246,7 @@ pub struct LgRenamedNote {
     pub id: i64,
     pub title: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 /// Convert a version 1 snapshot. A `legacy_flag` marks a shape with no rule.
@@ -284,7 +284,7 @@ pub struct LgSealedNote {
     #[encrypted]
     pub secret: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 fn upcast_lg_sealed_note(from: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
@@ -323,7 +323,7 @@ pub struct LgCascadeChild {
     pub parent_id: i64,
     pub label: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -362,7 +362,7 @@ pub struct LgVaultNote {
     #[encrypted]
     pub secret: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(LgVaultNote, table = "lg_vault_notes", soft_delete, ledgered = true)]
@@ -383,7 +383,7 @@ pub struct LgSecretNote {
     #[private]
     pub internal_note: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(LgSecretNote, table = "lg_secret_notes", soft_delete, ledgered = true)]
@@ -397,7 +397,7 @@ pub struct LgHookedNote {
     pub id: i64,
     pub body: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 /// Hooks that do nothing. They only select the hooked code path.
@@ -622,8 +622,13 @@ async fn resync_high_water_mark(pool: &SqlitePool, table: &str, record_id: i64) 
     clippy::disallowed_methods,
     reason = "test asserts against real recorded_at values"
 )]
-fn now() -> DateTime<Utc> {
-    Utc::now()
+fn now() -> Timestamp {
+    Timestamp::now()
+}
+
+/// A UTC wall-clock value as an instant.
+fn utc(dt: civil::DateTime) -> Timestamp {
+    tz::Offset::UTC.to_timestamp(dt).expect("in range")
 }
 
 /// Two writes inside one `SQLite` millisecond would make "the instant between
@@ -646,7 +651,7 @@ async fn golden_as_of_reconstruction_matches_the_oracle_and_tampering_is_detecte
 
     // Each step records the live row and the instant it was live at — the oracle
     // an as-of query must reproduce byte for byte.
-    let mut oracle: Vec<(DateTime<Utc>, LgInvoice)> = Vec::new();
+    let mut oracle: Vec<(Timestamp, LgInvoice)> = Vec::new();
 
     let created = with_actor("alice", async {
         repo.save(&NewLgInvoice {
@@ -711,7 +716,7 @@ async fn golden_as_of_reconstruction_matches_the_oracle_and_tampering_is_detecte
     }
 
     // Before the record existed, as-of resolves to nothing.
-    let before_creation = oracle[0].0 - Duration::seconds(60);
+    let before_creation = oracle[0].0 - SignedDuration::from_secs(60);
     assert!(
         repo.ledger_as_of(id, before_creation)
             .await
@@ -914,7 +919,11 @@ async fn diff_reports_the_field_level_delta_between_two_instants() {
 
     // A window with no writes in it is an empty delta, not an error.
     let quiet = repo
-        .ledger_diff(id, after_update, after_update + Duration::seconds(5))
+        .ledger_diff(
+            id,
+            after_update,
+            after_update + SignedDuration::from_secs(5),
+        )
         .await
         .expect("diff");
     assert!(quiet.is_empty(), "{quiet:?}");
@@ -1081,7 +1090,7 @@ async fn the_high_water_mark_upsert_refuses_to_move_backwards() {
              WHERE _autumn_ledger_high_water.high_seq < excluded.high_seq",
         )
         .bind::<diesel::sql_types::BigInt, _>(id)
-        .bind::<diesel::sql_types::TimestamptzSqlite, _>(now())
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(autumn_web::db::SqlTimestamp(now()))
         .execute(&mut *conn)
         .await
         .expect("the upsert itself must succeed — it simply must not lower the mark");
@@ -1660,8 +1669,8 @@ async fn a_pinned_head_detects_a_correctly_hashed_forgery() {
         .bind::<diesel::sql_types::BigInt, _>(id)
         .bind::<diesel::sql_types::BigInt, _>(head_revision.seq + 1)
         .bind::<diesel::sql_types::Text, _>(autumn_web::ledger::canonical_json(&snapshot))
-        .bind::<diesel::sql_types::TimestamptzSqlite, _>(recorded_at)
-        .bind::<diesel::sql_types::TimestamptzSqlite, _>(recorded_at)
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(autumn_web::db::SqlTimestamp(recorded_at))
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(autumn_web::db::SqlTimestamp(recorded_at))
         .bind::<diesel::sql_types::Text, _>(head_revision.hash.clone())
         .bind::<diesel::sql_types::Text, _>(forged_hash)
         .execute(&mut *conn)
@@ -1706,7 +1715,7 @@ async fn a_pinned_head_detects_a_correctly_hashed_forgery() {
 
 // ── transaction time comes from the database (#2323) ─────────────────
 
-/// `recorded_at` used to be `Utc::now()` on the writing node, so clock skew
+/// `recorded_at` used to be the host clock on the writing node, so clock skew
 /// across nodes — or a single host clock adjustment — could give a later
 /// sequence an earlier instant, and `snapshot_as_of` would then answer a
 /// transaction-time query with a revision that was not yet current. The write
@@ -1718,7 +1727,7 @@ async fn transaction_time_never_moves_backwards_along_a_chain() {
     let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
     let id = write_three_revisions(&repo).await;
 
-    let recorded: Vec<DateTime<Utc>> = repo
+    let recorded: Vec<Timestamp> = repo
         .ledger_revisions(id)
         .await
         .expect("revisions")
@@ -1733,7 +1742,7 @@ async fn transaction_time_never_moves_backwards_along_a_chain() {
     // The mark's instant is the floor only where it is the *only* floor: after
     // the revision that carried the real instant is gone. Lop the head off and
     // push the mark forward, as a host whose clock ran fast would have left it.
-    let ahead = autumn_web::ledger::truncate_to_micros(now() + Duration::minutes(30));
+    let ahead = autumn_web::ledger::truncate_to_micros(now() + SignedDuration::from_mins(30));
     {
         let mut conn = pool.get().await.expect("conn");
         diesel::sql_query(
@@ -1748,7 +1757,7 @@ async fn transaction_time_never_moves_backwards_along_a_chain() {
             "UPDATE _autumn_ledger_high_water SET recorded_at = ? \
              WHERE table_name = 'lg_invoices' AND record_id = ?",
         )
-        .bind::<diesel::sql_types::TimestamptzSqlite, _>(ahead)
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(autumn_web::db::SqlTimestamp(ahead))
         .bind::<diesel::sql_types::BigInt, _>(id)
         .execute(&mut *conn)
         .await
@@ -1773,7 +1782,7 @@ async fn transaction_time_never_moves_backwards_along_a_chain() {
          behind it: {} < {ahead}",
         head.recorded_at
     );
-    let recorded: Vec<DateTime<Utc>> = revisions.iter().map(|r| r.recorded_at).collect();
+    let recorded: Vec<Timestamp> = revisions.iter().map(|r| r.recorded_at).collect();
     assert!(
         recorded.windows(2).all(|w| w[0] <= w[1]),
         "still non-decreasing across the gap the deleted revision left: {recorded:?}"
@@ -1801,7 +1810,8 @@ async fn a_transaction_time_floor_far_ahead_of_the_database_refuses_the_write() 
     let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
     let id = write_three_revisions(&repo).await;
 
-    let far = autumn_web::ledger::truncate_to_micros(now() + Duration::days(365 * 900));
+    let far =
+        autumn_web::ledger::truncate_to_micros(now() + SignedDuration::from_hours(365 * 900 * 24));
     {
         let mut conn = pool.get().await.expect("conn");
         diesel::sql_query(
@@ -1816,7 +1826,7 @@ async fn a_transaction_time_floor_far_ahead_of_the_database_refuses_the_write() 
             "UPDATE _autumn_ledger_high_water SET recorded_at = ? \
              WHERE table_name = 'lg_invoices' AND record_id = ?",
         )
-        .bind::<diesel::sql_types::TimestamptzSqlite, _>(far)
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(autumn_web::db::SqlTimestamp(far))
         .bind::<diesel::sql_types::BigInt, _>(id)
         .execute(&mut *conn)
         .await
@@ -1862,14 +1872,14 @@ async fn a_rewritten_mark_instant_is_refused_like_any_other_mark_rewrite() {
     let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
     let id = write_three_revisions(&repo).await;
 
-    let ahead = autumn_web::ledger::truncate_to_micros(now() + Duration::minutes(45));
+    let ahead = autumn_web::ledger::truncate_to_micros(now() + SignedDuration::from_mins(45));
     {
         let mut conn = pool.get().await.expect("conn");
         diesel::sql_query(
             "UPDATE _autumn_ledger_high_water SET recorded_at = ? \
              WHERE table_name = 'lg_invoices' AND record_id = ?",
         )
-        .bind::<diesel::sql_types::TimestamptzSqlite, _>(ahead)
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(autumn_web::db::SqlTimestamp(ahead))
         .bind::<diesel::sql_types::BigInt, _>(id)
         .execute(&mut *conn)
         .await
@@ -1923,7 +1933,7 @@ async fn a_mark_behind_the_head_cannot_steer_the_next_revisions_time() {
     let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
     let id = write_three_revisions(&repo).await;
 
-    let ahead = autumn_web::ledger::truncate_to_micros(now() + Duration::minutes(45));
+    let ahead = autumn_web::ledger::truncate_to_micros(now() + SignedDuration::from_mins(45));
     {
         let mut conn = pool.get().await.expect("conn");
         diesel::sql_query(
@@ -1934,7 +1944,7 @@ async fn a_mark_behind_the_head_cannot_steer_the_next_revisions_time() {
              WHERE table_name = 'lg_invoices' AND record_id = ?",
         )
         .bind::<diesel::sql_types::BigInt, _>(id)
-        .bind::<diesel::sql_types::TimestamptzSqlite, _>(ahead)
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(autumn_web::db::SqlTimestamp(ahead))
         .bind::<diesel::sql_types::BigInt, _>(id)
         .execute(&mut *conn)
         .await
@@ -2027,7 +2037,7 @@ async fn an_as_of_query_never_returns_a_revision_recorded_after_the_instant() {
 
         // One microsecond earlier it cannot be: the answer is the *previous*
         // revision, or nothing at all before the insert.
-        let just_before = revision.recorded_at - Duration::microseconds(1);
+        let just_before = revision.recorded_at - SignedDuration::from_micros(1);
         let earlier = repo
             .ledger_as_of(created.id, just_before)
             .await
@@ -2063,7 +2073,7 @@ async fn verify_detects_a_transaction_time_that_moves_backwards() {
 
     let revisions = repo.ledger_revisions(id).await.expect("revisions");
     let head = revisions.last().expect("head");
-    let backdated = revisions[1].recorded_at - Duration::seconds(1);
+    let backdated = revisions[1].recorded_at - SignedDuration::from_secs(1);
     // Re-hash so the row still hashes to its stored digest: the point is that a
     // regression survives every *other* check and needs one of its own.
     let rehashed = autumn_web::ledger::revision_hash(&autumn_web::ledger::RevisionHashInput {
@@ -2085,7 +2095,7 @@ async fn verify_detects_a_transaction_time_that_moves_backwards() {
             "UPDATE _autumn_ledger_revisions SET recorded_at = ?, hash = ? \
              WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = ?",
         )
-        .bind::<diesel::sql_types::TimestamptzSqlite, _>(backdated)
+        .bind::<diesel::sql_types::TimestamptzSqlite, _>(autumn_web::db::SqlTimestamp(backdated))
         .bind::<diesel::sql_types::Text, _>(rehashed)
         .bind::<diesel::sql_types::BigInt, _>(id)
         .bind::<diesel::sql_types::BigInt, _>(head.seq)
@@ -2994,10 +3004,7 @@ async fn a_declared_valid_time_column_separates_the_two_axes() {
     let pool = boot_pool("lg_valid_time").await;
     let repo = PgLgEffectiveNoteRepository::with_pool_untracked(pool);
 
-    let effective = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
-        .expect("date")
-        .and_hms_opt(0, 0, 0)
-        .expect("time");
+    let effective = civil::date(2026, 1, 1).at(0, 0, 0, 0);
     let created = repo
         .save(&NewLgEffectiveNote {
             body: "v1".to_string(),
@@ -3010,7 +3017,7 @@ async fn a_declared_valid_time_column_separates_the_two_axes() {
     assert_eq!(revisions.len(), 1);
     assert_eq!(
         revisions[0].valid_from,
-        effective.and_utc(),
+        utc(effective),
         "valid time comes from the declared column, not the clock"
     );
     assert!(
@@ -3019,10 +3026,7 @@ async fn a_declared_valid_time_column_separates_the_two_axes() {
     );
 
     // A back-dated correction: recorded second, valid from *before* the insert.
-    let earlier = chrono::NaiveDate::from_ymd_opt(2025, 6, 1)
-        .expect("date")
-        .and_hms_opt(0, 0, 0)
-        .expect("time");
+    let earlier = civil::date(2025, 6, 1).at(0, 0, 0, 0);
     repo.update(
         created.id,
         &UpdateLgEffectiveNote {
@@ -3041,7 +3045,7 @@ async fn a_declared_valid_time_column_separates_the_two_axes() {
         .expect("live read")
         .expect("live row");
     let latest = repo
-        .ledger_as_of(created.id, now() + Duration::seconds(1))
+        .ledger_as_of(created.id, now() + SignedDuration::from_secs(1))
         .await
         .expect("as-of")
         .expect("state");
@@ -3049,11 +3053,7 @@ async fn a_declared_valid_time_column_separates_the_two_axes() {
     assert_eq!(latest.body, "v2");
 
     // Valid-time reads walk the valid-time timeline instead.
-    let mid_2025 = chrono::NaiveDate::from_ymd_opt(2025, 8, 1)
-        .expect("date")
-        .and_hms_opt(0, 0, 0)
-        .expect("time")
-        .and_utc();
+    let mid_2025 = utc(civil::date(2025, 8, 1).at(0, 0, 0, 0));
     let then = repo
         .ledger_as_of_at(created.id, LedgerAsOf::valid(mid_2025))
         .await
@@ -3064,11 +3064,7 @@ async fn a_declared_valid_time_column_separates_the_two_axes() {
         "the back-dated correction governs August 2025"
     );
 
-    let mid_2026 = chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
-        .expect("date")
-        .and_hms_opt(0, 0, 0)
-        .expect("time")
-        .and_utc();
+    let mid_2026 = utc(civil::date(2026, 6, 1).at(0, 0, 0, 0));
     let later = repo
         .ledger_as_of_at(created.id, LedgerAsOf::valid(mid_2026))
         .await
@@ -3237,10 +3233,7 @@ async fn a_trigger_written_valid_time_is_the_revisions_valid_time() {
     let created = repo
         .save(&NewLgEffectiveNote {
             body: "v1".to_string(),
-            effective_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
-                .expect("date")
-                .and_hms_opt(0, 0, 0)
-                .expect("time"),
+            effective_at: civil::date(2026, 1, 1).at(0, 0, 0, 0),
         })
         .await
         .expect("insert");
@@ -3265,10 +3258,7 @@ async fn a_trigger_written_valid_time_is_the_revisions_valid_time() {
     .await
     .expect("update");
 
-    let rewritten = chrono::NaiveDate::from_ymd_opt(2024, 3, 1)
-        .expect("date")
-        .and_hms_opt(0, 0, 0)
-        .expect("time");
+    let rewritten = civil::date(2024, 3, 1).at(0, 0, 0, 0);
     let live = repo
         .find_by_id(created.id)
         .await
@@ -3281,7 +3271,7 @@ async fn a_trigger_written_valid_time_is_the_revisions_valid_time() {
         .expect("revisions")
         .pop()
         .expect("head");
-    assert_eq!(head.valid_from, rewritten.and_utc());
+    assert_eq!(head.valid_from, utc(rewritten));
     let report = repo.ledger_verify(created.id).await.expect("verify");
     assert!(report.is_intact(), "{report:?}");
 }
@@ -3311,10 +3301,7 @@ async fn delete_and_restore_do_not_inherit_a_stale_valid_time() {
     let pool = boot_pool("lg_valid_time_delete").await;
     let repo = PgLgEffectiveNoteRepository::with_pool_untracked(pool);
 
-    let effective = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
-        .expect("date")
-        .and_hms_opt(0, 0, 0)
-        .expect("time");
+    let effective = civil::date(2026, 1, 1).at(0, 0, 0, 0);
     let created = repo
         .save(&NewLgEffectiveNote {
             body: "v1".to_string(),
@@ -3334,11 +3321,7 @@ async fn delete_and_restore_do_not_inherit_a_stale_valid_time() {
         );
     }
 
-    let february = chrono::NaiveDate::from_ymd_opt(2026, 2, 1)
-        .expect("date")
-        .and_hms_opt(0, 0, 0)
-        .expect("time")
-        .and_utc();
+    let february = utc(civil::date(2026, 2, 1).at(0, 0, 0, 0));
     let then = repo
         .ledger_as_of_at(created.id, LedgerAsOf::valid(february))
         .await
@@ -3683,8 +3666,8 @@ async fn every_ledger_read_refuses_across_tenants() {
             .map(drop),
         "as of",
     );
-    let now = Utc::now();
-    refused(across.ledger_diff(id, now, now).await.map(drop), "diff");
+    let at = now();
+    refused(across.ledger_diff(id, at, at).await.map(drop), "diff");
 }
 
 // ── #2319: paginated chain reads ─────────────────────────────────────
@@ -3863,7 +3846,7 @@ async fn a_delete_snapshots_the_row_a_trigger_rewrote() {
         "no false positive after delete: {report:?}"
     );
     let then = repo
-        .ledger_as_of(created.id, now() + Duration::seconds(1))
+        .ledger_as_of(created.id, now() + SignedDuration::from_secs(1))
         .await
         .expect("as-of")
         .expect("state");

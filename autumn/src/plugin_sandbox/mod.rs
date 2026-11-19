@@ -111,10 +111,8 @@ pub use wire::{
 
 // ── fuzzing seams (issue #1611's `__fuzz` convention) ────────────────────
 //
-// Everything here decodes bytes that came out of an artifact the operator
-// explicitly did not audit, which is exactly the shape #1611 asks to be fuzzed.
-// The functions are thin wrappers so `fuzz/` needs no knowledge of the module's
-// internals and the crate-private wire types stay crate-private.
+// Each decodes bytes from an unaudited artifact. Thin wrappers keep `fuzz/` off the
+// module's internals and keep the wire types crate-private.
 
 /// Decode a `.autumn-plugin` container. Fuzzing seam; not a public API.
 #[doc(hidden)]
@@ -149,8 +147,7 @@ pub fn __fuzz_parse_manifest(src: &str) -> bool {
 #[doc(hidden)]
 #[must_use]
 pub fn __fuzz_render_fragment(line: &str) -> bool {
-    // The same reservation the wire path makes, so the fuzzer exercises the
-    // parse the host actually runs rather than an unbounded one.
+    // The wire path's reservation, so the fuzzer runs the bounded parse the host runs.
     let _budget = capability::FragmentNodeBudget::reserve(capability::render::MAX_NODES);
     let Ok(nodes) = serde_json::from_str::<Vec<capability::FragmentNode>>(line) else {
         return false;

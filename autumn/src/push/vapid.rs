@@ -143,9 +143,8 @@ impl VapidKey {
         // Fixed header — the only algorithm RFC 8292 permits.
         let header = URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ES256"}"#);
         let exp = issued_at_unix.saturating_add(VAPID_TOKEN_TTL_SECS);
-        // Hand-rolled rather than `serde_json` so the claim ORDER is fixed and
-        // the signing input is byte-reproducible across serde versions — the
-        // unit tests below verify the exact signing input.
+        // Hand-rolled rather than `serde_json` so the claim order is fixed and
+        // the signing input is byte-reproducible; the tests pin it exactly.
         let claims = format!(
             r#"{{"aud":"{}","exp":{exp},"sub":"{}"}}"#,
             escape_json(audience),

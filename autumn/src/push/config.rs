@@ -79,10 +79,9 @@ pub struct PushConfig {
 pub(super) fn is_valid_vapid_subject(subject: &str) -> bool {
     let subject = subject.trim();
     if let Some(rest) = subject.strip_prefix("mailto:") {
-        // Accept one addr-spec: no whitespace, one `@`, and a non-empty local
-        // part and domain. A domain without a dot is valid, because the
-        // default is `admin@localhost`. This is not full RFC 5322. It rejects
-        // only what a push service refuses.
+        // One addr-spec: no whitespace, one `@`, non-empty local part and domain. Not full
+        // RFC 5322, only what a push service refuses. A dotless domain is valid because the
+        // default is `admin@localhost`.
         return rest.split_once('@').is_some_and(|(local, domain)| {
             !local.is_empty()
                 && !domain.contains('@')
@@ -125,9 +124,6 @@ impl PushConfig {
             return Ok(None);
         };
 
-        // Deliberately NOT treated as absent: an empty value is a set value
-        // that failed to interpolate, and silently disabling push there is the
-        // exact failure this whole path exists to prevent.
         if private.is_empty() {
             return Err(PushError::InvalidVapidKey(
                 "`[push] private_key` is empty. The commonest cause is \
@@ -154,10 +150,7 @@ impl PushConfig {
             }
         }
 
-        // A `sub` the push services will reject is just as fatal as a bad key,
-        // and just as invisible: the app boots, signs happily, and every
-        // delivery is refused remotely. Validate it here so it fails the boot
-        // alongside the key rather than in production.
+        // A rejected `sub` fails every delivery remotely, so it fails the boot with the key.
         self.validated_subject()?;
 
         Ok(Some(key))
@@ -230,8 +223,6 @@ mod tests {
 
     #[test]
     fn an_invalid_private_key_fails_fast_rather_than_silently_disabling_push() {
-        // The whole point: a typo'd key must stop the boot, not leave the app
-        // running with push quietly dead.
         let err = config("private_key = \"obviously-not-a-key\"")
             .load_vapid_key()
             .expect_err("an invalid key is a hard error");
@@ -240,9 +231,7 @@ mod tests {
 
     #[test]
     fn an_empty_private_key_is_rejected_not_treated_as_absent() {
-        // `private_key = ""` reads as "I meant to set this" — most often an
-        // env var that failed to interpolate. Treating it as absent would
-        // silently disable push in exactly the deployment that needed it.
+        // An empty key is usually an env var that failed to interpolate.
         let err = config("private_key = \"\"")
             .load_vapid_key()
             .expect_err("an empty key is an error, not an absent one");
@@ -251,9 +240,8 @@ mod tests {
 
     #[test]
     fn a_declared_public_key_must_match_the_private_one() {
-        // A mismatched pair is the nastiest possible failure: the browser
-        // subscribes under one key, the server signs with another, and every
-        // send is rejected by the push service with no clue why.
+        // Browsers would subscribe under one key while the server signs with the other, so the
+        // push service would reject every send.
         let generated = VapidKey::generate();
         let other = VapidKey::generate();
         let err = config(&format!(
@@ -284,8 +272,6 @@ mod tests {
 
     #[test]
     fn a_public_key_without_a_private_one_is_rejected() {
-        // Public-key-only would mean the browser can subscribe but nothing can
-        // ever be sent — a configuration that cannot work.
         let err = config(&format!(
             "public_key = \"{}\"",
             VapidKey::generate().public_key_base64url()
@@ -297,8 +283,7 @@ mod tests {
 
     #[test]
     fn surrounding_whitespace_in_a_key_is_tolerated() {
-        // Keys arrive via env vars and shell here-docs; a trailing newline is
-        // not a configuration error.
+        // Keys arrive via env vars and here-docs, often with a trailing newline.
         let generated = VapidKey::generate();
         config(&format!(
             "private_key = \"  {}\\n\"",
@@ -311,8 +296,6 @@ mod tests {
 
     #[test]
     fn subject_defaults_to_a_valid_vapid_sub_claim() {
-        // RFC 8292 requires `sub` to be a mailto: or https: URL; a push
-        // service may reject anything else.
         let subject = PushConfig::default().subject_or_default();
         assert!(
             subject.starts_with("mailto:") || subject.starts_with("https://"),
@@ -331,8 +314,6 @@ mod tests {
 
     #[test]
     fn a_bare_email_address_is_not_a_valid_subject() {
-        // The commonest mistake, and the most invisible: the app boots, signs
-        // happily, and every push service refuses the delivery.
         let err = config("subject = \"ops@example.com\"")
             .validated_subject()
             .expect_err("a bare address is not a `mailto:` URI");
@@ -358,9 +339,7 @@ mod tests {
 
     #[test]
     fn a_subject_with_a_wrong_scheme_is_rejected() {
-        // `http://` in particular: the point of the `sub` claim is that a push
-        // service operator can reach the sender, and RFC 8292 names only
-        // `mailto:` and `https:`.
+        // `http://` included: RFC 8292 names only `mailto:` and `https:`.
         for subject in ["http://example.com", "tel:+15550100", "example.com"] {
             let err = config(&format!("subject = \"{subject}\""))
                 .validated_subject()

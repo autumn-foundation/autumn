@@ -327,6 +327,7 @@ fn directions(
                 aliases: Vec::new(),
                 opaque: opaque(custom_ser),
                 nested: Vec::new(),
+                tag: wire.tag.map(|(n, _)| n),
             });
         }
         if !skip_deserializing {
@@ -342,6 +343,7 @@ fn directions(
                 aliases: serde_aliases(field),
                 opaque: opaque(custom_de),
                 nested: Vec::new(),
+                tag: wire.tag.map(|(n, _)| n),
             });
         }
     }
@@ -368,8 +370,24 @@ pub fn check_wire_attrs(input: &DeriveInput) -> Result<(), syn::Error> {
         ));
     }
     if let Data::Struct(data) = &input.data {
+        // A consumer cannot tell apart two fields with one protobuf number.
+        let mut tags: Vec<(u32, String)> = Vec::new();
         for field in &data.fields {
-            wire_attrs(field)?;
+            let Some((number, span)) = wire_attrs(field)?.tag else {
+                continue;
+            };
+            let name = field
+                .ident
+                .as_ref()
+                .map(|i| i.to_string().trim_start_matches("r#").to_owned())
+                .unwrap_or_default();
+            if let Some((_, other)) = tags.iter().find(|(n, _)| *n == number) {
+                return Err(syn::Error::new(
+                    span,
+                    format!("tag {number} is also on field `{other}`; give each field its own tag"),
+                ));
+            }
+            tags.push((number, name));
         }
     }
     Ok(())
@@ -466,6 +484,7 @@ fn field_tokens(fields: &[WireFieldDescriptor]) -> Vec<TokenStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autumn_macros_support::wire::format;
 
     fn shape(src: &str) -> WireTypeDescriptor {
         let input: DeriveInput = syn::parse_str(src).expect("fixture parses");
@@ -752,6 +771,13 @@ mod tests {
             naive_date: chrono::NaiveDate,
             naive_date_time: NaiveDateTime,
             naive_time: NaiveTime,
+            timestamp: jiff::Timestamp,
+            timestamp_bare: Timestamp,
+            timestamp_reexport: autumn_web::time::Timestamp,
+            civil_date_time: civil::DateTime,
+            civil_date: jiff::civil::Date,
+            civil_time: autumn_web::time::civil::Time,
+            zoned: jiff::ZonedDateTime,
             offset_date_time: time::OffsetDateTime,
             primitive_date_time: time::PrimitiveDateTime,
             time_date: time::Date,
@@ -795,15 +821,15 @@ mod tests {
             status: Status,
             #[wire(opaque)]
             maybe_status: Option<Status>,
-            #[serde(with = "chrono::serde::ts_seconds")]
-            with_no_override: chrono::DateTime<chrono::Utc>,
+            #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
+            with_no_override: jiff::Timestamp,
             #[serde(serialize_with = "as_text")]
             serialize_with: u32,
             #[serde(deserialize_with = "from_text")]
             deserialize_with: u32,
-            #[serde(with = "chrono::serde::ts_seconds")]
+            #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
             #[wire(type = "integer", format = "unix-seconds")]
-            stamp: chrono::DateTime<chrono::Utc>,
+            stamp: jiff::Timestamp,
             #[wire(type = "string", nullable)]
             nickname: MaybeName,
             #[wire(type = "number")]
@@ -1008,6 +1034,37 @@ mod tests {
     }
 
     #[test]
+    fn jiff_civil_types_need_the_civil_qualifier() {
+        let s = shape(
+            "struct T { a: civil::DateTime, b: civil::Date, c: civil::Time, d: time::Date, e: Date }",
+        );
+        assert_eq!(
+            wire(&s.serialized, "a"),
+            WireType::string_in(format::LOCAL_DATE_TIME)
+        );
+        assert_eq!(wire(&s.serialized, "b"), WireType::string_in(format::DATE));
+        assert_eq!(
+            wire(&s.serialized, "c"),
+            WireType::string_in(format::LOCAL_TIME)
+        );
+        assert_eq!(wire(&s.serialized, "d"), WireType::Any);
+        assert_eq!(wire(&s.serialized, "e"), WireType::Any);
+    }
+
+    #[test]
+    fn a_jiff_timestamp_is_a_date_time_and_a_foreign_one_is_any() {
+        let s = shape(
+            "struct T { a: Timestamp, b: jiff::Timestamp, c: autumn_web::time::Timestamp, d: prost_types::Timestamp }",
+        );
+        let date_time = WireType::string_in(format::DATE_TIME);
+        assert_eq!(wire(&s.serialized, "a"), date_time);
+        assert_eq!(wire(&s.serialized, "b"), date_time);
+        assert_eq!(wire(&s.serialized, "c"), date_time);
+        // A `Timestamp` from another crate has no known form.
+        assert_eq!(wire(&s.serialized, "d"), WireType::Any);
+    }
+
+    #[test]
     fn self_in_an_opaque_field_is_any() {
         let s = shape("struct T { #[wire(opaque)] kids: Vec<Self> }");
         assert_eq!(wire(&s.serialized, "kids"), WireType::array(WireType::Any));
@@ -1103,6 +1160,74 @@ mod tests {
             syn::parse_str("struct T { #[wire(type = \"date\")] a: Day }").expect("parses");
         let err = check_wire_attrs(&input).expect_err("refused").to_string();
         assert!(err.contains("unknown wire type"), "{err}");
+    }
+
+    #[test]
+    fn a_wire_tag_is_recorded_in_both_directions() {
+        let s = shape("struct T { #[wire(tag = 7)] id: String, name: String }");
+        assert_eq!(s.serialized[0].tag, Some(7));
+        assert_eq!(s.deserialized[0].tag, Some(7));
+        assert_eq!(s.serialized[1].tag, None);
+    }
+
+    #[test]
+    fn a_wire_tag_goes_with_type_and_opaque() {
+        let s = shape(
+            "struct T { #[wire(opaque, tag = 3)] a: Status, #[wire(type = \"string\")] #[wire(tag = 4)] b: Day }",
+        );
+        assert_eq!(
+            (s.serialized[0].tag, s.serialized[1].tag),
+            (Some(3), Some(4))
+        );
+        assert!(s.serialized[0].opaque);
+    }
+
+    #[test]
+    fn a_bad_wire_tag_is_refused() {
+        for (src, want) in [
+            ("struct T { #[wire(tag = 0)] a: String }", "1 to 536870911"),
+            (
+                "struct T { #[wire(tag = 536870912)] a: String }",
+                "1 to 536870911",
+            ),
+            (
+                "struct T { #[wire(tag = 19000)] a: String }",
+                "19000 to 19999",
+            ),
+            (
+                "struct T { #[wire(tag = 19999)] a: String }",
+                "19000 to 19999",
+            ),
+            ("struct T { #[wire(tag = \"1\")] a: String }", "integer"),
+            (
+                "struct T { #[wire(tag = 1, tag = 2)] a: String }",
+                "`tag` is set twice",
+            ),
+            (
+                "struct T { #[wire(tag = 2)] a: String, #[wire(tag = 2)] b: String }",
+                "tag 2 is also on field `a`",
+            ),
+        ] {
+            let err = refusal(src);
+            assert!(err.contains(want), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn check_wire_attrs_refuses_a_tag_clash() {
+        let input: DeriveInput =
+            syn::parse_str("struct T { #[wire(tag = 5)] a: String, #[wire(tag = 5)] b: String }")
+                .expect("parses");
+        let err = check_wire_attrs(&input).expect_err("refused").to_string();
+        assert!(err.contains("tag 5 is also on field `a`"), "{err}");
+    }
+
+    #[test]
+    fn a_skipped_field_keeps_no_tag_and_does_not_clash() {
+        let s = shape(
+            "struct T { #[serde(skip)] #[wire(tag = 1)] a: String, #[wire(tag = 2)] b: String }",
+        );
+        assert_eq!(names(&s.serialized), ["b"]);
     }
 
     #[test]

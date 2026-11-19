@@ -392,19 +392,13 @@ impl ShadowRegistry {
         bump(&self.counters.diverged);
 
         let Ok(mut records) = self.records.write() else {
-            // A poisoned lock means a previous writer panicked while holding
-            // it. The counters above still tell the operator divergences are
-            // happening; losing the sample is strictly better than propagating
-            // a panic into a detached mirror task.
+            // Poisoned lock: the counters above still record the divergence; losing the sample
+            // beats propagating a panic into a detached mirror task.
             return Recorded::RepeatDivergence;
         };
-        // Keyed on (route, fingerprint), not the fingerprint alone. The
-        // fingerprint is content-addressed over the two responses only, so two
-        // DIFFERENT routes that happen to answer identically — say a candidate
-        // that 500s with one generic error body everywhere — would otherwise
-        // collapse onto a single record attributed to whichever route was seen
-        // first, and the operator would fix one route believing it was the only
-        // one broken.
+        // Keyed on (route, fingerprint): the fingerprint covers only the two responses, so a
+        // candidate that 500s with one generic body everywhere would otherwise collapse every
+        // route onto one record attributed to whichever route was seen first.
         if let Some(existing) = records.iter_mut().find(|record| {
             record.divergence.fingerprint == divergence.fingerprint && record.route == context.route
         }) {
@@ -578,17 +572,13 @@ mod tests {
         let recent = registry.recent();
         assert_eq!(recent.len(), 3, "ring must be capped at max_records");
         assert_eq!(registry.stats().diverged, 10, "counters are not capped");
-        // The newest survive; the oldest are evicted.
         assert_eq!(recent[2].last_observed_at_ms, 1_009);
     }
 
     #[test]
     fn identical_divergences_on_different_routes_stay_separate() {
-        // The fingerprint is content-addressed over the two responses only, so
-        // a candidate that 500s with one generic body everywhere produces the
-        // same fingerprint on every route. Collapsing those would attribute one
-        // record to whichever route happened to be seen first, and the operator
-        // would fix one route believing it was the only one broken.
+        // A candidate that 500s with one generic body everywhere yields the same fingerprint on
+        // every route; each route must still get its own record.
         let registry = ShadowRegistry::new(10);
         for route in ["/api/orders", "/api/users"] {
             let context = RequestContext {
@@ -602,7 +592,7 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].route, "/api/orders");
         assert_eq!(recent[1].route, "/api/users");
-        // ...and the same route still collapses.
+        // Same fingerprint: only the route keeps the two records apart.
         assert_eq!(
             recent[0].divergence.fingerprint,
             recent[1].divergence.fingerprint

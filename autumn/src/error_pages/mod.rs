@@ -151,7 +151,6 @@ mod tests {
             is_dev: false,
         };
 
-        // Just verify we can call it without a panic and it produces HTML
         let html = render_error_page(&*renderer, StatusCode::BAD_REQUEST, &ctx).into_string();
         assert!(html.contains("html"));
         assert!(html.contains("400"));

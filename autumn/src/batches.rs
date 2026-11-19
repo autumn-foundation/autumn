@@ -155,8 +155,6 @@ impl<'a, S: BatchSource> FindInBatches<'a, S> {
             ));
         }
 
-        // On `Err` the cursor is untouched: the caller may retry this same
-        // batch by calling `next_batch()` again.
         let batch = self
             .source
             .fetch_batch_after(self.after, self.limit)
@@ -167,13 +165,11 @@ impl<'a, S: BatchSource> FindInBatches<'a, S> {
             return Ok(None);
         }
 
-        // Advance the keyset cursor past the last row of this chunk.
         if let Some(last) = batch.last() {
             self.after = Some(S::batch_key(last));
         }
 
-        // A short batch means the table is exhausted; the next query would
-        // return empty, so end now and avoid the extra round-trip.
+        // A short batch means the table is exhausted: skip the empty round-trip.
         if batch.len() < self.batch_size {
             self.ended = true;
         }

@@ -33,7 +33,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -45,7 +45,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone as _, Utc};
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{RunQueryDsl as _, SimpleAsyncConnection as _};
@@ -59,7 +58,7 @@ use crate::config::OutboxConfig;
 use crate::db::RuntimeConnection;
 use crate::entropy::Entropy;
 use crate::events::Event;
-use crate::time::ClockSource;
+use crate::time::{ClockSource, Timestamp};
 use crate::{AppState, AutumnError, AutumnResult};
 
 /// Topic of a durable event listener call. See [`Outbox::publish`].
@@ -190,8 +189,8 @@ pub async fn ensure_schema(pool: &Pool<RuntimeConnection>) -> AutumnResult<()> {
                 // Off the startup path: the build waits for every older
                 // transaction on the table, however long that takes.
                 let pool = pool.clone();
-                // The build holds a pooled connection until every older
-                // transaction on the table ends. A pool of one has none to spare.
+                // The build holds a pooled connection the whole time. A pool of one
+                // has none to spare.
                 if pool.status().max_size < 2 {
                     tracing::warn!(
                         "pool too small to build idx_autumn_outbox_claim in the background; run \
@@ -384,14 +383,12 @@ fn sql_error(context: &str, error: &diesel::result::Error) -> AutumnError {
     AutumnError::internal_server_error_msg(format!("{context}: {error}"))
 }
 
-const fn to_millis(time: DateTime<Utc>) -> i64 {
-    time.timestamp_millis()
+fn to_millis(time: Timestamp) -> i64 {
+    time.as_millisecond()
 }
 
-fn from_millis(millis: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(millis)
-        .single()
-        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+fn from_millis(millis: i64) -> Timestamp {
+    Timestamp::from_millisecond(millis).unwrap_or(Timestamp::MIN)
 }
 
 fn duration_millis(duration: Duration) -> i64 {
@@ -416,7 +413,8 @@ pub struct OutboxMessage {
     /// attempts made.
     pub attempt: u32,
     /// When the message was written (app clock).
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub created_at: Timestamp,
 }
 
 impl OutboxMessage {
@@ -427,7 +425,7 @@ impl OutboxMessage {
         aggregate: impl Into<String>,
         topic: impl Into<String>,
         payload: Value,
-        created_at: DateTime<Utc>,
+        created_at: Timestamp,
     ) -> Self {
         Self {
             id: id.into(),
@@ -466,7 +464,7 @@ pub struct DeadLetter {
     /// The error of the last attempt.
     pub last_error: Option<String>,
     /// When the relay stopped the message (app clock).
-    pub dead_at: DateTime<Utc>,
+    pub dead_at: Timestamp,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -1150,10 +1148,9 @@ async fn drain_until(
             "outbox relay is not installed; set outbox.enabled = true",
         )
     })?;
-    // Each pool gets its own budget, so a busy app pool cannot starve a
-    // shard.
-    // A failed pool (a shard that is down) does not stop the others. The
-    // drain fails only when every pool fails.
+    // Each pool gets its own budget, so a busy app pool cannot starve a shard. A failed
+    // pool (a shard that is down) does not stop the others; the drain fails only when
+    // every pool fails.
     let pools = relay_pools(state)?;
     let mut handled = 0;
     let mut failures = Vec::new();

@@ -118,10 +118,8 @@ pub async fn bind_challenge_listeners(port: u16) -> std::io::Result<Vec<tokio::n
         return Ok(vec![listener]);
     }
 
-    // Fallback: the platform refused a dual-stack socket. Bind IPv4 `0.0.0.0` as
-    // the mandatory baseline (its failure is fatal), then ADD a v6-only `[::]`
-    // listener when IPv6 is available — a missing IPv6 stack must not take down
-    // an otherwise-serviceable IPv4-only deployment.
+    // No dual-stack socket: IPv4 is the mandatory baseline, and a v6-only `[::]`
+    // listener is best-effort so an IPv4-only host still serves.
     tracing::warn!(
         port,
         "Dual-stack [::] bind for the ACME HTTP-01 challenge listener is unavailable; binding \
@@ -129,8 +127,7 @@ pub async fn bind_challenge_listeners(port: u16) -> std::io::Result<Vec<tokio::n
     );
     let v4 = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).await?;
     let mut listeners = vec![v4];
-    // v6-only so `[::]` does not also claim IPv4 and collide with the `0.0.0.0`
-    // bind above (SO_REUSEADDR lets the two families share the port regardless).
+    // v6-only so `[::]` does not also claim IPv4 and collide with the `0.0.0.0` bind.
     match bind_ipv6(port, true) {
         Ok(v6) => listeners.push(v6),
         Err(e) => tracing::warn!(
@@ -153,8 +150,6 @@ fn bind_ipv6(port: u16, only_v6: bool) -> std::io::Result<tokio::net::TcpListene
     socket.set_reuse_address(true)?;
     let addr: std::net::SocketAddr = (std::net::Ipv6Addr::UNSPECIFIED, port).into();
     socket.bind(&addr.into())?;
-    // A generous backlog: the challenge listener answers short-lived HTTP-01
-    // validation requests and HTTP→HTTPS redirects.
     socket.listen(1024)?;
     socket.set_nonblocking(true)?;
     tokio::net::TcpListener::from_std(socket.into())
@@ -395,22 +390,19 @@ mod tests {
         }
     }
 
-    // Regression (#1608, Codex): the HTTP-01 challenge listener must accept BOTH
-    // IPv4 and IPv6 so Let's Encrypt can validate an AAAA-only deployment.
+    // #1608: the HTTP-01 listener must accept both IPv4 and IPv6 so Let's Encrypt
+    // can validate an AAAA-only deployment.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn challenge_listener_accepts_ipv4_and_is_dual_stack_when_available() {
-        // The app-facing entrypoint always yields an IPv4-reachable listener,
-        // whether it took the dual-stack path or the IPv4 baseline fallback (an
-        // IPv4-only host has no IPv6 stack for the `[::]` socket).
+        // The entrypoint always yields an IPv4-reachable listener, dual-stack or
+        // via the IPv4 fallback.
         let listeners = bind_challenge_listeners(0)
             .await
             .expect("bind ephemeral challenge listener");
         assert_ipv4_served(listeners).await;
 
-        // Where the platform supports a dual-stack socket, an IPv4 connection
-        // accepted on the IPv6-bound `[::]` socket is the definitive proof that
-        // IPV6_V6ONLY=false (v4-mapped addresses are accepted). On an IPv4-only
-        // host this bind fails, and the invariant is already covered above.
+        // An IPv4 connection accepted on the `[::]` socket proves IPV6_V6ONLY=false.
+        // On an IPv4-only host this bind fails; the check above covers that case.
         if let Ok(dual) = bind_ipv6(0, false) {
             assert!(
                 dual.local_addr().unwrap().is_ipv6(),

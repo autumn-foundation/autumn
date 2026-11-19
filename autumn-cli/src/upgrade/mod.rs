@@ -227,9 +227,8 @@ pub fn render_text(report: &Report) -> String {
             "\nNothing to change: no shipped migration falls in this version range."
         );
         if report.from >= report.to {
-            // Overwhelmingly the reason someone sees an empty range: the
-            // dependency was bumped before running the codemods, so the app
-            // now records the version it is being upgraded *to*.
+            // Usually the dependency was bumped before running the codemods, so
+            // the app already records the version it is upgrading *to*.
             let _ = writeln!(
                 out,
                 "This app already records `autumn-web {}`. If you bumped the dependency\n\
@@ -279,10 +278,8 @@ fn render_migrations(out: &mut String, report: &Report) {
 fn render_diffs(out: &mut String, report: &Report) {
     use std::fmt::Write as _;
     if report.files.is_empty() {
-        // Nothing to *rewrite*. Say which kind of nothing it is: a site only a
-        // human can take is not the same answer as a clean tree, and telling
-        // someone to re-run with `--apply` when `--apply` would write nothing
-        // is the worst of the three.
+        // Distinguish "only manual sites remain" from a clean tree; neither should
+        // suggest `--apply`, which would write nothing.
         let human_sites = report
             .manual
             .iter()
@@ -366,10 +363,8 @@ fn render_summary(out: &mut String, report: &Report) {
     let files = report.files.len();
 
     match report.outcome {
-        // Whole-plan totals would claim every site landed. Only the files
-        // before the failure did, so the two halves are counted separately —
-        // saying "N sites rewritten" and "3 files written" in the same summary
-        // is worse than either number alone.
+        // Only the files before the failure landed, so written and unwritten
+        // sites are counted separately.
         Outcome::Partial { written } => {
             let written_sites = report.written_sites();
             let _ = writeln!(
@@ -511,9 +506,8 @@ pub fn json_value(report: &Report) -> serde_json::Value {
             Outcome::Preview => 0,
         },
         "files_scanned": report.files_scanned,
-        // The plan, and the part of it that reached disk. Equal for a complete
-        // apply; the second is what to gate on when the question is what the
-        // working tree now contains.
+        // The plan, and the part that reached disk. Gate on `written_sites` to
+        // know what the working tree contains.
         "rewritten_sites": report.rewritten_sites(),
         "written_sites": report.written_sites(),
         "migrations": migrations_json(&report.migrations),
@@ -541,30 +535,17 @@ pub fn json_value(report: &Report) -> serde_json::Value {
 /// do in that member (the rename it applies has already been applied), while
 /// taking the newest floor would skip a member that is genuinely behind.
 fn recorded_version(root: &Path) -> Option<String> {
-    // The root and the members are read *together*. Returning early on the
-    // root would let a workspace whose root records 0.6.0 hide a member that
-    // still pins 0.5.0 — the walk then migrates that member's source with no
-    // 0.5.0 -> 0.6.0 migration selected.
     use crate::doctor::AutumnWebDependency;
 
-    // `{ workspace = true }` resolves against the enclosing workspace, and Cargo
-    // finds that manifest by walking *up from the crate that inherits*. Not
-    // doing so aborted a member with "cannot tell which version" over a version
-    // Cargo resolves fine.
+    // Cargo resolves `{ workspace = true }` by walking up from the inheriting
+    // crate, not from the scan root: a workspace nested inside the scanned tree
+    // declares its entries between its members and the root.
     //
-    // Up from the crate, not up from the scan root: a whole workspace can sit
-    // inside the scanned tree, and then the entry its members inherit lives
-    // between them and the root. Searching the root's ancestors misses it, and
-    // an unresolved literal `autumn-web` reads as a declaration with no version
-    // — which fails detection for the entire run, not just that member.
-    //
-    // By the member's own key, not by the crate name: `autumn = { workspace =
-    // true }` paired with a renamed workspace entry is the shape where nothing
-    // on the member side mentions `autumn-web` at all.
+    // Looked up by the member's own key, not the crate name: with a renamed
+    // entry (`autumn = { workspace = true }`) the member never names `autumn-web`.
     fn inherited(from: &Path, key: &str) -> Option<AutumnWebDependency> {
-        // Canonicalised first: the scan root is usually the relative `.`, and
-        // `Path::new(".").ancestors()` yields only `.` — the walk upward would
-        // never leave the directory it started in.
+        // Canonicalised first: `Path::new(".").ancestors()` yields only `.`, so a relative
+        // scan root would never walk upward.
         let absolute = std::fs::canonicalize(from).unwrap_or_else(|_| from.to_path_buf());
         absolute
             .ancestors()
@@ -573,21 +554,15 @@ fn recorded_version(root: &Path) -> Option<String> {
 
     let mut lowest: Option<(Version, String)> = None;
     for directory in std::iter::once(root.to_path_buf()).chain(member_manifests(root)) {
-        // *Every* declaration in the manifest, not the first: a target-specific
-        // requirement can be older than the package-wide one, and the source
-        // scan rewrites that target's `#[cfg]` code either way.
+        // Every declaration, not the first: a target-specific requirement can be
+        // older than the package-wide one, and its `#[cfg]` code is rewritten too.
         for declaration in crate::doctor::autumn_web_declarations_at(&directory) {
             let declaration = match declaration {
-                // Substitute the workspace entry the member inherits.
-                //
-                // Unresolved splits two ways. A literal `autumn-web =
-                // { workspace = true }` that resolves nowhere is a manifest
-                // that would not build, so asking for `--from` is the honest
-                // answer. Any other key that resolves nowhere is simply some
-                // other crate's inherited dependency — every `{ workspace =
-                // true }` entry is collected because the member side cannot
-                // tell them apart, and this is where the ones that are not
-                // autumn-web drop out.
+                // Substitute the inherited workspace entry. An unresolved literal
+                // `autumn-web` is a manifest that would not build, so ask for
+                // `--from`. Any other unresolved key is some other crate's
+                // inherited dependency: the member side collects every
+                // `{ workspace = true }` entry because it cannot tell them apart.
                 AutumnWebDependency::Inherited(key) => match inherited(&directory, &key) {
                     Some(resolved) => resolved,
                     None if key == "autumn-web" => AutumnWebDependency::WithoutVersion,
@@ -597,24 +572,17 @@ fn recorded_version(root: &Path) -> Option<String> {
             };
             let requirement = match declaration {
                 AutumnWebDependency::Absent | AutumnWebDependency::Inherited(_) => continue,
-                // Two ways to know a crate's version is unknown rather than
-                // absent: a path or git dependency, which says this crate is on
-                // *some* version without saying which; and a manifest that
-                // exists but cannot be read or parsed, which says nothing at
-                // all. Letting a sibling decide the floor in either case would
-                // migrate this crate's source against a version nobody checked
-                // — and a vendored checkout is exactly the population the 0.6.0
-                // rename affects.
+                // A path/git dependency or an unreadable manifest means the version
+                // is unknown, not absent. Letting a sibling decide the floor would
+                // migrate this crate against a version nobody checked.
                 AutumnWebDependency::WithoutVersion | AutumnWebDependency::Unreadable => {
                     return None;
                 }
                 AutumnWebDependency::Version(requirement) => requirement,
             };
-            // A requirement carrying no usable floor makes the whole answer a
-            // guess. Dropping it and taking another declaration's version would
-            // silently skip that crate — exactly what refusing an
-            // upper-bound-only requirement was meant to prevent. Fail detection
-            // and let the caller ask for `--from`.
+            // A requirement with no usable floor (e.g. upper-bound only) fails
+            // detection. Taking another declaration's version would silently skip
+            // this crate's migrations.
             let version = migrations::parse_version_req(&requirement)?;
             if lowest.as_ref().is_none_or(|(lowest, _)| version < *lowest) {
                 lowest = Some((version, requirement));
@@ -664,10 +632,8 @@ fn collect_manifests(
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    // Exactly the exclusions the source walk uses, for exactly its reason: the
-    // floor has to be taken over the same crates the rewrite covers. A blanket
-    // dot-directory skip here let a hidden crate's sources be scanned and
-    // rewritten while its `Cargo.toml` had no vote on which migrations ran.
+    // The same exclusions as the source walk (only the listed dot-directories, not all of
+    // them): the floor must be taken over exactly the crates the rewrite covers.
     let at_crate_root = dir.join("Cargo.toml").is_file();
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
@@ -734,13 +700,10 @@ fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
     let absolute_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 
     // Cargo's hierarchy is the invocation directory upward, then Cargo home.
-    // The two settings read here merge differently and must not be pooled:
-    // `build.target-dir` is a scalar, so the *nearest* declaration wins and the
-    // rest are overridden — unioning them pruned directories that are really
-    // app source. The `[source.*]` tables merge into one table across every
-    // level, so `replace-with` in one file can name a source another defines;
-    // resolving each file alone found neither half. `cargo metadata` (below)
-    // does not report `[source.*]`, so this half stays hand-rolled either way.
+    // The two settings merge differently: `build.target-dir` is a scalar, so the
+    // nearest declaration wins; `[source.*]` tables merge across every level, so
+    // `replace-with` in one file can name a source another defines. `cargo
+    // metadata` does not report `[source.*]`, so that half stays hand-rolled.
     let mut levels: Vec<(PathBuf, PathBuf)> = absolute_root
         .ancestors()
         .map(|ancestor| (ancestor.join(".cargo"), ancestor.to_path_buf()))
@@ -759,11 +722,8 @@ fn configured_target_dirs(root: &Path) -> BTreeSet<PathBuf> {
         merge_sources(&mut sources, declared);
     }
 
-    // Cargo's own answer for the root, in preference to the hand-rolled walk
-    // above (issue #2234): `cargo metadata` resolves the same env vars and
-    // config hierarchy the way Cargo actually does, without the divergences
-    // the hand-rolled walk kept reintroducing. Fall back to the walk when the
-    // subprocess is unavailable or fails.
+    // Prefer Cargo's own answer for the root (issue #2234); fall back to the
+    // walk when the subprocess is unavailable or fails.
     let root_target_dir = cargo_metadata_target_dir(&absolute_root)
         .or(forced_target_dir)
         .or(nearest_target);
@@ -790,11 +750,8 @@ fn cargo_metadata_target_dir(root: &Path) -> Option<PathBuf> {
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .arg("--manifest-path")
         .arg(root.join("Cargo.toml"))
-        // Cargo's `.cargo/config.toml` hierarchy is discovered from the
-        // invoking process's *working directory*, not from `--manifest-path`
-        // — without this, a `path` argument that differs from this process's
-        // own cwd (`autumn upgrade ../other-app`) reads the wrong project's
-        // config, or misses `root`'s own.
+        // Cargo discovers `.cargo/config.toml` from the working directory, not
+        // `--manifest-path`, so `autumn upgrade ../other-app` needs this.
         .current_dir(root)
         .output()
         .ok()?;
@@ -848,10 +805,8 @@ fn is_consulted_source(name: &str) -> bool {
 /// followed to its end.
 fn active_vendor_dirs(sources: &Sources) -> Vec<PathBuf> {
     let mut active: BTreeSet<&str> = BTreeSet::new();
-    // Reachability starts at the sources Cargo actually consults, not at every
-    // declared edge: `[source.unused] replace-with = "vendored"` that nothing
-    // references activates nothing, and treating it as active excluded whatever
-    // `vendored` pointed at — the app's own `src/`, in the reported case.
+    // Start from the sources Cargo actually consults: an unreferenced
+    // `[source.unused] replace-with = "vendored"` activates nothing.
     let mut pending: Vec<&str> = sources
         .iter()
         .filter(|(name, _)| is_consulted_source(name))
@@ -1036,17 +991,13 @@ fn collect_sources(dir: &Path, target_dirs: &BTreeSet<PathBuf>, scan: &mut Sourc
         scan.unreadable.push(dir.to_path_buf());
         return;
     };
-    // `target/`, `vendor/` and friends name build output or third-party code
-    // only where a crate begins. Matching the basename at *any* depth silently
-    // dropped ordinary modules like `src/vendor/mod.rs` — the app then fails to
-    // compile after the bump with nothing in the report to explain why.
+    // `target/`, `vendor/` and friends are skipped only at a crate root; deeper
+    // down, `src/vendor/mod.rs` is an ordinary module.
     let at_crate_root = dir.join("Cargo.toml").is_file();
 
     for entry in entries.flatten() {
-        // `file_type` does not follow symlinks, so a link into `target/`, a
-        // link out of the project, or a cycle is neither descended into nor
-        // rewritten. Links are still *reported*: quietly leaving source out of
-        // the migration is the failure mode this command exists to remove.
+        // `file_type` does not follow symlinks, so links (into `target/`, out of
+        // the project, or in a cycle) are never followed, but they are reported.
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
@@ -1061,10 +1012,8 @@ fn collect_sources(dir: &Path, target_dirs: &BTreeSet<PathBuf>, scan: &mut Sourc
             }
             collect_sources(&path, target_dirs, scan);
         } else if file_type.is_symlink() {
-            // A symlinked *directory* has `is_dir() == false`, so gating this
-            // on a `.rs` extension hid a linked `src/` entirely: no traversal,
-            // no report, and a run that says "nothing to change" about an app
-            // it never looked at.
+            // A symlinked directory has `is_dir() == false`; report it too, or a
+            // linked `src/` would vanish from the report.
             let links_to_directory =
                 std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir());
             if links_to_directory || path.extension().is_some_and(|ext| ext == "rs") {
@@ -1190,8 +1139,7 @@ fn plan_with(
         skipped: Vec::new(),
     };
 
-    // A change with no machine-applyable rewrite is still the user's problem;
-    // surface it with its guide section rather than staying silent.
+    // A guide-only change is still listed, with its guide section.
     for migration in selected {
         if matches!(migration.rewrite, migrations::Rewrite::GuideOnly) {
             report.manual.push(ManualEntry {
@@ -1204,9 +1152,8 @@ fn plan_with(
         }
     }
 
-    // Every reported site names a migration from this same selection, so the
-    // lookup only fails if the two ever drift; the index page is the honest
-    // fallback rather than a guessed confidence level.
+    // Every site names a migration from this selection; the index page is the
+    // fallback if the two ever drift.
     let selected_by_id = |id: &str| {
         selected
             .iter()
@@ -1340,11 +1287,8 @@ fn write_one(file: &FileReport) -> std::io::Result<()> {
     if let Ok(metadata) = std::fs::metadata(&file.absolute) {
         let _ = temp.as_file().set_permissions(metadata.permissions());
     }
-    // Planning reads every file before anything is written, so a formatter, a
-    // generator, or the user's editor can change one inside that window. The
-    // rewrite was computed from a snapshot; writing it now would silently
-    // revert whatever landed since. Re-read and compare first, and skip the
-    // file rather than take the newer content away.
+    // A formatter or editor may have changed the file since planning. Writing
+    // the stale rewrite would revert that, so refuse instead.
     match std::fs::read_to_string(&file.absolute) {
         Ok(current) if current == file.original => {}
         Ok(_) => {
@@ -1366,9 +1310,8 @@ mod write_guard_tests {
 
     #[test]
     fn a_file_changed_after_planning_is_not_overwritten() {
-        // Planning reads every file before anything is written. A formatter or
-        // an editor saving inside that window would otherwise have its work
-        // silently replaced by the rewrite of a stale snapshot.
+        // An edit between planning and writing must not be replaced by the
+        // rewrite of a stale snapshot.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("main.rs");
         std::fs::write(&path, "fn main() {}\n").expect("write");
@@ -1494,9 +1437,7 @@ fn accept_scaffold(root: &Path, paths: &[String], json: bool) -> i32 {
     }
     match scaffold::accept(root, paths) {
         Ok(manifest) => {
-            // `--json` is the machine-readable mode for the whole command, so
-            // this branch cannot be the one that prints prose onto a stdout a
-            // caller is parsing.
+            // Under `--json`, stdout is parsed: no prose.
             if json {
                 println!(
                     "{}",
@@ -1567,9 +1508,8 @@ fn check_scaffold(root: &Path, target: &str, json: bool) -> i32 {
     }
     let report = scaffold::plan(root, target);
     if json {
-        // The same shape a normal `--json` run emits, so one `jq
-        // '.scaffold.drift'` works against both. Two shapes for one field is
-        // how a CI gate ends up reading `null` and passing.
+        // Same shape as a normal `--json` run, so `jq '.scaffold.drift'` works
+        // against both; with two shapes a CI gate can read `null` and pass.
         println!(
             "{}",
             serde_json::to_string_pretty(
@@ -1580,10 +1520,8 @@ fn check_scaffold(root: &Path, target: &str, json: bool) -> i32 {
     } else {
         print!("{}", scaffold::render_summary(&report));
     }
-    // A refusal to answer is not an all-clear, whatever the reason for it — a
-    // gate that goes green because the tool could not look is worse than no
-    // gate at all. This project's files were written by a release newer than
-    // this CLI, so reconciling them would mean downgrading them.
+    // A refusal to check is not an all-clear. Files scaffolded by a newer release
+    // would be downgraded by reconciling them.
     if let Some(newer) = &report.scaffolded_by_newer {
         eprintln!(
             "autumn upgrade: `{}` was scaffolded by autumn-cli {newer}, newer than this one \
@@ -1658,11 +1596,8 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
         return 2;
     };
 
-    // A path typo must not read as "your app is already migrated" — the same
-    // rule `autumn a11y verify` states for its scan root. Readability, not just
-    // `is_dir`: a directory the process cannot open answers "yes" to `is_dir`,
-    // and the walk would then report the root under `skipped` and exit 0 having
-    // examined no source at all.
+    // A path typo must not read as "already migrated". Check readability, not
+    // `is_dir`: an unopenable directory would exit 0 having scanned nothing.
     if std::fs::read_dir(root).is_err() {
         eprintln!(
             "autumn upgrade: `{}` is not a readable directory.",
@@ -1671,10 +1606,9 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
         return 2;
     }
 
-    // The CI gate (issue #1593). Deliberately ahead of the version resolution:
-    // scaffold drift is measured against the recorded provenance manifest, not
-    // against the `autumn-web` requirement, so a project whose manifest Cargo
-    // cannot give a single floor for can still be gated on scaffold freshness.
+    // `--accept` and `--check` (issue #1593) run before version resolution: they
+    // use the scaffold provenance manifest, not the `autumn-web` requirement, so
+    // they work on a project with no detectable version floor.
     if !opts.accept.is_empty() {
         return accept_scaffold(root, &opts.accept, opts.json);
     }
@@ -1706,11 +1640,8 @@ pub fn run_in(root: &Path, opts: &UpgradeOptions) -> i32 {
         match write_plan(&report) {
             Ok(()) => report.outcome = Outcome::Applied,
             Err(write_failure) => {
-                // Report first, fail second: a partial apply is exactly when
-                // the user most needs to see which files were in the plan and
-                // which one stopped it — and saying "nothing was written" when
-                // some files already changed would be worse than saying
-                // nothing at all.
+                // Report first, fail second: after a partial apply the user needs
+                // the plan and the file that stopped it.
                 report.outcome = Outcome::Partial {
                     written: write_failure.written,
                 };
@@ -1975,9 +1906,7 @@ mod tests {
 
     #[test]
     fn a_review_migration_rewrites_and_flags_every_site_it_touched() {
-        // The shipped registry has no `review` entry, so this path is only
-        // reachable through an injected selection — and it is an acceptance
-        // criterion, not dead code.
+        // The shipped registry has no `review` entry, so inject one.
         let root = tempfile::TempDir::new().expect("tempdir");
         std::fs::create_dir_all(root.path().join("src")).expect("src");
         std::fs::write(
@@ -2035,9 +1964,6 @@ mod tests {
 
     #[test]
     fn cargo_metadata_names_the_real_target_directory() {
-        // Issue #2234: ask Cargo instead of hand-rolling its config
-        // resolution. `cargo metadata` already applies `CARGO_TARGET_DIR`
-        // and the whole `.cargo/config.toml` hierarchy the way Cargo does.
         let root = tempfile::TempDir::new().expect("tempdir");
         std::fs::write(
             root.path().join("Cargo.toml"),
@@ -2046,9 +1972,8 @@ mod tests {
         .expect("manifest");
         std::fs::create_dir_all(root.path().join("src")).expect("src");
         std::fs::write(root.path().join("src/main.rs"), "fn main() {}\n").expect("source");
-        // `resolve_against` elsewhere in this module canonicalizes too, and
-        // that requires the directory to exist — a target directory nothing
-        // has built into yet holds nothing a source walk needs pruned anyway.
+        // `cargo_metadata_target_dir` canonicalizes, which needs the directory
+        // to exist.
         std::fs::create_dir_all(root.path().join("target")).expect("target");
 
         let expected = std::fs::canonicalize(root.path())
@@ -2059,8 +1984,7 @@ mod tests {
 
     #[test]
     fn cargo_metadata_target_dir_is_none_without_a_manifest() {
-        // No `Cargo.toml` to ask about — the caller falls back to the walk
-        // without paying for a subprocess that can only fail.
+        // No manifest: skip the subprocess, which could only fail.
         let root = tempfile::TempDir::new().expect("tempdir");
         assert_eq!(cargo_metadata_target_dir(root.path()), None);
     }
@@ -2085,9 +2009,6 @@ mod tests {
 
     #[test]
     fn a_partial_apply_never_claims_nothing_was_written() {
-        // The failure mode this guards: some files already rewritten, and the
-        // report telling the user to "re-run with --apply" as if the tree were
-        // untouched.
         // Two planned files, one of them written.
         let mut report = sample(Outcome::Preview);
         report.files.push(FileReport {
@@ -2143,8 +2064,6 @@ mod tests {
             json["applied"], false,
             "`applied` stays a strict did-everything-land flag"
         );
-        // The two site counts must not be conflated: automation gating on what
-        // landed would otherwise read the whole plan as having landed.
         assert_eq!(
             json["rewritten_sites"], 3,
             "the plan is still reported in full"
@@ -2179,8 +2098,7 @@ mod tests {
 
     #[test]
     fn json_report_omits_the_rewritten_file_bodies() {
-        // The report is a summary, not a payload: dumping every rewritten file
-        // into it would make `--json` unusable on a real app.
+        // Rewritten file bodies would make `--json` unusable on a real app.
         let out = render_json(&sample(Outcome::Preview));
         assert!(!out.contains("\"updated\""), "{out}");
     }

@@ -4,35 +4,35 @@
 
               Ir   share  function
 
-     461,973,836   29.1%  <core::hash::sip::Hasher as core::hash::Hasher>::write
-     211,681,050   13.3%  <autumn_web::metrics::Counter>::increment
-     185,015,808   11.7%  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one
-     101,776,977    6.4%  <autumn_web::metrics::Instrument>::series_for
-      78,916,427    5.0%  __memcmp_avx2_movbe
-      74,711,796    4.7%  autumn_web::metrics::instrument
-      73,400,051    4.6%  autumn_web::metrics::insert_label
-      63,750,980    4.0%  _int_free
-      50,563,473    3.2%  malloc
-      48,824,050    3.1%  autumn_web::actuator::is_valid_label_name
-      44,438,750    2.8%  <criterion::bencher::Bencher>::iter
-      36,591,005    2.3%  free
-      27,540,435    1.7%  core::ptr::drop_glue
-      25,231,030    1.6%  <autumn_web::metrics::Counter>::with_label
-      17,301,438    1.1%  <autumn_web::metrics::Series>::observe
-      16,883,115    1.1%  __memcpy_avx_unaligned_erms
-      11,796,435    0.7%  <autumn_web::metrics::Histogram>::record
-      10,623,717    0.7%  __rustc::__rdl_alloc
-      10,501,455    0.7%  <alloc::raw_vec::RawVecInner>::finish_grow
-       9,371,635    0.6%  autumn_web::metrics::counter
-       7,667,595    0.5%  <autumn_web::metrics::Timer>::record
-       6,297,291    0.4%  <alloc::raw_vec::RawVec>::grow_one
-       3,145,716    0.2%  autumn_web::metrics::limits
-       2,883,573    0.2%  <autumn_web::metrics::Instrument>::capped_key
-       1,180,413    0.1%  __rustc::__rust_alloc
-       1,180,413    0.1%  __rustc::__rust_no_alloc_shim_is_unstable_v2
-       1,180,348    0.1%  __rustc::__rdl_dealloc
-       1,180,348    0.1%  __rustc::__rust_dealloc
-         851,955    0.1%  autumn_web::metrics::timer
-         216,724    0.0%  _dl_relocate_object
+     933,494,522   30.1%  <autumn_web::metrics::Counter>::increment
+     285,737,822    9.2%  autumn_web::metrics::instrument
+     276,823,998    8.9%  <autumn_web::metrics::Series>::observe
+     206,700,071    6.7%  autumn_web::metrics::insert_label
+     176,166,709    5.7%  <criterion::bencher::Bencher>::iter
+     176,160,754    5.7%  <autumn_web::metrics::Histogram>::record
+     127,452,026    4.1%  _int_free
+     101,091,771    3.3%  malloc
+      98,839,833    3.2%  __memcmp_avx2_movbe
+      96,599,849    3.1%  <[(alloc::string::String, alloc::string::String)] as core::hash::Hash>::hash
+      93,338,568    3.0%  core::ptr::drop_glue
+      75,628,534    2.4%  <autumn_web::metrics::Instrument>::series_for
+      73,160,124    2.4%  free
+      68,158,456    2.2%  foldhash::hash_bytes_long
+      60,555,132    2.0%  <autumn_web::metrics::Counter>::with_label
+      50,331,636    1.6%  autumn_web::metrics::limits
+      34,865,138    1.1%  autumn_web::metrics::counter
+      33,725,927    1.1%  __memcpy_avx_unaligned_erms
+      25,690,355    0.8%  <std::sys::sync::once::futex::Once>::call
+      21,240,558    0.7%  __rustc::__rdl_alloc
+      20,987,215    0.7%  <alloc::raw_vec::RawVecInner>::finish_grow
+      18,087,798    0.6%  <autumn_web::metrics::Timer>::record
+      12,588,747    0.4%  <alloc::raw_vec::RawVec>::grow_one
+       9,961,547    0.3%  <std::sync::once_lock::OnceLock>::initialize
+       7,340,183    0.2%  <std::sync::once::Once>::call_once_force::{closure#0}
+       2,360,062    0.1%  __rustc::__rust_alloc
+       2,360,062    0.1%  __rustc::__rust_no_alloc_shim_is_unstable_v2
+       2,359,997    0.1%  __rustc::__rdl_dealloc
+       2,359,997    0.1%  __rustc::__rust_dealloc
+       1,834,994    0.1%  autumn_web::metrics::timer
 
-   1,587,479,810  100.0%  TOTAL
+   3,097,063,412  100.0%  TOTAL

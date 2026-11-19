@@ -270,7 +270,7 @@ pub struct FocSoftRecord {
     pub slug: String,
     pub name: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(FocSoftRecord, table = "test_foc_soft_records", soft_delete)]

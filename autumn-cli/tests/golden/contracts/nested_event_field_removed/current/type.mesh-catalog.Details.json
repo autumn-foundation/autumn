@@ -1,0 +1,21 @@
+{
+  "krate": "mesh-catalog",
+  "name": "Details",
+  "serialized": [
+    {
+      "rust_name": "size",
+      "wire_name": "size",
+      "ty": "u32",
+      "required": true
+    }
+  ],
+  "deserialized": [
+    {
+      "rust_name": "size",
+      "wire_name": "size",
+      "ty": "u32",
+      "required": true
+    }
+  ],
+  "closed": false
+}

@@ -517,12 +517,8 @@ impl CollabText {
     pub fn novel_count<'a>(&self, ops: impl IntoIterator<Item = &'a CollabOp>) -> usize {
         let ops: Vec<&CollabOp> = ops.into_iter().collect();
 
-        // Pass one: the characters this batch brings that will actually take
-        // their place. Naming an id is not enough — an insert whose own anchor
-        // is unknown stays in the buffer, and so does any delete waiting on
-        // it, so treating it as satisfied charged two slots as one. It is a
-        // fixed point because the batch can carry a chain: each insert that
-        // lands may be the anchor the next one was waiting for.
+        // Pass one: the inserts in this batch that will integrate. Iterated to a fixed point
+        // because each insert that lands may be the anchor the next one waits for.
         let mut integrable: HashSet<&OpId> = HashSet::new();
         loop {
             let mut grew = false;
@@ -561,16 +557,10 @@ impl CollabText {
             .filter(|op| !self.buffered.contains(**op))
             .collect();
 
-        // Credit what the batch frees. A buffered delete occupies a slot only
-        // until its target arrives: applying the insert tombstones it and the
-        // delete leaves the buffer, so the pair costs one element, not two.
-        // Charging both made a delete for an unknown id able to lock its own
-        // insert out of a full document — permanently, since the delete can
-        // never drain without it.
-        //
-        // Only deletes are credited. A buffered *insert* that integrates
-        // moves from the buffer to the elements and occupies a slot either
-        // way, so it frees nothing.
+        // Credit buffered deletes whose target this batch lands: the delete leaves the buffer,
+        // so the pair costs one slot. Without the credit, a buffered delete could lock its own
+        // insert out of a full document for good. A buffered insert that integrates still
+        // occupies a slot, so it frees nothing.
         let freed = self
             .pending
             .iter()
@@ -703,33 +693,22 @@ impl CollabText {
         let mut left = after.cloned();
         let mut chars = text.chars().peekable();
         while let Some(ch) = chars.next() {
-            // Stop below the reserved ceiling, not at it. `apply` refuses a
-            // counter of `MAX_COUNTER` or more, so minting one would return
-            // an operation this very replica rejects — and the hub would
-            // broadcast a character the authority does not hold.
-            //
-            // Unreachable after the preflight above, which is the point: this
-            // loop used to `break` here and hand back a *prefix* of the
-            // requested insert, silently. The editor kept a provisional
-            // character the authority never took and went read-only for good,
-            // because its next edit anchored to one the hub had refused.
+            // `apply` refuses a counter of `MAX_COUNTER` or more. Callers' preconditions make
+            // this unreachable; it guards against minting an op this replica would reject.
             let next = self.clock.saturating_add(1);
             if next >= MAX_COUNTER {
                 break;
             }
             self.clock = next;
             let id = OpId::new(self.clock, actor);
-            // The next character anchors on this one and needs its own copy
-            // of the id, if there is a next character. The last one (for a
-            // keystroke, the only one) moves its id into the operation.
+            // Clone the id only when a next character needs it as its anchor.
             let anchor = chars.peek().is_some().then(|| id.clone());
             let op = CollabOp::Insert {
                 id,
                 after: left,
                 ch,
             };
-            // Borrowed: `ops` keeps the operation, so an owned copy for
-            // `apply` was dropped as soon as it integrated.
+            // Borrowed: `ops` keeps the operation.
             self.apply_ref(&op);
             ops.push(op);
             left = anchor;
@@ -859,10 +838,8 @@ impl CollabText {
         }
 
         let added: String = new[prefix..new.len() - suffix].iter().collect();
-        // Before the remove below, not after it. The remove tombstones the
-        // replaced span, so refusing between the two would delete the old
-        // text and put back only as much of the new as the counter space
-        // happened to seat.
+        // Before the remove: refusing after it would delete the old text without inserting
+        // the new.
         Self::preflight_insert(actor, self.clock, added.chars().count())?;
 
         let mut ops = self.remove(prefix, old.len() - prefix - suffix);
@@ -908,22 +885,13 @@ impl CollabText {
     /// `Some(true)` integrated, `Some(false)` refused, `None` waiting for
     /// its cause, for the caller to buffer.
     fn try_integrate(&mut self, op: &CollabOp) -> Option<bool> {
-        // Refuse an id at or past the ceiling before the clock can adopt it.
-        // Drop it rather than buffer it: it can never become valid, and a
-        // buffered copy would just sit in the document forever.
-        //
-        // At or past, not past: a peer id of exactly `MAX_COUNTER` would pin
-        // the clock to the ceiling, and every later local keystroke would
-        // then mint nothing at all — silently, for good. Reserving the last
-        // counter for this replica keeps minting possible after any
-        // operation a peer can send.
+        // Drop, not buffer, an id at or past the ceiling before the clock adopts it: it can
+        // never become valid. `MAX_COUNTER` itself is refused so a peer cannot pin the clock
+        // there and stop this replica from minting.
         if op.minted_counter() >= MAX_COUNTER {
             return Some(false);
         }
-        // Drop for the same reason as the ceiling above: an id no replica
-        // could hold can never become valid, so buffering it would only park
-        // an unusable operation in memory — and a reference to an unmintable
-        // id would wait there for a cause that cannot arrive.
+        // Same as the ceiling: an id no replica could hold can never become valid.
         if !op.well_formed() {
             tracing::warn!(
                 "collab: refused an operation carrying an id no replica can hold \
@@ -931,21 +899,10 @@ impl CollabText {
             );
             return Some(false);
         }
-        // An id names one character typed in one place. The same id carrying
-        // different text or a different anchor means a replica minted it
-        // twice, and taking the second copy would make this document's text
-        // depend on which order the two arrived in — so two replicas holding
-        // the *same* operations would render differently, which is the one
-        // thing this type promises cannot happen.
-        //
-        // `integrate` already held the line for an id that is integrated. The
-        // buffer needs it too, and more sharply: it dedups whole operations,
-        // so both variants could sit in `pending` at once, each waiting to
-        // integrate and each spreading to every other replica on the next
-        // snapshot.
-        //
-        // The `index` probe is made once here and handed on to `integrate`,
-        // which would otherwise repeat it for the same id.
+        // The same id with a different character or anchor means it was minted twice. Taking
+        // the second copy would make the text depend on arrival order. Check the buffer as
+        // well as the index: the buffer dedups whole operations, so both variants could sit
+        // in `pending`. The index probe is passed on so `integrate` need not repeat it.
         let indexed = op.insert_id().map(|id| self.index.contains(id));
         if let CollabOp::Insert { id, after, ch } = op
             && let Some((held_after, held_ch)) = self.held_variant(id, indexed == Some(true))
@@ -1015,18 +972,9 @@ impl CollabText {
         match op {
             CollabOp::Insert { id, after, ch } => {
                 if indexed.unwrap_or_else(|| self.index.contains(id)) {
-                    // A genuine idempotent replay: `apply` has already turned
-                    // back anything reusing this id for a different character,
-                    // so reaching here means the same operation twice.
-                    //
-                    // Still first-wins rather than convergent: two replicas
-                    // that each saw a *different* variant first keep different
-                    // text. Repairing that means repositioning the element,
-                    // and its position comes from an anchor the conflicting
-                    // copy disagrees about, so nothing short of replaying the
-                    // whole document converges. `Deserialize` refuses such a
-                    // document at the door instead, which is where a crafted
-                    // one arrives.
+                    // An idempotent replay: `apply` already refused a reused id with a
+                    // different character. Two replicas that each saw a different variant first
+                    // would keep different text; `Deserialize` refuses such documents instead.
                     return true;
                 }
                 let Some(start) = self.slot_after(after.as_ref()) else {
@@ -1183,9 +1131,8 @@ impl fmt::Display for CollabText {
 /// hid the buffer would make a stuck merge invisible in test output.
 impl fmt::Debug for CollabText {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `finish_non_exhaustive`: the derived state (`index`, `buffered`,
-        // `clock`) restates what these three already show, and printing it
-        // would bury the text this exists to surface.
+        // The derived state (`index`, `buffered`, `clock`) is omitted: it restates these fields
+        // and would bury the text.
         f.debug_struct("CollabText")
             .field("text", &self.text())
             .field("elements", &self.elems.len())
@@ -1291,10 +1238,8 @@ pub const MAX_WIRE_PENDING: usize = 1_000;
 impl<'de> Deserialize<'de> for CollabText {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = Wire::deserialize(deserializer)?;
-        // Refuse before replaying, not after: the replay is the cost. This is
-        // the untrusted door — a request body, a sync payload — so the
-        // bounds apply here rather than in `from_wire`, which also serves
-        // `decode_column` reading a column this crate wrote.
+        // Check bounds before replaying: the replay is the expensive part. They apply here, at
+        // the untrusted door, not in `from_wire`, which also reads columns this crate wrote.
         if wire.elems.len() > MAX_WIRE_ELEMENTS {
             return Err(serde::de::Error::custom(format!(
                 "collaborative document carries {} elements, over the limit of {MAX_WIRE_ELEMENTS}",
@@ -1307,17 +1252,8 @@ impl<'de> Deserialize<'de> for CollabText {
                 wire.pending.len(),
             )));
         }
-        // An id at or past the ceiling is one `apply` drops on the floor. The
-        // replay ignores that, so the document would deserialize "fine" minus
-        // those characters — the server quietly deleting text from a document
-        // it accepted. Refuse the whole thing instead.
-        //
-        // The anchor counts as much as the id. An element anchored past the
-        // ceiling names a character no replica can mint, so `apply` refuses
-        // the whole insert and the element goes missing just the same — which
-        // is the silent deletion this refusal exists to prevent. Round fifteen
-        // closed this for buffered operations and left the elements checking
-        // only their own id.
+        // `apply` drops an id or anchor at or past the ceiling, and the replay ignores that,
+        // so the document would deserialize minus those characters. Refuse it whole.
         if let Some(id) = wire
             .elems
             .iter()
@@ -1330,12 +1266,8 @@ impl<'de> Deserialize<'de> for CollabText {
                 id.counter,
             )));
         }
-        // One id, two different characters. An id names one character typed
-        // in one place; reuse makes the document's own text depend on the
-        // order it is read in, and makes a merge with it depend on which side
-        // went first. In memory the replay can only keep the first and say so,
-        // because the element's position comes from an anchor the other copy
-        // disagrees about — so this door is where such a document is stopped.
+        // One id, two different characters: the text would depend on read and merge order. In
+        // memory the replay can only keep the first, so refuse such a document here.
         let mut seen: HashMap<&OpId, (&Option<OpId>, char)> =
             HashMap::with_capacity(wire.elems.len());
         for elem in &wire.elems {
@@ -1348,14 +1280,9 @@ impl<'de> Deserialize<'de> for CollabText {
                 )));
             }
         }
-        // The buffered half, which the element scan above cannot see. Two
-        // conflicting inserts can both sit in `pending` — the buffer dedups
-        // whole operations, not ids — and then a replica that receives one
-        // cause first integrates one variant while a replica that receives the
-        // other cause first integrates the other. Both replicas end up holding
-        // the same operations and rendering different text, which is the
-        // guarantee this type exists to make. Refused at the door, in the same
-        // pass and for the same reason as the integrated case.
+        // The same check for `pending`, which dedups whole operations, not ids: two
+        // conflicting inserts there would integrate in whichever order their causes arrive,
+        // and replicas holding the same operations would render different text.
         for op in &wire.pending {
             let (Some(id), Some((after, ch))) = (op.insert_id(), op.variant()) else {
                 continue;
@@ -1368,11 +1295,9 @@ impl<'de> Deserialize<'de> for CollabText {
                 )));
             }
         }
-        // Every id the operation carries, not just the one it mints: an
-        // insert anchored past the ceiling, or a delete naming a target
-        // there, can never be satisfied — `apply` refuses to mint such an id —
-        // so it would sit in the buffer for good, holding room the bound
-        // above is meant to ration.
+        // Every id the operation carries, not just the one it mints: an anchor or delete
+        // target past the ceiling can never be satisfied, so it would sit in the buffer for
+        // good.
         if let Some(id) = wire
             .pending
             .iter()
@@ -1384,15 +1309,9 @@ impl<'de> Deserialize<'de> for CollabText {
                 id.counter,
             )));
         }
-        // Replay under a cap. The order is not the problem — a scrambled
-        // store replaying back to canonical is a guarantee this type makes —
-        // but the buffer it passes through is. Ten thousand elements in
-        // reverse causal order all land in the causal buffer, ten times what
-        // `MAX_WIRE_PENDING` allows a document to be read with, and the drain
-        // rescans that buffer every time one integrates. Bounding the buffer
-        // during the replay bounds both the memory and that quadratic cost,
-        // and it refuses exactly the documents that could not be read back
-        // afterwards anyway.
+        // Replay with the buffer capped. Ten thousand elements in reverse causal order all
+        // land in the buffer, and the drain rescans it on every integration, so an uncapped
+        // replay is quadratic. The cap refuses only documents that could not be read anyway.
         Self::replay_bounded(wire, MAX_WIRE_PENDING).map_err(|held| {
             serde::de::Error::custom(format!(
                 "collaborative document needs {held} buffered operations to replay, \
@@ -1437,14 +1356,10 @@ impl CollabText {
     }
 
     fn replay(wire: Wire, max_pending: Option<usize>) -> Self {
-        // `apply` drops an id at or past the ceiling and says so only in a
-        // return value this replay ignores, so a document carrying one comes
-        // back short of those characters. `Deserialize` refuses such a
-        // document outright, but `decode_column` reads a column rather than a
-        // request and has no such door to close: refusing would strand the
-        // row, and reading it as prose would be worse. So it is read, and the
-        // loss is said out loud — silence here would let the next
-        // `encode_column` write the truncated version back as canonical.
+        // `apply` drops an id at or past the ceiling, so such a document comes back short.
+        // `Deserialize` refuses it, but `decode_column` cannot refuse a stored row without
+        // stranding it, so it reads the row and logs the loss. Silently, the next `encode_column`
+        // would write the truncated text back as canonical.
         let unusable = wire
             .elems
             .iter()
@@ -1464,9 +1379,8 @@ impl CollabText {
             );
         }
         let mut doc = Self::new();
-        // Stop early when a cap is set: a replay that has already blown the
-        // buffer is refused whatever the rest of the array holds, and every
-        // further element makes the drain scan more.
+        // Stop early once over the cap: the replay is refused anyway, and each further element
+        // makes the drain scan more.
         let over = |doc: &Self| max_pending.is_some_and(|max| doc.pending.len() > max);
         for elem in &wire.elems {
             if over(&doc) {

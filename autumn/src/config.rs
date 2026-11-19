@@ -272,6 +272,17 @@ use thiserror::Error;
 
 mod value_de;
 
+/// Deserialize `T` from a parsed TOML table, with the config deserializer.
+///
+/// An error names the key path, for example ``in `server.port` ``. Use this
+/// and not a typed `from_str` of the toml crate: that call compiles a second
+/// reader for `T`.
+pub(crate) fn from_table<T: serde::de::DeserializeOwned>(
+    table: toml::Table,
+) -> Result<T, toml::de::Error> {
+    value_de::from_value(toml::Value::Table(table))
+}
+
 /// Abstraction for reading environment variables, supporting dependency injection for testing.
 use std::sync::OnceLock;
 
@@ -419,7 +430,6 @@ pub(crate) fn resolve_profile(env: &dyn Env) -> String {
 /// `PROFILE_SELECTOR_KEYS`) so a `.env` file cannot switch the active profile.
 /// Keep the two lists in sync.
 fn resolve_profile_input(env: &dyn Env) -> String {
-    // 1. Preferred env var
     if let Ok(profile) = env.var("AUTUMN_ENV") {
         let trimmed = profile.trim();
         if !trimmed.is_empty() {
@@ -427,7 +437,6 @@ fn resolve_profile_input(env: &dyn Env) -> String {
         }
     }
 
-    // 2. Legacy env var
     if let Ok(profile) = env.var("AUTUMN_PROFILE") {
         let trimmed = profile.trim();
         if !trimmed.is_empty() {
@@ -435,7 +444,6 @@ fn resolve_profile_input(env: &dyn Env) -> String {
         }
     }
 
-    // 3. CLI flag
     let args: Vec<String> = std::env::args().collect();
     for (i, arg) in args.iter().enumerate() {
         if arg == "--profile"
@@ -454,7 +462,6 @@ fn resolve_profile_input(env: &dyn Env) -> String {
         }
     }
 
-    // 4. Auto-detect from build mode
     if env.var("AUTUMN_IS_DEBUG").ok().as_deref() == Some("0") {
         return "prod".to_owned();
     }
@@ -1327,12 +1334,9 @@ impl ReplicationConfig {
         if self.rpo_secs == 0 {
             errors.push("[replication] rpo_secs must be at least 1".to_owned());
         }
-        // An explicit override longer than the RPO quietly invalidates the
-        // objective it sits next to: `rpo_secs = 10` with
-        // `sync_interval_secs = 60` ships once a minute and can lose nearly a
-        // minute of committed writes, while every surface — the docs, the health
-        // detail, the restore report — still promises ten seconds. Refuse the
-        // pair rather than letting the stricter-looking number be the wrong one.
+        // An interval longer than the RPO breaks the objective: `rpo_secs = 10` with
+        // `sync_interval_secs = 60` can lose a minute of writes while the docs, health detail and
+        // restore report still promise ten seconds.
         if let Some(interval) = self.sync_interval_secs
             && self.rpo_secs > 0
             && interval > self.rpo_secs
@@ -1482,7 +1486,6 @@ pub struct AutumnConfig {
     /// unknown-key validation never descends into its children. The regression
     /// guard `failure_capture_child_keys_are_strictly_validated` fails if this
     /// ordering breaks.
-    #[cfg(feature = "reporting")]
     #[serde(default)]
     pub failure_capture: FailureCaptureConfig,
 
@@ -1494,8 +1497,8 @@ pub struct AutumnConfig {
     /// # Field ordering (load-bearing — do not move below `database`)
     ///
     /// Declared here, before [`database`](Self::database), for the same reason
-    /// [`deploy`](Self::deploy) and `failure_capture` (a field only present
-    /// with the `reporting` feature, hence not linked) are: `DatabaseConfig`'s
+    /// [`deploy`](Self::deploy) and [`failure_capture`](Self::failure_capture)
+    /// are: `DatabaseConfig`'s
     /// `deserialize_with` duration field aborts the
     /// `SchemaDeserializer` traversal, so a section declared after it is
     /// recorded only as an opaque root leaf and strict unknown-key validation
@@ -1750,9 +1753,9 @@ pub struct AutumnConfig {
     /// Error-reporting settings (`[reporting]` section in `autumn.toml`).
     ///
     /// Controls delivery of panic + 5xx [`ErrorEvent`](crate::reporting::ErrorEvent)s
-    /// to registered reporters. Honored only when the `reporting` cargo
+    /// to registered reporters. Honored only when the `error-reporting` cargo
     /// feature is enabled.
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[serde(default)]
     pub reporting: ReportingConfig,
 
@@ -1984,6 +1987,12 @@ impl Default for DeployBakeConfig {
 pub struct DeployConfig {
     /// SSH-reachable address (hostname or IP) of the target server.
     ///
+    /// Use an IPv6 address without brackets (a zone such as `%eth0` is
+    /// permitted), or a host name or IPv4 address. A name uses only ASCII
+    /// letters, digits, `.`, `_` and `-`, and starts with a letter or digit.
+    /// `autumn deploy` refuses other values. This rule also applies to
+    /// [`hosts`](Self::hosts) and group hosts.
+    ///
     /// Required when a deploy actually runs (`autumn deploy`), but `None` is
     /// valid at rest so a bare `[deploy]` table parses. Enforced by
     /// [`validate`](Self::validate).
@@ -2010,6 +2019,9 @@ pub struct DeployConfig {
     pub hosts: Vec<String>,
 
     /// SSH user to connect as. Default: `"root"`.
+    ///
+    /// Use 1 to 64 ASCII letters, digits, `_`, `.`, `-` or `@`. Start with a
+    /// letter, a digit or `_`. `autumn deploy` refuses other values.
     #[serde(default = "default_deploy_user")]
     pub user: String,
 
@@ -2020,15 +2032,25 @@ pub struct DeployConfig {
     /// Application name used to derive remote paths and the service unit.
     /// Resolved to the project's package name when unset (at deploy time, not
     /// during deserialization).
+    ///
+    /// Use 1 to 128 ASCII letters, digits, `_`, `.` or `-`. Start with a
+    /// letter, a digit or `_`. `autumn deploy` refuses other values. This check
+    /// also applies to a value from the package name or the directory name.
     #[serde(default)]
     pub app_name: Option<String>,
 
     /// Remote install directory. Resolved to `/srv/autumn/{app_name}` when
     /// unset (at deploy time).
+    ///
+    /// Use an absolute path of 1 to 1024 ASCII letters, digits, `/`, `_`, `.`,
+    /// `-`, `+`, `@` or `:`. `autumn deploy` refuses other values.
     #[serde(default)]
     pub app_dir: Option<String>,
 
     /// systemd unit name. Resolved to `{app_name}` when unset (at deploy time).
+    ///
+    /// The rules for [`app_name`](Self::app_name) apply. `autumn deploy`
+    /// refuses other values.
     #[serde(default)]
     pub service_name: Option<String>,
 
@@ -2045,6 +2067,9 @@ pub struct DeployConfig {
     /// as `AUTUMN_ENV`). Defaults to the production profile (`"prod"`) so a
     /// deploy never silently runs the `dev` profile; set to e.g. `"staging"`
     /// for non-prod targets.
+    ///
+    /// The rules for [`app_name`](Self::app_name) apply. `autumn deploy`
+    /// refuses other values.
     #[serde(default = "default_deploy_profile")]
     pub profile: String,
 
@@ -2124,8 +2149,6 @@ impl Default for DeployConfig {
     fn default() -> Self {
         Self {
             host: None,
-            // #1621: empty, so an existing single-host `[deploy]` table (and the
-            // type default) is byte-for-byte unchanged.
             hosts: Vec::new(),
             user: default_deploy_user(),
             ssh_port: default_deploy_ssh_port(),
@@ -2233,8 +2256,7 @@ impl DeployConfig {
             .map(str::trim)
             .filter(|host| !host.is_empty());
 
-        // 1. Mutual exclusion: with both spellings set the rollout order is
-        //    ambiguous, so name BOTH keys and let the operator pick one.
+        // Both set leaves the rollout order ambiguous, so name both keys and let the operator pick.
         if host.is_some() && !self.hosts.is_empty() {
             return Err(
                 "[deploy] host and [deploy] hosts are mutually exclusive: keep the \
@@ -2244,7 +2266,7 @@ impl DeployConfig {
             );
         }
 
-        // 2. A blank entry would resolve to a hostless SSH target mid-rollout.
+        // A blank entry would resolve to a hostless SSH target mid-rollout.
         for (index, entry) in self.hosts.iter().enumerate() {
             if entry.trim().is_empty() {
                 return Err(format!(
@@ -2254,10 +2276,9 @@ impl DeployConfig {
             }
         }
 
-        // 3. A duplicate would deploy the same server twice — the second pass sees
-        //    its own new release as live and corrupts the previous-release chain a
-        //    rollback depends on. Compared after trimming; DNS aliases are a
-        //    documented limitation.
+        // A duplicate deploys the same server twice: the second pass sees its own new release as
+        // live and corrupts the previous-release chain rollback needs. Compared after trimming; DNS
+        // aliases are not detected.
         let mut seen: Vec<&str> = Vec::with_capacity(self.hosts.len());
         for entry in &self.hosts {
             let trimmed = entry.trim();
@@ -2270,7 +2291,6 @@ impl DeployConfig {
             seen.push(trimmed);
         }
 
-        // 4. Neither spelling provides a target.
         if host.is_none() && self.hosts.is_empty() {
             return Err(
                 "[deploy] requires a target host: set `[deploy] host = \"<address>\"` in \
@@ -2490,7 +2510,7 @@ pub struct RobotsConfig {
 /// Note: `enabled = false` only suppresses *delivery* to reporters. Handler
 /// panics are still caught and converted to a clean 500 response regardless of
 /// this setting.
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReportingConfig {
     /// Whether error events are delivered to registered reporters.
@@ -2508,7 +2528,7 @@ pub struct ReportingConfig {
     pub sample_rate: f64,
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 impl Default for ReportingConfig {
     fn default() -> Self {
         Self {
@@ -2518,12 +2538,12 @@ impl Default for ReportingConfig {
     }
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 const fn default_reporting_enabled() -> bool {
     true
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 const fn default_reporting_sample_rate() -> f64 {
     1.0
 }
@@ -2547,7 +2567,9 @@ const fn default_reporting_sample_rate() -> f64 {
 /// through `[log] filter_parameters`, but unstructured bodies, URL paths and
 /// result rows are not. Read `docs/guide/failure-capsules.md` before enabling
 /// this outside development.
-#[cfg(feature = "reporting")]
+///
+/// The section parses in every build. `enabled = true` needs the `reporting`
+/// feature: without it, boot fails.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FailureCaptureConfig {
     /// Whether failing requests are recorded as capsules.
@@ -2583,7 +2605,6 @@ pub struct FailureCaptureConfig {
     pub max_capsules: usize,
 }
 
-#[cfg(feature = "reporting")]
 impl Default for FailureCaptureConfig {
     fn default() -> Self {
         Self {
@@ -2596,27 +2617,48 @@ impl Default for FailureCaptureConfig {
     }
 }
 
-#[cfg(feature = "reporting")]
+impl FailureCaptureConfig {
+    /// Refuse `enabled = true` in a build without the `reporting` feature.
+    ///
+    /// That build cannot write a capsule. An operator who turns capture on
+    /// expects one after a failure, so boot fails. Only boot calls this.
+    /// `validate` does not, because the CLI reads the config of an app that
+    /// it does not run.
+    pub(crate) fn check_build(&self) -> Result<(), ConfigError> {
+        Self::check_feature(self.enabled, cfg!(feature = "reporting"))
+    }
+
+    /// [`check_build`](Self::check_build) for a build with (`built`) or
+    /// without the feature.
+    pub(crate) fn check_feature(enabled: bool, built: bool) -> Result<(), ConfigError> {
+        if enabled && !built {
+            return Err(ConfigError::Validation(
+                "failure_capture.enabled is true, but this build does not have the \
+                 `reporting` feature. Turn on the feature, or set \
+                 failure_capture.enabled = false"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 const fn default_failure_capture_enabled() -> bool {
     false
 }
 
-#[cfg(feature = "reporting")]
 fn default_failure_capture_dir() -> String {
     "tmp/autumn-capsules".to_owned()
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_body_bytes() -> usize {
     65_536
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_capsule_bytes() -> usize {
     1_048_576
 }
 
-#[cfg(feature = "reporting")]
 const fn default_failure_capture_max_capsules() -> usize {
     50
 }
@@ -5106,10 +5148,7 @@ impl RetentionConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (key, window) in self.windows() {
             let Some(raw) = window else { continue };
-            // One message, not two: `parse_duration` already returns `None`
-            // for a syntactically valid but zero total ("0s"), so a separate
-            // "resolves to zero" branch would be unreachable. State what is
-            // required — valid *and* non-zero — and why zero is refused.
+            // `parse_duration` returns `None` for zero too, so this one check covers both cases.
             let Some(parsed) = crate::task::parse_duration(raw) else {
                 return Err(ConfigError::Validation(format!(
                     "retention.{key} = {raw:?} is not a valid non-zero duration: use a \
@@ -5118,12 +5157,9 @@ impl RetentionConfig {
                      to keep today's behavior (see docs/guide/data-retention.md)"
                 )));
             };
-            // The sweep binds its cutoff as `NOW() - make_interval(secs => $1)`
-            // with a `u32`-representable value. Rejecting anything larger here
-            // keeps the configured window and the window the database actually
-            // applies identical — silently clamping would delete rows the
-            // report claimed were still inside the policy. 136 years is far
-            // past any real retention policy, so this only ever catches a typo.
+            // The sweep binds the cutoff as `make_interval(secs => $1)` with a `u32`. Reject a
+            // longer window rather than clamp it, so the database applies the configured window.
+            // `u32::MAX` seconds is about 136 years, so this only catches typos.
             if parsed.as_secs() > u64::from(u32::MAX) {
                 return Err(ConfigError::Validation(format!(
                     "retention.{key} = {raw:?} is longer than the maximum supported \
@@ -5135,9 +5171,7 @@ impl RetentionConfig {
             }
         }
 
-        // Only meaningful once something is actually swept, but validated
-        // unconditionally so a typo is caught the first time it is written
-        // rather than the first time a window is added next to it.
+        // Validated even with no window set, so a typo is caught when it is written.
         if crate::task::parse_duration(&self.sweep_interval).is_none() {
             return Err(ConfigError::Validation(format!(
                 "retention.sweep_interval = {:?} is not a valid non-zero duration: use a \
@@ -6460,6 +6494,20 @@ const PUSH_ENV_KEYS: &[(&str, &str)] = &[
 pub(crate) const JWT_FEATURE_MISSING: &str = "tenancy.source = \"jwt\" but this binary was built \
      without the `jwt` feature; rebuild with `--features jwt`, or choose another tenancy source";
 
+/// The error for `tenancy.source = "header"` with no `tenancy.header_trust`.
+/// The boot reports it, and so does tenant resolution on a router built
+/// without `run`.
+pub(crate) const TENANT_HEADER_TRUST_MISSING: &str = "tenancy.source = \"header\" lets the \
+     client select its tenant. Set tenancy.header_trust to \"trusted_proxy\" or \"any_client\" \
+     (unsafe). Or use source = \"session\" or \"jwt\".";
+
+/// The error for `tenancy.header_trust = "trusted_proxy"` when no proxy range
+/// is trusted.
+pub(crate) const TENANT_HEADER_PROXY_UNTRUSTED: &str = "tenancy.header_trust = \
+     \"trusted_proxy\" needs a trusted proxy. Set \
+     security.trusted_proxies.trust_forwarded_headers = true and a valid range in \
+     security.trusted_proxies.ranges. trusted_hops does not count.";
+
 impl AutumnConfig {
     /// Resolve [`role`](Self::role) against [`roles`](Self::roles).
     ///
@@ -6541,21 +6589,51 @@ impl AutumnConfig {
     /// behind the `jwt` feature. Without it, every request would fail tenant
     /// resolution, so the boot fails instead.
     ///
+    /// `tenancy.source = "header"` lets the sender select the tenant, so it
+    /// needs `tenancy.header_trust`. `"trusted_proxy"` also needs a trusted
+    /// proxy range, or every request fails.
+    ///
     /// # Errors
     ///
-    /// [`ConfigError::Validation`] when tenancy is enabled with
-    /// `source = "jwt"` and the `jwt` feature is off.
-    #[allow(
-        clippy::unused_self,
-        clippy::missing_const_for_fn,
-        reason = "reads `self` only when the `jwt` feature is off"
-    )]
+    /// [`ConfigError::Validation`] when tenancy is enabled and:
+    /// - `source = "jwt"` and the `jwt` feature is off;
+    /// - `source = "header"` and `header_trust` is not set;
+    /// - `header_trust = "trusted_proxy"` and no proxy range is trusted.
     pub fn validate_tenancy_source(&self) -> Result<(), ConfigError> {
+        if !self.tenancy.enabled {
+            return Ok(());
+        }
         #[cfg(not(feature = "jwt"))]
-        if self.tenancy.enabled && self.tenancy.source == "jwt" {
+        if self.tenancy.source == "jwt" {
             return Err(ConfigError::Validation(JWT_FEATURE_MISSING.to_owned()));
         }
+        if self.tenancy.source == "header" {
+            match self.tenancy.header_trust {
+                None => {
+                    return Err(ConfigError::Validation(
+                        TENANT_HEADER_TRUST_MISSING.to_owned(),
+                    ));
+                }
+                Some(TenantHeaderTrust::TrustedProxy) if !self.has_tenant_header_proxy() => {
+                    return Err(ConfigError::Validation(
+                        TENANT_HEADER_PROXY_UNTRUSTED.to_owned(),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
         Ok(())
+    }
+
+    /// True when `[security.trusted_proxies]` names a proxy that can set the
+    /// tenant header: forwarding trust is on and a range is valid.
+    fn has_tenant_header_proxy(&self) -> bool {
+        let proxies = &self.security.trusted_proxies;
+        proxies.trust_forwarded_headers
+            && proxies
+                .ranges
+                .iter()
+                .any(|range| crate::security::trusted_proxies::CidrRange::parse(range).is_some())
     }
 
     /// The load-shedding ceiling the profile supplies when
@@ -6582,13 +6660,10 @@ impl AutumnConfig {
     #[must_use]
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_schema_keys() -> HashMap<String, HashSet<String>> {
-        // Adaptive multi-pass schema walk. `deserialize_any` probes with a scalar
-        // by default; any path whose visitor rejects that probe (a seq/map-only
-        // type such as `JobQueuesConfig` at `jobs.queues`) is escalated to a
-        // map- then seq-probe on the next pass, so the walk stops aborting there
-        // and enumerates every later section (#1890). Converges in two passes for
-        // the current config; the loop is bounded and monotonic (each escalated
-        // path only advances Str→Map→Seq), so it always terminates.
+        // Multi-pass walk (#1890). `deserialize_any` probes with a scalar; a path whose visitor
+        // rejects it (a seq/map-only type such as `JobQueuesConfig`) is retried with a map, then a
+        // seq probe, on the next pass, so later sections are still enumerated. Each path only
+        // advances Str→Map→Seq, so the loop terminates; two passes suffice today.
         const MAX_PASSES: usize = 8;
         let de = SchemaDeserializer::new();
         let mut prev_rejected: Vec<String> = Vec::new();
@@ -6798,32 +6873,15 @@ impl AutumnConfig {
                     }
                     path.pop();
                 } else if path.is_empty() && plugin_config_roots.contains(k) && val.is_table() {
-                    // A plugin has declared this top-level root as its own config
-                    // section, via `AppBuilder::config_section`. It is known and opaque:
-                    // accept it and do not descend, because the plugin, not core, owns
-                    // validation of its subtree. The `path.is_empty()` guard keeps this
-                    // strictly the true top-level root (`[media]`, path `[]`), so a key
-                    // that merely shares a plugin-root name while nested inside a known
-                    // section is still validated normally.
-                    //
-                    // The `val.is_table()` guard keeps the exemption table-only:
-                    // `config_section` declares a top-level config table, so a registered
-                    // root written as a scalar or array (`media = "enabled"`, `media =
-                    // ["a", "b"]`) is a malformed section that nothing would deserialize,
-                    // and the app would boot on default plugin config. A non-table value
-                    // therefore falls through to the normal unknown-root strict rejection
-                    // below and fails loudly.
-                    //
-                    // A profile-prefixed plugin root (`[profile.<env>.media]`, path
-                    // `["profile","<env>"]`) is deliberately not exempted and falls
-                    // through to that same rejection: the plugin consumes only the
-                    // top-level `[media]` table — its reader deserializes `root.media`
-                    // directly and does not apply Autumn's profile merge — so exempting a
-                    // profile layer the plugin cannot read would let a strict app with
-                    // media settings only under `[profile.<env>.media]` boot silently on
-                    // defaults. Profile-aware plugin config is a separate, larger
-                    // enhancement. Deliberately not added to `valid_keys`, which would
-                    // make the walk recurse and flag every plugin child as unknown.
+                    // A root a plugin declared via `AppBuilder::config_section` is known and
+                    // opaque: the plugin validates its subtree, so do not descend (adding it to
+                    // `valid_keys` would recurse and flag every child). Only a true top-level table
+                    // is exempt:
+                    // - a profile-prefixed `[profile.<env>.media]` falls through to the rejection
+                    //   below: the plugin reads only top-level `root.media`, without the profile
+                    //   merge, so the app would boot silently on defaults.
+                    // - a scalar or array (`media = "enabled"`) is malformed; nothing would
+                    //   deserialize it.
                 } else {
                     let mut full_path_parts = path.clone();
                     full_path_parts.push(k.clone());
@@ -6898,16 +6956,10 @@ impl AutumnConfig {
                     }
                     path.pop();
                 } else if plugin_config_roots.contains(k) && val.is_table() {
-                    // A plugin has declared this top-level root as its own config
-                    // section, via `AppBuilder::config_section`. It is known and opaque:
-                    // accept it and do not descend, because the plugin owns validation of
-                    // its subtree. Deliberately not injected into `root_keys`, which would
-                    // make the walk recurse and flag every plugin child as unknown. The
-                    // `val.is_table()` guard keeps the exemption table-only, since
-                    // `config_section` declares a top-level `[media]` table: a registered
-                    // root written as a scalar or array is malformed and falls through to
-                    // the unknown-root strict rejection below rather than being exempted
-                    // and booting on defaults.
+                    // A plugin-declared root (`AppBuilder::config_section`) is known and opaque: do
+                    // not descend, and do not add it to `root_keys`, which would flag every child.
+                    // A scalar or array value is malformed and falls through to the unknown-root
+                    // rejection below.
                 } else {
                     let mut closest: Option<&str> = None;
                     let mut min_dist = usize::MAX;
@@ -6990,26 +7042,17 @@ impl AutumnConfig {
     }
 
     fn load_policy(root_policy: UnknownRootPolicy) -> Result<Self, ConfigError> {
-        // Feed a project-root `.env` into the `AUTUMN_*` env layer before
-        // resolving config from the real environment. Rather than mutating the
-        // process environment, `.env` values are layered *under* the real
-        // environment via an overlay `Env`, so a real env var always wins. A
-        // malformed `.env` fails loudly here rather than silently skipping
-        // developer-provided values.
+        // Layer `.env` under the real environment through an overlay `Env` rather than mutating the
+        // process environment, so a real env var always wins. A malformed `.env` fails the load.
         let base = OsEnv;
         let profile = resolve_profile(&base);
-        // Resolve `.env` from the same base directory config uses for
-        // `autumn.toml` (AUTUMN_MANIFEST_DIR when set, else the process CWD),
-        // so a binary launched from outside its crate root reads the `.env`
-        // next to its config instead of the process working directory.
+        // Read `.env` from the directory `autumn.toml` is found in (AUTUMN_MANIFEST_DIR, else the
+        // CWD), so a binary launched elsewhere still finds the `.env` next to its config.
         let dir = crate::dotenv::dotenv_base_dir(&base);
         let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
             .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
         let env = crate::dotenv::DotenvEnv::new(&base, vars);
-        // The zero-arg loaders (`load` / `load_lenient_unknown_roots`) have no
-        // AppBuilder and therefore no plugin-declared config roots; plugin roots
-        // arrive only via `TomlEnvConfigLoader::with_plugin_config_roots` →
-        // `load_with_env_and_plugin_roots`. Pass an empty set here.
+        // The zero-arg loaders have no `AppBuilder`, so no plugin-declared config roots.
         Self::load_with_env_and_plugin_roots_policy(&env, &BTreeSet::new(), root_policy)
     }
 
@@ -7114,15 +7157,13 @@ impl AutumnConfig {
             normalize_profile_name(&selected_profile_input).unwrap_or_else(|| "dev".to_owned());
         let mut has_inline_profile_section = false;
 
-        // Build merged TOML:
-        // profile smart defaults ← autumn.toml ← [profile.{name}] ← autumn-{profile}.toml
+        // Precedence, lowest first: profile defaults, autumn.toml, its [profile.<name>] section,
+        // autumn-<profile>.toml (legacy). Env vars, applied after deserializing, win over all.
         let mut merged = profile_defaults_as_toml(&profile);
 
-        // Layer 3: base autumn.toml
         if let Some(base) = load_raw_toml(&find_config_file_named("autumn.toml", env))? {
             deep_merge(&mut merged, base.clone());
 
-            // Layer 4: [profile.{name}] in autumn.toml
             for profile_name in profile_lookup_names(&profile) {
                 if let Some(inline_profile) = profile_section_from_base_toml(&base, profile_name) {
                     deep_merge(&mut merged, inline_profile);
@@ -7131,7 +7172,6 @@ impl AutumnConfig {
             }
         }
 
-        // Layer 5: autumn-{profile}.toml (legacy compatibility)
         let mut has_profile_file = false;
         for profile_name in profile_override_file_lookup_names(&profile, &selected_profile_input) {
             let profile_path = find_config_file_named(&format!("autumn-{profile_name}.toml"), env);
@@ -7147,20 +7187,17 @@ impl AutumnConfig {
             warn_profile_typo(&profile);
         }
 
-        // Read the merged table into AutumnConfig. An error names its key.
         let mut config: Self = value_de::from_value(merged.clone())?;
         config.profile = Some(profile);
 
-        // An `AUTUMN_ROLE` that is not a role name fails the load, as a bad
-        // TOML `role` does (#3541). It must not boot as `combined`. Check the
-        // grammar before the overrides, so that error comes without their
-        // warning. An undeclared preset name fails after them.
+        // A malformed `AUTUMN_ROLE` fails the load like a bad TOML `role` instead of booting as
+        // `combined` (#3541). Checked before the overrides so the error comes without their
+        // warning; an undeclared preset name fails after them.
         let role_from_env = Self::role_env_override(env)?.is_some();
         // A bad TOML `role` fails even when `AUTUMN_ROLE` is valid (#3541).
         // An undeclared preset name in the file is a bad role too (#3543).
         config.check_role("role")?;
 
-        // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
 
         // An undeclared role name fails the load (#3543).
@@ -7182,17 +7219,13 @@ impl AutumnConfig {
             )?;
         }
 
-        // ── Deprecation channel (purely additive; never mutates `config`). ──────
-        // Emit exactly one structured WARN per deprecated key that is present in
-        // the resolved config (via TOML or env var). The old value is already
-        // honoured above; this is observation only.
+        // Deprecation warnings: one per deprecated key set via TOML or env. Observation only; the
+        // old value is already honored above.
         let empty_table = toml::Table::new();
         let merged_table = merged.as_table().unwrap_or(&empty_table);
         for f in detect_deprecated_keys(merged_table, env, DEPRECATED_CONFIG_KEYS) {
-            // eprintln! ensures the warning is visible on stderr even before the
-            // tracing subscriber is installed (config loads before telemetry init in
-            // the normal startup path).  The tracing::warn! below is kept so apps
-            // that pre-install their own subscriber still receive structured events.
+            // `eprintln!` because config loads before the tracing subscriber is installed;
+            // `tracing::warn!` still reaches apps that install their own subscriber first.
             eprintln!(
                 "Warning: deprecated configuration key `{}` is still honored but will be removed \
                  in {}; deprecated since {} (replacement: {}; source: {:?})",
@@ -7259,46 +7292,17 @@ impl AutumnConfig {
         let mut warn_only = Vec::new();
         let mut opaque_roots = Vec::new();
         for (path, sug, schema_parent, is_table, is_top_level) in errors {
-            // Deploy-CLI leniency (#2063/#2067): a genuinely-unknown true top-level
-            // root — one whose actual path is a bare root key, with no `profile.<name>`
-            // prefix, and whose schema parent is the document root `""` — is accepted
-            // as opaque rather than failing. It is almost certainly a plugin-owned
-            // config table such as `[media]` that the CLI structurally cannot know
-            // about, and app boot stays the strict gate for it.
-            //
-            // Top-level-ness is structural, taken from the error's `is_top_level` flag,
-            // set when the offending key's parent path was empty at push time. That is
-            // the same signal #2061's app-boot exemption keys on (`path.is_empty()` in
-            // `validate_toml_table`). It is deliberately not inferred from the rendered
-            // dotted `path` string, which is ambiguous: a legitimately quoted-dotted
-            // top-level key like `["my.plugin"]`, from `config_section("my.plugin")`,
-            // and a two-level path both render `my.plugin`. The earlier
-            // `!path.contains('.')` heuristic therefore hard-failed a quoted-dotted
-            // top-level plugin root at deploy even though app boot accepts it.
-            //
-            // Nor is it merely `schema_parent.is_empty()`. `validate_toml_detailed`
-            // reports an empty schema parent for a profile-prefixed section like
-            // `[profile.prod.media]` too, because the profile prefix is stripped before
-            // root-schema validation. But such a section is pushed with a non-empty
-            // parent path (`["profile","prod"]`), so `is_top_level` is false for it, and
-            // the deployed app — whose `config_section` seam exempts only the true
-            // top-level `[media]` via `path.is_empty()` — still rejects it at boot. So
-            // deploy and app boot agree: both accept top-level `[media]` and
-            // `["my.plugin"]`, and both reject `[profile.prod.media]`.
-            //
-            // A profile-prefixed root therefore falls through to the normal hard
-            // classification below (schema_parent `""` ∈ `PRE_1890_STRICT_PARENTS`) and
-            // is strictly rejected at deploy, matching app boot. Only a true root is
-            // spared: an unknown key inside a known section, with a non-empty
-            // schema_parent, also falls through, so a `[database] primry_url` typo still
-            // hard-fails. The app-boot path passes `Strict`, so its behavior is unchanged.
-            //
-            // Leniency also requires the root's TOML value to be a table, mirroring the
-            // #2061 app-boot exemption. A non-table true top-level root — `media =
-            // "enabled"`, `media = ["a", "b"]` — is a malformed section nothing would
-            // deserialize, so it falls through to the hard classification exactly as the
-            // deployed app rejects it. Without this check, deploy would accept a
-            // non-table root that boot rejects, reopening the gap this branch closes.
+            // Deploy-CLI leniency (#2063): the CLI cannot know plugin-owned tables such as
+            // `[media]`, so an unknown top-level table is accepted as opaque; app boot remains the
+            // strict gate. Accept exactly what app boot exempts in `validate_toml_table`
+            // (`path.is_empty()` and a table):
+            // - `is_top_level`, not the rendered path: a quoted `["my.plugin"]` and a two-level
+            //   path both render `my.plugin`.
+            // - not `schema_parent` alone: `[profile.prod.media]` also has an empty schema parent,
+            //   but boot rejects it.
+            // - `is_table`: boot rejects a scalar or array root such as `media = "enabled"`.
+            // Anything else, including a typo inside a known section, falls through to the hard
+            // classification below.
             if root_policy == UnknownRootPolicy::LenientWarn
                 && schema_parent.is_empty()
                 && is_top_level
@@ -7314,12 +7318,8 @@ impl AutumnConfig {
             }
         }
 
-        // Deploy-CLI opaque top-level roots (#2063): surface exactly one
-        // doctor-style line (never fatal) so an accepted plugin root is
-        // observable and a typo'd root is not silently swallowed — it will be
-        // rejected authoritatively when the app itself boots. `eprintln!`
-        // guarantees visibility before a tracing subscriber is installed; the
-        // `tracing::warn!` keeps structured output for apps that pre-install one.
+        // One non-fatal line for accepted opaque roots (#2063), so a typo'd root is visible here;
+        // app boot rejects it authoritatively.
         if !opaque_roots.is_empty() {
             let roots = opaque_roots.join(", ");
             let count = opaque_roots.len();
@@ -7339,13 +7339,9 @@ impl AutumnConfig {
             );
         }
 
-        // Warn-first rollout (#1890): unknown keys in sections that only became
-        // strictly validated by the schema-walk fix are surfaced loudly but do not fail
-        // startup for one release, so configs that silently passed before keep booting.
-        // `eprintln!` guarantees visibility before the tracing subscriber is installed;
-        // the `tracing::warn!` keeps structured output for apps that pre-install one.
-        // Set `server.strict_config_enforce_all = true`, or
-        // `AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL=1`, to promote these to hard errors.
+        // Warn-first rollout (#1890): unknown keys in sections the schema-walk fix newly validates
+        // warn instead of failing. `server.strict_config_enforce_all = true` (or
+        // `AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL=1`) makes them errors.
         for (path, sug) in &warn_only {
             let hint = sug
                 .as_deref()
@@ -7387,7 +7383,6 @@ impl AutumnConfig {
     fn expand_oauth2_providers(&mut self) {
         let provider_names: Vec<String> = self.auth.oauth2.providers.keys().cloned().collect();
         for name in provider_names {
-            // 1. Expand from preset if available
             if let (Some(preset), Some(p)) = (
                 crate::auth::provider_preset(&name),
                 self.auth.oauth2.providers.get_mut(&name),
@@ -7415,7 +7410,6 @@ impl AutumnConfig {
                 }
             }
 
-            // 2. Resolve credentials-backed secrets/IDs
             if let Some(p) = self.auth.oauth2.providers.get_mut(&name) {
                 let normalized_name = name
                     .chars()
@@ -7494,9 +7488,8 @@ impl AutumnConfig {
             self.profile.as_deref(),
             Some("prod" | "production")
         ))?;
-        // #1605: reject an unparseable or zero retention window at boot rather
-        // than silently skipping the dataset it names — a policy an operator
-        // believes is enforced but isn't is worse than no policy.
+        // Reject a bad retention window at boot (#1605): a policy the operator believes is
+        // enforced but is not is worse than none.
         self.retention.validate()?;
         self.validate_retention_against_replay_protection()?;
         // Framework state (autumn_jobs, the scheduler tick table) lives on
@@ -7556,10 +7549,8 @@ impl AutumnConfig {
         self.cost.validate().map_err(ConfigError::Validation)?;
         // An x402 route that can never match serves its handler free.
         self.aeo.validate().map_err(ConfigError::Validation)?;
-        // A `[replication]` block that is switched on but cannot ship (no
-        // destination, both destinations, no credential indirection) must fail
-        // here — so `autumn check` and `autumn doctor` see it too — rather than
-        // only when the app itself boots (#1628).
+        // Checked here (#1628) so `autumn check` and `autumn doctor` catch a `[replication]` block
+        // that cannot ship, not only app boot.
         if let Some(replication) = &self.replication {
             let errors = replication.validation_errors();
             if !errors.is_empty() {
@@ -7569,14 +7560,9 @@ impl AutumnConfig {
                 )));
             }
         }
-        // Session backend validation deliberately lives in
-        // `crate::session::build_session_layer`, not here. That function
-        // short-circuits when a custom `SessionStore` was installed via
-        // `AppBuilder::with_session_store(...)`, so a then-irrelevant
-        // `session.backend = "redis"` without a redis URL need not fail the
-        // boot. Validating it here would defeat the override and exit before
-        // the custom store applies. The "prod profile plus memory backend"
-        // warning lives there for the same reason.
+        // Session backend is validated in `crate::session::build_session_layer`, not here: a custom
+        // `SessionStore` makes `session.backend` irrelevant, and failing here would exit before it
+        // applies. The prod + memory backend warning lives there too.
         Ok(())
     }
 
@@ -7648,14 +7634,9 @@ impl AutumnConfig {
     /// Called on the loaded config during boot; apps do not call this
     /// directly.
     pub fn apply_retention_caps(&mut self) {
-        // `job_tracking` is capped only when its records do NOT live in
-        // `autumn_job_tracking`. Under `jobs.backend = "postgres"` the sweep
-        // enforces the window and a GDPR legal hold can stop it, so capping
-        // the TTL there would let the job runner's independent `expires_at`
-        // cleanup delete held rows on exactly the retention schedule. Under
-        // any other backend (redis, or the in-memory fallback) there is no
-        // table to sweep and the record's TTL is the only bound there is —
-        // leaving it uncapped would claim a window nothing enforces.
+        // Cap `job_tracking` only off the Postgres backend. On Postgres the sweep enforces the
+        // window and honors legal holds; a capped TTL would let the runner's `expires_at` cleanup
+        // delete held rows. Elsewhere the TTL is the only bound.
         let cap_job_tracking = self.jobs.backend != "postgres";
         let caps: [(&str, &mut u64); 3] = [
             ("idempotency", &mut self.idempotency.ttl_secs),
@@ -7836,9 +7817,8 @@ impl AutumnConfig {
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
         self.apply_metrics_env_overrides_with_env(env);
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         self.apply_reporting_env_overrides_with_env(env);
-        #[cfg(feature = "reporting")]
         self.apply_failure_capture_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
@@ -7876,14 +7856,9 @@ impl AutumnConfig {
     /// `503`, with the operator looking at a variable they did set.
     #[cfg(feature = "push")]
     fn apply_push_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // Not `parse_env_option_secret`. That helper treats a blank value as "clear this
-        // setting", which is right where unsetting via env is meaningful but wrong here,
-        // and dangerously so: the commonest way `AUTUMN_PUSH__PRIVATE_KEY` ends up blank
-        // is a secret that failed to interpolate. Clearing it would silently disable
-        // push, sail through `validate_push`, and surface much later as a 503 and
-        // `NotConfigured` on every send — and it would erase a good key from
-        // `autumn.toml`. So a blank value is preserved, precisely so `load_vapid_key`
-        // can reject it at boot with a message naming the environment variable.
+        // Not `parse_env_option_secret`, which clears the setting on a blank value. A blank key is
+        // usually a secret that failed to interpolate; clearing it would silently disable push and
+        // erase the TOML key. Keep it so `load_vapid_key` rejects it at boot, naming the variable.
         if let Ok(value) = env.var("AUTUMN_PUSH__PRIVATE_KEY") {
             self.push.private_key = Some(secrecy::SecretString::from(value));
         }
@@ -7916,10 +7891,8 @@ impl AutumnConfig {
             "AUTUMN_SHADOW__SAMPLE_RATE",
             &mut self.shadow.sample_rate,
         );
-        // `_non_empty`: an unfilled template (`AUTUMN_SHADOW__ROUTES=`) must not
-        // become a one-element allowlist containing the empty pattern, which
-        // matches no path and would silently mirror nothing (issue #1621's
-        // failure shape).
+        // `_non_empty`: an unfilled `AUTUMN_SHADOW__ROUTES=` must not become a one-element
+        // allowlist of the empty pattern, which matches no path and silently mirrors nothing.
         parse_env_csv_non_empty(env, "AUTUMN_SHADOW__ROUTES", &mut self.shadow.routes);
         parse_env(
             env,
@@ -7991,6 +7964,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_TENANCY__HEADER_NAME",
             &mut self.tenancy.header_name,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_TENANCY__HEADER_TRUST",
+            &mut self.tenancy.header_trust,
         );
         parse_env_string(
             env,
@@ -8093,9 +8071,7 @@ impl AutumnConfig {
             "AUTUMN_ALERTS__DISCORD_WEBHOOK_URL",
             &mut self.alerts.discord_webhook_url,
         );
-        // Per-channel severity routing (`all` / `critical`). `AlertRouting`'s
-        // `FromStr` accepts the same spellings as the TOML/serde path; an invalid
-        // value is logged and ignored by `parse_env`, leaving the current value.
+        // Per-channel severity routing: `all` or `critical`.
         parse_env(
             env,
             "AUTUMN_ALERTS__PAGERDUTY_SEVERITIES",
@@ -8151,7 +8127,7 @@ impl AutumnConfig {
         );
     }
 
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     fn apply_reporting_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(
             env,
@@ -8165,7 +8141,6 @@ impl AutumnConfig {
         );
     }
 
-    #[cfg(feature = "reporting")]
     fn apply_failure_capture_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(
             env,
@@ -8260,9 +8235,6 @@ impl AutumnConfig {
             "AUTUMN_ACTUATOR__SENSITIVE",
             &mut self.actuator.sensitive,
         );
-        // Security-sensitive: operators disable the Prometheus scrape endpoint
-        // with AUTUMN_ACTUATOR__PROMETHEUS=false; the override must be honored
-        // so the endpoint is not left exposed against the operator's intent.
         parse_env_bool(
             env,
             "AUTUMN_ACTUATOR__PROMETHEUS",
@@ -8461,12 +8433,8 @@ impl AutumnConfig {
         );
         self.apply_admission_env_overrides_with_env(env);
 
-        // `[server.tls]` is a nested optional. Materialize it from the
-        // environment when any of its keys are set (seeding an empty struct if
-        // the TOML section was absent), so a fully env-driven deployment can
-        // enable direct HTTPS without an `autumn.toml` section. A partially
-        // specified pair (e.g. only the cert) leaves the other path empty and
-        // is caught by the startup fail-fast validation.
+        // Materialize `[server.tls]` when any of its env keys is set, so an env-only deployment can
+        // enable HTTPS. A half-set cert/key pair is caught by startup validation.
         let tls_cert = env.var("AUTUMN_SERVER__TLS__CERT_PATH").ok();
         let tls_key = env.var("AUTUMN_SERVER__TLS__KEY_PATH").ok();
         let tls_reload = env.var("AUTUMN_SERVER__TLS__RELOAD_INTERVAL_SECS").ok();
@@ -8794,7 +8762,6 @@ impl AutumnConfig {
     }
 
     fn apply_telemetry_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // ── Health ──────────────────────────────────────────────
         parse_env_bool(
             env,
             "AUTUMN_TELEMETRY__ENABLED",
@@ -9469,7 +9436,6 @@ impl AutumnConfig {
             &mut self.security.allow_unauthorized_repository_api,
         );
 
-        // Signing secret (canonical env var documented in deployment guide)
         parse_env_option_string(
             env,
             "AUTUMN_SECURITY__SIGNING_SECRET",
@@ -9723,20 +9689,10 @@ impl AutumnConfig {
     /// section exists in TOML, a default one is materialized only if at least
     /// one offsite env var is present, so an all-env deployment still works.
     fn apply_backup_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // Keys that signal genuine intent to configure an offsite destination: the
-        // presence of any required destination or credential key materializes the
-        // `[backup.offsite]` section (#1791). The list is limited to what a working
-        // upload requires — a bucket, or the access and secret key-env names.
-        // Optional-only keys (`region`, `force_path_style`, `endpoint`, `prefix`,
-        // `keep`) do not materialize the section on their own: a bare
-        // `AUTUMN_BACKUP__OFFSITE__S3__REGION` with no bucket cannot upload, so it must
-        // leave offsite unconfigured rather than produce an empty section that then
-        // fails validation or `doctor` with "backup.offsite.s3.bucket is unset". Those
-        // optional keys are still applied below once a required key materializes the
-        // section. The two opt-out toggles are excluded too: a lone `AUTO_UPLOAD=false`
-        // or `ALLOW_SHARED_BUCKET=false` must not create an otherwise-empty section
-        // (#1619 P2 #18). A truthy `AUTO_UPLOAD=true` does materialize, since it needs a
-        // validated destination to act on.
+        // Only keys a working upload requires (a bucket, or the credential key-env names)
+        // materialize `[backup.offsite]` (#1791). Optional keys (`region`, `endpoint`, ...) and the
+        // opt-out toggles alone must not create a section that then fails validation; they still
+        // apply once it exists. A truthy `AUTO_UPLOAD` does materialize: it needs a destination.
         const OFFSITE_DEST_KEYS: &[&str] = &[
             "AUTUMN_BACKUP__OFFSITE__S3__BUCKET",
             "AUTUMN_BACKUP__OFFSITE__S3__ACCESS_KEY_ID_ENV",
@@ -9803,24 +9759,18 @@ impl AutumnConfig {
     /// optional-only keys never conjure a section that would then fail
     /// validation.
     fn apply_replication_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // Keys that express a real intent to configure a destination. A lone
-        // region/endpoint/prefix cannot replicate anywhere, so it must not
-        // materialize the section; `ENABLED=true` does, because it needs a
-        // destination to act on and the resulting validation error is the honest
-        // answer.
+        // Keys that name a destination. A lone region/endpoint/prefix cannot replicate anywhere, so
+        // it does not materialize the section; `ENABLED=true` does, so validation reports the
+        // missing destination.
         const DEST_KEYS: &[&str] = &[
             "AUTUMN_REPLICATION__S3__BUCKET",
             "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
             "AUTUMN_REPLICATION__S3__SECRET_ACCESS_KEY_ENV",
             "AUTUMN_REPLICATION__PATH",
         ];
-        // Only a REQUIRED S3 key materializes the sub-section, exactly as
-        // `OFFSITE_DEST_KEYS` does for `[backup.offsite]`. A stray
-        // `AUTUMN_REPLICATION__S3__REGION` next to a `path` destination must not
-        // conjure an empty `[replication.s3]` — that would make the section
-        // "configures both s3 and path" and fail boot on an otherwise valid
-        // config. The optional keys are still APPLIED once a required one has
-        // materialized the sub-section.
+        // Only a required S3 key materializes `[replication.s3]`: a stray `S3__REGION` next to a
+        // `path` destination would otherwise configure both s3 and path and fail boot. Optional
+        // keys still apply once the sub-section exists.
         const S3_KEYS: &[&str] = &[
             "AUTUMN_REPLICATION__S3__BUCKET",
             "AUTUMN_REPLICATION__S3__ACCESS_KEY_ID_ENV",
@@ -11266,14 +11216,9 @@ impl AcmeConfig {
                     .to_owned(),
             );
         }
-        // The renew-before window is compared against the issued certificate's
-        // REMAINING validity. Publicly-trusted CAs (Let's Encrypt) issue
-        // ~90-day certificates, so treat 90 days as the effective maximum cert
-        // lifetime: a `renew_before_days >= 90` keeps the freshly-issued
-        // certificate perpetually inside its renew-before window, so `needs_renewal`
-        // stays true immediately after every successful renewal and the hourly
-        // loop orders a brand-new certificate every tick until the CA's rate
-        // limits are hit. Reject it up front.
+        // `renew_before_days` is compared with the issued certificate's remaining validity, and
+        // public CAs (Let's Encrypt) issue ~90-day certificates. At 90 or more a fresh certificate
+        // is already due, so the hourly loop would reorder every tick until the CA rate-limits.
         if self.renew_before_days >= 90 {
             return Err(format!(
                 "[server.tls.acme] renew_before_days ({}) must be less than 90: it is compared \
@@ -11304,10 +11249,8 @@ impl AcmeConfig {
                      {index} is empty or whitespace-only)"
                 ));
             }
-            // A wildcard identifier can only ever be validated over DNS-01, so it
-            // is accepted exactly when `[server.tls.acme.dns]` is configured —
-            // and its shape is checked here rather than surfacing later as an
-            // opaque CA rejection mid-issuance.
+            // A wildcard can only be validated over DNS-01, so it needs `[server.tls.acme.dns]`;
+            // its shape is checked here instead of failing as an opaque CA rejection mid-issuance.
             if trimmed.contains('*') {
                 if self.dns.is_none() {
                     return Err(format!(
@@ -11333,14 +11276,9 @@ impl AcmeConfig {
                     ));
                 }
             }
-            // The checks above read `trimmed`, but the entry is stored — and used —
-            // UNTRIMMED: it becomes the certificate's SAN via `CertificateParams`,
-            // the placeholder key's `CertId`, and the ACME order's
-            // `Identifier::Dns`. A padded ` app.example.com ` is therefore a
-            // different identifier than the hostname the operator meant, and the
-            // failure surfaces as an opaque CA rejection mid-issuance. Reject the
-            // padding here instead of silently trimming, so the config file says
-            // exactly what will be requested.
+            // The entry is used untrimmed as the certificate SAN, the placeholder `CertId` and the
+            // ACME `Identifier::Dns`, so padding requests a different name. Reject it rather than
+            // trim, so the config says exactly what is requested.
             if domain != trimmed {
                 return Err(format!(
                     "[server.tls.acme] domain `{domain}` (entry at index {index}) has leading or \
@@ -13036,8 +12974,6 @@ pub fn database_backend_consistency(
     };
 
     if primary_backend == DatabaseBackend::Sqlite {
-        // Read replicas are a Postgres topology concept; SQLite has no
-        // replica role to serve reads from.
         if replica_url.is_some() {
             return Err(
                 "database.replica_url is set but the primary target is SQLite; \
@@ -13045,7 +12981,6 @@ pub fn database_backend_consistency(
                     .to_owned(),
             );
         }
-        // Horizontal sharding is Postgres-only.
         if has_shards {
             return Err(
                 "database.shards are configured but the primary target is SQLite; \
@@ -13055,10 +12990,7 @@ pub fn database_backend_consistency(
         }
     }
 
-    // Every configured connection role must name the same backend. Mixing
-    // (e.g. a Postgres primary with a SQLite replica, or vice versa) cannot
-    // work and is a boot-time misconfiguration rather than a first-query
-    // surprise.
+    // Every connection role must name the same backend.
     for (field, url) in [("database.url", url), ("database.replica_url", replica_url)] {
         if let Some(url) = url
             && DatabaseBackend::detect(url) != Some(primary_backend)
@@ -13281,9 +13213,7 @@ impl DatabaseConfig {
     /// a Postgres primary with Postgres roles and no `SQLite` anywhere hits none
     /// of these branches.
     fn validate_backend_consistency(&self) -> Result<(), ConfigError> {
-        // Single source of truth: delegate to the free
-        // [`database_backend_consistency`] rule so boot and out-of-process
-        // callers (e.g. `autumn doctor`) agree for every role/backend mismatch.
+        // Shared with out-of-process callers (`autumn doctor`) so both agree.
         database_backend_consistency(
             self.url.as_deref(),
             self.primary_url.as_deref(),
@@ -13305,13 +13235,7 @@ impl DatabaseConfig {
             ("database.primary_url", self.primary_url.as_deref()),
             ("database.replica_url", self.replica_url.as_deref()),
         ] {
-            // A SQLite target (issue #1614) is now a recognized shape and
-            // passes this per-field check; only strings that are neither a
-            // Postgres nor a SQLite target are rejected here. The message's
-            // GUIDANCE half is unchanged — everything up to "got" — so existing
-            // diagnostics that match on it still match; the target it quotes is
-            // now redacted (see below), because a rejected string is by
-            // definition one whose secrets this code cannot enumerate.
+            // Diagnostics match the message text up to "got"; keep that part stable.
             if let Some(url) = url
                 && DatabaseBackend::detect(url).is_none()
             {
@@ -13320,11 +13244,8 @@ impl DatabaseConfig {
                 } else {
                     field
                 };
-                // Redacted: this is the refusal a normal `autumn.toml`
-                // misconfiguration hits, and it reaches `tracing::error!` at
-                // boot — one line after the startup summary masked the same
-                // URL. A target this branch could not classify is, by
-                // definition, not a shape we can enumerate the secrets of.
+                // Redacted: this error reaches `tracing::error!` at boot, and a target that cannot
+                // be classified has no known shape to mask secrets in.
                 let target = crate::db_url::redact_target(url);
                 return Err(ConfigError::Validation(format!(
                     "Invalid {label}: must start with postgres:// or postgresql://, or be a \
@@ -14203,14 +14124,11 @@ pub struct CompressionConfig {
 /// Shared by [`AutumnConfig::load`] and `autumn doctor`'s deploy preflight so
 /// both surfaces resolve the identical deploy target (host, `ssh_port`, …) for the
 /// same environment + profile + TOML.
-// Exposed for autumn-cli's `autumn deploy` preflight (doctor) to reuse the deploy env-override logic; not yet a stable public API.
+// Public for autumn-cli's deploy preflight; not a stable API.
 #[doc(hidden)]
 pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn Env) {
-    // This array is a PRESENCE PROBE gating materialization of the ENTIRE
-    // `[deploy]` table: a key missing from it means an env-only config that sets
-    // only that key produces no deploy section at all — a silent skip, not an
-    // error, in both `AutumnConfig::load` and `autumn doctor`. Every key parsed
-    // below MUST appear here.
+    // Presence probe: unless one of these is set, no `[deploy]` table is materialized and an
+    // env-only config is silently skipped. Every key parsed below must be listed.
     const KEYS: [&str; 18] = [
         "AUTUMN_DEPLOY__HOST",
         "AUTUMN_DEPLOY__HOSTS",
@@ -14235,20 +14153,9 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         return;
     }
     let deploy = deploy.get_or_insert_with(DeployConfig::default);
-    // #1621 review round 1: `host` and `hosts` are mutually exclusive downstream, so
-    // applying one spelling from the environment on top of the other spelling in TOML
-    // produced a config that refuses every `autumn deploy` subcommand — even though
-    // `AUTUMN_DEPLOY__*` is documented to win over TOML. Whether each spelling was set
-    // non-empty in the environment is therefore captured before either is applied, so a
-    // non-empty env value can clear the TOML alternate below.
-    //
-    // "Non-empty" is judged conservatively: a value blank after trimming never clears
-    // the other spelling, so the established empty-means-unset semantics survive.
-    // `AUTUMN_DEPLOY__HOST=` and `AUTUMN_DEPLOY__HOSTS=`/`,`/` , ` are the shape a CI or
-    // compose template emits for an unfilled slot, and they say nothing about the other
-    // spelling. `parse_env_option_string` below still applies its own unchanged
-    // `is_empty()` rule to `host` itself; trimming here only makes the clearing decision
-    // stricter, so a whitespace-only value can never drop a configured fleet list.
+    // `host` and `hosts` are mutually exclusive (#1621), so a non-empty env spelling clears the
+    // TOML alternate below; env wins over TOML. A value blank after trimming (an unfilled
+    // template slot such as `AUTUMN_DEPLOY__HOSTS=,`) never clears the other spelling.
     let env_set_host = env
         .var("AUTUMN_DEPLOY__HOST")
         .is_ok_and(|value| !value.trim().is_empty());
@@ -14256,22 +14163,12 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         .var("AUTUMN_DEPLOY__HOSTS")
         .is_ok_and(|value| value.split(',').any(|entry| !entry.trim().is_empty()));
     parse_env_option_string(env, "AUTUMN_DEPLOY__HOST", &mut deploy.host);
-    // #1621: the fleet host list, as CSV. It REPLACES the whole TOML list (a
-    // fleet-level retarget), matching every other `AUTUMN_DEPLOY__*` override.
-    // Entries are trimmed by `parse_env_csv_non_empty`, which also DROPS blank
-    // segments: `AUTUMN_DEPLOY__HOSTS=` means unset (as `AUTUMN_DEPLOY__HOST=`
-    // does) and a trailing/doubled comma is tolerated, rather than reaching the
-    // CLI as a blank fleet entry that refuses every deploy subcommand. Duplicate
-    // entries are still rejected downstream by the CLI's `ResolvedFleet::resolve`.
+    // Replaces the whole TOML list. Blank segments are dropped, so `AUTUMN_DEPLOY__HOSTS=` means
+    // unset and a stray comma is tolerated; duplicates are rejected by the CLI.
     parse_env_csv_non_empty(env, "AUTUMN_DEPLOY__HOSTS", &mut deploy.hosts);
-    // Env-over-TOML precedence, applied to the spelling the operator did not set:
-    // retargeting a `[deploy] host` project as a fleet, or a `[deploy] hosts` project at
-    // a single server, is a legitimate env override rather than a conflict. It is
-    // deliberately not a tie-break: when both env spellings are set non-empty the
-    // rollout order is genuinely ambiguous — an operator error, not a precedence
-    // question — so both survive and the existing mutual-exclusion refusal
-    // (`DeployConfig::validate`, the CLI's `deploy_host_list`) still fires, naming both
-    // keys.
+    // Env retargeting a single host as a fleet (or back) is an override, not a conflict. With
+    // both env spellings set the order is ambiguous, so both survive and
+    // `DeployConfig::validate` rejects them.
     if env_set_hosts && !env_set_host {
         deploy.host = None;
     } else if env_set_host && !env_set_hosts {
@@ -14298,19 +14195,16 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         &mut deploy.keep_releases,
     );
     parse_env_string(env, "AUTUMN_DEPLOY__PROFILE", &mut deploy.profile);
-    // Opt-in TLS for the deploy-managed proxy (#1969). Env wins over TOML, matching
-    // every other deploy override above.
+    // Opt-in TLS for the deploy-managed proxy (#1969).
     parse_env_bool(env, "AUTUMN_DEPLOY__TLS__ENABLED", &mut deploy.tls.enabled);
     parse_env_option_string(env, "AUTUMN_DEPLOY__TLS__HOST", &mut deploy.tls.host);
-    // Host preparation opt-out (#1607). Env wins over TOML, like every other deploy
-    // override above, so a CI pipeline deploying to pre-provisioned hosts can
-    // decline it without editing `autumn.toml`.
+    // Lets CI deploying to pre-provisioned hosts skip host preparation (#1607).
     parse_env_bool(
         env,
         "AUTUMN_DEPLOY__INSTALL_PROXY",
         &mut deploy.install_proxy,
     );
-    // The post-cutover bake (#3069). Env wins over TOML.
+    // Post-cutover bake (#3069).
     let bake = &mut deploy.bake;
     parse_env(
         env,
@@ -14882,9 +14776,7 @@ impl Default for HealthConfig {
     }
 }
 
-// ----------------------------------------------------------------------------
-// ConfigLoader — tier-1 boot-time replaceable config loading
-// ----------------------------------------------------------------------------
+// ── ConfigLoader: replaceable boot-time config loading ─────────────────────
 
 /// Pluggable boot-time configuration loader.
 ///
@@ -14965,19 +14857,13 @@ impl TomlEnvConfigLoader {
 
 impl ConfigLoader for TomlEnvConfigLoader {
     async fn load(&self) -> Result<AutumnConfig, ConfigError> {
-        // Feed a project-root `.env` into the `AUTUMN_*` env layer before
-        // resolving config from the real environment. Rather than mutating the
-        // process environment (unsound on a live multi-threaded runtime), `.env`
-        // values are layered *under* the real environment via an overlay `Env`,
-        // so a real env var always wins. The sync file IO in `resolve_dotenv_vars`
-        // is fine on the async path. A malformed `.env` fails loudly here rather
-        // than silently skipping developer-provided values.
+        // Layer `.env` under the real environment through an overlay `Env`: mutating the process
+        // environment is unsound on a multi-threaded runtime, and a real env var must win. A
+        // malformed `.env` fails the load.
         let base = OsEnv;
         let profile = resolve_profile(&base);
-        // Resolve `.env` from the same base directory config uses for
-        // `autumn.toml` (AUTUMN_MANIFEST_DIR when set, else the process CWD),
-        // so a binary launched from outside its crate root reads the `.env`
-        // next to its config instead of the process working directory.
+        // Read `.env` from the directory `autumn.toml` is found in (AUTUMN_MANIFEST_DIR, else the
+        // CWD), so a binary launched elsewhere still finds the `.env` next to its config.
         let dir = crate::dotenv::dotenv_base_dir(&base);
         let vars = crate::dotenv::resolve_dotenv_vars(&dir, &profile, &base)
             .map_err(|e| ConfigError::Dotenv(e.to_string()))?;
@@ -15001,12 +14887,11 @@ pub fn parse_duration_str(s: &str) -> Result<std::time::Duration, String> {
         return Err("duration string is empty".to_owned());
     }
 
-    // Check if it's a plain integer
+    // A bare integer is milliseconds.
     if let Ok(ms) = s.parse::<u64>() {
         return Ok(std::time::Duration::from_millis(ms));
     }
 
-    // Try parsing suffix
     if let Some(val_str) = s.strip_suffix("ms") {
         let val = val_str
             .parse::<u64>()
@@ -15108,14 +14993,20 @@ pub struct TenancyConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Source configuration from which the tenant ID is extracted.
-    /// Values can be "header" (default), "subdomain", "session", "jwt".
+    /// Where the tenant ID comes from: `"session"` (default), `"jwt"`,
+    /// `"subdomain"` or `"header"`. `"header"` needs
+    /// [`header_trust`](Self::header_trust).
     #[serde(default = "default_tenancy_source")]
     pub source: String,
 
     /// Header name to lookup if source is "header". Default: "x-tenant-id".
     #[serde(default = "default_tenancy_header_name")]
     pub header_name: String,
+
+    /// Who can set the tenant header when `source = "header"`. No default:
+    /// `"header"` without it does not start. See [`TenantHeaderTrust`].
+    #[serde(default)]
+    pub header_trust: Option<TenantHeaderTrust>,
 
     /// Session key to lookup if source is "session". Default: "`tenant_id`".
     #[serde(default = "default_tenancy_session_key")]
@@ -15194,7 +15085,37 @@ pub struct TenancyConfig {
 }
 
 fn default_tenancy_source() -> String {
-    "header".to_string()
+    "session".to_string()
+}
+
+/// Who can set the tenant header (`tenancy.header_trust`).
+///
+/// The header lets the sender select the tenant. The app must name the
+/// senders it trusts.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TenantHeaderTrust {
+    /// Accept the header only from a peer address in
+    /// `security.trusted_proxies.ranges`. Other peers get `403`.
+    /// `trusted_hops` does not count. The proxy must authenticate the user,
+    /// set the header, and remove the client's copy.
+    TrustedProxy,
+    /// Accept the header from any client. **Unsafe:** the client selects its
+    /// tenant. Use it only when the app checks tenant membership itself.
+    AnyClient,
+}
+
+impl std::str::FromStr for TenantHeaderTrust {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "trusted_proxy" => Ok(Self::TrustedProxy),
+            "any_client" => Ok(Self::AnyClient),
+            _ => Err(()),
+        }
+    }
 }
 
 fn default_tenancy_header_name() -> String {
@@ -15215,6 +15136,7 @@ impl Default for TenancyConfig {
             enabled: false,
             source: default_tenancy_source(),
             header_name: default_tenancy_header_name(),
+            header_trust: None,
             session_key: default_tenancy_session_key(),
             jwt_claim: default_tenancy_jwt_claim(),
             jwt_secret: None,
@@ -15470,13 +15392,9 @@ mod tests {
         assert!(keys["database"].contains("primary_url"));
     }
 
-    // Regression (#1608): `server.tls.acme.directory` is the `AcmeDirectory`
-    // enum, declared under `server` — which precedes `database` in `AutumnConfig`.
-    // The `SchemaDeserializer` must treat that enum as an opaque leaf and keep
-    // walking; if it instead errors on the variant tag it aborts the whole
-    // traversal at the enum, dropping `database` (and every later section) from
-    // the derived schema. That silently disables the strict unknown-key validator
-    // for `[database]`, so a typo like `primry_url` stops being flagged.
+    // Regression (#1608): `server.tls.acme.directory` is an enum declared before `database`.
+    // The schema walk must treat it as an opaque leaf; erroring on it would drop `database` and
+    // every later section from the schema and disable unknown-key checks there.
     #[cfg(feature = "acme")]
     #[test]
     fn acme_enum_field_does_not_truncate_schema_traversal() {
@@ -15530,10 +15448,8 @@ mod tests {
         assert!(err_str.contains("primry_url"));
     }
 
-    // #2063 helper: a `prod`, manifest-scoped env with `strict_config` sourced
-    // from the on-disk `autumn.toml`. `prod` is pinned (not `dev`) so the
-    // dev-only injected `[storage]` smart-default can't masquerade as an unknown
-    // top-level root and skew these assertions — same reason the #1890 tests do.
+    // Pinned to `prod`: the dev smart defaults inject `[storage]`, which would show up as an
+    // unknown top-level root and skew these assertions.
     fn strict_prod_env_2063(temp: &std::path::Path) -> FakeEnv {
         FakeEnv(
             [
@@ -15547,10 +15463,8 @@ mod tests {
         )
     }
 
-    // #2063: the deploy CLI's lenient-unknown-roots load accepts a plugin-owned
-    // top-level config table (`[media]`) under `strict_config` — the CLI cannot
-    // know the app's plugin set — while the STRICT (app-boot) load still rejects
-    // it, so app boot remains the authoritative strict gate for plugin roots.
+    // #2063: the deploy CLI's lenient load accepts a plugin-owned top-level table under
+    // `strict_config`, while app boot still rejects it.
     #[test]
     fn deploy_cli_lenient_accepts_plugin_owned_top_level_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -15603,9 +15517,7 @@ mod tests {
         );
     }
 
-    // #2063: leniency is scoped to top-level ROOTS only. A typo INSIDE a known
-    // section (`[database] primry_url`) stays a hard error even under the lenient
-    // CLI load — the CLI does not soften validation of sections it knows.
+    // #2063: leniency covers top-level roots only; a typo inside a known section still fails.
     #[test]
     fn deploy_cli_lenient_still_rejects_known_section_typo() {
         let temp = tempfile::tempdir().unwrap();
@@ -15646,14 +15558,8 @@ mod tests {
         );
     }
 
-    // #2067: the lenient deploy-CLI load must NOT soften a PROFILE-PREFIXED
-    // unknown root like `[profile.prod.media]`. Its schema parent is empty
-    // (the profile prefix is stripped before root-schema validation), but its
-    // actual path (`profile.prod.media`) is not a true top-level root — so it
-    // stays strict and hard-fails, exactly as the deployed app rejects it at
-    // boot (the `config_section` seam exempts ONLY the true top-level `[media]`
-    // via `path.is_empty()`). Otherwise deploy would pass while remote boot
-    // fails.
+    // #2067: a profile-prefixed root (`[profile.prod.media]`) has an empty schema parent but is
+    // not a top-level root, so the lenient load rejects it, matching app boot.
     #[test]
     fn deploy_cli_lenient_still_rejects_profile_prefixed_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -15678,10 +15584,7 @@ mod tests {
         );
     }
 
-    // #2067: the profile-prefix strictness is not media-specific — a
-    // profile-prefixed genuinely-unknown NON-plugin root
-    // (`[profile.prod.definitely_unknown]`) also stays a hard error under the
-    // lenient CLI load; only TRUE top-level roots are ever softened.
+    // #2067: a profile-prefixed unknown root that no plugin owns also fails the lenient load.
     #[test]
     fn deploy_cli_lenient_still_rejects_profile_prefixed_unknown_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -15705,14 +15608,8 @@ mod tests {
         );
     }
 
-    // #2067: the lenient deploy-CLI demotion applies ONLY to a true top-level
-    // root whose TOML value is a TABLE. A registered/unknown root written as a
-    // SCALAR (`media = "enabled"`) or an ARRAY (`media = ["a", "b"]`) is a
-    // malformed section nothing would deserialize, so it must HARD-FAIL under
-    // the lenient CLI load too — exactly as the deployed app rejects it at boot
-    // (the #2061 `config_section` seam exempts a plugin root only when
-    // `val.is_table()`). Without the `is_table` gate deploy would accept a
-    // non-table root that app boot rejects.
+    // #2067: leniency applies only to a table. A scalar or array root is malformed and app boot
+    // rejects it, so the lenient load must too.
     #[test]
     fn deploy_cli_lenient_still_rejects_non_table_root() {
         // Scalar root: `media = "enabled"`.
@@ -15760,19 +15657,12 @@ mod tests {
         );
     }
 
-    // #2067: a legitimately quoted-dotted top-level table root — the valid TOML form of
-    // a plugin `config_section("my.plugin")`, whose top-level table is `["my.plugin"]`,
-    // one quoted key that happens to contain a dot — must be leniently accepted by the
-    // deploy CLI, because app boot accepts it too: the #2061 exemption keys on the raw
-    // table key with `path.is_empty()`. The earlier `!path.contains('.')` heuristic
-    // wrongly hard-failed it, since the rendered `my.plugin` is ambiguous between a
-    // quoted top-level key and a two-level path. Gating on the structural
-    // `is_top_level`, an empty parent path, fixes it.
+    // #2067: a quoted-dotted top-level table (`["my.plugin"]`, from
+    // `config_section("my.plugin")`) is one top-level key, so the lenient load accepts it as app
+    // boot does, even though its rendered path `my.plugin` looks two-level.
     #[test]
     fn deploy_cli_lenient_accepts_quoted_dotted_top_level_root() {
-        // `["my.plugin"]` is a quoted top-level key CONTAINING a dot (one
-        // structural top-level table), NOT the nested `[my.plugin]` two-level
-        // form — this is exactly what `config_section("my.plugin")` produces.
+        // `["my.plugin"]` is one top-level key containing a dot, not the two-level `[my.plugin]`.
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             temp.path().join("autumn.toml"),
@@ -15790,9 +15680,7 @@ mod tests {
              `path.contains('.')`: {lenient:?}"
         );
 
-        // Inline-table form of the same quoted-dotted top-level root is
-        // equivalent. It is written BEFORE the `[server]` header so it binds at
-        // the document top level, not inside `[server]`.
+        // The inline-table form must come before `[server]` to bind at the top level.
         let temp2 = tempfile::tempdir().unwrap();
         std::fs::write(
             temp2.path().join("autumn.toml"),
@@ -15806,9 +15694,8 @@ mod tests {
         );
     }
 
-    // 7a (#1890): a typo in a section that ONLY became strictly validated by the
-    // schema-walk fix (here `[log]`, declared after `database`) must WARN, not
-    // fail, during the one-release warn-first rollout.
+    // #1890: a typo in a section the schema-walk fix newly validates (`[log]`) warns during the
+    // warn-first rollout instead of failing.
     #[test]
     fn post_database_section_typo_warns_but_does_not_fail() {
         let temp = tempfile::tempdir().unwrap();
@@ -15818,10 +15705,8 @@ mod tests {
         let env = FakeEnv(
             [
                 ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
-                // Pin a non-dev profile: the `dev` smart-defaults inject a
-                // feature-gated `[storage]` table which, with the `storage`
-                // feature off, is flagged as a hard top-level unknown key and
-                // would derail this test regardless of the `[log]` typo.
+                // Not `dev`: its smart defaults inject a `[storage]` table that, with the `storage`
+                // feature off, is itself an unknown root.
                 ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
                 (
                     "AUTUMN_MANIFEST_DIR".to_owned(),
@@ -15838,8 +15723,7 @@ mod tests {
         );
     }
 
-    // 7b (#1890): with `strict_config_enforce_all` set, the SAME post-database
-    // typo is promoted to a hard error.
+    // #1890: `strict_config_enforce_all` turns the same typo into an error.
     #[test]
     fn post_database_section_typo_fails_under_enforce_all() {
         let temp = tempfile::tempdir().unwrap();
@@ -15852,10 +15736,8 @@ mod tests {
 
         let env = FakeEnv(
             [
-                // Non-dev profile so the `dev` smart-defaults' feature-gated
-                // `[storage]` table isn't injected — otherwise (storage feature
-                // off) the test would fail on `storage`, not the `[log]` typo it
-                // is meant to exercise.
+                // Not `dev`: its smart defaults inject a `[storage]` table that, with the `storage`
+                // feature off, is itself an unknown root.
                 ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
                 (
                     "AUTUMN_MANIFEST_DIR".to_owned(),
@@ -15877,8 +15759,7 @@ mod tests {
         );
     }
 
-    // 7c (#1890 regression guard): sections that were strictly validated BEFORE
-    // the fix (here `[server]`) must keep hard-failing on unknown keys.
+    // #1890: sections validated before the fix (`[server]`) still fail on unknown keys.
     #[test]
     fn pre_database_section_typo_still_hard_fails() {
         let temp = tempfile::tempdir().unwrap();
@@ -15888,9 +15769,8 @@ mod tests {
         let env = FakeEnv(
             [
                 ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
-                // Non-dev profile so the `dev` smart-defaults' feature-gated
-                // `[storage]` table isn't injected; this test must fail on the
-                // `[server]` typo, not on `storage` (storage feature off).
+                // Not `dev`: its smart defaults inject a `[storage]` table that, with the `storage`
+                // feature off, is itself an unknown root.
                 ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
                 (
                     "AUTUMN_MANIFEST_DIR".to_owned(),
@@ -15912,14 +15792,11 @@ mod tests {
         );
     }
 
-    // ── Plugin config-section seam (#1974 item 7) ─────────────────────────────
+    // ── Plugin config-section seam (#1974) ───────────────────────────────────
     //
-    // A plugin owns a top-level `[media]` table core's closed schema knows
-    // nothing about. `load_with_env_and_plugin_roots` exempts declared roots
-    // from the strict unknown-key check as known-and-opaque, while every other
-    // unknown root still hard-fails. All tests pin `AUTUMN_ENV=prod` so the dev
-    // smart-defaults' feature-gated `[storage]` root isn't injected (storage
-    // feature off), which would otherwise be flagged independently of `[media]`.
+    // Declared plugin roots such as `[media]` are exempt from the strict unknown-key check as
+    // known and opaque; every other unknown root still fails. Tests pin `AUTUMN_ENV=prod` so the
+    // dev smart defaults' `[storage]` root is not flagged too.
 
     fn plugin_roots(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| (*s).to_owned()).collect()
@@ -15943,8 +15820,7 @@ mod tests {
         FakeEnv(vars.into_iter().collect())
     }
 
-    // A registered `[media]` root boots green under strict_config: a
-    // media-enabled app no longer fails at boot with `unknown key "media"`.
+    // A registered `[media]` root boots under strict_config.
     #[test]
     fn strict_config_accepts_registered_plugin_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -15962,13 +15838,8 @@ mod tests {
         );
     }
 
-    // #2067 boot/deploy parity: a registered QUOTED-DOTTED plugin root — the app
-    // form of `config_section("my.plugin")`, whose top-level table is
-    // `["my.plugin"]` — is exempted at app-boot strict too. The exemption keys on
-    // the RAW table key (`plugin_config_roots.contains("my.plugin")`) with
-    // `path.is_empty()`, so the dot in the key name is irrelevant. This documents
-    // that deploy leniency (which now derives top-level-ness structurally) and
-    // app boot agree on quoted-dotted top-level roots.
+    // #2067: a registered quoted-dotted root (`["my.plugin"]`) is exempt at app boot too: the
+    // exemption matches the raw table key, so the dot is irrelevant. Deploy leniency agrees.
     #[test]
     fn strict_config_accepts_quoted_dotted_registered_plugin_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -15987,15 +15858,11 @@ mod tests {
         );
     }
 
-    // A registered plugin root written as a NON-TABLE (scalar or array) is a
-    // malformed section, not the opaque `[media]` TABLE `config_section`
-    // declares. It must NOT be exempted: nothing would deserialize it and the
-    // app would boot silently on default plugin config, so it stays a strict
-    // unknown-root HARD failure instead. Only a table-shaped `[media]` is opaque.
+    // A registered root written as a scalar or array is malformed, not the opaque table
+    // `config_section` declares. Exempting it would boot silently on default plugin config.
     #[test]
     fn strict_config_rejects_non_table_registered_plugin_root() {
-        // Scalar misspelling of a registered root (`media = "enabled"` instead of
-        // the `[media]` table) must hard-fail under strict_config.
+        // Scalar root: `media = "enabled"`.
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("autumn.toml"), "media = \"enabled\"\n").unwrap();
 
@@ -16011,8 +15878,7 @@ mod tests {
             "error should name the malformed media root"
         );
 
-        // Array-valued registered root (`media = ["a", "b"]`) is likewise
-        // malformed and must hard-fail.
+        // Array root: `media = ["a", "b"]`.
         let temp_arr = tempfile::tempdir().unwrap();
         std::fs::write(
             temp_arr.path().join("autumn.toml"),
@@ -16098,14 +15964,9 @@ mod tests {
         );
     }
 
-    // A registered plugin root under a profile prefix (`[profile.prod.media]`) stays
-    // strict and must be rejected: the exemption covers only the true top-level
-    // `[media]` table. The media plugin's reader deserializes only the top-level
-    // `root.media` and does not apply Autumn's profile merge, so a profile layer the
-    // plugin cannot consume must not be exempted — otherwise a strict app with media
-    // settings only under `[profile.prod.media]` would boot silently on default plugin
-    // config instead of failing loudly. Profile-aware plugin config is a separate,
-    // larger enhancement.
+    // The exemption covers only the top-level `[media]`: the plugin reads only `root.media`,
+    // without the profile merge, so `[profile.prod.media]` must fail rather than boot on
+    // defaults.
     #[test]
     fn strict_config_still_rejects_profile_prefixed_plugin_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -16131,10 +15992,7 @@ mod tests {
         );
     }
 
-    // The profile-prefix opacity is NOT a blanket allow of profile subtrees: a
-    // genuinely-unknown root under a profile prefix
-    // (`[profile.prod.definitely_not_a_root]`) still hard-fails, because it is
-    // validated against the root schema and is not a registered plugin root.
+    // A non-plugin unknown root under a profile prefix still fails against the root schema.
     #[test]
     fn strict_config_rejects_profile_prefixed_unknown_root() {
         let temp = tempfile::tempdir().unwrap();
@@ -16158,9 +16016,8 @@ mod tests {
         );
     }
 
-    // When strict_config is OFF, behavior is unchanged: `[media]` is tolerated
-    // even with no roots registered (non-strict never ran the check). `prod`
-    // turns strict_config on (#3057), so the test turns it off explicitly.
+    // Non-strict config tolerates `[media]` with no roots registered. `prod` turns
+    // strict_config on (#3057), so the test turns it off explicitly.
     #[test]
     fn non_strict_config_tolerates_media_root_without_registration() {
         let temp = tempfile::tempdir().unwrap();
@@ -16187,17 +16044,12 @@ mod tests {
         );
     }
 
-    // 7c′ (#1890 regression guard): a MALFORMED top-level `[profile]` entry (e.g.
-    // `[profile] dev = "prod"`, whose validation error path is `profile.dev`) is a
-    // structural error that was always fatal under strict_config. It is NOT a
-    // section newly revealed by #1890, so the warn-first classifier must keep it
-    // hard-failing. A genuinely newly-covered section typo (`[resilience]`) with
-    // the same strict_config (enforce_all OFF) must still only warn — proving the
-    // fix is narrow and did not over-broaden into hard-failing new sections.
+    // A malformed `[profile]` entry (error path `profile.dev`) is a structural error
+    // and must hard-fail under strict_config, while a typo in a section only covered
+    // since #1890 (`[resilience]`) still only warns with enforce_all off.
     #[test]
     fn malformed_profile_entry_still_hard_fails() {
-        // Malformed profile block: `dev = "prod"` is a scalar where a nested
-        // profile table is expected -> unknown-key error path `profile.dev`.
+        // `dev = "prod"` is a scalar where a profile table is expected.
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("autumn.toml");
         std::fs::write(&config_path, "[profile]\ndev = \"prod\"\n").unwrap();
@@ -16205,9 +16057,8 @@ mod tests {
         let env = FakeEnv(
             [
                 ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
-                // Non-dev profile so the `dev` smart-defaults' feature-gated
-                // `[storage]` table isn't injected; this test must fail on the
-                // malformed `[profile]` entry, not on `storage`.
+                // Non-dev profile: the `dev` smart defaults inject a feature-gated
+                // `[storage]` table that would fail first.
                 ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
                 (
                     "AUTUMN_MANIFEST_DIR".to_owned(),
@@ -16228,9 +16079,7 @@ mod tests {
             "malformed profile entry must fail as a validation error"
         );
 
-        // Narrowness guard: a typo in a section that only became strictly
-        // validated by #1890 (`[resilience]`) must still WARN (not fail) under the
-        // same strict_config with enforce_all OFF.
+        // A typo in a section covered since #1890 still only warns.
         let temp2 = tempfile::tempdir().unwrap();
         let config_path2 = temp2.path().join("autumn.toml");
         std::fs::write(&config_path2, "[resilience]\nboguz = 1\n").unwrap();
@@ -16238,10 +16087,8 @@ mod tests {
         let env2 = FakeEnv(
             [
                 ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
-                // Non-dev profile so the `dev` smart-defaults' feature-gated
-                // `[storage]` table isn't injected: the `[resilience]` typo must
-                // remain a warn-only (Ok) case, not be masked by a hard-failing
-                // `storage` key when the storage feature is off.
+                // Non-dev profile: the `dev` smart defaults inject a `[storage]` table
+                // that would hard-fail when the storage feature is off.
                 ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
                 (
                     "AUTUMN_MANIFEST_DIR".to_owned(),
@@ -16259,19 +16106,12 @@ mod tests {
         );
     }
 
-    // 7c″ (#1890 P2 fix): a typo under a quoted dotted profile name, such as
-    // `[profile."prod.eu".server]`, must classify by its real segment-derived schema
-    // parent. `"prod.eu"` is one TOML key with a literal dot, so the segmented path is
-    // `["profile", "prod.eu", "server"]` and the profile-stripped schema parent is
-    // `server`, a pre-#1890 strict section that must keep hard-failing rather than be
-    // demoted to warn-only by string-splitting the joined path. A
-    // `[profile."prod.eu".resilience]` typo, in a newly-#1890-covered section, with the
-    // same strict_config and enforce_all off must still only warn — proving the fix
-    // stays narrow under dotted profile names.
+    // `"prod.eu"` is one TOML key with a literal dot, so a typo under
+    // `[profile."prod.eu".server]` has schema parent `server` and must hard-fail.
+    // Splitting the joined path on dots would misclassify it as warn-only. The same
+    // typo under a section covered since #1890 (`resilience`) still only warns.
     #[test]
     fn dotted_profile_name_preserves_strictness() {
-        // Pre-#1890 strict section (`server`) under a quoted dotted profile name:
-        // must hard-fail.
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("autumn.toml");
         std::fs::write(
@@ -16283,9 +16123,8 @@ mod tests {
         let env = FakeEnv(
             [
                 ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
-                // Non-dev profile so the `dev` smart-defaults' feature-gated
-                // `[storage]` table isn't injected; this test must fail on the
-                // `[server]` typo, not on `storage` (storage feature off).
+                // Non-dev profile: the `dev` smart defaults inject a feature-gated
+                // `[storage]` table that would fail first.
                 ("AUTUMN_ENV".to_owned(), "prod".to_owned()),
                 (
                     "AUTUMN_MANIFEST_DIR".to_owned(),
@@ -16308,8 +16147,6 @@ mod tests {
             "hard-fail must be for the [server] typo (right reason): {err_str}"
         );
 
-        // Newly-#1890-covered section (`resilience`) under the same quoted dotted
-        // profile name: must still only WARN (enforce_all off) — the fix is narrow.
         let temp2 = tempfile::tempdir().unwrap();
         let config_path2 = temp2.path().join("autumn.toml");
         std::fs::write(
@@ -16338,9 +16175,7 @@ mod tests {
         );
     }
 
-    // 7d (#1890): the `database.statement_timeout` duration field — whose empty
-    // probe used to abort the schema walk — still deserializes correctly at
-    // runtime, in both string and integer (milliseconds) forms.
+    // `database.statement_timeout` accepts a duration string or integer milliseconds.
     #[test]
     fn statement_timeout_duration_field_loads() {
         let temp = tempfile::tempdir().unwrap();
@@ -16373,7 +16208,6 @@ mod tests {
 
     #[test]
     fn should_warn_total_connections_at_and_above_threshold() {
-        // At or above the threshold warns; below does not.
         assert!(should_warn_total_connections(100, 100));
         assert!(should_warn_total_connections(250, 100));
         assert!(!should_warn_total_connections(99, 100));
@@ -16381,14 +16215,12 @@ mod tests {
 
     #[test]
     fn should_warn_total_connections_zero_threshold_disables() {
-        // A zero threshold silences the warning regardless of the total.
         assert!(!should_warn_total_connections(0, 0));
         assert!(!should_warn_total_connections(10_000, 0));
     }
 
     #[test]
     fn the_connection_warning_speaks_sqlite_to_a_sqlite_app() {
-        // A SQLite app gets SQLite advice, not Postgres advice.
         let sqlite_backend = ConnectionBackend::Sqlite { databases: 65 };
         let sqlite = total_connections_warning(266, 100, sqlite_backend).expect("warns");
         assert!(!sqlite.contains("Postgres"), "{sqlite}");
@@ -16435,7 +16267,7 @@ mod tests {
 
     #[test]
     fn the_open_file_warning_fires_at_eighty_percent_of_the_limit() {
-        // The process also needs files for sockets and logs.
+        // 80%: the process also needs files for sockets and logs.
         assert!(open_files_warning(205, Some(256), 100).is_some());
         assert!(open_files_warning(204, Some(256), 100).is_none());
         assert!(open_files_warning(100, Some(1024), 100).is_none());
@@ -16506,13 +16338,9 @@ mod tests {
 
     #[test]
     fn validate_does_not_error_on_redis_backend_without_url() {
-        // Regression: previously `validate()` called
-        // `session.backend_plan(profile)` which returned an error for
-        // `backend = "redis"` without `redis.url`, exiting the boot before
-        // a `with_session_store(...)` override could apply. Session
-        // backend validation now lives in `build_session_layer`, which
-        // short-circuits when a custom store is installed. `validate()`
-        // is config-shape-only and must accept this combination.
+        // Session backend validation lives in `build_session_layer`, which a custom
+        // store from `with_session_store(...)` short-circuits. `validate()` checks
+        // config shape only, so it must accept this combination.
         let mut config = AutumnConfig::default();
         config.session.backend = crate::session::SessionBackend::Redis;
         config.session.redis.url = None;
@@ -16525,11 +16353,9 @@ mod tests {
 
     #[tokio::test]
     async fn default_toml_env_loader_succeeds_without_files() {
-        // No autumn.toml in the test runner's pwd; loader should fall back to
-        // framework defaults rather than failing.
+        // No autumn.toml in the test runner's pwd: the loader falls back to defaults.
         let loader = TomlEnvConfigLoader::new();
         let resolved = loader.load().await.expect("default loader should succeed");
-        // Default port is 3000 per ServerConfig::default — sanity check.
         assert_eq!(resolved.server.port, 3000);
     }
 
@@ -16570,18 +16396,14 @@ mod tests {
         assert!(result.is_err());
         match result {
             Err(ConfigError::Validation(msg)) => {
-                // Ensure we just match the underlying variant correctly
-                // as requested in the review.
                 assert!(msg.contains("must start with postgres:// or postgresql://"));
             }
             _ => panic!("Expected ConfigError::Validation"),
         }
     }
 
-    // The boot refusal an ordinary `autumn.toml` misconfiguration hits. It
-    // reaches `tracing::error!`, so under `log.format = "json"` whatever it
-    // names lands in the structured log stream — one line after the startup
-    // summary masked the very same URL.
+    // This error reaches `tracing::error!`, so under `log.format = "json"` anything
+    // it names lands in the structured log stream.
     #[test]
     fn database_config_validate_does_not_echo_credentials() {
         for url in [
@@ -16597,7 +16419,7 @@ mod tests {
                 panic!("{url} must be refused");
             };
             assert!(!msg.contains("hunter2"), "password leaked in: {msg}");
-            // Still actionable: the operator can tell which URL to go fix.
+            // Still names the host, so the operator knows which URL to fix.
             assert!(msg.contains("localhost") || msg.contains("broker"), "{msg}");
         }
     }
@@ -16765,15 +16587,11 @@ pool_size = 7
 
     #[test]
     fn alerts_severities_env_overrides_apply() {
-        // Per-channel severity routing must be controllable via the documented
-        // AUTUMN_ALERTS__*_SEVERITIES overrides, using the same `all`/`critical`
-        // value parsing the TOML/file path uses.
         let env = MockEnv::new()
             .with("AUTUMN_ALERTS__SLACK_SEVERITIES", "critical")
             .with("AUTUMN_ALERTS__PAGERDUTY_SEVERITIES", "all")
             .with("AUTUMN_ALERTS__DISCORD_SEVERITIES", "critical");
         let mut config = AutumnConfig::default();
-        // Defaults are `All` for every channel.
         assert_eq!(
             config.alerts.slack_severities,
             crate::alerts::AlertRouting::All
@@ -17310,13 +17128,9 @@ slots = ["8194-16383"]
 
     #[test]
     fn autumn_config_validate_no_longer_errors_on_invalid_session_backend() {
-        // Session backend validation moved to `build_session_layer`, so a custom store
-        // installed via `AppBuilder::with_session_store(...)` can override an otherwise
-        // invalid backend config without the boot exiting first. `validate()` is
-        // config-shape-only now; runtime session selection, and the backend error, live
-        // in `build_session_layer`, which short-circuits when a custom store is
-        // installed. `crate::session::tests::session_backend_plan_*` still cover the
-        // error cases directly on `SessionConfig::backend_plan`.
+        // The backend error lives in `build_session_layer`, so a custom store from
+        // `AppBuilder::with_session_store(...)` can override an invalid backend config.
+        // `crate::session::tests::session_backend_plan_*` cover the error cases.
         let mut config = AutumnConfig::default();
         config.session.backend = crate::session::SessionBackend::Redis;
         config.session.redis.url = None;
@@ -17558,8 +17372,7 @@ path = "/healthz"
 
     #[test]
     fn metrics_section_defaults_to_the_shipped_caps() {
-        // The whole point of making the caps configurable is that an app which
-        // configures nothing keeps the behaviour 0.7.0 shipped.
+        // An app that configures nothing keeps the caps 0.7.0 shipped.
         let config = AutumnConfig::default();
         assert_eq!(config.metrics.limits(), crate::metrics::Limits::default());
 
@@ -17605,8 +17418,8 @@ path = "/healthz"
 
     #[test]
     fn validate_rejects_an_out_of_range_metrics_cap() {
-        // A cap of 0 would drop every labeled sample the app records, silently.
-        // It must fail the boot — and `autumn check` — by name.
+        // A cap of 0 would silently drop every labeled sample, so it fails the boot
+        // and `autumn check` by name.
         let mut config = AutumnConfig::default();
         config.metrics.max_series_per_metric = 0;
 
@@ -17633,8 +17446,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_actuator_prometheus_disables() {
-        // Operators must be able to remove the scrape endpoint via the
-        // documented AUTUMN_SECTION__FIELD convention, not just TOML.
         let env = MockEnv::new().with("AUTUMN_ACTUATOR__PROMETHEUS", "false");
         let mut config = AutumnConfig::default();
         assert!(config.actuator.prometheus, "default should be enabled");
@@ -17717,7 +17528,7 @@ path = "/healthz"
         assert_eq!(config.database.pool_size, 25);
     }
 
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     #[test]
     fn env_override_reporting() {
         let env = MockEnv::new()
@@ -17731,7 +17542,6 @@ path = "/healthz"
         assert!((config.reporting.sample_rate - 0.1).abs() < f64::EPSILON);
     }
 
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_defaults_are_off() {
         let config = AutumnConfig::default();
@@ -17745,7 +17555,6 @@ path = "/healthz"
         assert_eq!(config.failure_capture.max_capsules, 50);
     }
 
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_env_overrides_apply() {
         let env = MockEnv::new()
@@ -17772,7 +17581,6 @@ path = "/healthz"
     /// `deserialize_with` duration field aborts the schema walk. If someone
     /// moves `failure_capture` below `database`, its child keys silently
     /// vanish from the schema and this fails.
-    #[cfg(feature = "reporting")]
     #[test]
     fn failure_capture_child_keys_are_strictly_validated() {
         let leaves = AutumnConfig::schema_leaf_paths();
@@ -17805,6 +17613,37 @@ path = "/healthz"
     // ── [cluster] (issue #1762) ──────────────────────────────────────────
 
     #[test]
+    fn failure_capture_enabled_without_the_feature_fails() {
+        let err = FailureCaptureConfig::check_feature(true, false).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("`reporting` feature"), "{text}");
+        assert!(FailureCaptureConfig::check_feature(true, true).is_ok());
+        assert!(FailureCaptureConfig::check_feature(false, false).is_ok());
+    }
+
+    #[test]
+    fn boot_accepts_or_refuses_failure_capture_by_the_build() {
+        let on = FailureCaptureConfig {
+            enabled: true,
+            ..FailureCaptureConfig::default()
+        };
+        // A build with `reporting` can capture. A build without it cannot.
+        assert_eq!(on.check_build().is_ok(), cfg!(feature = "reporting"));
+        assert!(FailureCaptureConfig::default().check_build().is_ok());
+    }
+
+    #[cfg(not(feature = "reporting"))]
+    #[test]
+    fn boot_refuses_failure_capture_in_a_build_without_reporting() {
+        let on = FailureCaptureConfig {
+            enabled: true,
+            ..FailureCaptureConfig::default()
+        };
+        let text = on.check_build().unwrap_err().to_string();
+        assert!(text.contains("`reporting` feature"), "{text}");
+    }
+
+    #[test]
     fn cluster_enabled_without_the_feature_fails() {
         let err = ClusterConfig::check_feature(true, false).unwrap_err();
         let text = err.to_string();
@@ -17832,7 +17671,6 @@ path = "/healthz"
             "the error must name the missing key so an operator can fix it; got {message:?}"
         );
 
-        // Disabled clusters need nothing: the default config must still boot.
         assert!(
             AutumnConfig::default().cluster.validate().is_ok(),
             "a disabled [cluster] section must validate with no secret at all"
@@ -18025,9 +17863,8 @@ path = "/healthz"
              got {message:?}"
         );
 
-        // …while a wildcard bind WITH a concrete advertised address — the
-        // documented container spelling — must pass, or the rule is a ban on
-        // the very deployment shape the guide recommends.
+        // A wildcard bind with a concrete advertised address is the documented
+        // container spelling.
         config.cluster.advertise_addr = Some("10.0.1.7:7946".to_owned());
         assert!(
             config.cluster.validate().is_ok(),
@@ -18035,7 +17872,6 @@ path = "/healthz"
              and must be accepted"
         );
 
-        // The rule is scoped to enabled sections: a disabled one binds nothing.
         config.cluster.enabled = false;
         config.cluster.advertise_addr = None;
         assert!(
@@ -18131,11 +17967,9 @@ path = "/healthz"
 
     #[test]
     fn an_empty_shadow_routes_override_does_not_disable_mirroring() {
-        // An unfilled compose/CI template (`AUTUMN_SHADOW__ROUTES=`) must not
-        // become a one-element allowlist holding the empty pattern: that
-        // matches no path, so the mirror would run and mirror nothing, with no
-        // diagnostic. Same failure shape `parse_env_csv_non_empty` was added
-        // for in #1621.
+        // An unfilled template (`AUTUMN_SHADOW__ROUTES=`) must not become an
+        // allowlist holding the empty pattern: it matches no path, so the mirror
+        // would silently mirror nothing.
         let env = MockEnv::new().with("AUTUMN_SHADOW__ROUTES", "");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
@@ -18565,8 +18399,8 @@ path = "/healthz"
 
     #[test]
     fn replication_env_does_not_materialize_a_section_from_optional_keys_alone() {
-        // A lone region/prefix cannot replicate anywhere, so it must NOT conjure
-        // a section that then fails validation (mirrors #1619's #1791 fix).
+        // A lone region/prefix cannot replicate anywhere, so it must not create a
+        // section that then fails validation.
         let env = MockEnv::new()
             .with("AUTUMN_REPLICATION__S3__REGION", "auto")
             .with("AUTUMN_REPLICATION__PREFIX", "db")
@@ -18694,7 +18528,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_backup_offsite_absent_stays_none() {
-        // With no offsite env vars and no TOML section, nothing is materialized.
         let env = MockEnv::new();
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
@@ -18703,9 +18536,8 @@ path = "/healthz"
 
     #[test]
     fn env_override_backup_offsite_lone_opt_out_toggle_stays_none() {
-        // P2 #18: a lone false/opt-out toggle must NOT materialize an empty
-        // [backup.offsite] (which would then fail validation / `doctor` with
-        // "bucket is unset"). Offsite stays unconfigured.
+        // A lone opt-out toggle must not materialize an empty [backup.offsite],
+        // which would then fail validation and `doctor` with "bucket is unset".
         for key in [
             "AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD",
             "AUTUMN_BACKUP__OFFSITE__ALLOW_SHARED_BUCKET",
@@ -18722,8 +18554,7 @@ path = "/healthz"
 
     #[test]
     fn env_override_backup_offsite_truthy_auto_upload_materializes() {
-        // P2 #18: AUTO_UPLOAD=true genuinely needs a validated destination, so it
-        // DOES materialize the section (auto_upload set), as before.
+        // AUTO_UPLOAD=true needs a validated destination, so it does materialize.
         let env = MockEnv::new().with("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD", "true");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
@@ -18736,8 +18567,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_backup_offsite_destination_key_materializes() {
-        // A destination/credential key still materializes the section (with the
-        // opt-out toggle applied to it), unchanged from before P2 #18.
         let env = MockEnv::new()
             .with("AUTUMN_BACKUP__OFFSITE__S3__BUCKET", "offsite")
             .with("AUTUMN_BACKUP__OFFSITE__AUTO_UPLOAD", "false");
@@ -18753,11 +18582,8 @@ path = "/healthz"
 
     #[test]
     fn env_override_backup_offsite_lone_optional_key_stays_none() {
-        // #1791: optional-only keys (region, force_path_style, endpoint, prefix,
-        // keep) must NOT materialize [backup.offsite] on their own — a bare
-        // region with no bucket/credentials cannot upload, so offsite stays
-        // UNCONFIGURED rather than producing an empty section that then fails
-        // `doctor` with "bucket is unset".
+        // Optional keys alone cannot upload anywhere, so they must not produce an
+        // empty section that then fails `doctor` with "bucket is unset" (#1791).
         for (key, val) in [
             ("AUTUMN_BACKUP__OFFSITE__S3__REGION", "us-east-1"),
             ("AUTUMN_BACKUP__OFFSITE__S3__ENDPOINT", "https://s3.test"),
@@ -18777,8 +18603,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_backup_offsite_credential_key_materializes() {
-        // #1791: the access/secret key-env names are REQUIRED signals, so either
-        // one still materializes the section.
         for key in [
             "AUTUMN_BACKUP__OFFSITE__S3__ACCESS_KEY_ID_ENV",
             "AUTUMN_BACKUP__OFFSITE__S3__SECRET_ACCESS_KEY_ENV",
@@ -18795,7 +18619,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_backup_offsite_bucket_only_materializes() {
-        // #1791: a lone bucket (required destination signal) still materializes.
         let env = MockEnv::new().with("AUTUMN_BACKUP__OFFSITE__S3__BUCKET", "offsite");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
@@ -18808,8 +18631,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_backup_offsite_region_only_applied_when_materialized() {
-        // #1791: region no longer TRIGGERS materialization, but it is still
-        // APPLIED when a required key materializes the section.
         let env = MockEnv::new()
             .with("AUTUMN_BACKUP__OFFSITE__S3__BUCKET", "offsite")
             .with("AUTUMN_BACKUP__OFFSITE__S3__REGION", "us-west-2")
@@ -18833,15 +18654,12 @@ path = "/healthz"
 
     #[test]
     fn database_auto_migrate_defaults_to_none() {
-        // Issue #1903: the profile-agnostic override is unset by default, so the
-        // decision falls to convention (dev on, everything else opt-in).
+        // Unset by default, so the profile decides: dev on, everything else opt-in (#1903).
         assert_eq!(DatabaseConfig::default().auto_migrate, None);
     }
 
     #[test]
     fn env_override_database_auto_migrate() {
-        // Issue #1903: AUTUMN_DATABASE__AUTO_MIGRATE flips the profile-agnostic
-        // override to an explicit Some(_) on any profile.
         let env = MockEnv::new().with("AUTUMN_DATABASE__AUTO_MIGRATE", "true");
         let mut config = AutumnConfig::default();
         assert_eq!(config.database.auto_migrate, None);
@@ -18900,9 +18718,8 @@ path = "/healthz"
 
     #[test]
     fn retention_config_defaults_leave_every_dataset_unset() {
-        // AC #1: "Leaving a dataset unset preserves today's behavior exactly."
-        // The only way to guarantee that is for every window to default to
-        // None, and for the whole section to report itself as unconfigured.
+        // An unset dataset keeps its existing behavior, so every window defaults to
+        // None and the section reports itself as unconfigured.
         let config = AutumnConfig::default();
         assert!(
             config.retention.job_history.is_none(),
@@ -18987,9 +18804,7 @@ path = "/healthz"
 
     #[test]
     fn env_override_retention_empty_value_clears_a_window() {
-        // An empty env value is the documented way to *unset* a window that
-        // autumn.toml declared, restoring today's behavior for that dataset
-        // without editing the file (matches parse_env_option_string).
+        // An empty env value unsets a window that autumn.toml declared.
         let env = MockEnv::new().with("AUTUMN_RETENTION__JOB_HISTORY", "");
         let mut config = AutumnConfig::default();
         config.retention.job_history = Some("90d".to_owned());
@@ -19014,8 +18829,7 @@ path = "/healthz"
 
     #[test]
     fn retention_validate_rejects_a_zero_window() {
-        // "0s" would purge everything the instant it is written — almost
-        // certainly a typo, and never something to guess at.
+        // "0s" would purge everything the instant it is written: almost certainly a typo.
         let mut config = AutumnConfig::default();
         config.retention.sessions = Some("0s".to_owned());
         let error = config.validate().expect_err("a zero window must fail boot");
@@ -19036,8 +18850,6 @@ path = "/healthz"
 
     #[test]
     fn retention_validate_accepts_a_default_config() {
-        // The whole point of AC #1: an app that never mentions [retention]
-        // must be entirely unaffected, validation included.
         AutumnConfig::default()
             .validate()
             .expect("an unconfigured [retention] section must validate");
@@ -19104,7 +18916,6 @@ path = "/healthz"
     /// Issue #3055: the dead-letter cap is configurable, and `0` is unbounded.
     #[test]
     fn jobs_redis_dead_letter_limit_defaults_parses_and_overrides() {
-        // The default is not smaller than the old hard-coded 1,000.
         let defaults = JobRedisConfig::default();
         assert_eq!(defaults.dead_letter_limit, 10_000);
         assert_eq!(AutumnConfig::default().jobs.redis.dead_letter_limit, 10_000);
@@ -19504,8 +19315,8 @@ path = "/healthz"
 
     #[test]
     fn job_queues_table_form_parses_caps_and_reserved_slots() {
-        // Issue #1623: a queue value may be a bare weight OR a table with
-        // per-queue `concurrency` (cap) and `reserved` (dedicated) slots.
+        // A queue value is a bare weight or a table with `concurrency` (cap) and
+        // `reserved` (dedicated) slots (#1623).
         let config: AutumnConfig = toml::from_str(
             r"
             [jobs.queues]
@@ -19623,8 +19434,7 @@ path = "/healthz"
             vec![
                 vec!["critical".to_owned()],
                 vec!["bulk".to_owned(), "default".to_owned()],
-                // An empty inner list is an *unpinned* tier that drains
-                // everything — a meaningful declaration, not a typo.
+                // An empty inner list is an unpinned tier that drains everything.
                 Vec::<String>::new(),
             ],
         );
@@ -20007,7 +19817,6 @@ path = "/healthz"
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.tenancy.quota_bytes, 0);
 
-        // Set via env: override is applied through the dispatcher.
         let env = MockEnv::new().with("AUTUMN_TENANCY__QUOTA_BYTES", "1048576");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
@@ -20016,7 +19825,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_tenancy_enabled() {
-        // Unset: default stays false.
         let env = MockEnv::new();
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
@@ -20063,8 +19871,56 @@ path = "/healthz"
     }
 
     #[test]
+    fn env_override_tenancy_header_trust() {
+        let mut config = AutumnConfig::default();
+        assert_eq!(config.tenancy.header_trust, None);
+        config.apply_env_overrides_with_env(
+            &MockEnv::new().with("AUTUMN_TENANCY__HEADER_TRUST", "trusted_proxy"),
+        );
+        assert_eq!(
+            config.tenancy.header_trust,
+            Some(TenantHeaderTrust::TrustedProxy)
+        );
+        config.apply_env_overrides_with_env(
+            &MockEnv::new().with("AUTUMN_TENANCY__HEADER_TRUST", "Any_Client"),
+        );
+        assert_eq!(
+            config.tenancy.header_trust,
+            Some(TenantHeaderTrust::AnyClient)
+        );
+        // An unknown value keeps the old value.
+        config.apply_env_overrides_with_env(
+            &MockEnv::new().with("AUTUMN_TENANCY__HEADER_TRUST", "everyone"),
+        );
+        assert_eq!(
+            config.tenancy.header_trust,
+            Some(TenantHeaderTrust::AnyClient)
+        );
+        config
+            .apply_env_overrides_with_env(&MockEnv::new().with("AUTUMN_TENANCY__HEADER_TRUST", ""));
+        assert_eq!(config.tenancy.header_trust, None);
+    }
+
+    #[test]
+    fn tenancy_defaults_to_the_session_source_with_no_header_trust() {
+        let config: AutumnConfig = toml::from_str("[tenancy]\nenabled = true\n").expect("parses");
+        assert_eq!(config.tenancy.source, "session");
+        assert_eq!(config.tenancy.header_trust, None);
+        let config: AutumnConfig =
+            toml::from_str("[tenancy]\nsource = \"header\"\nheader_trust = \"trusted_proxy\"\n")
+                .expect("parses");
+        assert_eq!(
+            config.tenancy.header_trust,
+            Some(TenantHeaderTrust::TrustedProxy)
+        );
+        assert!(
+            toml::from_str::<AutumnConfig>("[tenancy]\nheader_trust = \"everyone\"\n").is_err(),
+            "an unknown header_trust must not parse"
+        );
+    }
+
+    #[test]
     fn env_override_isolation_knobs() {
-        // Issue #3072: every isolation knob is settable from the environment.
         let env = MockEnv::new()
             .with("AUTUMN_TENANCY__MAX_CONCURRENT_REQUESTS", "32")
             .with("AUTUMN_TENANCY__MAX_DB_CONNECTIONS", "4")
@@ -20104,13 +19960,12 @@ path = "/healthz"
     fn env_override_tenancy_secret() {
         use secrecy::ExposeSecret;
 
-        // Unset: default stays None.
         let env = MockEnv::new();
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.tenancy.jwt_secret.is_none());
 
-        // Set via env: wrapped as a SecretString, trimmed.
+        // The value is trimmed.
         let env = MockEnv::new().with("AUTUMN_TENANCY__JWT_SECRET", "  s3cr3t-signing-key  ");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
@@ -20123,7 +19978,7 @@ path = "/healthz"
             Some("s3cr3t-signing-key".to_string())
         );
 
-        // Empty value clears the secret.
+        // A blank value clears the secret.
         let env = MockEnv::new().with("AUTUMN_TENANCY__JWT_SECRET", "   ");
         let mut config = AutumnConfig::default();
         config.tenancy.jwt_secret = Some(secrecy::SecretString::from("preexisting".to_string()));
@@ -20293,9 +20148,8 @@ path = "/healthz"
 
     #[test]
     fn server_upgrade_config_defaults_enabled_with_a_30s_readiness_budget() {
-        // On by default: SIGUSR2's own default disposition terminates the
-        // process, so an app that ignores this feature is strictly safer with
-        // the handler installed than without it.
+        // On by default: SIGUSR2's default disposition terminates the process, so
+        // installing the handler is strictly safer.
         let config = AutumnConfig::default();
         assert!(config.server.upgrade.enabled);
         assert_eq!(config.server.upgrade.ready_timeout_secs, 30);
@@ -20317,7 +20171,6 @@ path = "/healthz"
 
     #[test]
     fn env_overrides_server_upgrade() {
-        // The deploy-time knob an operator reaches for first is the env var.
         let env = MockEnv::new()
             .with("AUTUMN_SERVER__UPGRADE__ENABLED", "false")
             .with("AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS", "90");
@@ -20331,7 +20184,6 @@ path = "/healthz"
 
     #[test]
     fn server_config_defaults_tls_none() {
-        // Default must keep plain HTTP so existing apps are unaffected.
         let config = AutumnConfig::default();
         assert!(config.server.tls.is_none());
     }
@@ -20355,10 +20207,8 @@ path = "/healthz"
             tls.key_path,
             Some(std::path::PathBuf::from("/etc/autumn/tls/privkey.pem"))
         );
-        // Reload interval and handshake timeout default when omitted.
         assert_eq!(tls.reload_interval_secs, 60);
         assert_eq!(tls.handshake_timeout_secs, 10);
-        // No ACME section → static-cert mode.
         assert!(tls.acme.is_none());
         assert!(tls.validate().is_ok());
     }
@@ -20393,8 +20243,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_materializes_server_tls() {
-        // A fully env-driven deployment can enable direct HTTPS with no
-        // [server.tls] section in autumn.toml.
         let env = MockEnv::new()
             .with("AUTUMN_SERVER__TLS__CERT_PATH", "/env/cert.pem")
             .with("AUTUMN_SERVER__TLS__KEY_PATH", "/env/key.pem")
@@ -20415,8 +20263,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_updates_existing_server_tls_cert() {
-        // An env var overrides just the cert path of a TOML-configured section,
-        // leaving the key path intact.
         let mut config: AutumnConfig = toml::from_str(
             r#"
             [server.tls]
@@ -20447,8 +20293,6 @@ path = "/healthz"
 
     #[test]
     fn deploy_absent_is_none() {
-        // No [deploy] section → the field stays None so existing apps are
-        // unaffected.
         let config = AutumnConfig::default();
         assert!(config.deploy.is_none());
         let parsed: AutumnConfig = toml::from_str("[server]\nport = 3000\n")
@@ -20458,8 +20302,6 @@ path = "/healthz"
 
     #[test]
     fn deploy_defaults_from_bare_table() {
-        // A bare [deploy] table materializes the section with every optional
-        // field at its documented default.
         let config: AutumnConfig =
             toml::from_str("[deploy]\n").expect("bare [deploy] table should parse");
         let deploy = config.deploy.expect("deploy configured");
@@ -20471,10 +20313,8 @@ path = "/healthz"
         assert_eq!(deploy.service_name, None);
         assert_eq!(deploy.readiness_timeout_secs, 60);
         assert_eq!(deploy.keep_releases, 3);
-        // #1607: host preparation is ON by default, so the documented "target host
-        // precondition is at most a stock Ubuntu LTS" holds for a bare table. A
-        // plain `#[serde(default)]` here would silently deserialize `false` for
-        // every real user while `DeployConfig::default()` stayed `true`.
+        // Host preparation is on by default. A plain `#[serde(default)]` would
+        // deserialize `false` while `DeployConfig::default()` says `true`.
         assert!(deploy.install_proxy);
     }
 
@@ -20513,7 +20353,7 @@ path = "/healthz"
 
     #[test]
     fn deploy_validate_rejects_missing_host() {
-        // Missing host: a bare table is valid at rest but validate() rejects it.
+        // A bare table parses, but validate() rejects it for the missing host.
         let missing = DeployConfig::default();
         let err = missing
             .validate()
@@ -20523,14 +20363,12 @@ path = "/healthz"
             "error should name the missing key: {err}"
         );
 
-        // Present-but-blank host is also rejected.
         let blank = DeployConfig {
             host: Some("   ".to_owned()),
             ..DeployConfig::default()
         };
         assert!(blank.validate().is_err());
 
-        // A real host passes.
         let ok = DeployConfig {
             host: Some("example.com".to_owned()),
             ..DeployConfig::default()
@@ -20540,8 +20378,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_materializes_deploy() {
-        // A CI/VPS deploy can keep the target host out of autumn.toml and drive
-        // the whole [deploy] section through AUTUMN_DEPLOY__* env vars.
         let env = MockEnv::new()
             .with("AUTUMN_DEPLOY__HOST", "203.0.113.10")
             .with("AUTUMN_DEPLOY__USER", "deploy")
@@ -20570,10 +20406,8 @@ path = "/healthz"
 
     #[test]
     fn env_override_declines_deploy_host_preparation() {
-        // #1607: a CI pipeline deploying to pre-provisioned hosts must be able to
-        // decline host preparation without editing `autumn.toml`. The key is also in
-        // the presence probe, so setting only it materializes `[deploy]` — otherwise
-        // the override would be silently skipped for an env-only config.
+        // The key is in the presence probe, so setting only it materializes
+        // `[deploy]`; otherwise an env-only config would silently skip it.
         let env = MockEnv::new().with("AUTUMN_DEPLOY__INSTALL_PROXY", "false");
         let mut config = AutumnConfig::default();
         assert!(config.deploy.is_none());
@@ -20581,7 +20415,6 @@ path = "/healthz"
         let deploy = config.deploy.expect("env should materialize deploy");
         assert!(!deploy.install_proxy);
 
-        // …and it wins over TOML, like every other deploy override.
         let mut from_toml: AutumnConfig =
             toml::from_str("[deploy]\nhost = \"203.0.113.10\"\ninstall_proxy = true\n").unwrap();
         from_toml.apply_env_overrides_with_env(&env);
@@ -20659,9 +20492,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_sets_deploy_tls_enabled_and_host() {
-        // Opt-in TLS (#1969) can be driven entirely from the environment: setting
-        // both keys materializes `[deploy]` with TLS on and the host — the exact
-        // precondition under which the CLI resolves `tls_host == Some(host)`.
         let env = MockEnv::new()
             .with("AUTUMN_DEPLOY__TLS__ENABLED", "true")
             .with("AUTUMN_DEPLOY__TLS__HOST", "app.example.com");
@@ -20675,7 +20505,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_wins_over_toml_deploy_tls_host() {
-        // TOML configures a TLS host...
         let mut config: AutumnConfig = toml::from_str(
             r#"
             [deploy]
@@ -20692,7 +20521,6 @@ path = "/healthz"
             Some("toml.example.com"),
         );
 
-        // ...and the env var overrides it, matching every other deploy override.
         let env = MockEnv::new().with("AUTUMN_DEPLOY__TLS__HOST", "env.example.com");
         config.apply_env_overrides_with_env(&env);
         let deploy = config.deploy.unwrap();
@@ -20702,8 +20530,7 @@ path = "/healthz"
 
     #[test]
     fn deploy_profile_defaults_to_production() {
-        // A bare `[deploy]` table (or one omitting `profile`) resolves to the
-        // production profile so a deploy never silently runs the `dev` profile.
+        // A deploy never silently runs the `dev` profile.
         let config: AutumnConfig = toml::from_str(
             r#"
             [deploy]
@@ -20713,13 +20540,11 @@ path = "/healthz"
         .unwrap();
         let deploy = config.deploy.expect("deploy configured");
         assert_eq!(deploy.profile, "prod");
-        // The type default matches the serde default.
         assert_eq!(DeployConfig::default().profile, "prod");
     }
 
     #[test]
     fn deploy_profile_honors_toml_and_env_override() {
-        // TOML sets a non-prod profile...
         let mut config: AutumnConfig = toml::from_str(
             r#"
             [deploy]
@@ -20730,7 +20555,6 @@ path = "/healthz"
         .unwrap();
         assert_eq!(config.deploy.as_ref().unwrap().profile, "staging");
 
-        // ...and `AUTUMN_DEPLOY__PROFILE` wins over the TOML value.
         let env = MockEnv::new().with("AUTUMN_DEPLOY__PROFILE", "prod");
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.deploy.unwrap().profile, "prod");
@@ -20738,15 +20562,12 @@ path = "/healthz"
 
     #[test]
     fn env_override_materializes_deploy_from_single_host() {
-        // Setting only AUTUMN_DEPLOY__HOST with no [deploy] in TOML seeds the
-        // section with defaults and fills in the host.
         let env = MockEnv::new().with("AUTUMN_DEPLOY__HOST", "198.51.100.7");
         let mut config = AutumnConfig::default();
         assert!(config.deploy.is_none());
         config.apply_env_overrides_with_env(&env);
         let deploy = config.deploy.expect("env should materialize deploy");
         assert_eq!(deploy.host.as_deref(), Some("198.51.100.7"));
-        // Remaining fields fall back to their documented defaults.
         assert_eq!(deploy.user, "root");
         assert_eq!(deploy.ssh_port, 22);
         assert_eq!(deploy.readiness_timeout_secs, 60);
@@ -20755,8 +20576,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_updates_existing_deploy_host() {
-        // An env var overrides just the host of a TOML-configured section,
-        // leaving the other keys intact.
         let mut config: AutumnConfig = toml::from_str(
             r#"
             [deploy]
@@ -20797,10 +20616,7 @@ path = "/healthz"
 
     #[test]
     fn deploy_hosts_list_parses_in_declaration_order_and_defaults_to_empty() {
-        // #1621 (AC-1): `[deploy] hosts` is the fleet spelling of the target
-        // list. Declaration order IS the rollout order, so parsing must preserve
-        // it verbatim, and a `[deploy]` table without the key stays empty so
-        // every pre-#1621 config is unchanged.
+        // Declaration order is the rollout order, so parsing must preserve it.
         let config: AutumnConfig = toml::from_str(
             r#"
             [deploy]
@@ -20970,11 +20786,9 @@ path = "/healthz"
 
     #[test]
     fn deploy_validate_rejects_host_and_hosts_set_together() {
-        // #1621 (AC-1): `host` and `hosts` are mutually exclusive — with both set
-        // there is no unambiguous rollout order. `DeployConfig::validate` is not
-        // wired into `AutumnConfig::validate` (the CLI's `ResolvedFleet::resolve`
-        // is the enforcing seam), but it must MIRROR the same rules so the two
-        // never disagree about what a valid `[deploy]` table looks like.
+        // With both set the rollout order is ambiguous. `AutumnConfig::validate` does
+        // not call `DeployConfig::validate`; the CLI's `ResolvedFleet::resolve`
+        // enforces this, and `DeployConfig::validate` mirrors its rules.
         let cfg = DeployConfig {
             host: Some("203.0.113.10".to_owned()),
             hosts: vec!["web-1.example.com".to_owned()],
@@ -20992,10 +20806,9 @@ path = "/healthz"
 
     #[test]
     fn deploy_validate_rejects_blank_and_duplicate_hosts_entries() {
-        // #1621 (AC-1): a blank entry is a typo that would otherwise resolve to a
-        // hostless SSH target mid-rollout, and a duplicate entry would deploy the
-        // same machine twice (the second pass sees its own new release as live and
-        // corrupts the blue/green previous-release chain).
+        // A blank entry would resolve to a hostless SSH target mid-rollout. A
+        // duplicate would deploy one machine twice: the second pass sees its own new
+        // release as live and corrupts the blue/green previous-release chain.
         let blank = DeployConfig {
             hosts: vec!["web-1.example.com".to_owned(), "   ".to_owned()],
             ..DeployConfig::default()
@@ -21039,11 +20852,9 @@ path = "/healthz"
 
     #[test]
     fn env_override_materializes_deploy_from_hosts_only() {
-        // #1621: `KEYS` in `apply_deploy_env_overrides` is a PRESENCE PROBE that
-        // gates materialisation of the ENTIRE `[deploy]` table. If
-        // `AUTUMN_DEPLOY__HOSTS` is missing from that array, an env-only fleet
-        // config produces no deploy section at all — a silent skip, not an error,
-        // in both `AutumnConfig::load` and `autumn doctor`. This is the trap test.
+        // `KEYS` in `apply_deploy_env_overrides` is the presence probe that gates the
+        // whole `[deploy]` table. Without `AUTUMN_DEPLOY__HOSTS` in it, an env-only
+        // fleet config silently produces no deploy section.
         let env = MockEnv::new().with(
             "AUTUMN_DEPLOY__HOSTS",
             "web-1.example.com,web-2.example.com",
@@ -21063,7 +20874,6 @@ path = "/healthz"
             "the CSV env value must parse into the ordered fleet list, got: {:?}",
             deploy.hosts
         );
-        // Every other key falls back to its documented default.
         assert_eq!(deploy.host, None, "got: {:?}", deploy.host);
         assert_eq!(deploy.user, "root");
         assert_eq!(deploy.ssh_port, 22);
@@ -21071,9 +20881,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_hosts_replaces_the_whole_toml_list() {
-        // #1621: `AUTUMN_DEPLOY__HOSTS` is a fleet-level RETARGET — it replaces
-        // the TOML list wholesale rather than appending, matching every other
-        // `AUTUMN_DEPLOY__*` override (env wins).
         let mut config: AutumnConfig = toml::from_str(
             r#"
             [deploy]
@@ -21094,14 +20901,9 @@ path = "/healthz"
 
     #[test]
     fn an_empty_deploy_hosts_env_override_behaves_as_unset() {
-        // `AUTUMN_DEPLOY__HOSTS=` is the shape a CI or compose env template
-        // produces for "fill in for a fleet" — exactly what the sibling
-        // `AUTUMN_DEPLOY__HOST=` harmlessly takes. Splitting it
-        // unconditionally yielded `[""]`, a NON-empty fleet list holding a
-        // blank string, so a project keeping `[deploy] host` in autumn.toml
-        // hard-failed every `autumn deploy` subcommand (and `autumn doctor`)
-        // with "`[deploy] host` and `[deploy] hosts` are mutually exclusive" —
-        // naming a key the operator never set.
+        // `AUTUMN_DEPLOY__HOSTS=` is what an unfilled CI or compose template emits.
+        // Splitting it into `[""]` would give a non-empty fleet list, which trips the
+        // host/hosts mutual-exclusion error for a project that only set `host`.
         for blank in ["", "   ", ",", " , "] {
             let mut config: AutumnConfig = toml::from_str(
                 r#"
@@ -21129,10 +20931,8 @@ path = "/healthz"
 
     #[test]
     fn a_trailing_comma_in_the_deploy_hosts_env_override_is_tolerated() {
-        // Generated env lists routinely carry a trailing (or doubled) comma;
-        // the blank segment it produces used to reach the CLI as a blank fleet
-        // entry and refuse the whole command. Blank segments are dropped, so
-        // the list is exactly the addresses the operator wrote.
+        // Generated env lists often carry a trailing or doubled comma. Blank segments
+        // are dropped rather than refused as blank fleet entries.
         for (value, expected) in [
             ("10.0.0.1,10.0.0.2,", vec!["10.0.0.1", "10.0.0.2"]),
             ("10.0.0.1,,10.0.0.2", vec!["10.0.0.1", "10.0.0.2"]),
@@ -21186,12 +20986,8 @@ path = "/healthz"
 
     #[test]
     fn a_non_empty_deploy_host_env_override_clears_the_toml_alternate_spelling() {
-        // #1621 review round 1 (Codex 1). `host` and `hosts` are MUTUALLY
-        // EXCLUSIVE downstream, so an env override that sets one spelling while the
-        // TOML still holds the other produced a config that refuses every `autumn
-        // deploy` subcommand — even though `AUTUMN_DEPLOY__*` is documented to WIN
-        // over TOML. Retargeting a `[deploy] host` project as a fleet with
-        // `AUTUMN_DEPLOY__HOSTS=a,b` (and the reverse) must simply work.
+        // `host` and `hosts` are mutually exclusive, and env wins over TOML, so a
+        // non-empty env spelling clears the other spelling from TOML.
         let mut fleet_over_scalar: AutumnConfig = toml::from_str(
             r#"
             [deploy]
@@ -21245,11 +21041,9 @@ path = "/healthz"
 
     #[test]
     fn two_conflicting_non_empty_deploy_host_env_overrides_are_still_refused() {
-        // #1621 review round 1 (Codex 1), the other half: env-over-TOML precedence
-        // is NOT a licence to pick a winner between two conflicting env vars. Both
-        // spellings set NON-EMPTY in the environment is a genuine operator error —
-        // the rollout order is ambiguous — so both survive and the downstream
-        // mutual-exclusion refusal still fires.
+        // Env-over-TOML precedence does not pick a winner between two env vars. Both
+        // spellings set in the environment is an operator error, so both survive and
+        // validation refuses them.
         for toml_src in [
             "[deploy]\n",
             "[deploy]\nhost = \"toml-host\"\n",
@@ -21282,11 +21076,8 @@ path = "/healthz"
 
     #[test]
     fn an_empty_deploy_host_env_override_never_clears_the_toml_alternate_spelling() {
-        // #1621 review round 1 (Codex 1). The established empty-means-unset
-        // semantics must survive the clearing rule above: `AUTUMN_DEPLOY__HOST=`
-        // and `AUTUMN_DEPLOY__HOSTS=` (the shape a CI/compose template emits for an
-        // unfilled slot) say NOTHING about the alternate spelling, so the TOML value
-        // stands.
+        // An empty env value means unset, so it says nothing about the alternate
+        // spelling and the TOML value stands.
         for blank in ["", "   ", ",", " , "] {
             let mut config: AutumnConfig = toml::from_str(
                 r#"
@@ -21322,8 +21113,7 @@ path = "/healthz"
                 "AUTUMN_DEPLOY__HOST={blank:?} must not clear the TOML `hosts`"
             );
         }
-        // `AUTUMN_DEPLOY__HOST=` (truly empty) keeps its own documented
-        // clears-the-scalar meaning — the clearing rule above changes nothing here.
+        // A truly empty `AUTUMN_DEPLOY__HOST=` still clears the scalar itself.
         let mut config = AutumnConfig {
             deploy: Some(DeployConfig {
                 host: Some("toml-host".to_owned()),
@@ -21348,7 +21138,6 @@ path = "/healthz"
         )
         .expect("server-only TLS should parse");
         let tls = config.server.tls.expect("tls configured");
-        // Absent section => no client auth at all, so #1603's path is unchanged.
         assert!(tls.client_auth.is_none());
         assert!(!tls.client_auth_active());
         assert!(tls.validate().is_ok());
@@ -21453,9 +21242,8 @@ path = "/healthz"
 
     #[test]
     fn client_auth_rejects_required_paths_when_mode_is_off() {
-        // Routes declaring an mTLS requirement on a listener that never
-        // requests a certificate would reject every request forever — that is a
-        // misconfiguration, not a posture.
+        // A listener that never requests a certificate would reject every request
+        // to a route that requires one.
         let ca = ClientAuthConfig {
             required_paths: vec!["/internal/".to_owned()],
             ..ClientAuthConfig::default()
@@ -21480,10 +21268,8 @@ path = "/healthz"
 
     #[test]
     fn client_auth_rejects_noncanonical_required_paths() {
-        // Requests are normalized before matching but the configured prefix is
-        // not, so `/internal//` would protect strictly less than it looks like
-        // it does. A prefix that protects less than the operator wrote is the
-        // failure this section exists to prevent.
+        // Requests are normalized before matching but the configured prefix is not,
+        // so `/internal//` would protect less than it appears to.
         for bad in [
             "/internal//",
             "//internal",
@@ -21502,7 +21288,6 @@ path = "/healthz"
             assert!(err.contains("required_paths"), "unhelpful message: {err}");
         }
 
-        // The canonical spellings stay accepted.
         for good in ["/internal", "/internal/", "/internal/keys", "/"] {
             let ca = ClientAuthConfig {
                 mode: ClientAuthMode::Required,
@@ -21587,7 +21372,7 @@ path = "/healthz"
         let acme = tls.acme.as_ref().expect("acme configured");
         assert_eq!(acme.domains, vec!["app.example.com".to_owned()]);
         assert_eq!(acme.contact_email, "ops@example.com");
-        // Staging is the default on purpose (rate-limit safety).
+        // Staging is the default so experiments do not hit production rate limits.
         assert_eq!(acme.directory, AcmeDirectory::Staging);
         assert_eq!(acme.cache_dir, PathBuf::from("config/acme"));
         assert_eq!(acme.http_challenge_port, 80);
@@ -21597,8 +21382,7 @@ path = "/healthz"
 
     #[test]
     fn acme_ca_root_path_defaults_to_unset_and_round_trips() {
-        // Unset is the default: Let's Encrypt's staging and production API
-        // endpoints are publicly trusted, so no extra root is needed.
+        // Let's Encrypt's endpoints are publicly trusted, so no extra root is needed.
         let acme = acme_cfg(&["app.example.com"], "ops@example.com");
         assert_eq!(acme.ca_root_path, None);
         assert!(acme.validate().is_ok());
@@ -21623,9 +21407,8 @@ path = "/healthz"
 
     #[test]
     fn acme_rejects_a_blank_ca_root_path() {
-        // An empty path would otherwise be carried all the way into the renewal
-        // loop and fail every order at the TLS handshake with a far less
-        // actionable message.
+        // An empty path would otherwise fail every order at the TLS handshake, with a
+        // far less actionable message.
         let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
         acme.ca_root_path = Some(PathBuf::new());
         let err = acme
@@ -21711,9 +21494,8 @@ path = "/healthz"
         assert!(err.contains("wildcard"), "got: {err}");
     }
 
-    // Regression (#1608, Codex P2): a blank/whitespace-only domain entry passes
-    // `domains.is_empty()` (the list has length 1) but the runtime then orders a
-    // cert for an empty DNS identifier, so `validate()` must reject it up front.
+    // A blank entry passes `domains.is_empty()` but would order a cert for an empty
+    // DNS identifier.
     #[test]
     fn validate_acme_blank_domain_entry_rejected() {
         let mut cfg = tls_static(None, None);
@@ -21721,19 +21503,15 @@ path = "/healthz"
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("blank entries"), "got: {err}");
 
-        // A whitespace-only entry is rejected the same way.
         let mut cfg = tls_static(None, None);
         cfg.acme = Some(acme_cfg(&["   "], "ops@example.com"));
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("blank entries"), "got: {err}");
     }
 
-    // The `autumn doctor` grader FAILs a malformed `http_challenge_port` /
-    // `renew_before_days` (#1608, #1874) on the premise that the runtime's TYPED
-    // deserialization rejects the same spellings before boot. Pin that premise
-    // here: if a future lenient `deserialize_with` ever made the runtime accept
-    // `"30"`, doctor would start FAILing a file that boots fine — the same parity
-    // bug in the opposite direction, and today nothing would catch it.
+    // `autumn doctor` fails a malformed `http_challenge_port` / `renew_before_days`
+    // because typed deserialization rejects the same spellings at boot. If a lenient
+    // `deserialize_with` ever accepted `"30"`, doctor would fail a file that boots.
     #[test]
     fn acme_numeric_fields_reject_non_integer_toml_values() {
         for key in ["http_challenge_port", "renew_before_days"] {
@@ -21747,8 +21525,6 @@ path = "/healthz"
                     "{key} = {bad} must fail to deserialize"
                 );
             }
-            // ... while the plain unquoted integer the doctor grader treats as
-            // valid really is accepted.
             let src = format!(
                 "[server.tls.acme]\ndomains = [\"app.example.com\"]\n\
                  contact_email = \"ops@example.com\"\n{key} = 45\n"
@@ -21760,12 +21536,8 @@ path = "/healthz"
         }
     }
 
-    // Regression (#1874): a whitespace-padded domain (`" app.example.com "`)
-    // passed `validate()` — the blank and wildcard checks look at `domain.trim()`
-    // but the UNTRIMMED value is what is stored, so the padded string reached the
-    // placeholder/CSR builder and the ACME `Identifier::Dns` order. The CA then
-    // rejects (or mis-issues) an identifier that is not the hostname the operator
-    // meant, with a far less actionable error than a boot-time rejection.
+    // The untrimmed domain is what is stored, so a padded entry would reach the CSR
+    // and the ACME `Identifier::Dns` order, which the CA rejects or mis-issues (#1874).
     #[test]
     fn validate_acme_whitespace_padded_domain_rejected() {
         for padded in [
@@ -21793,8 +21565,6 @@ path = "/healthz"
             );
         }
 
-        // A padded entry is rejected even when a well-formed one precedes it, and
-        // the message points at the right index.
         let mut cfg = tls_static(None, None);
         cfg.acme = Some(acme_cfg(
             &["app.example.com", " www.example.com "],
@@ -21806,16 +21576,13 @@ path = "/healthz"
             "message must name the index: {err}"
         );
 
-        // The already-trimmed spelling of the same name still passes.
         let mut cfg = tls_static(None, None);
         cfg.acme = Some(acme_cfg(&["app.example.com"], "ops@example.com"));
         assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
     }
 
-    // The padded-domain rule must not shadow the two more specific per-entry
-    // rules: a whitespace-only entry is still reported as blank, and a padded
-    // wildcard is still reported as a wildcard (the deeper problem, and the
-    // message operators already get today).
+    // A whitespace-only entry is still reported as blank, and a padded wildcard as a
+    // wildcard, the deeper problem.
     #[test]
     fn validate_acme_padded_domain_rule_does_not_shadow_blank_or_wildcard() {
         let mut cfg = tls_static(None, None);
@@ -21830,9 +21597,8 @@ path = "/healthz"
         assert!(err.contains("[server.tls.acme.dns]"), "got: {err}");
     }
 
-    // Regression (#1608, Codex P2): `http_challenge_port = 0` binds an ephemeral
-    // OS port the HTTP-01 validator (always port 80) can never reach, so every
-    // issuance fails while the process stays up — `validate()` must reject it.
+    // Port 0 binds an ephemeral port the HTTP-01 validator (always port 80) can never
+    // reach, so every issuance would fail while the process stays up.
     #[test]
     fn validate_acme_zero_http_challenge_port_rejected() {
         let mut cfg = tls_static(None, None);
@@ -21843,14 +21609,11 @@ path = "/healthz"
         assert!(err.contains("http_challenge_port"), "got: {err}");
     }
 
-    // Regression (#1608, Codex P2): a `renew_before_days` >= the issued cert's
-    // lifetime (treated as ~90 days for a public CA) keeps `needs_renewal` true
-    // immediately after every successful renewal, so the hourly loop re-orders a
-    // fresh cert every tick until the CA rate-limits the account. `validate()`
-    // must reject any value >= 90.
+    // A `renew_before_days` at or above the cert lifetime (~90 days for a public CA)
+    // keeps `needs_renewal` true after every renewal, so the hourly loop re-orders
+    // until the CA rate-limits the account.
     #[test]
     fn validate_acme_renew_before_days_at_or_above_cert_lifetime_rejected() {
-        // Well above the cert lifetime (the reviewer's example).
         let mut cfg = tls_static(None, None);
         let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
         acme.renew_before_days = 100;
@@ -21859,8 +21622,7 @@ path = "/healthz"
         assert!(err.contains("renew_before_days"), "got: {err}");
         assert!(err.contains("rate limits"), "got: {err}");
 
-        // Exactly 90 (== the effective max cert lifetime) is also rejected: the
-        // fresh cert would be due for renewal from the moment it is issued.
+        // At exactly 90 the fresh cert is due for renewal the moment it is issued.
         let mut cfg = tls_static(None, None);
         let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
         acme.renew_before_days = 90;
@@ -21870,14 +21632,12 @@ path = "/healthz"
             "renew_before_days == 90 must be rejected"
         );
 
-        // A sane sub-lifetime value passes.
         let mut cfg = tls_static(None, None);
         let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
         acme.renew_before_days = 30;
         cfg.acme = Some(acme);
         assert!(cfg.validate().is_ok(), "got: {:?}", cfg.validate());
 
-        // The just-below-boundary value (89) is still accepted.
         let mut cfg = tls_static(None, None);
         let mut acme = acme_cfg(&["app.example.com"], "ops@example.com");
         acme.renew_before_days = 89;
@@ -21948,10 +21708,9 @@ path = "/healthz"
         }
     }
 
-    // AC3: DNS provider API tokens are NEVER supplied in plaintext `autumn.toml`.
-    // The section has no field to hold one, and `deny_unknown_fields` turns an
-    // operator's attempt into a load-time error rather than a silently-ignored key
-    // that leaves them wondering why the token "did not work".
+    // DNS provider tokens never live in plaintext `autumn.toml`. The section has no
+    // field for one, and `deny_unknown_fields` makes an attempt a load-time error
+    // rather than a silently ignored key.
     #[test]
     fn acme_dns_section_rejects_an_inline_secret() {
         for secret_key in [
@@ -21977,8 +21736,7 @@ path = "/healthz"
         }
     }
 
-    // AC1: a wildcard domain is accepted once — and only once — a DNS-01 provider
-    // is configured, because only DNS-01 can validate a wildcard identifier.
+    // Only DNS-01 can validate a wildcard identifier.
     #[test]
     fn validate_acme_wildcard_requires_a_dns_provider() {
         let mut cfg = tls_static(None, None);
@@ -21993,7 +21751,6 @@ path = "/healthz"
         );
         assert!(err.contains("DNS-01"), "got: {err}");
 
-        // With the section present it is accepted.
         let mut cfg = tls_static(None, None);
         let mut acme = acme_cfg(&["myapp.com", "*.myapp.com"], "ops@myapp.com");
         acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
@@ -22018,7 +21775,6 @@ path = "/healthz"
             );
         }
 
-        // The one well-formed shape stays accepted.
         let mut cfg = tls_static(None, None);
         let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
         acme.dns = Some(acme_dns_cfg(AcmeDnsProvider::Cloudflare));
@@ -22037,8 +21793,7 @@ path = "/healthz"
             .expect_err("provider = \"exec\" with no command must be rejected");
         assert!(err.contains("command"), "got: {err}");
 
-        // …and a command on a non-exec provider is a misconfiguration too: it
-        // would be silently ignored while the operator believes it runs.
+        // A command on a non-exec provider would be silently ignored.
         let mut cfg = tls_static(None, None);
         let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
         let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
@@ -22079,9 +21834,9 @@ path = "/healthz"
         assert!(err.contains("poll_interval_secs"), "got: {err}");
     }
 
-    // An unbounded budget reaches `Instant::now() + Duration::from_secs(..)`,
-    // which PANICS on overflow — inside the spawned renewal task, where the
-    // panic kills the loop silently and the placeholder is served forever.
+    // An unbounded budget overflows `Instant::now() + Duration::from_secs(..)` and
+    // panics inside the renewal task, which then dies silently and the placeholder
+    // cert is served forever.
     #[test]
     fn validate_acme_dns_rejects_an_unbounded_propagation_timeout() {
         let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
@@ -22093,7 +21848,6 @@ path = "/healthz"
             .expect_err("an unbounded propagation budget is invalid");
         assert!(err.contains("propagation_timeout_secs"), "got: {err}");
 
-        // The documented ceiling itself is accepted.
         let mut acme = acme_cfg(&["*.myapp.com"], "ops@myapp.com");
         let mut dns = acme_dns_cfg(AcmeDnsProvider::Cloudflare);
         dns.propagation_timeout_secs = MAX_ACME_DNS_PROPAGATION_TIMEOUT_SECS;
@@ -22165,11 +21919,9 @@ path = "/healthz"
         }
     }
 
-    // AC7 support: the grader `autumn doctor` uses to tell an operator that their
-    // `tenancy.base_domain` is not covered by the certificate.
+    // `autumn doctor` uses this to report a `tenancy.base_domain` the cert does not cover.
     #[test]
     fn san_covers_host_matches_rfc6125_wildcard_rules() {
-        // Exact match.
         assert!(san_covers_host("myapp.com", "myapp.com"));
         assert!(
             san_covers_host("MyApp.COM", "myapp.com"),
@@ -22177,7 +21929,7 @@ path = "/healthz"
         );
         assert!(!san_covers_host("myapp.com", "tenant1.myapp.com"));
 
-        // A wildcard covers exactly ONE label.
+        // A wildcard covers exactly one label.
         assert!(san_covers_host("*.myapp.com", "tenant1.myapp.com"));
         assert!(
             !san_covers_host("*.myapp.com", "a.b.myapp.com"),
@@ -22203,8 +21955,6 @@ path = "/healthz"
         assert!(!acme.covers_host("deep.tenant42.myapp.com"));
     }
 
-    // Companion: a valid domain list plus the default challenge port is unaffected
-    // by the new blank-entry / zero-port rejections.
     #[test]
     fn validate_acme_valid_domains_and_port_ok() {
         let mut cfg = tls_static(None, None);
@@ -22394,8 +22144,6 @@ path = "/healthz"
 
     #[test]
     fn server_config_defaults_max_concurrent_requests_none() {
-        // Default must preserve today's unlimited behavior — no existing app
-        // silently changes throughput.
         let config = AutumnConfig::default();
         assert!(config.server.max_concurrent_requests.is_none());
     }
@@ -22430,7 +22178,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_empty_max_concurrent_requests_clears_to_none() {
-        // parse_env_option's documented convention: empty string clears to None.
         let env = MockEnv::new().with("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "");
         let mut config = AutumnConfig::default();
         config.server.max_concurrent_requests = Some(64);
@@ -22602,9 +22349,8 @@ path = "/healthz"
 
     #[test]
     fn validate_accepts_keyword_value_connection_strings() {
-        // The pool's TLS support parses libpq keyword/value strings, so
-        // validation must let them through (issue #1585 review) — including
-        // quoted values and whitespace around `=`.
+        // The pool parses libpq keyword/value strings, including quoted values and
+        // whitespace around `=`, so validation must accept them (#1585).
         for url in [
             "host=db user=app dbname=app",
             "host=db user=app sslmode=require",
@@ -22690,8 +22436,6 @@ path = "/healthz"
 
     #[test]
     fn detect_backend_postgres_keyword_value() {
-        // libpq keyword/value strings are a Postgres shape (the pool accepts
-        // them), so they must classify as Postgres, not fall through.
         assert_eq!(
             DatabaseBackend::detect("host=db user=app sslmode=require"),
             Some(DatabaseBackend::Postgres)
@@ -22717,9 +22461,8 @@ path = "/healthz"
 
     #[test]
     fn detect_backend_bare_path_is_unrecognized() {
-        // A bare filesystem path carries no scheme distinguishing it from a
-        // typo'd URL, so it is deliberately NOT auto-detected as SQLite. Users
-        // must spell an explicit sqlite:// (or sqlite:/file:) scheme.
+        // A bare path is indistinguishable from a typo'd URL, so SQLite needs an
+        // explicit `sqlite:` or `file:` scheme.
         for target in ["/var/lib/app.db", "./app.db", "app.db", "C:\\db\\app.db"] {
             assert_eq!(
                 DatabaseBackend::detect(target),
@@ -23526,8 +23269,6 @@ path = "/healthz"
 
     #[test]
     fn validate_rejects_backend_mismatch_across_roles() {
-        // Postgres primary with a SQLite replica: a boot-time misconfiguration,
-        // not a first-query surprise.
         let config = DatabaseConfig {
             primary_url: Some("postgres://db-primary/app".to_owned()),
             replica_url: Some("sqlite:///var/lib/replica.db".to_owned()),
@@ -23546,8 +23287,8 @@ path = "/healthz"
 
     #[test]
     fn validate_rejects_sqlite_primary_with_postgres_url() {
-        // effective_primary_url() prefers primary_url; the legacy `url` role
-        // must agree on the backend.
+        // effective_primary_url() prefers primary_url, but the legacy `url` must
+        // still agree on the backend.
         let config = DatabaseConfig {
             primary_url: Some("sqlite:///var/lib/app.db".to_owned()),
             url: Some("postgres://db-primary/app".to_owned()),
@@ -23566,8 +23307,6 @@ path = "/healthz"
 
     #[test]
     fn validate_postgres_app_with_replica_still_valid() {
-        // Regression guard: the existing Postgres primary + replica path is
-        // unchanged and still validates cleanly.
         let config = DatabaseConfig {
             primary_url: Some("postgres://db-primary/app".to_owned()),
             replica_url: Some("postgres://db-replica/app".to_owned()),
@@ -23705,12 +23444,10 @@ path = "/healthz"
         assert_eq!(config.server.shutdown_timeout_secs, 35);
         assert_eq!(config.telemetry.environment, "production");
         assert!(!config.health.detailed);
-        // AC: HSTS auto-enabled in the production profile.
         assert!(
             config.security.headers.strict_transport_security,
             "prod profile must auto-enable Strict-Transport-Security"
         );
-        // Defaults should still be secure-by-default in prod.
         assert_eq!(config.security.headers.x_frame_options, "DENY");
         assert!(config.security.headers.x_content_type_options);
         assert!(!config.security.headers.content_security_policy.is_empty());
@@ -23839,7 +23576,6 @@ path = "/healthz"
         )
         .unwrap();
 
-        // Load base
         let mut merged = toml::Value::Table(toml::map::Map::new());
         let base = load_raw_toml(&base_path).unwrap().unwrap();
         deep_merge(&mut merged, base);
@@ -23958,7 +23694,6 @@ path = "/healthz"
 
     #[test]
     fn find_config_file_falls_back_to_cwd() {
-        // Without AUTUMN_MANIFEST_DIR, should return just the filename
         let env = MockEnv::new();
         let path = find_config_file_named("autumn.toml", &env);
         assert_eq!(path, PathBuf::from("autumn.toml"));
@@ -23978,7 +23713,6 @@ path = "/healthz"
     #[test]
     fn find_config_file_falls_back_when_manifest_dir_missing_file() {
         let dir = tempfile::tempdir().unwrap();
-        // dir exists but the file doesn't
         let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
         let path = find_config_file_named("nonexistent.toml", &env);
         assert_eq!(path, PathBuf::from("nonexistent.toml"));
@@ -23986,67 +23720,52 @@ path = "/healthz"
 
     #[test]
     fn resolve_profile_cli_flag_exact_match() {
-        // resolve_profile checks `--profile` in CLI args. We can't easily
-        // inject args, but we can verify the env path doesn't match other args.
-        // The `== "--profile"` guard is the key: if it were `!=`, every arg
-        // would trigger the branch.
+        // The result depends on the test harness's CLI args, which cannot be
+        // injected, so this only checks the call does not panic.
         let env = MockEnv::new();
-        // With no env vars and no matching CLI args, should be None
         let profile = resolve_profile(&env);
-        // This may or may not be None depending on test harness args,
-        // but the important thing is it doesn't crash or return garbage.
-        // The env-based tests above cover the positive cases.
         drop(profile);
     }
 
     #[test]
     fn deep_merge_non_table_overlay_replaces_base() {
-        // When overlay is not a table, it should replace (not merge into) base.
-        // This kills the `&& → ||` mutant on line 162.
+        // Merging happens only when both sides are tables, so a non-table overlay
+        // leaves a table base unchanged.
         let mut base: toml::Value = toml::from_str("[server]\nport = 3000\n").unwrap();
         let overlay = toml::Value::String("not_a_table".into());
 
-        // When base is table and overlay is NOT table, base should be unchanged
-        // (the function only merges when BOTH are tables).
         deep_merge(&mut base, overlay);
-        // base should still be the original table (overlay was ignored)
         assert!(base.is_table());
         assert_eq!(base["server"]["port"], toml::Value::Integer(3000));
     }
 
     #[test]
     fn deep_merge_when_base_not_table() {
-        // When base is not a table, overlay should not merge
         let mut base = toml::Value::String("original".into());
         let overlay: toml::Value = toml::from_str("[server]\nport = 3000\n").unwrap();
 
         deep_merge(&mut base, overlay);
-        // base should be unchanged
         assert_eq!(base, toml::Value::String("original".into()));
     }
 
     #[test]
     fn suggest_profile_close_match() {
-        // "dve" is edit-distance 2 from "dev" → should suggest "dev"
         assert_eq!(suggest_profile("dve"), Some("dev"));
     }
 
     #[test]
     fn suggest_profile_no_match_when_distant() {
-        // "xyz" is far from both "dev" and "prod" → no suggestion
         assert_eq!(suggest_profile("xyz"), None);
     }
 
     #[test]
     fn suggest_profile_exact_known_profile() {
-        // Exact match has distance 0 → suggests itself
         assert_eq!(suggest_profile("dev"), Some("dev"));
         assert_eq!(suggest_profile("prod"), Some("prod"));
     }
 
     #[test]
     fn suggest_profile_prd() {
-        // "prd" is distance 1 from "prod"
         assert_eq!(suggest_profile("prd"), Some("prod"));
     }
 
@@ -24145,12 +23864,10 @@ path = "/healthz"
 
     #[test]
     fn load_uses_profile_layering() {
-        // Test AutumnConfig::load_with_env() with a dev profile via env var.
-        // This kills the "replace load → Ok(Default::default())" mutant.
+        // Catches a `load` that returns `Ok(Default::default())`.
         let env = MockEnv::new().with("AUTUMN_PROFILE", "dev");
 
         let config = AutumnConfig::load_with_env(&env).unwrap();
-        // With dev profile, smart defaults should apply
         assert_eq!(config.profile.as_deref(), Some("dev"));
         assert_eq!(config.log.level, "debug"); // dev default
         assert_eq!(config.log.format, LogFormat::Pretty); // dev default
@@ -24159,22 +23876,20 @@ path = "/healthz"
 
     #[test]
     fn load_custom_profile_without_toml_warns() {
-        // Test the typo warning branch: profile != "dev" && profile != "prod"
-        // without a corresponding autumn-{profile}.toml triggers warn_profile_typo.
-        // This kills the match guard mutants on line 341.
+        // A profile other than dev/prod with no autumn-{profile}.toml takes the
+        // warn_profile_typo branch.
         let env = MockEnv::new().with("AUTUMN_PROFILE", "staging");
 
         let config = AutumnConfig::load_with_env(&env).unwrap();
         assert_eq!(config.profile.as_deref(), Some("staging"));
-        // staging has no smart defaults, so values should be framework defaults
+        // staging has no smart defaults.
         assert_eq!(config.server.port, 3000);
         assert_eq!(config.log.level, "info");
     }
 
     #[test]
     fn load_dev_profile_no_profile_toml_no_warn() {
-        // dev/prod without their profile TOML should NOT trigger warn_profile_typo.
-        // This tests the `None => {}` branch (line 342).
+        // dev/prod without their profile TOML do not trigger warn_profile_typo.
         let env = MockEnv::new().with("AUTUMN_PROFILE", "dev");
 
         let config = AutumnConfig::load_with_env(&env).unwrap();
@@ -24264,7 +23979,7 @@ path = "/healthz"
             ",
         )
         .unwrap();
-        // Malformed TOML should be ignored because `autumn-prod.toml` is chosen first.
+        // Never read: `autumn-prod.toml` is chosen first.
         std::fs::write(&production_path, "[server\nport = 4500").unwrap();
 
         let env = MockEnv::new()
@@ -24290,7 +24005,7 @@ path = "/healthz"
             ",
         )
         .unwrap();
-        // Malformed TOML should be ignored because `autumn-production.toml` is chosen first.
+        // Never read: `autumn-production.toml` is chosen first.
         std::fs::write(&prod_path, "[server\nport = 4400").unwrap();
 
         let env = MockEnv::new()
@@ -24304,8 +24019,7 @@ path = "/healthz"
 
     #[test]
     fn load_from_io_error_is_not_swallowed() {
-        // load_from should return Err on non-NotFound IO errors.
-        // On all platforms, trying to read a directory as a file triggers an error.
+        // Reading a directory is an IO error other than NotFound on every platform.
         let dir = tempfile::tempdir().unwrap();
         let result = AutumnConfig::load_from(dir.path());
         assert!(result.is_err());
@@ -24319,9 +24033,8 @@ path = "/healthz"
 
     #[test]
     fn load_raw_toml_directory_returns_io_error() {
-        // Reading a directory is an IO error, NOT NotFound.
-        // This kills the "replace match guard NotFound with true" mutant:
-        // if the guard were always true, this would return Ok(None) instead of Err.
+        // Reading a directory is an IO error other than NotFound, so it must not
+        // map to Ok(None).
         let dir = tempfile::tempdir().unwrap();
         let result = load_raw_toml(dir.path());
         assert!(result.is_err());
@@ -24342,10 +24055,8 @@ path = "/healthz"
 
     #[test]
     fn env_override_log_format_auto() {
-        // Kills the "delete match arm Auto" mutant
         let env = MockEnv::new().with("AUTUMN_LOG__FORMAT", "Auto");
         let mut config = AutumnConfig::default();
-        // Start with non-Auto to prove the override works
         config.log.format = LogFormat::Json;
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.log.format, LogFormat::Auto);
@@ -24353,7 +24064,6 @@ path = "/healthz"
 
     #[test]
     fn env_override_health_detailed_false() {
-        // Kills the 'delete match arm "false" | "0"' mutant
         let env = MockEnv::new().with("AUTUMN_HEALTH__DETAILED", "false");
         let mut config = AutumnConfig::default();
         config.health.detailed = true; // start true, override to false
@@ -24372,15 +24082,11 @@ path = "/healthz"
 
     #[test]
     fn health_enabled_defaults_true() {
-        // Issue #1971: the probe off-switch is opt-in — enabled by default so
-        // behavior is byte-identical to before the field existed.
         assert!(HealthConfig::default().enabled);
     }
 
     #[test]
     fn env_override_health_enabled_false() {
-        // Issue #1971: AUTUMN_HEALTH__ENABLED=false flips the built-in probe
-        // off-switch via env, mirroring the AUTUMN_HEALTH__DETAILED wiring.
         let env = MockEnv::new().with("AUTUMN_HEALTH__ENABLED", "false");
         let mut config = AutumnConfig::default();
         assert!(config.health.enabled); // starts true (default)
@@ -24410,8 +24116,7 @@ path = "/healthz"
         let config = ActuatorConfig::default();
         assert_eq!(config.prefix, "/actuator");
         assert!(!config.sensitive);
-        // Prometheus metrics export is on by default and independent of
-        // `sensitive`, so platform scraping works without exposing env/loggers.
+        // Independent of `sensitive`, so scraping works without exposing env/loggers.
         assert!(config.prometheus);
     }
 
@@ -24437,7 +24142,6 @@ path = "/healthz"
         let mut base = toml::Value::Table(toml::map::Map::new());
         let mut overlay = toml::Value::Table(toml::map::Map::new());
 
-        // Create a 10,000 deep nested table
         let mut current_base = &mut base;
         let mut current_overlay = &mut overlay;
 
@@ -24452,18 +24156,16 @@ path = "/healthz"
             }
         }
 
-        // Add a leaf value to test actual merging
         if let toml::Value::Table(t) = current_overlay {
             t.insert("y".to_owned(), toml::Value::Integer(42));
         }
 
-        // Trigger merge, expecting no panic/stack overflow
-        // We run it on a thread with a large stack to avoid the stack overflow caused by Drop when base is dropped at the end of the function (since we created a 10,000 depth structure).
+        // Dropping a 10,000-deep table recurses, so this runs on a large stack and
+        // leaks `base` rather than dropping it.
         std::thread::Builder::new()
             .stack_size(32 * 1024 * 1024)
             .spawn(move || {
                 deep_merge(&mut base, overlay);
-                // Let the OS clean up the memory instead of dropping deeply nested structure
                 std::mem::forget(base);
             })
             .unwrap()
@@ -24476,7 +24178,6 @@ path = "/healthz"
         let mut base = toml::Value::Table(toml::map::Map::new());
         let mut overlay = toml::Value::Table(toml::map::Map::new());
 
-        // Create structures nested exactly to MAX_MERGE_DEPTH + 1
         let mut current_base = &mut base;
         let mut current_overlay = &mut overlay;
 
@@ -24491,14 +24192,12 @@ path = "/healthz"
             }
         }
 
-        // Add a value deep in the overlay
         if let toml::Value::Table(t) = current_overlay {
             t.insert("deep_value".to_owned(), toml::Value::Integer(123));
         }
 
         deep_merge(&mut base, overlay);
 
-        // Verify the value was NOT merged due to max depth limit
         let mut current_base_check = &base;
         for _ in 0..=MAX_MERGE_DEPTH {
             if let toml::Value::Table(t) = current_base_check {
@@ -24533,7 +24232,6 @@ path = "/healthz"
     fn env_override_forbidden_response_404() {
         let env = MockEnv::new().with("AUTUMN_SECURITY__FORBIDDEN_RESPONSE", "404");
         let mut config = AutumnConfig::default();
-        // Pre-set to 403 to confirm env actually flips it back to 404.
         config.security.forbidden_response = crate::authorization::ForbiddenResponse::Forbidden403;
         config.apply_env_overrides_with_env(&env);
         assert_eq!(
@@ -24548,7 +24246,6 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.security.forbidden_response = crate::authorization::ForbiddenResponse::Forbidden403;
         config.apply_env_overrides_with_env(&env);
-        // Invalid value warns and leaves the existing setting alone.
         assert_eq!(
             config.security.forbidden_response,
             crate::authorization::ForbiddenResponse::Forbidden403
@@ -24580,7 +24277,6 @@ path = "/healthz"
     fn env_override_csrf_token_scan_bytes() {
         let env = MockEnv::new().with("AUTUMN_SECURITY__CSRF__TOKEN_SCAN_BYTES", "8388608");
         let mut config = AutumnConfig::default();
-        // Default is 2 MiB; the env override must raise it.
         assert_eq!(config.security.csrf.token_scan_bytes, 2 * 1024 * 1024);
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.security.csrf.token_scan_bytes, 8_388_608);
@@ -24591,15 +24287,13 @@ path = "/healthz"
         let env = MockEnv::new().with("AUTUMN_SECURITY__CSRF__TOKEN_SCAN_BYTES", "not-a-number");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
-        // Invalid values are ignored, leaving the default intact.
         assert_eq!(config.security.csrf.token_scan_bytes, 2 * 1024 * 1024);
     }
 
-    // ── [openapi] config section tests (RED phase) ─────────────────────────
+    // ── [openapi] config section tests ─────────────────────────────────────
 
     #[test]
     fn openapi_runtime_config_defaults_enabled() {
-        // The [openapi] section must default to enabled=true and path="/openapi.json".
         let config = AutumnConfig::default();
         assert!(
             config.openapi_runtime.enabled,
@@ -24699,8 +24393,7 @@ path = "/api-spec.json"
             replica_id: None,
             ..SchedulerConfig::default()
         };
-        // In CI, FLY_MACHINE_ID and HOSTNAME may or may not be set,
-        // so just verify we get a non-empty string back.
+        // FLY_MACHINE_ID and HOSTNAME may or may not be set in CI.
         assert!(!cfg.resolved_replica_id().is_empty());
     }
 
@@ -24816,7 +24509,7 @@ path = "/api-spec.json"
         std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
         std::fs::write(tmp.path().join("config/credentials/dev.toml.enc"), &ct).unwrap();
 
-        // Write a base configuration with an empty/blank github provider defined
+        // The blank provider values are filled in from the credentials file.
         std::fs::create_dir_all(tmp.path().join("config")).unwrap();
         let config_toml = r#"
 [auth.oauth2.github]
@@ -24843,7 +24536,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
-        // Write an encrypted file but supply a wrong-length key so validation fails
+        // The master key has the right length but is not hex.
         let bogus_key = "zz".repeat(32); // 64 chars but not valid hex
         let ct = encrypt(&crate::credentials::MasterKey::generate(), b"x = \"y\"\n");
         std::fs::create_dir_all(tmp.path().join("config/credentials")).unwrap();
@@ -25651,7 +25344,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
 
     #[test]
     fn red_detect_replacement_only_no_finding() {
-        // Only the new replacement key is set; deprecated key is absent.
+        // Only the replacement key `a.b.d` is set.
         let mut merged = toml::Table::new();
         let mut b = toml::Table::new();
         b.insert("d".to_owned(), toml::Value::Integer(1)); // new key, not deprecated
@@ -25686,7 +25379,6 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
 
     #[test]
     fn red_toml_path_non_table_mid_segment_not_present() {
-        // If a mid-segment is not a Table, must return false without panicking.
         let mut root = toml::Table::new();
         root.insert("a".to_owned(), toml::Value::Integer(42)); // "a" is a leaf, not a table
         assert!(!toml_path_present(&root, "a.b.c"));
@@ -25694,13 +25386,6 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
 
     #[test]
     fn red_schema_leaf_paths_includes_known_paths() {
-        // The SchemaDeserializer recurses into any derived-Deserialize struct it
-        // reaches, regardless of module — external-module types (SecurityConfig,
-        // AuthConfig, etc.) now descend too. They were root-only before the #1890
-        // adaptive walk because the walk aborted before them (at the
-        // `statement_timeout` duration / the `jobs.queues` seq-only visitor), not
-        // because of their module. Each still also appears as a bare root leaf
-        // (recorded as a field of the root struct).
         let leaves = AutumnConfig::schema_leaf_paths();
         assert!(
             leaves.contains("server.port"),
@@ -25714,8 +25399,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             leaves.contains("database.url"),
             "database.url must be a schema leaf"
         );
-        // Root-level sections also appear as single-segment leaves (recorded as
-        // fields of the root struct), alongside their now-descended child keys.
+        // Root sections are also leaves of the root struct, alongside their child keys.
         assert!(
             leaves.contains("security"),
             "security must appear as a root-level leaf"
@@ -25911,8 +25595,6 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         }
     }
 
-    // Issue #1864: named so ACME's spawn site reads as intent rather than an
-    // inline `matches!` against the enum.
     #[test]
     fn scheduler_backend_is_fleet_distributed_only_for_postgres() {
         assert!(!SchedulerBackend::InProcess.is_fleet_distributed());
@@ -26091,8 +25773,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
 
     #[test]
     fn split_role_requires_durable_backend_truth_table() {
-        // Combined is always fine (enqueues and drains in one process), even on
-        // the in-process local backend.
+        // Combined enqueues and drains in one process, so any backend works.
         assert!(!split_role_requires_durable_backend(
             ProcessRole::Combined,
             "local"
@@ -26101,9 +25782,8 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             ProcessRole::Combined,
             "postgres"
         ));
-        // Split roles on any backend that falls through to the per-process local
-        // runtime are invalid: the literal `local`, a typo like `postgresql`, a
-        // blank backend, or any other unknown value.
+        // A split role is invalid on any backend that falls through to the
+        // per-process local runtime: `local`, a typo, blank, or unknown.
         assert!(split_role_requires_durable_backend(
             ProcessRole::Web,
             "local"
@@ -26121,13 +25801,12 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             ProcessRole::Web,
             "unknown"
         ));
-        // The match is exact (mirroring `start_runtime`'s dispatch), so a
-        // case-variant like `LOCAL` is likewise a non-durable fall-through.
+        // The match is exact, as in `start_runtime`'s dispatch, so `LOCAL` falls
+        // through too.
         assert!(split_role_requires_durable_backend(
             ProcessRole::Web,
             "LOCAL"
         ));
-        // Split roles on the recognized durable backends are fine.
         assert!(!split_role_requires_durable_backend(
             ProcessRole::Web,
             "postgres"
@@ -26153,7 +25832,6 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
     /// replica would enqueue where no worker can look.
     #[test]
     fn split_role_on_sqlite_requires_a_file_backed_database() {
-        // Every in-memory spelling is refused for a split role.
         for url in [
             "sqlite::memory:",
             "sqlite://:memory:",
@@ -26177,7 +25855,6 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             );
         }
 
-        // A file target is exactly what makes the split valid.
         for url in ["sqlite:///var/lib/app.db", "sqlite://./app.db", "app.db"] {
             assert!(
                 !is_in_memory_sqlite_target(url),
@@ -26346,7 +26023,6 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         for spelling in ROLE_SPELLINGS_3541 {
             assert!(message.contains(spelling), "{spelling} missing: {message}");
         }
-        // A blank string is not a role.
         assert!("".parse::<ProcessRole>().is_err());
     }
 
@@ -27061,7 +26737,6 @@ workers = 2
         ] {
             assert!(!is_valid_capability_name(name), "{name}");
         }
-        // No built-in capability name is a valid plugin capability name.
         for capability in Capability::ALL {
             assert!(!is_valid_capability_name(capability.as_str()));
         }

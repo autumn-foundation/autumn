@@ -121,15 +121,8 @@ pub struct SweepFailure<T> {
 
 impl<T: fmt::Debug> fmt::Display for SweepFailure<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Caller-agnostic — [`sweep_proptest`] is a public library function
-        // any application can call with its own strategy/body, so this must
-        // not prescribe a specific command (that was a real bug: it used to
-        // hard-code the `sim-sweep` bin's own invocation, which runs an
-        // unrelated built-in demo and can pass even when the reported seed
-        // reliably fails the *caller's* property). Mirrors
-        // [`Sim::run_proptest`]'s own replay line for the same reason — a
-        // caller that knows its own invocation context (like the `sim-sweep`
-        // bin) appends its own replay suggestion when it prints this.
+        // No replay command: only the caller knows how to rerun its own property. A caller
+        // that does (like the `sim-sweep` bin) appends its own.
         write!(
             f,
             "AUTUMN_SIM_SEED=0x{:x} — shrunk to {} op(s): {:?} ({})",
@@ -231,10 +224,7 @@ where
     }
 
     if seeds_run == 0 {
-        // An empty `seeds` iterator ran the loop above zero times, so both
-        // aggregate sets are (vacuously) empty too — without this check
-        // that would fall through to `Passed { seeds_run: 0 }` below,
-        // silently reporting success for a sweep that tested nothing.
+        // Otherwise this would report `Passed` for a sweep that tested nothing.
         return SweepOutcome::Empty;
     }
 
@@ -267,13 +257,7 @@ mod tests {
 
     #[test]
     fn failure_display_is_caller_agnostic_and_does_not_prescribe_a_replay_command() {
-        // `sweep_proptest` is a public library function any application can
-        // call with its own strategy/body — `Display` used to hard-code a
-        // `cargo run ... --bin sim-sweep` suggestion, which is wrong for
-        // every caller except that one specific demo binary (that command
-        // runs sim-sweep's *own* built-in scenario, not the caller's). A
-        // caller that knows its own invocation context appends its own
-        // suggestion instead (see `sim_sweep.rs`'s `main`).
+        // A `sim-sweep` command would rerun that bin's own demo, not the caller's property.
         let failure = SweepFailure {
             seed: 300u64,
             shrunk_ops: vec![TinyOp::Inc],
@@ -304,9 +288,7 @@ mod tests {
 
     #[test]
     fn sweep_reports_empty_rather_than_a_silent_pass_for_a_zero_length_range() {
-        // `AUTUMN_SIM_SEEDS=0` (or any empty `seeds` iterator) must not
-        // silently report `Passed { seeds_run: 0 }` — that would let a
-        // misconfigured seed count green a CI job that tested nothing.
+        // `AUTUMN_SIM_SEEDS=0` must not green a CI job that tested nothing.
         let strategy = tiny_op_strategy();
         let outcome = sweep_proptest(0..0, &strategy, |_sim, _ops| {
             panic!("body must never run for an empty seed range");
@@ -338,11 +320,8 @@ mod tests {
 
     #[test]
     fn sweep_aggregates_sometimes_observations_across_every_case_in_a_seed() {
-        // `op::EMBEDDED_CASES` is 256 — a `sometimes!` satisfied by only
-        // SOME of those 256 candidate op-sequences (not necessarily the last
-        // one tried) must still show up as satisfied in the aggregate. A
-        // single seed (0..1) makes this a direct test of the per-case fold,
-        // not an artifact of averaging across many seeds.
+        // One seed runs 256 cases. A label satisfied by only some of them, not necessarily the
+        // last, must still count as satisfied: this tests the per-case fold.
         let strategy = tiny_op_strategy();
         let outcome = sweep_proptest(0..1, &strategy, |_sim, ops| {
             let has_inc = ops.contains(&TinyOp::Inc);

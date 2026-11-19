@@ -269,11 +269,9 @@ mod tests {
         );
     }
 
-    // Codex review (#1864): a `StagedFile` dropped without being published —
-    // an early return between staging and publishing, or a `spawn_blocking`
-    // closure whose result nobody ever awaits because the caller was
-    // cancelled — must not leak its temp file. Unlike the old fixed `.tmp`
-    // name, nothing will ever overwrite an abandoned unpredictable-named one.
+    // A `StagedFile` dropped unpublished (an early return, or a cancelled caller that never awaits
+    // the `spawn_blocking` result) must remove its temp file: nothing will ever overwrite an
+    // abandoned randomly-named one (#1864).
     #[test]
     fn staged_file_removes_itself_if_dropped_without_publishing() {
         let dir = tempfile::tempdir().unwrap();

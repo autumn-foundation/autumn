@@ -199,13 +199,9 @@ impl MirrorSelector {
         actuator_prefix: &str,
         probe_paths: &[String],
     ) -> Self {
-        // The actuator's OWN normalizer, not a hand-rolled trim. `[actuator]
-        // prefix` accepts noncanonical forms — `"ops/"` mounts at `/ops`, `"/"`
-        // mounts at the root — and a trim that disagreed with the mount would
-        // leave the real endpoints unexempt, so operator polling of
-        // `/metrics`, `/prometheus`, `/shadow` would be mirrored: candidate
-        // load, plus permanent false divergences from payloads that are
-        // per-replica by construction.
+        // Use the actuator's own normalizer: `[actuator] prefix` accepts noncanonical forms
+        // (`"ops/"` mounts at `/ops`), and a trim that disagreed with the mount would leave the
+        // real endpoints unexempt, mirroring per-replica payloads as false divergences.
         let actuator_prefix = crate::actuator::normalize_actuator_prefix(actuator_prefix);
         Self {
             sample_rate,
@@ -249,10 +245,9 @@ impl MirrorSelector {
         if headers.contains_key(SHADOW_HEADER) {
             return MirrorDecision::Skip(SkipReason::LoopGuard);
         }
-        // A body-carrying GET/HEAD is never mirrored (issue #2332): declared
-        // via `request_carries_body`, or undeclared — frames with no
-        // `Content-Length`/`Transfer-Encoding` — via the body's own
-        // end-of-stream signal. Fails closed: doubt means no mirror.
+        // A body-carrying GET/HEAD is never mirrored (#2332), whether declared in the headers or
+        // undeclared (frames with no framing headers, caught by the body's end-of-stream signal).
+        // Fails closed: doubt means no mirror.
         if !body_known_empty || request_carries_body(headers) {
             return MirrorDecision::Skip(SkipReason::HasRequestBody);
         }
@@ -268,8 +263,8 @@ impl MirrorSelector {
             return MirrorDecision::Skip(SkipReason::RouteNotOptedIn);
         }
 
-        // `roll < rate` — so `rate = 0.0` never fires (no roll is below zero)
-        // and `rate = 1.0` always does (every roll is below one).
+        // `roll < rate`: `rate = 1.0` always fires, since every roll is in `[0, 1)`. A zero rate
+        // returns early so it never draws entropy.
         if self.sample_rate <= 0.0 {
             return MirrorDecision::Skip(SkipReason::NotSampled);
         }
@@ -340,10 +335,8 @@ fn request_carries_body(headers: &HeaderMap) -> bool {
         return true;
     }
     headers.get(CONTENT_LENGTH).is_some_and(|value| {
-        // Only `Some(0)` promises no body. A present-but-unparseable value
-        // fails closed to carrying (the doc comment's contract): the request
-        // is malformed, and the live build may answer with a `400` the
-        // mirror could not replay.
+        // Only `Some(0)` promises no body. An unparseable value fails closed to carrying: the
+        // live build may answer the malformed request with a `400` the mirror cannot replay.
         !matches!(
             value
                 .to_str()
@@ -488,7 +481,6 @@ mod tests {
                 );
             }
         }
-        // An unconditional request carrying other headers still mirrors.
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::ACCEPT,
@@ -545,10 +537,8 @@ mod tests {
 
     #[test]
     fn an_undeclared_body_on_a_get_is_never_mirrored() {
-        // No `Content-Length`, no `Transfer-Encoding`: on HTTP/2 a client can
-        // legally send DATA frames on a GET stream without declaring them.
-        // The headers alone would wave this through; the body's own
-        // end-of-stream signal is what catches it (issue #2332, option 1).
+        // On HTTP/2 a client can send DATA frames on a GET stream without framing headers.
+        // Only the body's end-of-stream signal catches it (#2332).
         let selector = selector();
         let drew = std::cell::Cell::new(false);
         assert_eq!(
@@ -570,8 +560,7 @@ mod tests {
 
     #[test]
     fn an_undeclared_body_beats_a_zero_content_length() {
-        // The headers say "no body" but the stream disagrees. Fail closed:
-        // the live build may be reading frames the mirror cannot replay.
+        // The headers say "no body" but the stream disagrees: fail closed.
         let selector = selector();
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
@@ -583,8 +572,7 @@ mod tests {
 
     #[test]
     fn a_declared_body_skips_even_when_the_stream_reports_empty() {
-        // The two signals are ORed, not ANDed: either one alone is enough to
-        // sit the request out.
+        // The two signals are ORed: either one alone skips the request.
         let selector = selector();
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_LENGTH, HeaderValue::from_static("42"));
@@ -596,8 +584,6 @@ mod tests {
 
     #[test]
     fn the_body_gate_runs_before_the_sampling_roll() {
-        // Like the other cheap gates, a body-carrying GET must decide without
-        // touching the entropy source.
         let selector = selector();
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_LENGTH, HeaderValue::from_static("5"));
@@ -620,7 +606,7 @@ mod tests {
                 "{path} must be exempt"
             );
         }
-        // A route that merely *starts with the same letters* is not exempt.
+        // A path that only shares the prefix's letters is not exempt.
         assert_eq!(
             selector.decide(
                 &Method::GET,
@@ -717,8 +703,7 @@ mod tests {
     fn route_label_is_the_configured_pattern_not_the_raw_path() {
         let selector = MirrorSelector::new(1.0, &["/api/*".to_owned()], "/actuator", &[]);
         assert_eq!(selector.route_label("/api/orders/42"), "/api/*");
-        // With no patterns configured the label collapses to a single bucket so
-        // metric cardinality can never follow the URL space.
+        // With no patterns, one bucket, so metric cardinality never follows the URL space.
         let all = MirrorSelector::new(1.0, &[], "/actuator", &[]);
         assert_eq!(all.route_label("/api/orders/42"), "*");
     }
@@ -732,8 +717,6 @@ mod tests {
             0.0
         };
 
-        // Wrong method, conditional request, exempt path, and un-opted-in route
-        // must all decide without touching the entropy source.
         let _ = selector.decide(&Method::POST, "/api/orders", &HeaderMap::new(), true, roll);
         assert_eq!(draws.get(), 0);
         let mut conditional = HeaderMap::new();
@@ -754,7 +737,6 @@ mod tests {
         let _ = selector.decide(&Method::GET, "/elsewhere", &HeaderMap::new(), true, roll);
         assert_eq!(draws.get(), 0);
 
-        // An eligible request does draw.
         let _ = selector.decide(&Method::GET, "/api/orders", &HeaderMap::new(), true, roll);
         assert_eq!(draws.get(), 1);
     }

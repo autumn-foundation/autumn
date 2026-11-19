@@ -317,8 +317,7 @@ impl Grant {
     pub const fn allows_cross_tenant(&self) -> bool {
         match self.tenant_scope {
             TenantScope::Scoped => false,
-            // `none` is the single-tenant application: the dimension does not
-            // apply, so a cross-tenant call is not a violation of anything.
+            // `none` marks a single-tenant app, where the dimension does not apply.
             TenantScope::CrossTenant | TenantScope::None => true,
         }
     }
@@ -391,13 +390,10 @@ pub const fn reversibility_floor_of(kind: EffectKind) -> Reversibility {
 
 // ── const string primitives ──────────────────────────────────────────
 //
-// `str` comparison and slicing are not `const`, and every check above has to
-// run inside a `const _: () = assert!(…)` the macro emits at a call site. So
-// each one is a byte loop. They are deliberately ASCII-only: every subject a
-// grant names — a Rust type name, a URL prefix, a job name, a topic — is
-// ASCII, and a byte-wise prefix test on UTF-8 can only split a multi-byte
-// character when the prefix itself is not a character boundary, which the
-// boundary check below already rejects.
+// `str` comparison and slicing are not `const`, and these checks run inside the
+// `const _: () = assert!(…)` items the macro emits, so each is a byte loop.
+// Byte-wise is safe on UTF-8: a prefix match must be followed by the end or an
+// ASCII `/`, `?` or `#`, so it never splits a character.
 
 /// Whether two strings are byte-for-byte equal.
 const fn str_eq(a: &str, b: &str) -> bool {
@@ -812,9 +808,8 @@ impl GrantBuilder {
     pub const fn build(self, name: &'static str, location: &'static str) -> Grant {
         let reversibility = match self.reversibility {
             Some(reversibility) => reversibility,
-            // Unreachable in a build that compiles: the macro's assertion has
-            // already failed. Fail closed anyway rather than pick a value that
-            // would let an action through.
+            // Unreachable in a build that compiles (the macro's assertion has
+            // failed). Fail closed anyway.
             None => Reversibility::Irreversible,
         };
         Grant {
@@ -882,8 +877,7 @@ macro_rules! __authority_grant_reversibility {
     (irreversible) => {
         $crate::agent_authority::Reversibility::Irreversible
     };
-    // The near-miss is common enough to be worth its own line: "compensatable"
-    // is what most people reach for first.
+    // "compensatable" is the common misspelling, so it gets its own message.
     (compensatable) => {
         ::core::compile_error!(
             "authority_grant!: `reversibility` is spelled `compensable`, not `compensatable`. \
@@ -916,19 +910,13 @@ macro_rules! __authority_grant_parse {
         @meta [$($meta:tt)*] @vis [$($vis:tt)*] @name [$name:ident]
         @fields [$($fields:tt)*] @rest []
     ) => {
-        // Everything worth refusing is refused here, at the macro's own
-        // expansion site, by top-level `const _: () = assert!(...)` items --
-        // never by a panic inside `GrantBuilder::build`. A panic in a const fn
-        // makes rustc print the const-eval backtrace (`note: inside
-        // GrantBuilder::build`, a `$RUST/core/src/panic.rs` frame, and a
-        // snippet of the framework's own source), and that framing changes
-        // between compiler versions, which made two compile-fail goldens fail
-        // on any rustc but the one that generated them. A top-level `const _`
-        // assertion is a single `E0080` whose caret sits on the author's
-        // `authority_grant!` and says nothing about our internals.
+        // Refusals are top-level `const _` assertions here, never a panic inside
+        // `GrantBuilder::build`: a const-fn panic prints rustc's const-eval
+        // backtrace, whose shape changes between compiler versions and breaks
+        // compile-fail goldens. A top-level assertion is one `E0080` pointing at
+        // the author's `authority_grant!`.
         //
-        // The value checks come first so a typo'd `rate` is the first thing an
-        // author reads rather than something buried under a missing key.
+        // The value checks come first so a typo'd `rate` is the first error shown.
         const _: () = {
             #[allow(clippy::needless_update)]
             let builder = $crate::agent_authority::GrantBuilder {
@@ -972,17 +960,12 @@ macro_rules! __authority_grant_parse {
         };
 
         $($meta)*
-        // A grant is named for the *role* it grants, not for a magic number:
-        // `RefundDrafter` reads correctly at the `#[agent_operable(grant = ...)]`
-        // use site in a way `REFUND_DRAFTER` does not, so the declaration style
-        // the guide teaches must not cost every author a lint.
+        // Grants are named like roles (`RefundDrafter`), which reads better at the
+        // `#[agent_operable(grant = ...)]` use site than `REFUND_DRAFTER`.
         #[allow(non_upper_case_globals)]
         $($vis)* const $name: $crate::agent_authority::Grant = {
-            // The `..DEFAULT` splat is what makes every key optional and
-            // order-independent, so it is still correct — and inert — for a
-            // grant that happens to declare all of them. Bound in a block
-            // because an author who fills in the whole envelope should not be
-            // told their own declaration is redundant.
+            // `..DEFAULT` makes every key optional. It is redundant for a grant
+            // that declares all of them, which must not trip a lint.
             #[allow(clippy::needless_update)]
             let builder = $crate::agent_authority::GrantBuilder {
                 $($fields)*
@@ -1206,9 +1189,8 @@ macro_rules! __authority_grant_parse {
 /// rustc's own duplicate-field error, pointing at the second one.
 #[macro_export]
 macro_rules! authority_grant {
-    // Visibility is matched as tokens rather than captured as a `vis` fragment:
-    // an opaque `vis` non-terminal cannot be carried through a token muncher,
-    // and three arms here is cheaper than the alternative everywhere else.
+    // Visibility is matched as tokens, not captured as a `vis` fragment: an
+    // opaque `vis` non-terminal cannot be carried through a token muncher.
     (
         $(#[$meta:meta])*
         pub($($restricted:tt)*) $name:ident { $($body:tt)* }
@@ -1300,8 +1282,7 @@ mod tests {
         assert!(grant.allows_write("Refund"));
         assert!(grant.allows_write("RefundNote"));
         assert!(!grant.allows_write("Payment"));
-        // Exact, not prefix: a model whose name merely starts with a listed
-        // one is a different table.
+        // Exact match, not prefix: a longer model name is a different table.
         assert!(!grant.allows_write("RefundNoteRevision"));
         assert!(!grant.allows_write("Refun"));
     }
@@ -1315,8 +1296,7 @@ mod tests {
 
     #[test]
     fn writes_does_not_imply_unbounded_writes() {
-        // Deleting one row and deleting the table are different authorities:
-        // the whole point of the second list.
+        // Deleting one row and deleting the table are different authorities.
         let grant = Grant {
             writes: &["Refund"],
             ..empty_grant()
@@ -1327,9 +1307,7 @@ mod tests {
 
     #[test]
     fn unbounded_writes_implies_the_bounded_form() {
-        // The converse direction: an action allowed to truncate the table is
-        // allowed to delete one row of it, so a handler that does both needs
-        // only the one entry.
+        // An action allowed to truncate the table may delete one row of it.
         let grant = Grant {
             unbounded_writes: &["Refund"],
             ..empty_grant()
@@ -1353,8 +1331,7 @@ mod tests {
         assert!(grant.allows_outbound("https://api.stripe.com/v1/refunds/re_123"));
         assert!(grant.allows_outbound("https://api.stripe.com/v1/refunds?x=1"));
         assert!(grant.allows_outbound("https://api.stripe.com/v1/refunds#frag"));
-        // The whole reason the boundary rule exists: a sibling path that
-        // merely starts with the allowed one is a different endpoint.
+        // A sibling path that merely starts with the prefix is a different endpoint.
         assert!(!grant.allows_outbound("https://api.stripe.com/v1/refunds-evil"));
         assert!(!grant.allows_outbound("https://api.stripe.com/v1/refundsevil.com"));
     }
@@ -1377,9 +1354,8 @@ mod tests {
 
     #[test]
     fn an_alias_entry_matches_exactly() {
-        // `client.named("stripe")` yields the subject `alias:stripe`; the
-        // boundary rule makes that an exact match, so `alias:stripe2` is not
-        // covered by `alias:stripe`.
+        // `client.named("stripe")` yields the subject `alias:stripe`. The boundary
+        // rule makes that an exact match.
         let grant = Grant {
             outbound: &["alias:stripe"],
             ..empty_grant()
@@ -1428,8 +1404,7 @@ mod tests {
             }
             .allows_cross_tenant()
         );
-        // `none` is the single-tenant application: the dimension does not
-        // apply, so a cross-tenant call is not a violation of anything.
+        // `none` marks a single-tenant app, where the dimension does not apply.
         assert!(
             Grant {
                 tenant_scope: TenantScope::None,
@@ -1507,9 +1482,7 @@ mod tests {
 
     #[test]
     fn a_malformed_rate_is_rejected() {
-        // `0/min` is rejected on purpose: a cap of zero is either a typo or a
-        // way to say "never", and "never" is spelled by not declaring the
-        // dimension at all.
+        // `0/min` is rejected: "never" is spelled by not declaring the dimension.
         for rate in [
             "ten per minute",
             "10/",
@@ -1563,8 +1536,8 @@ mod tests {
 /// The declaration grammar itself: the keys are order-independent, all but
 /// `reversibility` are optional, and the expansion registers the envelope.
 #[cfg(test)]
-// The `pub(crate)` grants below are the point: the macro matches visibility as
-// tokens, and each of the three shapes it accepts needs an expansion here.
+// The `pub(crate)` grants are deliberate: the macro matches visibility as tokens,
+// and each shape it accepts needs an expansion here.
 #[allow(clippy::redundant_pub_crate)]
 mod grant_syntax {
     use super::*;

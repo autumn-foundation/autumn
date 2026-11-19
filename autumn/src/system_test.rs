@@ -143,10 +143,8 @@ const CONSOLE_ERROR_GRACE: Duration = Duration::from_millis(500);
 
 // ── Browser detection ──────────────────────────────────────────────────────
 
-// Browser discovery and the `--version` probe live in `crate::browser_detect`
-// so `autumn doctor` (which must not depend on chromiumoxide) runs exactly
-// the same resolution logic. Re-exported here because
-// `autumn_web::system_test::BrowserCheck` is the documented path.
+// Discovery lives in `crate::browser_detect` so `autumn doctor`, which must not depend on
+// chromiumoxide, shares it. Re-exported because `system_test::BrowserCheck` is the documented path.
 pub use crate::browser_detect::BrowserCheck;
 use crate::browser_detect::{browser_candidates, find_chromium};
 
@@ -226,8 +224,7 @@ const TRANSIENT_NAVIGATION_MARKERS: &[&str] = &[
     "cannot find context with specified id",
     // Same race, reported against the context rather than the lookup.
     "execution context was destroyed",
-    // A navigation that swapped the inspected target out from under the
-    // in-flight command — no "context" in the text at all.
+    // A navigation swapped the target out from under the in-flight command.
     "inspected target navigated or closed",
 ];
 
@@ -238,9 +235,8 @@ const TRANSIENT_NAVIGATION_MARKERS: &[&str] = &[
 /// failure: assertion polling loops treat these as "not ready yet" and keep
 /// polling rather than aborting on the first unlucky tick.
 fn is_transient_navigation_error(err: &chromiumoxide::error::CdpError) -> bool {
-    // `Chrome` carries a typed CDP error object; `ChromeMessage` is the same
-    // class of failure for responses that did not deserialise into one, so
-    // both must be inspected or the error leaks through under the other name.
+    // `ChromeMessage` is the same failure as `Chrome` for a response that did not deserialise
+    // into a typed error, so both are inspected.
     let message = match err {
         chromiumoxide::error::CdpError::Chrome(inner) => inner.message.as_str(),
         chromiumoxide::error::CdpError::ChromeMessage(message) => message.as_str(),
@@ -308,7 +304,7 @@ where
 /// Output: `target/system-tests/<test_name>/`
 #[must_use]
 pub fn artifact_dir(test_name: &str) -> PathBuf {
-    // Walk up from the crate root (or use CARGO_TARGET_DIR if set).
+    // `target` relative to the working directory, unless CARGO_TARGET_DIR is set.
     let base =
         std::env::var("CARGO_TARGET_DIR").map_or_else(|_| PathBuf::from("target"), PathBuf::from);
     base.join("system-tests").join(test_name)
@@ -520,15 +516,13 @@ impl SystemTest {
     /// - [`SystemTestError::BrowserNotFound`] when no Chromium binary is available.
     /// - [`SystemTestError::Browser`] for CDP launch/connect errors.
     pub async fn build(self) -> Result<SystemTestRunner, SystemTestError> {
-        // 1. Bind the app to an ephemeral port.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(SystemTestError::ArtifactIo)?;
         let addr = listener.local_addr().map_err(SystemTestError::ArtifactIo)?;
         let base_url = format!("http://127.0.0.1:{}", addr.port());
 
-        // Read the settings the runner (not the router) needs before
-        // `into_router` consumes the builder.
+        // `into_router` consumes the builder, so read the runner's settings first.
         let browser_timeout = self.browser_timeout;
         let hx_settle_timeout = self.hx_settle_timeout;
         let artifact_dir = self
@@ -536,12 +530,10 @@ impl SystemTest {
             .clone()
             .unwrap_or_else(default_artifact_dir);
 
-        // 2. Build the axum router from the registered routes.
         let router = self.into_router();
         let service = tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), router);
         let make_service = axum::ServiceExt::<axum::extract::Request>::into_make_service(service);
 
-        // 3. Spawn the server in a background task.
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server_handle = tokio::spawn(async move {
             let _ = axum::serve(listener, make_service)
@@ -551,7 +543,6 @@ impl SystemTest {
                 .await;
         });
 
-        // 4. Launch Chromium.
         let (browser, user_data_dir) = launch_browser(browser_timeout).await?;
 
         Ok(SystemTestRunner {
@@ -572,16 +563,11 @@ impl SystemTest {
     /// registration, state selection, and custom-layer application — is
     /// exercisable without a Chromium binary.
     fn into_router(self) -> axum::Router {
-        // Both arms only decide *which* (config, state) pair to build from;
-        // the single build call below is deliberately shared so a future edit
-        // cannot wire `custom_layers` into one path and forget the other.
+        // Both arms only pick the (config, state) pair; the build below is shared so
+        // `custom_layers` cannot be wired into one path and missed in the other.
         let (config, state) = if let Some(state) = self.state_override {
-            // Use the config already embedded in the caller-supplied state so
-            // that middleware (tenancy, auth, rate-limiting, CSRF) is built
-            // from the same settings handlers observe via AppState::config().
-            // Headless Chromium handles cookies normally, so CSRF works
-            // end-to-end: the browser receives the CSRF cookie on first visit
-            // and replays it on form submissions, exactly as a real user does.
+            // Middleware is built from the state's own config, the one handlers see. CSRF works
+            // end-to-end: headless Chromium keeps the cookie and replays it on form submits.
             let config = state
                 .extension::<AutumnConfig>()
                 .map(|arc| (*arc).clone())
@@ -678,25 +664,15 @@ async fn launch_browser(browser_timeout: Duration) -> Result<(Browser, PathBuf),
 
     let config = BrowserConfig::builder()
         .chrome_executable(browser_path)
-        // chromiumoxide defaults every browser to the SAME fixed
-        // `<tmp>/chromiumoxide-runner` profile directory. Two browsers alive
-        // at once (e.g. two SystemTest runners in the same process, or an
-        // `attach()` runner alongside the `build()` server it targets) then
-        // collide on Chrome's profile singleton lock and one launch fails.
-        // Give every launch its own directory.
+        // chromiumoxide defaults every browser to one fixed profile directory, where two live
+        // browsers collide on Chrome's profile lock. Each launch gets its own.
         .user_data_dir(&user_data_dir)
-        // `chromiumoxide::browser::argument::Arg`'s `From<&str>` treats the
-        // whole string as the flag *name* and prepends its own `--`, so a
-        // literal `"--no-sandbox"` here renders as the four-dash garbage flag
-        // `----no-sandbox` that Chrome silently ignores. Use the dedicated
-        // builder method for the sandbox flag and bare (no-dash) flag names
-        // for the rest; headless mode is already the builder default.
+        // `.arg()` prepends its own `--`, so `"--no-sandbox"` would become `----no-sandbox`, which
+        // Chrome ignores. Flag names go in bare; headless is already the builder default.
         .no_sandbox()
         .arg("disable-dev-shm-usage")
         .arg("disable-gpu")
-        // Forward the configured timeout into chromiumoxide's own launch
-        // watchdog so the inner and outer timeouts are consistent and the
-        // outer tokio::time::timeout always wins.
+        // Match chromiumoxide's launch watchdog to the outer `tokio::time::timeout`.
         .launch_timeout(browser_timeout)
         .build()
         .map_err(|msg| SystemTestError::Browser(chromiumoxide::error::CdpError::msg(msg)))?;
@@ -708,7 +684,7 @@ async fn launch_browser(browser_timeout: Duration) -> Result<(Browser, PathBuf),
             timeout: browser_timeout,
         })??;
 
-    // Drive the CDP event loop in a background task.
+    // The CDP event loop must be driven for the browser to make progress.
     tokio::spawn(async move {
         handler.for_each(|_| async {}).await;
     });
@@ -745,8 +721,7 @@ fn default_artifact_dir() -> PathBuf {
 /// the runner also removes its per-launch Chrome profile directory.
 pub struct SystemTestRunner {
     base_url: String,
-    // `Option` so `Drop` can synchronously extract and drop the browser
-    // *before* removing its profile directory — see the `Drop` impl below.
+    // `Option` so `Drop` can drop the browser before removing its profile directory.
     browser: Option<Browser>,
     artifact_dir: PathBuf,
     user_data_dir: PathBuf,
@@ -757,28 +732,13 @@ pub struct SystemTestRunner {
 
 impl Drop for SystemTestRunner {
     fn drop(&mut self) {
-        // chromiumoxide sets `kill_on_drop(true)` on the underlying child
-        // process, so dropping `Browser` synchronously *sends* the kill
-        // signal (only the OS reaping the process afterward is
-        // asynchronous/unguaranteed-timing). Rust drops a struct's own
-        // fields only *after* a custom `Drop::drop` body returns, so without
-        // this explicit `take()` the profile directory would be removed
-        // before the browser (and thus the signal) is even dropped.
-        // Dropping the taken `Browser` here, before touching the directory,
-        // ensures the kill is at least sent first.
+        // Dropping `Browser` sends the kill signal (`kill_on_drop`). Fields drop only after this
+        // body returns, so take it now to send the kill before the directory is removed.
         drop(self.browser.take());
 
-        // Best-effort cleanup for the per-launch profile directory created
-        // in `launch_browser`/`unique_user_data_dir`. The kill signal above
-        // is sent synchronously, but the OS reaping the process (and
-        // releasing any file handles it held open under this directory) is
-        // not instantaneous or guaranteed-ordered from Rust's perspective;
-        // a short grace period trades a little latency for meaningfully
-        // higher odds the removal actually succeeds. Errors (including
-        // "still in use") are ignored — this is best-effort, not a
-        // correctness guarantee. Since `SystemTestRunner` is typically
-        // dropped at the end of an async test, the sleep and removal run on
-        // a background thread rather than blocking a Tokio worker thread.
+        // Best-effort: the OS reaps the killed process (and releases its file handles) later,
+        // so wait briefly before removing the profile directory, and ignore errors. A background
+        // thread keeps the sleep off the Tokio worker that drops the runner.
         let user_data_dir = self.user_data_dir.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
@@ -846,11 +806,8 @@ async fn spawn_console_error_capture(
     let mut log_events = page.event_listener::<EventEntryAdded>().await?;
 
     tokio::spawn(async move {
-        // Track each stream's liveness independently: a `select!` branch
-        // guarded by `if <flag>` is skipped once that flag is false, so one
-        // stream ending (e.g. a transient CDP session hiccup) only stops
-        // polling *that* stream — it must not end capture on the others.
-        // The task only exits once all streams are done.
+        // One stream ending (e.g. a transient CDP session hiccup) must not end capture on the
+        // others, so each has its own flag and the task exits only when all are done.
         let mut console_open = true;
         let mut exception_open = true;
         let mut log_open = true;
@@ -965,10 +922,8 @@ impl Page {
     pub async fn fill(&self, selector: &str, value: &str) -> Result<&Self, SystemTestError> {
         let element = self.inner.find_element(selector).await?;
         element.click().await?;
-        // Clear via JS without dispatching any DOM events. type_str() below
-        // fires native key events that trigger 'input' handlers naturally for
-        // each character, so the app never sees a transient empty-value event
-        // that could race with or overwrite the intended filled-value request.
+        // Clear without dispatching events, so the app never sees a transient empty-value
+        // `input` that could race the typed value's request.
         self.inner
             .evaluate(format!(
                 "(function() {{ var el = document.querySelector({}); \
@@ -977,9 +932,7 @@ impl Page {
             ))
             .await?;
         element.type_str(value).await?;
-        // When value is empty, type_str() emits no key/input events, so
-        // hx-trigger="input" handlers would never see the cleared state.
-        // Dispatch an explicit input event to cover that case.
+        // An empty value types no keys, so `hx-trigger="input"` would never see the clear.
         if value.is_empty() {
             self.inner
                 .evaluate(format!(
@@ -989,8 +942,7 @@ impl Page {
                 ))
                 .await?;
         }
-        // Dispatch a final change event so `hx-trigger="change"` and validation
-        // listeners see the fully typed value.
+        // `hx-trigger="change"` and validation listeners need a change event.
         self.inner
             .evaluate(format!(
                 "(function() {{ var el = document.querySelector({}); \
@@ -1011,14 +963,12 @@ impl Page {
     /// # Errors
     /// CDP or assertion errors.
     pub async fn click(&self, selector_or_label: &str) -> Result<&Self, SystemTestError> {
-        // Try CSS selector first; fall back to JS text match.
+        // CSS selector first, then a text match.
         if let Ok(element) = self.inner.find_element(selector_or_label).await {
             element.click().await?;
         } else {
-            // Compare normalized text in JS to avoid XPath string-literal
-            // quoting issues (labels with ', ", or both). Walk interactive
-            // elements in DOM order; skip hidden/disabled nodes so a visible
-            // control is always preferred over a hidden template duplicate.
+            // Matching in JS avoids XPath quoting issues with labels containing ' and ".
+            // Hidden and disabled nodes are skipped so a hidden template duplicate never wins.
             let js = format!(
                 "(function() {{ \
                  var want = {}; \
@@ -1119,7 +1069,7 @@ impl Page {
         if !written {
             return Err(fail("the clipboard write failed".into()));
         }
-        // Ctrl+V with the editing command `paste`, so each OS pastes.
+        // Ctrl+V (modifier 2) carrying the `paste` editing command, so it pastes on every OS.
         for kind in [
             DispatchKeyEventType::RawKeyDown,
             DispatchKeyEventType::KeyUp,
@@ -1427,10 +1377,8 @@ impl Page {
         let deadline = tokio::time::Instant::now() + timeout;
 
         loop {
-            // Try getElementById(stream_id) first — this handles IDs with CSS
-            // metacharacters (e.g. "notifications:main") that would break
-            // querySelector. Fall back to querySelector only when getElementById
-            // returns null, so full selectors like ".sse-target" still work.
+            // getElementById handles ids with CSS metacharacters ("notifications:main");
+            // querySelector is the fallback for full selectors like ".sse-target".
             let js = format!(
                 "(function() {{ \
                    var raw = {id}; \
@@ -1545,12 +1493,8 @@ impl Page {
 
     async fn wait_for_hx_settle(&self) -> Result<(), SystemTestError> {
         let deadline = tokio::time::Instant::now() + self.hx_settle_timeout;
-        // A destroyed execution context (the page navigated away, e.g. a plain
-        // form submit's full-page redirect) means there is no more htmx
-        // activity on that page to wait for — that counts as settled, not
-        // "keep polling a page that no longer exists". Hence
-        // `transient_means: true`. An undecodable result reads as settled for
-        // the same reason: a page with no htmx at all must not stall here.
+        // A page that navigated away has no htmx activity left, so a transient error reads as
+        // settled. An undecodable result does too, so a page without htmx does not stall.
         let settled = poll_until_deadline(deadline, true, || {
             self.evaluate_bool(
                 "document.querySelectorAll('.htmx-request,.htmx-settling,.htmx-swapping').length === 0"
@@ -1646,7 +1590,6 @@ impl Page {
         let base = dir.join(label);
         let base_str = base.to_string_lossy().into_owned();
 
-        // Screenshot
         let png_path = base.with_extension("png");
         if let Ok(bytes) = self
             .inner
@@ -1656,7 +1599,6 @@ impl Page {
             let _ = tokio::fs::write(&png_path, bytes).await;
         }
 
-        // HTML dump
         let html_path = base.with_extension("html");
         if let Ok(html) = self.inner.content().await {
             let _ = tokio::fs::write(&html_path, html).await;
@@ -1736,14 +1678,10 @@ mod tests {
         assert!(d.to_string_lossy().contains("system-tests"));
     }
 
-    // ── Issue #1456 (2): transient CDP errors during page transitions ────
+    // ── Transient CDP errors during page transitions (#1456) ─────────────
     //
-    // When a user action navigates the page (a submit button that redirects),
-    // Chrome tears down the JS execution context. An `evaluate()` already in
-    // flight from an assertion poll then fails with a CDP error that means
-    // "the page moved" — not "the assertion is false". Those must be
-    // swallowed by the polling loops and retried until the deadline, while
-    // genuine CDP errors still surface immediately.
+    // A navigation tears down the JS execution context, so an in-flight `evaluate()` fails with
+    // an error meaning "the page moved". Polling retries those; genuine CDP errors surface at once.
 
     /// Build the `CdpError` shape Chrome actually returns for these.
     fn chrome_err(message: &str) -> chromiumoxide::error::CdpError {
@@ -1761,9 +1699,7 @@ mod tests {
             // The exact error reported in #1456.
             "Cannot find context with specified id",
             "Execution context was destroyed.",
-            // Same race, reported against the target — note it contains no
-            // "context" at all, which is why the pre-#1456 substring match
-            // let it through.
+            // Same race, reported against the target, with no "context" in the text.
             "Inspected target navigated or closed",
             // Casing must not matter.
             "cannot find CONTEXT with specified id",
@@ -1778,9 +1714,7 @@ mod tests {
 
     #[test]
     fn transient_detection_covers_untyped_chrome_messages() {
-        // chromiumoxide reports a CDP response error that does not
-        // deserialise into its typed `Error` as `ChromeMessage` instead —
-        // same failure, different variant, must not leak through.
+        // A CDP error that does not deserialise into the typed `Error` arrives as `ChromeMessage`.
         assert!(
             is_transient_navigation_error(&chromiumoxide::error::CdpError::msg(
                 "Cannot find context with specified id"
@@ -1797,8 +1731,7 @@ mod tests {
             "No node with given id found",
             "Could not compute content quads.",
             "Node is not a HTMLElement",
-            // A JS error that merely mentions the word — the pre-#1456 bare
-            // `contains("context")` match would have swallowed this.
+            // A JS error that merely mentions "context".
             "ReferenceError: context is not defined",
         ] {
             assert!(
@@ -1818,12 +1751,9 @@ mod tests {
 
     #[test]
     fn a_dead_target_is_not_treated_as_a_navigation() {
-        // Chrome emits these when the renderer died (a sad tab under CI
-        // memory pressure), not only when the page moved. `wait_for_hx_settle`
-        // reads a transient error as *settled*, so swallowing these would let
-        // a crashed page sail through `click()` and fail five seconds later in
-        // `expect_text` with no screenshot — the exact decay this predicate
-        // exists to prevent.
+        // Chrome also emits these for a dead renderer. `wait_for_hx_settle` reads a transient
+        // error as settled, so a crashed page would pass `click()` and time out later in
+        // `expect_text` with no screenshot.
         for message in ["Target closed", "Session with given id not found."] {
             assert!(
                 !is_transient_navigation_error(&chrome_err(message)),
@@ -1833,12 +1763,10 @@ mod tests {
         }
     }
 
-    // ── The retry loop itself (AC2's actual behaviour) ───────────────────
+    // ── The shared retry loop ────────────────────────────────────────────
     //
-    // The predicate above only classifies an error. What #1456 asks for is
-    // that assertion helpers *keep polling* past one — these drive the shared
-    // loop with a scripted probe so the behaviour is covered without a
-    // browser.
+    // A scripted probe drives `poll_until_deadline`, so retrying past a transient error is
+    // covered without a browser.
 
     /// A probe that replays `script`, one entry per call, then repeats the
     /// last entry forever. Also records how many times it was called.
@@ -1865,8 +1793,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn polling_retries_past_transient_errors_and_succeeds() {
-        // The #1456 scenario: a redirect destroys the execution context under
-        // two in-flight evaluations, then the post-navigation page answers.
+        // A redirect destroys the context under two in-flight evaluations, then the new page
+        // answers.
         let (probe, calls) = scripted_probe(vec![
             Err(chrome_err("Cannot find context with specified id")),
             Err(chrome_err("Cannot find context with specified id")),
@@ -1908,8 +1836,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn polling_gives_up_at_the_deadline() {
-        // Unrelenting transient errors must still terminate — otherwise a
-        // permanently broken page hangs the test instead of failing it.
+        // Endless transient errors must still end, or a broken page hangs the test.
         let (probe, _) = scripted_probe(vec![Err(chrome_err(
             "Cannot find context with specified id",
         ))]);
@@ -1930,9 +1857,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn settle_treats_a_navigated_page_as_settled() {
-        // `wait_for_hx_settle` passes `transient_means: true`: a page that
-        // navigated away has no htmx activity left to wait for, so the fence
-        // must return at once rather than poll a page that no longer exists.
+        // `wait_for_hx_settle` passes `transient_means: true`: a navigated page has no htmx
+        // activity left, so the fence returns at once.
         let (probe, calls) =
             scripted_probe(vec![Err(chrome_err("Execution context was destroyed."))]);
         let deadline = tokio::time::Instant::now() + DEFAULT_HX_SETTLE_TIMEOUT;
@@ -1947,16 +1873,10 @@ mod tests {
         );
     }
 
-    // ── Issue #1456 (3): custom middleware layers on the test router ──────
+    // ── Custom middleware layers on the test router (#1456) ──────────────
     //
-    // Apps whose routes depend on global middleware (tenant scoping, auth
-    // shims, request enrichment) had no way to register it on `SystemTest`,
-    // forcing callers to hand-map layers onto individual handlers before
-    // passing them to `.routes()`. `SystemTest::layer` must register a
-    // Tower layer that the served router actually runs — on *both* the
-    // default-state and `state()`-override paths — and must compose
-    // multiple registrations with the same ordering contract as
-    // `AppBuilder::layer` (first call = outermost on ingress).
+    // `SystemTest::layer` layers must run on both the default-state and `state()`-override
+    // paths, ordered like `AppBuilder::layer` (first call is outermost on ingress).
 
     /// Records the ingress order of every middleware that ran.
     type IngressLog = Arc<Mutex<Vec<&'static str>>>;
@@ -2047,8 +1967,6 @@ mod tests {
 
     #[tokio::test]
     async fn registered_layer_reaches_registered_route_handlers() {
-        // The whole point of the feature: middleware must wrap the routes
-        // under test, and what it puts on the request must reach the handler.
         let builder = SystemTest::new()
             .routes(vec![tenant_echo_route()])
             .layer(tenant_layer());
@@ -2072,8 +1990,7 @@ mod tests {
 
     #[tokio::test]
     async fn registered_layer_runs_on_the_state_override_path() {
-        // Layers must not silently vanish because the caller supplied their
-        // own AppState — the branch a future edit is most likely to forget.
+        // Layers must not vanish when the caller supplies its own AppState.
         let state = crate::state::AppState::for_test();
         state.insert_extension(AutumnConfig::default());
         let builder = SystemTest::new()
@@ -2086,8 +2003,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_layer_can_short_circuit_the_handler() {
-        // Proves the layer genuinely *wraps* the handler rather than merely
-        // running alongside it.
+        // Proves the layer wraps the handler rather than running alongside it.
         let builder =
             SystemTest::new()
                 .routes(vec![tenant_echo_route()])
@@ -2125,9 +2041,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_registered_layer_observes_the_framework_request_id() {
-        // The stack-position claim in the docs — layers sit *inside*
-        // Autumn's RequestId layer — is what makes a system test faithful to
-        // production for middleware that reads it. Mirrors
+        // Layers sit inside Autumn's RequestId layer, as in production. Mirrors
         // `custom_layer_sees_request_id` in tests/integration/custom_layer.rs.
         let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&seen);
@@ -2190,8 +2104,7 @@ mod tests {
 
     #[test]
     fn build_router_with_state_override_uses_embedded_config() {
-        // Exercises the Some(state) arm: config is read from the supplied
-        // state rather than constructed from scratch.
+        // Exercises the Some(state) arm: config comes from the supplied state.
         let config = AutumnConfig {
             profile: Some("custom".into()),
             ..Default::default()

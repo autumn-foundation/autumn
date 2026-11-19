@@ -1227,6 +1227,10 @@ jobs:
             sudo apt-get install -y postgresql-client
           fi
           pg_dump --version
+      - name: Use the PostgreSQL 16 client tools
+        # pg_restore 17+ cannot restore into the 11 and 16 test servers.
+        # See the script header.
+        run: ./scripts/ci-pg-client-16.sh
 
       - name: generated_scaffold_serves_posts_index_and_json_api
         run: |

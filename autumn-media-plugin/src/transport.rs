@@ -21,7 +21,9 @@ use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
+use autumn_web::time::compat::{Digits, rfc3339_opts};
+use jiff::civil;
+use jiff::tz::Offset;
 use reqwest::header;
 use serde::Serialize;
 
@@ -573,14 +575,16 @@ impl MediaUrls {
     ///
     /// Returns `None` when the recording path does not resolve to a
     /// `live/<key>` path under `recordings_root`, or when the duration is
-    /// non-positive. `started_at` / `ended_at` are the recording's UTC bounds.
+    /// non-positive, or when `started_at` is past the last instant
+    /// [`jiff::Timestamp`] can hold. `started_at` / `ended_at` are the
+    /// recording's UTC bounds.
     #[must_use]
     pub fn recording_playback_url(
         &self,
         recording_path: &Path,
         recordings_root: &Path,
-        started_at: NaiveDateTime,
-        ended_at: NaiveDateTime,
+        started_at: civil::DateTime,
+        ended_at: civil::DateTime,
     ) -> Option<String> {
         recording_url(
             recording_path,
@@ -598,8 +602,8 @@ impl MediaUrls {
         &self,
         recording_path: &Path,
         recordings_root: &Path,
-        started_at: NaiveDateTime,
-        ended_at: NaiveDateTime,
+        started_at: civil::DateTime,
+        ended_at: civil::DateTime,
     ) -> Option<String> {
         recording_url(
             recording_path,
@@ -616,17 +620,22 @@ impl MediaUrls {
 fn recording_url(
     recording_path: &Path,
     recordings_root: &Path,
-    started_at: NaiveDateTime,
-    ended_at: NaiveDateTime,
+    started_at: civil::DateTime,
+    ended_at: civil::DateTime,
     playback_base: &str,
 ) -> Option<String> {
     let mediamtx_path = recording_mediamtx_path(recording_path, recordings_root)?;
-    let duration_millis = (ended_at - started_at).num_milliseconds();
+    // Truncated toward zero, so a sub-millisecond recording counts as empty.
+    let duration_millis =
+        i64::try_from(ended_at.duration_since(started_at).as_millis()).unwrap_or(i64::MAX);
     if duration_millis <= 0 {
         return None;
     }
-    let start = DateTime::<Utc>::from_naive_utc_and_offset(started_at, Utc)
-        .to_rfc3339_opts(SecondsFormat::AutoSi, true);
+    let start = rfc3339_opts(
+        Offset::UTC.to_timestamp(started_at).ok()?,
+        Digits::AutoSi,
+        true,
+    );
     let duration = duration_seconds_param(duration_millis);
     let mut url =
         reqwest::Url::parse(&format!("{}/get", playback_base.trim_end_matches('/'))).ok()?;
@@ -720,11 +729,8 @@ mod tests {
         }
     }
 
-    fn started_at() -> NaiveDateTime {
-        chrono::NaiveDate::from_ymd_opt(2026, 5, 14)
-            .unwrap()
-            .and_hms_opt(10, 0, 0)
-            .unwrap()
+    fn started_at() -> civil::DateTime {
+        jiff::civil::date(2026, 5, 14).at(10, 0, 0, 0)
     }
 
     // ── Parsers ─────────────────────────────────────────────────────────────
@@ -959,7 +965,7 @@ mod tests {
         };
         let urls = MediaUrls::from_config(&config);
         let start = started_at();
-        let end = start + chrono::Duration::hours(1);
+        let end = start + jiff::SignedDuration::from_hours(1);
         assert_eq!(
             urls.recording_playback_url(
                 &PathBuf::from("recordings/live/sk_test"),
@@ -982,11 +988,8 @@ mod tests {
         };
         let urls = MediaUrls::from_config(&config);
         // A start anchor 250ms into the second must not be truncated away.
-        let start = chrono::NaiveDate::from_ymd_opt(2026, 5, 14)
-            .unwrap()
-            .and_hms_milli_opt(10, 0, 0, 250)
-            .unwrap();
-        let end = start + chrono::Duration::hours(1);
+        let start = jiff::civil::date(2026, 5, 14).at(10, 0, 0, 250_000_000);
+        let end = start + jiff::SignedDuration::from_hours(1);
         let url = urls
             .recording_playback_url(
                 &PathBuf::from("recordings/live/sk_test"),
@@ -1008,7 +1011,7 @@ mod tests {
                 &PathBuf::from("recordings/live/sk_test"),
                 &PathBuf::from("recordings"),
                 whole,
-                whole + chrono::Duration::hours(1),
+                whole + jiff::SignedDuration::from_hours(1),
             )
             .expect("playback url should build");
         assert!(
@@ -1026,7 +1029,7 @@ mod tests {
         };
         let urls = MediaUrls::from_config(&config);
         let start = started_at();
-        let end = start + chrono::Duration::hours(1);
+        let end = start + jiff::SignedDuration::from_hours(1);
         let probe = urls
             .recording_probe_url(
                 &PathBuf::from("recordings/live/sk_test"),

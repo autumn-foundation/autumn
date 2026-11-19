@@ -89,11 +89,9 @@ impl ParameterFilter {
 
     #[must_use]
     pub fn matches_key(&self, key: &str) -> bool {
-        // `normalize_key` keeps a key's ASCII alphanumerics, lowercased. A
-        // non-ASCII char's UTF-8 bytes are all >= 0x80, so filtering the bytes
-        // keeps exactly the same characters, and the normalized key can be
-        // built on the stack rather than in a fresh `String` per probe: this
-        // runs once per field of every captured log event and scrubbed map.
+        // Same result as `normalize_key`, built on the stack: this runs once per field of every
+        // captured log event and scrubbed map. Non-ASCII UTF-8 bytes are all >= 0x80, so
+        // filtering bytes keeps exactly the characters that filtering chars keeps.
         let mut buf = [0u8; INLINE_KEY_CAPACITY];
         let mut len = 0;
         for byte in key.bytes().filter(u8::is_ascii_alphanumeric) {

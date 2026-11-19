@@ -178,8 +178,7 @@ mod tests {
         // connection is now accepted but idle (no request bytes yet).
         tokio::time::sleep(Duration::from_millis(30)).await;
         stop.cancel();
-        // The request arrives after shutdown began, well inside the settle
-        // window.
+        // The request arrives after shutdown began, well inside the settle window.
         tokio::time::sleep(Duration::from_millis(10)).await;
         let _ = client
             .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")

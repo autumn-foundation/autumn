@@ -33,7 +33,6 @@
 //! argument naming the extern-prelude identifier to use instead, e.g.
 //! `#[get("/x", crate = "autumn_web_05")]`.
 
-mod agent_authority;
 mod api_doc;
 mod authorize;
 mod cached;
@@ -65,7 +64,6 @@ mod param_helpers;
 mod parse;
 mod paths_macro;
 mod public;
-mod query_budget;
 mod request_gate;
 mod route;
 mod routes_macro;
@@ -1073,7 +1071,7 @@ pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
     autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
-        query_budget::query_budget_macro(attr, item)
+        autumn_macros_support::analysers::query_budget(attr, item)
     })
     .into()
 }
@@ -1159,7 +1157,7 @@ pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn agent_operable(attr: TokenStream, item: TokenStream) -> TokenStream {
     autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
-        agent_authority::agent_operable_macro(attr, item)
+        autumn_macros_support::analysers::agent_operable(attr, item)
     })
     .into()
 }
@@ -1740,12 +1738,13 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `name = ident` (required): the obligation name.
 /// - `within = "..."` (required): the budget, such as `"2 business days"`.
 ///   A bad budget is a compile error.
-/// - `starts = field` (required): a `DateTime<Utc>` field. The clock starts
+/// - `starts = field` (required): a `Timestamp` field. The clock starts
 ///   there.
 /// - `calendar = "..."`: the calendar name. The default is `"default"`.
-/// - `met = field`: an `Option<DateTime<Utc>>` field. Your code sets it when
+/// - `met = field`: an `Option<Timestamp>` field. Your code sets it when
 ///   the subject meets the obligation.
-/// - `zone = field`: a time zone field (`Tz`, an IANA name, or an `Option`).
+/// - `zone = field`: a time zone field (`jiff::tz::TimeZone`, an IANA name,
+///   or an `Option`).
 /// - `subject = field`: the identity field. The default is `id`. The subject
 ///   is the `snake_case` type name, a colon, and the field value.
 ///
@@ -1758,8 +1757,8 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///              starts = opened_at, met = responded_at)]
 /// pub struct Ticket {
 ///     pub id: i64,
-///     pub opened_at: chrono::DateTime<chrono::Utc>,
-///     pub responded_at: Option<chrono::DateTime<chrono::Utc>>,
+///     pub opened_at: autumn_web::time::Timestamp,
+///     pub responded_at: Option<autumn_web::time::Timestamp>,
 /// }
 /// ```
 #[proc_macro_attribute]

@@ -41,11 +41,14 @@
 //! }
 //! ```
 
+use std::sync::OnceLock;
+
 use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::StatusCode;
+use uuid::Uuid;
 
-// The layer half below needs the idempotency store, so it is built only with
-// the `idempotency` feature. The extractors above it work without.
+// The layer needs the idempotency store, so it is built only with the `idempotency` feature.
+// The extractors work without it.
 #[cfg(feature = "idempotency")]
 use std::future::Future;
 #[cfg(feature = "idempotency")]
@@ -67,8 +70,6 @@ use futures::StreamExt as _;
 use sha2::Digest as _;
 #[cfg(feature = "idempotency")]
 use tower::{Layer, Service};
-#[cfg(feature = "idempotency")]
-use uuid::Uuid;
 
 #[cfg(feature = "idempotency")]
 use super::config::SubmitTokenConfig;
@@ -100,28 +101,69 @@ pub struct SubmitFormField(pub String);
 /// A one-time submit token minted per render.
 ///
 /// Use this as a handler parameter to embed the token in an HTML form's hidden
-/// `_submit_token` field. A fresh token is generated for every request (both
-/// the GET that renders the form and the 422 re-render on a rejected POST) and
-/// stored in request extensions by [`SubmitTokenLayer`].
-#[derive(Clone, Debug)]
-pub struct SubmitToken(String);
+/// `_submit_token` field. Every request (both the GET that renders the form and
+/// the 422 re-render on a rejected POST) has a fresh token of its own, stored
+/// in request extensions by [`SubmitTokenLayer`].
+///
+/// The random value is drawn the first time the token is read, so a request
+/// that renders no form pays for no random draw. Every read within one request
+/// returns the same value, and so does every clone, whenever it was taken.
+//
+// `Box<str>` and not `String`: with the cell's state word the value is then no
+// larger than the `String` it replaces, so its request extension is not either.
+pub struct SubmitToken(OnceLock<Box<str>>);
 
 impl SubmitToken {
+    /// A token whose value is drawn on its first read.
+    #[cfg(feature = "idempotency")]
+    const fn unminted() -> Self {
+        Self(OnceLock::new())
+    }
+
     /// Returns the submit-token value for embedding in forms.
     #[must_use]
     pub fn token(&self) -> &str {
-        &self.0
+        self.0.get_or_init(|| encode_token(Uuid::new_v4()))
     }
 
     #[cfg(test)]
-    pub(crate) const fn new(token: String) -> Self {
-        Self(token)
+    pub(crate) fn new(token: String) -> Self {
+        Self(OnceLock::from(token.into_boxed_str()))
+    }
+
+    /// Whether the value has been drawn yet.
+    #[cfg(all(test, feature = "idempotency"))]
+    fn is_minted(&self) -> bool {
+        self.0.get().is_some()
+    }
+}
+
+/// The text of a token: the 36-character lowercase hyphenated form of `uuid`.
+///
+/// These are the bytes `Uuid`'s `Display` writes. They are encoded on the stack
+/// and copied once, with no formatter and no growing `String`.
+fn encode_token(uuid: Uuid) -> Box<str> {
+    Box::from(&*uuid.hyphenated().encode_lower(&mut Uuid::encode_buffer()))
+}
+
+impl Clone for SubmitToken {
+    /// Copies the value, and draws it first when it has not been read yet. A
+    /// copy of an undrawn token would draw a value of its own, and the two
+    /// would then name different submissions.
+    fn clone(&self) -> Self {
+        Self(OnceLock::from(Box::<str>::from(self.token())))
+    }
+}
+
+impl std::fmt::Debug for SubmitToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SubmitToken").field(&self.token()).finish()
     }
 }
 
 impl std::fmt::Display for SubmitToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.token())
     }
 }
 
@@ -244,20 +286,11 @@ impl TokenForm {
         if crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded") {
             return Some(Self::UrlEncoded);
         }
-        // Parse the boundary with `multer::parse_boundary` — the exact parser
-        // `axum::extract::Multipart` uses downstream (via `mime`) — so the guard
-        // and the extractor can never disagree about the boundary. A hand-rolled
-        // `split(';')` diverges on quoted values: `mime` permits a `;` inside a
-        // quoted parameter value, so `boundary="x;y"` parses to the boundary
-        // `x;y` in the real extractor while a split truncates it to `x`, leaving
-        // the form to be handled while its `_submit_token` is never
-        // scanned/consumed (the request stays REPLAYABLE). `parse_boundary` is
-        // case-insensitive on the media type / `boundary` param name and
-        // preserves the boundary VALUE's case; it returns `Err` for a
-        // non-multipart type.
+        // `multer::parse_boundary` is the parser `axum::extract::Multipart` uses, so the guard
+        // and the extractor agree on the boundary. A naive `split(';')` truncates a quoted
+        // `boundary="x;y"` to `x`: the token would go unscanned and the form stay replayable.
         //
-        // The parse allocates. Only a type that starts with `multipart/` can
-        // parse as multipart, so skip the parse for each other type.
+        // The parse allocates, and only a `multipart/` type can parse, so check the prefix first.
         let maybe_multipart = content_type
             .trim_start()
             .get(..MULTIPART_PREFIX.len())
@@ -309,30 +342,21 @@ async fn collect_body(body: Body, limit: usize) -> CollectedBody {
     let mut stream = body.into_data_stream();
     loop {
         match stream.next().await {
-            // Clean end of stream: return everything buffered so far.
             None => break,
-            // A mid-stream read error must be propagated, never swallowed into a
-            // truncated `Full`: the handler would otherwise receive a form whose
-            // tail fields were lost while the leading token still scanned and
-            // consumed, so the caller fails the request on this variant.
+            // Never return a truncated `Full`: the handler would get a form missing its tail
+            // fields after the leading token was consumed.
             Some(Err(err)) => return CollectedBody::Errored(err),
             Some(Ok(chunk)) => {
                 let remaining = limit.saturating_sub(buf.len());
                 if chunk.len() > remaining {
-                    // Fill the scan prefix up to `limit` with the leading bytes
-                    // of the over-limit chunk, so a token at the front of the
-                    // form is still found even when the FIRST chunk already
-                    // exceeds the cap (e.g. an upstream middleware rebuilt the
-                    // buffered body as one `Body::from(bytes)`, leaving `buf`
-                    // empty here).
+                    // Fill the scan prefix with the head of this chunk, so a leading token
+                    // is found even when the first chunk alone exceeds the limit (an
+                    // upstream middleware may have rebuilt the body as one chunk).
                     let mut prefix_buf = buf.clone();
                     prefix_buf.extend_from_slice(&chunk[..remaining]);
                     let prefix = Bytes::from(prefix_buf);
-                    // Replay the FULL body unchanged: the buffered prefix bytes
-                    // followed by the *complete* over-limit chunk (not just its
-                    // scanned head) and the rest of the stream. The scan prefix
-                    // is only for locating the token; the handler must receive
-                    // every byte.
+                    // The handler gets every byte: the buffered bytes, the whole chunk,
+                    // then the rest of the stream.
                     let mut leading = Vec::with_capacity(2);
                     if !buf.is_empty() {
                         leading.push(Ok::<Bytes, axum::Error>(Bytes::from(buf)));
@@ -483,9 +507,9 @@ impl Clone for SubmitTokenSettings {
 /// submit tokens.
 ///
 /// Applied automatically when `security.submit_token.enabled = true` in config
-/// (the default). Mints a fresh [`SubmitToken`] into request extensions on every
-/// request, and guards mutating requests that carry a `_submit_token` form
-/// field.
+/// (the default). Places a fresh [`SubmitToken`] in request extensions on every
+/// request (its value is drawn when a handler first reads it), and guards
+/// mutating requests that carry a `_submit_token` form field.
 #[derive(Clone)]
 pub struct SubmitTokenLayer {
     settings: Arc<SubmitTokenSettings>,
@@ -508,11 +532,9 @@ impl SubmitTokenLayer {
     #[must_use]
     pub fn new(store: Arc<dyn IdempotencyStore>, config: &SubmitTokenConfig) -> Self {
         let ttl = Duration::from_secs(config.ttl_secs);
-        // The in-flight lock TTL is a SEPARATE knob from the replay `ttl`: it
-        // must outlast any active mutating request so a slow submission's retry
-        // stays excluded until the first request records its consumed token.
-        // Deriving it from `ttl_secs` would let lowering the replay window reopen
-        // the double-execute re-entry gap (issue #1360).
+        // Separate from the replay `ttl`: the lock must outlast a slow request so its retry
+        // stays excluded until the token is recorded. Deriving it from `ttl_secs` would let a
+        // shorter replay window reopen the double-execute gap (#1360).
         let in_flight_ttl = Duration::from_secs(config.in_flight_ttl_secs);
         Self {
             settings: Arc::new(SubmitTokenSettings {
@@ -587,10 +609,10 @@ where
     }
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
-        // Mint a fresh token for every request and expose it via extensions so
-        // GET renders and 422 re-renders can embed it in the next form.
-        let minted = Uuid::new_v4().to_string();
-        req.extensions_mut().insert(SubmitToken(minted));
+        // Every request gets a fresh token in its extensions, so GET renders
+        // and 422 re-renders can embed it in the next form. Its random value is
+        // drawn by the first reader: a request that renders no form draws none.
+        req.extensions_mut().insert(SubmitToken::unminted());
         req.extensions_mut()
             .insert(SubmitFormField(self.settings.field_name.clone()));
 
@@ -626,10 +648,7 @@ where
             {
                 Ok(pair) => pair,
                 Err(error) => {
-                    // A body-stream read error while scanning must reject the
-                    // request: forwarding the bytes read so far would hand the
-                    // handler a truncated form whose leading token we already
-                    // scanned, silently dropping tail fields.
+                    // Forwarding the bytes read so far would hand the handler a truncated form.
                     tracing::warn!(
                         error = %error,
                         "Submit-token body scan failed on a read error; rejecting the request"
@@ -639,18 +658,13 @@ where
             };
 
             let Some(token) = submitted.filter(|t| !t.is_empty()) else {
-                // No submit token present — pass through unchanged.
                 return inner.call(req).await;
             };
 
             let key = storage_key(&token);
 
-            // Already consumed — replay the stored first response. Use the
-            // fallible `try_get` so a backend read/deserialization failure fails
-            // CLOSED (matching `IdempotencyService`'s lookup path) instead of
-            // collapsing to a cache miss: a swallowed error would fall through,
-            // acquire a fresh lock, and re-run the mutation for an
-            // already-consumed token. No lock is held yet, so surface `503`.
+            // Already consumed: replay the first response. A store error fails closed with 503;
+            // treating it as a miss would re-run the mutation for a consumed token.
             match settings.store.get(&key).await {
                 Ok(Some(entry)) => return Ok(replay_response(&entry.record)),
                 Ok(None) => {}
@@ -689,13 +703,9 @@ where
                 });
             }
 
-            // Double-check after locking: a racing request may have completed
-            // and stored its response between our miss and the lock acquisition.
-            // A read failure here must also fail closed. Because we now hold the
-            // in-flight lock, keep it held (do NOT unlock, letting it expire via
-            // `in_flight_ttl`) so a retry with the same token is rejected
-            // in-flight rather than re-running the handler — exactly as
-            // `IdempotencyService` does on a post-lock lookup error.
+            // Re-check after locking: a racing request may have stored its response since our
+            // miss. On a read error keep the lock held (it expires by `in_flight_ttl`) so a
+            // retry gets 409 instead of re-running the handler.
             match settings.store.get(&key).await {
                 Ok(Some(entry)) => {
                     release_lock(&settings.store, &key, &owner).await;
@@ -771,8 +781,6 @@ async fn cache_consumed_token_response(
     match collect_body(body, MAX_CACHEABLE_RESPONSE_BODY).await {
         CollectedBody::Full(bytes) => {
             let status = parts.status.as_u16();
-            // Cache successful (2xx) and redirect (3xx) responses so the
-            // replayed submit returns the first response verbatim.
             if (200..400).contains(&status) {
                 let record = IdempotencyRecord {
                     status,
@@ -780,14 +788,9 @@ async fn cache_consumed_token_response(
                     body: bytes.to_vec(),
                     metadata: Vec::new(),
                 };
-                // Persist the consumed-token record. If the store write fails
-                // after the handler already committed its mutation and returned
-                // a 2xx/3xx, fail closed exactly as `IdempotencyLayer` does: keep
-                // the in-flight lock held (by not unlocking, it expires via
-                // `in_flight_ttl`) so a retry carrying the same token gets a
-                // `409` in-flight conflict rather than silently re-running the
-                // create/update, and surface `503` instead of an un-recorded
-                // success.
+                // The handler already committed. If the record cannot be stored, keep the lock
+                // held (it expires by `in_flight_ttl`) so a retry gets 409 rather than re-running
+                // the mutation, and return 503.
                 if let Err(error) = settings
                     .store
                     .set(key, owner, record, Vec::new(), settings.ttl)
@@ -805,29 +808,16 @@ async fn cache_consumed_token_response(
             Response::from_parts(parts, Body::from(bytes))
         }
         CollectedBody::Oversized { body, .. } => {
-            // Too large to cache — stream through. The lock is released; a later
-            // retry re-runs (acceptable: form responses are tiny redirects, so
-            // this path is not hit in practice).
+            // Too large to cache: stream it and release the lock, so a retry re-runs. Form
+            // responses are small redirects, so this is rare.
             release_lock(&settings.store, key, owner).await;
             Response::from_parts(parts, body)
         }
         CollectedBody::Errored(error) => {
             let status = parts.status.as_u16();
-            // The response body errored while buffering for the replay cache.
-            // Mirror the `Full` branch's commit policy, keyed on status:
-            //
-            // * 2xx/3xx (committed, cacheable): the handler already committed
-            //   its mutation, but we can neither record the token nor replay a
-            //   truncated body. Fail closed exactly like the `try_set`
-            //   persistence-failure path above — keep the in-flight lock held
-            //   (by not unlocking, it expires via `in_flight_ttl`) so a retry
-            //   carrying the same token gets a `409` in-flight conflict rather
-            //   than re-running the committed mutation.
-            // * non-2xx/3xx (not committed, not cacheable): like the `Full`
-            //   branch's clean non-success path, this stores no record and the
-            //   request stays retryable, so release the lock. An immediate
-            //   resubmit of a failed/validation request re-runs the handler
-            //   instead of getting a spurious 24h `409` in-flight conflict.
+            // The body can be neither recorded nor replayed. A 2xx/3xx means the handler
+            // committed: keep the lock held (it expires by `in_flight_ttl`) so a retry gets 409.
+            // Any other status committed nothing: release the lock so a resubmit runs again.
             tracing::error!(
                 error = %error,
                 "Submit-token response buffering failed on a read error; failing closed"
@@ -967,6 +957,302 @@ mod tests {
         );
     }
 
+    #[test]
+    fn debug_and_display_keep_their_format() {
+        let token = SubmitToken::new("a\"b".to_owned());
+        assert_eq!(format!("{token:?}"), r#"SubmitToken("a\"b")"#);
+        assert_eq!(format!("{token:#?}"), "SubmitToken(\n    \"a\\\"b\",\n)");
+        // `Display` writes the bare value and ignores width and fill.
+        assert_eq!(format!("{token}"), "a\"b");
+        assert_eq!(format!("{token:>10}"), "a\"b");
+
+        let empty = SubmitToken::new(String::new());
+        assert_eq!(empty.token(), "");
+        assert_eq!(format!("{empty:?}"), r#"SubmitToken("")"#);
+    }
+
+    #[test]
+    fn token_is_drawn_once_and_every_read_agrees() {
+        let token = SubmitToken::unminted();
+        assert!(!token.is_minted(), "nothing is drawn before the first read");
+
+        let first = token.token().to_owned();
+        assert!(token.is_minted());
+        assert_eq!(token.token(), first);
+        assert_eq!(token.to_string(), first);
+        assert_eq!(format!("{token:?}"), format!("SubmitToken({first:?})"));
+    }
+
+    #[test]
+    fn display_and_debug_of_an_unread_token_show_the_value_later_reads_return() {
+        let shown = SubmitToken::unminted();
+        let displayed = shown.to_string();
+        assert_eq!(shown.token(), displayed);
+
+        let debugged = SubmitToken::unminted();
+        let text = format!("{debugged:?}");
+        assert_eq!(text, format!("SubmitToken({:?})", debugged.token()));
+    }
+
+    #[test]
+    fn clone_taken_before_the_first_read_carries_the_same_token() {
+        let original = SubmitToken::unminted();
+        let copy = original.clone();
+        let copy_of_copy = copy.clone();
+        assert_eq!(copy.token(), original.token());
+        assert_eq!(copy_of_copy.token(), original.token());
+    }
+
+    #[test]
+    fn clone_taken_after_the_first_read_carries_the_same_token() {
+        let original = SubmitToken::unminted();
+        let first = original.token().to_owned();
+        let copy = original.clone();
+        assert_eq!(copy.token(), first);
+        assert_eq!(
+            original.token(),
+            first,
+            "a clone does not redraw the source"
+        );
+
+        let fixed = SubmitToken::new("abc-123".to_owned());
+        let fixed_copy = fixed.clone();
+        assert_eq!(fixed_copy.token(), "abc-123");
+        assert_eq!(fixed.token(), "abc-123");
+    }
+
+    #[test]
+    fn drawn_token_is_a_canonical_v4_uuid() {
+        let token = SubmitToken::unminted();
+        let text = token.token();
+        let uuid = Uuid::parse_str(text).expect("the token is a uuid");
+        assert_eq!(uuid.get_version_num(), 4);
+        assert_eq!(text.len(), 36);
+        assert_eq!(text, uuid.to_string(), "lowercase and hyphenated");
+    }
+
+    #[test]
+    fn each_unread_token_draws_its_own_value() {
+        let first = SubmitToken::unminted();
+        let second = SubmitToken::unminted();
+        assert_ne!(first.token(), second.token());
+    }
+
+    #[test]
+    fn concurrent_first_reads_agree() {
+        for _ in 0..64 {
+            let token = SubmitToken::unminted();
+            let reads: Vec<String> = std::thread::scope(|scope| {
+                let readers: Vec<_> = (0..4)
+                    .map(|_| scope.spawn(|| token.token().to_owned()))
+                    .collect();
+                readers
+                    .into_iter()
+                    .map(|reader| reader.join().expect("reader thread"))
+                    .collect()
+            });
+            for read in &reads {
+                assert_eq!(read, token.token());
+            }
+        }
+    }
+
+    /// The type is public and lives in request extensions: its auto traits and
+    /// its size are part of what callers and the extension map rely on.
+    #[test]
+    fn submit_token_keeps_its_traits_and_size() {
+        fn assert_traits<T>()
+        where
+            T: Clone
+                + std::fmt::Debug
+                + std::fmt::Display
+                + Send
+                + Sync
+                + Unpin
+                + std::panic::UnwindSafe
+                + std::panic::RefUnwindSafe
+                + 'static,
+        {
+        }
+        assert_traits::<SubmitToken>();
+        assert!(
+            std::mem::size_of::<SubmitToken>() <= std::mem::size_of::<String>(),
+            "the token's request extension must not grow"
+        );
+    }
+
+    proptest::proptest! {
+        /// The stack encoding writes the bytes `Uuid`'s `Display` writes, for
+        /// every bit pattern and not only for version 4.
+        #[test]
+        fn encoded_token_matches_uuid_display(bits in proptest::prelude::any::<u128>()) {
+            let uuid = Uuid::from_u128(bits);
+            proptest::prop_assert_eq!(encode_token(uuid).into_string(), uuid.to_string());
+        }
+    }
+
+    #[test]
+    fn encoded_token_matches_uuid_display_at_the_edges() {
+        for uuid in [Uuid::nil(), Uuid::max(), Uuid::from_u128(0xABCD_EF01 << 96)] {
+            assert_eq!(encode_token(uuid).into_string(), uuid.to_string());
+        }
+    }
+
+    /// The required extractor, the optional extractor and a direct read of the
+    /// extension all see one value within a request.
+    #[tokio::test]
+    async fn every_reader_of_one_request_sees_one_token() {
+        async fn handler(
+            required: SubmitToken,
+            optional: Option<SubmitToken>,
+            req: Request<Body>,
+        ) -> String {
+            let optional = optional.map(|token| token.token().to_owned());
+            let direct = req
+                .extensions()
+                .get::<SubmitToken>()
+                .map(|token| token.token().to_owned());
+            format!(
+                "{}\n{}\n{}",
+                required.token(),
+                optional.unwrap_or_default(),
+                direct.unwrap_or_default()
+            )
+        }
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(layer_with_store(store));
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            let readers: Vec<&str> = body.lines().collect();
+            assert_eq!(readers.len(), 3, "three readers: {body:?}");
+            assert!(Uuid::parse_str(readers[0]).is_ok(), "not a uuid: {body:?}");
+            assert_eq!(readers[1], readers[0]);
+            assert_eq!(readers[2], readers[0]);
+            seen.push(readers[0].to_owned());
+        }
+        assert_ne!(seen[0], seen[1], "each request has a token of its own");
+    }
+
+    /// The layer places the token and never reads it: a request whose handler
+    /// renders no form reaches the inner service with nothing drawn.
+    #[tokio::test]
+    async fn layer_does_not_draw_a_token_nobody_reads() {
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let svc =
+            layer_with_store(store).layer(tower::service_fn(|req: Request<Body>| async move {
+                let drawn = req
+                    .extensions()
+                    .get::<SubmitToken>()
+                    .map(SubmitToken::is_minted);
+                let field = req
+                    .extensions()
+                    .get::<SubmitFormField>()
+                    .map(|field| field.0.clone());
+                Ok::<_, std::convert::Infallible>(Response::new(Body::from(format!(
+                    "{drawn:?} {field:?}"
+                ))))
+            }));
+
+        let requests = [
+            (
+                "GET",
+                Request::builder().uri("/").body(Body::empty()).unwrap(),
+            ),
+            (
+                "JSON POST",
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            ),
+            ("form POST with a token", urlencoded_post("tok-unread")),
+            (
+                "form POST without a token",
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("title=hello"))
+                    .unwrap(),
+            ),
+        ];
+        for (name, request) in requests {
+            let response = svc.clone().oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                &body[..],
+                br#"Some(false) Some("_submit_token")"#,
+                "{name}: the token is present and not drawn"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extractors_without_the_layer_are_unchanged() {
+        let app = Router::new()
+            .route(
+                "/required",
+                get(|token: SubmitToken| async move { token.token().to_owned() }),
+            )
+            .route(
+                "/optional",
+                get(|token: Option<SubmitToken>| async move { token.is_some().to_string() }),
+            );
+
+        let required = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/required")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(required.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(required.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            b"Submit token not found in request extensions. Is SubmitTokenLayer enabled?"
+        );
+
+        let optional = app
+            .oneshot(
+                Request::builder()
+                    .uri("/optional")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(optional.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(optional.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"false");
+    }
+
     #[tokio::test]
     async fn first_use_runs_handler_replay_short_circuits() {
         let store: Arc<dyn IdempotencyStore> =
@@ -987,7 +1273,6 @@ mod tests {
             .layer(layer_with_store(store));
 
         let token = "tok-replay";
-        // First submit runs the handler.
         let first = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);
         assert!(first.headers().get(SUBMIT_TOKEN_REPLAYED).is_none());
@@ -996,7 +1281,6 @@ mod tests {
             .unwrap();
         assert_eq!(&first_body[..], b"created");
 
-        // Second submit with the same token replays without re-running.
         let second = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(
@@ -1020,9 +1304,7 @@ mod tests {
 
     #[tokio::test]
     async fn lowercase_multipart_consumes_token_and_replay_short_circuits() {
-        // Positive control: a conventionally-cased multipart body already works.
-        // This proves the multipart body format the tests build is correct, so
-        // any failure of the mixed-case test below is unambiguously about casing.
+        // Control for the mixed-case test: proves the multipart body the tests build is valid.
         let store: Arc<dyn IdempotencyStore> =
             Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
         let count = Arc::new(AtomicUsize::new(0));
@@ -1075,11 +1357,8 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_case_multipart_consumes_token_and_replay_short_circuits() {
-        // Media types are case-insensitive (RFC 9110); the Multipart extractor
-        // accepts `Multipart/Form-Data` with a `Boundary=` parameter. The body
-        // scanner must recognize it and consume the token so a replay is caught.
-        // The weird-case boundary value is identical in the header and the body
-        // delimiters, which also proves the boundary VALUE stays case-sensitive.
+        // Media types are case-insensitive (RFC 9110), as the Multipart extractor accepts. The
+        // boundary value matches the body delimiters exactly, so its case must be preserved.
         let store: Arc<dyn IdempotencyStore> =
             Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
         let count = Arc::new(AtomicUsize::new(0));
@@ -1132,15 +1411,9 @@ mod tests {
 
     #[tokio::test]
     async fn quoted_semicolon_boundary_consumes_token_and_replay_short_circuits() {
-        // A `;` inside a QUOTED boundary parameter is a valid RFC 2046 /
-        // `mime` restricted quoted char, so `boundary="x;y"` parses to the
-        // boundary `x;y` in the `multer`/`mime` parser axum's Multipart
-        // extractor uses downstream. A hand-rolled `split(';')` truncates it
-        // to `x`, so the guard fails to find/consume `_submit_token` while the
-        // handler still parses and acts on the form — leaving the request
-        // REPLAYABLE. The boundary parser must match the extractor's so the
-        // token is consumed and a replay is short-circuited. Fully lowercase,
-        // RFC-shaped multipart — no casing trick.
+        // A `;` inside a quoted boundary is valid (RFC 2046): axum's Multipart extractor reads
+        // `boundary="x;y"` as `x;y`. The guard must agree, or it misses the token while the
+        // handler still acts on the form.
         let store: Arc<dyn IdempotencyStore> =
             Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
         let count = Arc::new(AtomicUsize::new(0));
@@ -1193,8 +1466,7 @@ mod tests {
 
     #[tokio::test]
     async fn uppercase_urlencoded_consumes_token_and_replay_short_circuits() {
-        // The urlencoded branch has the same casing hole and is fixed by the
-        // same media-type normalization.
+        // The urlencoded media type is case-insensitive too.
         let store: Arc<dyn IdempotencyStore> =
             Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
         let count = Arc::new(AtomicUsize::new(0));
@@ -1278,10 +1550,8 @@ mod tests {
 
     #[tokio::test]
     async fn exempt_path_is_exact_or_subtree_only() {
-        // Mirrors csrf.rs's `exempt_path_exact_or_subtree_only`: exempting
-        // `/webhooks/stripe` must skip dedup guarding on that path and its
-        // slash-delimited subtree, but not on an adjacent route that merely
-        // starts with the same characters.
+        // Exempting `/webhooks/stripe` covers that path and its `/` subtree, not a sibling route
+        // that only shares the prefix.
         let store: Arc<dyn IdempotencyStore> =
             Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
         let count = Arc::new(AtomicUsize::new(0));
@@ -1343,22 +1613,19 @@ mod tests {
             }
         };
 
-        // Exact exempt path: dedup guarding is skipped, so the same token
-        // submitted twice runs the handler both times.
+        // Exact exempt path: not guarded, so both submits run.
         count.store(0, Ordering::SeqCst);
         submit("/webhooks/stripe", "tok-exact").await;
         submit("/webhooks/stripe", "tok-exact").await;
         assert_eq!(count.load(Ordering::SeqCst), 2);
 
-        // Slash-delimited subtree of the exempt path: same, exempt.
+        // Subtree of the exempt path: also exempt.
         count.store(0, Ordering::SeqCst);
         submit("/webhooks/stripe/events", "tok-subtree").await;
         submit("/webhooks/stripe/events", "tok-subtree").await;
         assert_eq!(count.load(Ordering::SeqCst), 2);
 
-        // Adjacent route sharing the prefix but not the boundary: NOT exempt,
-        // so dedup guarding applies and the second submit replays instead of
-        // re-running the handler.
+        // Sibling route that only shares the prefix: guarded, so the second submit replays.
         count.store(0, Ordering::SeqCst);
         submit("/webhooks/stripe-admin", "tok-adjacent").await;
         submit("/webhooks/stripe-admin", "tok-adjacent").await;
@@ -1416,8 +1683,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_token_re_runs_after_ttl() {
-        // A very short TTL means the stored record expires and a later submit
-        // re-runs rather than replaying.
+        // An expired record is gone, so a later submit re-runs rather than replaying.
         let store = MemoryIdempotencyStore::new(Duration::from_millis(10));
         let key = storage_key("ttl-token");
         store
@@ -1445,9 +1711,7 @@ mod tests {
 
     #[tokio::test]
     async fn distinct_from_csrf_replayed_submit_token_short_circuits() {
-        // Even a request that would pass CSRF is short-circuited when its
-        // submit token has already been consumed: the guard consults the store,
-        // not the CSRF cookie/token.
+        // The guard consults the store, not CSRF: a replay with a valid `_csrf` still replays.
         let store: Arc<dyn IdempotencyStore> =
             Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
         let count = Arc::new(AtomicUsize::new(0));
@@ -1466,7 +1730,6 @@ mod tests {
             .layer(layer_with_store(store));
 
         let token = "tok-csrf-distinct";
-        // Each submit carries a valid _csrf field alongside the submit token.
         let build = || {
             Request::builder()
                 .method("POST")
@@ -1479,8 +1742,6 @@ mod tests {
         };
         let first = app.clone().oneshot(build()).await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);
-        // A replay with the same submit token (and a still-valid _csrf) is
-        // short-circuited by the guard.
         let second = app.clone().oneshot(build()).await.unwrap();
         assert_eq!(
             second
@@ -1499,7 +1760,7 @@ mod tests {
     async fn ten_concurrent_posts_persist_exactly_one_row() {
         let store: Arc<dyn IdempotencyStore> =
             Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
-        // Simulates the durable side effect (a DB insert).
+        // Stands in for a DB insert.
         let rows = Arc::new(AtomicUsize::new(0));
         let rows_inner = rows.clone();
         let app = Router::new()
@@ -1508,7 +1769,7 @@ mod tests {
                 post(move || {
                     let rows = rows_inner.clone();
                     async move {
-                        // Simulate real work so requests genuinely overlap.
+                        // Make the requests overlap.
                         tokio::time::sleep(Duration::from_millis(20)).await;
                         rows.fetch_add(1, Ordering::SeqCst);
                         (StatusCode::SEE_OTHER, [("location", "/posts")], "")
@@ -1574,8 +1835,7 @@ mod tests {
         let count_inner = count.clone();
         let seen_len = Arc::new(AtomicUsize::new(0));
         let seen_len_inner = seen_len.clone();
-        // The handler consumes the whole body so we can assert nothing was
-        // truncated on its way through the scan.
+        // The handler reads the whole body so the test can check nothing was truncated.
         let app = Router::new()
             .route(
                 "/submit",
@@ -1589,12 +1849,11 @@ mod tests {
                     }
                 }),
             )
-            // A tiny scan cap the very first chunk already blows past.
+            // The first chunk alone exceeds this cap.
             .layer(layer_with_store(store).with_max_scan_bytes(64));
 
         let token = "over-limit-token";
-        // `_submit_token` sits at the front (well within the 64-byte cap); a
-        // large filler pushes the single chunk far over the cap.
+        // The token sits within the 64-byte cap; the filler pushes the single chunk far past it.
         let filler = "x".repeat(4096);
         let full_body = format!("_submit_token={token}&title={filler}");
         let full_len = full_body.len();
@@ -1608,8 +1867,6 @@ mod tests {
                 .unwrap()
         };
 
-        // First submit: the guard scans the leading bytes of the over-limit
-        // chunk, runs the handler once, and the handler sees the full body.
         let first = app.clone().oneshot(make()).await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);
         assert!(first.headers().get(SUBMIT_TOKEN_REPLAYED).is_none());
@@ -1619,8 +1876,6 @@ mod tests {
             "handler must receive the complete body, not just the scanned prefix"
         );
 
-        // Second submit with the same token replays — proving the leading token
-        // was detected despite the over-limit first chunk.
         let second = app.clone().oneshot(make()).await.unwrap();
         assert_eq!(
             second
@@ -1712,8 +1967,6 @@ mod tests {
 
         let token = "tok-persist-fail";
 
-        // First submit: handler runs once, but the store write fails, so the
-        // guard fails closed with 503 instead of returning the 200 "created".
         let first = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
         assert_eq!(
             first.status(),
@@ -1721,9 +1974,7 @@ mod tests {
             "a persistence failure after handler success must fail closed, not return the success"
         );
 
-        // Retry with the same token: the in-flight lock is still held (it was
-        // deliberately not released), so the retry is rejected in-flight and the
-        // handler does NOT run a second time.
+        // The lock was kept, so the retry is rejected in-flight.
         let second = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
         assert_eq!(
             second.status(),
@@ -1831,10 +2082,7 @@ mod tests {
                 post(move || {
                     let count = count_inner.clone();
                     async move {
-                        // The handler commits its mutation and returns a 200
-                        // whose body stream delivers a leading chunk and then
-                        // errors before EOF — so the replay cache buffering hits
-                        // `CollectedBody::Errored` after the commit.
+                        // Commit, then return a 200 whose body errors after the first chunk.
                         count.fetch_add(1, Ordering::SeqCst);
                         let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
                             Ok(Bytes::from("created")),
@@ -1848,9 +2096,6 @@ mod tests {
 
         let token = "tok-resp-stream-fail";
 
-        // First submit: handler runs once and commits, but its response body
-        // stream errors while buffering, so the guard fails closed with 500
-        // instead of returning a truncated success.
         let first = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
         assert_eq!(
             first.status(),
@@ -1858,16 +2103,13 @@ mod tests {
             "a response-stream error after handler commit must fail closed, not return a truncated body"
         );
 
-        // No consumed-token record was persisted (the body never fully buffered).
         let key = storage_key(token);
         assert!(
             store.get(&key).await.unwrap().is_none(),
             "a response-stream error must not persist a consumed-token record"
         );
 
-        // Retry with the same token: the in-flight lock is still held (it was
-        // deliberately not released), so the retry is rejected in-flight and the
-        // handler does NOT run a second time.
+        // The lock was kept, so the retry is rejected in-flight.
         let second = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
         assert_eq!(
             second.status(),
@@ -1901,11 +2143,7 @@ mod tests {
                 post(move || {
                     let count = count_inner.clone();
                     async move {
-                        // The handler returns a 422 (validation failure — no
-                        // committed, cacheable mutation) whose body stream
-                        // delivers a leading chunk and then errors before EOF,
-                        // so the replay cache buffering hits
-                        // `CollectedBody::Errored` on a non-success status.
+                        // A 422 (nothing committed) whose body errors after the first chunk.
                         count.fetch_add(1, Ordering::SeqCst);
                         let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
                             Ok(Bytes::from("invalid")),
@@ -1922,9 +2160,6 @@ mod tests {
 
         let token = "tok-resp-stream-fail-422";
 
-        // First submit: handler runs once and returns a 422 whose body stream
-        // errors while buffering, so the guard surfaces 500 but — because the
-        // status is non-success — releases the in-flight lock.
         let first = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
         assert_eq!(
             first.status(),
@@ -1932,16 +2167,13 @@ mod tests {
             "a response-stream error must fail closed with 500 rather than a truncated body"
         );
 
-        // No consumed-token record was persisted (non-success, and the body
-        // never fully buffered).
         let key = storage_key(token);
         assert!(
             store.get(&key).await.unwrap().is_none(),
             "a non-success response-stream error must not persist a consumed-token record"
         );
 
-        // Retry with the same token: the lock was released, so the retry is NOT
-        // rejected in-flight — it re-acquires the lock and re-runs the handler.
+        // The lock was released, so the retry runs the handler again.
         let second = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
         assert_ne!(
             second.status(),
@@ -2038,13 +2270,11 @@ mod tests {
 
         let token = "tok-read-fail";
 
-        // First submit consumes the token and records the response.
         let first = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
-        // Now make consumed-token lookups fail. A replay must fail closed with
-        // 503 rather than treating the errored lookup as a miss and re-running.
+        // A failing lookup must fail closed, not count as a miss and re-run the handler.
         store.fail_reads.store(true, Ordering::SeqCst);
         let second = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
         assert_eq!(
@@ -2159,8 +2389,7 @@ mod tests {
             )
             .layer(layer_with_store(store));
 
-        // A urlencoded body whose stream delivers a leading chunk (with the
-        // token near the front) and then errors before EOF.
+        // The stream delivers the token, then errors before EOF.
         let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
             Ok(Bytes::from("_submit_token=tok-read-err&ti")),
             Err(std::io::Error::other("simulated body read failure")),
@@ -2249,7 +2478,7 @@ mod tests {
     async fn in_flight_lock_ttl_is_decoupled_from_replay_ttl() {
         let store = Arc::new(TtlRecordingStore::new());
         let store_dyn: Arc<dyn IdempotencyStore> = store.clone();
-        // A deliberately tiny replay window paired with a normal in-flight TTL.
+        // A tiny replay window with a normal in-flight TTL.
         let config = SubmitTokenConfig {
             enabled: true,
             ttl_secs: 1,
@@ -2263,8 +2492,6 @@ mod tests {
         let resp = app.oneshot(urlencoded_post("tok-decoupled")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // The lock excluding a concurrent retry lives for the full
-        // in_flight_ttl_secs — lowering ttl_secs does NOT open the re-entry gap.
         let lock_ttl = store
             .lock_ttl
             .lock()
@@ -2275,7 +2502,6 @@ mod tests {
             Duration::from_hours(24),
             "the in-flight lock TTL must come from in_flight_ttl_secs, not ttl_secs"
         );
-        // ...while the consumed-record replay window still tracks ttl_secs.
         let set_ttl = store
             .set_ttl
             .lock()
@@ -2316,9 +2542,7 @@ mod tests {
             )
             .layer(SubmitTokenLayer::new(store_dyn, &config));
 
-        // Simulate the first request being mid-flight: hold the in-flight lock
-        // for the token key with the normal in-flight TTL, without recording a
-        // consumed response yet.
+        // Hold the lock as a mid-flight first request would, with no record stored yet.
         let token = "tok-inflight";
         let key = storage_key(token);
         assert!(
@@ -2328,8 +2552,6 @@ mod tests {
                 .unwrap()
         );
 
-        // A concurrent retry with the same token is rejected in-flight and never
-        // reaches the handler.
         let resp = app.oneshot(urlencoded_post(token)).await.unwrap();
         assert_eq!(
             resp.status(),

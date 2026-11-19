@@ -250,11 +250,8 @@ fn rejection_response<B>(request: &Request<B>) -> Option<Response<axum::body::Bo
         message,
     )
         .into_response();
-    // Surface this as a framework error so the exception filter
-    // chain (problem-details normalization, custom HTML error-page
-    // rendering) processes it the same as any handler-generated
-    // error response. Without this extension, `ExceptionFilterFuture`
-    // treats the response as pre-formed and skips renegotiation.
+    // Without this extension `ExceptionFilterFuture` treats the response as pre-formed and skips
+    // problem-details and error-page rendering.
     response.extensions_mut().insert(AutumnErrorInfo {
         status,
         message: message.to_owned(),
@@ -488,11 +485,8 @@ fn origin_matches_request_with_identity(
         return false;
     };
 
-    // When a resolved identity is present, use it exclusively — never fall
-    // back to raw X-Forwarded-Host, because the resolver has already applied
-    // the trusted-proxy policy.  Only when no identity extension exists (e.g.,
-    // a standalone test without the proxy middleware) do we read headers
-    // directly for backwards compatibility.
+    // With a resolved identity, never read raw X-Forwarded-Host: the resolver already applied
+    // the trusted-proxy policy. Headers are read directly only without the proxy middleware.
     let expected_host: Option<std::borrow::Cow<str>> = identity.map_or_else(
         || {
             headers
@@ -506,8 +500,6 @@ fn origin_matches_request_with_identity(
                 .map(std::borrow::Cow::Borrowed)
         },
         |id| {
-            // Identity stamp present: use resolver-validated host, or fall back
-            // to Host header only (never raw X-Forwarded-Host).
             id.host
                 .as_deref()
                 .or_else(|| {
@@ -526,17 +518,13 @@ fn origin_matches_request_with_identity(
         return false;
     }
 
-    // Prefer the resolver-validated scheme; fall back to header reads. Borrowed
-    // either way: the comparison below ignores ASCII case, so neither a copy of
-    // the identity's scheme nor a lower-cased copy of the header is needed.
     let resolved_scheme: Option<&str> = identity.map_or_else(
         || {
             headers
                 .get("x-forwarded-proto")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| {
-                    // Multiple `X-Forwarded-Proto` values chained by intermediaries;
-                    // the leftmost (client-facing) is the one that matters.
+                    // Chained by intermediaries; the leftmost is the client-facing scheme.
                     s.split(',').next().unwrap_or(s).trim()
                 })
         },
@@ -562,7 +550,7 @@ fn parse_origin(origin: &str) -> Option<(&str, &str)> {
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return None;
     }
-    // Defensive: `Origin` is just scheme://authority with no path.
+    // `Origin` carries no path; strip one defensively.
     let authority = rest.split('/').next()?;
     if authority.is_empty() {
         return None;
@@ -591,19 +579,13 @@ where
     }
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
-        // Only POST form-urlencoded submissions originating from the
-        // same origin are eligible. Same-origin form semantics: nothing
-        // else is allowed to silently morph methods, because a request
-        // that browsers won't make directly (e.g. a cross-origin
-        // `<form>` submitting to a `#[delete]` route) must not gain
-        // reachability via the override convention.
+        // Only same-origin form POSTs are eligible: a cross-origin `<form>` must not reach a
+        // `#[delete]` route through the override.
         if req.method() != http::Method::POST
             || !is_form_urlencoded(req.headers())
             || !is_same_origin_form_request(&req)
         {
-            // Ineligible request (almost all: each GET, each JSON POST, each
-            // cross-origin form). Nothing runs before the inner call, so the
-            // inner future is the future of this service.
+            // The common path: return the inner future unboxed.
             return futures::future::Either::Left(self.inner.call(req));
         }
 
@@ -613,30 +595,14 @@ where
         std::mem::swap(&mut self.inner, &mut inner);
 
         futures::future::Either::Right(Box::pin(async move {
-            // Temporarily take ownership of the body so we can buffer it
-            // for parsing without losing the bytes the handler will need.
-            //
-            // We do NOT short-circuit on `Content-Length > limit` and
-            // forward the body untouched — that would let a form with
-            // `_method=DELETE` and an oversized body silently fall
-            // through to the inner router as a `POST`, demoting the
-            // user's intended mutating operation based purely on body
-            // size. Instead, we always attempt the scan. `to_bytes`
-            // checks the body's `size_hint` first and errors out
-            // immediately (no buffering) for bodies advertised larger
-            // than the cap, so the cost on the fast-failure path is
-            // negligible; we mark the rejection and let the inner
-            // filter render `413` so the user is told plainly that
-            // the form is too large to support the override.
+            // An oversized body is rejected with 413, never forwarded untouched: that would turn
+            // an intended `_method=DELETE` into a `POST`. `to_bytes` checks `size_hint` first, so
+            // a body advertised over the cap fails without buffering.
             let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
             let Ok(bytes) = axum::body::to_bytes(body, max_scan_bytes).await else {
-                // Body exceeded the scan cap. The bytes are gone, so
-                // we can't forward a faithful request — and we don't
-                // want to silently turn an intended `DELETE` into a
-                // `POST` either. Stamp the rejection and pass the
-                // request through with an empty body; the inner
-                // `method_override_rejection_filter` short-circuits to
-                // `413` before any handler is called.
+                // The bytes are gone. Forward with an empty body and the rejection stamped:
+                // `method_override_rejection_filter` answers 413 before any handler runs. When
+                // route matching fails first (404/405), rewrite that response to 413 here.
                 req.extensions_mut()
                     .insert(MethodOverrideRejection::BodyTooLarge);
                 let res = inner.call(req).await?;
@@ -668,7 +634,6 @@ where
 
             let outcome = scan_form_for_override(&bytes, &config.field_name);
 
-            // Restore the body verbatim regardless of outcome.
             *req.body_mut() = axum::body::Body::from(bytes);
 
             match outcome {
@@ -683,14 +648,10 @@ where
                     inner.call(req).await
                 }
                 OverrideOutcome::Invalid => {
-                    // Stamp the rejection and forward as POST. The
-                    // inner rejection filter converts this to `400`
-                    // from inside the framework's response middleware
-                    // stack, so security headers, request IDs, metrics,
-                    // and error-page rendering all apply.
-                    // If route matching fails and returns 404 or 405, we
-                    // intercept and rewrite to 400 Bad Request, keeping
-                    // headers/extensions (like RequestId and security headers).
+                    // Forward as POST with the rejection stamped: the inner rejection filter
+                    // answers 400 inside the response middleware stack, so security headers,
+                    // request IDs and error pages apply. A 404/405 from route matching is
+                    // rewritten to 400 here, keeping its headers and extensions.
                     req.extensions_mut()
                         .insert(MethodOverrideRejection::InvalidValue);
                     let res = inner.call(req).await?;
@@ -895,9 +856,7 @@ mod tests {
 
     #[tokio::test]
     async fn override_ignored_without_form_content_type() {
-        // JSON POST should NOT have its method rewritten even if a `_method`
-        // string happens to appear in the body. The convention is documented
-        // for browser HTML form submissions only.
+        // A JSON body containing `_method` is not rewritten: the override is for HTML forms only.
         let app = layered_router();
         let response = app
             .oneshot(
@@ -941,8 +900,7 @@ mod tests {
 
     #[tokio::test]
     async fn override_preserves_body_for_handler() {
-        // Override consumes the body to peek at `_method`; it MUST restore
-        // the bytes so handler extractors (Form, ChangesetForm, etc.) work.
+        // The override reads the body to find `_method`; it must restore it for extractors.
         async fn echo(body: String) -> String {
             body
         }
@@ -1155,9 +1113,7 @@ mod tests {
             .layer(axum::middleware::from_fn(method_override_rejection_filter));
         let app = MethodOverrideLayer::new().layer(router);
 
-        // No Content-Length header -> content_length_exceeds returns
-        // false and we attempt to buffer. The body itself is larger
-        // than the scan cap so `to_bytes` will error.
+        // No Content-Length: the cap is hit while buffering, not from the size hint.
         let payload = "x".repeat(3 * 1024 * 1024);
         let response = app
             .oneshot(
@@ -1242,10 +1198,7 @@ mod tests {
     /// is CSRF-exempt).
     #[tokio::test]
     async fn cross_site_form_is_not_honoured_as_override() {
-        // Inner /items/{id} only has DELETE; no POST handler. If the
-        // override were applied, we'd see 200 "delete-ok". If the
-        // override is correctly skipped, we should see 405 (POST not
-        // allowed for that route).
+        // /items/{id} has only DELETE: an applied override would answer 200, a skipped one 405.
         let app = layered_router();
         let response = app
             .oneshot(
@@ -1409,9 +1362,7 @@ mod tests {
                     .header("content-type", "application/x-www-form-urlencoded")
                     .header("origin", "https://app.example")
                     .header("host", "app.example")
-                    // First hop saw HTTPS; later hops were HTTP between
-                    // proxy and app. Only the client-facing scheme
-                    // matters for the same-origin comparison.
+                    // Only the leftmost, client-facing scheme counts.
                     .header("x-forwarded-proto", "https, http")
                     .body(Body::from("_method=DELETE"))
                     .unwrap(),
@@ -1527,8 +1478,7 @@ mod tests {
     /// Helper-level cases that don't require the full router wiring.
     #[test]
     fn is_same_origin_form_decision_matrix() {
-        // `same-origin` and `none` are accepted on the Sec-Fetch-Site
-        // signal alone.
+        // `same-origin` and `none` are accepted on Sec-Fetch-Site alone.
         for site in ["same-origin", "none"] {
             let mut h = http::HeaderMap::new();
             h.insert("sec-fetch-site", http::HeaderValue::from_str(site).unwrap());
@@ -1538,9 +1488,8 @@ mod tests {
             );
         }
 
-        // `same-site` is NOT sufficient alone: it allows sibling
-        // origins under the same registrable domain. Require an
-        // Origin/Host match before honouring it.
+        // `same-site` alone is not enough: it covers sibling origins under the same registrable
+        // domain, so an Origin/Host match is also required.
         let mut h = http::HeaderMap::new();
         h.insert(
             "sec-fetch-site",
@@ -1567,9 +1516,7 @@ mod tests {
         );
         assert!(is_same_origin_form_request(&req_from_headers(h)));
 
-        // `same-site` with a sibling Origin: the registrable domain is
-        // the same so the browser sends `same-site`, but the Origin
-        // differs and we must reject.
+        // `same-site` with a sibling Origin: rejected.
         let mut h = http::HeaderMap::new();
         h.insert(
             "sec-fetch-site",
@@ -1669,7 +1616,7 @@ mod tests {
             .route("/items", post(|| async { "ok" }))
             .layer(axum::middleware::from_fn(method_override_rejection_filter));
 
-        // Set a very small cap (10 bytes) — the 20-byte body should be rejected.
+        // A 10-byte cap against a 29-byte body.
         let service =
             tower::Layer::layer(&MethodOverrideLayer::new().with_max_scan_bytes(10), router);
 
@@ -1689,8 +1636,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    // ── AC #5(d): PR #791 PoC regression — method-override spoofing stays rejected
-    // after migration to the centralized proxy resolver.
+    // ── Resolved identity vs. spoofed forwarded headers ──────────────────────────
 
     /// Regression for PR #791: an attacker who controls `X-Forwarded-Host` and
     /// `X-Forwarded-Proto` must NOT be able to spoof the same-origin check when
@@ -1709,12 +1655,7 @@ mod tests {
     async fn pr791_poc_with_resolved_identity_uses_validated_host() {
         use crate::security::trusted_proxies::ResolvedClientIdentity;
 
-        // The app's "real" origin is https://app.example.
-        // An attacker injects X-Forwarded-Host: app.example with matching Origin
-        // trying to make the middleware see a same-origin match.
-        //
-        // When the proxy resolver has determined the real host is "app.example"
-        // (legitimate — request is really from app.example), the override is allowed.
+        // The resolver confirms the host is app.example, so the same-origin override applies.
         let app = layered_router();
         let mut req = Request::builder()
             .method("POST")
@@ -1727,7 +1668,6 @@ mod tests {
             .body(Body::from("_method=DELETE"))
             .unwrap();
 
-        // Inject resolved identity as the framework would (host = app.example, scheme = https).
         req.extensions_mut().insert(ResolvedClientIdentity {
             addr: None,
             host: Some("app.example".to_owned()),
@@ -1735,7 +1675,6 @@ mod tests {
         });
 
         let response = app.oneshot(req).await.unwrap();
-        // Legitimate same-origin request with resolver-validated identity: allowed.
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -1743,9 +1682,8 @@ mod tests {
     async fn pr791_poc_resolved_identity_different_host_is_rejected() {
         use crate::security::trusted_proxies::ResolvedClientIdentity;
 
-        // The resolver determined the real host is "internal.cluster.local" (not
-        // what the attacker put in X-Forwarded-Host). The Origin says "app.example",
-        // which doesn't match the resolver-validated host, so the override is rejected.
+        // X-Forwarded-Host claims app.example, but the resolver says the host is
+        // internal.cluster.local, so the Origin does not match and the override is rejected.
         let app = layered_router();
         let mut req = Request::builder()
             .method("POST")
@@ -1758,8 +1696,6 @@ mod tests {
             .body(Body::from("_method=DELETE"))
             .unwrap();
 
-        // Resolver says the real host is the internal cluster hostname, not the
-        // attacker-injected X-Forwarded-Host value.
         req.extensions_mut().insert(ResolvedClientIdentity {
             addr: None,
             host: Some("internal.cluster.local".to_owned()),
@@ -1767,8 +1703,6 @@ mod tests {
         });
 
         let response = app.oneshot(req).await.unwrap();
-        // Origin (app.example) does not match resolver-validated host
-        // (internal.cluster.local): override must NOT apply.
         assert_eq!(
             response.status(),
             StatusCode::METHOD_NOT_ALLOWED,

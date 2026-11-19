@@ -8,7 +8,7 @@
 //!   [`ChangeOutcome`] per change, in order).
 //! - `GET <base>/pull?cursor=N&limit=M` → [`PullResponse`].
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// Server-assigned change sequence number. `0` means "never synced".
@@ -110,7 +110,8 @@ pub struct Change {
     pub base_version: Version,
     /// Wall-clock time of the local write, used only by conflict
     /// resolvers — never for change-feed ordering.
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub updated_at: Timestamp,
 }
 
 /// Body of `POST <base>/push`.
@@ -144,7 +145,8 @@ pub struct RemoteRow {
     /// `true` if the row is a tombstone.
     pub deleted: bool,
     /// `updated_at` of the write that produced this row state.
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub updated_at: Timestamp,
     /// Device that produced this row state (empty for server-side writes).
     pub device_id: String,
 }
@@ -253,7 +255,10 @@ pub enum PullResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+
+    fn noon() -> Timestamp {
+        "2026-07-07T12:00:00Z".parse().unwrap()
+    }
 
     fn sample_change() -> Change {
         Change {
@@ -263,7 +268,7 @@ mod tests {
             op: Op::Upsert,
             payload: Some(serde_json::json!({"title": "hi"})),
             base_version: 3,
-            updated_at: Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap(),
+            updated_at: noon(),
         }
     }
 
@@ -306,9 +311,8 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
 
-        // Explicit null: a REAL JSON document (e.g. store.put(&None::<T>)) —
-        // must survive as "payload": null and come back as Some(Null), not
-        // collapse into an omitted payload the server would reject.
+        // Explicit null is a real JSON document (e.g. `store.put(&None::<T>)`). It must stay
+        // `"payload": null`: an omitted payload would be rejected by the server.
         let mut change = sample_change();
         change.payload = Some(serde_json::Value::Null);
         let json = serde_json::to_string(&change).unwrap();
@@ -318,7 +322,6 @@ mod tests {
         );
         assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
 
-        // Ordinary value round-trips unchanged.
         let change = sample_change();
         let json = serde_json::to_string(&change).unwrap();
         assert_eq!(serde_json::from_str::<Change>(&json).unwrap(), change);
@@ -332,7 +335,7 @@ mod tests {
             payload,
             version: 7,
             deleted,
-            updated_at: chrono::Utc::now(),
+            updated_at: crate::time::ambient_now(),
             device_id: "d".to_owned(),
         };
         // Tombstone: payload key omitted entirely.
@@ -341,16 +344,15 @@ mod tests {
         assert!(!json.contains("payload"), "{json}");
         assert_eq!(serde_json::from_str::<RemoteRow>(&json).unwrap(), tombstone);
 
-        // Live row whose document IS null: present on the wire, intact back
-        // — a collapse to None would materialize as an absent row on pull.
+        // A live row whose document is null: collapsing to None would materialize as an absent
+        // row on pull.
         let null_row = row(Some(serde_json::Value::Null), false);
         let json = serde_json::to_string(&null_row).unwrap();
         assert!(json.contains(r#""payload":null"#), "{json}");
         assert_eq!(serde_json::from_str::<RemoteRow>(&json).unwrap(), null_row);
 
-        // The Y dedup snapshot (serde_json::to_value/from_value on the
-        // resolved row) uses the same field encoding — Some(Null) must
-        // round-trip through a Value too.
+        // The dedup snapshot (`to_value`/`from_value` on the resolved row) uses the same
+        // encoding, so Some(Null) must round-trip through a Value too.
         let snapshot = serde_json::to_value(&null_row).unwrap();
         assert_eq!(
             serde_json::from_value::<RemoteRow>(snapshot).unwrap(),
@@ -384,7 +386,7 @@ mod tests {
                 payload: None,
                 version: 9,
                 deleted: true,
-                updated_at: Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap(),
+                updated_at: noon(),
                 device_id: "device-a".into(),
             }],
             next_cursor: 9,

@@ -399,9 +399,8 @@ mod tests {
 
     #[test]
     fn a_printed_target_keeps_no_credential() {
-        // Codex review on #3222: no path either. A path can hold a signed
-        // token or an object key, and the scrub never learns an unrecorded
-        // call's values.
+        // The path goes too: it can hold a signed token or an object key, and the scrub never
+        // learns an unrecorded call's values.
         assert_eq!(
             printable_target("https://user:pw@api.example/v1/reset/s3cr3t?token=t#f"),
             "https://api.example"
@@ -474,8 +473,7 @@ mod tests {
         })
         .await;
         assert!(carried, "the spawned task must see the replay tape");
-        // The recording had no detached work, so the spawn is a divergence,
-        // logged at the spawn (Codex review on #3222).
+        // The recording had no detached work, so the spawn is a divergence, logged at the spawn.
         let divergences = tape.divergences();
         assert_eq!(divergences.len(), 1, "{divergences:?}");
         assert_eq!(divergences[0].seam, EffectSeam::Detached);

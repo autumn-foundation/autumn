@@ -202,7 +202,7 @@ const TOTALS: &str = "SELECT COUNT(*) AS rows, SUM(n) AS total, SUM(price) AS pr
                       COUNT(data) AS blobs, group_concat(body, ',' ORDER BY body) AS bodies \
                       FROM notes";
 
-// ── AC: the lake matches the fleet, with no volume ──────────────────────────
+// ── The lake matches the fleet, with no volume ──────────────────────────────
 
 #[tokio::test]
 async fn three_tenants_aggregate_matches_the_fleet_with_no_volume() {
@@ -327,7 +327,7 @@ async fn more_tenants_than_the_attach_cap_load() {
     assert_eq!(order, sorted);
 }
 
-// ── AC: deleted tenants are excluded ────────────────────────────────────────
+// ── Deleted tenants are excluded ────────────────────────────────────────────
 
 #[tokio::test]
 async fn a_deleted_tenant_is_excluded_by_its_row_and_by_its_marker() {
@@ -454,7 +454,7 @@ async fn an_unreadable_marker_fails_the_load() {
 
 #[test]
 fn decide_matches_the_tombstone_rule() {
-    let at = |ms| DateTime::from_timestamp_millis(ms).unwrap();
+    let at = |ms| Timestamp::from_millisecond(ms).unwrap();
     // `included` in verification/fleet_lake.rs, before the plan.
     assert_eq!(
         decide(true, None, Some(at(5))),
@@ -862,7 +862,7 @@ async fn the_manifest_table_records_each_tenant() {
     for (row, tenant) in rows.rows.iter().zip(snapshot.tenants()) {
         assert_eq!(text(&row[0]), tenant.tenant.as_str());
         assert_eq!(text(&row[1]), tenant.generation);
-        assert_eq!(row[2].as_i64(), Some(tenant.effective.timestamp_millis()));
+        assert_eq!(row[2].as_i64(), Some(tenant.effective.as_millisecond()));
     }
 }
 

@@ -196,7 +196,7 @@ impl CapsuleService {
     pub fn capsule_name() -> String {
         static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let time = crate::time::ambient_now().format("%Y%m%dT%H%M%S%6f");
+        let time = crate::time::ambient_now().strftime("%Y%m%dT%H%M%S%6f");
         format!("capsule-{time}-{count}")
     }
 

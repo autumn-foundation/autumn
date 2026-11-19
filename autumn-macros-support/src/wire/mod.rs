@@ -23,6 +23,12 @@ pub use resolve::{
     module_of_file, resolve_type, type_id, type_paths,
 };
 
+/// The largest protobuf field number.
+pub const MAX_FIELD_NUMBER: u32 = 536_870_911;
+
+/// The field numbers that protobuf keeps for its own use.
+pub const KEPT_FIELD_NUMBERS: std::ops::RangeInclusive<u32> = 19_000..=19_999;
+
 /// One field of a request or response type, as serde treats it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WireFieldDescriptor {
@@ -55,6 +61,10 @@ pub struct WireFieldDescriptor {
     /// source order. The export fills them in. See [`type_id`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nested: Vec<String>,
+    /// `#[wire(tag = N)]`: the protobuf field number of this field. It wins
+    /// over the number in the proto lock file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<u32>,
 }
 
 /// The serde-visible shape of one request or response type.
@@ -273,14 +283,13 @@ pub struct CallerCall {
     pub client: String,
     /// The client method called. It is also the endpoint's name.
     pub method: String,
-    /// Response fields the caller reads, by Rust name, sorted. A field inside
-    /// a field is a dotted path: `details.color`. Each parent path is also in
-    /// the list: `details`.
+    /// Response fields the caller reads, by Rust name, sorted. A nested
+    /// field is a dotted path (`details.color`), and its prefixes are in the
+    /// list too.
     pub reads: Vec<String>,
     /// Request fields the call site sets, by Rust name, sorted. A field of a
-    /// nested struct literal is a dotted path, and its parent is also in the
-    /// list: `details` and `details.color`. `None` when the request is not an
-    /// inline struct literal.
+    /// nested inline literal is a dotted path, as in `reads`. `None` when the
+    /// request is not an inline struct literal.
     pub writes: Option<Vec<String>>,
 }
 
@@ -372,9 +381,8 @@ pub struct ListenerDescriptor {
     pub function: String,
     /// The event type's path, as the attribute gives it.
     pub event: String,
-    /// Payload fields the consumer reads, by Rust name, sorted. A field
-    /// inside a field is a dotted path: `address.city`. Each parent path is
-    /// also in the list: `address`.
+    /// Payload fields the consumer reads, by Rust name, sorted. A nested
+    /// field is a dotted path, as in [`CallerCall::reads`].
     pub reads: Vec<String>,
 }
 

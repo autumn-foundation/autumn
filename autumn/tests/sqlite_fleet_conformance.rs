@@ -3,7 +3,7 @@
 //!
 //! Run: `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_conformance`.
 
-#![cfg(feature = "sqlite")]
+#![cfg(all(feature = "sqlite", feature = "plugin-conformance"))]
 
 use std::path::Path;
 use std::sync::Arc;

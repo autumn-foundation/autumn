@@ -1,0 +1,93 @@
+--- 100000 rows, schema_before.sql
+insert ttl window: calls 200, rows 39
+insert plain: calls 1006, rows 1006
+insert running/pending window: calls 794, rows 103
+unique holds by name/window/status: digest.send/running/enqueued=72, report.build/ttl/enqueued=39, sync.pull/pending/enqueued=31
+evicted ttl holds (fixture rows): 0
+end-state md5 (id, name, queue, status, keys): 1136acf2e5eae86f89a1d913fb20b424
+--- 100000 rows, schema.sql
+insert plain: calls 1006, rows 1006
+insert running/pending window: calls 794, rows 103
+insert ttl window: calls 200, rows 39
+unique holds by name/window/status: digest.send/running/enqueued=72, report.build/ttl/enqueued=39, sync.pull/pending/enqueued=31
+evicted ttl holds (fixture rows): 0
+end-state md5 (id, name, queue, status, keys): 1136acf2e5eae86f89a1d913fb20b424
+--- 1000000 rows, schema_before.sql
+insert ttl window: calls 200, rows 29
+insert plain: calls 1006, rows 1006
+insert running/pending window: calls 794, rows 103
+unique holds by name/window/status: digest.send/running/enqueued=72, report.build/ttl/enqueued=29, sync.pull/pending/enqueued=31
+evicted ttl holds (fixture rows): 0
+end-state md5 (id, name, queue, status, keys): 83b221a2b316452e814949a23ddaf29f
+--- 1000000 rows, schema.sql
+insert plain: calls 1006, rows 1006
+insert running/pending window: calls 794, rows 103
+insert ttl window: calls 200, rows 29
+unique holds by name/window/status: digest.send/running/enqueued=72, report.build/ttl/enqueued=29, sync.pull/pending/enqueued=31
+evicted ttl holds (fixture rows): 0
+end-state md5 (id, name, queue, status, keys): 83b221a2b316452e814949a23ddaf29f
+--- 3000000 rows, schema_before.sql
+insert ttl window: calls 200, rows 24
+insert plain: calls 1006, rows 1006
+insert running/pending window: calls 794, rows 103
+unique holds by name/window/status: digest.send/running/enqueued=72, report.build/ttl/enqueued=24, sync.pull/pending/enqueued=31
+evicted ttl holds (fixture rows): 0
+end-state md5 (id, name, queue, status, keys): f264c5cc1a54930854dbc350211b1391
+--- 3000000 rows, schema.sql
+insert plain: calls 1006, rows 1006
+insert running/pending window: calls 794, rows 103
+insert ttl window: calls 200, rows 24
+unique holds by name/window/status: digest.send/running/enqueued=72, report.build/ttl/enqueued=24, sync.pull/pending/enqueued=31
+evicted ttl holds (fixture rows): 0
+end-state md5 (id, name, queue, status, keys): f264c5cc1a54930854dbc350211b1391
+psql:schema_before.sql:2: NOTICE:  table "autumn_jobs" does not exist, skipping
+psql:schema.sql:2: NOTICE:  table "autumn_jobs" does not exist, skipping
+--- edge cases, before (no index)
+               case_name                | inserted |                                dedup_scan                                
+----------------------------------------+----------+--------------------------------------------------------------------------
+ ttl: finished in window                |        0 | Seq Scan on autumn_jobs dup
+ ttl: finished before window            |        1 | Seq Scan on autumn_jobs dup
+ ttl: enqueued_at = now() - ttl         |        1 | Seq Scan on autumn_jobs dup
+ ttl: 1us inside the boundary           |        0 | Seq Scan on autumn_jobs dup
+ ttl: same key, other name              |        1 | Seq Scan on autumn_jobs dup
+ ttl: key only in pending_unique_key    |        1 | Seq Scan on autumn_jobs dup
+ ttl: in flight, enqueued before window |        0 | Seq Scan on autumn_jobs dup
+ ttl: failed in window                  |        0 | Seq Scan on autumn_jobs dup
+ ttl: running-window row in window      |        0 | Seq Scan on autumn_jobs dup
+ ttl: in flight in window               |        0 | Seq Scan on autumn_jobs dup
+ ttl: key differs in case               |        1 | Seq Scan on autumn_jobs dup
+ ttl: empty key                         |        1 | Seq Scan on autumn_jobs dup
+ ttl: ttl 0                             |        1 | Seq Scan on autumn_jobs dup
+ running: finished only                 |        1 | Index Only Scan using idx_autumn_jobs_unique_inflight on autumn_jobs dup
+ running: in flight                     |        0 | Index Only Scan using idx_autumn_jobs_unique_inflight on autumn_jobs dup
+ plain: no key                          |        1 | (no dedup scan)
+
+                                                                                                                                 ?column?                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ rows after: 9, inserted ids: eq-plain: no key eq-running: finished only eq-ttl: empty key eq-ttl: enqueued_at = now() - ttl eq-ttl: finished before window eq-ttl: key differs in case eq-ttl: key only in pending_unique_key eq-ttl: same key, other name eq-ttl: ttl 0
+
+--- edge cases, after (index, enable_seqscan = off)
+               case_name                | inserted |                                  dedup_scan                                  
+----------------------------------------+----------+------------------------------------------------------------------------------
+ ttl: finished in window                |        0 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: finished before window            |        1 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: enqueued_at = now() - ttl         |        1 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: 1us inside the boundary           |        0 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: same key, other name              |        1 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: key only in pending_unique_key    |        1 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: in flight, enqueued before window |        0 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: failed in window                  |        0 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: running-window row in window      |        0 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: in flight in window               |        0 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: key differs in case               |        1 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: empty key                         |        1 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ ttl: ttl 0                             |        1 | Index Only Scan using idx_autumn_jobs_unique_key_enqueued on autumn_jobs dup
+ running: finished only                 |        1 | Index Only Scan using idx_autumn_jobs_unique_inflight on autumn_jobs dup
+ running: in flight                     |        0 | Index Only Scan using idx_autumn_jobs_unique_inflight on autumn_jobs dup
+ plain: no key                          |        1 | (no dedup scan)
+
+                                                                                                                                 ?column?                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ rows after: 9, inserted ids: eq-plain: no key eq-running: finished only eq-ttl: empty key eq-ttl: enqueued_at = now() - ttl eq-ttl: finished before window eq-ttl: key differs in case eq-ttl: key only in pending_unique_key eq-ttl: same key, other name eq-ttl: ttl 0
+
+--- outcome columns identical: yes

@@ -77,9 +77,8 @@ pub fn encrypt(
     auth_secret: &[u8],
 ) -> Result<Vec<u8>, PushError> {
     let mut salt = [0_u8; 16];
-    // `SysRng` is the operating system CSPRNG — the same source `SigningKey::
-    // random` draws from. A non-cryptographic RNG here would be a real break,
-    // not a style choice.
+    // Salt and ephemeral key must come from the OS CSPRNG; a non-cryptographic RNG breaks the
+    // encryption.
     rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut salt)
         .map_err(|e| PushError::Encryption(format!("could not draw a random salt: {e}")))?;
     let ephemeral = p256::SecretKey::try_generate_from_rng(&mut rand::rngs::SysRng)
@@ -115,8 +114,8 @@ pub fn encrypt_with(
             auth_secret.len()
         )));
     }
-    // `from_sec1_bytes` rejects both a wrong length and a point that is not on
-    // the curve, so a hostile `p256dh` cannot steer the ECDH onto a weak curve.
+    // `from_sec1_bytes` rejects a wrong length and an off-curve point, so a hostile `p256dh`
+    // cannot mount an invalid-curve attack on the ECDH.
     let ua_key = p256::PublicKey::from_sec1_bytes(ua_public).map_err(|_| {
         PushError::InvalidSubscriptionKey(
             "`p256dh` is not an uncompressed P-256 public key on the curve".to_owned(),
@@ -185,7 +184,7 @@ pub fn encrypt_with(
 pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     type HmacSha256 = Hmac<Sha256>;
 
-    // Extract: PRK = HMAC(salt, IKM). `new_from_slice` accepts any key length.
+    // Extract: PRK = HMAC(salt, IKM).
     let mut extract =
         <HmacSha256 as KeyInit>::new_from_slice(salt).expect("HMAC accepts any key length");
     extract.update(ikm);
@@ -216,12 +215,8 @@ mod tests {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-    // ── RFC 8291 §5 published test vector ───────────────────────────────────
-    //
-    // Every value below is copied verbatim from RFC 8291 Section 5 ("Push
-    // Message Encryption Example"). Pinning the RFC's own vector — not a
-    // round-trip against our own code — is what proves this implementation
-    // interoperates with real push services and real browsers.
+    // RFC 8291 §5 test vector, copied verbatim. Matching the RFC's vector rather than a round-trip
+    // through our own code is what shows interop with real push services and browsers.
 
     const RFC_PLAINTEXT: &str = "When I grow up, I want to be a watermelon";
     /// The user agent's public key (`p256dh`).
@@ -305,9 +300,7 @@ mod tests {
 
     #[test]
     fn hkdf_matches_rfc_5869_test_case_1() {
-        // RFC 5869 Appendix A.1 — an independent check that the HKDF-SHA256
-        // used for every derived key here is correct, separate from the
-        // Web Push framing.
+        // RFC 5869 Appendix A.1: checks HKDF on its own, apart from the Web Push framing.
         let ikm = [0x0b_u8; 22];
         let salt: Vec<u8> = (0x00..=0x0c).collect();
         let info: Vec<u8> = (0xf0..=0xf9).collect();
@@ -320,8 +313,7 @@ mod tests {
 
     #[test]
     fn each_message_uses_a_fresh_salt_and_ephemeral_key() {
-        // Reusing either across messages would leak plaintext relationships;
-        // the random entry point must never produce the same body twice.
+        // Reusing either across messages would leak relationships between plaintexts.
         let first = encrypt(
             RFC_PLAINTEXT.as_bytes(),
             &b64(RFC_UA_PUBLIC),
@@ -354,8 +346,8 @@ mod tests {
 
     #[test]
     fn rejects_a_p256dh_that_is_not_on_the_curve() {
-        // Right length and right prefix, but not a curve point: accepting it
-        // would be an invalid-curve attack surface.
+        // Right length and prefix, but off the curve: accepting it would allow an invalid-curve
+        // attack.
         let mut bogus = b64(RFC_UA_PUBLIC);
         bogus[64] ^= 0x01;
         let err = encrypt(b"hi", &bogus, &b64(RFC_AUTH_SECRET))

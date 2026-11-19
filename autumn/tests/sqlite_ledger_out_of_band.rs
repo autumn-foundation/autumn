@@ -7,7 +7,8 @@
 //! a typed error and leave the table and its chain unchanged.
 //!
 //! Hand-written SQL is out of reach. `ledger_verify` must report it as
-//! `LiveStateMismatch`, with no false positive on the refused paths.
+//! `LiveStateMismatch`, with no false positive on the refused paths, nor on a
+//! row whose time columns moved from `chrono` to `jiff` unchanged.
 //!
 //! Run: `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_ledger_out_of_band`.
 #![cfg(feature = "sqlite")]
@@ -16,7 +17,8 @@
 use autumn_web::config::DatabaseConfig;
 use autumn_web::db::{RuntimeConnection, create_pool};
 use autumn_web::ledger::LedgerError;
-use autumn_web::reexports::{chrono, diesel, diesel_async};
+use autumn_web::reexports::{diesel, diesel_async};
+use autumn_web::time::civil;
 use diesel_async::SimpleAsyncConnection as _;
 use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -112,6 +114,18 @@ mod schema {
         }
     }
     autumn_web::reexports::diesel::table! {
+        lgo_stamps (id) {
+            id -> Int8,
+            at -> TimestamptzSqlite,
+            maybe_at -> Nullable<TimestamptzSqlite>,
+            local -> Timestamp,
+            day -> Date,
+            clock -> Time,
+            maybe_clock -> Nullable<Time>,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+    autumn_web::reexports::diesel::table! {
         lgo_note_comments (id) {
             id -> Int8,
             commentable_type -> Text,
@@ -128,7 +142,7 @@ mod schema {
 use schema::{
     lgo_comments, lgo_del_children, lgo_del_parents, lgo_like_posts, lgo_note_comments, lgo_notes,
     lgo_nul_children, lgo_nul_parents, lgo_plain_comments, lgo_plain_posts, lgo_posts,
-    lgo_shadow_parents, lgo_users, lgo_vote_posts,
+    lgo_shadow_parents, lgo_stamps, lgo_users, lgo_vote_posts,
 };
 
 // ── counter cache on a ledgered parent ───────────────────────────────
@@ -141,7 +155,7 @@ pub struct LgoPost {
     #[default]
     pub comment_count: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(LgoPost, table = "lgo_posts", soft_delete, ledgered = true)]
@@ -192,7 +206,7 @@ pub struct LgoDelChild {
     pub id: i64,
     pub parent_id: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(LgoDelChild, table = "lgo_del_children", soft_delete, ledgered = true)]
@@ -220,7 +234,7 @@ pub struct LgoNulChild {
     pub id: i64,
     pub parent_id: Option<i64>,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(LgoNulChild, table = "lgo_nul_children", soft_delete, ledgered = true)]
@@ -267,7 +281,7 @@ pub struct LgoVotePost {
     #[default]
     pub score: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(LgoVotePost, table = "lgo_vote_posts", soft_delete, ledgered = true)]
@@ -298,9 +312,9 @@ pub struct LgoNoteComment {
     pub author_id: i64,
     pub body: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: civil::DateTime,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -336,7 +350,7 @@ pub trait LgoLikePostRepository {}
 /// The edge table, ledgered. Its own module: `#[votable]` declares a hidden
 /// table of the same name.
 mod likes {
-    use autumn_web::reexports::chrono;
+    use autumn_web::time::civil;
 
     autumn_web::reexports::diesel::table! {
         lgo_post_likes (id) {
@@ -354,7 +368,7 @@ mod likes {
         pub voter_id: i64,
         pub post_id: i64,
         #[default]
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<civil::DateTime>,
     }
 
     #[autumn_web::repository(LgoPostLike, table = "lgo_post_likes", soft_delete, ledgered = true)]
@@ -365,7 +379,7 @@ mod likes {
 
 mod shadow {
     use super::schema::lgo_posts;
-    use autumn_web::reexports::chrono;
+    use autumn_web::time::civil;
 
     #[autumn_web::model(table = "lgo_posts")]
     pub struct LgoShadowPost {
@@ -375,7 +389,7 @@ mod shadow {
         #[default]
         pub comment_count: i64,
         #[default]
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<civil::DateTime>,
     }
 
     #[autumn_web::repository(LgoShadowPost, table = "lgo_posts")]
@@ -386,7 +400,7 @@ mod shadow {
 /// `destroy` cascade.
 mod shadow_children {
     use super::schema::lgo_del_children;
-    use autumn_web::reexports::chrono;
+    use autumn_web::time::civil;
 
     #[autumn_web::model(table = "lgo_del_children")]
     pub struct LgoShadowChild {
@@ -394,7 +408,7 @@ mod shadow_children {
         pub id: i64,
         pub parent_id: i64,
         #[default]
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<civil::DateTime>,
     }
 
     #[autumn_web::repository(LgoShadowChild, table = "lgo_del_children", soft_delete)]
@@ -418,6 +432,25 @@ pub struct LgoShadowParent {
     )
 )]
 pub trait LgoShadowParentRepository {}
+
+// ── time columns written before the move to jiff ─────────────────────
+
+#[autumn_web::model(table = "lgo_stamps")]
+pub struct LgoStamp {
+    #[id]
+    pub id: i64,
+    pub at: autumn_web::time::Timestamp,
+    pub maybe_at: Option<autumn_web::time::Timestamp>,
+    pub local: civil::DateTime,
+    pub day: civil::Date,
+    pub clock: civil::Time,
+    pub maybe_clock: Option<civil::Time>,
+    #[default]
+    pub deleted_at: Option<civil::DateTime>,
+}
+
+#[autumn_web::repository(LgoStamp, table = "lgo_stamps", soft_delete, ledgered = true)]
+pub trait LgoStampRepository {}
 
 // ── harness ──────────────────────────────────────────────────────────
 
@@ -475,6 +508,9 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
          commentable_type TEXT NOT NULL, commentable_id BIGINT NOT NULL, \
          parent_id BIGINT, author_id BIGINT NOT NULL, body TEXT NOT NULL, \
          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, deleted_at TIMESTAMP)",
+        "CREATE TABLE lgo_stamps (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+         at TEXT NOT NULL, maybe_at TEXT, local TEXT NOT NULL, day TEXT NOT NULL, \
+         clock TEXT NOT NULL, maybe_clock TEXT, deleted_at TIMESTAMP)",
         VERSION_HISTORY_UP,
         LEDGER_UP,
         LEDGER_HIGH_WATER_UP,
@@ -688,6 +724,134 @@ async fn a_hand_written_delete_is_reported_as_live_state_mismatch() {
         .broken
         .expect("a hand-written delete must be reported");
     assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+}
+
+/// The snapshot of a row whose time columns were `chrono` types when it was
+/// written, as `chrono`'s serde wrote them: fractions in groups of 3, 6 or 9
+/// digits, `Z` on the instant, no offset on the naive values.
+fn chrono_era_stamp_snapshot(id: i64) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "at": "2026-09-01T18:08:53.120Z",
+        "maybe_at": "2026-09-01T18:08:53.000123Z",
+        "local": "2026-09-01T18:08:53.123400",
+        "day": "2026-09-01",
+        "clock": "18:08:53.100",
+        "maybe_clock": null,
+        "deleted_at": null,
+    })
+}
+
+/// A ledgered row whose time columns moved from `chrono` to `jiff` with no
+/// other change still verifies against a head written in `chrono`'s encoding.
+/// `jiff`'s own serde trims a fraction to its shortest form (`.12`), so the
+/// durable codec must keep `chrono`'s digits for the two to compare equal.
+#[tokio::test]
+async fn a_head_written_with_chrono_time_text_verifies_against_the_jiff_row() {
+    use diesel_async::RunQueryDsl as _;
+
+    let pool = boot_pool("lgo_chrono_era").await;
+    let stamps = PgLgoStampRepository::with_pool_untracked(pool.clone());
+    let at = "2026-09-01T18:08:53.12Z"
+        .parse::<autumn_web::time::Timestamp>()
+        .unwrap();
+    let stamp = stamps
+        .save(&NewLgoStamp {
+            at,
+            maybe_at: Some(
+                "2026-09-01T18:08:53.000123Z"
+                    .parse::<autumn_web::time::Timestamp>()
+                    .unwrap(),
+            ),
+            local: civil::date(2026, 9, 1).at(18, 8, 53, 123_400_000),
+            day: civil::date(2026, 9, 1),
+            clock: civil::time(18, 8, 53, 100_000_000),
+            maybe_clock: None,
+        })
+        .await
+        .expect("insert");
+    assert_eq!(stamp.at, at, "the column keeps the fraction");
+
+    let chrono_era = chrono_era_stamp_snapshot(stamp.id);
+    assert_eq!(
+        stamp.__autumn_commit_hook_to_value().expect("encode"),
+        chrono_era,
+        "the durable codec writes chrono's time text"
+    );
+    let decoded = LgoStamp::__autumn_commit_hook_from_value(chrono_era.clone()).expect("decode");
+    assert_eq!(
+        (
+            decoded.at,
+            decoded.maybe_at,
+            decoded.local,
+            decoded.day,
+            decoded.clock,
+            decoded.maybe_clock,
+        ),
+        (
+            stamp.at,
+            stamp.maybe_at,
+            stamp.local,
+            stamp.day,
+            stamp.clock,
+            stamp.maybe_clock,
+        ),
+        "chrono's time text decodes to the same row"
+    );
+
+    let mut revisions = stamps.ledger_revisions(stamp.id).await.expect("revisions");
+    let head = revisions.pop().expect("the insert wrote a revision");
+    assert_eq!(
+        head.snapshot, chrono_era,
+        "the stored snapshot is chrono's text"
+    );
+    assert!(stamps.ledger_verify(stamp.id).await.unwrap().is_intact());
+
+    // Rewrite the head as a chain written before the move would hold it:
+    // chrono's snapshot bytes, hashed the way the framework hashes them.
+    // Re-deriving the current hash first proves the inputs are complete.
+    let rehash = |snapshot: &serde_json::Value| {
+        autumn_web::ledger::revision_hash(&autumn_web::ledger::RevisionHashInput {
+            prev_hash: head.prev_hash.as_deref(),
+            table_name: "lgo_stamps",
+            tenant_id: head.tenant_id.as_deref(),
+            record_id: stamp.id,
+            seq: head.seq,
+            op: head.op,
+            actor: &head.actor,
+            request_id: head.request_id.as_deref(),
+            snapshot,
+            valid_from: head.valid_from,
+            recorded_at: head.recorded_at,
+        })
+    };
+    assert_eq!(rehash(&head.snapshot), head.hash);
+    let chrono_hash = rehash(&chrono_era);
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query("UPDATE _autumn_ledger_revisions SET snapshot = ?, hash = ? WHERE id = ?")
+        .bind::<diesel::sql_types::Text, _>(autumn_web::ledger::canonical_json(&chrono_era))
+        .bind::<diesel::sql_types::Text, _>(chrono_hash.clone())
+        .bind::<diesel::sql_types::BigInt, _>(head.id)
+        .execute(&mut *conn)
+        .await
+        .expect("rewrite the head");
+    diesel::sql_query(
+        "UPDATE _autumn_ledger_high_water SET head_hash = ? \
+         WHERE table_name = 'lgo_stamps' AND record_id = ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(chrono_hash)
+    .bind::<diesel::sql_types::BigInt, _>(stamp.id)
+    .execute(&mut *conn)
+    .await
+    .expect("move the mark to the rewritten head");
+    drop(conn);
+
+    let report = stamps.ledger_verify(stamp.id).await.expect("verify");
+    assert!(
+        report.broken.is_none(),
+        "an unchanged row must not be reported: {:?}",
+        report.broken
+    );
 }
 
 /// Zero false positives: repository writes and refused paths leave the

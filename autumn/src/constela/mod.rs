@@ -318,11 +318,8 @@ impl Document {
         let ctx = dispatch::DispatchCtx {
             route,
             styles: &self.program.styles,
-            // An action's expressions are bounded by the same depth budget a
-            // render uses. It is not configurable here because it is not a
-            // knob worth turning: `Limits::max_depth` already bounded the
-            // document's nesting at parse time, and this is the backstop for
-            // the case where that was raised.
+            // `Limits::max_depth` already bounded nesting at parse time; this is
+            // the backstop for when that limit was raised.
             depth: RenderLimits::default().max_depth,
             // One pool for the whole dispatch; see `DispatchCtx::budget`.
             budget: &budget,

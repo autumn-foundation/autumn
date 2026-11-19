@@ -29,7 +29,8 @@ pub struct Export {
     /// does not understand rather than silently dropping fields.
     pub version: u32,
     pub site_title: String,
-    pub exported_at: chrono::DateTime<chrono::Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub exported_at: autumn_web::time::Timestamp,
     pub terms: Vec<ExportTerm>,
     pub posts: Vec<ExportPost>,
     /// Attachment metadata rows. Defaulted so a version-2 file still imports:
@@ -102,7 +103,7 @@ pub struct ExportPost {
     #[serde(default)]
     pub parent: Option<String>,
     #[serde(default)]
-    pub published_at: Option<chrono::NaiveDateTime>,
+    pub published_at: Option<autumn_web::time::civil::DateTime>,
     /// Whether the post is pinned to the top of the blog index. Carried for the
     /// same reason as `comment_status`: it is an editorial decision, and a
     /// restore that silently unpins every sticky post has changed the site.
@@ -165,7 +166,7 @@ pub struct ExportRevision {
     pub status: String,
     #[serde(default)]
     pub summary: String,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 /// One custom field in an export file.
@@ -199,7 +200,7 @@ pub struct ExportComment {
     /// `approved`, `pending`, `spam` or `trash` — the moderation decision,
     /// which is work a restore must not discard.
     pub status: String,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
     #[serde(default)]
     pub replies: Vec<ExportComment>,
 }
@@ -582,7 +583,7 @@ pub async fn export(repos: Repos, session: Session, csrf: Csrf) -> AutumnResult<
     let payload = Export {
         version: EXPORT_VERSION,
         site_title: settings.site_title.clone(),
-        exported_at: chrono::Utc::now(),
+        exported_at: autumn_web::time::ambient_now(),
         terms,
         posts,
         attachments,
@@ -1324,7 +1325,7 @@ async fn find_local_by_slug(
 /// could not be restored without hand-editing its JSON. The scheduler would
 /// have published these within a minute of their due time, so publishing them
 /// now is what the file actually asked for.
-fn import_status(status: &str, published_at: Option<chrono::NaiveDateTime>) -> &str {
+fn import_status(status: &str, published_at: Option<autumn_web::time::civil::DateTime>) -> &str {
     // The exporter excludes trash, so a file carrying it was hand-edited or
     // came from another tool. Restoring straight into the trash is meaningless
     // — a backup restores content, not deletions — and it is the one status
@@ -1334,7 +1335,8 @@ fn import_status(status: &str, published_at: Option<chrono::NaiveDateTime>) -> &
     if status == "trash" {
         return "draft";
     }
-    if status == "future" && published_at.is_none_or(|when| when <= chrono::Utc::now().naive_utc())
+    if status == "future"
+        && published_at.is_none_or(|when| when <= autumn_web::time::ambient_civil_utc())
     {
         return "publish";
     }
@@ -2117,7 +2119,7 @@ mod tests {
             author_ip: String::new(),
             body: body.to_owned(),
             status: "approved".to_owned(),
-            created_at: chrono::NaiveDateTime::default(),
+            created_at: autumn_web::time::civil::date(1970, 1, 1).at(0, 0, 0, 0),
         }
     }
 

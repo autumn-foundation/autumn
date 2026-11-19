@@ -75,7 +75,7 @@
 //!   [`FiredFault::at`] and [`FiredFault::elapsed_ms`] come from the clock
 //!   [`TestApp::build`](crate::test::TestApp::build) resolved, which under a
 //!   [`Sim`](crate::sim::Sim) is the virtual clock. Nothing here reads
-//!   `Utc::now()` or `Instant::now()`.
+//!   `Timestamp::now()` or `Instant::now()`.
 //! * **The outcome record is canonical.** [`FaultOutcome`] contains only
 //!   integers, strings, RFC 3339 timestamps, structs and `Vec`s — no maps, no
 //!   floats, no request ids (those are entropy-minted) — so
@@ -109,7 +109,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -120,7 +120,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::entropy::{Entropy, SeededEntropy};
@@ -519,8 +519,10 @@ pub struct FiredFault {
     /// The **per-target** 1-based ordinal this fault fired at.
     pub target_ordinal: u32,
     /// Wall-clock reading from the app's injected
-    /// [`ClockSource`] when the fault fired.
-    pub at: DateTime<Utc>,
+    /// [`ClockSource`] when the fault fired. Serialized as RFC 3339 with `Z`
+    /// and a 0/3/6/9-digit fraction.
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub at: Timestamp,
     /// Milliseconds since app start, on the injected monotonic clock.
     pub elapsed_ms: u64,
 }
@@ -597,7 +599,7 @@ pub struct FaultOutcome {
     /// Planned faults whose ordinal was never reached, sorted.
     pub unfired: Vec<PlannedFault>,
     /// 5xx responses captured through autumn's error-reporting layer, in report
-    /// order. Always present; empty when the `reporting` feature is off.
+    /// order. Always present; empty when the `error-reporting` feature is off.
     pub server_errors: Vec<ReportedError>,
     /// Totals for the whole run.
     pub final_state: FinalState,
@@ -748,11 +750,9 @@ impl FaultState {
             FaultEffect::JobExecution => &self.job_execution_seq,
         };
 
-        // The global ordinal is allocated INSIDE the `recorded` lock, together
-        // with the per-target one. Bumping the atomic before taking the lock
-        // let two passes on a multi-threaded runtime interleave and pair one
-        // pass's global ordinal with another's target ordinal in a single
-        // record. The counters stay atomics; the lock is what orders them.
+        // Allocate the global ordinal inside the `recorded` lock, with the per-target one.
+        // Otherwise two passes on a multi-threaded runtime can interleave and pair one
+        // pass's global ordinal with another's target ordinal.
         let mut recorded = self
             .recorded
             .lock()
@@ -830,9 +830,9 @@ impl FaultState {
         counter.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Only the `reporting`-gated [`FaultReporter`] pushes here; without that
+    /// Only the `error-reporting`-gated [`FaultReporter`] pushes here; without that
     /// feature [`FaultOutcome::server_errors`] is always empty (by contract).
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     fn record_server_error(&self, error: ReportedError) {
         self.server_errors
             .lock()
@@ -954,7 +954,7 @@ impl FaultLedger {
 
     /// The error reporter that projects 5xx events into
     /// [`FaultOutcome::server_errors`].
-    #[cfg(feature = "reporting")]
+    #[cfg(feature = "error-reporting")]
     pub(crate) fn reporter(&self) -> Arc<dyn crate::reporting::ErrorReporter> {
         Arc::new(FaultReporter {
             state: Arc::clone(&self.0),
@@ -1038,12 +1038,9 @@ impl crate::interceptor::JobInterceptor for FaultJobInterceptor {
                     )))
                 }
                 Decision::Proceed => {
-                    // A panicking handler unwinds straight through `next.await`
-                    // (the job runtime catches it outside this seam), so a bare
-                    // post-await count would drop the pass and leave
-                    // `job_executions != failed + succeeded`. The guard books
-                    // the unwind as a failure; the happy path disarms it and
-                    // records the real result.
+                    // A panicking handler unwinds through `next.await` (the job runtime
+                    // catches it outside this seam). The guard books the unwind as a
+                    // failure so `job_executions == failed + succeeded` still holds.
                     let mut guard = RecordOnUnwind {
                         state: self.state.as_ref(),
                         armed: true,
@@ -1134,20 +1131,19 @@ impl crate::interceptor::DbConnectionInterceptor for FaultDbInterceptor {
 ///
 /// Registered alongside (never instead of) the app's own reporters. The
 /// projection drops the request id on purpose — see [`ReportedError`].
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 struct FaultReporter {
     state: Arc<FaultState>,
 }
 
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 impl crate::reporting::ErrorReporter for FaultReporter {
     fn report<'a>(
         &'a self,
         event: &'a crate::reporting::ErrorEvent,
     ) -> crate::reporting::ReportFuture<'a> {
-        // Recorded as the future is constructed rather than when it is polled:
-        // the reporter chain does both on the same detached task, and doing it
-        // here shortens the window `TestClient::fault_outcome` has to settle.
+        // Record at construction, not on poll: it shortens the window
+        // `TestClient::fault_outcome` has to wait for.
         self.state.record_server_error(ReportedError {
             status: event.status.as_u16(),
             method: event.method.clone(),
@@ -1166,6 +1162,7 @@ mod tests {
         sample_distinct,
     };
     use crate::time::{ClockSource as _, TickingClock};
+    use jiff::{SignedDuration, Timestamp};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1173,8 +1170,8 @@ mod tests {
 
     /// The sim epoch (`2020-01-01T00:00:00Z`), so the timings a windowed test
     /// asserts on read like the ones a `#[sim_test]` produces.
-    fn epoch() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::from_timestamp(1_577_836_800, 0).expect("valid timestamp")
+    fn epoch() -> Timestamp {
+        Timestamp::from_second(1_577_836_800).expect("valid timestamp")
     }
 
     /// A ledger state driven by a virtual clock the test still holds a handle
@@ -1274,8 +1271,7 @@ mod tests {
             build(SEED + 1),
             "different seeds should (overwhelmingly likely) diverge"
         );
-        // Every pick lands inside the requested range, and there are `count` of
-        // them (distinct, so the set does not collapse).
+        // `count` distinct picks, all inside the range.
         let planned = build(SEED);
         assert_eq!(planned.len(), 3);
         assert!(planned.iter().all(|p| (1..=20).contains(&p.ordinal)));
@@ -1365,7 +1361,7 @@ mod tests {
         let outcome = state.outcome();
         assert_eq!(outcome.fired.len(), 1, "{outcome:?}");
         assert_eq!(outcome.fired[0].elapsed_ms, 5_000);
-        assert_eq!(outcome.fired[0].at, epoch() + chrono::Duration::seconds(5));
+        assert_eq!(outcome.fired[0].at, epoch() + SignedDuration::from_secs(5));
 
         // t = 10s — the end is exclusive.
         clock.advance(Duration::from_secs(5));
@@ -1500,7 +1496,7 @@ mod tests {
                 target: "probe".to_owned(),
                 ordinal: 2,
                 target_ordinal: 2,
-                at: chrono::DateTime::from_timestamp(1_577_836_806, 0).expect("valid timestamp"),
+                at: Timestamp::from_second(1_577_836_806).expect("valid timestamp"),
                 elapsed_ms: 6_000,
             }],
             suppressed: Vec::new(),
@@ -1564,11 +1560,8 @@ mod tests {
 
     // ── End-to-end wiring smoke test ────────────────────────────────────────
     //
-    // Proves the whole seam in one cheap, DB-free run: the plan reaches
-    // `TestApp::build`, the fault interceptor is chained innermost of the job
-    // chain (the always-on `JobRecorder` still records the enqueue), the
-    // targeted execution fails, the runtime retries it, and the ledger's
-    // outcome reports exactly that.
+    // DB-free: the plan reaches `TestApp::build`, the targeted execution fails, the
+    // runtime retries it, and the ledger's outcome reports exactly that.
 
     /// Handler attempts the smoke-test job actually reached. Process-global
     /// because a `JobInfo` handler is a plain `fn` pointer with no captures.
@@ -1637,8 +1630,7 @@ mod tests {
             1,
             "the faulted attempt never reached the handler; the retry did"
         );
-        // The always-on enqueue recorder still sees the job: the fault lane
-        // composes with it rather than replacing it.
+        // The always-on enqueue recorder still sees the job.
         assert_eq!(sim.client().enqueued_jobs().len(), 1);
 
         crate::job::clear_global_job_client();

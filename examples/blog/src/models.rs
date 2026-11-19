@@ -1,5 +1,7 @@
+use autumn_web::db::SqlDateTime;
 use autumn_web::error::{AutumnError, AutumnResult};
 use autumn_web::slugify;
+use autumn_web::time::civil;
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
@@ -16,8 +18,10 @@ pub struct Post {
     pub slug: String,
     pub body: String,
     pub published: bool,
-    pub created_at: chrono::NaiveDateTime,
-    pub updated_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = SqlDateTime)]
+    pub created_at: civil::DateTime,
+    #[diesel(deserialize_as = SqlDateTime)]
+    pub updated_at: civil::DateTime,
 }
 
 /// One row of the admin post list: everything it renders, no `body`.
@@ -27,7 +31,8 @@ pub struct PostListing {
     pub title: String,
     pub slug: String,
     pub published: bool,
-    pub created_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = SqlDateTime)]
+    pub created_at: civil::DateTime,
 }
 
 impl Post {
@@ -184,5 +189,6 @@ pub struct UpdatePost {
     /// key (see `routes::posts::post_card`) and serve a stale card forever.
     /// Never deserialized from form/JSON input; the handler always sets it.
     #[serde(skip)]
-    pub updated_at: Option<chrono::NaiveDateTime>,
+    #[diesel(serialize_as = SqlDateTime)]
+    pub updated_at: Option<civil::DateTime>,
 }

@@ -187,10 +187,9 @@ pub fn validate_key(key: &str) -> Result<(), DestinationError> {
     if key.starts_with('/') {
         return Err(reject(format!("object key {key:?} must be relative")));
     }
-    // `\` and `:` are refused because a destination may be a directory: on
-    // Windows both are path syntax, and `PathBuf::push` of a segment carrying a
-    // drive prefix REPLACES the path rather than appending to it. Autumn never
-    // generates a key containing either.
+    // A destination may be a directory. On Windows `\` and `:` are path syntax,
+    // and `PathBuf::push` of a segment with a drive prefix replaces the path
+    // instead of appending. Autumn never generates a key containing either.
     if key.contains('\\') || key.contains('\0') || key.contains(':') {
         return Err(reject(format!(
             "object key {key:?} contains an illegal character"
@@ -426,11 +425,9 @@ impl FileDestination {
             std::fs::create_dir_all(parent)
                 .map_err(DestinationError::io("create key directory"))?;
         }
-        // Unpredictable, and created with O_EXCL. A destination directory can be
-        // shared (the module docs endorse an NFS or bind mount), and a staging
-        // name an attacker can predict is a staging name they can pre-create as a
-        // symlink — `File::create` would then write the object's bytes through it
-        // with this process's privileges.
+        // Random and created with O_EXCL: the directory may be shared (NFS, bind
+        // mount), and a predictable staging name could be pre-created as a
+        // symlink that this process would then write through.
         let mut staging = path.clone();
         let mut name = staging.file_name().unwrap_or_default().to_os_string();
         name.push(format!(".tmp-{:016x}", rand::random::<u64>()));
@@ -444,8 +441,8 @@ impl FileDestination {
                 .map_err(DestinationError::io("fsync object"))?;
         }
         std::fs::rename(&staging, &path).map_err(DestinationError::io("publish object"))?;
-        // Durability of the rename itself, which matters on the removable /
-        // network destinations this is meant for.
+        // Make the rename itself durable, which matters on removable and network
+        // destinations.
         if let Some(parent) = path.parent()
             && let Ok(dir) = std::fs::File::open(parent)
         {

@@ -29,6 +29,7 @@
 use autumn_web::auth::{generate_raw_token, hash_api_token, hash_password, verify_password};
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
+use autumn_web::time::{SignedDuration, ambient_civil_utc, civil};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
@@ -72,7 +73,13 @@ struct InsertInvitation {
     token_hash: String,
     status: String,
     invited_by_user_id: i64,
-    expires_at: chrono::NaiveDateTime,
+    #[diesel(serialize_as = autumn_web::db::SqlDateTime)]
+    expires_at: civil::DateTime,
+}
+
+/// When an invitation minted now stops being accepted.
+fn invitation_expiry() -> civil::DateTime {
+    ambient_civil_utc().saturating_add(SignedDuration::from_hours(24 * INVITATION_TTL_DAYS))
 }
 
 // ── Create ───────────────────────────────────────────────────────────────────
@@ -264,15 +271,14 @@ pub async fn create_invitation(
                 .await?;
 
                 diesel::insert_into(invitations::table)
-                    .values(&InsertInvitation {
+                    .values(InsertInvitation {
                         tenant_id,
                         email: insert_email,
                         role: insert_role,
                         token_hash,
                         status: "pending".to_owned(),
                         invited_by_user_id: inviter_id,
-                        expires_at: chrono::Utc::now().naive_utc()
-                            + chrono::Duration::days(INVITATION_TTL_DAYS),
+                        expires_at: invitation_expiry(),
                     })
                     .execute(conn)
                     .await?;
@@ -395,9 +401,7 @@ fn invitation_status_error(invitation: &Invitation) -> Option<&'static str> {
     match invitation.status.as_str() {
         "accepted" => Some("This invitation has already been used."),
         "revoked" => Some("This invitation was revoked."),
-        _ if invitation.expires_at <= chrono::Utc::now().naive_utc() => {
-            Some("This invitation has expired.")
-        }
+        _ if invitation.expires_at <= ambient_civil_utc() => Some("This invitation has expired."),
         _ => None,
     }
 }
@@ -826,7 +830,7 @@ pub async fn accept_invitation(
                 // review finding).
                 if invitation.status == "revoked"
                     || (invitation.status == "pending"
-                        && invitation.expires_at <= chrono::Utc::now().naive_utc())
+                        && invitation.expires_at <= ambient_civil_utc())
                 {
                     return Err(AutumnError::gone_msg(
                         "This invitation is no longer available",
@@ -1081,15 +1085,14 @@ pub async fn resend_invitation(
                     .await?;
 
                 let new: Invitation = diesel::insert_into(invitations::table)
-                    .values(&InsertInvitation {
+                    .values(InsertInvitation {
                         tenant_id,
                         email,
                         role,
                         token_hash,
                         status: "pending".to_owned(),
                         invited_by_user_id: inviter_id,
-                        expires_at: chrono::Utc::now().naive_utc()
-                            + chrono::Duration::days(INVITATION_TTL_DAYS),
+                        expires_at: invitation_expiry(),
                     })
                     .returning(Invitation::as_returning())
                     .get_result(conn)

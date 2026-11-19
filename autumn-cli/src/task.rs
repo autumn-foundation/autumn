@@ -44,11 +44,9 @@ pub fn run(opts: &TaskOptions<'_>) {
 /// --dry-run`) can share it instead of re-deriving the same attach-vs-spawn
 /// logic.
 pub fn apply_managed_pg_env(cmd: &mut Command, package: Option<&str>) {
-    // The attach URL is CLI→child plumbing, not an operator knob. Clear any
-    // inherited value up front so a stale/foreign one can't override the data dir
-    // (the provider checks the attach URL first) — including when an explicit
-    // `AUTUMN_MANAGED_PG_DATA_DIR` override makes `managed_pg_env` return `None`.
-    // We re-set it only when we discover a live cluster to attach to.
+    // The attach URL is CLI-to-child plumbing. Clear any inherited value first: the provider
+    // checks it before the data dir, so a stale one would win, even when
+    // `AUTUMN_MANAGED_PG_DATA_DIR` makes `managed_pg_env` return `None`.
     cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
     let Some(env) = crate::serve::managed_pg_env(package) else {
         return;
@@ -59,15 +57,27 @@ pub fn apply_managed_pg_env(cmd: &mut Command, package: Option<&str>) {
     }
 }
 
-fn list_tasks(binary: &std::path::Path, opts: &TaskOptions<'_>) {
+/// Selects the task-list one-shot mode in the app.
+const LIST_TASKS_ENV: &str = "AUTUMN_LIST_TASKS";
+/// Selects the run-task one-shot mode in the app. The value is the task name.
+const RUN_TASK_ENV: &str = "AUTUMN_RUN_TASK";
+
+/// Makes the command for `autumn task --list`.
+fn list_tasks_command(binary: &std::path::Path, profile: &str) -> Command {
     let mut command = Command::new(binary);
     command
-        .env("AUTUMN_LIST_TASKS", "1")
-        .env("AUTUMN_ENV", opts.profile)
-        .env("AUTUMN_PROFILE", opts.profile)
+        .env(LIST_TASKS_ENV, "1")
+        .env("AUTUMN_ENV", profile)
+        .env("AUTUMN_PROFILE", profile)
         .stdout(Stdio::piped())
+        // `output()` captures stderr by default. Show the app errors to the user.
         .stderr(Stdio::inherit());
-    crate::routes::clear_other_dump_modes(&mut command, "AUTUMN_LIST_TASKS");
+    crate::routes::clear_other_dump_modes(&mut command, LIST_TASKS_ENV);
+    command
+}
+
+fn list_tasks(binary: &std::path::Path, opts: &TaskOptions<'_>) {
+    let mut command = list_tasks_command(binary, opts.profile);
     apply_managed_pg_env(&mut command, opts.package);
     let output = command.output().unwrap_or_else(|error| {
         eprintln!("Failed to run {}: {error}", binary.display());
@@ -92,6 +102,31 @@ fn list_tasks(binary: &std::path::Path, opts: &TaskOptions<'_>) {
     print_task_table(&tasks);
 }
 
+/// Makes the command for `autumn task <name>`.
+///
+/// `AppBuilder::run` reads the dump modes and `AUTUMN_LIST_TASKS` before
+/// `AUTUMN_RUN_TASK`. This function removes them from the child environment.
+/// Thus a value from the parent shell cannot stop the task (#3733).
+fn run_task_command(
+    binary: &std::path::Path,
+    profile: &str,
+    name: &str,
+    args_json: &str,
+) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .env(RUN_TASK_ENV, name)
+        .env("AUTUMN_TASK_ARGS_JSON", args_json)
+        .env("AUTUMN_ENV", profile)
+        .env("AUTUMN_PROFILE", profile)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    crate::routes::clear_other_dump_modes(&mut command, RUN_TASK_ENV);
+    command.env_remove(LIST_TASKS_ENV);
+    command
+}
+
 fn run_task(binary: &std::path::Path, opts: &TaskOptions<'_>) {
     let Some(name) = opts.name else {
         eprintln!("autumn task: missing task name");
@@ -104,16 +139,7 @@ fn run_task(binary: &std::path::Path, opts: &TaskOptions<'_>) {
         std::process::exit(1);
     });
 
-    let mut command = Command::new(binary);
-    command
-        .env("AUTUMN_RUN_TASK", name)
-        .env("AUTUMN_TASK_ARGS_JSON", args_json)
-        .env("AUTUMN_ENV", opts.profile)
-        .env("AUTUMN_PROFILE", opts.profile)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    crate::routes::clear_other_dump_modes(&mut command, "AUTUMN_RUN_TASK");
+    let mut command = run_task_command(binary, opts.profile, name, &args_json);
     apply_managed_pg_env(&mut command, opts.package);
     let status = command.status().unwrap_or_else(|error| {
         eprintln!("Failed to run {}: {error}", binary.display());
@@ -153,33 +179,76 @@ fn print_task_table(tasks: &[TaskListing]) {
 mod tests {
     use super::*;
 
+    use std::path::Path;
+
+    /// The state of one variable in the child environment.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Env {
+        /// Not touched: the child inherits it.
+        Inherited,
+        /// Explicitly removed.
+        Removed,
+        /// Set to a value.
+        Set(String),
+    }
+
+    fn env_of(command: &Command, var: &str) -> Env {
+        match command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(var))
+        {
+            None => Env::Inherited,
+            Some((_, None)) => Env::Removed,
+            Some((_, Some(value))) => Env::Set(value.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn set(value: &str) -> Env {
+        Env::Set(value.to_owned())
+    }
+
     #[test]
-    fn clear_other_dump_modes_removes_every_mode_var_before_list_tasks() {
-        // Every one of these is dispatched before AUTUMN_LIST_TASKS /
-        // AUTUMN_RUN_TASK in AppBuilder::run's dispatch chain, so any one
-        // left in the CLI's own environment would hijack `autumn task`: the
-        // child would print a manifest where the task listing JSON is
-        // expected, or exit 0 without ever running the task
-        // (AUTUMN_DUMP_CACHE_COHERENCE in particular — issue #2370).
-        // Previously only 4 of these 8 were cleared.
-        let competing = crate::routes::ALL_DUMP_MODE_ENVS;
-        let mut command = Command::new("true");
-        for var in competing {
-            command.env(var, "1");
-        }
+    fn run_task_command_clears_inherited_list_tasks() {
+        // Tests the fix for #3733. `AppBuilder::run` reads `AUTUMN_LIST_TASKS`
+        // first. An inherited value lists the tasks and does not run the task.
+        let command = run_task_command(Path::new("app"), "dev", "cleanup", "[]");
 
-        crate::routes::clear_other_dump_modes(&mut command, "AUTUMN_LIST_TASKS");
+        assert_eq!(env_of(&command, "AUTUMN_LIST_TASKS"), Env::Removed);
+    }
 
-        for var in competing {
-            let value = command
-                .get_envs()
-                .find(|(key, _)| *key == std::ffi::OsStr::new(var));
-            assert_eq!(
-                value,
-                Some((std::ffi::OsStr::new(var), None)),
-                "{var} must be explicitly removed: {value:?}"
-            );
+    #[test]
+    fn run_task_command_clears_every_dump_mode() {
+        // `AppBuilder::run` reads each dump mode before the task modes (#2370).
+        let command = run_task_command(Path::new("app"), "dev", "cleanup", "[]");
+
+        for &var in crate::routes::ALL_DUMP_MODE_ENVS {
+            assert_eq!(env_of(&command, var), Env::Removed, "{var} must be removed");
         }
+    }
+
+    #[test]
+    fn run_task_command_sets_task_name_args_and_profile() {
+        let command = run_task_command(Path::new("app"), "prod", "backfill", r#"["--dry-run"]"#);
+
+        assert_eq!(env_of(&command, "AUTUMN_RUN_TASK"), set("backfill"));
+        assert_eq!(
+            env_of(&command, "AUTUMN_TASK_ARGS_JSON"),
+            set(r#"["--dry-run"]"#)
+        );
+        assert_eq!(env_of(&command, "AUTUMN_ENV"), set("prod"));
+        assert_eq!(env_of(&command, "AUTUMN_PROFILE"), set("prod"));
+    }
+
+    #[test]
+    fn list_tasks_command_clears_every_dump_mode_and_keeps_its_own() {
+        let command = list_tasks_command(Path::new("app"), "staging");
+
+        for &var in crate::routes::ALL_DUMP_MODE_ENVS {
+            assert_eq!(env_of(&command, var), Env::Removed, "{var} must be removed");
+        }
+        assert_eq!(env_of(&command, "AUTUMN_LIST_TASKS"), set("1"));
+        assert_eq!(env_of(&command, "AUTUMN_ENV"), set("staging"));
+        assert_eq!(env_of(&command, "AUTUMN_PROFILE"), set("staging"));
     }
 
     #[test]

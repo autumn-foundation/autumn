@@ -56,12 +56,15 @@ profile in `Cargo.toml`, for your app and for its dependencies:
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
-debug = "line-tables-only"
+debug = false
 ```
 
-`line-tables-only` keeps file and line in backtraces. It removes variable
-inspection in a debugger. To get full debug info back, set `debug = true` in
-both tables.
+`line-tables-only` keeps file and line in backtraces for your app. It removes
+variable inspection in a debugger. Dependencies build with no debug info: the
+first build is faster, and a backtrace frame in a dependency shows the
+function name with no file and line. To get those back, set
+`debug = "line-tables-only"` in the second table. To get full debug info
+back, set `debug = true` in both tables.
 
 The second is the linker's own remedy, in `.cargo/config.toml`. It applies to
 Windows MSVC targets only:

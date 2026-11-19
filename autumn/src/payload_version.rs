@@ -153,8 +153,7 @@ pub fn split_version(value: &Value) -> (u32, &Value) {
 /// whether a given value is an envelope.
 #[must_use]
 pub fn strip_version(value: Value) -> (u32, Value) {
-    // Detect on a borrow first so the strict predicate lives in one place; only
-    // consume `obj` once we know it is a real envelope.
+    // Detect on a borrow so the shape check lives only in `as_version_envelope`.
     let Some((version, _)) = as_version_envelope(&value) else {
         return (DEFAULT_VERSION, value);
     };
@@ -276,11 +275,8 @@ impl std::fmt::Display for JobPayloadVersionError {
                 Ok(())
             }
             VersionErrorKind::DecodeFailed => {
-                // When the stored and expected versions match (the common
-                // un-versioned case, both 1), naming "expected version 1" —
-                // a version the user never declared — reads as noise, so drop
-                // that clause. The `ERROR_SENTINEL` prefix is preserved either
-                // way so `is_payload_version_error` still matches.
+                // With matching versions (usually both 1, never declared), naming the
+                // expected version is noise, so drop it.
                 if stored_version == expected_version {
                     write!(
                         f,
@@ -434,16 +430,13 @@ mod tests {
         let (version, inner) = split_version(&raw);
         assert_eq!(version, DEFAULT_VERSION);
         assert_eq!(inner, &raw);
-        // Non-objects, too.
         assert_eq!(read_version(&Value::Null), DEFAULT_VERSION);
         assert_eq!(strip_version(Value::Null), (DEFAULT_VERSION, Value::Null));
     }
 
     #[test]
     fn marker_without_args_is_not_an_envelope() {
-        // Marker present but no `args` field (only one key): NOT an envelope, so
-        // the whole object passes through as raw args at version 1. (Codex #1205
-        // collision fix: strict exact-shape detection.)
+        // No `args` key: not an envelope, so the whole object is raw args at version 1.
         let raw = json!({ VERSION_MARKER: 5, "other": 1 });
         assert_eq!(read_version(&raw), DEFAULT_VERSION);
         let (sv, si) = split_version(&raw);
@@ -465,7 +458,6 @@ mod tests {
 
     #[test]
     fn non_integer_marker_is_not_an_envelope() {
-        // Marker present with the right sibling key but a string value: raw.
         let raw = json!({ VERSION_MARKER: "v3", "args": { "x": 1 } });
         assert_eq!(read_version(&raw), DEFAULT_VERSION);
         assert_eq!(split_version(&raw), (DEFAULT_VERSION, &raw));
@@ -474,9 +466,8 @@ mod tests {
 
     #[test]
     fn raw_payload_with_marker_field_decodes_whole_object() {
-        // A raw args struct that legitimately carries a top-level
-        // `__autumn_schema_version` field must deserialize as-is, not as a
-        // stripped envelope subtree — the "zero behavior change" guarantee.
+        // Raw args that carry a top-level `__autumn_schema_version` field decode as-is,
+        // not as a stripped envelope.
         #[derive(Debug, Deserialize, PartialEq, Eq)]
         struct Raw {
             #[serde(rename = "__autumn_schema_version")]
@@ -496,7 +487,6 @@ mod tests {
 
     #[test]
     fn exact_two_key_envelope_is_detected() {
-        // The real envelope shape still matches and round-trips.
         let env = wrap(3, json!({ "x": 1 }));
         assert_eq!(read_version(&env), 3);
         assert_eq!(split_version(&env), (3, &json!({ "x": 1 })));

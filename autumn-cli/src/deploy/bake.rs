@@ -21,8 +21,7 @@
 //! The bake reads no clock. Each sample is one remote command that sleeps
 //! and then runs `curl`, so the fake executor drives the tests.
 
-// The items are crate-internal, as in `fleet.rs`. `deploy` is a private module
-// of this bin crate, so clippy calls each `pub(crate)` redundant.
+// `deploy` is a private module of this bin crate, so clippy calls each `pub(crate)` redundant.
 #![allow(clippy::redundant_pub_crate)]
 
 use std::fmt::{self, Write as _};
@@ -31,7 +30,7 @@ use autumn_web::config::DeployBakeConfig;
 use autumn_web::slo::{PPM, ROLLBACK_BURN_TENTHS, Sli, Slo, format_decimal, max_error_ppm};
 use serde::Deserialize;
 
-use super::exec::{DeployExecutor, RemoteCommand, shell_quote};
+use super::exec::{DeployExecutor, RemoteCommand, shell_quote, unit_service_word};
 
 /// The step label of a bake failure, in fleet reports.
 pub(crate) const BAKE_LABEL: &str = "bake";
@@ -327,7 +326,7 @@ pub(crate) fn sample_command(target: &BakeTarget<'_>, sleep_secs: u64) -> Remote
     let restarts = format!(
         "printf '\\n%s\\n' {} && (systemctl show -p NRestarts --value {} || true)",
         shell_quote(RESTARTS_MARKER),
-        shell_quote(&format!("{}.service", target.unit)),
+        unit_service_word(target.unit),
     );
     let shell = if sleep_secs == 0 {
         format!("{curl} && {restarts}")
@@ -426,8 +425,7 @@ pub(crate) fn run<E: DeployExecutor>(
 /// The `/actuator/metrics` path for an `[actuator] prefix`. It matches the
 /// app's own prefix rules: trim, add a leading `/` when it is missing, drop trailing `/`.
 pub(crate) fn metrics_path(prefix: &str) -> String {
-    // The same rules as `normalize_actuator_prefix` and `actuator_route_path`
-    // in autumn-web: trailing `/` go, leading `/` stay.
+    // Mirrors `normalize_actuator_prefix` and `actuator_route_path` in autumn-web.
     let trimmed = prefix.trim();
     if trimmed.is_empty() || trimmed == "/" {
         return "/metrics".to_owned();

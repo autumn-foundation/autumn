@@ -1,6 +1,6 @@
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -235,9 +235,8 @@ fn build_storage_key(
     push_storage_key_component(&mut hasher, "target", target.as_bytes());
     push_storage_key_component(&mut hasher, "scope-header-count", b"0");
     push_storage_key_component(&mut hasher, "principal", principal.as_bytes());
-    // Pushed only when the request carried a bearer credential, so a
-    // session-only app keeps the exact keys it had before, like the tenant
-    // component below.
+    // Pushed only when the request carried a bearer credential, so a session-only app keeps
+    // its existing keys.
     match bearer {
         Some(BearerScope::Verified(principal_id)) => {
             push_storage_key_component(&mut hasher, "bearer-principal", principal_id.as_bytes());
@@ -247,9 +246,8 @@ fn build_storage_key(
         }
         Some(BearerScope::Header(_)) | None => {}
     }
-    // Pushed only when a tenant was resolved, so an app that does not use
-    // tenancy keeps the exact keys it had before — no cache-wide miss, and no
-    // duplicate execution of a mutation retried across an upgrade.
+    // Pushed only when a tenant was resolved, so an app without tenancy keeps its existing
+    // keys: no cache-wide miss, and no rerun of a mutation retried across an upgrade.
     if let Some(tenant) = tenant {
         push_storage_key_component(&mut hasher, "tenant", tenant.as_bytes());
     }
@@ -257,28 +255,19 @@ fn build_storage_key(
     format!("v2:{}", hex::encode(hasher.finalize()))
 }
 
+/// The session id the request's storage key is scoped by. The session layer
+/// records it on the [`Session`](crate::session::Session) it builds, so a
+/// request that never reaches this layer pays nothing for it.
 async fn storage_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {
-    let session_scope = parts
-        .extensions
-        .get::<IdempotencySessionScope>()
-        .and_then(|scope| scope.session_id.as_deref().map(str::to_owned));
-    let session = parts.extensions.get::<crate::session::Session>().cloned();
-    if session_scope.is_some() {
-        session_scope
-    } else if let Some(session) = session
-        && session.is_cookie_backed().await
-    {
-        Some(session.id().await)
-    } else {
-        None
-    }
+    let session = parts.extensions.get::<crate::session::Session>()?;
+    session.idempotency_session_id().await
 }
 
-fn stale_cookie_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {
-    parts
-        .extensions
-        .get::<IdempotencySessionScope>()
-        .and_then(|scope| scope.stale_cookie_session_id.as_deref().map(str::to_owned))
+/// The id of a request cookie that named no stored session, read from the
+/// same [`Session`](crate::session::Session).
+async fn stale_cookie_session_id_for_parts(parts: &axum::http::request::Parts) -> Option<String> {
+    let session = parts.extensions.get::<crate::session::Session>()?;
+    session.idempotency_stale_cookie_id().await
 }
 
 fn extract_replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
@@ -293,9 +282,9 @@ fn extract_replay_headers_with_policy(
     headers: &HeaderMap,
     include_set_cookie: bool,
 ) -> Vec<(String, Vec<u8>)> {
-    // Headers that must not be cached or replayed.
-    // `set-cookie` is replayed only for finalized session-mutating responses
-    // so lost successful mutations can deliver the session state they created.
+    // Headers that must not be cached or replayed. `set-cookie` is replayed only for
+    // finalized session-mutating responses, so a lost successful mutation still delivers
+    // the session state it created.
     const SKIP: &[&str] = &[
         "connection",
         "transfer-encoding",
@@ -347,25 +336,6 @@ fn finalized_session_record(
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct IdempotencyCacheCommittedErrorResponse;
-
-#[derive(Clone, Debug)]
-pub(crate) struct IdempotencySessionScope {
-    session_id: Option<String>,
-    stale_cookie_session_id: Option<String>,
-}
-
-impl IdempotencySessionScope {
-    #[must_use]
-    pub(crate) const fn new(
-        session_id: Option<String>,
-        stale_cookie_session_id: Option<String>,
-    ) -> Self {
-        Self {
-            session_id,
-            stale_cookie_session_id,
-        }
-    }
-}
 
 #[doc(hidden)]
 #[derive(Clone, Debug, Default)]
@@ -651,8 +621,7 @@ impl MemoryIdempotencyStore {
             },
         );
         drop(in_flight);
-        // Periodically evict expired entries to bound memory growth for
-        // long-running processes. O(N) scan is amortised over every 128 writes.
+        // Evict expired entries every 128 writes to bound memory in long-running processes.
         let n = self.write_count.fetch_add(1, Ordering::Relaxed);
         if n.is_multiple_of(128) {
             entries.retain(|_, v| v.entry.expires_at > now);
@@ -666,14 +635,12 @@ impl MemoryIdempotencyStore {
             .in_flight
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        // Check only the requested key's active in-flight marker.
         if let Some(lock) = in_flight.get(key)
             && lock.expires_at > now
         {
             return false; // still in flight
         }
-        // Not locked: acquire until the handler finishes, unlocks, or the
-        // safety TTL expires after cancellation.
+        // Held until the handler unlocks, or until the TTL expires after a cancellation.
         let ttl = if lock_ttl.is_zero() {
             Duration::from_secs(1)
         } else {
@@ -1163,8 +1130,7 @@ where
         if let Some(replay) = req.extensions_mut().remove::<IdempotencyReplayResponse>() {
             return futures::future::Either::Left(std::future::ready(Ok(replay.into_response())));
         }
-        // Almost no request has a replay marker. Only the capsule replay
-        // driver sets one.
+        // Only the capsule replay driver sets a replay marker.
         futures::future::Either::Right(self.inner.call(req))
     }
 }
@@ -1315,9 +1281,8 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        // Clone-and-swap: the instance that was polled ready becomes `inner`
-        // for this call; `self.inner` is replaced with a fresh clone for the
-        // next call. This preserves Tower backpressure semantics.
+        // Call the instance that was polled ready, which keeps tower backpressure intact;
+        // leave a fresh clone for the next call.
         let clone = self.inner.clone();
         let inner = std::mem::replace(&mut self.inner, clone);
         let config = IdempotencyRequestConfig {
@@ -1766,12 +1731,9 @@ fn in_flight_lock_owner(entropy: &dyn crate::entropy::Entropy) -> String {
     entropy.uuid_v4().to_string()
 }
 
-// `clippy::result_large_err` (armed by rustc 1.98) measures the `Err` variant at
-// 128 bytes — that is `axum::response::Response`'s own size, not something this
-// crate chose. Returning a ready-made rejection response IS the idiom here, and
-// boxing it would add an allocation to every rejection path to satisfy a size
-// heuristic. Allowed at the site rather than workspace-wide so the lint stays
-// armed for error types we do control.
+// `clippy::result_large_err` flags the 128-byte `axum::response::Response` in `Err`.
+// Returning a ready-made rejection is the idiom here, and boxing it would allocate on every
+// rejection. Allowed per site so the lint stays on for error types this crate defines.
 #[allow(clippy::result_large_err)]
 async fn prepare_idempotency_request(
     idempotency_key: String,
@@ -1781,10 +1743,12 @@ async fn prepare_idempotency_request(
     let key_context = StorageKeyContext::from_parts(idempotency_key.clone(), &parts);
     let session_id = storage_session_id_for_parts(&parts).await;
     let storage_key = key_context.storage_key(session_id.as_deref(), None);
-    let stale_cookie_storage_key = stale_cookie_session_id_for_parts(&parts).and_then(|id| {
-        let key = key_context.storage_key(Some(&id), None);
-        (key != storage_key).then_some(key)
-    });
+    let stale_cookie_storage_key = stale_cookie_session_id_for_parts(&parts)
+        .await
+        .and_then(|id| {
+            let key = key_context.storage_key(Some(&id), None);
+            (key != storage_key).then_some(key)
+        });
     parts.extensions.insert(IdempotencyContext::new(
         idempotency_key.clone(),
         storage_key.clone(),
@@ -1838,7 +1802,7 @@ fn lock_deadline_bound_ms(in_flight_ttl: Duration) -> i64 {
         in_flight_ttl
     };
     crate::time::ambient_now()
-        .timestamp_millis()
+        .as_millisecond()
         .saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX))
 }
 
@@ -2394,8 +2358,7 @@ where
         .await?;
     let (mut resp_parts, resp_body) = response.into_parts();
 
-    // Collect up to the cache cap; stream oversized bodies through without
-    // buffering to avoid materialising large responses in memory.
+    // Buffer up to the cache cap; a larger body streams through uncached.
     let resp_bytes = match collect_response_for_cache(resp_body).await {
         CollectedResponseBody::StreamError(passthrough_body) => {
             lock.release().await;
@@ -2408,7 +2371,6 @@ where
         CollectedResponseBody::TooLarge {
             passthrough_body, ..
         } => {
-            // Body exceeded MAX_CACHEABLE_RESPONSE_BODY — stream through.
             lock.release().await;
             tracing::debug!(
                 idempotency.key = %idempotency_key,
@@ -2484,7 +2446,7 @@ where
 
     metrics.inspect(|m| m.record_idempotency_miss());
 
-    // Reconstruct from original parts — preserves set-cookie and extensions.
+    // The original parts keep `set-cookie` and the extensions.
     Ok(Response::from_parts(resp_parts, Body::from(resp_bytes)))
 }
 
@@ -2631,12 +2593,9 @@ fn response_from_record(record: IdempotencyRecord) -> Response<Body> {
     for (name, value) in &record.headers {
         builder = builder.header(name.as_str(), value.as_slice());
     }
-    // The status, header names/values, and body all originate from the
-    // idempotency store, which may be a custom or corrupted backend. An
-    // invalid stored status (e.g. `0` or `> 999`) or invalid header bytes
-    // makes the builder stash an error that surfaces here. A corrupted replay
-    // record must not crash request handling: fall back to an internal-error
-    // response instead of panicking.
+    // The record comes from the store, which may be custom or corrupted. An invalid status
+    // (`0`, `> 999`) or invalid header bytes surface as a builder error here: answer 500
+    // instead of panicking.
     match builder
         .header(X_IDEMPOTENT_REPLAYED, "true")
         .body(Body::from(record.body))
@@ -2700,10 +2659,8 @@ mod tests {
                 "same seed ⇒ identical lock-owner stream"
             );
         }
-        // The owner is a well-formed v4 UUID string.
         let owner = in_flight_lock_owner(&SeededEntropy::new(1));
         assert!(uuid::Uuid::parse_str(&owner).is_ok());
-        // A different seed diverges.
         assert_ne!(
             in_flight_lock_owner(&SeededEntropy::new(1)),
             in_flight_lock_owner(&SeededEntropy::new(2)),
@@ -2771,9 +2728,7 @@ mod tests {
 
         let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
 
-        // Simulate a request handler that panics while holding one of the
-        // store's internal locks, poisoning it. Without poison recovery this
-        // would make every later request that touches `entries` panic too.
+        // Poison `entries`. Without recovery, every later request that touches it would panic.
         let result = catch_unwind(AssertUnwindSafe(|| {
             let _guard = store
                 .entries
@@ -2787,9 +2742,8 @@ mod tests {
             "holding the write lock across a panic must poison it",
         );
 
-        // A subsequent normal store round-trip must still succeed, proving the
-        // `unwrap_or_else(PoisonError::into_inner)` recovery keeps shared state
-        // usable for later requests (AC4 lock-poisoning recovery contract).
+        // A later round-trip still succeeds: `PoisonError::into_inner` recovery keeps the store
+        // usable.
         let record = IdempotencyRecord {
             status: 200,
             headers: Vec::new(),
@@ -3058,11 +3012,9 @@ mod tests {
 
     #[test]
     fn in_flight_lock_held_when_dropped_without_release() {
-        // Simulates the inner handler future being cancelled (by the outer
-        // request-timeout layer) or unwound by a panic: the lock is dropped
-        // without any of the explicit completion paths calling `release`.
-        // The lock must stay held so a retry carrying the same Idempotency-Key
-        // cannot re-run a mutation whose side effect may already have committed.
+        // A handler cancelled by the request timeout, or unwound by a panic, drops the lock
+        // without `release`. It stays held so a retry cannot re-run a mutation that may have
+        // committed.
         let memory = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
         assert!(memory.try_lock_now("key", "owner-a", Duration::from_secs(60)));
 
@@ -3081,8 +3033,6 @@ mod tests {
 
     #[tokio::test]
     async fn in_flight_lock_release_frees_the_key() {
-        // The normal completion paths call `release`, which must free the key
-        // at once so a subsequent distinct request can proceed.
         let memory = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
         assert!(memory.try_lock_now("key", "owner-a", Duration::from_secs(60)));
 
@@ -3103,9 +3053,8 @@ mod tests {
 
     #[test]
     fn set_with_extreme_ttl_does_not_panic() {
-        // Regression: `Instant::now() + ttl` panics when the sum is not
-        // representable. A pathological TTL (configured or attacker-influenced)
-        // must clamp rather than crash the process. See saturating_deadline.
+        // `Instant::now() + ttl` panics when the sum overflows. An extreme TTL (configured or
+        // attacker-influenced) must clamp instead; see `saturating_deadline`.
         let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
         let record = IdempotencyRecord {
             status: 200,
@@ -3117,7 +3066,6 @@ mod tests {
         // Both of these overflow `Instant + Duration` on the underlying clock.
         for extreme in [Duration::from_secs(u64::MAX), Duration::MAX] {
             store.set_now("extreme-ttl-key", "", record.clone(), Vec::new(), extreme);
-            // Entry must be retrievable and (far-future) unexpired.
             assert!(
                 store.get_now("extreme-ttl-key").is_some(),
                 "entry stored with an extreme TTL should be present and unexpired"
@@ -3127,7 +3075,6 @@ mod tests {
         // The in-flight lock path uses the same arithmetic and must not panic.
         assert!(store.try_lock_now("lock-key", "owner", Duration::MAX));
 
-        // saturating_deadline itself clamps to a representable far future.
         let deadline = saturating_deadline(Duration::MAX);
         assert!(deadline > Instant::now());
     }
@@ -3242,6 +3189,192 @@ mod tests {
         assert_eq!(bob_body, Bytes::from_static(b"bob"));
     }
 
+    /// The two session-scope readers, on a request that came through the
+    /// session layer: a cookie that names a stored session, one that names
+    /// none, and no cookie.
+    #[tokio::test]
+    async fn session_scope_readers_follow_the_session_layer_cookie_lookup() {
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore as _};
+
+        let store = MemoryStore::new();
+        store
+            .save("live", HashMap::new())
+            .await
+            .expect("memory store should save");
+        let service = SessionLayer::new(store, SessionConfig::default()).layer(tower::service_fn(
+            |req: Request<Body>| async move {
+                let (parts, _body) = req.into_parts();
+                let scope = format!(
+                    "{:?} {:?}",
+                    storage_session_id_for_parts(&parts).await,
+                    stale_cookie_session_id_for_parts(&parts).await,
+                );
+                Ok::<_, Infallible>(Response::new(Body::from(scope)))
+            },
+        ));
+
+        for (cookie, expected) in [
+            (Some("autumn.sid=live"), r#"Some("live") None"#),
+            (Some("autumn.sid=gone"), r#"None Some("gone")"#),
+            (None, "None None"),
+        ] {
+            let mut request = Request::builder().method(Method::POST).uri("/orders");
+            if let Some(cookie) = cookie {
+                request = request.header(axum::http::header::COOKIE, cookie);
+            }
+            let response = service
+                .clone()
+                .oneshot(request.body(Body::empty()).expect("request should build"))
+                .await
+                .expect("request should complete");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should collect");
+            assert_eq!(body, Bytes::from(expected), "cookie: {cookie:?}");
+        }
+    }
+
+    /// Without the session layer, the readers scope by a cookie-backed
+    /// session's id and by nothing else.
+    #[tokio::test]
+    async fn session_scope_readers_use_a_hand_built_session_as_it_is() {
+        let parts_with = |session: Option<crate::session::Session>| {
+            let mut request = idempotent_post("/orders", "key", "body");
+            if let Some(session) = session {
+                request.extensions_mut().insert(session);
+            }
+            request.into_parts().0
+        };
+
+        let cookie_backed = parts_with(Some(session_with_user("session-alice", "alice")));
+        assert_eq!(
+            storage_session_id_for_parts(&cookie_backed).await,
+            Some("session-alice".to_owned())
+        );
+        assert_eq!(
+            stale_cookie_session_id_for_parts(&cookie_backed).await,
+            None
+        );
+
+        let fresh = parts_with(Some(crate::session::Session::new_for_test_without_cookie(
+            "fresh".to_owned(),
+            HashMap::new(),
+        )));
+        assert_eq!(storage_session_id_for_parts(&fresh).await, None);
+        assert_eq!(stale_cookie_session_id_for_parts(&fresh).await, None);
+
+        let no_session = parts_with(None);
+        assert_eq!(storage_session_id_for_parts(&no_session).await, None);
+        assert_eq!(stale_cookie_session_id_for_parts(&no_session).await, None);
+    }
+
+    /// One key through the session and idempotency layers, in every scope a
+    /// login that rotates the session id passes through: no cookie, the
+    /// cookie of a stored session, that cookie once the rotation has made it
+    /// stale, and the cookie the rotation issued.
+    #[tokio::test]
+    async fn a_rotating_login_replays_for_the_stale_and_the_new_cookie() {
+        use crate::session::{
+            MemoryStore, Session, SessionConfig, SessionLayer, SessionStore as _,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let session_store = MemoryStore::new();
+        let mut existing = HashMap::new();
+        existing.insert("marker".to_owned(), "old-session".to_owned());
+        session_store
+            .save("old-session-id", existing)
+            .await
+            .expect("memory store should save");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let app = axum::Router::new()
+            .route(
+                "/login",
+                axum::routing::post(move |session: Session| {
+                    let handler_calls = Arc::clone(&handler_calls);
+                    async move {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        let marker = session
+                            .get("marker")
+                            .await
+                            .unwrap_or_else(|| "anonymous".to_owned());
+                        session.insert("user_id", "42").await;
+                        session.rotate_id().await;
+                        marker
+                    }
+                }),
+            )
+            .layer(IdempotencyLayer::new(Arc::new(
+                MemoryIdempotencyStore::new(Duration::from_secs(30)),
+            )))
+            .layer(SessionLayer::new(session_store, SessionConfig::default()));
+        let send = |cookie: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut request = Request::builder()
+                    .method(Method::POST)
+                    .uri("/login")
+                    .header(IDEMPOTENCY_KEY_HEADER, "login-key");
+                if let Some(cookie) = cookie {
+                    request = request.header(axum::http::header::COOKIE, cookie);
+                }
+                let response = app
+                    .oneshot(request.body(Body::empty()).expect("request should build"))
+                    .await
+                    .expect("request should complete");
+                let replayed = response.headers().contains_key(X_IDEMPOTENT_REPLAYED);
+                let new_cookie = response
+                    .headers()
+                    .get(axum::http::header::SET_COOKIE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.split(';').next())
+                    .map(str::to_owned);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body should collect");
+                (
+                    String::from_utf8(body.to_vec()).expect("body should be text"),
+                    replayed,
+                    new_cookie,
+                )
+            }
+        };
+        let old_cookie = || Some("autumn.sid=old-session-id".to_owned());
+
+        let (body, replayed, _) = send(None).await;
+        assert_eq!((body.as_str(), replayed), ("anonymous", false));
+
+        let (body, replayed, new_cookie) = send(old_cookie()).await;
+        assert_eq!(
+            (body.as_str(), replayed),
+            ("old-session", false),
+            "a stored session is a scope of its own, apart from the anonymous one"
+        );
+        let new_cookie = new_cookie.expect("the rotation should issue a cookie");
+        assert_ne!(new_cookie, "autumn.sid=old-session-id");
+
+        let (body, replayed, _) = send(old_cookie()).await;
+        assert_eq!(
+            (body.as_str(), replayed),
+            ("old-session", true),
+            "the cookie the rotation made stale still finds the record it wrote"
+        );
+
+        let (body, replayed, _) = send(Some(new_cookie)).await;
+        assert_eq!(
+            (body.as_str(), replayed),
+            ("old-session", true),
+            "the cookie the rotation issued finds the same record"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "neither retry runs the handler again"
+        );
+    }
+
     #[tokio::test]
     async fn storage_key_hashes_length_delimited_components() {
         let observed_store = RecordingStore::default();
@@ -3337,10 +3470,7 @@ mod tests {
 
     #[test]
     fn corrupted_stored_record_does_not_panic_on_replay() {
-        // A store backend (custom or corrupted) can hand back a record whose
-        // stored status is out of the valid HTTP range and whose headers carry
-        // invalid bytes. Replaying it must not panic — it must surface an
-        // internal-error response instead.
+        // A custom or corrupted store can return an out-of-range status and invalid header bytes.
         let corrupted = IdempotencyRecord {
             status: 1000,
             headers: vec![("inv\nalid".to_owned(), vec![0x00, 0x0a])],
@@ -3363,8 +3493,7 @@ mod tests {
 
     #[test]
     fn invalid_stored_status_alone_does_not_panic_on_replay() {
-        // Even with otherwise-valid headers, an out-of-range status byte must
-        // not crash replay handling.
+        // Valid headers, out-of-range status.
         let corrupted = IdempotencyRecord {
             status: 0,
             headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],

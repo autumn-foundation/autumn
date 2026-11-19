@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use chrono::{DateTime, TimeZone as _, Utc};
+use crate::time::Timestamp;
 use diesel::OptionalExtension as _;
 use diesel::sql_types::{BigInt, Bool, Integer, Nullable, Text};
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -114,10 +114,13 @@ const FAILURE_SQL: &str = "UPDATE autumn_webhook_subscriptions \
          status = CASE WHEN consecutive_failures + 1 >= $1 THEN 'failed' ELSE status END \
      WHERE id = $2 AND status = 'active'";
 
+/// Every successful delivery runs this. The last condition skips a row it
+/// would leave unchanged, so a healthy subscription is not rewritten and
+/// its row is not locked until the delivery's transaction commits.
 const REACTIVATE_SQL: &str = "UPDATE autumn_webhook_subscriptions \
      SET consecutive_failures = 0, \
          status = CASE WHEN status = 'failed' THEN 'active' ELSE status END \
-     WHERE id = $1";
+     WHERE id = $1 AND (consecutive_failures <> 0 OR status = 'failed')";
 
 fn sql(pg: &str) -> String {
     crate::backend_select! {
@@ -201,10 +204,7 @@ impl LogRow {
             elapsed_ms: u64::try_from(self.elapsed_ms).unwrap_or(0),
             attempt: u32::try_from(self.attempt).unwrap_or(0),
             max_attempts: u32::try_from(self.max_attempts).unwrap_or(0),
-            timestamp: Utc
-                .timestamp_millis_opt(self.logged_at)
-                .single()
-                .unwrap_or(DateTime::<Utc>::MIN_UTC),
+            timestamp: Timestamp::from_millisecond(self.logged_at).unwrap_or(Timestamp::MIN),
             id: self.id,
             subscription_id: self.subscription_id,
             topic: self.topic,
@@ -311,12 +311,12 @@ impl SqlOutboundWebhookStore {
     /// # Errors
     ///
     /// Returns an error when the delete fails.
-    pub async fn purge_deliveries_before(&self, cutoff: DateTime<Utc>) -> AutumnResult<usize> {
+    pub async fn purge_deliveries_before(&self, cutoff: Timestamp) -> AutumnResult<usize> {
         diesel::sql_query(sql(
             "DELETE FROM autumn_webhook_deliveries WHERE logged_at < $1 AND NOT is_dlq \
              AND response_status BETWEEN 200 AND 299",
         ))
-        .bind::<BigInt, _>(cutoff.timestamp_millis())
+        .bind::<BigInt, _>(cutoff.as_millisecond())
         .execute(&mut self.conn().await?)
         .await
         .map_err(|error| db_error("purge", &error))
@@ -421,7 +421,7 @@ async fn write_log_on(
         .bind::<Integer, _>(i32::try_from(log.max_attempts).unwrap_or(i32::MAX))
         .bind::<Bool, _>(log.is_dlq)
         .bind::<Nullable<Text>, _>(log.last_error.as_deref())
-        .bind::<BigInt, _>(log.timestamp.timestamp_millis())
+        .bind::<BigInt, _>(log.timestamp.as_millisecond())
         .execute(conn)
         .await
         .map_err(|error| db_error("log write", &error))
@@ -602,7 +602,7 @@ mod tests {
             max_attempts: 5,
             is_dlq: false,
             last_error: error.map(str::to_owned),
-            timestamp: DateTime::<Utc>::MIN_UTC,
+            timestamp: Timestamp::MIN,
         }
     }
 

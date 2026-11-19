@@ -52,7 +52,7 @@ Doctor results (exit <N>):
 
 If the command is not found, tell the user to install:
 ```bash
-cargo install autumn-cli --version 0.5.0
+cargo install autumn-cli --version 0.11.0
 ```
 
 ## Common FAIL remedies
@@ -66,12 +66,12 @@ These names match what `autumn doctor --json` actually emits in the `name` field
 | `db_connectivity` | Verify `AUTUMN_DATABASE__PRIMARY_URL` and that Postgres is reachable |
 | `trusted_hosts` | Set explicit `[security] trusted_hosts` in `autumn.toml` for production |
 | `rate_limit_key_strategy` | Set `rate_limit.key_strategy` to `"ip"`, `"api_token"`, or `"authenticated_principal"` |
-| `version_compat` | Upgrade `autumn-cli` to match the framework version: `cargo install autumn-cli --version 0.5.0` |
+| `version_compat` | Upgrade `autumn-cli` to the same minor version as the project's `autumn-web` (for 0.11: `cargo install autumn-cli --version 0.11.0`) |
 | `dotenv` | Copy `.env.example` to `.env` and fill in local values, or add every present secret dotenv file (`.env`, `.env.local`, and any `.env.<profile>.local`) to `.gitignore` if it is not already ignored — committable `.env.<profile>` files are left alone (warns only; never fails) |
 | `jobs_queue_coverage` **(trunk-dev)** | Add the uncovered queue(s) to a tier's `jobs.pin` in `[jobs.fleet].tiers`, or run an unpinned tier that drains everything (fails once `[jobs.fleet]` is declared and a needed queue is uncovered; informational when `[jobs.fleet]` is absent) |
 | `offsite_backup` **(trunk-dev)** | Set `backup.offsite.s3.bucket`, or set `backup.offsite.allow_shared_bucket = true` if intentionally reusing the app `[storage.s3]` bucket |
 | `edge_target` **(trunk-dev)** | Run `rustup target add wasm32-wasip1` — the project has `#[edge]` routes, so `autumn build` needs that target to compile the edge capsule (passes with "no `#[edge]` routes" when the project has none) |
-| `deploy_host` **(trunk-dev)** | Set a deploy target in `autumn.toml`: `[deploy] host = "<address>"` (one server) **or** `[deploy] hosts = ["<a>", "<b>"]` (a fleet, in rollout order) — never both. Blank or duplicate `hosts` entries are refused (issue #1621) |
+| `deploy_host` **(trunk-dev)** | Set a deploy target in `autumn.toml`: `[deploy] host = "<address>"` (one server) **or** `[deploy] hosts = ["<a>", "<b>"]` (a fleet, in rollout order) — never both. Blank or duplicate `hosts` entries are refused (issue #1621). A host that `ssh` can read as an option (for example one that starts with `-`) is refused too |
 | `plugin_residue` **(trunk-dev)** | Orphaned plugin wiring (issue #1631). Warns when a plugin is declared in `[dependencies]` but never mounted (`autumn plugin add <name>` finishes the install, `autumn plugin remove <name>` takes the dependency back — for a community `autumn-plugin-*` crate, add the `.plugin(...)` call from its README, since `add` never writes one). Fails when a plugin's fully-qualified type is mounted but the crate is not declared, which does not compile. Warns when migrations a plugin declares are still recorded as applied and the plugin is gone (`autumn plugin remove <name> --drop-data` reverts them); that last finding needs a configured database and the `diesel` CLI, and is skipped otherwise |
 | `platform_support` **(trunk-dev)** | Never fails — reports this platform's Windows support tier (issue #1616). On Windows its `detail` names the Tier 1 (native) and Tier 2 (WSL2) commands and the vcpkg/`VCPKG_ROOT` prerequisite for `generate auth --passkeys` |
 | `edge_routes` **(trunk-dev)** | Fails when an `#[edge]` handler also carries `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]`/`#[intercept]`: remove one of the two — edge routes are unauthenticated read-path routes served without origin middleware. Warns when a marked handler is missing from `edge_routes![]`, or when `src/bin/edge-capsule.rs` is absent |

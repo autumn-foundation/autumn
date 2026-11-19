@@ -54,7 +54,7 @@ impl SigningKey {
     #[must_use]
     pub fn random() -> Self {
         let mut bytes = vec![0u8; 32];
-        // Mix a UUID v4 (already cryptographic-quality random) into the key.
+        // Two v4 UUIDs: 244 random bits, since each fixes 6 version/variant bits.
         let a = uuid::Uuid::new_v4();
         let b = uuid::Uuid::new_v4();
         bytes[..16].copy_from_slice(a.as_bytes());
@@ -125,11 +125,7 @@ impl LocalBlobStore {
         previous_signing_keys: Vec<SigningKey>,
     ) -> Result<Self, BlobStoreError> {
         let mount_path = mount_path.into();
-        // axum panics with `Paths must start with a '/'` if we hand it a
-        // mount path that doesn't lead with a slash. Catch that here as
-        // a recoverable configuration error so a bad
-        // `[storage.local].mount_path` (or the env-var equivalent)
-        // surfaces a clean message instead of a router-build panic.
+        // axum panics on a mount path without a leading '/'; report it as a config error instead.
         if !mount_path.starts_with('/') {
             return Err(BlobStoreError::InvalidInput(format!(
                 "storage.local.mount_path must start with '/' (got {mount_path:?})"
@@ -137,10 +133,8 @@ impl LocalBlobStore {
         }
         let root = root.into();
         std::fs::create_dir_all(&root).map_err(BlobStoreError::io)?;
-        // Canonicalize once at construction — `safe_path_for_key`
-        // compares each operation's resolved target against this so
-        // a hostile symlink inside the storage tree (e.g.
-        // `root/avatars -> /etc`) can't be used to escape the root.
+        // `safe_path_for_key` checks every resolved target against this, so a symlink in the
+        // tree (`root/avatars -> /etc`) cannot escape the root.
         let canonical_root = std::fs::canonicalize(&root).map_err(BlobStoreError::io)?;
         Ok(Self {
             inner: Arc::new(LocalInner {
@@ -218,9 +212,8 @@ impl LocalBlobStore {
         validate_key(key)?;
         let target = self.inner.root.join(key);
 
-        // `canonicalize` errors with NotFound when the target doesn't
-        // exist yet (which is normal for `put`). Walk up to the deepest
-        // ancestor that exists, canonicalize that, and check it.
+        // `canonicalize` fails on a target that does not exist yet (normal for `put`), so
+        // canonicalize the deepest existing ancestor instead.
         let mut probe = target.clone();
         let canon_existing = loop {
             match tokio::fs::canonicalize(&probe).await {
@@ -287,10 +280,8 @@ impl BlobStore for LocalBlobStore {
             }
             let etag = sha256_hex(&bytes);
 
-            // Write to a temp file in the same directory, then rename
-            // into place. This means a partial write (disk full,
-            // crash, killed process) never leaves a truncated blob at
-            // `path` for a future `get` to serve.
+            // Write a sibling temp file, then rename into place, so a partial write (disk full,
+            // crash) never leaves a truncated blob at `path`.
             let tmp_path = temp_sibling_path(&path);
             if let Err(err) = tokio::fs::write(&tmp_path, &bytes).await {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
@@ -301,15 +292,8 @@ impl BlobStore for LocalBlobStore {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(BlobStoreError::io(err));
             }
-            // Persist the content_type + etag in a sibling sidecar so
-            // `head`, `get_with_meta`, and the serving route can return
-            // the right MIME instead of `application/octet-stream`. If
-            // the sidecar write fails on an overwrite, clear any
-            // pre-existing sidecar so future `head`/serve calls fall
-            // back to `application/octet-stream` rather than reporting
-            // stale `content_type` from the previous put. The bytes
-            // themselves are committed and correct; we'd rather serve
-            // "unknown MIME" than misrepresent the MIME.
+            // If the sidecar write fails, drop the previous put's sidecar: serving
+            // `application/octet-stream` beats reporting a stale content type for the new bytes.
             if write_meta_sidecar(
                 &path,
                 &StoredBlobMeta {
@@ -413,11 +397,8 @@ impl BlobStore for LocalBlobStore {
                     .map_err(BlobStoreError::io)?;
             }
 
-            // Stream into a sibling temp file and rename into place
-            // only on a clean finish. A client disconnect, mid-stream
-            // error, or transient I/O failure leaves the temp file
-            // (which we unlink) and never touches `path`, so future
-            // `get` calls don't serve a corrupted blob.
+            // Stream into a sibling temp file and rename only on a clean finish, so a client
+            // disconnect or mid-stream error never leaves a partial blob at `path`.
             let tmp_path = temp_sibling_path(&path);
             let result = async {
                 let mut file = tokio::fs::File::create(&tmp_path)
@@ -453,10 +434,7 @@ impl BlobStore for LocalBlobStore {
                     .await
                     .is_err()
                     {
-                        // Same rationale as `put`: clear any
-                        // pre-existing sidecar so future `head`/serve
-                        // requests don't report stale MIME for the
-                        // freshly committed bytes.
+                        // As in `put`: no stale content type for the new bytes.
                         drop_stale_sidecar(&path).await;
                     }
                     Ok(Blob {
@@ -498,9 +476,8 @@ impl BlobStore for LocalBlobStore {
                 }
                 Err(err) => return Err(BlobStoreError::io(err)),
             };
-            // `ReaderStream` owns the open file handle, so the resulting
-            // stream is `'static` (it does not borrow `self`) and reads the
-            // object incrementally rather than buffering it all in memory.
+            // `ReaderStream` owns the file handle, so the stream is `'static` and reads
+            // incrementally.
             let stream = tokio_util::io::ReaderStream::new(file)
                 .map(|chunk| chunk.map_err(BlobStoreError::io));
             let boxed: ByteStream<'static> = Box::pin(stream);
@@ -525,9 +502,7 @@ impl BlobStore for LocalBlobStore {
                 }
                 Err(err) => return Err(BlobStoreError::io(err)),
             };
-            // Seek to the start offset and cap the read at the inclusive slice
-            // length so only `[start, end]` is read off disk — a slice of a
-            // large file never buffers the whole object in memory.
+            // `end` is inclusive.
             file.seek(std::io::SeekFrom::Start(start))
                 .await
                 .map_err(BlobStoreError::io)?;
@@ -543,15 +518,9 @@ impl BlobStore for LocalBlobStore {
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             let path = self.safe_path_for_key(key).await?;
-            // Delete the blob bytes first, then the sidecar. If the
-            // blob delete fails (permissions, transient I/O, …) the
-            // sidecar stays in place, so a failed delete is
-            // side-effect-free as far as `head`/serve are concerned.
-            // If the blob delete succeeds but the sidecar delete fails,
-            // the orphan sidecar is harmless: a future `head` on the
-            // (now-missing) key returns `None` from the metadata-stat
-            // call before the sidecar is even read, and a future `put`
-            // overwrites the sidecar atomically.
+            // Blob first, then sidecar: a failed blob delete leaves the blob's metadata intact.
+            // An orphan sidecar is harmless, since `head` stats the blob before reading it and
+            // the next `put` overwrites it.
             let _commit = self.lock_path(&path).await;
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => {}
@@ -568,12 +537,8 @@ impl BlobStore for LocalBlobStore {
             let path = self.safe_path_for_key(key).await?;
             match tokio::fs::metadata(&path).await {
                 Ok(fs_meta) => {
-                    // Prefer the persisted sidecar metadata
-                    // (content_type + etag) over the filesystem
-                    // defaults. Fall back to `application/octet-stream`
-                    // for blobs written by something other than
-                    // `put`/`put_stream` (older deployments, manual
-                    // file drops, …).
+                    // A blob not written by `put`/`put_stream` (e.g. a manual file drop) has no
+                    // sidecar.
                     let sidecar = read_meta_sidecar(&path).await;
                     Ok(Some(BlobMeta {
                         key: key.to_owned(),
@@ -605,13 +570,8 @@ impl BlobStore for LocalBlobStore {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
 
-            // Sign the canonical (unencoded) key — the serving route
-            // decodes path segments before re-signing for verification.
+            // Sign the unencoded key: the serving route decodes path segments before verifying.
             let signature = sign(self.inner.signing_key.as_bytes(), key, exp_at);
-            // Percent-encode each segment so keys containing reserved
-            // URL characters (`?`, `#`, `%`, spaces, …) round-trip
-            // correctly through the path. `/` survives as the segment
-            // separator.
             let encoded_key = encode_key_path(key);
             let url = format!(
                 "{base}/{encoded_key}?exp={exp_at}&sig={signature}",
@@ -640,9 +600,8 @@ impl BlobStore for LocalBlobStore {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
 
-            // Sign over "upload:{key}:{content_type}:{exp}" — the "upload:" prefix
-            // ensures upload tokens cannot be confused with download tokens which sign
-            // over "{key}:{exp}" only.
+            // The "upload:" prefix keeps an upload token from verifying as a download token,
+            // which signs "{key}:{exp}".
             let signature =
                 sign_upload(self.inner.signing_key.as_bytes(), key, content_type, exp_at);
             let encoded_key = encode_key_path(key);
@@ -965,8 +924,7 @@ async fn atomic_replace(src: &std::path::Path, dst: &std::path::Path) -> std::io
     match tokio::fs::rename(src, dst).await {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Move the existing dst aside under a unique sibling name
-            // so we can restore it if the rename-into-place fails.
+            // Move dst aside so it can be restored if the rename fails.
             let backup = backup_sibling_path(dst);
             tokio::fs::rename(dst, &backup).await?;
             match tokio::fs::rename(src, dst).await {
@@ -975,10 +933,6 @@ async fn atomic_replace(src: &std::path::Path, dst: &std::path::Path) -> std::io
                     Ok(())
                 }
                 Err(rename_err) => {
-                    // Restore the original dst from backup. If even
-                    // this fails the system is in a state we can't
-                    // automatically recover, but it's still better
-                    // than the unconditional-delete alternative.
                     let _ = tokio::fs::rename(&backup, dst).await;
                     Err(rename_err)
                 }
@@ -1226,9 +1180,8 @@ async fn read_meta_sidecar(blob_path: &std::path::Path) -> Option<StoredBlobMeta
 /// path. Segment separators stay raw so the path tree survives.
 fn encode_key_path(key: &str) -> String {
     use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-    // RFC 3986 path segment: encode controls, path-reserved, and
-    // anything that would alias another segment or query/fragment
-    // delimiter.
+    // RFC 3986 path segment: encode controls and anything that would end the segment or
+    // start a query or fragment.
     const PATH_SEGMENT: &AsciiSet = &CONTROLS
         .add(b' ')
         .add(b'"')
@@ -1646,7 +1599,7 @@ mod tests {
         remove_own_blob(&path, &ours).await;
         assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
 
-        // The file that `ours` linked goes.
+        // A blob hard-linked from `ours` is removed.
         std::fs::remove_file(&path).unwrap();
         std::fs::hard_link(&ours, &path).unwrap();
         remove_own_blob(&path, &ours).await;
@@ -1736,11 +1689,9 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let outside = tempfile::tempdir().unwrap();
-        // Create a sensitive file outside the storage root.
         std::fs::write(outside.path().join("secret"), b"do not read").unwrap();
 
         let dir = temp_root();
-        // root/escape -> outside_dir
         symlink(outside.path(), dir.path().join("escape")).unwrap();
 
         let s = store(dir.path());
@@ -1750,8 +1701,6 @@ mod tests {
             "expected PermissionDenied, got {err:?}"
         );
 
-        // And the same for writes — `put` to a key that resolves
-        // outside the root must refuse before any bytes hit disk.
         let err = s
             .put(
                 "escape/leaked.txt",
@@ -1761,7 +1710,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BlobStoreError::PermissionDenied(_)));
-        // Outside dir is untouched.
         assert!(!outside.path().join("leaked.txt").exists());
     }
 
@@ -1783,19 +1731,14 @@ mod tests {
         let dir = temp_root();
         let s = store(dir.path());
 
-        // Plant a symlink at the *sidecar* path before the put runs.
-        // The sidecar for key `victim.bin` is `victim.bin.meta`.
         let sidecar_path = dir.path().join("victim.bin.meta");
         symlink(&target, &sidecar_path).unwrap();
 
-        // The put succeeds (sidecar errors are logged, not surfaced) —
-        // the important invariant is the symlink target.
+        // Sidecar write errors are logged, not returned, so check the symlink target instead.
         s.put("victim.bin", "image/png", Bytes::from_static(b"pixels"))
             .await
             .unwrap();
 
-        // The original symlink target must still hold its original
-        // bytes, *not* the sidecar JSON.
         assert_eq!(std::fs::read(&target).unwrap(), b"original-contents");
     }
 
@@ -1804,7 +1747,6 @@ mod tests {
         let key = b"k";
         let sig = sign(key, "blob/1.png", 99);
         verify(key, "blob/1.png", u64::MAX / 2, &sig).unwrap_err();
-        // Use a now-future expiry for verification.
         let exp = SystemTime::now()
             .checked_add(Duration::from_secs(60))
             .unwrap()
@@ -1852,14 +1794,11 @@ mod tests {
     async fn presigned_url_percent_encodes_reserved_chars() {
         let dir = temp_root();
         let s = store(dir.path());
-        // Space and `#` pass `validate_key` (the Windows-reserved
-        // rejection set is `< > : " | ? *` + control bytes only) but
-        // still need percent-encoding inside the URL path.
+        // Space and `#` pass `validate_key` but still need encoding in a URL path.
         let url = s
             .presigned_url("user 1/note#1.png", Duration::from_secs(120))
             .await
             .unwrap();
-        // `/` stays raw as a segment separator.
         assert!(
             url.starts_with("/_blobs/user%201/note%231.png?exp="),
             "unexpected URL: {url}"
@@ -1874,8 +1813,6 @@ mod tests {
         let dir = temp_root();
         let s = store(dir.path());
 
-        // First chunk succeeds, second yields an error to short-circuit
-        // the write.
         let chunks: Vec<Result<Bytes, BlobStoreError>> = vec![
             Ok(Bytes::from_static(b"first")),
             Err(BlobStoreError::Backend("boom".into())),
@@ -1887,7 +1824,6 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, BlobStoreError::Backend(_)));
 
-        // The partial file must not be left on disk.
         let path = dir.path().join("interrupted.bin");
         assert!(!path.exists(), "partial blob was not cleaned up");
         assert!(matches!(
@@ -1910,10 +1846,6 @@ mod tests {
 
     #[tokio::test]
     async fn put_replaces_atomically() {
-        // Successive `put` calls to the same key replace via temp-file +
-        // rename. Concrete fault injection for a mid-write IO error is
-        // exercised through `put_stream_cleans_up_partial_file_on_error`;
-        // here we just confirm the happy path of atomic replacement.
         let dir = temp_root();
         let s = store(dir.path());
         s.put(
@@ -1932,7 +1864,6 @@ mod tests {
         .unwrap();
         assert_eq!(&s.get("k.bin").await.unwrap()[..], b"second");
 
-        // No leftover temp files in the storage root.
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -2049,8 +1980,6 @@ mod tests {
         let dir = temp_root();
         let s = store(dir.path());
 
-        // Put `pinned.bin` as a *directory* so `remove_file` errors,
-        // and pre-stage a sidecar so we can verify it survives.
         let blob_path = dir.path().join("pinned.bin");
         tokio::fs::create_dir(&blob_path).await.unwrap();
         let sidecar = meta_sidecar_path(&blob_path);
@@ -2065,19 +1994,15 @@ mod tests {
             result.is_err(),
             "expected error: blob path is a directory, remove_file should fail"
         );
-        // The new ordering propagates the blob-delete error before
-        // touching the sidecar, so the sidecar stays behind.
         assert!(
             sidecar.exists(),
             "sidecar must survive a failed blob delete"
         );
-        // And the (directory) blob is also still there.
         assert!(blob_path.is_dir());
     }
 
     #[tokio::test]
     async fn head_falls_back_to_octet_stream_without_sidecar() {
-        // Simulate an older blob written without a sidecar.
         let dir = temp_root();
         let s = store(dir.path());
         let path = dir.path().join("legacy.bin");
@@ -2090,11 +2015,6 @@ mod tests {
 
     #[tokio::test]
     async fn drop_stale_sidecar_removes_existing_metadata() {
-        // The recovery path used by `put` / `put_stream` when a sidecar
-        // write fails after the bytes commit: we delete the old
-        // sidecar so future `head`/serve calls fall back to
-        // octet-stream rather than reporting stale MIME for the new
-        // bytes.
         let dir = temp_root();
         let blob = dir.path().join("victim.bin");
         let sidecar = meta_sidecar_path(&blob);
@@ -2106,21 +2026,16 @@ mod tests {
         drop_stale_sidecar(&blob).await;
         assert!(!sidecar.exists());
 
-        // Idempotent — calling again on a missing sidecar is a no-op,
-        // not an error.
+        // A missing sidecar is a no-op.
         drop_stale_sidecar(&blob).await;
     }
 
     #[tokio::test]
     async fn read_meta_sidecar_handles_missing_and_malformed() {
         let dir = temp_root();
-        // Missing sidecar → None (file at the blob path doesn't matter
-        // for this helper; we're only testing sidecar read behavior).
         let blob_path = dir.path().join("absent.bin");
         assert!(read_meta_sidecar(&blob_path).await.is_none());
 
-        // Malformed JSON in the sidecar → None (graceful degradation;
-        // the serving route falls back to octet-stream).
         let blob_path = dir.path().join("malformed.bin");
         tokio::fs::write(meta_sidecar_path(&blob_path), b"not json")
             .await
@@ -2158,21 +2073,15 @@ mod tests {
         let dst = dir.path().join("target.bin");
         tokio::fs::write(&dst, b"old-blob").await.unwrap();
 
-        // Manually drive the recovery sequence. Move dst aside …
         let backup = backup_sibling_path(&dst);
         tokio::fs::rename(&dst, &backup).await.unwrap();
-        // … attempt the second rename with a non-existent source so it
-        // fails (this is the "transient failure on the new write"
-        // branch the production code's `match` arm catches) …
+        // A missing source makes the second rename fail.
         let err = tokio::fs::rename(dir.path().join("never.tmp"), &dst)
             .await
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        // … and restore the backup, which is exactly what the
-        // production path does on rename failure.
         tokio::fs::rename(&backup, &dst).await.unwrap();
 
-        // The original blob bytes are intact.
         assert_eq!(tokio::fs::read(&dst).await.unwrap(), b"old-blob");
     }
 
@@ -2180,13 +2089,11 @@ mod tests {
     fn encode_key_path_does_not_skip_leading_slash() {
         let key = "/some/key";
         let encoded = encode_key_path(key);
-        // The first segment before the split '/' is empty
         assert_eq!(encoded, "/some/key");
     }
 
     #[test]
     fn sha256_hex_computes_correct_hash() {
-        // e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 is empty string
         assert_eq!(
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -2233,7 +2140,7 @@ mod tests {
         let s = store(dir.path());
 
         let path = dir.path().join("some_blob");
-        // create a directory so that get_with_meta reading file fails
+        // A directory at the blob path makes the read fail.
         tokio::fs::create_dir(&path).await.unwrap();
         let Err(err) = s.get_with_meta("some_blob").await else {
             panic!("Expected error");
@@ -2249,21 +2156,18 @@ mod tests {
 
         drop_stale_sidecar(&blob).await;
         drop_stale_sidecar(&blob).await;
-        // Make sure doing it when file doesn't exist doesn't panic
         assert!(!sidecar.exists());
     }
 
     #[tokio::test]
     async fn drop_stale_sidecar_ignores_and_survives_non_not_found_errors() {
-        // Create a directory where the sidecar should be so that remove_file returns EISDIR
+        // A directory at the sidecar path makes `remove_file` fail with something other than
+        // NotFound.
         let dir = temp_root();
         let blob = dir.path().join("victim.bin");
         let sidecar = meta_sidecar_path(&blob);
         tokio::fs::create_dir(&sidecar).await.unwrap();
 
-        // The function drop_stale_sidecar ignores all errors internally but prints a warning.
-        // It's `async fn drop_stale_sidecar`, no return value.
-        // We will just run it and ensure it doesn't panic on a non-not-found error.
         drop_stale_sidecar(&blob).await;
         assert!(sidecar.exists()); // Because it couldn't remove a dir
     }
@@ -2273,7 +2177,6 @@ mod tests {
         let dir = temp_root();
         let s = store(dir.path());
 
-        // Write the blob but no sidecar
         let path = dir.path().join("blob.bin");
         tokio::fs::write(&path, b"data").await.unwrap();
 
@@ -2291,22 +2194,11 @@ mod tests {
         let tmp = dir.path().join("staging.tmp");
         tokio::fs::write(&tmp, b"new").await.unwrap();
 
-        // Create a backup file manually to trigger AlreadyExists
         let backup = backup_sibling_path(&dst);
         tokio::fs::write(&backup, b"interloper").await.unwrap();
 
-        // Atomic replace will encounter AlreadyExists when renaming `dst` to `backup`
-        // It will then retry. Before it loops, it does nothing if there is an interloper? No, the code says:
-        // if err.kind() == std::io::ErrorKind::AlreadyExists ... Wait, rename can overwrite. But on Windows `rename` fails if dst exists.
-        // It's possible `AlreadyExists` or `PermissionDenied` depending on OS. The code is:
-        // match tokio::fs::rename(dst, backup_path).await {
-        //   Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-        //       let _ = tokio::fs::remove_file(backup_path).await;
-        //       continue;
-        //   } ...
-        // So we can simulate this by mocking, or relying on `rename` failing if exists (not true on Unix).
-        // Since we are on Unix, rename just replaces. To trigger this we can't easily do it.
-        // Let's at least test we can still replace if backup exists.
+        // Each call picks a fresh backup name, so a leftover backup file does not block the
+        // replace. On Unix `rename` overwrites, so the `AlreadyExists` arm is not reached here.
         atomic_replace(&tmp, &dst).await.unwrap();
 
         assert_eq!(tokio::fs::read(&dst).await.unwrap(), b"new");
@@ -2377,7 +2269,7 @@ mod tests {
         assert!(dbg.contains("len"));
     }
 
-    // ── Previous-key rotation (RED phase) ──────────────────────────────────
+    // ── Previous-key rotation ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn blob_url_signed_with_previous_key_still_verifies() {
@@ -2385,7 +2277,6 @@ mod tests {
         let old_key = SigningKey::new(b"old-key-32-bytes-xxxxxxxxxxxxxxx".to_vec());
         let new_key = SigningKey::new(b"new-key-32-bytes-xxxxxxxxxxxxxxx".to_vec());
 
-        // Store is built with new key + old key as previous
         let store = LocalBlobStore::new(
             "test",
             dir.path(),
@@ -2401,7 +2292,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Sign a URL with the old key directly
         let exp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2409,7 +2299,6 @@ mod tests {
             + 3600;
         let old_sig = sign(old_key.as_bytes(), "a/b.txt", exp);
 
-        // The store should accept it via its previous-key list
         assert!(
             verify_with_rotation(
                 &store.inner.signing_key,
@@ -2436,7 +2325,7 @@ mod tests {
         );
     }
 
-    // ── RED: upload token signing ───────────────────────────────────────────
+    // ── Upload token signing ────────────────────────────────────────────────
 
     #[test]
     fn sign_upload_differs_from_sign_download() {
@@ -2505,7 +2394,6 @@ mod tests {
 
     #[test]
     fn upload_token_rejects_download_sig_replay() {
-        // A download signature must not be accepted as an upload token.
         let key = b"secret";
         let blob_key = "img/photo.jpg";
         let exp = u64::MAX / 2;
@@ -2555,7 +2443,6 @@ mod tests {
 
     #[tokio::test]
     async fn presign_put_upload_token_does_not_verify_as_download() {
-        // The upload URL's sig= value must not be accepted by the download verify.
         let dir = temp_root();
         let key = SigningKey::new(b"shared-signing-key".to_vec());
         let s = LocalBlobStore::new(
@@ -2576,7 +2463,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Extract sig and exp from the upload URL
         let url = &result.url;
         let sig = url.split("&sig=").nth(1).expect("sig param missing");
         let exp_str = url
@@ -2586,7 +2472,6 @@ mod tests {
             .expect("exp param missing");
         let exp: u64 = exp_str.parse().unwrap();
 
-        // The upload sig must not verify as a download token
         let download_result = verify_with_rotation(&key, &[], "docs/report.pdf", exp, sig);
         assert!(
             download_result.is_err(),
@@ -2594,7 +2479,7 @@ mod tests {
         );
     }
 
-    // ── RED: direct upload PUT route ────────────────────────────────────────
+    // ── Direct upload PUT route ─────────────────────────────────────────────
 
     #[tokio::test]
     async fn direct_put_round_trip_via_serving_route() {
@@ -2637,7 +2522,6 @@ mod tests {
             "PUT upload should return 200"
         );
 
-        // Confirm blob landed in the store
         let bytes = s.get("test/upload.png").await.unwrap();
         assert_eq!(&bytes[..], b"PNG_DATA_BYTES");
     }
@@ -2700,7 +2584,6 @@ mod tests {
             .with_extension(config);
         let router = serve_router(&s).with_state(state);
 
-        // Put 15 bytes, which exceeds the limit of 10
         let request = Request::builder()
             .method(Method::PUT)
             .uri(&result.url)
@@ -2712,10 +2595,8 @@ mod tests {
 
     #[test]
     fn encode_query_value_encodes_special_chars() {
-        // Content-types with `/` should be encoded in query values
         let encoded = encode_query_value("image/png");
         assert!(encoded.contains("%2F") || encoded == "image%2Fpng");
-        // Spaces must be encoded
         assert!(encode_query_value("text plain").contains("%20"));
     }
 

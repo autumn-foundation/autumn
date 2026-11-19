@@ -63,6 +63,8 @@ use std::io::Write as _;
 
 use serde::{Deserialize, Serialize};
 
+use crate::time::Timestamp;
+
 /// Version of the object layout and payload framing. Bumped only by a
 /// breaking change; restore refuses a version it does not understand.
 pub const LAYOUT_VERSION: u32 = 1;
@@ -224,6 +226,22 @@ pub struct SegmentRef {
 pub fn generation_id(created_ms: i64, nonce: u64) -> String {
     let ms = created_ms.max(0);
     format!("{ms:013}-{nonce:016x}")
+}
+
+/// The instant `ms` milliseconds after the Unix epoch, clamped to
+/// [`Timestamp::MIN`]..=[`Timestamp::MAX`].
+///
+/// `Timestamp::from_millisecond` refuses the millisecond count of
+/// `Timestamp::MAX` itself (its last whole millisecond is past the last whole
+/// second the constructor accepts), so a stored `MAX` must clamp back to it
+/// rather than fail.
+#[must_use]
+pub(crate) fn timestamp_from_ms(ms: i64) -> Timestamp {
+    Timestamp::from_millisecond(ms).unwrap_or(if ms < 0 {
+        Timestamp::MIN
+    } else {
+        Timestamp::MAX
+    })
 }
 
 /// Parse a generation id produced by [`generation_id`].
@@ -461,11 +479,8 @@ pub fn decode_segment(payload: &[u8]) -> Result<(SegmentHeader, Vec<u8>), Segmen
             version: header.version,
         });
     }
-    // A segment is one WAL byte range, bounded in practice by the checkpoint
-    // threshold. Refuse a header that claims more than any real segment can hold
-    // BEFORE inflating anything: the periodic verifier runs this inside the app
-    // process, so an unbounded inflate of a crafted object is an OOM of the whole
-    // app, not just a failed restore.
+    // Refuse an oversized claim BEFORE inflating: the periodic verifier runs inside the app
+    // process, so an unbounded inflate of a crafted object would take the whole app down.
     if header.uncompressed_len > MAX_SEGMENT_BYTES {
         return Err(SegmentError::DigestMismatch {
             expected_len: header.uncompressed_len,

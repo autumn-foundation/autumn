@@ -1,0 +1,50 @@
+{
+  "type": "record",
+  "name": "CatalogMapped",
+  "namespace": "autumn.mesh_catalog",
+  "doc": "topic: catalog.mapped, version 1",
+  "autumn.topic": "catalog.mapped",
+  "fields": [
+    { "name": "text", "type": "string" },
+    { "name": "id", "type": { "type": "string", "logicalType": "uuid" } },
+    {
+      "name": "at",
+      "type": { "type": "string", "autumn.format": "date-time" }
+    },
+    {
+      "name": "price",
+      "type": { "type": "string", "autumn.format": "decimal" }
+    },
+    { "name": "tiny", "type": "int" },
+    { "name": "small", "type": "int" },
+    { "name": "int", "type": "int" },
+    { "name": "byte", "type": "int" },
+    { "name": "short", "type": "int" },
+    { "name": "unsigned", "type": "long" },
+    { "name": "long", "type": "long" },
+    {
+      "name": "seconds",
+      "type": { "type": "long", "autumn.format": "unix-seconds" }
+    },
+    { "name": "ratio", "type": "double" },
+    { "name": "flag", "type": "boolean" },
+    { "name": "tags", "type": { "type": "array", "items": "string" } },
+    { "name": "scores", "type": { "type": "map", "values": "double" } },
+    { "name": "note", "type": ["null", "string"], "default": null },
+    {
+      "name": "ref_id",
+      "type": ["null", { "type": "string", "logicalType": "uuid" }],
+      "default": null
+    },
+    { "name": "gaps", "type": { "type": "array", "items": ["null", "int"] } },
+    {
+      "name": "maybe_list",
+      "type": ["null", { "type": "array", "items": "boolean" }],
+      "default": null
+    },
+    {
+      "name": "grid",
+      "type": { "type": "array", "items": { "type": "array", "items": "int" } }
+    }
+  ]
+}

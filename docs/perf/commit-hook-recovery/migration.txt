@@ -1,0 +1,25 @@
+NOTICE:  database "ledger_hookmig_full" does not exist, skipping
+NOTICE:  database "ledger_hookmig_standalone" does not exist, skipping
+=== full set, hist=1000000: 1000038 rows, 23789 heap blocks
+--- up.sql
+Timing is on.
+Time: 0.137 ms
+Time: 77.347 ms
+Timing is off.
+   mode    | granted 
+-----------+---------
+ ShareLock | t
+(1 row)
+
+created: idx_autumn_repository_commit_hooks_after_hook_recovery, 2 blocks
+--- up.sql again (idempotent)
+DO
+indexes on claimed_at: 3
+--- down.sql
+Timing is on.
+DROP INDEX
+Time: 2.686 ms
+after rollback, after_hook_recovery present: false
+=== standalone set (pending_recovery already covers both statuses)
+DO
+claimed_at indexes: idx_autumn_repository_commit_hooks_pending_recovery, idx_autumn_repository_commit_hooks_stale_recovery

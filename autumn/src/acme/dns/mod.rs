@@ -230,8 +230,7 @@ pub fn sanitize_upstream(text: &str, secrets: &[&str]) -> String {
         text
     };
 
-    // Redact, normalize, redact again — see the note above on why the order is
-    // not interchangeable.
+    // Redact, normalize, redact again: the order matters (see above).
     let raw = redact(text.to_owned());
     let folded: String = raw
         .chars()
@@ -545,13 +544,9 @@ pub fn build_provider(
             },
             transport,
         )),
-        // Every DNS secret this process holds, handed to the hook provider for
-        // redaction. Autumn passes the hook no credential of its own, but the
-        // hook INHERITS the process environment — so a script written with
-        // `set -x` traces `AUTUMN_ACME_DNS_API_TOKEN` (or whatever it reads) to
-        // stderr, and that stderr is copied into the issuance error, which is
-        // published on `/actuator/health` and pushed to the operator's alert
-        // destination.
+        // The hook inherits the process environment, so a `set -x` script can trace
+        // a DNS secret to stderr, which lands in the published issuance error. Hand
+        // it every secret this process holds for redaction.
         AcmeDnsProvider::Exec => Arc::new(
             exec::ExecProvider::new(dns_cfg.command.clone())
                 .with_secrets(credential.secret_values()),
@@ -576,10 +571,8 @@ mod tests {
         );
     }
 
-    // AWS answers a SigV4 mismatch by echoing the canonical request, which
-    // contains every signed header — including the STS session token. That reply
-    // is published on the unauthenticated `/actuator/health` and pushed to the
-    // operator's alert destination, so it must be scrubbed on the way in.
+    // AWS answers a SigV4 mismatch by echoing the canonical request, STS session
+    // token included. That reply is published, so it must be scrubbed.
     #[test]
     fn upstream_text_is_scrubbed_of_live_secrets() {
         let token = "FwoGZXIvYXdzEHwaDNOT-A-REAL-SESSION-TOKEN";
@@ -615,8 +608,6 @@ mod tests {
         assert!(safe.contains("forged"), "the text itself is kept: {safe:?}");
     }
 
-    // A short string is not treated as a secret: redacting on a 3-character
-    // "secret" would blank out most of any message.
     /// Regression (#1620): a credential containing control characters must be
     /// redacted, whatever order the sanitizer's steps run in.
     ///
@@ -643,9 +634,8 @@ mod tests {
         // The surrounding diagnostic survives.
         assert!(safe.contains("nsupdate"), "got: {safe}");
 
-        // …and the mirror case: the text has already been normalized (newlines
-        // folded to spaces) by whatever produced it, while the secret is still
-        // raw. Matching the secret's folded spelling catches that too.
+        // Mirror case: the text arrives already folded while the secret is raw;
+        // matching the secret's folded spelling catches it.
         let folded_text = traced.replace('\n', " ");
         let safe = sanitize_upstream(&folded_text, &[KEY]);
         assert!(
@@ -712,10 +702,8 @@ mod tests {
         assert!(resolved.access_key_id.is_none());
     }
 
-    // Regression (Codex, #1620): `ExecProvider::with_secrets` existed but
-    // `build_provider` never called it, so the hook's redaction list was empty
-    // in production. A hook inherits the process environment, so a `set -x`
-    // script traces the very token this list exists to scrub.
+    // A hook inherits the process environment, so a `set -x` script can trace
+    // any of these secrets; each must be in the redaction list (#1620).
     #[test]
     fn the_exec_provider_is_built_with_the_credentials_secrets() {
         let credential = DnsCredential {

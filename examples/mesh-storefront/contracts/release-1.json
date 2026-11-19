@@ -1,5 +1,5 @@
 {
-  "format": 5,
+  "format": 4,
   "endpoints": [
     {
       "service": "catalog",

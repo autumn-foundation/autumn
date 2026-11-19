@@ -50,7 +50,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -81,7 +81,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection as _;
 use diesel::prelude::*;
@@ -93,7 +92,7 @@ use super::segment::{self, SegmentError, SegmentHeader, SnapshotMeta};
 use super::sqlite::{self, CheckpointOutcome, SqliteError};
 use super::status::{self, ReplicationStatus};
 use super::wal::{self, ScanCursor, WalError, WalHeader};
-use crate::time::{ClockSource, SystemClock};
+use crate::time::{ClockSource, SystemClock, Timestamp};
 
 /// How long the loop sleeps between shutdown checks while waiting for the next
 /// tick. Short enough that shutdown is prompt, long enough to be free.
@@ -249,7 +248,6 @@ impl From<SegmentError> for ReplicationError {
 impl From<DestinationError> for ReplicationError {
     fn from(e: DestinationError) -> Self {
         match e {
-            // The fence of core refused a put.
             DestinationError::Fenced { epoch, newest } => Self::Fenced { epoch, newest },
             e => Self::Destination(e),
         }
@@ -304,7 +302,7 @@ struct GenerationState {
     /// Database page size, from the WAL header.
     page_size: u32,
     /// When the generation opened.
-    started_at: DateTime<Utc>,
+    started_at: Timestamp,
     /// Sequence number for the next segment.
     next_seq: u64,
     /// `-wal` bytes already shipped. Starts at `0`, so segment `0` carries the
@@ -374,7 +372,7 @@ pub struct Replicator {
     /// The ownership epoch this replicator ships under (issue #3233).
     epoch: Option<u64>,
     /// When the destination's epochs were last read.
-    fence_checked_at: Option<DateTime<Utc>>,
+    fence_checked_at: Option<Timestamp>,
     /// The newer epoch that stopped this replicator.
     fenced_by: Option<u64>,
 }
@@ -497,10 +495,7 @@ impl Replicator {
         }
         self.epoch.is_some()
             && self.fence_checked_at.is_none_or(|at| {
-                self.clock
-                    .now()
-                    .signed_duration_since(at)
-                    .to_std()
+                Duration::try_from(self.clock.now().duration_since(at))
                     // A clock that stepped back checks now.
                     .map_or(true, |age| age >= FENCE_CHECK_INTERVAL)
             })
@@ -533,9 +528,7 @@ impl Replicator {
             self.tick_and_record();
 
             if let Some(interval) = self.settings.verify_interval {
-                let due = now
-                    .signed_duration_since(last_verify)
-                    .to_std()
+                let due = Duration::try_from(now.duration_since(last_verify))
                     .is_ok_and(|elapsed| elapsed >= interval);
                 if due {
                     last_verify = now;
@@ -547,8 +540,7 @@ impl Replicator {
                 break;
             }
         }
-        // Final flush: the app is stopping, so ship the last committed frames
-        // before the process (and possibly the machine) goes away.
+        // Final flush: ship the last committed frames before the process exits.
         self.tick_and_record();
     }
 
@@ -633,19 +625,10 @@ impl Replicator {
         let mut header = header;
         let mut wal_len = wal_len;
         if self.needs_new_generation(header.as_ref(), wal_len) {
-            // Ship what the outgoing generation still owes before rotating.
-            //
-            // `start_generation` checkpoints, which folds every unshipped frame
-            // into the database file the new base snapshot copies. Those commits
-            // are not lost, but they leave the *old* generation's chain — so a
-            // point-in-time restore aimed just before the rollover would replay
-            // that chain and legitimately miss them. They would also stay
-            // offsite-less for the whole compress-and-upload of a full snapshot,
-            // which on a large database is minutes against an advertised
-            // ten-second objective.
-            //
-            // Shipping first closes both: the frames land in the generation that
-            // owns them, at the moment they were committed.
+            // Ship what the outgoing generation still owes before rotating. `start_generation`
+            // checkpoints those frames into the new snapshot, so otherwise they would be missing
+            // from the old chain (a restore just before the rollover would lose them) and stay
+            // unshipped for the whole snapshot upload.
             if self.state.is_some()
                 && let Some(pending) = header.as_ref()
             {
@@ -667,18 +650,11 @@ impl Replicator {
             report.bytes = shipped.1;
         }
 
-        // Re-measured, never reused from the top of the tick. `wal_len` was
-        // sampled before an upload that can take seconds, so commits made during
-        // the transfer are absent from it — reporting that stale figure as
-        // `pending_bytes`, and stamping a fresh `last_success_at` beside it, made
-        // `/actuator/health` show near-zero lag while the destination was a whole
-        // transfer behind. A run of slow uploads could hold the indicator `Up`
-        // indefinitely past the configured RPO. (`maybe_checkpoint` already
-        // re-measures for the same reason; the status path did not.)
+        // Re-measure: `wal_len` predates uploads that can take seconds, and reporting it would
+        // show near-zero lag while the destination is a whole transfer behind.
         //
-        // Read the clock before you measure the tail. Each commit at or
-        // before this reading is then in the `-wal`. A proven caught-up tail
-        // has shipped it.
+        // Read the clock before measuring the tail, so every commit at or before the reading is
+        // in the `-wal`. A proven caught-up tail has shipped it.
         let through = self.clock.now();
         let tail = self.settled_tail(&wal_path);
         let (pending, caught_up) = (tail.pending, tail.caught_up);
@@ -693,25 +669,18 @@ impl Replicator {
             self.status.record_replicated_through(bound);
         }
 
-        // Read *after* anything this tick may have opened or shipped, never
-        // before. Both judgements below compare this instant against a timestamp
-        // the tick itself may have just written — a generation's `started_at`,
-        // an artifact's creation instant — and each of those is sampled at the
-        // moment its contents were fenced, which is later than the top of the
-        // tick. A reading taken up there would sit *behind* them, and
-        // `generation_expired` reads a negative span as "expired": every fresh
-        // generation would be retired on the tick that opened it.
+        // Read after this tick opened or shipped anything: the checks below compare against
+        // timestamps it may have just written. An earlier reading would sit behind them, and
+        // `generation_expired` reads a negative span as expired, so every fresh generation
+        // would be retired on the tick that opened it.
         let now = self.clock.now();
         let mut index_rotated = false;
         report.checkpointed =
             self.maybe_checkpoint(&db, &wal_path, pending, now, &mut index_rotated)?;
         report.index_rotated = index_rotated;
 
-        // Retention runs every tick, not only when a generation opens: on a
-        // quiet database a generation can outlive many ticks, and a destination
-        // that grows without bound is its own outage. A prune failure (a revoked
-        // DeleteObject, a throttle) must not fail the tick — the data is still
-        // safely offsite — so it is logged and retried next time.
+        // Prune every tick, since on a quiet database one generation outlives many ticks. A prune
+        // failure does not fail the tick: the data is still offsite, and the next tick retries.
         match self.prune(now) {
             Ok(pruned) => report.pruned_generations = pruned,
             Err(e) => tracing::warn!(error = %e, "SQLite replica retention sweep failed"),
@@ -818,7 +787,7 @@ impl Replicator {
         db: &Path,
         wal_path: &Path,
         pending: u64,
-        now: DateTime<Utc>,
+        now: Timestamp,
         index_rotated: &mut bool,
     ) -> Result<bool, ReplicationError> {
         let expired = self.generation_expired(now);
@@ -907,8 +876,7 @@ impl Replicator {
         let spawned = std::thread::Builder::new()
             .name("autumn-replica-verify".to_owned())
             .spawn(move || {
-                // Cleared on drop, so a panic anywhere in the restore path
-                // cannot leave the flag set and silently disable every future
+                // Cleared on drop, so a panic in the restore path cannot disable every future
                 // verification.
                 let _guard = InFlightGuard(verifying);
                 let result = verify_replica(destination.as_ref(), &root, &database_path)
@@ -965,9 +933,7 @@ impl Replicator {
                 state.salt.is_some_and(|salt| salt != header.salt())
                     || wal_len < state.shipped_offset
             }
-            // The WAL vanished or shrank below what we had shipped — a
-            // checkpoint happened (ours, on the previous tick, or someone
-            // else's).
+            // The WAL vanished or shrank below what was shipped: a checkpoint happened.
             (Some(state), None) => state.shipped_offset > 0 || wal_len < state.shipped_offset,
         }
     }
@@ -1018,31 +984,17 @@ impl Replicator {
                 return Err(ReplicationError::CheckpointBlocked { wal_bytes });
             }
         }
-        // Stamped only now: the checkpoint is what fences the database file this
-        // snapshot copies. A reading taken before it would claim the snapshot
-        // holds a moment it does not yet cover, and a point-in-time restore
-        // landing in that window would replay a transaction from *after* the
-        // instant the operator asked for. Reading after the fence can only
-        // over-state the snapshot's age, which costs the restore an extra
-        // generation of WAL replay and never correctness.
+        // Stamped after the checkpoint that fences the copied file. An earlier reading would
+        // claim a moment the snapshot does not cover, and a restore to it would replay a later
+        // transaction. A late stamp only costs extra WAL replay.
         let now = self.clock.now();
-        // Generation ids order by this stamp, and both "restore the latest" and
-        // retention take the greatest one. A host clock that steps backward
-        // between generations would stamp the *newer* generation lower, so a
-        // latest-restore would silently select the older one and omit every
-        // write captured after the step until wall time caught up again. That is
-        // not a remote case here: `generation_expired` deliberately treats a
-        // negative elapsed duration as expiry, so a backward step is precisely
-        // when a new generation gets opened.
-        //
-        // The stamp is therefore floored one millisecond past the newest
-        // generation already at the destination. Reading the floor from the
-        // destination rather than from memory is what makes it durable: a
-        // process that restarts with an already-rolled-back clock still orders
-        // its new generation after the ones it finds offsite.
+        // Generation ids order by this stamp, and restore and retention take the greatest. A
+        // clock that steps backward would stamp a newer generation lower, and a backward step is
+        // exactly when `generation_expired` opens one. Floor the stamp one millisecond past the
+        // newest generation at the destination, which also holds across a restart.
         let floor_ms = self.newest_generation_ms()?;
         let created_ms = now
-            .timestamp_millis()
+            .as_millisecond()
             .max(floor_ms.map_or(i64::MIN, |ms| ms.saturating_add(1)));
         let id = segment::generation_id(created_ms, rand::random::<u64>());
 
@@ -1067,7 +1019,7 @@ impl Replicator {
         let meta = SnapshotMeta {
             version: segment::LAYOUT_VERSION,
             generation: id.clone(),
-            created_at: now.to_rfc3339(),
+            created_at: crate::time::compat::rfc3339(now),
             created_ms,
             sha256,
             uncompressed_len,
@@ -1129,19 +1081,10 @@ impl Replicator {
             return Ok((0, 0));
         }
 
-        // Never read past what the decoder will accept. `decode_segment` refuses
-        // any `uncompressed_len` over `MAX_SEGMENT_BYTES` — a bound it needs,
-        // because the periodic verifier inflates segments inside the app process
-        // — but nothing capped the *write* side. After an outage, a long sync
-        // interval, or one enormous transaction, this read took the whole
-        // committed tail and published a segment that no restore could ever
-        // decode, while the tick went on to checkpoint the local WAL away: the
-        // generation is then unrestorable until the next base snapshot.
-        //
-        // Capping the window instead makes the scan below stop at the last commit
-        // that fits, and the next tick ships the rest. A single transaction
-        // larger than the cap ships nothing, which grows lag and trips the health
-        // indicator — loudly stuck rather than quietly unrestorable.
+        // Never read past `MAX_SEGMENT_BYTES`, the most `decode_segment` accepts: a larger segment
+        // could never be restored once the checkpoint drops the local WAL. The scan stops at the
+        // last commit that fits and the next tick ships the rest. A single transaction over the
+        // cap ships nothing, so lag grows and the health indicator trips.
         let window_end = wal_len.min(
             state
                 .shipped_offset
@@ -1167,14 +1110,9 @@ impl Replicator {
             ),
         })?;
 
-        // Stamped only now, once the bytes this segment carries have been read
-        // out of the `-wal` and sliced at their commit boundary. `wal_len` is
-        // measured at the top of the tick and the read follows it, so a
-        // transaction can commit into that window and land in `raw`; a timestamp
-        // sampled before the read would date the segment earlier than a change
-        // it actually contains, and a restore to an instant in between would
-        // replay that change. Sampling after can only date the segment late,
-        // which excludes it from such a restore instead.
+        // Stamped after the read: a transaction can commit after `wal_len` was measured and still
+        // land in `raw`. An earlier stamp would date the segment before a change it holds, so a
+        // restore to that instant would replay it. A late stamp only excludes the segment.
         let now = clock.now();
         let segment_header = SegmentHeader {
             version: segment::LAYOUT_VERSION,
@@ -1188,8 +1126,8 @@ impl Replicator {
             db_size_pages: outcome.last_commit_db_pages,
             salt1: header.salt1,
             salt2: header.salt2,
-            created_at: now.to_rfc3339(),
-            created_ms: now.timestamp_millis(),
+            created_at: crate::time::compat::rfc3339(now),
+            created_ms: now.as_millisecond(),
             sha256: segment::sha256_hex(raw),
             uncompressed_len: raw.len() as u64,
         };
@@ -1230,15 +1168,11 @@ impl Replicator {
     /// Whether the current generation has outlived the snapshot interval, so the
     /// next checkpoint should start a new one with a fresh base snapshot rather
     /// than another index.
-    fn generation_expired(&self, now: DateTime<Utc>) -> bool {
+    fn generation_expired(&self, now: Timestamp) -> bool {
         self.state.as_ref().is_some_and(|state| {
-            let elapsed = now.signed_duration_since(state.started_at);
-            // A clock that stepped backwards leaves a negative span. Treat that
-            // as "expired" rather than "forever young", so a bad clock cannot
-            // pin one generation open indefinitely.
-            elapsed
-                .to_std()
-                .map_or(true, |age| age >= self.settings.snapshot_interval)
+            let elapsed = now.duration_since(state.started_at);
+            // A clock that stepped back counts as expired, so it cannot pin a generation open.
+            Duration::try_from(elapsed).map_or(true, |age| age >= self.settings.snapshot_interval)
         })
     }
 
@@ -1247,14 +1181,11 @@ impl Replicator {
     /// The newest generation that opened at or before the cutoff is **kept**:
     /// without it the start of the window is not reconstructable. Returns how
     /// many generations were removed.
-    fn prune(&self, now: DateTime<Utc>) -> Result<u64, ReplicationError> {
-        let Ok(retention) = chrono::Duration::from_std(self.settings.retention) else {
+    fn prune(&self, now: Timestamp) -> Result<u64, ReplicationError> {
+        let Ok(retention) = jiff::SignedDuration::try_from(self.settings.retention) else {
             return Ok(0);
         };
-        let cutoff_ms = now
-            .checked_sub_signed(retention)
-            .unwrap_or(now)
-            .timestamp_millis();
+        let cutoff_ms = now.checked_sub(retention).unwrap_or(now).as_millisecond();
         let keys = self
             .destination
             .list(&segment::generations_prefix(&self.settings.root))?;
@@ -1384,12 +1315,8 @@ fn verify_replica(
         std::process::id(),
         rand::random::<u64>()
     ));
-    // Created here, owner-only, rather than left to `restore`'s `create_dir_all`:
-    // that lands 0755 under the usual umask, and what goes inside is a complete
-    // copy of production. On a host where the database file is protected but its
-    // parent directory is traversable, every verification would hand a readable
-    // snapshot to any other local user — and a crash would leave it there. The
-    // CLI verifier already creates its scratch directory this way.
+    // Owner-only: `restore`'s `create_dir_all` would give 0755 under the usual umask, and this
+    // holds a full copy of production that a crash could leave readable to every local user.
     if let Err(e) = create_private_dir(&scratch) {
         return Err(RestoreError::Io {
             op: "create the verification scratch directory",
@@ -1598,7 +1525,7 @@ mod tests {
             keys(&latest, Some(1), true),
         ];
         assert!(pruned(&all, 5_000, None).is_empty());
-        // Without epochs the old rules hold: older than the floor goes.
+        // Without epochs, a generation older than the floor goes.
         let (old, mid) = (id(1_000, 1), id(2_000, 2));
         let (recent, newest) = (id(9_000, 3), id(9_500, 4));
         let all = vec![

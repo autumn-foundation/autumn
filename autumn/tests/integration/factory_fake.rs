@@ -45,7 +45,7 @@ mod fake_factory_tests {
         pub body: String,
         pub score: i32,
         pub active: bool,
-        pub created_at: chrono::DateTime<chrono::Utc>,
+        pub created_at: autumn_web::time::Timestamp,
         pub bio: Option<String>,
     }
 
@@ -165,15 +165,13 @@ mod fake_factory_tests {
         fake::reseed(3);
         let a = FakeArticle::factory().fake().build();
         // Deterministic mode anchors to 2024-01-01T00:00:00Z minus a <=30d offset.
-        let base = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
+        let base: autumn_web::time::Timestamp = "2024-01-01T00:00:00Z".parse().unwrap();
         assert!(
             a.created_at <= base,
             "created_at should be at/before the base"
         );
         assert!(
-            a.created_at >= base - chrono::Duration::days(31),
+            a.created_at >= base - autumn_web::time::SignedDuration::from_hours(31 * 24),
             "created_at should be within ~30 days of the base"
         );
     }

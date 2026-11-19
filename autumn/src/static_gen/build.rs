@@ -75,16 +75,12 @@ async fn expand_route(
     router: &axum::Router,
 ) -> Result<Vec<RenderJob>, BuildError> {
     match meta.params_fn {
-        None => {
-            // Simple static route -- single job
-            Ok(vec![RenderJob {
-                url: meta.path.to_owned(),
-                revalidate: meta.revalidate,
-                content_type: meta.content_type,
-            }])
-        }
+        None => Ok(vec![RenderJob {
+            url: meta.path.to_owned(),
+            revalidate: meta.revalidate,
+            content_type: meta.content_type,
+        }]),
         Some(params_fn) => {
-            // Parameterized route -- call the params function
             let param_sets = params_fn(router.clone()).await;
             if param_sets.is_empty() {
                 return Err(BuildError::EmptyParams {
@@ -204,7 +200,6 @@ pub async fn render_static_routes(
     metas: &[StaticRouteMeta],
     dist_dir: &Path,
 ) -> Result<(), BuildError> {
-    // Phase 1: Expand all routes into concrete render jobs
     let mut jobs = Vec::new();
     for meta in metas {
         let expanded = expand_route(meta, &router).await?;
@@ -214,7 +209,7 @@ pub async fn render_static_routes(
 
     let staging = dist_dir.with_extension("staging");
 
-    // Clean staging dir if it exists from a previous failed build
+    // A failed build can leave the staging dir behind.
     if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(&staging).await?;
     }
@@ -229,12 +224,10 @@ pub async fn render_static_routes(
         }
     }
 
-    // Render concurrently
     let results: Vec<Result<(String, ManifestEntry), BuildError>> =
-        // Consume `jobs` by value: a `|job: &RenderJob|` closure makes rustc
-        // infer a single concrete region for the returned `async move` block,
-        // and the `Send` check then fails with "implementation of `FnOnce` is
-        // not general enough", poisoning every future that awaits this fn.
+        // Consume `jobs` by value: with a `|job: &RenderJob|` closure rustc infers one
+        // concrete region for the `async move` block and this fn's future stops being
+        // `Send` ("implementation of `FnOnce` is not general enough").
         futures::stream::iter(jobs.into_iter().map(|job| {
             let router = router.clone();
             let staging = staging.clone();
@@ -264,11 +257,8 @@ pub async fn render_static_routes(
                     });
                 }
 
-                // #1832: capture the Content-Type the handler declared, before
-                // the response is consumed for its body. This is the one place
-                // the page's intended MIME type is actually known; recording it
-                // is what frees the serve path from re-deriving it from the
-                // route slug and the `<route>/index.html` file name.
+                // Only here is the page's intended Content-Type known; recording it spares
+                // the serve path from guessing from `<route>/index.html` (#1832).
                 let (content_type, explicit) =
                     recorded_content_type(response.headers(), &url, declared);
 
@@ -280,7 +270,6 @@ pub async fn render_static_routes(
                     })?;
 
                 let file_path = url_to_file_path(&url);
-                // staging dir pre-created above, just write
                 let full_path = staging.join(&file_path);
                 tokio::fs::write(&full_path, &body_bytes).await?;
 
@@ -297,7 +286,6 @@ pub async fn render_static_routes(
         .collect()
         .await;
 
-    // Check for errors -- if any route failed, clean up and return first error
     let mut manifest_routes = HashMap::new();
     for result in results {
         match result {
@@ -311,12 +299,11 @@ pub async fn render_static_routes(
         }
     }
 
-    // Write manifest
     let manifest = StaticManifest::new(manifest_routes);
     let json = serde_json::to_string_pretty(&manifest)?;
     tokio::fs::write(staging.join("manifest.json"), json).await?;
 
-    // Atomic swap: remove old dist, rename staging -> dist
+    // Only a complete build replaces `dist_dir`.
     if tokio::fs::try_exists(dist_dir).await.unwrap_or(false) {
         tokio::fs::remove_dir_all(dist_dir).await?;
     }
@@ -358,9 +345,7 @@ mod tests {
         }
     }
 
-    // --- ParamsFn helpers for tests ---
-    // Since ParamsFn is a fn pointer (not a closure), we define named
-    // functions that return fixed parameter sets for each test scenario.
+    // `ParamsFn` is a fn pointer, not a closure, so each fixed param set needs a named fn.
 
     fn slug_params_hello_world(
         _router: axum::Router,
@@ -424,7 +409,7 @@ mod tests {
         }))
     }
 
-    // --- Simple route tests (Phase 1 regression) ---
+    // --- Simple routes ---
 
     #[tokio::test]
     async fn renders_single_route_to_dist() {
@@ -496,13 +481,12 @@ mod tests {
         assert!(result.is_ok());
         let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
         assert_eq!(manifest.routes.len(), 3);
-        // Verify all files exist
         assert!(dist.join("index.html").exists());
         assert!(dist.join("about/index.html").exists());
         assert!(dist.join("contact/index.html").exists());
     }
 
-    // --- Parameterized route tests (Phase 2) ---
+    // --- Parameterized routes ---
 
     #[test]
     fn substitute_params_single() {
@@ -545,14 +529,12 @@ mod tests {
         let result = render_static_routes(echo_router(), &[meta], &dist).await;
         assert!(result.is_ok(), "render failed: {:?}", result.err());
 
-        // Verify both pages generated
         let hello_html = std::fs::read_to_string(dist.join("posts/hello/index.html")).unwrap();
         assert_eq!(hello_html, "Hello from /posts/hello");
 
         let world_html = std::fs::read_to_string(dist.join("posts/world/index.html")).unwrap();
         assert_eq!(world_html, "Hello from /posts/world");
 
-        // Verify manifest
         let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
         assert_eq!(manifest.routes.len(), 2);
         assert!(manifest.routes.contains_key("/posts/hello"));
@@ -817,8 +799,7 @@ mod tests {
             "tab OWS is legal in a media type and must be recorded verbatim"
         );
 
-        // ...and the serve path must honour what generation recorded. If it
-        // did not, `/feed` would derive `text/html` from `feed/index.html`.
+        // The serve path must honour it, or `/feed` would derive `text/html`.
         assert_eq!(
             super::super::resolved_content_type(
                 recorded,

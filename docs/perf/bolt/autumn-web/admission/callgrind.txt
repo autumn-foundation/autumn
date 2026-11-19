@@ -4,35 +4,35 @@
 
               Ir   share  function
 
-     350,716,946   11.4%  <autumn_web::admission::LimitAlgorithm>::update
-     291,521,973    9.4%  __memcpy_avx_unaligned_erms
-     247,502,060    8.0%  _int_malloc
-     226,492,272    7.3%  <autumn_web::admission::AdaptiveLimiter>::record
-     158,682,272    5.1%  core::ptr::drop_glue
-     152,107,029    4.9%  <autumn_web::middleware::load_shed::LoadShedService as tower_service::Service>::call
-     132,142,353    4.3%  <criterion::bencher::Bencher>::iter
-     130,756,839    4.2%  _int_free
-     122,583,669    4.0%  <http::uri::path::PathAndQuery>::from_shared
-      91,225,056    3.0%  <http::request::Builder>::and_then
-      89,387,631    2.9%  malloc_consolidate
-      82,626,396    2.7%  malloc
-      67,173,580    2.2%  <autumn_web::middleware::load_shed::LoadShedFuture as futures_util::future::future::FutureExt>::now_or_never
-      56,990,110    1.8%  free
-      52,264,355    1.7%  <http::uri::Uri>::from_shared
-      48,397,771    1.6%  admission::request
-      42,807,476    1.4%  <criterion::bencher::Bencher>::iter_batched
-      40,654,767    1.3%  unlink_chunk.isra.0
-      40,061,394    1.3%  <alloc::vec::into_iter::IntoIter as core::iter::traits::iterator::Iterator>::fold
-      35,356,174    1.1%  <autumn_web::middleware::load_shed::Sampler>::record
-      35,159,657    1.1%  <admission::inner::{closure#0} as core::ops::function::FnOnce>::call_once
-      31,587,936    1.0%  <std::sys::pal::unix::time::Timespec>::sub_timespec
-      30,798,759    1.0%  __ieee754_log_fma
-      30,408,352    1.0%  <bytes::bytes::Bytes>::copy_from_slice
-      29,586,150    1.0%  __floattidf
-      28,507,830    0.9%  <bytes::bytes::Bytes as core::convert::From>::from
-      27,557,569    0.9%  <http::request::Parts>::new
-      27,428,081    0.9%  <hashbrown::raw::RawTable>::reserve_rehash
-      26,211,720    0.8%  __log10_finite@GLIBC_2.15
-      25,689,797    0.8%  <autumn_web::admission::PartitionShares>::threshold
+     944,767,329   17.9%  <autumn_web::admission::LimitAlgorithm>::update
+     603,979,632   11.4%  <autumn_web::admission::AdaptiveLimiter>::record
+     446,341,558    8.4%  __memcpy_avx_unaligned_erms
+     354,490,165    6.7%  _int_malloc
+     352,375,014    6.7%  <criterion::bencher::Bencher>::iter
+     242,240,547    4.6%  core::ptr::drop_glue
+     232,781,845    4.4%  <autumn_web::middleware::load_shed::LoadShedService as tower_service::Service>::call
+     187,471,505    3.5%  _int_free
+     185,989,749    3.5%  <http::uri::path::PathAndQuery>::from_shared
+     138,410,976    2.6%  <http::request::Builder>::and_then
+     128,680,744    2.4%  malloc_consolidate
+     117,822,464    2.2%  malloc
+     107,478,220    2.0%  <autumn_web::middleware::load_shed::LoadShedFuture as futures_util::future::future::FutureExt>::now_or_never
+      81,373,258    1.5%  free
+      79,297,955    1.5%  <http::uri::Uri>::from_shared
+      73,268,683    1.4%  admission::request
+      64,933,712    1.2%  <criterion::bencher::Bencher>::iter_batched
+      58,317,168    1.1%  unlink_chunk.isra.0
+      58,250,334    1.1%  <alloc::vec::into_iter::IntoIter as core::iter::traits::iterator::Iterator>::fold
+      53,345,897    1.0%  <admission::inner::{closure#0} as core::ops::function::FnOnce>::call_once
+      46,136,992    0.9%  <bytes::bytes::Bytes>::copy_from_slice
+      43,714,945    0.8%  <std::sys::pal::unix::time::Timespec>::sub_timespec
+      43,253,430    0.8%  <bytes::bytes::Bytes as core::convert::From>::from
+      41,811,649    0.8%  <http::request::Parts>::new
+      41,025,221    0.8%  <autumn_web::admission::PartitionShares>::threshold
+      36,570,353    0.7%  <hashbrown::raw::RawTable>::reserve_rehash
+      34,211,827    0.6%  <hashbrown::map::HashMap>::insert
+      33,160,912    0.6%  <autumn_web::middleware::load_shed::InFlightGuard>::complete
+      33,029,808    0.6%  <autumn_web::middleware::load_shed::Sampler>::record
+      30,670,536    0.6%  <autumn_web::admission::AdaptiveLimiter>::record_with
 
-   3,085,520,674  100.0%  TOTAL
+   5,290,779,354  100.0%  TOTAL

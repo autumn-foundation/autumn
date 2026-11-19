@@ -67,7 +67,6 @@ pub fn run_config_check_impl(dir: &std::path::Path) -> Result<(), String> {
     let schema = autumn_web::config::AutumnConfig::get_schema_keys();
     let mut errors = Vec::new();
 
-    // 1. Validate base autumn.toml
     let base_errors = crate::doctor::validate_toml_content(&toml_content, &schema);
     for (path, sug) in base_errors {
         errors.push(format!(
@@ -77,7 +76,6 @@ pub fn run_config_check_impl(dir: &std::path::Path) -> Result<(), String> {
         ));
     }
 
-    // 2. Validate any autumn-*.toml profile files
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
@@ -167,7 +165,7 @@ pub fn analyse_html(html: &str) -> Vec<A11yViolation> {
 ///
 /// WCAG 2.1 SC 3.1.1 (Level A) — axe-core rule `html-has-lang`.
 fn check_lang(html: &str, out: &mut Vec<A11yViolation>) {
-    // Verify the value is non-empty: lang="" fails WCAG just as much as no lang.
+    // lang="" fails WCAG just as much as a missing lang.
     let has_lang = html.find("<html").is_some_and(|start| {
         let tag_end = html[start..].find('>').unwrap_or(0);
         let tag = &html[start..start + tag_end];
@@ -191,16 +189,10 @@ fn check_skip_link(html: &str, out: &mut Vec<A11yViolation>) {
     let body_start = html.find("<body").unwrap_or(0);
     let body_content = &html[body_start..];
 
-    // A skip link exists to let keyboard users jump past content that
-    // precedes the page's main landmark (nav, header, banners, ...). When
-    // the landmark is itself the first thing in `<body>` there is nothing to
-    // bypass, so requiring a skip link would flag pages it cannot help
-    // (e.g. a single-section page whose only link sits in its footer, after
-    // the landmark). Only applied when a main landmark was actually found —
-    // its absence is `landmark-one-main`'s concern, not this rule's.
-    // `find_main_landmark` accepts the same two shapes that rule does
-    // (`<main>` or `role="main"`), so a page using the ARIA form alone isn't
-    // treated as having no landmark and pushed through the stricter path.
+    // A skip link lets keyboard users jump past content before the main landmark. When the
+    // landmark is the first thing in `<body>` there is nothing to bypass. `find_main_landmark`
+    // accepts `<main>` and `role="main"`, the same shapes `landmark-one-main` counts. A missing
+    // landmark is that rule's concern, not this one's.
     let body_tag_end = body_content.find('>').map_or(0, |p| p + 1);
     if let Some(main_pos) = find_main_landmark(body_content)
         && !body_content[body_tag_end..main_pos].contains('<')
@@ -208,9 +200,8 @@ fn check_skip_link(html: &str, out: &mut Vec<A11yViolation>) {
         return;
     }
 
-    // The skip link must be the FIRST focusable link in the document; a skip
-    // link that comes after navigation links doesn't help keyboard users.
-    // Verify by finding the first <a > and checking it is the skip link.
+    // The skip link must be the first link in the document: one placed after navigation links
+    // does not help keyboard users.
     let has_skip_link = body_content.find("<a ").is_some_and(|a_pos| {
         let rest = &body_content[a_pos..];
         let tag_end = rest.find('>').unwrap_or(rest.len());
@@ -311,7 +302,6 @@ fn check_images_alt(html: &str, out: &mut Vec<A11yViolation>) {
 fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
     let mut unlabelled = 0u32;
 
-    // Collect all `for=` values from `<label` tags.
     let mut labelled_ids: Vec<String> = Vec::new();
     let mut lsearch = html;
     while let Some(pos) = lsearch.find("<label") {
@@ -331,7 +321,6 @@ fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
     // implicitly associated by containment (no for=/id pair needed) pass.
     let label_regions = label_regions(html);
 
-    // Check <input>, <textarea>, and <select> — all require an accessible label.
     for (tag_name, skip_len) in &[("<input", 6usize), ("<textarea", 9), ("<select", 7)] {
         let mut offset = 0usize;
         while let Some(rel_pos) = html[offset..].find(tag_name) {
@@ -340,7 +329,6 @@ fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
             let tag_end = rest.find('>').unwrap_or(rest.len());
             let tag = &rest[..tag_end];
 
-            // For <input>, skip types that don't need a visible label.
             let skip = if *tag_name == "<input" {
                 let input_type = attr_value(tag, "type").unwrap_or_default();
                 ["hidden", "submit", "button", "reset", "image"].contains(&input_type.as_str())
@@ -349,7 +337,6 @@ fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
             };
 
             if !skip {
-                // Require non-empty aria-label values and resolve aria-labelledby IDs.
                 let has_aria = attr_value(tag, "aria-label").is_some_and(|label| !label.is_empty())
                     || attr_value(tag, "aria-labelledby")
                         .is_some_and(|ids| !ids.is_empty() && aria_labelledby_resolves(html, &ids));
@@ -413,7 +400,6 @@ fn check_buttons_accessible_name(html: &str, out: &mut Vec<A11yViolation>) {
         let tag_end = rest.find('>').unwrap_or(0);
         let tag = &rest[..tag_end];
 
-        // Require non-empty aria-label values and resolve aria-labelledby IDs.
         let has_aria_label = attr_value(tag, "aria-label").is_some_and(|label| !label.is_empty())
             || attr_value(tag, "aria-labelledby")
                 .is_some_and(|ids| !ids.is_empty() && aria_labelledby_resolves(html, &ids));
@@ -422,10 +408,8 @@ fn check_buttons_accessible_name(html: &str, out: &mut Vec<A11yViolation>) {
         } else {
             ""
         };
-        // Strip HTML tags (e.g. <img>) before checking for visible text so that a
-        // button containing only an image without alt text is not incorrectly named.
-        // Also accept a non-empty alt on a child <img> — that alt contributes to
-        // the button's accessible name per the AccName algorithm.
+        // Markup alone is not a name: an image-only button without alt text is nameless. A
+        // non-empty alt on a child <img> does count toward the name (AccName).
         let has_text = !strip_html_tags(inner).trim().is_empty() || img_alt_text(inner);
 
         if !has_aria_label && !has_text {
@@ -817,12 +801,10 @@ mod tests {
         )
         .unwrap();
 
-        // Valid check passes
         if let Err(e) = run_config_check_impl(temp.path()) {
             panic!("Valid check failed: {e}");
         }
 
-        // Typo check fails
         std::fs::write(
             &toml_path,
             "[database]\nprimry_url = \"postgres://localhost/db\"",
@@ -832,7 +814,6 @@ mod tests {
         assert!(res.is_err());
         assert!(res.err().unwrap().contains("primry_url"));
 
-        // Inline profile with valid key passes
         std::fs::write(
             &toml_path,
             "[profile.dev.database]\nprimary_url = \"postgres://localhost/db\"",
@@ -842,7 +823,6 @@ mod tests {
             panic!("Inline profile with valid key failed: {e}");
         }
 
-        // Inline profile with typo fails
         std::fs::write(
             &toml_path,
             "[profile.dev.database]\nprimry_url = \"postgres://localhost/db\"",
@@ -852,14 +832,13 @@ mod tests {
         assert!(res.is_err());
         assert!(res.err().unwrap().contains("primry_url"));
 
-        // Reset autumn.toml to be clean
+        // Clean base file, so the next failure can only come from autumn-dev.toml.
         std::fs::write(
             &toml_path,
             "[database]\nprimary_url = \"postgres://localhost/db\"",
         )
         .unwrap();
 
-        // Profile file (autumn-dev.toml) with typo fails
         let profile_toml_path = temp.path().join("autumn-dev.toml");
         std::fs::write(
             &profile_toml_path,
@@ -870,7 +849,6 @@ mod tests {
         assert!(res.is_err());
         assert!(res.err().unwrap().contains("primry_url"));
 
-        // Profile file (autumn-dev.toml) valid passes
         std::fs::write(
             &profile_toml_path,
             "[database]\nprimary_url = \"postgres://localhost/db\"",
@@ -888,9 +866,9 @@ mod tests {
         ids
     }
 
-    // Helper: minimal clean base page (all green)
+    // Minimal page that passes every rule.
     fn clean_page(inner: &str) -> String {
-        // Use concat + runtime format to avoid "# inside raw-string-literal issues.
+        // concat! lets each part pick its own raw-string delimiter around `"#`.
         format!(
             concat!(
                 r#"<!DOCTYPE html><html lang="en"><body>"#,
@@ -957,7 +935,6 @@ mod tests {
 
     #[test]
     fn skip_link_href_to_main_passes() {
-        // Use r## so the inner "# sequences don't close the raw string.
         let html = r##"<html lang="en"><body><a href="#main">Skip</a><main></main></body></html>"##;
         assert!(
             !violation_ids(html).contains(&"bypass"),
@@ -988,10 +965,8 @@ mod tests {
 
     #[test]
     fn main_first_in_body_no_skip_link_needed_passes() {
-        // <main> is the very first thing in <body> — no nav/header precedes
-        // it, so there is nothing for a skip link to bypass. The page's only
-        // link sits in its footer, after <main>. Flagging this would ask for
-        // a skip link that fixes nothing (issue found via examples/todo-app).
+        // Nothing precedes <main>, so a skip link has nothing to bypass. The only link sits in
+        // the footer, after <main>.
         let html = r#"<html lang="en"><body><main><h1>Hi</h1></main><footer><a href="/">Home</a></footer></body></html>"#;
         assert!(
             !violation_ids(html).contains(&"bypass"),
@@ -1002,9 +977,7 @@ mod tests {
 
     #[test]
     fn bare_links_before_main_without_nav_tag_still_requires_skip_link() {
-        // Content before <main> still needs a skip link even when it isn't
-        // wrapped in a literal <nav> element (mirrors
-        // skip_link_after_nav_link_fails, without the skip link at all).
+        // Content before <main> needs a skip link even without a <nav> wrapper.
         let html = r#"<html lang="en"><body><a href="/home">Home</a><main><h1>Hi</h1></main></body></html>"#;
         assert!(
             violation_ids(html).contains(&"bypass"),
@@ -1015,11 +988,8 @@ mod tests {
 
     #[test]
     fn custom_element_sharing_main_prefix_is_not_mistaken_for_landmark() {
-        // A bare substring search for "<main" would match "<main-nav>" (a
-        // custom element), treat it as the landmark, and see nothing before
-        // it — wrongly exempting a page whose real navigation-bearing
-        // <main-nav> precedes the actual <main> landmark and has no skip
-        // link.
+        // A substring search for "<main" would take the <main-nav> custom element as the
+        // landmark, see nothing before it, and wrongly exempt the page.
         let html = r#"<html lang="en"><body><main-nav><a href="/home">Home</a></main-nav><main><h1>Hi</h1></main></body></html>"#;
         assert!(
             violation_ids(html).contains(&"bypass"),
@@ -1030,9 +1000,7 @@ mod tests {
 
     #[test]
     fn role_main_first_in_body_no_skip_link_needed_passes() {
-        // `role="main"` is an equally valid landmark (check_landmark_main
-        // already accepts it); a page using only that form, with nothing
-        // before it, has just as little to bypass as a literal <main> first.
+        // `role="main"` is an equally valid landmark: nothing before it means nothing to bypass.
         let html = r#"<html lang="en"><body><div role="main"><h1>Hi</h1></div><footer><a href="/">Home</a></footer></body></html>"#;
         assert!(
             !violation_ids(html).contains(&"bypass"),
@@ -1043,8 +1011,6 @@ mod tests {
 
     #[test]
     fn skip_link_after_nav_link_fails() {
-        // The skip link must be the FIRST focusable link; a nav link before it
-        // defeats the purpose for keyboard users.
         let html = r##"<html lang="en"><body><a href="/home">Home</a><a class="skip-link" href="#main">Skip</a><main></main></body></html>"##;
         assert!(
             violation_ids(html).contains(&"bypass"),
@@ -1400,10 +1366,9 @@ mod tests {
 
     #[test]
     fn unclosed_button_does_not_panic() {
-        // Malformed HTML with no </button> must not panic — it should be flagged
-        // as nameless (no visible text, no aria) rather than causing an index OOB.
+        // Malformed HTML with no </button> must not index out of bounds. Only the absence of a
+        // panic is asserted.
         let html = r#"<html lang="en"><body><main><button></main></body></html>"#;
-        // We only care that this returns without panicking; the violation may or may not fire.
         let _ = violation_ids(html);
     }
 

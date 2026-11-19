@@ -26,10 +26,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
-
 use crate::capsule::capture::current_scope;
-use crate::time::ClockSource;
+use crate::time::{ClockSource, Timestamp};
 
 /// Wraps the application's clock and tees every reading into the capture scope
 /// of the request that took it.
@@ -50,7 +48,7 @@ impl RecordingClock {
 }
 
 impl ClockSource for RecordingClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> crate::time::Timestamp {
         let reading = self.inner.now();
         if let Some(scope) = current_scope() {
             scope.record_clock(reading);
@@ -141,10 +139,10 @@ pub(crate) fn in_replay_request() -> bool {
 /// recording never attributed those reads either.
 #[derive(Debug)]
 pub struct ReplayClock {
-    readings: Mutex<VecDeque<DateTime<Utc>>>,
-    last: Mutex<Option<DateTime<Utc>>>,
+    readings: Mutex<VecDeque<Timestamp>>,
+    last: Mutex<Option<Timestamp>>,
     over_reads: std::sync::atomic::AtomicUsize,
-    fallback: DateTime<Utc>,
+    fallback: Timestamp,
     /// Recorded [`ClockSource::monotonic`] readings, as offsets from the
     /// recording clock's origin, served with the same scope-gated,
     /// repeat-on-over-read discipline as the wall readings.
@@ -157,7 +155,7 @@ impl ReplayClock {
     ///
     /// `fallback` is used only when the capsule recorded no readings at all.
     #[must_use]
-    pub fn new(readings: Vec<DateTime<Utc>>, fallback: DateTime<Utc>) -> Self {
+    pub fn new(readings: Vec<Timestamp>, fallback: Timestamp) -> Self {
         Self {
             readings: Mutex::new(readings.into()),
             last: Mutex::new(None),
@@ -197,7 +195,7 @@ impl ReplayClock {
 }
 
 impl ClockSource for ReplayClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> crate::time::Timestamp {
         if !in_replay_request() {
             // A read the recording never attributed (boot, or a spawned
             // task): stable and non-consuming, so it can neither shift the
@@ -251,9 +249,9 @@ impl ClockSource for ReplayClock {
             }
             return crate::time::MonotonicInstant::from_origin_elapsed(reading);
         }
-        // Over-read: repeat rather than drift to the (stub-fast) real
-        // timeline. Not counted separately — a handler that over-reads the
-        // monotonic clock over-reads it deterministically.
+        // Over-read: repeat the last reading rather than drift to the (stub-fast) real timeline.
+        // Not added to `over_reads`: a handler that over-reads the monotonic clock does so
+        // deterministically.
         last_or_origin()
     }
 }
@@ -261,11 +259,9 @@ impl ClockSource for ReplayClock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
-
-    fn at(second: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, second)
-            .single()
+    fn at(second: i8) -> Timestamp {
+        jiff::tz::TimeZone::UTC
+            .to_timestamp(jiff::civil::date(2026, 1, 1).at(0, 0, second, 0))
             .expect("valid timestamp")
     }
 
@@ -326,7 +322,6 @@ mod tests {
         let clock = ReplayClock::new(Vec::new(), at(0))
             .with_monotonic(vec![Duration::from_millis(10), Duration::from_millis(30)]);
 
-        // Outside the scope: origin, non-consuming.
         assert_eq!(
             clock.monotonic(),
             crate::time::MonotonicInstant::ORIGIN,

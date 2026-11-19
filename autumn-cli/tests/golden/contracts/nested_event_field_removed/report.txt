@@ -1,0 +1,10 @@
+Wire contracts: the current build against the deployed release.
+
+If the callees ship first (new callees, deployed callers): 1 break(s)
+  - item.changed (event): consumer `mesh-storefront::on_item_changed` reads field `details.color`, which the new producer does not send
+
+If the callers ship first (new callers, deployed callees): ok
+
+Verdict: safe only if the callers ship first.
+  Deploy mesh-storefront before mesh-catalog.
+  To declare this order, run with --order caller-first.

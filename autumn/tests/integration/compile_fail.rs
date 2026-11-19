@@ -127,6 +127,9 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/model_on_enum.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_shard_key_unknown.rs");
+    // A `chrono` date or time field fails with a hint naming the `jiff` type.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_chrono_time_field.rs");
 
     // `#[validate(nested)]` collides with this crate's own `ValidateExt` when
     // both are in scope in the struct's own defining module -- true of
@@ -619,6 +622,7 @@ fn compile_fail_wire_contract_tests() {
     t.compile_fail("tests/compile-fail/wire_shape_rejects_container_rewrites.rs");
     t.compile_fail("tests/compile-fail/wire_client_path_params_drift.rs");
     t.compile_fail("tests/compile-fail/wire_shape_unknown_wire_type.rs");
+    t.compile_fail("tests/compile-fail/wire_shape_tag_clash.rs");
 }
 
 /// Event contracts: a consumer that reads a field the event does not send

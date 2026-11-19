@@ -51,7 +51,7 @@
 //!   `maud` matters even on non-`--api` projects, which already have it, but
 //!   is required for `--api` projects, whose starter strips it), and ensures
 //!   the generated code's own direct dependencies (`diesel`, `diesel-async`,
-//!   `chrono`, `serde`, `serde_json`, `validator`, `maud`, plus `pq-sys` on
+//!   `serde`, `serde_json`, `validator`, `maud`, plus `pq-sys` on
 //!   Postgres or `libsqlite3-sys` on `SQLite`) are
 //!   present. Works on either backend: the migration DDL is emitted in the
 //!   app's own dialect (issue #1927).
@@ -91,14 +91,10 @@ use super::{GenerateError, ensure_project_root, read_or_empty};
 /// Postgres only — [`TEAMS_DEPS_SQLITE`] is the `SQLite` set and
 /// [`teams_deps`] picks between them (issue #1927).
 const TEAMS_DEPS: &[(&str, &str)] = &[
-    ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
-    (
-        "diesel",
-        "{ version = \"2\", features = [\"postgres\", \"chrono\"] }",
-    ),
+    ("diesel", "{ version = \"2\", features = [\"postgres\"] }"),
     (
         "diesel-async",
-        "{ version = \"0.9\", features = [\"postgres\"] }",
+        "{ version = \"0.10\", features = [\"postgres\"] }",
     ),
     (
         "pq-sys",
@@ -110,13 +106,8 @@ const TEAMS_DEPS: &[(&str, &str)] = &[
         "validator",
         "{ version = \"0.21\", features = [\"derive\"] }",
     ),
-    // `minimal_page`/`routes::organizations::*`/etc. all render `Markup`
-    // via `html!`/`maud::DOCTYPE`. A default `autumn new` project already
-    // has `maud` as a direct dependency and enables autumn-web's default
-    // `maud` feature, but an `--api` project strips both (see
-    // `new.rs`'s JSON-only starter) — matching `channel.rs`'s SSE
-    // transport, which enables the same pair when its own generated views
-    // need them.
+    // The generated routes render `Markup` via `html!`. An `--api` project strips both the direct
+    // `maud` dependency and autumn-web's `maud` feature, so `teams` adds the pair back.
     ("maud", "{ version = \"0.27\", features = [\"axum\"] }"),
 ];
 
@@ -134,19 +125,18 @@ const TEAMS_DEPS: &[(&str, &str)] = &[
 /// matches what `autumn-web`'s own `sqlite` feature enables, so the app and the
 /// framework never disagree about `RETURNING` support.
 const TEAMS_DEPS_SQLITE: &[(&str, &str)] = &[
-    ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
     (
         "diesel",
-        "{ version = \"2\", features = [\"sqlite\", \"chrono\", \"serde_json\", \
+        "{ version = \"2\", features = [\"sqlite\", \"serde_json\", \
          \"returning_clauses_for_sqlite_3_35\"] }",
     ),
     (
         "diesel-async",
-        "{ version = \"0.9\", features = [\"sync-connection-wrapper\"] }",
+        "{ version = \"0.10\", features = [\"sync-connection-wrapper\"] }",
     ),
     (
         "libsqlite3-sys",
-        "{ version = \"0.38\", features = [\"bundled\"] }",
+        "{ version = \"0.40\", features = [\"bundled\"] }",
     ),
     ("serde", "{ version = \"1\", features = [\"derive\"] }"),
     ("serde_json", "\"1\""),
@@ -191,12 +181,9 @@ pub fn plan_teams(
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
 
-    // The emitted DDL is backend-aware (issue #1927), resolved the same way
-    // `autumn migrate` resolves the database URL (env vars, then the
-    // profile-merged `autumn.toml` / `.env`); Postgres is the default when
-    // nothing is configured. Everything else this generator emits is already
-    // backend-neutral: `#[repository]` binds `::autumn_web::RuntimeConnection`,
-    // and `schema.rs` uses only sql-types both diesel backends carry.
+    // Only the DDL is backend-specific (issue #1927). The backend is resolved the way `autumn
+    // migrate` resolves the database URL; Postgres when nothing is configured. `#[repository]`
+    // binds `RuntimeConnection` and `schema.rs` uses sql-types both diesel backends carry.
     let backend = super::detect_backend(project_root);
 
     let mut plan = Plan::new(project_root);
@@ -234,17 +221,9 @@ pub fn plan_teams(
     );
 
     // ── migrations/<timestamp>_create_teams ─────────────────────────────
-    // `teams` is a singleton scaffold (fixed table set, no per-invocation
-    // resource name): re-running — especially with `--force` to refresh
-    // it — must not mint a SECOND `*_create_teams` directory, since two
-    // `CREATE TABLE organizations/memberships/invitations` migrations would
-    // fail the next `autumn migrate` on the duplicate tables (Codex review
-    // finding; mirrors `notifications.rs`'s identical singleton-migration
-    // fix from PR #2144 finding B). Reuse an existing `*_create_teams` dir
-    // when one is present, minting a fresh timestamped dir only on a clean
-    // project. `autumn destroy teams` matches by the same suffix regardless
-    // (see `emit.rs`'s `resolve_migration_removal`), so this doesn't change
-    // destroy behavior.
+    // `teams` is a singleton: a re-run (e.g. `--force`) reuses the existing `*_create_teams`
+    // dir, since a second `CREATE TABLE` migration would fail `autumn migrate` on duplicate
+    // tables.
     let migration_dir = existing_teams_migration_dir(project_root).unwrap_or_else(|| {
         project_root
             .join("migrations")
@@ -272,8 +251,7 @@ pub fn plan_teams(
     plan_teams_cargo_toml(&mut plan, project_root, teams_dir, backend);
 
     // ── [tenancy] config reminder ────────────────────────────────────────
-    // Never auto-edited (too many possible existing shapes/profiles to
-    // safely text-patch) — a warning is the safe, honest choice.
+    // Not auto-edited: too many possible existing shapes/profiles to text-patch safely.
     plan.warn(
         "teams' Membership/Invitation repositories are tenant_scoped by the active \
          organization (issue #695). Make sure autumn.toml has:\n\
@@ -304,25 +282,13 @@ fn plan_teams_cargo_toml(
     teams_dir: PathBuf,
     backend: DatabaseBackend,
 ) {
-    // All edits land in a single `plan.modify()` call: `ensure_*` helpers
-    // are pure string transforms over an in-memory `String`, not aware of
-    // each other's pending edits, so chaining them here (rather than
-    // separate `read_or_empty` + `plan.modify` round trips against the same
-    // path) is what stops a later edit from being computed against
-    // pre-earlier-edit disk content and clobbering it when `Plan::execute`
-    // applies each `Action::Modify` in order (mirrors `channel.rs`'s
-    // combined feature+deps Cargo.toml edit). "maud" is needed even though
-    // a default `autumn new` project already has it: an `--api` project's
-    // starter strips both the direct `maud` dependency and autumn-web's
-    // `maud` feature (see `TEAMS_DEPS`'s doc comment on the `maud` entry).
+    // All edits are chained into one `plan.modify()`: separate modifies of the same path would
+    // each be computed from the on-disk content, and the later one would clobber the earlier.
+    // "maud" is listed because an `--api` project strips it (see the `maud` entry in `TEAMS_DEPS`).
     //
-    // A `SQLite` app needs autumn-web's `sqlite` feature on top (issue #1927).
-    // It is what flips `RuntimeConnection` to the `SQLite` connection, which
-    // every `#[repository]` in `src/teams/` binds. Without it the generated app
-    // still compiles and `autumn migrate` still applies the migration, but the
-    // app refuses its own `sqlite://` URL at pool-build (boot) time with
-    // `PoolError::UnsupportedBackend` — see `autumn-web`'s `build_pool`. Same
-    // conditional `model.rs`/`scaffold.rs` already apply.
+    // A `SQLite` app also needs autumn-web's `sqlite` feature (issue #1927): it switches
+    // `RuntimeConnection` to SQLite. Without it the app still compiles and migrates, but refuses
+    // its own `sqlite://` URL at boot with `PoolError::UnsupportedBackend`.
     let autumn_web_features: &[&str] = match backend {
         DatabaseBackend::Postgres => &["mail", "maud"],
         DatabaseBackend::Sqlite => &["mail", "maud", "sqlite"],
@@ -346,22 +312,12 @@ fn plan_teams_cargo_toml(
             owner_dir: Some(teams_dir.clone()),
         });
     }
-    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
-    // model.rs: destroy recomputes this plan against the already-generated
-    // Cargo.toml, where these entries are by definition already present.
+    // Pushed unconditionally: destroy recomputes this plan against the generated Cargo.toml,
+    // where these entries are already present.
     //
-    // Unlike `plan_cargo_deps`, this doesn't exclude every
-    // `TEMPLATE_SHIPPED_CARGO_DEPS` name — only `autumn-web` (every Autumn
-    // app unconditionally needs it) and `diesel_migrations` (every
-    // `autumn new` template ships it regardless of `teams`). `maud` stays
-    // revertible: a default project already has it (so `Revert::CargoDeps`'s
-    // own whole-project reference check — see `emit.rs` — finds it still
-    // used by the app's own `maud::`-qualified `src/main.rs` layout and
-    // leaves it alone), but an `--api` project has no other use for it once
-    // `teams` is destroyed, and *did* get it added solely by `teams` (see
-    // `TEAMS_DEPS`'s doc comment on the `maud` entry) — excluding it the
-    // same way `autumn-web` is excluded would wrongly treat it as always
-    // pre-existing.
+    // Only `autumn-web` and `diesel_migrations` are excluded (every template ships them). `maud`
+    // stays revertible: an `--api` project got it only from `teams`, and `Revert::CargoDeps`'s
+    // whole-project reference check keeps it in a default project whose `src/main.rs` uses it.
     let dep_names: Vec<String> = deps
         .iter()
         .map(|(name, _)| *name)
@@ -427,10 +383,8 @@ fn teams_route_entries() -> Vec<String> {
 
 // ── File renderers ──────────────────────────────────────────────────────
 //
-// Every rendered file is fixed content (no user-supplied name to
-// interpolate — `teams` itself is the fixed name), so these are plain
-// `&'static str` constants rather than the `format!`-built templates the
-// per-resource generators (`mailer.rs`, `policy.rs`, ...) need.
+// Every rendered file is fixed content (no user-supplied name), so these are plain
+// `&'static str` constants rather than `format!` templates.
 
 fn render_mod_rs() -> String {
     MOD_RS.to_owned()
@@ -605,7 +559,7 @@ pub struct Organization {
     #[validate(length(min = 1, max = 200))]
     pub name: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // ── Membership ───────────────────────────────────────────────────────────
@@ -631,7 +585,7 @@ pub struct Membership {
     pub user_id: i64,
     pub role: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // ── Invitation ───────────────────────────────────────────────────────────
@@ -654,9 +608,9 @@ pub struct Invitation {
     // also sets it explicitly.
     pub status: String,
     pub invited_by_user_id: i64,
-    pub expires_at: chrono::NaiveDateTime,
+    pub expires_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // ── Forms ────────────────────────────────────────────────────────────────
@@ -1507,6 +1461,15 @@ use super::{csrf_value, minimal_page};
 
 const INVITATION_TTL_DAYS: i64 = 7;
 
+/// When an invitation minted now expires, as the UTC wall-clock value the
+/// `expires_at` column stores.
+fn invitation_expiry() -> autumn_web::db::SqlDateTime {
+    autumn_web::db::SqlDateTime::from(
+        autumn_web::time::ambient_civil_utc()
+            + autumn_web::time::SignedDuration::from_hours(INVITATION_TTL_DAYS * 24),
+    )
+}
+
 // Raw-insert struct for `resend_invitation`'s hand-rolled `db.tx`
 // transaction (revoke old + create new in one atomic step) — the generated
 // `tenant_scoped` repository's CRUD methods each acquire their own pooled
@@ -1521,7 +1484,7 @@ struct InsertInvitation {
     token_hash: String,
     status: String,
     invited_by_user_id: i64,
-    expires_at: chrono::NaiveDateTime,
+    expires_at: autumn_web::db::SqlDateTime,
 }
 
 // A minimal, read-only view onto your app's own `users` table — just enough
@@ -1707,8 +1670,7 @@ pub async fn create_invitation(
                         token_hash,
                         status: "pending".to_owned(),
                         invited_by_user_id: inviter_id,
-                        expires_at: chrono::Utc::now().naive_utc()
-                            + chrono::Duration::days(INVITATION_TTL_DAYS),
+                        expires_at: invitation_expiry(),
                     })
                     .execute(conn)
                     .await?;
@@ -1815,7 +1777,7 @@ fn invitation_status_error(invitation: &Invitation) -> Option<&'static str> {
     match invitation.status.as_str() {
         "accepted" => Some("This invitation has already been used."),
         "revoked" => Some("This invitation was revoked."),
-        _ if invitation.expires_at <= chrono::Utc::now().naive_utc() => {
+        _ if invitation.expires_at <= autumn_web::time::ambient_civil_utc() => {
             Some("This invitation has expired.")
         }
         _ => None,
@@ -2034,7 +1996,7 @@ pub async fn accept_invitation(
                 // review finding).
                 if invitation.status == "revoked"
                     || (invitation.status == "pending"
-                        && invitation.expires_at <= chrono::Utc::now().naive_utc())
+                        && invitation.expires_at <= autumn_web::time::ambient_civil_utc())
                 {
                     return Err(AutumnError::gone_msg(
                         "This invitation is no longer available",
@@ -2317,8 +2279,7 @@ pub async fn resend_invitation(
                         token_hash,
                         status: "pending".to_owned(),
                         invited_by_user_id: inviter_id,
-                        expires_at: chrono::Utc::now().naive_utc()
-                            + chrono::Duration::days(INVITATION_TTL_DAYS),
+                        expires_at: invitation_expiry(),
                     })
                     .returning(Invitation::as_returning())
                     .get_result(conn)
@@ -3213,11 +3174,8 @@ async fn main() {
             })
             .unwrap();
 
-        // The second run reuses the first run's migration directory — a
-        // singleton scaffold like `teams` must not mint a second
-        // `*_create_teams` directory on `--force` (two `CREATE TABLE
-        // organizations` migrations would fail `autumn migrate` on the
-        // duplicate table).
+        // `--force` reuses the first run's migration dir: a second `*_create_teams` would fail
+        // `autumn migrate` on duplicate tables.
         assert!(
             tmp.path()
                 .join("migrations/20260101000000_create_teams")
@@ -3240,9 +3198,7 @@ async fn main() {
             .execute(Flags::default())
             .unwrap();
 
-        // Hand-edit the migration to prove the second run actually reuses
-        // (overwrites in place) this exact directory rather than leaving it
-        // untouched alongside a fresh one.
+        // Stale content proves the second run overwrites this directory in place.
         let up_path = tmp
             .path()
             .join("migrations/20260101000000_create_teams/up.sql");
@@ -3461,7 +3417,7 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
             #[diesel(sql_type = diesel::sql_types::BigInt)]
             id: i64,
             #[diesel(sql_type = diesel::sql_types::Timestamp)]
-            created_at: chrono::NaiveDateTime,
+            created_at: autumn_web::db::SqlDateTime,
         }
 
         let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
@@ -3486,7 +3442,9 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         assert_eq!(orgs.len(), 1);
         assert_eq!(orgs[0].id, 1, "id must be auto-assigned");
         assert!(
-            orgs[0].created_at.and_utc().timestamp() > 0,
+            jiff::tz::TimeZone::UTC
+                .to_timestamp(orgs[0].created_at.0)
+                .is_ok_and(|ts| ts.as_second() > 0),
             "created_at must be defaulted to a parseable timestamp by SQLite"
         );
 
@@ -4131,7 +4089,7 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
         assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
     }
 
-    // ── seventh round of Codex review findings ──────────────────────────
+    // ── invitation and membership invariants ────────────────────────────
 
     /// `accept_invitation`'s existing-membership shortcut must not run
     /// before a revoked/expired-pending invitation is rejected — otherwise
@@ -4261,10 +4219,8 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
             organizations.contains(".set(memberships::role.eq(Role::Owner.as_str()))"),
             "{organizations}"
         );
-        // The promotion query (successor lookup) must run, and complete,
-        // before this user's own membership row is deleted — verified by
-        // source order, since the delete would otherwise remove the very
-        // row being promoted.
+        // The successor promotion must precede the user's own membership delete (checked by
+        // source order).
         let promote_pos = organizations
             .find(".filter(memberships::role.eq(Role::Admin.as_str()))")
             .unwrap();
@@ -4671,10 +4627,8 @@ CREATE UNIQUE INDEX idx_invitations_pending_email ON invitations (tenant_id, ema
             ),
             "{invitations}"
         );
-        // The live email must be re-compared, not just existence checked
-        // (Codex review finding: an email-change flow could move the
-        // account off the invited address between the standalone
-        // pre-transaction check and this lock).
+        // The live email must be re-compared, not just existence checked: an email change could
+        // move the account off the invited address between the pre-transaction check and this lock.
         assert!(
             invitations.contains(
                 "normalize_email(&live_caller_email) != normalize_email(&invitation_email)"

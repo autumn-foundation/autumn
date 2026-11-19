@@ -128,7 +128,6 @@ fn parse_dotenv(path: &Path, contents: &str) -> Result<Vec<(String, String)>, Do
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        // Strip an optional leading `export ` prefix.
         let body = trimmed
             .strip_prefix("export ")
             .unwrap_or(trimmed)
@@ -253,8 +252,7 @@ pub(crate) fn resolve_dotenv_vars(
         };
 
         for (key, value) in parse_dotenv(&path, &contents)? {
-            // Safety: `.env` must never select the active profile/environment,
-            // so drop the profile-selector keys regardless of the file.
+            // `.env` must never select the active profile.
             if is_profile_selector_key(&key) {
                 continue;
             }
@@ -262,7 +260,7 @@ pub(crate) fn resolve_dotenv_vars(
             if env.var(&key).is_ok() {
                 continue;
             }
-            // Earlier file / already-seen key wins.
+            // The earlier file wins.
             if seen.insert(key.clone()) {
                 merged.push((key, value));
             }
@@ -317,7 +315,6 @@ impl<'a> DotenvEnv<'a> {
 
 impl Env for DotenvEnv<'_> {
     fn var(&self, key: &str) -> Result<String, std::env::VarError> {
-        // Base (real env) wins; the overlay only fills keys the base lacks.
         self.base.var(key).or_else(|_| {
             self.overlay
                 .get(key)
@@ -336,7 +333,6 @@ pub struct DotenvOsEnv {
 
 impl Env for DotenvOsEnv {
     fn var(&self, key: &str) -> Result<String, std::env::VarError> {
-        // Real OS env wins; the overlay only fills keys the OS env lacks.
         OsEnv.var(key).or_else(|_| {
             self.overlay
                 .get(key)
@@ -538,11 +534,9 @@ mod tests {
 
     #[test]
     fn dotenv_profile_selection_reproduces_offsite_wrong_profile_bug() {
-        // Reproduction for issue #1619 P2 #6: an offsite override + credential
-        // live ONLY in `.env.test`. With the ambient shell profile unset (default
-        // "dev"), resolving `.env` for "dev" MISSES `.env.test` — the bug the
-        // offsite path hit by feeding `dotenv_env()` the ambient profile.
-        // Resolving for the TARGET profile "test" (the fix) picks them up.
+        // The offsite settings live only in `.env.test` (#1619). Resolving for
+        // the ambient profile ("dev") misses them; resolving for the target
+        // profile ("test") finds them.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".env.test"),
@@ -552,7 +546,6 @@ mod tests {
         .unwrap();
         let ambient = MockEnv::new(); // AUTUMN_ENV / AUTUMN_PROFILE unset
 
-        // Buggy path: the ambient/default profile "dev" does NOT load `.env.test`.
         let dev: std::collections::HashMap<_, _> = resolve_dotenv_vars(dir.path(), "dev", &ambient)
             .unwrap()
             .into_iter()
@@ -563,8 +556,6 @@ mod tests {
         );
         assert!(!dev.contains_key("AUTUMN_OFFSITE_SECRET"));
 
-        // Fixed path: resolving for the target profile "test" loads `.env.test`,
-        // so both the offsite override and the credential value are honored.
         let test: std::collections::HashMap<_, _> =
             resolve_dotenv_vars(dir.path(), "test", &ambient)
                 .unwrap()
@@ -682,7 +673,7 @@ export BAZ=qux
         assert_eq!(err.line, 2);
         assert_eq!(err.path, p());
         assert!(err.message.contains("KEY=VALUE"), "got: {}", err.message);
-        // Display form is file:line: message.
+        // Displayed as `file:line: message`.
         assert!(err.to_string().contains("/tmp/.env:2:"), "{err}");
     }
 
@@ -709,21 +700,17 @@ export BAZ=qux
     #[test]
     fn file_order_earlier_wins() {
         let dir = tempfile::tempdir().unwrap();
-        // `.env` sets KEY=from_env and ONLY_BASE.
         std::fs::write(dir.path().join(".env"), "KEY=from_env\nONLY_BASE=base\n").unwrap();
-        // `.env.local` tries to override KEY and adds ONLY_LOCAL.
         std::fs::write(
             dir.path().join(".env.local"),
             "KEY=from_local\nONLY_LOCAL=local\n",
         )
         .unwrap();
-        // `.env.dev` tries to override KEY and adds ONLY_DEV.
         std::fs::write(dir.path().join(".env.dev"), "KEY=from_dev\nONLY_DEV=dev\n").unwrap();
 
         let env = MockEnv::new();
         let out = resolve_dotenv_vars(dir.path(), "dev", &env).unwrap();
         let map: std::collections::HashMap<_, _> = out.into_iter().collect();
-        // Earlier file wins for overlapping keys.
         assert_eq!(map.get("KEY").map(String::as_str), Some("from_env"));
         assert_eq!(map.get("ONLY_BASE").map(String::as_str), Some("base"));
         assert_eq!(map.get("ONLY_LOCAL").map(String::as_str), Some("local"));
@@ -732,8 +719,7 @@ export BAZ=qux
 
     #[test]
     fn real_env_always_wins() {
-        // AC #2 precedence test: a key already set in the real environment is
-        // excluded from the resolved `.env` set entirely.
+        // A key set in the real environment is left out of the `.env` set.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".env"),
@@ -771,8 +757,8 @@ export BAZ=qux
     #[test]
     fn read_error_becomes_dotenv_error() {
         let dir = tempfile::tempdir().unwrap();
-        // Create `.env` as a directory so reading it as a file errors (not
-        // NotFound), which must surface as a DotenvError.
+        // A directory named `.env` fails to read with an error other than
+        // `NotFound`.
         std::fs::create_dir(dir.path().join(".env")).unwrap();
         let env = MockEnv::new();
         let err = resolve_dotenv_vars(dir.path(), "dev", &env).unwrap_err();
@@ -831,8 +817,7 @@ export BAZ=qux
 
     #[test]
     fn gating_custom_profile_does_not_load_by_default() {
-        // A non-prod custom profile such as `staging` must NOT auto-load `.env`
-        // without the explicit opt-in — only `dev`/`test` auto-load.
+        // Only `dev` and `test` auto-load.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".env"), "FOO=bar\n").unwrap();
         let env = MockEnv::new();
@@ -862,7 +847,6 @@ export BAZ=qux
 
     #[test]
     fn dotenv_env_base_wins_over_overlay() {
-        // Real env (base) defines the key: base value must win.
         let base = MockEnv::new().with("AUTUMN_DATABASE__URL", "postgres://from-real-env");
         let env = DotenvEnv::new(
             &base,
@@ -879,7 +863,6 @@ export BAZ=qux
 
     #[test]
     fn dotenv_env_overlay_fills_unset_key() {
-        // Base does not define the key: overlay value fills it.
         let base = MockEnv::new();
         let env = DotenvEnv::new(
             &base,
@@ -903,9 +886,6 @@ export BAZ=qux
 
     #[test]
     fn dotenv_os_env_base_wins_over_overlay() {
-        // A real OS env var must win over the overlay value for the same key.
-        // Uses a key that is essentially never set in the test environment,
-        // set locally for the duration of this test via `temp_env`.
         let overlay = std::collections::BTreeMap::from([(
             "AUTUMN_TEST_DOTENV_OVERLAY_KEY".to_owned(),
             "from-dotenv".to_owned(),
@@ -940,10 +920,8 @@ export BAZ=qux
 
     #[test]
     fn dotenv_env_prod_does_not_flip_resolved_profile() {
-        // End-to-end guard: a `.env`-provided `AUTUMN_ENV=prod` must NOT change
-        // the profile the overlay resolves to. `resolve_profile` is exactly the
-        // selector `autumn migrate` / config load consult, so this proves the
-        // prod/destructive guards can't be flipped by `.env`.
+        // `resolve_profile` is the selector `autumn migrate` and config load
+        // use, so `.env` cannot switch on the prod guards.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".env"),
@@ -953,14 +931,11 @@ export BAZ=qux
         let base = MockEnv::new();
         let vars = resolve_dotenv_vars(dir.path(), "dev", &base).unwrap();
         let env = DotenvEnv::new(&base, vars);
-        // The selector is not honored from `.env`, so the profile stays `dev`.
         assert_eq!(crate::config::resolve_profile(&env), "dev");
     }
 
     #[test]
     fn dotenv_resolves_into_config_via_overlay() {
-        // End-to-end: a `.env` value flows into `config.database.url` through
-        // the overlay `Env`, with no process-environment mutation.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".env"),
@@ -980,9 +955,6 @@ export BAZ=qux
 
     #[test]
     fn profile_selector_keys_are_dropped_from_dotenv() {
-        // Safety: `.env` must never select the active profile/environment.
-        // `AUTUMN_ENV`, `AUTUMN_PROFILE`, and `AUTUMN_IS_DEBUG` are dropped even
-        // when present in `.env`, while ordinary keys still flow through.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".env"),
@@ -1007,7 +979,6 @@ export BAZ=qux
             !map.contains_key("AUTUMN_IS_DEBUG"),
             "AUTUMN_IS_DEBUG must not be honored from .env"
         );
-        // Non-selector keys are unaffected.
         assert_eq!(
             map.get("AUTUMN_DATABASE__URL").map(String::as_str),
             Some("postgres://localhost/app")
@@ -1016,25 +987,19 @@ export BAZ=qux
 
     #[test]
     fn real_env_profile_selector_is_unaffected_by_exclusion() {
-        // Excluding the selector keys from `.env` must not touch the REAL
-        // environment: a real-env `AUTUMN_ENV` remains readable through the
-        // base env even though a `.env`-provided one is dropped.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".env"), "AUTUMN_ENV=prod\nOTHER=x\n").unwrap();
         let env = MockEnv::new().with("AUTUMN_ENV", "dev");
         let out = resolve_dotenv_vars(dir.path(), "dev", &env).unwrap();
         let map: std::collections::HashMap<_, _> = out.into_iter().collect();
-        // The `.env` selector is dropped, not surfaced.
         assert!(!map.contains_key("AUTUMN_ENV"));
-        // The real-env value is still what callers observe.
         assert_eq!(env.var("AUTUMN_ENV").unwrap(), "dev");
         assert_eq!(map.get("OTHER").map(String::as_str), Some("x"));
     }
 
     #[test]
     fn dotenv_base_dir_prefers_manifest_dir() {
-        // The `.env` base directory tracks config's `autumn.toml` base:
-        // AUTUMN_MANIFEST_DIR wins over the process CWD when set.
+        // `.env` is read from the same base as config's `autumn.toml`.
         let dir = tempfile::tempdir().unwrap();
         let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
         assert_eq!(dotenv_base_dir(&env), dir.path().to_path_buf());
@@ -1049,9 +1014,6 @@ export BAZ=qux
 
     #[test]
     fn resolve_reads_env_from_manifest_dir_not_cwd() {
-        // With AUTUMN_MANIFEST_DIR pointing at a temp dir that contains a `.env`,
-        // resolution reads THAT file — proving the base directory is the manifest
-        // dir, not the process working directory.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".env"), "FROM_MANIFEST=yes\n").unwrap();
         let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
@@ -1064,8 +1026,6 @@ export BAZ=qux
 
     #[test]
     fn real_env_wins_over_dotenv_end_to_end() {
-        // A real env var of the same key must win over the `.env` value when
-        // resolved end-to-end into config.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".env"),

@@ -107,8 +107,6 @@ impl<R: ConflictResolver> ConflictResolver for CollabResolver<R> {
     fn resolve(&self, client_device_id: &str, client: &Change, server: &RemoteRow) -> Resolution {
         let verdict = self.inner.resolve(client_device_id, client, server);
 
-        // Out of scope: another collection's same-named field keeps the
-        // wrapped verdict.
         if self
             .collection
             .as_ref()
@@ -117,9 +115,8 @@ impl<R: ConflictResolver> ConflictResolver for CollabResolver<R> {
             return verdict;
         }
 
-        // A row-level conflict is not a field merge: a delete on either side
-        // is a decision about whether the row exists, which the wrapped
-        // resolver owns. Merging would resurrect a deleted row silently.
+        // A delete on either side decides whether the row exists, which the
+        // wrapped resolver owns. Merging would silently resurrect the row.
         if client.op == Op::Delete || server.deleted {
             return verdict;
         }
@@ -144,9 +141,8 @@ impl<R: ConflictResolver> ConflictResolver for CollabResolver<R> {
         for field in &self.fields {
             match (from_client.get(field), from_server.get(field)) {
                 (Some(mine), Some(theirs)) => {
-                    // Both sides must be documents. If either is not, the
-                    // field is not really collaborative on this row and the
-                    // wrapped verdict already covers it.
+                    // If either side is not a document, the field is not
+                    // collaborative on this row; keep the wrapped verdict.
                     let (Ok(mut mine), Ok(theirs)) = (
                         serde_json::from_value::<CollabText>(mine.clone()),
                         serde_json::from_value::<CollabText>(theirs.clone()),
@@ -155,20 +151,13 @@ impl<R: ConflictResolver> ConflictResolver for CollabResolver<R> {
                     };
                     mine.merge(&theirs);
                     // Two documents inside the limits can merge into one that
-                    // is not: 6 000 distinct elements each make 12 000. Storing
-                    // it would be worse than not merging — every later read
-                    // would refuse it, this resolver would fall through to
-                    // last-write-wins, and the side it drops would be gone for
-                    // good. Leave the wrapped verdict instead, which is at
-                    // least a document that can still be read.
+                    // is not (6 000 distinct elements each make 12 000). Every
+                    // later read would refuse it, so keep the wrapped verdict,
+                    // which is still readable.
                     //
-                    // The *total* as well as each array, because that is what
-                    // the hub charges: `open_with` refuses once elements plus
-                    // buffered operations pass `max_document_chars`, which
-                    // defaults to `MAX_WIRE_ELEMENTS`. Checking the arrays
-                    // separately let 9 500 elements and 600 buffered
-                    // operations through — a document that deserializes and
-                    // that no live session can ever open.
+                    // Check the total too: the hub's `open_with` refuses once
+                    // elements plus buffered operations pass
+                    // `max_document_chars` (default `MAX_WIRE_ELEMENTS`).
                     let total = mine.element_count() + mine.pending_len();
                     if total > MAX_WIRE_ELEMENTS
                         || mine.element_count() > MAX_WIRE_ELEMENTS

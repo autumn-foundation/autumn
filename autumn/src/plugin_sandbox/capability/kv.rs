@@ -149,18 +149,12 @@ pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &
         CapabilityCall::KvGet { .. } => {
             let ceiling = runtime.quotas().kv_value_bytes as usize;
             match store.get(&physical) {
-                // A backend that could not answer is not a miss. Reporting it
-                // as `found: false` would run the guest's miss path over data
-                // that exists, and the audit ledger would record a read that
-                // never happened.
+                // A backend that could not answer is not a miss: `found: false` would run the
+                // guest's miss path over data that exists.
                 Err(detail) => CallResult::denied(id, DenialReason::BackendError, detail),
-                // Checked on the way *out* as well as in. A quota is the
-                // operator's current answer, and lowering one is meant to
-                // *reduce* authority — but the store keeps what was written
-                // under the old ceiling, so without this an upgrade that
-                // tightened `kv_value_bytes` would go on serving values over
-                // it, and a value large enough could overrun the reply queue
-                // and fail the request outright rather than being refused.
+                // Checked on the way out too: after `kv_value_bytes` is lowered, values written
+                // under the old ceiling must not be served, and a large one could overrun the
+                // reply queue.
                 Ok(Some(value)) if value.weight() > ceiling => CallResult::denied(
                     id,
                     DenialReason::QuotaExceeded,
@@ -205,9 +199,8 @@ pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &
                 id,
                 value: CallValue::Done,
             },
-            // A delete that did not happen must not read as `Done`. A plugin
-            // releasing a lock or clearing state would carry on as though the
-            // value were gone while it is still there to be read.
+            // A failed delete must not read as `Done`: a plugin releasing a lock would carry
+            // on while the value is still readable.
             Err(detail) => CallResult::denied(id, DenialReason::BackendError, detail),
         },
         // `perform` is only reached from the KV arm of `CapabilityRuntime::perform`.
@@ -356,23 +349,17 @@ impl KvStore for MemoryKvStore {
     )]
     fn set(&self, key: &str, value: PluginValue) -> Result<(), String> {
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        // Overwriting an existing key adds no *entry*, so the key ceiling
-        // applies to new keys only — a plugin that keeps one counter updated is
-        // never refused however long it runs.
+        // The key ceiling applies to new keys only: overwriting adds no entry.
         if entries.map.len() >= self.capacity && !entries.map.contains_key(key) {
             return Err(format!(
                 "this host's plugin key/value store is full at {} keys",
                 self.capacity
             ));
         }
-        // The byte ceiling is the one that actually bounds memory, and it has to
-        // account for a *replacement* too: overwriting a small value with a huge
-        // one adds no key and can still take the store past its size.
-        // Against the running total, not a fresh scan of the map. Re-weighing
-        // everything on each `set` made a *full* store the expensive case —
-        // and `weight` now walks each value's characters to find its encoded
-        // length, so a plugin that filled the store and then overwrote one key
-        // repeatedly could spend the host's CPU without spending its own quota.
+        // The byte ceiling covers a replacement too: a huge value over a small one adds no
+        // key. Checked against the running total, not a rescan: `weight` walks every
+        // character, so rescanning a full store on each `set` would let a plugin spend
+        // host CPU without spending its quota.
         let incoming = Self::entry_weight(key, &value);
         let outgoing = entries
             .map
@@ -401,8 +388,7 @@ impl KvStore for MemoryKvStore {
         {
             let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(removed) = entries.map.remove(key) {
-                // The total follows the map. A delete that freed bytes without
-                // saying so would ratchet the store shut over a long run.
+                // The total follows the map, or a long-running store ratchets shut.
                 let freed = Self::entry_weight(key, &removed);
                 entries.bytes = entries.bytes.saturating_sub(freed);
             }
@@ -431,25 +417,19 @@ impl std::fmt::Debug for CacheKvStore {
 }
 
 impl KvStore for CacheKvStore {
-    // `get_cached`/`insert_cached` rather than `get_value`/`insert_value`, and
-    // the difference is the whole of whether this type works at all against the
-    // cross-replica backend it exists to reach. The erased pair is the
-    // *in-process* half of the `Cache` trait: a serializing backend implements
-    // `insert_value` as a no-op and answers `get_value` with `RawCacheBytes`,
-    // which no `downcast_ref::<PluginValue>` can see. The serde pair takes both
-    // paths: the downcast when the backend keeps values, JSON when it keeps
-    // bytes. The `try_*` forms carry a backend failure to the guest, so an
-    // outage is not a miss and a lost write is not `Done` (#2523).
+    // The serde helpers, not `get_value`/`insert_value`: a serializing backend (such as Redis)
+    // makes `insert_value` a no-op and answers `get_value` with `RawCacheBytes`, which a
+    // downcast cannot read. The serde pair downcasts or decodes JSON as the backend needs.
+    // The `try_*` forms carry backend failures to the guest, so an outage is not a miss
+    // and a lost write is not `Done` (#2523).
     fn get(&self, key: &str) -> Result<Option<PluginValue>, String> {
         crate::cache::try_get_cached::<PluginValue>(self.0.as_ref(), key)
             .map_err(|error| error.to_string())
     }
 
     fn set(&self, key: &str, value: PluginValue) -> Result<(), String> {
-        // No TTL: a plugin's KV entry lives until the plugin deletes it or the
-        // backend evicts it. A ceiling on *lifetime* is not one of the grants an
-        // operator gave, and inventing one here would make a plugin's data
-        // disappear on a schedule nothing in the manifest mentions.
+        // No TTL: an entry lives until the plugin deletes it or the backend evicts it. The
+        // manifest grants no lifetime limit.
         crate::cache::try_insert_cached(self.0.as_ref(), key, value, None)
             .map_err(|error| error.to_string())
     }
@@ -460,8 +440,6 @@ impl KvStore for CacheKvStore {
             .map_err(|error| error.to_string())
     }
 }
-
-// ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -650,10 +628,8 @@ mod tests {
 
     #[test]
     fn a_read_that_could_not_happen_is_not_an_absent_key() {
-        // The distinction the trait exists to carry. Before it did, an outage
-        // reached the guest as `found: false`: the plugin ran its miss path and
-        // could overwrite state that was only unreachable, while the audit
-        // ledger recorded a read that succeeded.
+        // An outage read as `found: false` would run the plugin's miss path over state
+        // that was only unreachable.
         let store = UnreachableKvStore;
         let key = namespaced_key("shop", Some("alpha"), "cart");
         assert_eq!(
@@ -662,8 +638,7 @@ mod tests {
             "a failed read must stay a failure, not collapse into None"
         );
 
-        // And the in-memory store still says `Ok(None)` for a key that is
-        // genuinely absent, so the two answers really are distinguishable.
+        // An absent key is still `Ok(None)`, so the two answers differ.
         let present = MemoryKvStore::new();
         assert_eq!(
             present.get(&key),

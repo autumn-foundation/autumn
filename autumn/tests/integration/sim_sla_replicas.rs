@@ -17,10 +17,19 @@ use autumn_web::sla::{
     WorkingHours,
 };
 use autumn_web::test::{TestApp, TestClient};
-use autumn_web::time::TickingClock;
-use chrono::{DateTime, TimeZone, Utc, Weekday};
+use autumn_web::time::civil::{self, Weekday};
+use autumn_web::time::tz::TimeZone;
+use autumn_web::time::{SignedDuration, TickingClock, Timestamp};
 use tokio::sync::Barrier;
 use uuid::Uuid;
+
+fn utc(y: i16, m: i8, d: i8, h: i8, min: i8, sec: i8) -> Timestamp {
+    civil::date(y, m, d)
+        .at(h, min, sec, 0)
+        .to_zoned_datetime(TimeZone::UTC)
+        .unwrap()
+        .timestamp()
+}
 
 /// A shared store. While armed, the first two `get` calls read, then wait for
 /// each other. Thus two checks read "not escalated" before either one claims.
@@ -34,10 +43,10 @@ struct RacingStore {
     fail_mark_met: Arc<AtomicBool>,
     /// A met instant that a rival `track` writes just before the next
     /// `mark_met`, so that call loses the race.
-    rival_met: Arc<Mutex<Option<DateTime<Utc>>>>,
+    rival_met: Arc<Mutex<Option<Timestamp>>>,
     /// A deadline that a rival `reconcile` stores just before the next
     /// `mark_met`.
-    rival_due: Arc<Mutex<Option<DateTime<Utc>>>>,
+    rival_due: Arc<Mutex<Option<Timestamp>>>,
 }
 
 impl RacingStore {
@@ -79,7 +88,7 @@ impl ObligationStore for RacingStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> StoreFuture<'a, bool> {
         if self.fail_mark_met.load(Ordering::SeqCst) {
             return Box::pin(std::future::ready(Err(SlaError::Store("down".to_owned()))));
@@ -101,7 +110,7 @@ impl ObligationStore for RacingStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        due_at: DateTime<Utc>,
+        due_at: Timestamp,
     ) -> StoreFuture<'a, bool> {
         self.inner.set_due(key, generation, due_at)
     }
@@ -110,7 +119,7 @@ impl ObligationStore for RacingStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        due_at: DateTime<Utc>,
+        due_at: Timestamp,
         token: Uuid,
     ) -> StoreFuture<'a, bool> {
         self.inner.begin_dispatch(key, generation, due_at, token)
@@ -120,8 +129,8 @@ impl ObligationStore for RacingStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        due_at: DateTime<Utc>,
-        at: DateTime<Utc>,
+        due_at: Timestamp,
+        at: Timestamp,
     ) -> StoreFuture<'a, bool> {
         self.claims.fetch_add(1, Ordering::SeqCst);
         self.inner.claim_escalation(key, generation, due_at, at)
@@ -131,7 +140,7 @@ impl ObligationStore for RacingStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        claimed_at: DateTime<Utc>,
+        claimed_at: Timestamp,
     ) -> StoreFuture<'a, ()> {
         self.inner.release_escalation(key, generation, claimed_at)
     }
@@ -182,7 +191,7 @@ async fn sim_sla_two_replicas_escalate_once() {
     job::clear_global_job_client();
 
     // Wednesday 2020-01-01 09:00 UTC.
-    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap());
+    let clock = TickingClock::starting_at(utc(2020, 1, 1, 9, 0, 0));
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let a = replica(&clock, &store, &fired);
@@ -196,10 +205,7 @@ async fn sim_sla_two_replicas_escalate_once() {
     let due_a = sla_a.track(&obligation).await.unwrap().due_at;
     let due_b = sla_b.track(&obligation).await.unwrap().due_at;
     assert_eq!(due_a, due_b);
-    assert_eq!(
-        due_a,
-        Some(Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap())
-    );
+    assert_eq!(due_a, Some(utc(2020, 1, 1, 11, 0, 0)));
     settle().await;
 
     // Go three hours past the start: both check jobs come due and race.
@@ -231,7 +237,7 @@ async fn sim_sla_a_failed_track_can_be_retried() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let start = utc(2020, 1, 1, 9, 0, 0);
     let clock = TickingClock::starting_at(start);
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
@@ -243,7 +249,7 @@ async fn sim_sla_a_failed_track_can_be_retried() {
     sla.track(&ob).await.unwrap();
 
     // The store fails while a later `track` reports the reply.
-    let met = start + chrono::Duration::minutes(30);
+    let met = start + SignedDuration::from_mins(30);
     store.fail_mark_met.store(true, Ordering::SeqCst);
     assert!(sla.track(&ob.clone().met_at(met)).await.is_err());
     let status = sla.get(&ob.key()).await.unwrap().unwrap();
@@ -264,8 +270,8 @@ async fn sim_sla_on_time_met_after_the_claim_cancels_the_breach() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let due = utc(2020, 1, 1, 11, 0, 0);
     let clock = TickingClock::starting_at(start);
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
@@ -279,7 +285,7 @@ async fn sim_sla_on_time_met_after_the_claim_cancels_the_breach() {
 
     // A check claimed the breach at 11:05. Then a late `track` wrote an
     // on-time met instant (10:30) before the escalate job ran.
-    let claimed = due + chrono::Duration::minutes(5);
+    let claimed = due + SignedDuration::from_mins(5);
     assert!(
         store
             .inner
@@ -287,7 +293,7 @@ async fn sim_sla_on_time_met_after_the_claim_cancels_the_breach() {
             .await
             .unwrap()
     );
-    let met = Utc.with_ymd_and_hms(2020, 1, 1, 10, 30, 0).unwrap();
+    let met = utc(2020, 1, 1, 10, 30, 0);
     store
         .inner
         .mark_met(&ob.key(), record.generation, met)
@@ -328,7 +334,7 @@ async fn sim_sla_reconcile_moves_a_check_to_an_earlier_deadline() {
     job::clear_global_job_client();
 
     // Wednesday 2020-01-01 09:00 UTC.
-    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap());
+    let clock = TickingClock::starting_at(utc(2020, 1, 1, 9, 0, 0));
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let ob = Obligation::new("first_response", "ticket:1")
@@ -364,10 +370,7 @@ async fn sim_sla_reconcile_moves_a_check_to_an_earlier_deadline() {
             .track(&ob)
             .await
             .unwrap();
-        assert_eq!(
-            status.due_at,
-            Some(Utc.with_ymd_and_hms(2020, 1, 2, 10, 0, 0).unwrap())
-        );
+        assert_eq!(status.due_at, Some(utc(2020, 1, 2, 10, 0, 0)));
     }
     job::clear_global_job_client();
 
@@ -393,8 +396,8 @@ async fn sim_sla_a_check_that_runs_hours_early_waits_and_escalates() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let due = utc(2020, 1, 1, 11, 0, 0);
     let clock = TickingClock::starting_at(start);
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
@@ -406,7 +409,7 @@ async fn sim_sla_a_check_that_runs_hours_early_waits_and_escalates() {
         .within(BusinessDuration::hours(2))
         .calendar("support")
         .starting_at(start)
-        .zone(chrono_tz::Tz::UTC);
+        .zone(TimeZone::UTC);
     let generation = Uuid::from_u128(7);
     store
         .inner
@@ -439,8 +442,8 @@ async fn sim_sla_an_early_check_never_uses_the_deadline_as_now() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let due = utc(2020, 1, 1, 11, 0, 0);
     let clock = TickingClock::starting_at(start);
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
@@ -450,7 +453,7 @@ async fn sim_sla_an_early_check_never_uses_the_deadline_as_now() {
         .within(BusinessDuration::hours(2))
         .calendar("support")
         .starting_at(start)
-        .zone(chrono_tz::Tz::UTC);
+        .zone(TimeZone::UTC);
     let generation = Uuid::from_u128(8);
     store
         .inner
@@ -501,7 +504,7 @@ async fn sim_sla_a_track_that_loses_the_met_race_reads_the_stored_met() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let start = utc(2020, 1, 1, 9, 0, 0);
     let clock = TickingClock::starting_at(start);
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
@@ -516,10 +519,10 @@ async fn sim_sla_a_track_that_loses_the_met_race_reads_the_stored_met() {
     // its `mark_met`. This call must return the stored met, not a stale
     // running status.
     clock.advance(Duration::from_secs(3600));
-    let rival = start + chrono::Duration::minutes(20);
+    let rival = start + SignedDuration::from_mins(20);
     *store.rival_met.lock().unwrap() = Some(rival);
     let status = sla
-        .track(&ob.clone().met_at(start + chrono::Duration::minutes(40)))
+        .track(&ob.clone().met_at(start + SignedDuration::from_mins(40)))
         .await
         .unwrap();
     assert_eq!(status.state, autumn_web::sla::ObligationState::Met);
@@ -533,9 +536,9 @@ async fn sim_sla_a_stale_calendar_does_not_claim_before_the_stored_deadline() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let old_due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
-    let new_due = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let old_due = utc(2020, 1, 1, 11, 0, 0);
+    let new_due = utc(2020, 1, 1, 15, 0, 0);
     let clock = TickingClock::starting_at(start);
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
@@ -547,7 +550,7 @@ async fn sim_sla_a_stale_calendar_does_not_claim_before_the_stored_deadline() {
         .within(BusinessDuration::hours(2))
         .calendar("support")
         .starting_at(start)
-        .zone(chrono_tz::Tz::UTC);
+        .zone(TimeZone::UTC);
     let generation = Uuid::from_u128(11);
     store
         .inner
@@ -593,9 +596,9 @@ async fn sim_sla_a_stale_calendar_reads_the_stored_deadline_status() {
 
     // Wednesday 2020-01-01. This replica's calendar puts the deadline at
     // 11:00. The stored deadline is Thursday 15:00.
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let stored = Utc.with_ymd_and_hms(2020, 1, 2, 15, 0, 0).unwrap();
-    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 18, 0, 0).unwrap());
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let stored = utc(2020, 1, 2, 15, 0, 0);
+    let clock = TickingClock::starting_at(utc(2020, 1, 1, 18, 0, 0));
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let app = replica(&clock, &store, &fired);
@@ -603,7 +606,7 @@ async fn sim_sla_a_stale_calendar_reads_the_stored_deadline_status() {
         .within(BusinessDuration::hours(2))
         .calendar("support")
         .starting_at(start)
-        .zone(chrono_tz::Tz::UTC);
+        .zone(TimeZone::UTC);
     store
         .inner
         .insert(ObligationRecord::new(ob.clone(), Uuid::from_u128(12)).with_due_at(stored))
@@ -620,10 +623,7 @@ async fn sim_sla_a_stale_calendar_reads_the_stored_deadline_status() {
         .unwrap();
     assert_eq!(status.state, autumn_web::sla::ObligationState::Paused);
     assert_eq!(status.due_at, Some(stored));
-    assert_eq!(
-        status.resumes_at,
-        Some(Utc.with_ymd_and_hms(2020, 1, 2, 9, 0, 0).unwrap())
-    );
+    assert_eq!(status.resumes_at, Some(utc(2020, 1, 2, 9, 0, 0)));
     assert_eq!(status.remaining, Duration::from_hours(6));
 
     job::clear_global_job_client();
@@ -634,9 +634,9 @@ async fn sim_sla_an_escalation_enqueued_again_after_it_ran_does_not_fire_again()
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
-    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap());
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let due = utc(2020, 1, 1, 11, 0, 0);
+    let clock = TickingClock::starting_at(utc(2020, 1, 1, 12, 0, 0));
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let app = replica(&clock, &store, &fired);
@@ -644,7 +644,7 @@ async fn sim_sla_an_escalation_enqueued_again_after_it_ran_does_not_fire_again()
         .within(BusinessDuration::hours(2))
         .calendar("support")
         .starting_at(start)
-        .zone(chrono_tz::Tz::UTC);
+        .zone(TimeZone::UTC);
     let generation = Uuid::from_u128(13);
     store
         .inner
@@ -687,7 +687,7 @@ async fn sim_sla_a_deadline_restored_while_its_check_runs_still_escalates() {
     job::clear_global_job_client();
 
     // Wednesday 2020-01-01 09:00. The deadline on this calendar is 11:00.
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let start = utc(2020, 1, 1, 9, 0, 0);
     let clock = TickingClock::starting_at(start);
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
@@ -707,7 +707,7 @@ async fn sim_sla_a_deadline_restored_while_its_check_runs_still_escalates() {
         .generation;
 
     // Another calendar version moved the stored deadline to 15:00.
-    let later = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
+    let later = utc(2020, 1, 1, 15, 0, 0);
     assert!(
         store
             .inner
@@ -752,7 +752,7 @@ async fn sim_sla_a_reconcile_retry_is_not_absorbed_by_a_running_check() {
     job::clear_global_job_client();
 
     // Wednesday 2020-01-01 09:00. The deadline on this calendar is 11:00.
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let start = utc(2020, 1, 1, 9, 0, 0);
     let clock = TickingClock::starting_at(start);
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
@@ -765,8 +765,8 @@ async fn sim_sla_a_reconcile_retry_is_not_absorbed_by_a_running_check() {
     settle().await;
     let key = ob.key();
     let generation = store.inner.get(&key).await.unwrap().unwrap().generation;
-    let eleven = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
-    let later = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
+    let eleven = utc(2020, 1, 1, 11, 0, 0);
+    let later = utc(2020, 1, 1, 15, 0, 0);
     assert!(store.inner.set_due(&key, generation, later).await.unwrap());
 
     // At 11:00 the old check reads the 15:00 record, then waits.
@@ -802,11 +802,11 @@ async fn sim_sla_an_on_time_met_clears_a_newer_claim_than_the_job_payload() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
-    let first_claim = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 1).unwrap();
-    let retry_claim = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 5).unwrap();
-    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap());
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let due = utc(2020, 1, 1, 11, 0, 0);
+    let first_claim = utc(2020, 1, 1, 11, 0, 1);
+    let retry_claim = utc(2020, 1, 1, 11, 0, 5);
+    let clock = TickingClock::starting_at(utc(2020, 1, 1, 12, 0, 0));
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let app = replica(&clock, &store, &fired);
@@ -814,7 +814,7 @@ async fn sim_sla_an_on_time_met_clears_a_newer_claim_than_the_job_payload() {
         .within(BusinessDuration::hours(2))
         .calendar("support")
         .starting_at(start)
-        .zone(chrono_tz::Tz::UTC);
+        .zone(TimeZone::UTC);
     let key = ob.key();
     let generation = Uuid::from_u128(14);
     store
@@ -831,7 +831,7 @@ async fn sim_sla_an_on_time_met_clears_a_newer_claim_than_the_job_payload() {
             .await
             .unwrap()
     );
-    let met = Utc.with_ymd_and_hms(2020, 1, 1, 10, 30, 0).unwrap();
+    let met = utc(2020, 1, 1, 10, 30, 0);
     assert!(store.inner.mark_met(&key, generation, met).await.unwrap());
 
     let breach = serde_json::json!({
@@ -865,7 +865,7 @@ async fn sim_sla_a_track_reads_a_deadline_that_changed_before_its_met_write() {
     job::clear_global_job_client();
 
     // Wednesday 2020-01-01 09:00. The deadline on this calendar is 11:00.
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
+    let start = utc(2020, 1, 1, 9, 0, 0);
     let clock = TickingClock::starting_at(start);
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
@@ -879,9 +879,9 @@ async fn sim_sla_a_track_reads_a_deadline_that_changed_before_its_met_write() {
     // A rival reconcile stores 15:00 just before this call writes a 12:00
     // reply. The stored record is met on time.
     clock.advance(Duration::from_hours(4));
-    let later = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
+    let later = utc(2020, 1, 1, 15, 0, 0);
     *store.rival_due.lock().unwrap() = Some(later);
-    let met = Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap();
+    let met = utc(2020, 1, 1, 12, 0, 0);
     let status = sla.track(&ob.clone().met_at(met)).await.unwrap();
     assert_eq!(status.due_at, Some(later));
     assert_eq!(status.state, autumn_web::sla::ObligationState::Met);
@@ -896,11 +896,11 @@ async fn sim_sla_reconcile_stores_a_later_deadline_for_a_met_record() {
 
     // Budget 6 h from 09:00: 15:00 on this calendar. The record still has
     // the old 11:00 deadline and a 12:00 reply, so it reads as breached.
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let old_due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
-    let new_due = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
-    let met = Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap();
-    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 13, 0, 0).unwrap());
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let old_due = utc(2020, 1, 1, 11, 0, 0);
+    let new_due = utc(2020, 1, 1, 15, 0, 0);
+    let met = utc(2020, 1, 1, 12, 0, 0);
+    let clock = TickingClock::starting_at(utc(2020, 1, 1, 13, 0, 0));
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let app = replica(&clock, &store, &fired);
@@ -909,7 +909,7 @@ async fn sim_sla_reconcile_stores_a_later_deadline_for_a_met_record() {
         .within(BusinessDuration::hours(6))
         .calendar("support")
         .starting_at(start)
-        .zone(chrono_tz::Tz::UTC)
+        .zone(TimeZone::UTC)
         .met_at(met);
     let key = ob.key();
     let generation = Uuid::from_u128(15);
@@ -948,16 +948,16 @@ async fn sim_sla_reconcile_with_no_deadline_stops_the_old_check() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let old_due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
-    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 10, 0, 0).unwrap());
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let old_due = utc(2020, 1, 1, 11, 0, 0);
+    let clock = TickingClock::starting_at(utc(2020, 1, 1, 10, 0, 0));
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let ob = Obligation::new("first_response", "ticket:1")
         .within(BusinessDuration::hours(2))
         .calendar("support")
         .starting_at(start)
-        .zone(chrono_tz::Tz::UTC);
+        .zone(TimeZone::UTC);
     let key = ob.key();
     let generation = Uuid::from_u128(16);
     store
@@ -1007,9 +1007,9 @@ async fn sim_sla_a_second_escalation_after_the_unique_window_does_not_fire() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
-    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap());
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let due = utc(2020, 1, 1, 11, 0, 0);
+    let clock = TickingClock::starting_at(utc(2020, 1, 1, 12, 0, 0));
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let app = replica(&clock, &store, &fired);
@@ -1017,7 +1017,7 @@ async fn sim_sla_a_second_escalation_after_the_unique_window_does_not_fire() {
         .within(BusinessDuration::hours(2))
         .calendar("support")
         .starting_at(start)
-        .zone(chrono_tz::Tz::UTC);
+        .zone(TimeZone::UTC);
     let generation = Uuid::from_u128(17);
     store
         .inner
@@ -1067,10 +1067,10 @@ async fn sim_sla_a_stale_escalation_does_not_fire_before_the_new_deadline() {
 
     // The escalate job for 11:00 is still queued, its claim was released,
     // and reconcile then stored 15:00.
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let old_due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
-    let new_due = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
-    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap());
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let old_due = utc(2020, 1, 1, 11, 0, 0);
+    let new_due = utc(2020, 1, 1, 15, 0, 0);
+    let clock = TickingClock::starting_at(utc(2020, 1, 1, 12, 0, 0));
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let app = replica(&clock, &store, &fired);
@@ -1078,7 +1078,7 @@ async fn sim_sla_a_stale_escalation_does_not_fire_before_the_new_deadline() {
         .within(BusinessDuration::hours(2))
         .calendar("support")
         .starting_at(start)
-        .zone(chrono_tz::Tz::UTC);
+        .zone(TimeZone::UTC);
     let key = ob.key();
     let generation = Uuid::from_u128(18);
     store
@@ -1128,9 +1128,9 @@ async fn sim_sla_a_dispatched_escalation_retries_after_an_on_time_backfill() {
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(2020, 1, 1, 9, 0, 0).unwrap();
-    let due = Utc.with_ymd_and_hms(2020, 1, 1, 11, 0, 0).unwrap();
-    let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap());
+    let start = utc(2020, 1, 1, 9, 0, 0);
+    let due = utc(2020, 1, 1, 11, 0, 0);
+    let clock = TickingClock::starting_at(utc(2020, 1, 1, 12, 0, 0));
     let store = RacingStore::new();
     let fired = Arc::new(Mutex::new(Vec::new()));
     let app = replica(&clock, &store, &fired);
@@ -1138,7 +1138,7 @@ async fn sim_sla_a_dispatched_escalation_retries_after_an_on_time_backfill() {
         .within(BusinessDuration::hours(2))
         .calendar("support")
         .starting_at(start)
-        .zone(chrono_tz::Tz::UTC);
+        .zone(TimeZone::UTC);
     let key = ob.key();
     let generation = Uuid::from_u128(19);
     let token = Uuid::from_u128(51);
@@ -1163,7 +1163,7 @@ async fn sim_sla_a_dispatched_escalation_retries_after_an_on_time_backfill() {
             .await
             .unwrap()
     );
-    let met = Utc.with_ymd_and_hms(2020, 1, 1, 10, 30, 0).unwrap();
+    let met = utc(2020, 1, 1, 10, 30, 0);
     assert!(store.inner.mark_met(&key, generation, met).await.unwrap());
 
     // The retry has the same token and must still run the handler.
@@ -1194,23 +1194,23 @@ async fn sim_sla_a_deadline_at_the_no_deadline_marker_is_refused_before_insert()
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
 
-    let start = Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 58).unwrap();
+    let start = Timestamp::MAX - SignedDuration::from_secs(1);
     let clock = TickingClock::starting_at(start);
     let store = RacingStore::new();
     let mut all_week = BusinessCalendar::weekdays(WorkingHours::ALL_DAY);
-    for day in [Weekday::Sat, Weekday::Sun] {
+    for day in [Weekday::Saturday, Weekday::Sunday] {
         all_week = all_week.hours(day, WorkingHours::ALL_DAY);
     }
     let app = TestApp::new()
         .with_clock(clock.clone())
         .plugin(
             SlaPlugin::new()
-                .calendar("all", all_week.zone(chrono_tz::Tz::UTC))
+                .calendar("all", all_week.zone(TimeZone::UTC))
                 .store(store.clone()),
         )
         .build();
     let sla = Sla::from_state(app.state()).unwrap();
-    // The deadline is 9999-12-31T23:59:59Z, the no-deadline marker.
+    // The deadline is `Timestamp::MAX`, the no-deadline marker.
     let ob = Obligation::new("first_response", "ticket:1")
         .within(BusinessDuration::from_parts(0, 1))
         .calendar("all")

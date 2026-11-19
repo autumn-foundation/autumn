@@ -323,12 +323,8 @@ pub fn format_drift(committed: &ArchitectureGraph, current: &ArchitectureGraph) 
                 "  ~ {} -> {}: {} -> {}",
                 edge.from, edge.to, edge.access, after.access
             )),
-            // A route that stopped taking the repository as an extractor and
-            // now only names it in its body keeps the edge but weakens the
-            // evidence for it; one that reaches the same target through a
-            // different name has swapped its resolving symbol. Both are changes
-            // the report has in hand, and neither should hide behind "the
-            // documents differ in a field this report does not name".
+            // Same edge and access, but weaker evidence (e.g. extractor -> body mention) or a
+            // different resolving symbol. Name the change rather than report an unnamed diff.
             Some(after) if after.provenance != edge.provenance => lines.push(format!(
                 "  ~ {} -> {}: evidence {} ({}) -> {} ({})",
                 edge.from,
@@ -535,9 +531,8 @@ pub fn run(opts: &GraphOptions<'_>) {
         release: opts.release,
     });
 
-    // Read the committed copy BEFORE writing anything. `--manifest P --check P`
-    // would otherwise compare the fresh graph against the copy this very run
-    // just wrote and always pass -- a gate that certifies itself.
+    // Read the committed copy before writing anything, or `--manifest P --check P` would compare
+    // against the copy this run just wrote and always pass.
     let committed = opts.check.map(|path| match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<ArchitectureGraph>(&text) {
             Ok(g) => g,
@@ -763,10 +758,8 @@ mod tests {
 
     #[test]
     fn a_weakened_edge_evidence_is_named_in_the_drift_report() {
-        // The route stops taking the repository as an extractor and reaches it
-        // only by naming it in the body. Same endpoints, same access — but the
-        // evidence changed, and "the documents differ in a field this report
-        // does not name" is not something a reviewer can approve.
+        // The route reaches the repository by naming it in the body instead of as an extractor:
+        // same endpoints and access, but the evidence changed and must be named.
         let before = graph();
         let after = build(&[], 0, BODY_ONLY, MODELS, REPOSITORIES, JOBS);
         let drift = format_drift(&before, &after).expect("weakened evidence is drift");
@@ -776,9 +769,8 @@ mod tests {
 
     #[test]
     fn a_new_unenumerable_router_is_named_in_the_drift_report() {
-        // The route and model counts are identical; only the opaque-router
-        // count moved. Printing "39 / 39 -> 39 / 39" for that would withhold
-        // exactly what a reviewer needs to approve.
+        // Route and model counts are unchanged; only the opaque-router count moved, and the
+        // report must say so.
         let before = graph();
         let after = build(&[], 2, ROUTES, MODELS, REPOSITORIES, JOBS);
         let drift = format_drift(&before, &after).expect("a new opaque router is drift");
@@ -810,10 +802,8 @@ mod tests {
 
     #[test]
     fn a_cosmetic_line_move_is_not_drift() {
-        // `location` is worth having in the document and not worth gating on: a
-        // gate that fails on every blank line added above a handler gets
-        // regenerated reflexively, and an auth change rides along in the same
-        // regeneration.
+        // `location` is not gated: a gate that fails on every added blank line gets regenerated
+        // reflexively, and a real auth change would ride along unreviewed.
         let before = graph();
         let mut after = graph();
         for node in &mut after.nodes {

@@ -155,8 +155,8 @@ fn a_negative_amount_belongs_to_the_side_not_to_the_value() {
 
 #[test]
 fn the_extreme_value_cannot_reach_the_ledger() {
-    // `i64::MIN` has no positive form, so it can only arrive as a negative
-    // amount — which is refused before anything tries to negate it.
+    // `i64::MIN` has no positive form, so it arrives as a negative amount, refused before
+    // anything negates it.
     let posting = Posting::credit("a", usd(i64::MIN));
     assert!(matches!(
         posting.signed_minor(),
@@ -316,8 +316,8 @@ fn a_derived_key_changes_with_the_money() {
 
 #[test]
 fn the_namespace_and_the_postings_cannot_run_together() {
-    // A length-prefixed hash: moving a character from the namespace into an
-    // account id must not produce the same key.
+    // The hash is length-prefixed: moving a character from the namespace into an account id
+    // must change the key.
     let left = IdempotencyKey::derive(
         "ab",
         &[Posting::debit("c", usd(1)), Posting::credit("d", usd(1))],
@@ -491,15 +491,10 @@ fn every_error_says_what_went_wrong() {
     assert!(message.contains("USD"), "{message}");
 }
 
-// ── Characterization: hex rendering (Echo clone class, `hex_lower`) ────────
+// ── Hex rendering ───────────────────────────────────────────────────────────
 //
-// `request_hash` and `IdempotencyKey::derive` both render a SHA-256 digest as
-// lowercase hex through this file's own `hex_lower`, one of six byte-identical
-// copies across the crate (autumn/src/{idempotency,repository_commit_hooks,
-// derivation,money/ledger}.rs, autumn/src/security/submit_token.rs,
-// autumn/src/etag.rs). These two values are pinned here before `hex_lower` is
-// replaced by the `hex` crate (already a dependency, already used this way in
-// ~20 other places in this crate) at its call sites.
+// Stored request hashes and derived keys are compared across releases, so their lowercase-hex
+// SHA-256 rendering is pinned.
 
 #[test]
 fn request_hash_is_pinned_hex() {

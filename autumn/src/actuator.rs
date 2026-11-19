@@ -9,7 +9,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -679,7 +679,6 @@ impl LogLevels {
         guard
             .logger_overrides
             .insert(name.to_string(), level.to_string());
-        // If setting the root level, update current_level too.
         let returned = if is_root {
             guard.current_level = level.to_string();
             Some(previous_current.clone())
@@ -1111,15 +1110,13 @@ impl JobRegistry {
     /// Mixing in a mark stamped elsewhere — a database `run_at`, a real
     /// `SystemTime` reading — is what makes an age come back as years or zero.
     fn now_ms(&self) -> u64 {
-        // Recover rather than drop the reading on a poisoned lock: the cell holds
-        // an immutable `Arc` handle, so a panic elsewhere leaves it perfectly
-        // readable, and falling back to real time here would reintroduce exactly
-        // the mixed timeline this field exists to prevent.
+        // Recover from poisoning: the cell holds an immutable `Arc`, so it stays readable, and
+        // falling back to real time would mix the timelines this field keeps apart.
         let clock = self
             .clock
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        u64::try_from(clock.now().timestamp_millis()).unwrap_or(0)
+        u64::try_from(clock.now().as_millisecond()).unwrap_or(0)
     }
 
     /// Whether any job name has been registered against this registry.
@@ -1558,14 +1555,10 @@ impl JobRegistry {
                     clippy::disallowed_methods,
                     reason = "Real marks are measured by Postgres clock_timestamp(), a real clock"
                 )]
-                let real_now =
-                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(u64::MAX);
-                // Walk oldest-first (ascending `seq`) and stop at the first
-                // entry that is actually due; only when none is found (the
-                // loop runs to completion) fall back to the oldest entry
-                // overall (`pg_marks_seq_order`'s own first key). See
-                // `pg_marks_seq_order`'s doc comment for why this is not a
-                // full scan in the common case.
+                let real_now = u64::try_from(crate::time::Timestamp::now().as_millisecond())
+                    .unwrap_or(u64::MAX);
+                // Evict the oldest due entry, else the oldest overall. `pg_marks_seq_order`
+                // documents why this is rarely a full scan.
                 let evict_id = guard
                     .pg_marks_seq_order
                     .iter()
@@ -1688,8 +1681,6 @@ impl JobRegistry {
     /// oldest mark so every enqueue still has a matching removal (no leak).
     fn pop_waiting(&self, name: &str, prefer_ready: bool) {
         let now = self.now_ms();
-        // The queue is looked up by borrow under the write lock taken here
-        // anyway, instead of copied out under a separate read lock first.
         if let Ok(mut guard) = self.queues.write()
             && let Some(waiting) = guard.waiting_for_mut(name)
         {
@@ -2024,7 +2015,7 @@ impl TaskRegistry {
             return;
         };
         task.status = "idle".to_string();
-        let now = crate::time::ambient_now().to_rfc3339();
+        let now = crate::time::compat::rfc3339(crate::time::ambient_now());
         task.last_run = Some(now.clone());
         task.last_fired_at = Some(now);
         task.last_duration_ms = Some(duration_ms);
@@ -2042,7 +2033,7 @@ impl TaskRegistry {
             return;
         };
         task.status = "idle".to_string();
-        let now = crate::time::ambient_now().to_rfc3339();
+        let now = crate::time::compat::rfc3339(crate::time::ambient_now());
         task.last_run = Some(now.clone());
         task.last_fired_at = Some(now);
         task.last_duration_ms = Some(duration_ms);
@@ -2100,7 +2091,6 @@ impl ConfigProperties {
         let profile = config.profile.as_deref().unwrap_or("default");
         let defaults = crate::config::AutumnConfig::default();
 
-        // Avoids dynamic reallocation since we know roughly how many config properties are tracked.
         let mut props = HashMap::with_capacity(32);
         let profile_str = profile.to_string();
 
@@ -2533,7 +2523,6 @@ impl ConfigProperties {
         default_value: &str,
         profile: &str,
     ) {
-        // Check if there's an env var override
         let env_key = format!("AUTUMN_{}", key.replace('.', "__").to_uppercase());
         let source = if std::env::var(&env_key).is_ok() {
             env_key
@@ -3058,7 +3047,6 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
 ) -> impl IntoResponse {
     let detailed = state.health_detailed();
 
-    // ── built-in db component ────────────────────────────────────
     let db_component = async {
         #[cfg(feature = "db")]
         {
@@ -3097,7 +3085,6 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
         }
     };
 
-    // ── registered custom indicators ───────────────────────────
     let indicators = async {
         if let Some(registry) = state.health_indicator_registry() {
             registry.run_all().await
@@ -3110,7 +3097,6 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     let ((db_component_status, db_check), indicator_results) =
         tokio::join!(db_component, indicators);
 
-    // ── aggregate status ────────────────────────────────────────
     let mut all_statuses: Vec<HealthStatus> =
         indicator_results.iter().map(|r| r.output.status).collect();
     if let Some(s) = db_component_status {
@@ -3118,7 +3104,6 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     }
     let overall = HealthIndicatorRegistry::aggregate_status(&all_statuses);
 
-    // ── build components map ────────────────────────────────────
     let components = build_health_components(
         db_component_status,
         db_check.as_ref(),
@@ -3215,9 +3200,8 @@ pub(crate) async fn info<S: ProvideActuatorState + Send + Sync + 'static>(
 ) -> Json<ActuatorInfo> {
     Json(ActuatorInfo {
         app: AppInfo {
-            // Read the consuming app's compile-time name/version (baked in by
-            // `#[autumn_web::main]`), not a runtime `std::env::var` lookup that
-            // always failed in a released binary (issue #1242).
+            // The app's compile-time name/version, baked in by `#[autumn_web::main]`. A runtime
+            // `std::env::var` lookup fails in a released binary (#1242).
             name: crate::build_info::app_name(),
             version: crate::build_info::app_version(),
         },
@@ -3304,13 +3288,11 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
     let snapshot = state.metrics().snapshot();
     let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
 
-    // Include read-through cache stampede-protection counters (always
-    // present; the read-through API works standalone without app state).
+    // Always present: the read-through API works standalone, without app state.
     if let serde_json::Value::Object(ref mut map) = result {
         map.insert("cache".to_string(), cache_metrics_json());
     }
 
-    // Include DB pool stats if available
     #[cfg(feature = "db")]
     if let Some(pool) = state.pool() {
         let status = pool.status();
@@ -3324,7 +3306,6 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
         }
     }
 
-    // Include per-shard pool stats keyed by shard name
     #[cfg(feature = "db")]
     if let Some(shards) = state.shards() {
         let mut shard_stats = serde_json::Map::new();
@@ -3363,7 +3344,6 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
 
     insert_app_metrics(&mut result);
 
-    // Include plugin-contributed sources under the "sources" key
     if let Some(registry) = state.metrics_source_registry() {
         let all = registry.collect_all();
         let mut sources = serde_json::Map::new();
@@ -3547,11 +3527,9 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 46] = [
     "autumn_http_requests_total",
     "autumn_http_requests_active",
     "autumn_http_responses_total",
-    // A histogram owns its derived `_bucket`/`_sum`/`_count` names, and a
-    // summary owns `_sum`/`_count`, even when this exporter writes only
-    // quantile lines. A second family under a derived name gives the document
-    // two `# HELP` lines for one family. Prometheus then rejects the *whole*
-    // scrape, not just that family.
+    // A histogram owns its `_bucket`/`_sum`/`_count` names and a summary owns `_sum`/`_count`, even
+    // when only quantile lines are written. A second family under a derived name duplicates
+    // `# HELP`, and Prometheus then rejects the whole scrape.
     HTTP_DURATION_FAMILY,
     "autumn_http_request_duration_seconds_bucket",
     "autumn_http_request_duration_seconds_sum",
@@ -3598,17 +3576,23 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 46] = [
 ];
 
 /// Returns true if `s` is a valid Prometheus metric name (`[a-zA-Z_:][a-zA-Z0-9_:]*`).
+///
+/// Read by byte: the grammar is ASCII, and every byte of a character outside
+/// ASCII is `0x80` or more, which the grammar does not hold.
 pub(crate) fn is_valid_metric_name(s: &str) -> bool {
-    let mut it = s.chars();
-    matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':')
-        && it.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+    let mut it = s.bytes();
+    matches!(it.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_' || b == b':')
+        && it.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
 }
 
 /// Returns true if `s` is a valid Prometheus label name (`[a-zA-Z_][a-zA-Z0-9_]*`).
+///
+/// Read by byte, as [`is_valid_metric_name`] is. An app metric checks each
+/// label name on each `with_label`.
 pub(crate) fn is_valid_label_name(s: &str) -> bool {
-    let mut it = s.chars();
-    matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-        && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let mut it = s.bytes();
+    matches!(it.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
+        && it.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Escape a Prometheus label value (backslash, newline, and double-quote).
@@ -3758,7 +3742,6 @@ fn write_admission_metrics(
 ) {
     use std::fmt::Write as _;
 
-    // autumn_requests_shed_total
     out.push_str(
         "# HELP autumn_requests_shed_total \
          HTTP requests rejected by admission control because the in-flight count was at its limit\n",
@@ -3821,7 +3804,6 @@ fn write_builtin_http_metrics(
 ) {
     use std::fmt::Write;
 
-    // requests_total
     out.push_str("# HELP autumn_http_requests_total Total number of HTTP requests\n");
     out.push_str("# TYPE autumn_http_requests_total counter\n");
     let _ = writeln!(
@@ -3830,7 +3812,6 @@ fn write_builtin_http_metrics(
         snapshot.http.requests_total
     );
 
-    // requests_active
     out.push_str("# HELP autumn_http_requests_active Currently active HTTP requests\n");
     out.push_str("# TYPE autumn_http_requests_active gauge\n");
     let _ = writeln!(
@@ -3839,7 +3820,6 @@ fn write_builtin_http_metrics(
         snapshot.http.requests_active
     );
 
-    // by_status
     out.push_str("# HELP autumn_http_responses_total HTTP responses by status code\n");
     out.push_str("# TYPE autumn_http_responses_total counter\n");
     for (status, count) in [
@@ -3858,7 +3838,6 @@ fn write_builtin_http_metrics(
 
     write_http_duration_quantiles(out, labels, snapshot);
 
-    // autumn_shutdown_aborted_requests_total
     out.push_str(
         "# HELP autumn_shutdown_aborted_requests_total \
          HTTP requests forcibly dropped when the graceful-shutdown drain deadline expired\n",
@@ -3870,7 +3849,6 @@ fn write_builtin_http_metrics(
         snapshot.http.shutdown_aborted_requests_total
     );
 
-    // autumn_request_timeouts_total
     out.push_str(
         "# HELP autumn_request_timeouts_total \
          HTTP requests that exceeded the configured per-request timeout\n",
@@ -3882,7 +3860,6 @@ fn write_builtin_http_metrics(
         snapshot.http.request_timeouts_total
     );
 
-    // autumn_read_your_writes_pins_total
     out.push_str(
         "# HELP autumn_read_your_writes_pins_total \
          Replica reads redirected to the primary by the read-your-own-writes pin\n",
@@ -3895,7 +3872,6 @@ fn write_builtin_http_metrics(
     );
 
     write_admission_metrics(out, labels, &snapshot.http);
-    // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
         out.push_str("# TYPE autumn_http_route_requests_total counter\n");
@@ -4422,12 +4398,9 @@ fn write_app_series(out: &mut String, name: &str, series: &crate::metrics::Serie
             sum,
             ref buckets,
         } => {
-            // Every bucket line carries the same user labels with `le` appended
-            // last, so the shared prefix — everything up to but not including
-            // the closing brace — is rendered once and reused. `rendered` is
-            // either empty or ends in the ASCII `}`, so the slice is always on
-            // a character boundary. `le` values are generated by the facade
-            // (decimal bounds and the literal `+Inf`) and need no escaping.
+            // Bucket lines share the user labels with `le` appended last, so the prefix (everything
+            // before the closing `}`) is rendered once. `rendered` is empty or ends in ASCII `}`,
+            // so the slice is on a char boundary. Facade-generated `le` values need no escaping.
             let prefix = rendered
                 .strip_suffix('}')
                 .map_or_else(|| "{le=\"".to_string(), |inner| format!("{inner},le=\""));
@@ -4481,9 +4454,8 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     State(state): State<S>,
 ) -> impl IntoResponse {
     let snapshot = state.metrics().snapshot();
-    // Deploy-version label so a canary controller can compare canary vs. stable
-    // cohorts, plus the role label of a preset. Escaped defensively in case an
-    // operator sets an exotic value via AUTUMN_DEPLOY_VERSION.
+    // The deploy-version label lets a canary controller compare cohorts; a preset adds its role
+    // label. Escaped in case AUTUMN_DEPLOY_VERSION holds an exotic value.
     let labels = framework_metric_labels(&state.deploy_version(), state.process_role().as_ref());
     let mut out = String::with_capacity(2048);
 
@@ -4600,7 +4572,6 @@ pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>
 ) -> impl IntoResponse {
     let level = body.level.to_lowercase();
 
-    // Validate the level
     if !AVAILABLE_LEVELS.contains(&level.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
@@ -4615,8 +4586,7 @@ pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>
         );
     }
 
-    // Validate the target name the same way, so a name carrying an `EnvFilter`
-    // metacharacter is rejected before it can reach the subscriber (issue #1044).
+    // Reject a name carrying an `EnvFilter` metacharacter before it reaches the subscriber (#1044).
     if !is_valid_logger_name(&name) {
         return (
             StatusCode::BAD_REQUEST,
@@ -4630,9 +4600,8 @@ pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>
         );
     }
 
-    // Base the response on the *actual* apply outcome, never on handle presence:
-    // a change that failed to reach the live subscriber must not report `ok`
-    // (issue #1044).
+    // Report the actual apply outcome, not handle presence: a change that failed to reach the live
+    // subscriber must not report `ok` (#1044).
     match state.log_levels().set_logger_level(&name, &level) {
         LogLevelChange::Applied { previous } => (
             StatusCode::OK,
@@ -4793,16 +4762,12 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
 pub(crate) async fn derivations_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> axum::response::Response {
-    // The control pool is one target among several: a shard-only deployment
-    // (`[[database.shards]]` with no control role, which the config accepts)
-    // has none, and its derivations live on the shards. Only a process with
-    // no database at all is a 503.
+    // A shard-only deployment has no control pool; its derivations live on the shards. Only a
+    // process with no database at all is a 503.
     let mut report = Vec::new();
     if let Some(pool) = state.pool() {
-        // The control target fails the same way a shard does: one error row,
-        // so a control pool that cannot be reached does not hide the shards
-        // that maintain the derivations. Only a process with no shards at all
-        // turns a control failure into the response's own status.
+        // A control failure is one error row, like a shard's, so it does not hide the shards. Only
+        // with no shards does it become the response status.
         let statuses = match pool.get().await {
             Ok(mut conn) => crate::derivation::derivation_status(&mut conn).await,
             Err(error) => Err(crate::AutumnError::from(std::io::Error::other(
@@ -4839,11 +4804,8 @@ pub(crate) async fn derivations_endpoint<S: ProvideActuatorState + Send + Sync +
         )
             .into_response();
     }
-    // A sharded app maintains its derivations on every shard primary (that is
-    // where the tenant rows live, and where startup reconciles and sweeps), so
-    // the control database alone would report a clean slate while a shard sat
-    // pending or drifted. One shard that cannot answer is reported as such
-    // rather than hiding the rest.
+    // A sharded app maintains its derivations on every shard primary, so the control database alone
+    // would miss a pending or drifted shard. A shard that cannot answer gets its own error row.
     if let Some(shards) = state.shards() {
         for shard in shards.iter() {
             let target = shard.name();
@@ -5238,7 +5200,7 @@ pub(crate) async fn webhooks_replay_endpoint<S: ProvideActuatorState + Send + Sy
             .into_response();
     }
 
-    // Enqueue background delivery job now that the log state is safely reset in the store
+    // Enqueue only once the log state is reset in the store.
     if let Err(message) = enqueue_webhook_replay_job(&body.log_id).await {
         if let Err(rollback_error) = manager.store().replace_delivery_log(original_log).await {
             tracing::error!(
@@ -5505,15 +5467,10 @@ pub(crate) fn actuator_endpoint_paths(
         #[cfg(feature = "http-client")]
         {
             paths.push(actuator_route_path(prefix, "/webhooks/dlq"));
-            // `/webhooks/replay` is mounted as `POST` (see
-            // `actuator_mutating_routes`), not `GET`, but it is included in this
-            // path set because the runtime startup barrier seeds its actuator
-            // allow-list from this helper (`StartupBarrierState::from_config`).
-            // Without it, the `POST {prefix}/webhooks/replay` mount would no
-            // longer bypass the startup barrier. The GET-only route listing
-            // (`append_framework_routes`) excludes any path also produced by
-            // `actuator_mutating_routes`, so this does not surface as a phantom
-            // GET there.
+            // `/webhooks/replay` is POST-only, but the startup barrier seeds its allow-list from
+            // this helper (`StartupBarrierState::from_config`): without it the POST mount would not
+            // bypass the barrier. The GET route listing (`append_framework_routes`) excludes
+            // mutating routes, so it shows no phantom GET.
             paths.push(actuator_route_path(prefix, "/webhooks/replay"));
         }
         #[cfg(feature = "ws")]
@@ -5721,7 +5678,7 @@ pub(crate) fn actuator_router_with_prefix<
         }
     }
 
-    // Nova: Add HTMX UI endpoints available unconditionally like metrics
+    // The UI is mounted whether or not sensitive endpoints are, like metrics.
     router
         .route(
             &actuator_route_path(prefix, "/ui"),
@@ -5736,6 +5693,15 @@ pub(crate) fn actuator_router_with_prefix<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The UTC instant at the given wall clock time.
+    fn utc_instant(y: i16, mo: i8, d: i8, h: i8, mi: i8, sec: i8) -> crate::time::Timestamp {
+        crate::time::civil::date(y, mo, d)
+            .at(h, mi, sec, 0)
+            .to_zoned_datetime(crate::time::tz::TimeZone::UTC)
+            .expect("a valid UTC date-time")
+            .timestamp()
+    }
     use crate::config::AutumnConfig;
 
     #[test]
@@ -5849,7 +5815,6 @@ mod tests {
         registry.register_on_queue("reset_email", "critical");
         registry.register_on_queue("reindex", "bulk");
 
-        // Enqueue two on `critical`, one on `bulk`.
         registry.record_enqueue("reset_email");
         registry.record_enqueue("reset_email");
         registry.record_enqueue("reindex");
@@ -5870,11 +5835,9 @@ mod tests {
             "a job waiting for ~5ms must report a positive age"
         );
 
-        // Starting a critical job drops the queue depth.
         registry.record_start("reset_email");
         assert_eq!(registry.queue_snapshot().get("critical").unwrap().depth, 1);
 
-        // Draining everything leaves depth 0 and age 0.
         registry.record_start("reset_email");
         registry.record_start("reindex");
         let drained = registry.queue_snapshot();
@@ -5897,7 +5860,6 @@ mod tests {
         assert_eq!(registry.queue_snapshot().get("default").unwrap().depth, 1);
         let status = registry.snapshot().get("ghost").cloned().unwrap();
         assert_eq!((status.queued, status.in_flight), (1, 1));
-        // A first enqueue lands as exactly one queued job, all else empty.
         registry.record_enqueue("fresh");
         let fresh = registry.snapshot().get("fresh").cloned().unwrap();
         assert_eq!(fresh.queued, 1);
@@ -5934,24 +5896,19 @@ mod tests {
     /// depths, and years of waiting age, for identical state.
     #[test]
     fn installing_a_clock_reaches_registry_clones() {
-        use chrono::{TimeZone, Utc};
-
-        // Clone first, install second — the order that used to diverge.
+        // Clone before the clock is installed.
         let registry = JobRegistry::new();
         let earlier_clone = registry.clone();
         registry.register_on_queue("probe", "default");
 
-        // Behind real time, like a sim epoch. That direction is what separates
-        // the two handles: a deadline one virtual minute past a 2020 epoch is
-        // still years behind a real-clock reading, so a stale clone calls it
-        // ready while the injected one correctly calls it scheduled. An epoch
-        // *ahead* of real time would have both answer "not yet" and prove
-        // nothing.
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        // An epoch behind real time, like a sim epoch: a deadline a minute past it is years behind
+        // a real-clock reading, so a clone reading real time would call it ready while the injected
+        // clock calls it scheduled. An epoch ahead of real time would prove nothing.
+        let epoch = utc_instant(2020, 1, 1, 0, 0, 0);
         let registry = registry.with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
 
         // A job due a minute after the injected epoch: scheduled, not ready.
-        let ready_at = u64::try_from(epoch.timestamp_millis()).unwrap() + 60_000;
+        let ready_at = u64::try_from(epoch.as_millisecond()).unwrap() + 60_000;
         registry.record_enqueue_scheduled("probe", ready_at);
 
         let through_new = registry.queue_snapshot();
@@ -5984,20 +5941,18 @@ mod tests {
     /// pinned ahead of the database, or zero when it is behind.
     #[test]
     fn a_surveyed_age_survives_the_rebase_onto_the_registry_clock() {
-        use chrono::{TimeZone, Utc};
-
         // The database reports its oldest ready job has waited 5s.
         const DB_AGE_MS: u64 = 5_000;
 
         // A clock pinned far from real time in each direction, so a leaked
         // real-vs-injected subtraction cannot coincidentally pass.
         for year in [1999, 2036] {
-            let epoch = Utc.with_ymd_and_hms(year, 6, 1, 12, 0, 0).unwrap();
+            let epoch = utc_instant(year, 6, 1, 12, 0, 0);
             let registry = JobRegistry::new()
                 .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
             registry.register_on_queue("probe", "default");
 
-            let registry_now = u64::try_from(epoch.timestamp_millis()).unwrap();
+            let registry_now = u64::try_from(epoch.as_millisecond()).unwrap();
             let survey = HashMap::from([(
                 "default".to_string(),
                 (3u64, Some(ready_at_from_age(registry_now, DB_AGE_MS))),
@@ -6036,35 +5991,24 @@ mod tests {
     /// boundary; trying each mark's own plausible timeline directly cannot.
     #[test]
     fn cancel_at_backend_offset_falls_back_to_the_nearest_of_its_three_timelines() {
-        use chrono::{TimeZone, Utc};
-
-        // An arbitrary "backend now" reference, unrelated to either pinned
-        // registry clock below — standing in for a Postgres `clock_timestamp()`
-        // reading, which a real cancel would supply.
+        // An arbitrary backend `clock_timestamp()` reading, unrelated to either registry clock.
         const BACKEND_NOW_MS: u64 = 1_800_000_000_000;
-        // An arbitrary absolute due-at instant, far from every other value
-        // used here, standing in for an `enqueue_at(some_instant)` mark.
+        // An arbitrary absolute due-at for an `enqueue_at` mark, far from every other value.
         const ABSOLUTE_MARK_MS: u64 = 9_999_999_999_999;
 
         for year in [1999, 2036] {
-            let epoch = Utc.with_ymd_and_hms(year, 6, 1, 12, 0, 0).unwrap();
-            let epoch_ms = u64::try_from(epoch.timestamp_millis()).unwrap();
+            let epoch = utc_instant(year, 6, 1, 12, 0, 0);
+            let epoch_ms = u64::try_from(epoch.as_millisecond()).unwrap();
             let registry = JobRegistry::new()
                 .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(epoch)));
             registry.register_on_queue("immediate_job", "mail");
             registry.register_on_queue("relative_job", "mail");
             registry.register_on_queue("absolute_job", "mail");
 
-            // Three marks, three timelines — mirroring how the three enqueue
-            // shapes actually stamp a Postgres-backed job's registry mark.
-            // Pushed via the plain (non-`_pg_`) enqueue methods, so no exact
-            // mark is noted under any id: every cancel below must resolve
-            // through the candidate fallback, not the exact lookup. Asserted
-            // via `waiting_marks_for_test` rather than `queue_snapshot`'s
-            // depth: that method buckets marks against its own `now_ms()`
-            // (the registry's pinned clock here), which — unrelated to the
-            // fix under test — would itself misjudge a mark stamped on a
-            // wildly different timeline as "not yet ready".
+            // One mark per timeline, as each enqueue shape stamps a Postgres job's mark. The plain
+            // enqueue methods note no exact mark, so every cancel below goes through the candidate
+            // fallback. Checked via `waiting_marks_for_test`: `queue_snapshot` buckets marks
+            // against the pinned clock and would misjudge marks from another timeline as not ready.
             registry.record_enqueue("immediate_job");
             registry.record_enqueue_scheduled("relative_job", BACKEND_NOW_MS + 3_600_000);
             registry.record_enqueue_scheduled("absolute_job", ABSOLUTE_MARK_MS);
@@ -6074,9 +6018,8 @@ mod tests {
                 "all three marks pushed onto the shared queue"
             );
 
-            // Cancel the relative-delay job: offset ~+1h from BACKEND_NOW_MS
-            // (real time). No `run_at` supplied (irrelevant to this branch).
-            // "no-exact-mark" is an unregistered id, forcing the fallback.
+            // Relative-delay job: offset ~+1h from BACKEND_NOW_MS. "no-exact-mark" is an unknown id,
+            // forcing the fallback.
             registry.record_cancel_at_backend_offset(
                 "relative_job",
                 "no-exact-mark",
@@ -6108,9 +6051,8 @@ mod tests {
                  its own registry-clock mark and leave the absolute mark intact"
             );
 
-            // Cancel the absolute job: `run_at` supplied verbatim, matching
-            // ABSOLUTE_MARK_MS exactly regardless of the (irrelevant, and
-            // here deliberately wrong) offset/real-reference pair.
+            // Absolute job: `run_at` is matched verbatim, whatever the (deliberately wrong)
+            // offset/reference pair.
             registry.record_cancel_at_backend_offset(
                 "absolute_job",
                 "no-exact-mark",
@@ -6164,11 +6106,8 @@ mod tests {
             "both marks pushed onto the shared queue"
         );
 
-        // Cancel job-a: its offset/real-reference pair is deliberately
-        // chosen so the *fallback* candidate (9_999 + 0 = 9_999) collides
-        // exactly with job-b's mark, not job-a's own (5_000). Without the
-        // exact-by-id lookup, nearest-match would remove job-b's mark
-        // instead (distance 0 beats 5_000's distance of 4_999).
+        // The fallback candidate (9_999 + 0) lands on job-b's mark, not job-a's own (5_000).
+        // Without the exact-by-id lookup, nearest-match would remove job-b's mark.
         registry.record_cancel_at_backend_offset("relative_job", "job-a-id", None, 9_999, 0);
         assert_eq!(
             registry.waiting_marks_for_test("relative_job"),
@@ -6267,21 +6206,17 @@ mod tests {
     /// than judged against both; this still exercises the same scenario.)
     #[test]
     fn note_pg_job_mark_eviction_judges_a_real_timeline_mark_against_real_time_only() {
-        use chrono::{TimeZone, Utc};
-
         let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
-            crate::time::FixedClock::at(Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap()),
+            crate::time::FixedClock::at(utc_instant(2100, 1, 1, 0, 0, 0)),
         ));
         registry.register_on_queue("skewed", "mail");
 
-        let real_now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
-        // 5 real-world minutes out — genuinely not due yet — but a "small"
-        // number next to the registry's year-2100 reading, which is exactly
-        // what made the single-clock check call it due in error.
+        let real_now = u64::try_from(crate::time::Timestamp::now().as_millisecond()).unwrap();
+        // 5 real minutes out, so not due, but small next to the registry's year-2100 reading: a
+        // check against the registry clock alone would call it due.
         let genuinely_delayed = real_now + 300_000;
 
-        // Inserted first, so plain FIFO (and the single-clock check) would
-        // pick it first.
+        // Inserted first, so FIFO (or a registry-clock-only check) would evict it first.
         registry.record_pg_enqueue(
             "skewed",
             "still-delayed",
@@ -6330,14 +6265,12 @@ mod tests {
     /// ([`PgMarkTimeline`]) that actually measures it.
     #[test]
     fn note_pg_job_mark_eviction_judges_a_real_timeline_mark_even_when_the_registry_clock_lags() {
-        use chrono::{TimeZone, Utc};
-
         let registry = JobRegistry::new().with_clock(std::sync::Arc::new(
-            crate::time::FixedClock::at(Utc.with_ymd_and_hms(2000, 1, 1, 0, 0, 0).unwrap()),
+            crate::time::FixedClock::at(utc_instant(2000, 1, 1, 0, 0, 0)),
         ));
         registry.register_on_queue("lagging", "mail");
 
-        let real_now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+        let real_now = u64::try_from(crate::time::Timestamp::now().as_millisecond()).unwrap();
         // An hour out in real time — genuinely not due yet — inserted
         // first, so plain FIFO would evict it first.
         let far_future = real_now + 3_600_000;
@@ -6478,12 +6411,9 @@ mod tests {
         // Original enqueue: pushes mark_a and notes it under "job-id".
         registry.record_pg_enqueue("flaky_job", "job-id", Some(MARK_A), PgMarkTimeline::Real);
 
-        // The job starts: use plain `record_start` (not `record_pg_start`)
-        // to pop mark_a from the queue while deliberately leaving "job-id"'s
-        // exact entry in place, simulating a caller that pushed a waiting
-        // mark outside the `record_pg_start`/`record_pg_enqueue` pair — the
-        // one way an entry can still go stale — so this test exercises the
-        // fallback in isolation from that pair's own bookkeeping.
+        // Plain `record_start` pops mark_a but leaves "job-id"'s exact entry, as a caller pushing
+        // marks outside the `record_pg_start`/`record_pg_enqueue` pair would. That is how an entry
+        // goes stale, and it isolates the fallback from the pair's own bookkeeping.
         registry.record_start("flaky_job");
         assert_eq!(
             registry.waiting_marks_for_test("flaky_job"),
@@ -6491,13 +6421,9 @@ mod tests {
             "record_start must have popped mark_a"
         );
 
-        // The job fails non-terminally and is requeued as a retry: a new
-        // mark is pushed under the same job name via the plain
-        // `record_enqueue_scheduled` primitive, without updating "job-id"'s
-        // exact entry — exercising the fallback directly, for whichever
-        // caller pushes a retry mark this way rather than through
-        // `record_pg_enqueue` (see `pg_retry_refreshes_the_exact_mark_so_a_racing_cancel_does_not_hit_a_coincidental_collision`
-        // in job.rs for the production retry-lifecycle path, which now does).
+        // A retry pushed through the plain primitive leaves "job-id"'s exact entry stale. The
+        // production retry path uses `record_pg_enqueue` (see job.rs
+        // `pg_retry_refreshes_the_exact_mark_so_a_racing_cancel_does_not_hit_a_coincidental_collision`).
         registry.record_enqueue_scheduled("flaky_job", MARK_B);
 
         // Cancel "job-id": the exact lookup finds the stale mark_a, which
@@ -6596,10 +6522,8 @@ mod tests {
         registry.register_on_queue("nightly_report", "reports");
         registry.register_on_queue("send_email", "reports");
 
-        // A job scheduled for the future is not yet claimable, so it must not
-        // count toward ready queue depth or age the queue: future-dated jobs
-        // enqueued via enqueue_in/enqueue_at were reporting phantom backlog and
-        // could trip false autoscaling/alerting on /actuator/jobs.
+        // A future-scheduled job is not claimable, so it must not count toward ready depth or age:
+        // phantom backlog would trip autoscaling and alerts on /actuator/jobs.
         let far_future = now_epoch_ms() + 60_000;
         registry.record_enqueue_scheduled("nightly_report", far_future);
 
@@ -6658,11 +6582,8 @@ mod tests {
 
     #[test]
     fn canceling_a_scheduled_job_preserves_a_coqueued_ready_mark() {
-        // Reproduces the durable admin-cancel gap: when an operator cancels a
-        // still-scheduled (delayed) job that shares a queue with a ready job,
-        // the cancel must remove the *scheduled* waiting mark, not the ready
-        // one. Popping the ready mark (via the ready removal path) would report
-        // the queue depth one too low while the ready job is still waiting.
+        // Canceling a scheduled job that shares a queue with a ready job must remove the scheduled
+        // mark. Popping the ready one would report depth one too low while it still waits.
         let registry = JobRegistry::new();
         registry.register_on_queue("nightly_report", "reports");
         registry.register_on_queue("send_email", "reports");
@@ -6678,9 +6599,8 @@ mod tests {
             "only the ready job counts toward ready depth"
         );
 
-        // Cancel the scheduled job (the durable backend signals this because it
-        // removed the job from its delayed set). The scheduled removal path must
-        // consume the future mark and leave the ready job's mark intact.
+        // The durable backend signals this after removing the job from its delayed set. The
+        // scheduled path must consume the future mark and leave the ready one.
         registry.record_cancel_scheduled("nightly_report");
         assert_eq!(
             registry.queue_snapshot().get("reports").unwrap().depth,
@@ -6700,8 +6620,6 @@ mod tests {
 
     #[test]
     fn canceling_a_ready_job_removes_a_ready_mark() {
-        // No-regression companion: canceling a ready (immediately-runnable) job
-        // removes a ready mark, so the queue depth drops by exactly one.
         let registry = JobRegistry::new();
         registry.register_on_queue("send_email", "mail");
 
@@ -6757,13 +6675,9 @@ mod tests {
 
     #[test]
     fn deduplicating_a_scheduled_duplicate_preserves_a_coqueued_ready_mark() {
-        // Reproduces the dedup category gap (sibling of the #965 cancel fix):
-        // when a delayed (scheduled) duplicate coalesces on a queue that also
-        // holds a ready job, the dedup must remove the *scheduled* waiting mark,
-        // not the ready one. The failing order is "delayed duplicate enqueued
-        // first, ready job second": the old unconditional `pop_back` removed the
-        // most-recent (ready) mark, reporting ready depth 0 while ready work was
-        // still waiting.
+        // Like the #965 cancel fix: a delayed duplicate coalescing on a queue that also holds a
+        // ready job must remove the scheduled mark, not the ready one. Delayed first, ready second
+        // is the order an unconditional `pop_back` gets wrong.
         let registry = JobRegistry::new();
         registry.register_on_queue("nightly_report", "reports");
         registry.register_on_queue("send_email", "reports");
@@ -6787,10 +6701,8 @@ mod tests {
             "the ready job ages the queue before the dedup"
         );
 
-        // The delayed duplicate coalesces: it recorded a scheduled enqueue mark
-        // (had_enqueue_mark = true, was_scheduled = true), so the removal must
-        // consume the future mark and leave the ready job's mark intact. Under
-        // the old `pop_back` this stole the ready mark (depth 0) — the RED case.
+        // The delayed duplicate recorded a scheduled mark (had_enqueue_mark, was_scheduled), so the
+        // removal must consume the future mark and leave the ready one.
         registry.record_deduplicated("nightly_report", true, true);
         let after = registry.queue_snapshot();
         assert_eq!(
@@ -6994,7 +6906,7 @@ mod tests {
             max_attempts: 5,
             is_dlq: true,
             last_error: Some("server returned status: 503".to_string()),
-            timestamp: chrono::Utc::now(),
+            timestamp: crate::time::ambient_now(),
         }
     }
 
@@ -7871,10 +7783,8 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
             Box::leak(value.into_boxed_str())
         }
 
-        // Use the repo's real HEAD so this exercises AC #2's contract: the
-        // reported commit equals `git rev-parse HEAD` of the source tree.
-        // During cargo mutants runs, the .git directory is stripped, so fallback
-        // to a default value if git rev-parse fails.
+        // Use the repo's real HEAD: the reported commit must equal `git rev-parse HEAD`. cargo
+        // mutants strips .git, so fall back to a default when git fails.
         let head = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .output()
@@ -7913,14 +7823,13 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        // AC #3: app.name/version reflect the consuming app's compile-time
-        // values, not "unknown".
+        // app.name/version are the app's compile-time values, not "unknown".
         assert_eq!(json["app"]["name"], "provenance_probe_app");
         assert_eq!(json["app"]["version"], "9.9.9");
         assert_ne!(json["app"]["version"], "unknown");
 
-        // AC #1/#2: build object carries full + short SHA, branch, dirty bool,
-        // and an ISO-8601 UTC build timestamp; commit equals real HEAD.
+        // The build object carries full and short SHA, branch, dirty flag and an ISO-8601 UTC build
+        // timestamp; the commit is the real HEAD.
         assert_eq!(json["build"]["git"]["commit"], head);
         assert_eq!(json["build"]["git"]["commit_short"], short);
         assert_eq!(json["build"]["git"]["branch"], "provenance-branch");
@@ -8156,9 +8065,8 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[tokio::test]
     async fn actuator_graph_serves_the_installed_graph_over_http() {
-        // End to end: install a graph, mount the real sensitive router, GET it.
-        // The install-site guard is
-        // `app::tests::graph_installed_before_every_router_build`.
+        // End to end: install a graph, mount the sensitive router, GET it.
+        // `app::tests::graph_installed_before_every_router_build` guards the install site.
         let state = crate::AppState::test_default();
         crate::graph::install(
             &state,
@@ -8323,13 +8231,9 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // Postgres-only: the fixture gives one shard a DISTINCT replica_url, and
-    // both layers refuse that on SQLite — `database_backend_consistency` at
-    // config time, `reject_unusable_sqlite_replica` at topology build. The
-    // replica is the blocker: native sharding is Postgres-only too, but it is
-    // refused at BOOT rather than by the topology builder, so the shards alone
-    // would not fail here. Same treatment `db::`'s replica tests got, rather
-    // than a fixture swap that would assert a configuration production refuses.
+    // Postgres-only: the fixture gives a shard a distinct replica_url, which SQLite refuses at
+    // config time (`database_backend_consistency`) and at topology build
+    // (`reject_unusable_sqlite_replica`).
     #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
     #[cfg(feature = "db")]
@@ -8397,13 +8301,9 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
         let mut state = test_state();
 
-        // `RuntimeConnection` is `AsyncPgConnection` in the default build and a
-        // SQLite connection under `--features sqlite`, and this test RUNS on
-        // both. It builds the manager directly rather than through
-        // `create_pool`, so nothing would refuse a target meant for the other
-        // backend — hence the target comes from `test_urls`, not a literal.
-        // Only pool metrics are exercised; deadpool is lazy, so no connection
-        // is opened.
+        // `RuntimeConnection` differs per backend and this test runs on both. Building the manager
+        // directly skips `create_pool`'s backend check, so the URL comes from `test_urls`. deadpool
+        // is lazy, so no connection is opened.
         let manager = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
             crate::test_urls::primary("actuator_metrics"),
         );
@@ -8687,11 +8587,8 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // `test_state()` has no reload-capable subscriber wired in, so the
-        // endpoint honestly reports the change was recorded but not applied
-        // rather than a false-positive `ok` (issue #1044). A live-subscriber
-        // integration test (`actuator_loggers_live_reload`) covers the `ok`
-        // path with a real reloadable subscriber.
+        // `test_state()` has no reloadable subscriber, so the change is recorded, not applied
+        // (#1044). `actuator_loggers_live_reload` covers the `ok` path.
         assert_eq!(json["status"], "recorded");
         assert_eq!(json["applied"], false);
 
@@ -8727,12 +8624,9 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[tokio::test]
     async fn actuator_loggers_put_rejects_invalid_name() {
-        // A logger name carrying an `EnvFilter` metacharacter (`=`) must be
-        // rejected up front (400) — never applied, never recorded — so the
-        // endpoint cannot claim success for a directive the subscriber would
-        // reject (issue #1044). Other metacharacters (`,`, whitespace) too.
-        // `has%20space` is percent-encoded whitespace: axum's `Path` extractor
-        // decodes it back to a space, which the validator must still reject.
+        // A name carrying an `EnvFilter` metacharacter (`=`, `,`, whitespace) is rejected with 400
+        // and never recorded (#1044). axum's `Path` decodes `has%20space` to a space, which must
+        // still be rejected.
         let state = test_state();
         for bogus in ["a=b", "a,b", "has%20space", "a::b=trace"] {
             let app = actuator_router(true).with_state(state.clone());
@@ -8760,7 +8654,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
             assert_eq!(json["status"], "error");
         }
 
-        // And GET /loggers must NOT then list any of the bogus overrides.
+        // GET /loggers must not list any of the bogus overrides.
         let app = actuator_router(true).with_state(state.clone());
         let resp = app
             .oneshot(
@@ -8784,12 +8678,8 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[tokio::test]
     async fn actuator_loggers_put_accepts_dotted_and_hyphenated_names() {
-        // Real-world `tracing` targets from third-party crates and custom
-        // targets carry `.` and `-` (e.g. `tower-http`, `my.custom.target`,
-        // `h2::proto`). These are valid inside a target and are *not*
-        // `EnvFilter` directive metacharacters, so a PUT to such a name must
-        // NOT be rejected as invalid (400) — it reaches the normal
-        // apply/record path (200) and is recorded as an override.
+        // `.` and `-` appear in real targets (`tower-http`, `my.custom.target`) and are not
+        // `EnvFilter` metacharacters, so these names are recorded, not rejected.
         let state = test_state();
         for name in ["tower-http", "my.custom.target", "h2::proto"] {
             let app = actuator_router(true).with_state(state.clone());
@@ -8814,9 +8704,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
                 .await
                 .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            // No live subscriber is attached in `test_state()`, so a valid name
-            // takes the "recorded" path — the point is it is not the invalid
-            // "error" path.
+            // With no live subscriber a valid name is "recorded"; the point is it is not "error".
             assert_ne!(
                 json["status"], "error",
                 "valid name {name:?} must not hit the invalid-name error path"
@@ -8849,10 +8737,8 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[tokio::test]
     async fn actuator_loggers_put_applied_ok_with_live_subscriber() {
-        // Positive path: with a reload-capable subscriber installed, a valid
-        // change reports `{"status":"ok","applied":true}` end-to-end (issue
-        // #1044 AC7). Uses a no-op reload handle that accepts any valid
-        // directive, standing in for a live subscriber.
+        // With a reloadable subscriber, a valid change reports `{"status":"ok","applied":true}`
+        // (#1044). The no-op handle accepts any valid directive.
         let state = test_state();
         state
             .log_levels()
@@ -8921,9 +8807,8 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[test]
     fn root_level_change_preserves_startup_per_target_directives() {
-        // Regression: an app configured with a full `EnvFilter` directive at
-        // startup must not lose its per-target directives when
-        // `PUT /actuator/loggers/root` replaces only the global level.
+        // `PUT /actuator/loggers/root` replaces only the global level, so the startup per-target
+        // directives must survive it.
         let levels = LogLevels::new("info,tower_http=warn,my_app=debug");
         levels.attach_reload_handle(crate::telemetry::FilterReloadHandle::accept_all_for_test());
 
@@ -8965,10 +8850,8 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[test]
     fn bare_non_level_segment_is_a_trace_target_not_the_global_level() {
-        // `EnvFilter` semantics: in `info,my_app`, `info` is the global level
-        // and the bare `my_app` is a *target directive at trace*, NOT the global
-        // level. The old code took the last bare segment as the global level,
-        // which both lost `info` and set an invalid global of `my_app`.
+        // `EnvFilter` semantics: in `info,my_app`, `info` is the global level and the bare `my_app`
+        // is a target directive at trace.
         let levels = LogLevels::new("info,my_app");
         assert_eq!(levels.current_level(), "info");
         let overrides = levels.logger_overrides();
@@ -9015,8 +8898,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[test]
     fn purely_bare_level_config_has_no_target_overrides() {
-        // Regression guard: a plain level stays the global level with no
-        // spurious target overrides.
         let levels = LogLevels::new("info");
         assert_eq!(levels.current_level(), "info");
         assert!(levels.logger_overrides().is_empty());
@@ -9300,8 +9181,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         // Must not leak the default "stable" label when running as canary.
         assert!(!text.contains("version=\"stable\""));
 
-        // Verify the percentile math: values are reported in seconds (ms / 1000)
-        // and satisfy the quantile invariant p50 <= p95 <= p99.
+        // Quantiles are reported in seconds (ms / 1000) and satisfy p50 <= p95 <= p99.
         let quantile = |q: &str| -> f64 {
             let needle = format!(
                 "autumn_http_request_duration_quantiles_seconds{{version=\"canary\",quantile=\"{q}\"}} "
@@ -9339,8 +9219,8 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[tokio::test]
     async fn actuator_prometheus_available_when_export_enabled_and_nonsensitive() {
-        // Metrics export decoupled from sensitive: prometheus is reachable even
-        // though sensitive endpoints (env/configprops/loggers/tasks) are not.
+        // Metrics export is decoupled from sensitive: prometheus is reachable while
+        // env/configprops/loggers/tasks are not.
         let app = actuator_router_with_prefix("/actuator", false, true).with_state(test_state());
         let resp = app
             .clone()
@@ -9383,7 +9263,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[tokio::test]
     async fn actuator_prometheus_unavailable_when_export_disabled() {
-        // Regression: with metrics export disabled, the scrape endpoint is gone.
         let app = actuator_router_with_prefix("/actuator", false, false).with_state(test_state());
         let resp = app
             .oneshot(
@@ -9572,7 +9451,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
             let _ = levels.set_logger_level(&format!("logger_{i}"), "debug");
         }
 
-        // Try to add a new key, should be rejected
         let result = levels.set_logger_level("logger_1000", "warn");
         assert!(matches!(result, LogLevelChange::Rejected { .. }));
         assert_eq!(levels.logger_overrides().len(), 1000);
@@ -9587,7 +9465,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
             let _ = levels.set_logger_level(&format!("logger_{i}"), "debug");
         }
 
-        // Try to update an existing key, should succeed
         let change = levels.set_logger_level("logger_999", "warn");
         assert_eq!(change.previous(), Some("debug"));
         assert_eq!(levels.logger_overrides().len(), 1000);
@@ -9605,11 +9482,9 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         let registry = TaskRegistry::new();
         registry.register("my_task", "cron * * * * *");
 
-        // 1st success
         registry.record_start("my_task");
         registry.record_success("my_task", 100);
 
-        // 2nd success
         registry.record_start("my_task");
         registry.record_success("my_task", 110);
 
@@ -9618,7 +9493,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert_eq!(task.total_runs, 2);
         assert_eq!(task.total_failures, 0);
 
-        // 1st failure
         registry.record_start("my_task");
         registry.record_failure("my_task", 50, "failed");
 
@@ -9735,8 +9609,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[tokio::test]
     async fn test_actuator_router_calls_prefix_variant() {
-        // The `actuator_router` function is a convenience wrapper around `actuator_router_with_prefix`
-        // using "/actuator" as the prefix. We can test it by building it and hitting one of the endpoints.
         let app = actuator_router(false).with_state(test_state());
         let resp = app
             .oneshot(
@@ -9751,7 +9623,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // ── RED: /actuator/a11y endpoint ───────────────────────────────
+    // ── /actuator/a11y endpoint ───────────────────────────────
 
     #[tokio::test]
     async fn actuator_a11y_returns_posture_json() {
@@ -9809,7 +9681,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // Default test state should report false for all posture fields
         assert_eq!(json["lang_set"], false, "{json}");
         assert_eq!(json["skip_link_present"], false, "{json}");
         assert_eq!(json["landmark_regions_present"], false, "{json}");
@@ -10118,6 +9989,37 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert!(!is_valid_metric_name("has-hyphen"));
     }
 
+    proptest::proptest! {
+        /// The byte readers give the answer the grammar gives when it is
+        /// read by character, for any string: ASCII, other scripts, and
+        /// letters that are alphabetic but not ASCII.
+        #[test]
+        fn name_grammars_read_by_byte_match_the_grammar_by_character(
+            s in "[a-zA-Z0-9_:\\-. éßЖ中𝒜\u{0}\u{7f}\u{85}]{0,12}",
+        ) {
+            let metric_by_char = {
+                let mut it = s.chars();
+                matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == ':')
+                    && it.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+            };
+            let label_by_char = {
+                let mut it = s.chars();
+                matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                    && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            };
+            proptest::prop_assert_eq!(is_valid_metric_name(&s), metric_by_char, "{:?}", s);
+            proptest::prop_assert_eq!(is_valid_label_name(&s), label_by_char, "{:?}", s);
+        }
+    }
+
+    #[test]
+    fn name_grammars_reject_letters_outside_ascii() {
+        for name in ["é", "aé", "éa", "a\u{85}", "ж_total", "a中", "_𝒜"] {
+            assert!(!is_valid_metric_name(name), "{name}");
+            assert!(!is_valid_label_name(name), "{name}");
+        }
+    }
+
     #[test]
     fn is_valid_label_name_accepts_valid_and_rejects_invalid() {
         assert!(is_valid_label_name("shard"));
@@ -10235,12 +10137,10 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
 
-        // First sample (bad-key) must be absent entirely
         assert!(
             !text.contains("dirty_labels_metric{good=\"a\"} 1"),
             "sample with invalid label key must be skipped:\n{text}"
         );
-        // Second (clean) sample must still appear
         assert!(
             text.contains("dirty_labels_metric{good=\"a\"} 2"),
             "clean sample must appear:\n{text}"
@@ -10288,7 +10188,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
 
-        // Only the first occurrence of `env` is kept
         assert!(
             text.contains("dup_label_metric{env=\"prod\"} 5"),
             "first env value must be kept:\n{text}"
@@ -10471,8 +10370,8 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[tokio::test]
     async fn prometheus_endpoint_skips_builtin_duration_family_collision() {
-        // The new built-in latency family must be in the duplicate guard so a
-        // plugin emitting the same family cannot produce a second HELP/TYPE block.
+        // The built-in latency family must be in the duplicate guard, so a plugin emitting it
+        // cannot add a second HELP/TYPE block.
         struct ShadowLatency;
         impl MetricsSource for ShadowLatency {
             fn collect(&self) -> Vec<MetricFamily> {
@@ -10566,7 +10465,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
 
-        // First occurrence kept, second skipped
         assert!(
             text.contains("dup_series_metric{region=\"us\"} 10"),
             "first sample must appear:\n{text}"
@@ -10577,7 +10475,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         );
     }
 
-    // ── RED then GREEN: /actuator/logfile endpoint ─────────────
+    // ── /actuator/logfile endpoint ─────────────────────────
 
     fn make_log_buffer_with_entries() -> crate::log::capture::LogBuffer {
         use crate::log::capture::{CapturedLogEntry, LogBuffer};
@@ -10739,7 +10637,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[tokio::test]
     async fn green_logfile_endpoint_in_sensitive_router() {
-        // The endpoint must be reachable when sensitive=true.
         let state = test_state();
         let app = actuator_router::<TestActuatorState>(true).with_state(state);
         let resp = app
@@ -10756,7 +10653,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[tokio::test]
     async fn green_logfile_endpoint_not_in_non_sensitive_router() {
-        // The endpoint must NOT be reachable when sensitive=false.
         let state = test_state();
         let app = actuator_router::<TestActuatorState>(false).with_state(state);
         let resp = app
@@ -10847,7 +10743,6 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
             "counter must render as an integer with sorted labels in:\n{text}"
         );
 
-        // Gauge.
         assert!(
             text.contains(&format!("# TYPE {gauge_name} gauge")),
             "missing gauge TYPE in:\n{text}"
@@ -11714,7 +11609,6 @@ mod health_indicator_tests {
         assert_eq!(found.unwrap().output.status, HealthStatus::Down);
         assert_eq!(found.unwrap().output.details.get("state").unwrap(), "OPEN");
 
-        // Transition to HalfOpen manually to check status
         {
             let mut inner = breaker.inner.lock().unwrap();
             inner.state = crate::circuit_breaker::CircuitState::HalfOpen;
@@ -11767,7 +11661,7 @@ mod havoc_proptest {
     }
 }
 
-// ── Nova: Actuator HTMX Dashboard UI ──────────────────────────
+// ── Actuator HTMX dashboard UI ──────────────────────────
 
 #[cfg(all(feature = "maud", feature = "htmx"))]
 async fn ui_dashboard() -> impl IntoResponse {

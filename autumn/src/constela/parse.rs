@@ -208,15 +208,9 @@ mod tests {
     #[test]
     fn rejects_deep_nesting_before_typed_deserialization() {
         // 100 levels of `not` would recurse 100 frames deep inside serde's
-        // derived `Expr` deserializer. The depth check must reject it first.
-        //
-        // 100 and not 5000 on purpose: `serde_json` enforces its own
-        // 128-frame recursion limit while building the `Value`, so anything
-        // deeper is rejected as a *syntax* error before `check_shape` is
-        // reached. That is the backstop described on `Limits::max_depth` — it
-        // is why `Limits::unbounded()` still cannot be made to overflow the
-        // stack — but this test is about the bound this module owns, so it
-        // stays inside the range where that bound is the one doing the work.
+        // derived `Expr` deserializer, so the depth check must reject it first.
+        // Kept under serde_json's own 128-frame limit, which would otherwise
+        // reject it as a syntax error before `check_shape` runs.
         let mut deep = String::from(r#"{"version":"1.0","view":{"kind":"text","value":"#);
         let depth = 100;
         for _ in 0..depth {

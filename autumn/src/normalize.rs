@@ -142,15 +142,12 @@ pub fn normalize_lookup_value<M: NormalizedModel>(column: &str, value: &str) -> 
 
 // ── Autoref specialization for the `#[repository]` call sites ─────────────
 //
-// A `#[repository]` can target a hand-written `New*` or model. Such a type
-// need not implement `Normalize` / `NormalizedModel`. So the generated code
-// calls these probe wrappers. Method resolution picks the first arm whose
-// bound the concrete type satisfies. Each arm takes one more `&` than the
-// next arm. This sets the order. This works only at a concrete call site, not
-// through a generic boundary. Thus the macro builds the wrappers in the
-// generated code. The method names differ from 0.8.0 (two arms). Thus 0.8.0
-// macro output does not compile against this probe and cannot skip
-// normalization silently.
+// A `#[repository]` can target a hand-written `New*` or model that may not implement
+// `Normalize` or `NormalizedModel`, so the generated code calls these probe wrappers. Each arm
+// takes one more `&` than the next, so method resolution picks the first arm whose bound the
+// type satisfies. That only works at a concrete call site, not through a generic, so the macro
+// emits the calls. The method names differ from the two-arm 0.8.0 probe, so 0.8.0 macro output
+// fails to compile rather than silently skipping normalization.
 
 /// Probe wrapper for write-path normalization.
 ///
@@ -166,8 +163,8 @@ pub fn normalize_lookup_value<M: NormalizedModel>(column: &str, value: &str) -> 
 #[doc(hidden)]
 pub struct SpezNormalize<'a, T: ?Sized>(pub &'a T);
 
-// The `No` arm takes `self` by value after autoderef. Thus `SpezNormalize`
-// must be `Copy`. A derive adds a `T: Copy` bound, so the impls are manual.
+// The `No` arm takes `self` by value after autoderef, so `SpezNormalize` must be `Copy`. A
+// derive would add a `T: Copy` bound, so the impls are manual.
 impl<T: ?Sized> Clone for SpezNormalize<'_, T> {
     fn clone(&self) -> Self {
         *self
@@ -295,8 +292,7 @@ mod tests {
     #[test]
     fn strip_nul_leaves_clean_text_untouched() {
         assert_eq!(strip_nul("plain text"), "plain text");
-        // Other control characters are storable in a Postgres TEXT column and
-        // are deliberately left alone.
+        // Other control characters are valid in a Postgres TEXT column, so they stay.
         assert_eq!(strip_nul("tab\there"), "tab\there");
     }
 
@@ -319,8 +315,6 @@ mod tests {
 
     #[test]
     fn builtins_are_idempotent() {
-        // Round-trip: normalizing an already-normalized value is a no-op
-        // (issue #1379 AC: idempotency).
         for input in ["  Foo@X.COM ", "a  b   c", "MixedCase", ""] {
             let once = squish(&downcase(&trim(input)));
             let twice = squish(&downcase(&trim(&once)));

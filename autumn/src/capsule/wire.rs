@@ -44,8 +44,7 @@
         clippy::arithmetic_side_effects,
     )
 )]
-// `pub` throughout this file is crate-visible only: the enclosing `wire` module
-// is itself `pub(crate)`, so nothing here escapes the crate
+// `pub` here is crate-visible only: the enclosing `wire` module is `pub(crate)`
 // (clippy::redundant_pub_crate).
 
 use bytes::{Bytes, BytesMut};
@@ -278,9 +277,8 @@ impl FrameSplitter {
                 Step::Fail => self.mark_unrecordable(),
             }
         }
-        // Belt and braces: a partial frame can never legitimately exceed the
-        // budget (the length check below refuses first), but an accumulator
-        // that somehow grows past it is treated the same way.
+        // The length checks refuse an oversized frame first; this catches an accumulator that
+        // grows past the budget anyway.
         if self.buf.len() > MAX_FRAME_ACCUM {
             self.mark_unrecordable();
         }
@@ -313,9 +311,8 @@ impl FrameSplitter {
             tag: TAG_UNTAGGED,
             bytes: self.buf.split_to(total).freeze(),
         };
-        // `SSLRequest`/`GSSENCRequest` are answered with a single byte and are
-        // followed by another untagged packet; the real startup message is the
-        // last untagged thing the frontend ever sends.
+        // `SSLRequest`/`GSSENCRequest` get a one-byte answer and another untagged packet follows;
+        // the real startup message is the last untagged thing the frontend sends.
         let still_untagged = matches!(
             frame.startup_code(),
             Some(SSL_REQUEST_CODE | GSSENC_REQUEST_CODE | CANCEL_REQUEST_CODE)
@@ -333,10 +330,8 @@ impl FrameSplitter {
             return Step::Need;
         };
         if first == b'S' || first == b'N' {
-            // `S` is also `ParameterStatus` and `N` also `NoticeResponse`, so
-            // disambiguate on the four bytes that would be the length field: a
-            // real message declares a plausible length, whereas the byte after
-            // a bare answer is the tag of the next message.
+            // `S` is also `ParameterStatus` and `N` also `NoticeResponse`. A real message has a
+            // plausible length field; after a bare answer byte comes the next message's tag.
             let plausible_len = be_i32(self.buf.get(1..).unwrap_or_default()).is_some_and(|len| {
                 usize::try_from(len)
                     .is_ok_and(|len| (MIN_TAGGED_LEN..=MAX_FRAME_ACCUM).contains(&len))
@@ -352,8 +347,7 @@ impl FrameSplitter {
                 };
                 self.phase = Phase::Tagged;
                 if first == b'S' {
-                    // SSL was accepted: everything after this byte is TLS
-                    // ciphertext we cannot frame (F7).
+                    // SSL was accepted: the rest is TLS ciphertext we cannot frame.
                     self.mark_unrecordable();
                 }
                 return Step::Frame(frame);
@@ -388,8 +382,8 @@ impl FrameSplitter {
             bytes: self.buf.split_to(total).freeze(),
         };
         if self.direction == Direction::Backend && is_copy_start(tag) {
-            // The copy sub-protocol inverts flow control; the recorder refuses
-            // to model it rather than producing a tape that cannot replay (F9).
+            // The copy sub-protocol inverts flow control; refuse it rather than record a tape that
+            // cannot replay.
             self.mark_unrecordable();
         }
         Step::Frame(frame)
@@ -673,23 +667,17 @@ fn is_housekeeping_statement(statement: &str) -> bool {
         return false;
     };
     let setting = setting.trim_start();
-    // A single `SET LOCAL ...` is application code: `Db::checkout` issues a
-    // plain session-level `SET statement_timeout`, and the framework's own
-    // `SET LOCAL` pair is matched whole by `is_framework_tx_timeouts`. An
-    // application's settings belong on the ordered tape so that changing or
-    // removing one shows up as a divergence rather than being synthesized
-    // away.
+    // A single `SET LOCAL` is application code: `Db::checkout` sets `statement_timeout` at
+    // session level, and the framework's own `SET LOCAL` pair is matched whole by
+    // `is_framework_tx_timeouts`. Application settings stay on the ordered tape so changing one
+    // shows up as a divergence.
     if strip_keyword(setting, "LOCAL").is_some() {
         return false;
     }
-    // `TIME ZONE` and `CLIENT_ENCODING` stay here even though an application
-    // can issue them too: the pool sets them when a connection is established,
-    // and the replay stub answers a *replayed* connection's setup through this
-    // same classifier. Dropping them makes checkout itself look for a tape
-    // entry the recorder never wrote, and no replay connection opens at all
-    // (`a_replay_pool_never_blocks_on_itself` catches exactly that). Telling
-    // those two apart from an application's own `SET TIME ZONE` needs origin
-    // attribution on the wire rather than a better pattern — see #2202.
+    // `TIME ZONE` and `CLIENT_ENCODING` are housekeeping even though an application can issue
+    // them: the pool sets them on connect, and the replay stub answers a replayed connection's
+    // setup through this classifier, so without them no replay connection opens. Telling the
+    // pool's from the application's needs origin attribution on the wire (#2202).
     [
         "TIME ZONE",
         "CLIENT_ENCODING",
@@ -722,8 +710,7 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
     let mut in_double = false;
     for (index, byte) in sql.bytes().enumerate() {
         match byte {
-            // `''` inside a literal toggles twice, which is a no-op — exactly
-            // the behaviour an escaped quote needs.
+            // An escaped `''` toggles twice: a no-op.
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
             b';' if !in_single && !in_double => {
@@ -1346,7 +1333,7 @@ mod tests {
         frames.iter().map(|f| f.tag).collect()
     }
 
-    // ---- R3 -----------------------------------------------------------------
+    // ---- frame splitting and parsing ----------------------------------------
 
     #[test]
     fn splits_backend_frames_on_tag_and_length() {
@@ -1812,9 +1799,8 @@ mod tests {
 
     #[test]
     fn application_catalog_reads_are_not_catalog_probes() {
-        // An application statement that merely reads a system catalog is real
-        // request work: it belongs in the ordered tape, where the consumption
-        // audit can notice a revised handler no longer issuing it.
+        // An application read of a system catalog is request work: it belongs on the ordered
+        // tape, where the consumption audit notices a handler that stops issuing it.
         assert!(!is_catalog_sql("SELECT * FROM pg_settings"));
         assert!(!is_catalog_sql(
             "SELECT column_name FROM information_schema.columns"

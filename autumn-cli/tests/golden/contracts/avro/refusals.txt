@@ -1,0 +1,49 @@
+## u64
+event `stock.counted`: field `count`: `integer(u64)` does not fit in an Avro `long`. Use a smaller integer. Or send it as a string with a serde adapter, such as `serde_with::DisplayFromStr`, and name that form with `#[wire(type = "string")]`
+
+## i128
+event `stock.counted`: field `count`: `integer(i128)` does not fit in an Avro `long`. Use a smaller integer. Or send it as a string with a serde adapter, such as `serde_with::DisplayFromStr`, and name that form with `#[wire(type = "string")]`
+
+## u128
+event `stock.counted`: field `count`: `integer(u128)` does not fit in an Avro `long`. Use a smaller integer. Or send it as a string with a serde adapter, such as `serde_with::DisplayFromStr`, and name that form with `#[wire(type = "string")]`
+
+## u64_in_a_list
+event `stock.counted`: field `counts[]`: `integer(u64)` does not fit in an Avro `long`. Use a smaller integer. Or send it as a string with a serde adapter, such as `serde_with::DisplayFromStr`, and name that form with `#[wire(type = "string")]`
+
+## any
+event `stock.counted`: field `meta`: the JSON form is `any`, so Avro has no type for it. Name the form with `#[wire(type = …)]`, or mark the event `#[event(opaque)]`
+
+## nullable_any
+event `stock.counted`: field `meta`: the JSON form is `any`, so Avro has no type for it. Name the form with `#[wire(type = …)]`, or mark the event `#[event(opaque)]`
+
+## object_with_no_shape
+event `stock.counted`: field `place`: names type `core::Place`, and the bundle has no shape for it. Derive `WireShape` on it, or name the JSON form with `#[wire(type = …)]`
+
+## two_forms
+event `stock.counted`: field `count`: serde writes `integer(i32)` and reads `string`. Avro needs one form. Give both sides one `#[wire(type = …)]`
+
+## field_name
+event `stock.counted`: field `price-cents`: `price-cents` is not an Avro name. An Avro name has only ASCII letters, digits and `_`, and does not start with a digit. Rename the field with `#[serde(rename = "…")]`
+
+## topic_file_name
+event `../stock`: `../stock` is not a safe file name. The Avro export allows only ASCII letters, digits, `.`, `_` and `-`, no `.` first, and no Windows device name such as `con` or `aux` before the first `.`. Rename it
+
+## topic_case
+`Stock.counted.avsc` and `stock.counted.avsc` differ only in case, and some file systems do not tell them apart. Rename one topic or endpoint
+
+## type_name_clash
+event `stock.counted`: `core::a_b::Place` and `core::a-b::Place` both map to the Avro name `autumn.core.a_b.Place`. Rename one Rust type
+
+## endpoint_any
+endpoint `catalog.create_item` request body: field `meta`: the JSON form is `any`, so Avro has no type for it. Name the form with `#[wire(type = …)]`
+
+## topic_device_name
+event `aux.created`: `aux.created` is not a safe file name. The Avro export allows only ASCII letters, digits, `.`, `_` and `-`, no `.` first, and no Windows device name such as `con` or `aux` before the first `.`. Rename it
+
+## same_path
+endpoint `catalog.create_item` in crate `mesh-catalog` and endpoint `catalog.create_item` in crate `other-crate` both write `endpoints/catalog.create_item.request.avsc`. Rename one
+endpoint `catalog.create_item` in crate `mesh-catalog` and endpoint `catalog.create_item` in crate `other-crate` both write `endpoints/catalog.create_item.response.avsc`. Rename one
+
+## nothing_to_export
+the bundle has no event, so there is nothing to export. Add `--endpoints` to export the endpoint bodies
+

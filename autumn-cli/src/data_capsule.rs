@@ -159,24 +159,10 @@ fn build_command(
 /// Clear the one-shot modes that `AppBuilder::run` reads before
 /// `AUTUMN_DATA_CAPSULE`. An inherited value would take this run.
 fn clear_competing_one_shot_env(command: &mut Command) {
-    for var in [
-        "AUTUMN_BUILD_STATIC",
-        "AUTUMN_DUMP_ROUTES",
-        "AUTUMN_DUMP_OPENAPI",
-        "AUTUMN_DUMP_CACHE_COHERENCE",
-        "AUTUMN_DUMP_DATA_FLOW",
-        "AUTUMN_DUMP_AGENT_AUTHORITY",
-        "AUTUMN_DUMP_GRAPH",
-        "AUTUMN_DUMP_JOBS",
-        "AUTUMN_LIST_TASKS",
-        "AUTUMN_RUN_TASK",
-        "AUTUMN_MIGRATE",
-        "AUTUMN_RETENTION_DRY_RUN",
-        "AUTUMN_DB_RETENTION",
-        "AUTUMN_DB_RETENTION_DATASET",
-    ] {
-        command.env_remove(var);
-    }
+    crate::routes::clear_other_one_shot_envs(command, MODE_ENV);
+    // Not itself a dispatch gate, just `AUTUMN_DB_RETENTION`'s dataset filter,
+    // but clearing it defensively alongside `AUTUMN_DB_RETENTION` costs nothing.
+    command.env_remove("AUTUMN_DB_RETENTION_DATASET");
 }
 
 /// The JSON of the last report line. Logs can come before it.
@@ -326,6 +312,37 @@ mod tests {
         for var in ONE_SHOT_ENV {
             assert_eq!(env_of(&cmd, var), Env::Removed, "{var}");
         }
+    }
+
+    #[test]
+    fn clear_competing_one_shot_env_removes_every_var_checked_before_the_capsule_mode() {
+        // AppBuilder::run dispatches each of these before AUTUMN_DATA_CAPSULE, so one inherited
+        // from the CLI's environment would turn the capsule run into another, possibly
+        // mutating, mode.
+        let mut cmd = Command::new("/bin/true");
+        for mode in crate::routes::all_one_shot_envs() {
+            cmd.env(mode, "1");
+        }
+        cmd.env("AUTUMN_DB_RETENTION_DATASET", "widgets");
+
+        clear_competing_one_shot_env(&mut cmd);
+
+        for mode in crate::routes::all_one_shot_envs() {
+            if mode == MODE_ENV {
+                assert_eq!(
+                    env_of(&cmd, mode),
+                    Env::Set("1".into()),
+                    "{mode} is our own mode"
+                );
+                continue;
+            }
+            assert_eq!(env_of(&cmd, mode), Env::Removed, "{mode}");
+        }
+        assert_eq!(
+            env_of(&cmd, "AUTUMN_DB_RETENTION_DATASET"),
+            Env::Removed,
+            "AUTUMN_DB_RETENTION_DATASET"
+        );
     }
 
     #[test]

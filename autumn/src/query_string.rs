@@ -311,9 +311,8 @@ fn parse_key(key: &str) -> Option<(&str, Vec<Segment<'_>>)> {
     let (base, mut rest) = key.split_at(open);
     let mut segments = Vec::new();
     while !rest.is_empty() {
-        // Every remaining group must start with `[` and close with `]`.
         let (inner, remainder) = rest.strip_prefix('[')?.split_once(']')?;
-        // A nested `[` inside a group means the key is malformed, not nested.
+        // A `[` inside a group makes the key malformed, not nested.
         if inner.contains('[') {
             return None;
         }
@@ -335,8 +334,7 @@ fn classify_segment(inner: &str) -> Segment<'_> {
     }
     if inner.bytes().all(|b| b.is_ascii_digit()) {
         return Segment::Index {
-            // Saturation only affects ORDERING; `raw` keeps the submitted text,
-            // so nothing about the key itself is platform-dependent.
+            // Saturation only affects ordering; `raw` keeps the submitted text.
             position: inner.parse().unwrap_or(usize::MAX),
             raw: inner,
         };
@@ -517,9 +515,8 @@ fn insert<'q, 's>(
     value: Cow<'q, str>,
     own: impl Fn(&'s str) -> Cow<'q, str>,
 ) {
-    // `segments.len()` counts the bracketed steps; the base key is the first
-    // level, so the total depth is `len + 1` — expressed as `>=` to stay clear
-    // of the request-path gate's arithmetic ban.
+    // Total depth is `segments.len() + 1` (the base key is the first level),
+    // written as `>=` to avoid the request-path gate's arithmetic ban.
     if segments.len() >= MAX_DEPTH {
         let node = root
             .entry(own(base))
@@ -534,9 +531,8 @@ fn insert<'q, 's>(
         return;
     }
 
-    // Descend to the node this key addresses, creating containers on the way.
     // The *next* segment decides which container the current entry must be, so
-    // the shape is always known before the entry is materialized.
+    // the shape is known before the entry is materialized.
     let mut node = root
         .entry(own(base))
         .or_insert_with(|| empty_for(segments.first()));
@@ -545,11 +541,9 @@ fn insert<'q, 's>(
         let next = segments.get(position.saturating_add(1));
         match segment {
             Segment::Key(name) => {
-                // A container that has so far only seen positions is not
-                // necessarily a sequence: `?filter[0]=zero&filter[name]=value`
-                // is a perfectly good dynamic object, and which it is only
-                // becomes knowable when a named key arrives. Promote rather
-                // than declare a conflict.
+                // A container that has only seen positions may still be an
+                // object (`?filter[0]=zero&filter[name]=value`), which is
+                // knowable only once a named key arrives. Promote, not conflict.
                 promote_to_map(node);
                 let Node::Map(entries) = node else {
                     return poison(node, conflict(base, segments, position, "an object"));
@@ -577,11 +571,9 @@ fn insert<'q, 's>(
                     return poison(other, conflict(base, segments, position, "a sequence"));
                 }
             },
-            // `k[]` appends after the highest position seen so far. This
-            // keeps repeated appends in submission order, even when mixed
-            // with explicit indices. `position` can saturate at
-            // `usize::MAX`. Then `saturating_add(1)` cannot advance it.
-            // `append_seq` still keeps two appends apart.
+            // `k[]` appends after the highest position so far, keeping submission
+            // order even when mixed with explicit indices. Once `position`
+            // saturates at `usize::MAX`, `append_seq` keeps two appends apart.
             Segment::Append => match node {
                 Node::Seq(entries) => {
                     let index = entries
@@ -599,12 +591,10 @@ fn insert<'q, 's>(
                         .filter_map(|key| key.parse::<usize>().ok())
                         .max()
                         .map_or(0, |last| last.saturating_add(1));
-                    // `index` can collide with an existing key. This can
-                    // happen only after a numeric key has saturated at
-                    // `usize::MAX`. Probe for a free key instead of reusing
-                    // one and silently merging two elements. At most
-                    // `entries.len()` candidates can already be taken, so
-                    // this loop always finds a free one.
+                    // After a numeric key saturates at `usize::MAX`, `index` can
+                    // collide with an existing key. Probe for a free one rather
+                    // than merge two elements; at most `entries.len()` are taken,
+                    // so the loop terminates.
                     let mut key = index.to_string();
                     let mut suffix = 0usize;
                     while entries.contains_key(key.as_str()) {
@@ -671,15 +661,13 @@ fn build_tree<'a>(
     let mut root = BTreeMap::new();
     for (key, value) in pairs {
         match key {
-            // The key still borrows the query string, so the tree can hold the
-            // base and every segment name as slices of it without copying.
+            // The tree borrows the base and segment names from the query string.
             Cow::Borrowed(key) => match parse_key(key) {
                 Some((base, segments)) => insert(&mut root, base, &segments, value, Cow::Borrowed),
-                // Not a well-formed bracket key: treat it as a flat literal name.
                 None => insert(&mut root, key, &[], value, Cow::Borrowed),
             },
-            // A percent-decoded key is a fresh allocation owned by this loop
-            // iteration, so the tree takes its own copy of each piece.
+            // A percent-decoded key lives only for this iteration, so the tree
+            // copies each piece.
             Cow::Owned(key) => {
                 let own = |text: &str| Cow::Owned(text.to_owned());
                 match parse_key(&key) {
@@ -724,10 +712,9 @@ macro_rules! parse_scalar {
     ($($method:ident => $visit:ident : $ty:ty),* $(,)?) => {
         $(
             fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, QueryError> {
-                // The offending text is deliberately NOT echoed: the error
-                // reaches the 400 body and every error reporter, and a query
-                // parameter can hold a secret. The field path already names
-                // which parameter failed.
+                // The offending text is not echoed: the error reaches the 400 body
+                // and every error reporter, and a parameter can hold a secret. The
+                // field path already names the parameter.
                 let parsed: $ty = self.value.parse().map_err(|_| {
                     QueryError::msg(concat!("invalid ", stringify!($ty), " value"))
                 })?;
@@ -948,10 +935,8 @@ impl<'a> NodeDeserializer<'a, '_> {
                 // is never empty; the fallback keeps this total regardless.
                 value: values.first().map_or("", |v| &**v),
             }),
-            // The caller sent the bracketed form for a key the target types as
-            // a plain value. Name the fix rather than just the mismatch: this is
-            // the one shape that used to arrive as a literal `key[sub]` string
-            // under `serde_urlencoded`.
+            // The bracketed form was sent for a key the target types as a plain
+            // value. Name the fix, not just the mismatch.
             other => Err(QueryError::msg(format!(
                 "expected {wanted}, found {} — the request used the bracketed form \
                  (`key[…]=`) for this parameter, so give the field a nested type or \
@@ -1076,11 +1061,9 @@ impl<'de> de::Deserializer<'de> for NodeDeserializer<'_, '_> {
                 value: None,
                 key: "",
             }),
-            // An all-digit key (`counts[2024]=5`) parses as a position, because
-            // the tree is built before the target type is known. Serving a
-            // positional node as a map — index rendered as its decimal key —
-            // lets such a field still land in a `HashMap`/struct target instead
-            // of failing on a shape the caller never chose.
+            // An all-digit key (`counts[2024]=5`) parses as a position because the
+            // tree is built before the target type is known. Serve it as a map
+            // keyed by the submitted digits so a `HashMap`/struct target works.
             Node::Seq(entries) => visitor.visit_map(IndexMap {
                 entries: entries.iter(),
                 value: None,
@@ -1486,9 +1469,8 @@ mod tests {
             args("tags=a&tags=b").tags.unwrap(),
             vec!["a".to_owned(), "b".to_owned()]
         );
-        // Fail closed: picking one of two values for a single-valued field is
-        // how parameter-pollution bugs are built, and `serde_urlencoded` +
-        // serde's derive rejected it too.
+        // Fail closed: picking one of two values for a single-valued field
+        // invites parameter-pollution bugs.
         let err = from_query_str::<Args>("q=first&q=second").expect_err("duplicate scalar");
         assert!(
             err.to_string().contains("duplicate query parameter"),
@@ -1498,7 +1480,7 @@ mod tests {
 
     #[test]
     fn distinct_index_spellings_stay_distinct() {
-        // Codex P2: `0` and `00` are different keys, so neither may overwrite
+        // `0` and `00` are different keys, so neither may overwrite
         // the other. A sequence target orders them by position and keeps both;
         // a map target receives each spelling unchanged.
         #[derive(Debug, Deserialize)]
@@ -1523,15 +1505,14 @@ mod tests {
         let out: Counts = from_query_str("counts[99999999999999999999]=7").expect("decodes");
         assert_eq!(out.counts.get("99999999999999999999"), Some(&7));
 
-        // The SAME spelling twice is still a genuine duplicate.
+        // The same spelling twice is still a duplicate.
         assert!(from_query_str::<Args>("tags[0]=a&tags[0]=b").is_err());
     }
 
     #[test]
     fn a_custom_deserializer_message_is_discarded_not_merely_bounded() {
-        // Codex P1: a `deserialize_with` helper can interpolate the submitted
-        // value into its own message. Truncating that still surfaces the first
-        // 160 characters, so the content is dropped outright.
+        // A `deserialize_with` helper can interpolate the submitted value into
+        // its message; truncation would still leak a prefix, so it is dropped.
         fn picky<'de, D>(deserializer: D) -> Result<String, D::Error>
         where
             D: serde::Deserializer<'de>,
@@ -1557,11 +1538,10 @@ mod tests {
             !rendered.contains("invalid token"),
             "retained content: {rendered}"
         );
-        // The field path still identifies *where* the failure was; it comes
-        // from the target type, not from the request.
+        // The field path comes from the target type, not the request, so it stays.
         assert!(rendered.contains("token"), "{rendered}");
 
-        // A secret longer than the old 160-char bound is equally absent.
+        // A long secret is equally absent.
         let long = "S3CRET".repeat(60);
         let err = from_query_str::<Guarded>(&format!("token={long}")).expect_err("helper rejects");
         assert!(!err.to_string().contains("S3CRET"), "{err}");
@@ -1569,8 +1549,8 @@ mod tests {
 
     #[test]
     fn a_unit_variant_still_validates_the_node_it_claims() {
-        // Codex P2: selecting a unit variant must not silently discard an
-        // attached payload or accept a poisoned node.
+        // Selecting a unit variant must not silently discard an attached payload
+        // or accept a poisoned node.
         #[derive(Debug, Deserialize, PartialEq)]
         #[serde(rename_all = "lowercase")]
         enum Mode {
@@ -1595,8 +1575,8 @@ mod tests {
 
     #[test]
     fn serde_generated_errors_never_echo_request_text() {
-        // Codex P1: serde builds its own messages for these cases and the
-        // defaults embed the submitted text. All three must stay redacted.
+        // serde's default messages for these three cases embed the submitted
+        // text; all must stay redacted.
         #[derive(Debug, Deserialize)]
         #[serde(rename_all = "lowercase")]
         enum Sort {
@@ -1631,9 +1611,8 @@ mod tests {
 
     #[test]
     fn a_unit_field_still_validates_the_node_it_claims() {
-        // Codex P2: `()` discards its value, but the key is still *claimed* —
-        // a poisoned shape conflict or a bracketed container under it must not
-        // decode successfully just because the target throws the value away.
+        // `()` discards its value, but the key is still claimed: a shape conflict
+        // or a bracketed container under it must still fail.
         #[derive(Debug, Deserialize)]
         struct WithUnit {
             #[allow(dead_code)]
@@ -1652,9 +1631,8 @@ mod tests {
 
     #[test]
     fn pair_sequence_errors_sanitize_their_key() {
-        // Codex P2: this path annotated errors with the raw, percent-decoded
-        // key while `NodeMap` sanitized — the same control characters and
-        // unbounded length would have reached the 400 body.
+        // The key is raw percent-decoded request text and reaches the 400 body,
+        // so control characters are stripped and its length bounded.
         let err = from_query_str::<Vec<(String, u32)>>("\nATTACKER=not-a-number")
             .expect_err("coercion failure");
         let rendered = err.to_string();
@@ -1674,8 +1652,8 @@ mod tests {
 
     #[test]
     fn a_container_may_mix_numeric_and_named_keys() {
-        // Codex P2: `filter[0]=zero&filter[name]=value` is a valid dynamic
-        // object; classifying `0` as a position must not poison it.
+        // `filter[0]=zero&filter[name]=value` is a valid dynamic object;
+        // classifying `0` as a position must not poison it.
         #[derive(Debug, Deserialize)]
         struct Dynamic {
             filter: std::collections::HashMap<String, String>,
@@ -1723,8 +1701,8 @@ mod tests {
 
     #[test]
     fn a_conflicting_key_the_target_ignores_is_still_ignored() {
-        // Pre-existing behaviour for an unrecognised parameter: it does not
-        // fail the request. Junk like `?utm=1&utm[src]=x` must stay ignorable.
+        // An unrecognised parameter does not fail the request, even when its
+        // shape conflicts (`?utm=1&utm[src]=x`).
         let out = args("q=ok&utm=1&utm[src]=x");
         assert_eq!(out.q.as_deref(), Some("ok"));
         // Same for a key that nests past the cap but is never claimed.
@@ -1781,9 +1759,8 @@ mod tests {
 
     #[test]
     fn append_after_a_saturated_explicit_index_sorts_after_it() {
-        // The explicit index overflows to `usize::MAX`. So `saturating_add(1)`
-        // cannot move the append past it. The append must still keep
-        // submission order.
+        // The index saturates at `usize::MAX`, so `saturating_add(1)` cannot move
+        // the append past it; the append must still keep submission order.
         assert_eq!(
             args("tags[99999999999999999999]=a&tags[]=b").tags.unwrap(),
             vec!["a".to_owned(), "b".to_owned()]
@@ -1792,9 +1769,8 @@ mod tests {
 
     #[test]
     fn append_after_an_index_spelled_exactly_usize_max_does_not_collide() {
-        // The explicit index is spelled as literally `usize::MAX`. This used
-        // to match the append key byte for byte. The two entries merged into
-        // one node instead of staying distinct.
+        // An index spelled exactly `usize::MAX` gets the same position as the
+        // append that follows it; the two must stay distinct entries.
         assert_eq!(
             args("tags[18446744073709551615]=a&tags[]=b").tags.unwrap(),
             vec!["a".to_owned(), "b".to_owned()]
@@ -1803,8 +1779,7 @@ mod tests {
 
     #[test]
     fn append_after_a_saturated_index_does_not_merge_nested_elements() {
-        // Same collision, one level deeper. Two outer elements must stay
-        // two. They must not collapse into one.
+        // Same collision, one level deeper: the two outer elements stay two.
         #[derive(Debug, Deserialize, PartialEq)]
         struct Wrapper {
             x: String,
@@ -1831,10 +1806,8 @@ mod tests {
 
     #[test]
     fn an_explicit_index_always_sorts_before_an_append_at_the_same_position() {
-        // This ordering is load-bearing: it is what lets an append keep
-        // submission order after `position` saturates and can no longer
-        // move it forward. Assert it directly, not only through the
-        // end-to-end tests above.
+        // This ordering is what lets an append keep submission order after
+        // `position` saturates and can no longer move it forward.
         assert!(SeqKeyTie::Explicit(String::new()) < SeqKeyTie::Appended(0));
     }
 

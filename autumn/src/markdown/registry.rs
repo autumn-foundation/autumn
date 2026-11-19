@@ -64,7 +64,7 @@ impl MarkdownRegistry {
                 path: dir.to_owned(),
                 source,
             })?;
-            // Skip non-regular files (symlinks, subdirectories, …).
+            // `DirEntry::file_type` does not follow links, so symlinks are skipped too.
             if !entry.file_type().is_ok_and(|t| t.is_file()) {
                 continue;
             }
@@ -211,16 +211,13 @@ fn split_frontmatter<'a>(
     let toml_str = &after_open[..close_pos];
     let after_close = &after_open[close_pos + 4..]; // skip "\n+++"
 
-    // Skip the optional newline(s) immediately after the closing +++
     let body = after_close
         .strip_prefix("\r\n")
         .or_else(|| after_close.strip_prefix('\n'))
         .unwrap_or(after_close);
 
-    // Normalize CRLF → LF before TOML parsing so that embedded files checked
-    // out on Windows (where git autocrlf converts line endings) parse correctly.
-    // The toml crate rejects bare \r that results when find("\n+++") lands on
-    // the \n of a \r\n sequence, leaving a trailing \r in the TOML slice.
+    // With CRLF line endings (a Windows checkout under git autocrlf), `find("\n+++")` leaves a
+    // trailing bare `\r` in the TOML slice, which the toml crate rejects.
     let toml_normalized;
     let toml_for_parse: &str = if toml_str.contains('\r') {
         toml_normalized = toml_str.replace('\r', "");
@@ -251,8 +248,6 @@ mod tests {
         slug: "api-reference",
         content: "+++\ntitle = \"API Reference\"\ndescription = \"API docs\"\norder = 2\n+++\n\n# API Reference\n\nRoutes and types.\n",
     };
-
-    // ---- Unit tests: parsing ----
 
     #[test]
     fn parses_frontmatter_correctly() {
@@ -336,8 +331,6 @@ mod tests {
         assert!(page.body.starts_with("# Body"));
     }
 
-    // ---- Unit tests: registry operations ----
-
     #[test]
     fn builds_registry_from_embedded() {
         let registry = MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap();
@@ -363,7 +356,7 @@ mod tests {
 
     #[test]
     fn all_sorted_orders_by_order_field() {
-        // Sources given in reverse order — sorted output must be by `order`.
+        // Sources given in reverse order.
         let registry = MarkdownRegistry::from_embedded(&[API_REFERENCE, GETTING_STARTED]).unwrap();
         let pages = registry.all_sorted();
         assert_eq!(pages[0].slug, "getting-started"); // order = 1
@@ -410,9 +403,6 @@ mod tests {
 
     #[test]
     fn static_params_for_uses_custom_param_name() {
-        // `#[static_get("/docs/{page}")]` binds a param named `page`, not
-        // `slug`. Without a keyed helper, SSG for such a route gets params it
-        // cannot substitute.
         let registry = MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap();
         let params = registry.static_params_for("page");
         assert_eq!(params.len(), 2);
@@ -466,7 +456,7 @@ mod tests {
             "+++\ntitle = \"Page Two\"\norder = 2\n+++\n\n# Page Two\n",
         )
         .unwrap();
-        // Non-md file must be ignored
+        // Non-md file must be ignored.
         std::fs::write(dir.path().join("README.txt"), "ignore me").unwrap();
 
         let registry = MarkdownRegistry::from_dir(dir.path()).unwrap();
@@ -502,18 +492,13 @@ mod tests {
     #[test]
     fn from_dir_duplicate_slug_returns_error() {
         let dir = tempfile::tempdir().unwrap();
-        // Two files with the same stem produce a duplicate slug.
         std::fs::write(
             dir.path().join("page.md"),
             "+++\ntitle = \"Page A\"\norder = 1\n+++\n\n# A\n",
         )
         .unwrap();
-        // On most filesystems a second `page.md` cannot exist; simulate the
-        // duplicate by writing a file whose stem matches an already-inserted
-        // slug.  We achieve this via a wrapper that inserts the same slug twice
-        // using from_embedded instead, since from_dir cannot have two files with
-        // the same name in the same directory.
-        // Test the embedded path only (the from_dir duplicate path is identical code).
+        // A directory cannot hold two `page.md` files, so the duplicate is exercised
+        // through `from_embedded`, which runs the same insert check.
         let dup = MarkdownSource {
             slug: "page",
             content: "+++\ntitle = \"Page B\"\norder = 2\n+++\n\n# B\n",
@@ -524,13 +509,9 @@ mod tests {
         };
         let result = MarkdownRegistry::from_embedded(&[base, dup]);
         assert!(matches!(result, Err(MarkdownError::DuplicateSlug { .. })));
-        // Also verify from_dir returns one page cleanly (no duplicate possible
-        // in a real filesystem with identical filenames).
         let registry = MarkdownRegistry::from_dir(dir.path()).unwrap();
         assert_eq!(registry.len(), 1);
     }
-
-    // ---- Integration test: statically renders at least two Markdown pages ----
 
     #[tokio::test]
     async fn integration_statically_renders_two_markdown_pages() {
@@ -555,7 +536,6 @@ mod tests {
         let registry =
             Arc::new(MarkdownRegistry::from_embedded(&[GETTING_STARTED, API_REFERENCE]).unwrap());
 
-        // Build a router that renders pages from the registry.
         let reg = registry.clone();
         let router = axum::Router::new().route(
             "/docs/{slug}",
@@ -590,7 +570,6 @@ mod tests {
 
         render_static_routes(router, &[meta], &dist).await.unwrap();
 
-        // Both pages must be pre-rendered.
         let html_a = std::fs::read_to_string(dist.join("docs/getting-started/index.html")).unwrap();
         assert!(html_a.contains("Getting Started"));
 

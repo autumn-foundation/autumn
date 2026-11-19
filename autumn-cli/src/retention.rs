@@ -122,27 +122,11 @@ pub fn run(opts: &RetentionOptions<'_>) {
 /// these left over in the CLI's own environment (e.g. from a wrapping script,
 /// or a previous `autumn migrate`/`autumn task run ...` invocation in the
 /// same shell) would silently hijack a `--dry-run` invocation into a
-/// completely different — and potentially mutating — mode, since every one of
-/// them is checked earlier in `AppBuilder::run`'s dispatch chain than
-/// `AUTUMN_RETENTION_DRY_RUN` (#1342 review round 23). `AUTUMN_REPLAY_CAPSULE`
-/// is checked *after* retention dry-run and so is deliberately left alone;
+/// completely different — and potentially mutating — mode (#1342).
 /// `AUTUMN_DUMP_SECURITY` only matters inside the `AUTUMN_DUMP_ROUTES` branch,
 /// which is already cleared here.
 fn clear_competing_one_shot_env(command: &mut Command) {
-    for var in [
-        "AUTUMN_BUILD_STATIC",
-        "AUTUMN_DUMP_ROUTES",
-        "AUTUMN_DUMP_CACHE_COHERENCE",
-        "AUTUMN_DUMP_DATA_FLOW",
-        "AUTUMN_DUMP_AGENT_AUTHORITY",
-        "AUTUMN_DUMP_GRAPH",
-        "AUTUMN_DUMP_JOBS",
-        "AUTUMN_LIST_TASKS",
-        "AUTUMN_RUN_TASK",
-        "AUTUMN_MIGRATE",
-    ] {
-        command.env_remove(var);
-    }
+    crate::routes::clear_other_one_shot_envs(command, "AUTUMN_RETENTION_DRY_RUN");
 }
 
 /// Set or clear `AUTUMN_RETENTION_MODEL` on `command` from `model`.
@@ -245,11 +229,8 @@ mod tests {
 
     #[test]
     fn extract_dry_run_json_ignores_incidental_stdout_noise() {
-        // Regression (#1342 review round 14): the default `dev` profile's
-        // stdout-backed tracing formatter and Diesel's migration-progress
-        // output can both print before the report line whenever anything
-        // is pending — the extractor must not choke on (or accidentally
-        // match) any of that.
+        // The `dev` tracing formatter and Diesel's migration progress both print to stdout before
+        // the report line; the extractor must skip them.
         let stdout = "Running migration 20260101000000_create_widgets\n\
                        {\"level\":\"INFO\",\"message\":\"listening\"}\n\
                        AUTUMN_RETENTION_DRY_RUN_REPORT=[]\n";
@@ -264,29 +245,15 @@ mod tests {
 
     #[test]
     fn clear_competing_one_shot_env_removes_every_var_checked_before_retention_dry_run() {
-        // Regression (#1342 review round 23): AppBuilder::run checks
-        // AUTUMN_BUILD_STATIC, AUTUMN_DUMP_ROUTES,
-        // AUTUMN_DUMP_CACHE_COHERENCE, AUTUMN_DUMP_DATA_FLOW,
-        // AUTUMN_DUMP_AGENT_AUTHORITY, AUTUMN_DUMP_JOBS, AUTUMN_LIST_TASKS,
-        // AUTUMN_RUN_TASK, and AUTUMN_MIGRATE *before*
-        // AUTUMN_RETENTION_DRY_RUN in its dispatch chain — any of them left
-        // over in the CLI's own environment would hijack a --dry-run
-        // invocation into a completely different (potentially mutating)
-        // mode via Command's default environment inheritance.
-        let competing_vars = [
-            "AUTUMN_BUILD_STATIC",
-            "AUTUMN_DUMP_ROUTES",
-            "AUTUMN_DUMP_CACHE_COHERENCE",
-            "AUTUMN_DUMP_DATA_FLOW",
-            "AUTUMN_DUMP_AGENT_AUTHORITY",
-            "AUTUMN_DUMP_GRAPH",
-            "AUTUMN_DUMP_JOBS",
-            "AUTUMN_LIST_TASKS",
-            "AUTUMN_RUN_TASK",
-            "AUTUMN_MIGRATE",
-        ];
+        // AppBuilder::run dispatches each of `all_one_shot_envs()` (other than our own
+        // AUTUMN_RETENTION_DRY_RUN) before or after it; clearing the whole shared list -- not
+        // just the subset dispatched strictly earlier -- is what keeps this test from silently
+        // tolerating a mode the list gains later and this call site never learns about.
+        let competing_vars: Vec<&str> = crate::routes::all_one_shot_envs()
+            .filter(|&v| v != "AUTUMN_RETENTION_DRY_RUN")
+            .collect();
         let mut command = std::process::Command::new("true");
-        for var in competing_vars {
+        for &var in &competing_vars {
             command.env(var, "1");
         }
 
@@ -308,14 +275,9 @@ mod tests {
 
     #[test]
     fn apply_model_env_removes_an_inherited_var_when_no_model_given() {
-        // Regression (#1342 review round 20): without an explicit removal,
-        // an AUTUMN_RETENTION_MODEL already present in the CLI's own
-        // environment (e.g. exported by a wrapping script) would otherwise
-        // leak into a filter-less --dry-run via Command's default
-        // environment inheritance.
+        // Without an explicit removal, an AUTUMN_RETENTION_MODEL inherited from the CLI's
+        // environment would filter a --dry-run that asked for no model.
         let mut command = std::process::Command::new("true");
-        // Simulate the var already being set, as it would be if inherited
-        // from the parent process's environment.
         command.env("AUTUMN_RETENTION_MODEL", "LeftoverFromParentEnv");
 
         apply_model_env(&mut command, None);
@@ -387,9 +349,8 @@ mod tests {
 
     #[test]
     fn format_retention_report_disambiguates_same_model_name_by_table() {
-        // Regression (#1342 review round 5): two policies can share a model
-        // name (same-named model in different modules); the table column is
-        // what keeps their rows distinguishable in an unfiltered report.
+        // Two policies can share a model name (same-named models in different modules); the
+        // table column keeps their rows apart.
         let table = format_retention_report(&[
             RetentionSweepReport {
                 model: "Session".to_string(),

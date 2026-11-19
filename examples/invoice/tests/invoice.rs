@@ -6,11 +6,10 @@
 
 use autumn_web::routes;
 use autumn_web::test::TestApp;
-use autumn_web::time::FixedClock;
-use chrono::{TimeZone, Utc};
+use autumn_web::time::{FixedClock, Timestamp};
 
 fn client() -> autumn_web::test::TestClient {
-    let fixed = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let fixed: Timestamp = "2026-01-01T12:00:00Z".parse().expect("valid timestamp");
     // `routes!` needs the fully-qualified path (not a `use`-imported bare
     // name) so it can resolve each handler's hidden
     // `__autumn_route_info_*` companion function relative to the same path.
@@ -28,7 +27,8 @@ async fn detail_page_renders_html() {
         .await
         .assert_ok()
         .assert_body_contains("Invoice #42")
-        .assert_body_contains("Total: $42.00");
+        .assert_body_contains("Total: $42.00")
+        .assert_body_contains("Generated at 2026-01-01T12:00:00+00:00");
 }
 
 /// Regression test for the a11y fix (autumn check --a11y `html-has-lang`,

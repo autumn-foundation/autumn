@@ -328,16 +328,14 @@ pub fn jittered_ttl(base: Duration, fraction: f64) -> Duration {
 
     let mut buf = [0_u8; 4];
     if getrandom::fill(&mut buf).is_err() {
-        // Fallback entropy source if the OS RNG is unavailable.
         let nanos = crate::time::ambient_system_time()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos());
         buf = nanos.to_le_bytes();
     }
     let unit = f64::from(u32::from_le_bytes(buf)) / f64::from(u32::MAX);
-    // factor is uniform in [1 - fraction, 1 + fraction].
-    // `try_from_secs_f64` saturates instead of panicking (as `mul_f64` did)
-    // when a huge base times a factor above 1 overflows `Duration`.
+    // `factor` is uniform in [1 - fraction, 1 + fraction]. An overflowing product saturates to
+    // `Duration::MAX`; `mul_f64` would panic.
     let factor = fraction.mul_add(2.0f64.mul_add(unit, -1.0), 1.0).max(0.0);
     Duration::try_from_secs_f64(base.as_secs_f64() * factor).unwrap_or(Duration::MAX)
 }
@@ -463,9 +461,7 @@ fn now_unix_ms(clock: &dyn ClockSource) -> u64 {
 /// replica mistake the old stale envelope for a completed refresh.
 fn fast_path_value<V>(cache: &Arc<dyn Cache>, key: &str, options: &GetOrComputeOptions) -> Option<V>
 where
-    // `Serialize` because `get_cached` records the value it served into a
-    // failure capsule (#1634); every caller of this helper already carries the
-    // bound, since the same `V` is written back through `insert_cached`.
+    // `Serialize` because `get_cached` records the served value into a failure capsule (#1634).
     V: Clone + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     if options.uses_envelope() {
@@ -566,18 +562,12 @@ where
             // fixed clock there, and a fixed clock does not advance, so the
             // wait below would not end.
             let start = crate::time::ambient_instant();
-            // Exponential backoff, capped at MAX_LOCK_POLL_INTERVAL: a flat
-            // poll cadence means every waiting replica hammers Redis (a cache
-            // read plus a lock-acquire attempt, each a block_in_place round
-            // trip) at a constant rate for the whole wait, even once it's
-            // clear the lock is held and unlikely to free up immediately.
+            // Exponential backoff, capped at MAX_LOCK_POLL_INTERVAL: at a flat cadence every
+            // waiting replica hits Redis (a read plus a lock attempt) at full rate all wait long.
             let mut poll_interval = options.lock_poll_interval;
             loop {
-                // Never sleep past the deadline: a growing poll_interval (or
-                // simply a lock_wait_timeout shorter than lock_poll_interval)
-                // could otherwise overshoot lock_wait_timeout by a full
-                // interval before this loop gets a chance to check it,
-                // making the "bounded wait" option not actually bounded.
+                // Never sleep past the deadline: a growing interval, or a timeout shorter than the
+                // interval, would overshoot `lock_wait_timeout` by up to a full interval.
                 let remaining = options.lock_wait_timeout.saturating_sub(
                     crate::time::ambient_instant().saturating_duration_since(start),
                 );
@@ -596,8 +586,7 @@ where
                 if crate::time::ambient_instant().saturating_duration_since(start)
                     >= options.lock_wait_timeout
                 {
-                    // Bounded damage: give up waiting and fill locally rather
-                    // than block the caller indefinitely.
+                    // Give up waiting and fill locally rather than block the caller indefinitely.
                     let result = fill().await;
                     return finish_fill(cache, key, options, result, &tx);
                 }
@@ -629,12 +618,9 @@ where
     match result {
         Ok(value) => {
             if options.uses_envelope() {
-                // `ttl: None` means "no expiry" (per its own doc comment): the
-                // envelope must stay fresh forever, not go stale immediately.
-                // Treating a missing TTL as `ttl_ms = 0` would stamp
-                // `fresh_until` as "now", making the very next read (and every
-                // read after) take the stale branch and re-trigger a
-                // background refresh in a tight loop.
+                // `ttl: None` means no expiry, so the envelope stays fresh forever. Stamping
+                // `fresh_until` as now would send every read down the stale branch and re-trigger
+                // a background refresh in a tight loop.
                 let fresh_until_unix_ms = options.ttl.map_or(u64::MAX, |ttl| {
                     let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
                     now_unix_ms(options.clock.as_ref()).saturating_add(ttl_ms)
@@ -704,7 +690,7 @@ fn spawn_background_refresh<V, E, F, Fut>(
                 drop(guard);
             };
             // The refresh runs detached: capture marks the capsule
-            // incomplete, and a replay gives the task the tape (#2351 item 3).
+            // incomplete, and a replay gives the task the tape (#2351).
             #[cfg(feature = "reporting")]
             crate::capsule::spawn(refresh);
             #[cfg(not(feature = "reporting"))]
@@ -861,8 +847,7 @@ where
                 spawn_background_refresh(cache.clone(), key.to_owned(), options.clone(), fill);
                 return Ok(envelope.value.clone());
             }
-            // Past `ttl + grace`: fall through to the cold-miss path below
-            // instead of serving this indefinitely-stale value forever.
+            // Past `ttl + grace`: fall through to the cold-miss path instead of serving it forever.
         }
 
         read_through_metrics()
@@ -870,11 +855,9 @@ where
             .fetch_add(1, Ordering::Relaxed);
         match claim_role(cache, key) {
             Role::Leader(tx, guard) => {
-                // Double-check: another leader may have refreshed the key
-                // between the read above and winning leadership. Only trust
-                // that write if it's actually usable (fresh or in grace) —
-                // otherwise this would just re-observe the same expired
-                // envelope and skip filling entirely.
+                // Double-check: another leader may have refreshed the key since the read above.
+                // Trust that write only if it is fresh or in grace; otherwise this would re-read
+                // the same expired envelope and skip the fill.
                 if let Some(envelope) = get_cached::<SwrEnvelope<V>>(cache.as_ref(), key)
                     && swr_within_grace(
                         now_unix_ms(options.clock.as_ref()),
@@ -1034,13 +1017,9 @@ mod tests {
         let key = "fast-path-swr-key";
         let options = GetOrComputeOptions::new().stale_while_revalidate(Duration::from_secs(10));
 
-        // A stale envelope (fresh_until in the past) must NOT be reported as
-        // "the fill landed": the lock-poll loop in `run_leader_fill` relies on
-        // `fast_path_value` to distinguish a fresh write by the lock winner
-        // from the pre-existing stale value that triggered the refresh in the
-        // first place. Reporting the stale value here would make a losing
-        // replica stop waiting/polling prematurely and publish stale data as
-        // if it were the completed refresh.
+        // The lock-poll loop in `run_leader_fill` relies on `fast_path_value` to tell the lock
+        // winner's fresh write from the stale value that triggered the refresh. Reporting the
+        // stale value would make a losing replica stop polling and publish it as the refresh.
         let stale = SwrEnvelope {
             value: "stale-value".to_string(),
             fresh_until_unix_ms: 0,
@@ -1052,7 +1031,6 @@ mod tests {
             "a stale SWR envelope must not be reported as a completed fill"
         );
 
-        // A fresh envelope (fresh_until far in the future) is reported.
         let fresh = SwrEnvelope {
             value: "fresh-value".to_string(),
             fresh_until_unix_ms: u64::MAX,
@@ -1074,9 +1052,8 @@ mod tests {
         let options = GetOrComputeOptions::new();
         let (tx, mut rx) = watch::channel(FillState::Pending);
 
-        // Simulate another replica having already run an entire
-        // acquire-fill-write-release cycle in the gap between this caller's
-        // last cache read and its own (now successful) lock acquisition.
+        // Another replica ran a whole acquire-fill-write-release cycle between this caller's last
+        // cache read and its lock acquisition.
         insert_cached(cache.as_ref(), key, "already-written".to_string(), None);
 
         let fill_count = Arc::new(AtomicU64::new(0));

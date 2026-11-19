@@ -105,8 +105,7 @@ pub fn parse_backtrace_string(
         // Frame index lines look like: "   0: symbol_name"
         if let Some(colon_pos) = trimmed.find(": ") {
             let index_part = &trimmed[..colon_pos];
-            // Reject empty index_part: `all()` on an empty iterator returns true,
-            // which would incorrectly accept lines starting with ": ".
+            // `all()` is true on an empty iterator, so reject an empty index explicitly.
             if index_part.is_empty() || !index_part.chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
@@ -115,10 +114,8 @@ pub fn parse_backtrace_string(
                 continue;
             }
 
-            // Next line may be the location: "              at FILE:LINE:COL"
-            // Peek-then-advance: materialise the "at FILE:LINE" portion as an
-            // owned String first so the peek borrow is released before calling
-            // `lines.next()` below.
+            // The next line may be the location: "   at FILE:LINE:COL". Copied out so the peek
+            // borrow ends before `lines.next()`.
             let at_rest_owned = lines
                 .peek()
                 .and_then(|s| s.trim().strip_prefix("at "))
@@ -304,7 +301,6 @@ mod tests {
 
         let lines = read_source_context(&path, 10);
         assert!(!lines.is_empty());
-        // Should include line 10 ± CONTEXT_RADIUS = 5, so lines 5-15
         let line_nos: Vec<u32> = lines.iter().map(|l| l.line_no).collect();
         assert!(line_nos.contains(&10), "should include failing line");
         assert!(line_nos.contains(&5), "should include 5 lines before");

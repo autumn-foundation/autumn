@@ -47,9 +47,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use diesel::{PgConnection, RunQueryDsl as _, sql_query};
 
 use super::super::{quote_ident, quote_literal};
-// Every statement is schema-qualified through the scrub's own helper, so a
-// role- or database-level `search_path` cannot redirect a delete to a table
-// nothing classified.
+// Every statement is schema-qualified, so a role- or database-level `search_path`
+// cannot redirect a delete to an unclassified table.
 use super::qualified_ident as qualified;
 
 /// Ceiling on closure passes, purely defensive.
@@ -260,8 +259,7 @@ pub enum SampleError {
 }
 
 impl std::fmt::Display for SampleError {
-    // One arm per variant, each a single actionable message; splitting the
-    // match would scatter the error copy across helpers for no reader benefit.
+    // One arm per variant, each a single actionable message.
     #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -552,23 +550,15 @@ pub fn parse_spec(raw: &str) -> Result<SampleSpec, SampleError> {
         spec: raw.to_owned(),
         detail: detail.to_owned(),
     };
-    // Split at the LAST `=`, not the first: an amount never contains one, but a
-    // quoted table name may (`CREATE TABLE "events=2026"` is legal), and
-    // splitting at the first left no spelling at all for such a root — the
-    // remainder parsed as the amount and failed.
+    // Split at the LAST `=`: an amount never contains one, but a quoted table
+    // name may (`CREATE TABLE "events=2026"` is legal).
     let (table, amount) = raw
         .rsplit_once('=')
         .ok_or_else(|| invalid("no `=` between the table and the amount"))?;
-    // The table portion is taken VERBATIM. A quoted identifier may begin or end
-    // with a space (`CREATE TABLE " users"` is legal), and trimming it silently
-    // retargeted the root: measured, `--sample " users=5"` reported "Sampling
-    // control from users" and subsetted `users` — a different table that
-    // happened to exist — while the one the operator named was never a root.
-    // Losing a wrong target beats gaining tolerance for `users = 500`, which
-    // `resolve_roles` now names as a suggestion instead of guessing at.
-    //
-    // The amount is still trimmed: it is a count or a percentage, so it has no
-    // meaningful leading or trailing space to preserve.
+    // The table is taken verbatim: a quoted identifier may begin or end with a
+    // space (`CREATE TABLE " users"`), so trimming could retarget the root at a
+    // different table. `resolve_roles` suggests the trimmed name instead.
+    // The amount is trimmed: a count or percentage has no meaningful whitespace.
     if table.is_empty() {
         return Err(invalid("the table name is empty"));
     }
@@ -615,20 +605,10 @@ impl SampleAmount {
             Self::Percent(pct) => {
                 let wanted = (total as f64 * pct / 100.0).ceil();
                 let rows = (wanted as i64).clamp(0, total);
-                // A positive percentage of a nonempty table is at least one
-                // row, and `ceil` is not enough to guarantee that: the product
-                // UNDERFLOWS for a denormal percentage, and `ceil(0.0)` is 0.
-                // Measured, `pct = 5e-324` (the smallest positive f64, which
-                // parses as finite and > 0 and so is accepted):
-                //
-                //   total=1   -> product 0.0     -> 0 rows
-                //   total=10  -> product 0.0     -> 0 rows
-                //   total=200 -> product 1e-323  -> 1 row
-                //
-                // A zero-row seed does not select nothing harmlessly: the
-                // root's `DELETE ... WHERE NOT EXISTS (keep)` then matches
-                // every row, which is exactly the silently-empty database this
-                // round-up exists to prevent.
+                // A positive percentage of a nonempty table is at least one row.
+                // `ceil` alone does not guarantee it: for a denormal percentage
+                // (`5e-324`) the product underflows to 0.0. A zero-row seed makes
+                // the root's `DELETE ... WHERE NOT EXISTS (keep)` empty the table.
                 if total > 0 && pct > 0.0 {
                     rows.max(1)
                 } else {
@@ -796,11 +776,9 @@ fn resolve_roles(
             });
         }
     }
-    // Rendered quoted, because the table portion is verbatim and an identifier
-    // may carry leading or trailing space: unquoted, `--sample " users=5"` and
-    // `--sample "users=5"` produce an identical message. Where trimming WOULD
-    // have matched, say so rather than trimming — guessing is what silently
-    // retargeted the root before.
+    // Quoted, because the table is taken verbatim and may carry leading or
+    // trailing space. Where trimming would have matched, suggest it rather than
+    // guessing.
     let unknown = sorted_unique(inputs.roots.iter().filter_map(|s| {
         if keys.contains_key(s.table.as_str()) {
             return None;
@@ -829,10 +807,8 @@ fn resolve_roles(
     }
 
     let always: BTreeSet<&String> = inputs.rules.always_include.iter().collect();
-    // A root silently overriding `always_include` would subset a table declared
-    // full-copy AND make it a descend source, which is the blow-up that rule
-    // exists to prevent. Refuse it, exactly as a `never_include` root is
-    // refused.
+    // A root overriding `always_include` would subset a full-copy table and make
+    // it a descend source, the blow-up that rule exists to prevent.
     let copied_whole = sorted_unique(
         inputs
             .roots
@@ -948,14 +924,10 @@ fn defer_purge_for_excluded_leaf(
             .or_default()
             .push(describe(edge));
     }
-    // The mirror requirement, and the one the excuse itself depends on. When
-    // the LEAF's own top-level parent is purged and the edge points INTO a
-    // subsetted table, the excuse ("the purge removes every leaf row first")
-    // holds only while that purge runs BEFORE the sample — exactly as it does
-    // for a non-partitioned purged child. Recording it lets `check_purge_order`
-    // see a contradiction when some other edge defers the very same purge;
-    // dropping it let the two conclusions stand together and the run failed at
-    // delete time instead of refusing.
+    // The mirror case: when the leaf's own top-level parent is purged and the
+    // edge points into a subsetted table, ignoring the edge is safe only while
+    // that purge runs BEFORE the sample. Recording it lets `check_purge_order`
+    // refuse when another edge defers the same purge.
     if let Some(root) = inputs.partitions.get(&edge.child_table)
         && inputs.purged.contains(root)
         && roles
@@ -990,13 +962,8 @@ fn partition_verdict(
     edge: &ForeignKeyConstraint,
 ) -> PartitionVerdict {
     // `[framework] purge` empties the child's whole tree exactly as
-    // `never_include` does, so the same reasoning applies — and here it is not
-    // merely symmetry. A framework table cannot be named in `[sample]` at all
-    // (that is its own refusal), so refusing this edge left the operator with
-    // NO configuration remedy while recommending one: measured, a partitioned
-    // `autumn_jobs` with a leaf-local key to `countries` was refused with
-    // "drop the table with `never_include`", and adding it there was refused in
-    // turn with "framework-owned rows are emptied with `[framework] purge`".
+    // `never_include` does. A framework table cannot be named in `[sample]`, so
+    // refusing its leaf edge would leave the operator no remedy at all.
     let excluded_leaf = |table: &String| {
         inputs.partitions.get(table).is_some_and(|root| {
             roles.get(root) == Some(&SampleRole::NeverInclude) || inputs.purged.contains(root)
@@ -1058,49 +1025,36 @@ fn classify_edges(
                 }
                 internal.push(edge.clone());
             }
-            // Nothing removes rows from a table outside the sampled universe —
-            // in practice a framework-owned one — but the rows it points at ARE
-            // removed, unless the parent is copied whole or that table is
-            // emptied in the same run. Keyed on "outside the universe" rather
-            // than on the framework-table list, which holds only the names the
-            // scrub probes for: a name missing from it would otherwise reach
-            // the deletes and fail as a raw constraint violation.
+            // Nothing removes rows from a table outside the sampled universe (in
+            // practice a framework-owned one), but the rows it points at are
+            // removed. Keyed on "outside the universe" rather than on the
+            // framework-table list, which holds only the names the scrub probes for:
+            // a name missing from it would fail at delete time as a raw FK violation.
             (None, Some(parent_role))
                 if parent_role.is_subsetted() && !inputs.purged.contains(&edge.child_table) =>
             {
                 outside_refs.push(describe(edge));
             }
-            // The same shape, excused because the child IS purged: its rows are
-            // gone before the sample removes the parents they point at. That
-            // excuse holds only while this purge runs FIRST, so remember the
-            // edge — if the branch below then defers the very same purge, the
-            // two conclusions contradict and neither order is safe.
+            // The same shape, excused because the child is purged first. Remember
+            // the edge: if another edge defers the same purge, neither order works.
             (None, Some(parent_role)) if parent_role.is_subsetted() => {
                 purged_before
                     .entry(edge.child_table.clone())
                     .or_default()
                     .push(describe(edge));
             }
-            // The mirror of the retained-child case below: an outside child —
-            // framework-owned, and NOT purged, so it keeps its rows — pointing
-            // at a sampled parent that keeps every row of its own (a full-copy
-            // table, or an exact-100% root). The two arms above already took
-            // every subsetted parent, so the sample cannot break this reference:
-            // the parent loses nothing. The re-count still wants it, for the one
-            // reason the re-count exists — a constraint a migration left
-            // `NOT VALID` over a pre-existing orphan is never revalidated by
-            // Postgres, and keeping both sides whole does not repair it. A
-            // purged child is exempt: the run empties it, and an absent row
-            // cannot dangle.
+            // An unpurged outside child pointing at a parent that keeps every row
+            // (full-copy, or an exact-100% root). The sample cannot break it, but
+            // the re-count still checks it: a `NOT VALID` constraint over a
+            // pre-existing orphan is never revalidated by Postgres. A purged child
+            // is exempt: an absent row cannot dangle.
             (None, Some(_)) if !inputs.purged.contains(&edge.child_table) => {
                 verify_only.push(edge.clone());
             }
-            // The mirror image: a table the sample removes rows from points INTO
-            // a purged framework table. Purges run before the sample so the case
-            // above holds, which would empty the parent while these rows still
-            // reference it — so this one purge has to wait until the sample has
-            // emptied its child. That is only possible when the sample empties
-            // the child completely; if it keeps rows, no order satisfies the key.
+            // A sampled table pointing INTO a purged framework table. That purge
+            // must wait until the sample has emptied the child, which works only
+            // when the child is emptied completely; if it keeps rows, no order
+            // satisfies the key.
             (Some(child_role), None) if inputs.purged.contains(&edge.parent_table) => {
                 if *child_role == SampleRole::NeverInclude {
                     purge_after.insert(edge.parent_table.clone());
@@ -1112,27 +1066,16 @@ fn classify_edges(
                     retained_into_purged.push(describe(edge));
                 }
             }
-            // A retained table pointing at a framework table nothing empties.
-            // The walk has no reason to follow it — the parent keeps every row,
-            // so the reference cannot be broken BY the sample — but the
-            // re-count still wants it. A constraint a migration left `NOT VALID`
-            // over an existing orphan is never revalidated by Postgres, and
-            // keeping the parent whole does not repair it, so without this the
-            // run would report that every checked reference resolves while one
-            // does not.
-            // Keyed on "keeps any rows", NOT on `is_subsetted`: a full-copy
-            // table and an exact-100% root keep EVERY row, so they are the most
-            // likely to still hold a pre-existing orphan, and `is_subsetted` is
-            // false for both. Only a `never_include` child is exempt, because
-            // the run empties it and an absent row cannot dangle.
+            // A retained table pointing at a framework table nothing empties. The
+            // walk need not follow it, but the re-count checks it for orphans under
+            // a `NOT VALID` constraint. Keyed on "keeps any rows", not
+            // `is_subsetted`: full-copy tables and 100% roots keep every row and
+            // are the likeliest to hold an old orphan.
             (Some(child_role), None) if *child_role != SampleRole::NeverInclude => {
                 verify_only.push(edge.clone());
             }
-            // Two purged framework tables referencing each other. Neither is in
-            // the sampled universe, so nothing above decides their order — but
-            // the split below can now put them in DIFFERENT phases, which the
-            // single pre-sample pass never could. Remember the edge so the
-            // deferral can be propagated along it.
+            // Two purged framework tables referencing each other. They may land in
+            // different purge phases, so remember the edge to propagate a deferral.
             (None, None)
                 if inputs.purged.contains(&edge.child_table)
                     && inputs.purged.contains(&edge.parent_table) =>
@@ -1882,11 +1825,9 @@ impl SamplePlan {
             "    total := 0;".to_owned(),
         ];
         for statement in self.walk_statements() {
-            // `EXECUTE` plans the statement again on each pass. PL/pgSQL keeps
-            // one plan per static statement and replans only when a table it
-            // reads changes. A frontier keeps about the same size, so its
-            // `ANALYZE` does not cause a replan, and a plan made for the
-            // first pass stays for all of them.
+            // `EXECUTE` replans each pass. PL/pgSQL caches one plan per static
+            // statement, and a frontier stays about the same size, so its `ANALYZE`
+            // would not trigger a replan and the first pass's plan would serve all.
             body.push(format!("    EXECUTE {};", quote_literal(&statement)));
             // Immediately, before the next statement overwrites it.
             body.push("    GET DIAGNOSTICS moved = ROW_COUNT;".to_owned());
@@ -1916,13 +1857,9 @@ impl SamplePlan {
         self.tables
             .iter()
             .filter_map(|table| match table.role {
-                // Nothing to remove, so nothing to state. An exact-100% root is
-                // the same case as a full copy and is skipped for the same
-                // reason: a `DELETE` matching no rows still fires a
-                // statement-level trigger, and `report_triggers` does not warn
-                // about a table it knows is not subsetted — so the run would
-                // have side effects it never mentioned, on a flag that asks for
-                // everything to be kept.
+                // Full copies and exact-100% roots emit no `DELETE`: one matching
+                // no rows still fires statement-level triggers, which
+                // `report_triggers` does not warn about for unsubsetted tables.
                 _ if !table.role.is_subsetted() => None,
                 SampleRole::AlwaysInclude => None,
                 SampleRole::NeverInclude => {
@@ -2021,9 +1958,8 @@ impl SamplePlan {
                     .join(" AND ");
                 let missing = format!("p.{} IS NULL", quote_ident(&edge.parent_columns[0]));
                 // MATCH FULL admits only all-NULL or all-populated tuples, so a
-                // partially-NULL one is itself a violation — and one Postgres
-                // will not re-check for us on a constraint a migration left
-                // `NOT VALID`, which is exactly what this recount is for.
+                // partially-NULL one is a violation Postgres does not re-check
+                // on a `NOT VALID` constraint.
                 let mixed_null = if edge.match_full && edge.child_columns.len() > 1 {
                     let any_null = edge
                         .child_columns
@@ -2044,11 +1980,9 @@ impl SamplePlan {
                     None
                 };
                 (
-                    // Sanitized here rather than at the point of use: this label
-                    // is printed into a `--` comment in the dry run, where a
-                    // newline inside a quoted identifier would end the comment
-                    // and leave the rest of the name as executable SQL in a
-                    // sequence advertised as paste-ready.
+                    // Sanitized because the dry run prints this label in a `--`
+                    // comment, where a newline in an identifier would turn the rest
+                    // of the name into executable SQL.
                     format!(
                         "{} ({} -> {})",
                         comment_safe(&edge.name),
@@ -2502,11 +2436,8 @@ mod tests {
         assert_eq!(SampleAmount::Percent(100.0).rows(1000), 1000);
         // An empty source table stays empty.
         assert_eq!(SampleAmount::Percent(50.0).rows(0), 0);
-        // `ceil` alone does not deliver the round-up: the product underflows
-        // for a denormal percentage, and `parse_spec` accepts one because it is
-        // finite and greater than zero. Measured before the clamp: 0 rows for a
-        // table of 1 and of 10 — and a zero-row seed makes the root's DELETE
-        // match every row, emptying the table it was asked to sample.
+        // A denormal percentage underflows the product to 0.0, so `ceil` alone
+        // would select 0 rows and the root's DELETE would empty the table.
         assert_eq!(SampleAmount::Percent(5e-324).rows(1), 1);
         assert_eq!(SampleAmount::Percent(5e-324).rows(10), 1);
         assert_eq!(SampleAmount::Percent(5e-324).rows(200), 1);
@@ -2545,7 +2476,7 @@ mod tests {
     fn plan_refuses_a_table_no_root_can_reach() {
         let (tables, keys) = schema();
         // `audit_logs` is connected to nothing and declared nothing: sampling
-        // would empty it silently, which is exactly what AC #5 forbids.
+        // would empty it silently.
         let err = plan_of(
             &[root("users", SampleAmount::Percent(1.0))],
             &SampleRules {
@@ -3178,8 +3109,8 @@ mod tests {
 
     #[test]
     fn a_partial_root_still_refuses_the_same_outside_reference() {
-        // The contrast that makes the case above meaningful: at 99% rows DO go
-        // away, so the unpurged framework table is refused as before.
+        // The contrast with the case above: at 99% rows do go away, so the
+        // unpurged framework table is refused.
         let (tables, mut keys) = schema();
         keys.push(fk("jobs_user_fk", "autumn_jobs", "user_id", "users", "id"));
         let err = build_plan(&SampleInputs {
@@ -3220,13 +3151,10 @@ mod tests {
 
     #[test]
     fn a_purge_needed_both_before_and_after_the_sample_is_refused() {
-        // The interaction the two purge branches miss when read alone:
         // `audit_logs` (never_include) -> autumn_jobs defers that purge past the
-        // sample, while autumn_jobs -> users is excused ONLY because the purge
-        // runs before the sample removes users rows. Both cannot hold. The one
-        // valid order interleaves the sample's own deletes around the purge
-        // (audit_logs, then autumn_jobs, then users), which a single atomic
-        // sample between two purge passes cannot express — so it is refused.
+        // sample, while autumn_jobs -> users is excused only if the purge runs
+        // before it. The one valid order interleaves the sample's deletes around
+        // the purge, which an atomic sample between two purge passes cannot do.
         let (tables, mut keys) = schema();
         keys.push(fk(
             "audit_logs_job_fk",
@@ -3311,8 +3239,8 @@ mod tests {
 
     #[test]
     fn a_purge_nothing_sampled_references_still_runs_first() {
-        // The unchanged majority: no sampled table points at the purged one, so
-        // nothing is deferred and the single pre-sample pass runs every purge.
+        // No sampled table points at the purged one, so nothing is deferred and
+        // the pre-sample pass runs every purge.
         let (tables, keys) = schema();
         let plan = build_plan(&SampleInputs {
             roots: &[root("users", SampleAmount::Count(10))],
@@ -3330,13 +3258,10 @@ mod tests {
 
     #[test]
     fn a_partition_local_foreign_key_is_refused_rather_than_dropped() {
-        // A key declared on the partition itself, not cloned from the parent
-        // (the caller filters clones out by catalog parentage, so one reaching
-        // here is partition-local). The plan plays every partition's rows
-        // through the partitioned parent, so it cannot honour a key that binds
-        // one partition — dropping it silently would leave the edge out of both
-        // the walk and the integrity re-check, which is the fail-open this
-        // feature exists to avoid.
+        // A key declared on the partition itself (the caller filters out clones).
+        // The plan keys every partition's rows on the parent, so it cannot honour
+        // a key binding one partition; dropping it would leave the edge out of
+        // both the walk and the integrity re-check.
         let (tables, mut keys) = schema();
         keys.push(fk(
             "comments_2026_local_fk",
@@ -3521,9 +3446,9 @@ mod tests {
             joined(&plan.walk_statements()),
             joined(&plan.delete_statements()),
         );
-        // A tenant `search_path` must not be able to redirect a DELETE to a
-        // table nothing classified — the same rule the scrub's own writes keep.
-        // Checked for EVERY table: one unqualified name is one redirected write.
+        // A tenant `search_path` must not redirect a DELETE to an unclassified
+        // table. Checked for every table: one unqualified name is one redirected
+        // write.
         for (name, _) in &tables {
             let quoted = quote_ident(name);
             assert_eq!(
@@ -3536,12 +3461,9 @@ mod tests {
 
     #[test]
     fn an_integrity_label_cannot_break_out_of_a_sql_comment() {
-        // The label is printed after `-- verifies` in the dry run. A newline
-        // inside a quoted identifier — which Postgres permits — would end that
-        // comment and leave the rest of the name as executable SQL in a
-        // sequence the operator was told to paste verbatim. A `COMMIT;` there
-        // lands between the sample's deletes and the column rewrites, so the
-        // paste commits a sampled but UNSCRUBBED database.
+        // The label is printed after `-- verifies` in the dry run. A newline in a
+        // quoted identifier would end that comment and run the rest as SQL; a
+        // `COMMIT;` there would commit a sampled but unscrubbed database.
         let (tables, _) = schema();
         let hostile = "comments_user_fk\nCOMMIT; SELECT 'INJECTED'; --";
         let keys = vec![
@@ -3590,10 +3512,9 @@ mod tests {
         let analyze = plan.analyze_statements();
         let loop_sql = plan.walk_loop_statement();
 
-        // Every statement of a pass is inside the loop, not merely described by
-        // it: a printed walk that runs each statement once selects only as deep
-        // as the catalog's edge order reaches, and the rows below that are then
-        // deleted without breaking any foreign key the assertions check.
+        // Every statement of a pass is inside the loop: running each once selects
+        // only as deep as the catalog's edge order reaches, and the rows below
+        // are deleted without breaking any foreign key.
         assert!(
             !walk.is_empty(),
             "the fixture must have a walk to loop over"
@@ -3894,12 +3815,10 @@ mod tests {
 
     #[test]
     fn an_outgoing_key_from_an_excluded_partition_leaf_is_not_refused() {
-        // The refusal's own advice is to drop the table with `never_include` —
-        // so it must not fire on a schema that has already done that. Emptying
-        // the partitioned parent takes every leaf row with it, leaving the key
-        // nothing to dangle and nothing to walk.
-        // A partition is absent from `tables`: the caller plans its rows through
-        // the parent, exactly as `build_sample_plan_for` filters them out.
+        // The refusal advises `never_include`, so it must not fire once that is
+        // done: emptying the partitioned parent takes every leaf row with it.
+        // A partition is absent from `tables`, as `build_sample_plan_for` filters
+        // them out.
         let (tables, mut keys) = schema();
         keys.push(fk(
             "leaf_lookup_fk",
@@ -3949,11 +3868,8 @@ mod tests {
 
     #[test]
     fn an_exact_100_percent_root_is_not_deleted_from() {
-        // The predicate would match no rows, but a statement-level `DELETE`
-        // trigger fires on a zero-row statement all the same — and
-        // `report_triggers` says nothing about a table it knows is not
-        // subsetted, so the run would have side effects it never announced, on
-        // a flag that asked for every row to be kept.
+        // A zero-row `DELETE` still fires statement-level triggers, which
+        // `report_triggers` does not announce for an unsubsetted table.
         let (tables, keys) = schema();
         let plan = plan_of(
             &[root("users", SampleAmount::Percent(100.0))],
@@ -3976,10 +3892,8 @@ mod tests {
 
     #[test]
     fn a_key_whose_sides_disagree_on_arity_is_refused() {
-        // The join zips the two column lists, and `zip` stops at the shorter —
-        // so a mismatch would emit a join WEAKER than the constraint and relate
-        // rows the database does not. The catalog cannot report this, which is
-        // exactly why it must not be handled by silently dropping components.
+        // The join zips the two column lists, and `zip` stops at the shorter, so
+        // a mismatch would emit a join weaker than the constraint.
         let (tables, _) = schema();
         let mut lopsided = fk("comments_user_fk", "comments", "user_id", "users", "id");
         lopsided.child_columns.push("body".to_owned());
@@ -4003,13 +3917,9 @@ mod tests {
 
     #[test]
     fn an_outside_child_of_a_full_copy_parent_is_still_verified() {
-        // The mirror of the case above, on the other side of the edge: a
-        // framework-owned table nothing empties pointing INTO a full-copy table.
-        // Neither side loses a row, so the sample cannot break the reference —
-        // which is exactly why it fell through every arm and was dropped. A
-        // `NOT VALID` constraint over a pre-existing orphan is never revalidated
-        // by Postgres, so the run would report every checked reference resolving
-        // while one does not.
+        // An unpurged framework table pointing INTO a full-copy table. The sample
+        // cannot break the reference, but a `NOT VALID` constraint over an old
+        // orphan is never revalidated by Postgres, so the re-count must cover it.
         let (tables, mut keys) = schema();
         keys.push(fk(
             "job_country_fk",
@@ -4045,12 +3955,9 @@ mod tests {
 
     #[test]
     fn the_recounts_own_endpoints_are_locked_and_rls_checked() {
-        // `locked_tables` is what the scrub's RLS refusal and its `LOCK TABLE`
-        // set are both built from. An outside child reached only by the
-        // re-count is in neither the plan's tables nor the purge list, so
-        // without this it is read by a check whose answer nothing protects: a
-        // policy hiding the orphan turns "every reference resolves" into a false
-        // clean bill of health.
+        // The scrub's RLS refusal and `LOCK TABLE` set are both built from
+        // `locked_tables`. An outside child reached only by the re-count must be
+        // in it, or a policy hiding an orphan would make the re-count pass falsely.
         let (tables, mut keys) = schema();
         keys.push(fk(
             "job_country_fk",
@@ -4180,7 +4087,7 @@ mod tests {
 
     #[test]
     fn a_match_simple_composite_key_ignores_partially_null_tuples() {
-        // The default, unchanged: a NULL component satisfies the reference, so
+        // The default: a NULL component satisfies the reference, so
         // only fully-populated tuples are checked for a missing parent.
         let (tables, mut keys) = schema();
         // The same composite edge, left at the default MATCH SIMPLE.
@@ -4207,10 +4114,9 @@ mod tests {
 
     #[test]
     fn an_excluded_table_without_a_primary_key_builds_no_set() {
-        // It is emptied by a bare DELETE, so it needs no row identity — and
-        // building it one would render an empty key expression, which is not
-        // SQL at all. The `never_include` remedy `NoRowKey` prescribes has to
-        // actually work.
+        // It is emptied by a bare DELETE, so it needs no row identity; building
+        // it a set would render an empty key expression. This is the remedy
+        // `NoRowKey` prescribes, so it has to work.
         let (mut tables, keys) = schema();
         tables.push(table("request_logs", &[]));
         let plan = plan_of(

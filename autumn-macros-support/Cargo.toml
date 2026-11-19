@@ -11,6 +11,12 @@ readme = "../README.md"
 keywords = ["web", "composable", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
 
+[features]
+# The `#[query_budget]` and `#[agent_operable]` analysers. Only `autumn-macros`
+# turns this on. `autumn-cli` links this crate for `wire` alone. Cargo resolves
+# host and target features apart, so that copy compiles without the analysers.
+analysers = []
+
 [dependencies]
 syn.workspace = true
 quote.workspace = true

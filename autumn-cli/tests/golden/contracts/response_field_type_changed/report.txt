@@ -1,0 +1,11 @@
+Wire contracts: the current build against the deployed release.
+
+If the callees ship first (new callees, deployed callers): 2 break(s)
+  - catalog.create_item (POST /items): response field `subtitle` is `Option<i64>` in the new callee, and caller `mesh-storefront::add_item` decodes it as `Option<String>`
+  - catalog.get_item (GET /items/{id}): response field `subtitle` is `Option<i64>` in the new callee, and caller `mesh-storefront::show_item` decodes it as `Option<String>`
+
+If the callers ship first (new callers, deployed callees): 2 break(s)
+  - catalog.create_item (POST /items): response field `subtitle` is `Option<String>` in the deployed callee, and caller `mesh-storefront::add_item` decodes it as `Option<i64>`
+  - catalog.get_item (GET /items/{id}): response field `subtitle` is `Option<String>` in the deployed callee, and caller `mesh-storefront::show_item` decodes it as `Option<i64>`
+
+Verdict: not safe in any deploy order. Keep the old shape or route until no deployed release needs it.

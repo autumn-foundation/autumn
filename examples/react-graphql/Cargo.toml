@@ -22,9 +22,8 @@ autumn-web = { path = "../../autumn" }
 # multipart uploads. Everything this example needs is in the core crate.
 async-graphql = { version = "7.0", default-features = false }
 axum = { workspace = true }
-chrono = { version = "0.4", features = ["serde"] }
-diesel = { version = "2", features = ["postgres", "chrono"] }
-diesel-async = { version = "0.9", features = ["postgres"] }
+diesel = { version = "2", features = ["postgres"] }
+diesel-async = { version = "0.10", features = ["postgres"] }
 diesel_migrations = "2"
 maud = { version = "0.27", features = ["axum"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }

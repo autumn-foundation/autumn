@@ -139,6 +139,7 @@ fn a_declined_request_is_forwarded_unchanged_and_the_origin_answer_is_returned()
     let request = Request::get("/nope?a=1&a=2")
         .header("cookie", "session=s1")
         .header("authorization", "Bearer t1")
+        .header("cf-access-jwt-assertion", "ey.cf")
         .header("accept", "text/html")
         .body(Body::empty())
         .unwrap();
@@ -163,6 +164,7 @@ fn a_declined_request_is_forwarded_unchanged_and_the_origin_answer_is_returned()
     for (name, value) in [
         ("cookie", "session=s1"),
         ("authorization", "Bearer t1"),
+        ("cf-access-jwt-assertion", "ey.cf"),
         ("accept", "text/html"),
     ] {
         assert!(
@@ -234,9 +236,10 @@ fn a_non_utf8_header_skips_the_capsule_and_reaches_the_origin_intact() {
     let seen = Seen::default();
     let gateway = EdgeGateway::new(serving_guest(), origin(&seen));
 
+    // Only a header the capsule would get can force the origin lane.
     let request = Request::get("/greet")
         .header(
-            "x-latin1",
+            "accept-language",
             http::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
         )
         .body(Body::empty())
@@ -363,11 +366,15 @@ fn a_write_with_a_bad_header_is_still_a_method_fallthrough() {
 fn a_utf8_header_value_and_a_bad_credential_still_reach_the_capsule() {
     let seen = Seen::default();
     let gateway = EdgeGateway::new(serving_guest(), origin(&seen));
-    // `é` is UTF-8 but not visible ASCII. The cookie never reaches the
-    // capsule, so its bytes do not matter.
+    // `é` is UTF-8 but not visible ASCII. The cookie and the proxy
+    // assertion never reach the capsule, so their bytes do not matter.
     let request = Request::get("/greet")
         .header(
-            "x-name",
+            "x-goog-iap-jwt-assertion",
+            http::HeaderValue::from_bytes(b"ey\xff").unwrap(),
+        )
+        .header(
+            "accept-language",
             http::HeaderValue::from_bytes("José".as_bytes()).unwrap(),
         )
         .header(

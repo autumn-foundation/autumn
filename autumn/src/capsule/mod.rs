@@ -46,9 +46,8 @@ pub mod regression;
 pub mod replay;
 pub mod schema;
 
-// DB wire submodules (PostgreSQL only; the sqlite backend has no wire capture).
-// Crate-private like `wire`: these are the recorder and the replay stub, not an
-// extension point, and everything a caller needs is re-exported below.
+// PostgreSQL wire capture and replay; the sqlite backend has none. Crate-private: callers use
+// the re-exports below.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 pub(crate) mod record_db;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]

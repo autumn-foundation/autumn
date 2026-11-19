@@ -4,7 +4,7 @@
 //! type it does not know is a nested `WireShape` type: an object, by the path
 //! as written. The export changes that path to the type's id.
 
-use autumn_macros_support::wire::format;
+use autumn_macros_support::wire::{KEPT_FIELD_NUMBERS, MAX_FIELD_NUMBER, format};
 use quote::quote;
 use syn::spanned::Spanned as _;
 
@@ -20,6 +20,8 @@ pub struct WireAttrs {
     pub opaque: bool,
     /// `#[wire(type = …)]`, with its `format` and `nullable`.
     pub wire_type: Option<WireType>,
+    /// `#[wire(tag = N)]`: the protobuf field number, with its span.
+    pub tag: Option<(u32, proc_macro2::Span)>,
 }
 
 /// Parse every `#[wire(…)]` on a field.
@@ -32,6 +34,7 @@ pub fn wire_attrs(field: &syn::Field) -> Result<WireAttrs, syn::Error> {
     let mut ty: Option<syn::LitStr> = None;
     let mut fmt: Option<syn::LitStr> = None;
     let mut nullable: Option<proc_macro2::Span> = None;
+    let mut tag: Option<(u32, proc_macro2::Span)> = None;
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("wire")) {
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("opaque") {
@@ -42,9 +45,17 @@ pub fn wire_attrs(field: &syn::Field) -> Result<WireAttrs, syn::Error> {
                 set_once(&mut fmt, meta.value()?.parse()?, "format")?;
             } else if meta.path.is_ident("nullable") {
                 nullable = Some(meta.path.span());
+            } else if meta.path.is_ident("tag") {
+                let lit: syn::Lit = meta.value()?.parse()?;
+                let number = checked_tag(&lit)?;
+                if tag.is_some() {
+                    return Err(syn::Error::new(lit.span(), "`tag` is set twice"));
+                }
+                tag = Some((number, lit.span()));
             } else {
                 return Err(meta.error(
-                    "unknown `wire` argument; expected `opaque`, `type`, `format` or `nullable`",
+                    "unknown `wire` argument; expected `opaque`, `type`, `format`, `nullable` \
+                     or `tag`",
                 ));
             }
             Ok(())
@@ -60,6 +71,7 @@ pub fn wire_attrs(field: &syn::Field) -> Result<WireAttrs, syn::Error> {
         return Ok(WireAttrs {
             opaque,
             wire_type: None,
+            tag,
         });
     };
     let kind = ty.value();
@@ -102,7 +114,36 @@ pub fn wire_attrs(field: &syn::Field) -> Result<WireAttrs, syn::Error> {
     Ok(WireAttrs {
         opaque,
         wire_type: Some(wire_type),
+        tag,
     })
+}
+
+/// The field number in `#[wire(tag = N)]`, if protobuf allows it.
+fn checked_tag(lit: &syn::Lit) -> syn::Result<u32> {
+    let syn::Lit::Int(int) = lit else {
+        return Err(syn::Error::new(
+            lit.span(),
+            "`tag` is an integer, such as `tag = 3`",
+        ));
+    };
+    let number = int
+        .base10_parse::<u64>()
+        .ok()
+        .filter(|n| (1..=u64::from(MAX_FIELD_NUMBER)).contains(n))
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| {
+            syn::Error::new(
+                int.span(),
+                format!("a protobuf field number is 1 to {MAX_FIELD_NUMBER}"),
+            )
+        })?;
+    if KEPT_FIELD_NUMBERS.contains(&number) {
+        return Err(syn::Error::new(
+            int.span(),
+            "protobuf keeps field numbers 19000 to 19999 for its own use",
+        ));
+    }
+    Ok(number)
 }
 
 /// Store `value` in `slot`, or refuse a key that is set twice.
@@ -177,11 +218,15 @@ impl Mapper<'_> {
         if let Some(scalar) = scalar(&name) {
             return scalar;
         }
+        if let Some(time) = jiff_time(path, &name, &args) {
+            return time;
+        }
         match name.as_str() {
             "Self" if self.opaque => WireType::Any,
             "Self" => WireType::object(self.own),
             // chrono's `DateTime<Tz>`. A `DateTime` with no time zone is
-            // another crate's type, with another form.
+            // `jiff`'s civil one after `civil::` (see `jiff_time`), and
+            // otherwise another crate's type, with another form.
             "DateTime" if args.len() == 1 => WireType::string_in(format::DATE_TIME),
             "NonZero" => match arg(0) {
                 integer @ WireType::Integer { .. } => integer,
@@ -242,6 +287,35 @@ fn scalar(name: &str) -> Option<WireType> {
         "Ipv6Addr" => text(format::IPV6),
         // serde_json writes bytes as an array of numbers.
         "Bytes" | "ByteBuf" => Some(WireType::array(WireType::integer(8, false))),
+        _ => None,
+    }
+}
+
+/// The wire type of a `jiff` date or time value, read off its name and the
+/// path segment before it.
+///
+/// `Timestamp` and `ZonedDateTime` are known bare, or after `jiff::` or
+/// `time::` (`autumn_web::time`). `Date`, `Time` and a `DateTime` with no type
+/// arguments are `jiff`'s civil types only after `civil::`: other crates use
+/// those names for values with other JSON forms. A `ZonedDateTime` writes its
+/// offset and a bracketed zone name (RFC 9557), which no known format names.
+fn jiff_time(path: &syn::Path, name: &str, args: &[&syn::Type]) -> Option<WireType> {
+    if !args.is_empty() {
+        return None;
+    }
+    let parent = path
+        .segments
+        .iter()
+        .rev()
+        .nth(1)
+        .map(|segment| segment.ident.to_string());
+    let text = |format: &str| Some(WireType::string_in(format));
+    match (name, parent.as_deref()) {
+        ("Timestamp", None | Some("jiff" | "time")) => text(format::DATE_TIME),
+        ("ZonedDateTime", None | Some("jiff" | "time")) => Some(WireType::string()),
+        ("DateTime", Some("civil")) => text(format::LOCAL_DATE_TIME),
+        ("Date", Some("civil")) => text(format::DATE),
+        ("Time", Some("civil")) => text(format::LOCAL_TIME),
         _ => None,
     }
 }

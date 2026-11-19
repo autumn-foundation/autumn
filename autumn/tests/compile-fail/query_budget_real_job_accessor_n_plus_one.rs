@@ -8,7 +8,7 @@
 //!
 //! `db()` is added to `AppState` via a local extension trait — the walker's
 //! `HANDLE_ACCESSORS` check is a syntactic match on the method name
-//! (`autumn-macros/src/query_budget.rs`'s `expr_is_handle`), not a type
+//! (`autumn-macros-support/src/query_budget.rs`'s `expr_is_handle`), not a type
 //! resolution, so this is a faithful stand-in for an app defining its own
 //! `AppState::db()` convenience method without dragging the `db` feature's
 //! real connection pool into a compile-time-only fixture.

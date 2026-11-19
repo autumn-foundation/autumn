@@ -123,11 +123,14 @@ mod embed_assets_integration;
 mod encryption_columns;
 #[cfg(feature = "db")]
 mod encryption_repository;
+#[cfg(feature = "error-reporting")]
 mod error_reporting;
 mod error_validation_details;
 #[cfg(feature = "db")]
 mod event_wire_contract;
 mod events_integration;
+#[cfg(feature = "db")]
+mod experiments_assign_connection_profile;
 #[cfg(feature = "db")]
 mod experiments_pg_integration;
 #[cfg(feature = "db")]
@@ -581,6 +584,7 @@ mod system_test_api;
 mod table_boundaries;
 #[cfg(feature = "db")]
 mod tenancy;
+mod tenancy_header_trust;
 mod tenancy_unit;
 mod tenant_bulkhead;
 mod tenant_cell_quota;
@@ -629,7 +633,12 @@ mod webmcp_shim;
 mod widget_css_coverage;
 #[cfg(feature = "maud")]
 mod widget_features;
-#[cfg(all(feature = "system-tests", feature = "maud", feature = "htmx"))]
+#[cfg(all(
+    feature = "system-tests",
+    feature = "maud",
+    feature = "htmx",
+    feature = "plugin-conformance"
+))]
 mod widget_pack_browser;
 #[cfg(feature = "maud")]
 mod widgets_accordion;

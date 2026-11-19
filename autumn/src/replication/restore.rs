@@ -33,7 +33,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -60,7 +60,7 @@ use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 use super::destination::{DestinationError, ReplicaDestination};
 use super::segment::{self, SegmentError, SegmentHeader, SnapshotMeta};
@@ -81,9 +81,9 @@ pub enum RestoreError {
     /// The requested instant predates every replicated generation.
     TargetBeforeRetention {
         /// The instant that was asked for.
-        target: DateTime<Utc>,
+        target: Timestamp,
         /// The oldest instant the replica can reconstruct.
-        oldest: DateTime<Utc>,
+        oldest: Timestamp,
     },
     /// A segment is missing from the middle of a generation's sequence.
     SegmentGap {
@@ -271,7 +271,7 @@ pub struct PlannedSegment {
     /// Position inside that index.
     pub seq: u64,
     /// When the segment was shipped.
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 /// What a restore will download and reconstruct.
@@ -280,7 +280,7 @@ pub struct RestorePlan {
     /// The generation the restore is built from.
     pub generation: String,
     /// When that generation's base snapshot was taken.
-    pub generation_started_at: DateTime<Utc>,
+    pub generation_started_at: Timestamp,
     /// Key of the base snapshot.
     pub snapshot_key: String,
     /// Key of the snapshot's metadata / commit marker.
@@ -288,10 +288,10 @@ pub struct RestorePlan {
     /// The segments to replay, in order.
     pub segments: Vec<PlannedSegment>,
     /// The instant that was asked for (`None` = "the latest available").
-    pub requested: Option<DateTime<Utc>>,
+    pub requested: Option<Timestamp>,
     /// The instant the restore will actually land on: the ship time of the last
     /// replayed segment, or the snapshot time when none is replayed.
-    pub effective: DateTime<Utc>,
+    pub effective: Timestamp,
 }
 
 /// What a completed restore produced.
@@ -309,8 +309,8 @@ pub struct RestoreOutcome {
 
 /// Convert epoch milliseconds to a UTC instant, clamping an unrepresentable
 /// value rather than failing a restore over a clock artifact.
-fn ms_to_utc(ms: i64) -> DateTime<Utc> {
-    DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)
+fn ms_to_utc(ms: i64) -> Timestamp {
+    segment::timestamp_from_ms(ms)
 }
 
 /// Refuse a latest restore whose chain stops short of the generation's head.
@@ -379,7 +379,7 @@ pub(crate) fn generation_epochs(
 pub fn plan(
     destination: &dyn ReplicaDestination,
     root: &str,
-    target: Option<DateTime<Utc>>,
+    target: Option<Timestamp>,
 ) -> Result<RestorePlan, RestoreError> {
     let keys = destination.list(&segment::generations_prefix(root))?;
     plan_from_listing(destination, root, &keys, target)
@@ -397,7 +397,7 @@ pub(crate) fn plan_from_listing(
     destination: &dyn ReplicaDestination,
     root: &str,
     keys: &[String],
-    target: Option<DateTime<Utc>>,
+    target: Option<Timestamp>,
 ) -> Result<RestorePlan, RestoreError> {
     let generations = segment::generations_prefix(root);
     let keys: Vec<String> = keys
@@ -433,7 +433,7 @@ pub(crate) fn plan_from_listing(
         });
     };
 
-    let target_ms = target.map_or(i64::MAX, |t| t.timestamp_millis());
+    let target_ms = target.map_or(i64::MAX, Timestamp::as_millisecond);
     let Some((_, generation_ms, generation)) = complete
         .iter()
         .rev()
@@ -495,10 +495,9 @@ fn chain_of(
         if reference.created_ms > target_ms {
             break;
         }
-        // A checkpoint opens the next index and restarts `seq` at 0. Anything
-        // else — a skipped index, a skipped seq, a first segment that is not
-        // (0, 0) — is a hole, and a hole is refused rather than replayed up to
-        // it (reverse-brainstorm R6).
+        // A checkpoint opens the next index and restarts `seq` at 0. Anything else (a skipped
+        // index or seq, a first segment that is not (0, 0)) is a hole, and a hole is refused
+        // rather than replayed up to.
         if expected_index != Some(reference.index) {
             let opens_the_chain = expected_index
                 .map_or(reference.index == 0 && reference.seq == 0, |previous| {
@@ -572,12 +571,9 @@ pub fn apply(
     if let Some(parent) = output.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(RestoreError::io("create output directory"))?;
     }
-    // The staged database is checkpointed, so its sidecars carry nothing, and a
-    // stale one left next to the output would let SQLite recover an old WAL over
-    // the freshly restored file. They are moved aside rather than deleted:
-    // until the new database is actually in place they are still the *existing*
-    // database's newest commits, and a restore that fails must leave behind what
-    // it found rather than the wreckage of a half-finished publish.
+    // The staged database is checkpointed, so it needs no sidecars, and a stale one beside the
+    // output would let SQLite recover an old WAL over the restored file. Move them aside rather than delete them: until the new file is in place they hold
+    // the existing database's newest commits, which a failed restore must leave intact.
     let staged_db = staging.join("restored.db");
     let displaced = match displace_sidecars(output) {
         Ok(displaced) => displaced,
@@ -614,7 +610,7 @@ pub fn apply(
 pub fn restore(
     destination: &dyn ReplicaDestination,
     root: &str,
-    target: Option<DateTime<Utc>>,
+    target: Option<Timestamp>,
     output: &Path,
 ) -> Result<RestoreOutcome, RestoreError> {
     let plan = plan(destination, root, target)?;
@@ -651,11 +647,8 @@ fn displace_sidecars(output: &Path) -> Result<Vec<(PathBuf, PathBuf)>, RestoreEr
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     for sidecar in [wal::wal_path(output), wal::shm_path(output)] {
         let parked = displaced_path(&sidecar);
-        // A park left by an interrupted earlier run is not something to
-        // preserve, and `rename` refuses an existing *directory* as its
-        // destination on every platform. (It does replace an existing file,
-        // Windows included: `fs::rename` is documented as "replacing the
-        // original file if `to` already exists".)
+        // Clear a park left by an interrupted run: `rename` refuses an existing directory as
+        // its destination on every platform.
         if let Err(e) = std::fs::remove_file(&parked)
             && e.kind() != std::io::ErrorKind::NotFound
         {
@@ -687,13 +680,9 @@ fn move_file(from: &Path, to: &Path) -> Result<(), RestoreError> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }
-    // A rename across filesystems fails with EXDEV; the staging directory and
-    // the output can legitimately live on different mounts. Copying straight
-    // onto `to` would truncate the database already sitting there before
-    // writing a byte, so a copy that then hit a full disk or an I/O error would
-    // leave it destroyed — the very failure this path exists to avoid. Land the
-    // bytes beside the target first, then rename, which is atomic within the
-    // single filesystem they now share.
+    // Across filesystems `rename` fails with EXDEV. Copying straight onto `to` would truncate
+    // the existing database first, so a failed copy would destroy it. Copy beside the target,
+    // then rename within that filesystem.
     let mut name = to.as_os_str().to_os_string();
     name.push(".incoming");
     let incoming = PathBuf::from(name);
@@ -733,8 +722,7 @@ fn build_in_staging(
         });
     }
 
-    // Snapshot: download the gzip stream, inflate it, and verify the bytes match
-    // the digest recorded when it was taken.
+    // Snapshot: inflate it and check it against the digest recorded when it was taken.
     let compressed = staging.join("snapshot.db.gz");
     destination.get_to_file(&plan.snapshot_key, &compressed)?;
     let db_path = staging.join("restored.db");
@@ -754,17 +742,14 @@ fn build_in_staging(
         });
     }
 
-    // WAL: replay index by index. Each index is one WAL salt sequence starting
-    // at offset 0, so its segments concatenate into a `-wal` beside the snapshot
-    // that SQLite recovers on its own; the index is then checkpointed in before
-    // the next one is staged, exactly reversing how the replicator produced them.
+    // WAL: each index is one salt sequence from offset 0, so its segments concatenate into a
+    // `-wal` that SQLite recovers on its own. Each index is checkpointed in before the next is
+    // staged, the reverse of how the replicator produced them.
     let wal_target = wal::wal_path(&db_path);
     let mut frames_replayed: u64 = 0;
     let mut current_index: Option<u32> = None;
     let mut expected_offset: u64 = 0;
-    // A WAL index's salt is whatever its own segment 0 carries; every later
-    // segment in that index must agree, or frames from two WAL sequences have
-    // been mixed.
+    // Every segment of an index must carry its segment 0's salt, or two WAL sequences were mixed.
     let mut expected_salt: Option<(u32, u32)> = None;
     let mut staged: Option<std::fs::File> = None;
     // The database size the current index's last commit recorded, used below to
@@ -992,8 +977,8 @@ mod tests {
         id
     }
 
-    fn at(ms: i64) -> Option<DateTime<Utc>> {
-        DateTime::from_timestamp_millis(ms)
+    fn at(ms: i64) -> Option<Timestamp> {
+        Timestamp::from_millisecond(ms).ok()
     }
 
     #[test]

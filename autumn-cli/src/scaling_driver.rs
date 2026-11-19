@@ -21,20 +21,16 @@ use crate::dev_loop_scaling::{
     generate_synthetic_app, load_baseline, parse_sizes, run_scaling_dry_run,
 };
 
-// ── App scaffold ─────────────────────────────────────────────────────────────
-
 /// Write a `GeneratedApp` to `project_dir` and append a
 /// `[patch.crates-io] autumn-web` section pointing at local source.
 ///
 /// The `[patch]` append reuses `cold_start_driver::repoint_autumn_web` so both
 /// benchmarks generate byte-identical patch sections.
 fn scaffold_app(app: &GeneratedApp, project_dir: &Path, autumn_web: &Path) -> Result<(), String> {
-    // Write the generated manifest, then repoint autumn-web at local source.
     std::fs::write(project_dir.join("Cargo.toml"), &app.cargo_toml)
         .map_err(|e| format!("write Cargo.toml: {e}"))?;
     repoint_autumn_web(project_dir, autumn_web)?;
 
-    // Write source files
     for (relpath, content) in &app.files {
         let dest = project_dir.join(relpath);
         if let Some(parent) = dest.parent() {
@@ -47,8 +43,6 @@ fn scaffold_app(app: &GeneratedApp, project_dir: &Path, autumn_web: &Path) -> Re
     Ok(())
 }
 
-// ── Build helpers ────────────────────────────────────────────────────────────
-
 /// Run `cargo build` in `project_dir`, capturing stderr for diagnostics.
 ///
 /// Pass `timed = true` to wrap the call in an `Instant` and return elapsed ms;
@@ -59,15 +53,13 @@ fn run_cargo_build(project_dir: &Path, timed: bool) -> Result<u64, String> {
     cmd.args(["build", "--target-dir"])
         .arg(&target_dir)
         .current_dir(project_dir)
-        // Remove inherited target-dir overrides so the warm cache for THIS
-        // project accumulates in its own dedicated directory.
+        // Keep this project's warm cache in its own target dir, whatever the parent set.
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET");
 
-    // Capture output rather than inheriting it: keeps the benchmark's own
-    // stderr clean on success, but preserves the compiler's diagnostics so a
-    // build failure mid-sweep is actually debuggable.
+    // Captured, not inherited: the benchmark's stderr stays clean, and a failed build still
+    // reports the compiler's diagnostics.
     let start = Instant::now();
     let output = cmd
         .output()
@@ -87,8 +79,6 @@ fn run_cargo_build(project_dir: &Path, timed: bool) -> Result<u64, String> {
     }
     Ok(elapsed)
 }
-
-// ── Per-size measurement ─────────────────────────────────────────────────────
 
 /// Measure warm incremental rebuild latency for a synthetic app of size `n`.
 ///
@@ -113,7 +103,6 @@ fn measure_size(n: usize, runs: u32, autumn_web: &Path) -> Result<Vec<u64>, Stri
     let mut samples = Vec::with_capacity(runs as usize);
 
     for run in 1..=runs {
-        // Bump the sentinel to trigger a one-file incremental recompile.
         let handlers_src = std::fs::read_to_string(&handlers_path)
             .map_err(|e| format!("read handlers.rs: {e}"))?;
         let edited = apply_handler_edit(&handlers_src, run);
@@ -127,8 +116,6 @@ fn measure_size(n: usize, runs: u32, autumn_web: &Path) -> Result<Vec<u64>, Stri
 
     Ok(samples)
 }
-
-// ── Sweep ────────────────────────────────────────────────────────────────────
 
 /// Run the full scaling sweep: for each size in `sizes`, measure `runs`
 /// incremental rebuild samples and return `(n, samples)` pairs.
@@ -168,8 +155,6 @@ fn measure_scaling(
     }
     Ok(results)
 }
-
-// ── CLI entry point ──────────────────────────────────────────────────────────
 
 /// Run the `autumn dev-loop-bench --scaling` command.
 ///
@@ -240,15 +225,9 @@ pub fn run_scaling(
     emit_scaling_report(&report, json, output, fail_on_regression)
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // `locate_autumn_web` / `cached_autumn_web` are owned and tested by
-    // `cold_start_driver` (see its `locate_autumn_web_honours_env_override`);
-    // this module reuses them rather than duplicating the logic or its test.
 
     #[test]
     fn scaffold_app_writes_cargo_toml_and_sources() {
@@ -299,7 +278,6 @@ mod tests {
         assert_eq!(exit, 1, "invalid sizes must be rejected");
     }
 
-    // Live test — compiles a real n=1 synthetic app; gated behind --ignored.
     #[test]
     #[ignore = "compiles a synthetic app from scratch; run with --ignored"]
     fn scaling_live_n1_measures_positive_duration() {

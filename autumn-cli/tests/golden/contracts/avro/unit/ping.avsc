@@ -1,0 +1,8 @@
+{
+  "type": "record",
+  "name": "Ping",
+  "namespace": "autumn.core",
+  "doc": "topic: ping, version 1. Autumn sends JSON null for this event, not an object",
+  "autumn.topic": "ping",
+  "fields": []
+}

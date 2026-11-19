@@ -8,7 +8,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -51,12 +51,42 @@ pub struct MetricsCollector {
     inner: Arc<MetricsInner>,
 }
 
+/// A map of series by key. A request probes one with its route, and each
+/// query with its statement, under the shard's write lock. The hasher is the
+/// one the app-metrics registry uses: it hashes a short key several times
+/// faster than the standard one, and each process seeds it at random.
+type SeriesMap = HashMap<String, RouteMetrics, foldhash::fast::RandomState>;
+
 #[derive(Debug, Default)]
 struct Shard {
-    by_route: HashMap<String, RouteMetrics>,
-    by_query: HashMap<String, RouteMetrics>,
+    by_route: SeriesMap,
+    by_query: SeriesMap,
     /// Connection hold time per route: checkout to release of one `Db`.
-    holds: HashMap<String, RouteMetrics>,
+    holds: SeriesMap,
+}
+
+/// The longest series key built on the stack.
+const STACK_KEY_LEN: usize = 256;
+
+/// Write `"{method} {route}"` into `buf` and return its length, or `0` when
+/// it is longer than the buffer. Two copies and a space: the formatting
+/// machinery is not needed to join two strings, and this runs once for each
+/// request.
+fn compose_route_key(buf: &mut [u8; STACK_KEY_LEN], method: &str, route: &str) -> usize {
+    let len = method.len().saturating_add(1).saturating_add(route.len());
+    let Some(key) = buf.get_mut(..len) else {
+        return 0;
+    };
+    let Some((method_part, rest)) = key.split_at_mut_checked(method.len()) else {
+        return 0;
+    };
+    let Some((space, route_part)) = rest.split_first_mut() else {
+        return 0;
+    };
+    method_part.copy_from_slice(method.as_bytes());
+    *space = b' ';
+    route_part.copy_from_slice(route.as_bytes());
+    len
 }
 
 /// The database series a sample goes in.
@@ -556,23 +586,10 @@ impl MetricsCollector {
         let latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let status_class = status_class_index(status);
 
-        // ⚡ Bolt Optimization:
-        // Format the key into a stack-allocated buffer to avoid a heap allocation
-        // on every request. Fall back to allocating a String only if the route
-        // is exceptionally long (which is rare) or if it's a new route missing
-        // from the metrics map.
-        let mut buf = [0u8; 256];
-        // `Cursor::position` reports the bytes written directly, so the filled
-        // prefix is read back without deriving a length from the remaining
-        // slice (`256 - cursor.len()`).
-        let written = {
-            let mut cursor = std::io::Cursor::new(buf.as_mut_slice());
-            if std::io::Write::write_fmt(&mut cursor, format_args!("{method} {route}")).is_ok() {
-                usize::try_from(cursor.position()).unwrap_or_default()
-            } else {
-                0
-            }
-        };
+        // Compose the key on the stack so a route already in the map costs no allocation. A key
+        // over 256 bytes leaves `written == 0` and takes the owned path below.
+        let mut buf = [0u8; STACK_KEY_LEN];
+        let written = compose_route_key(&mut buf, method, route);
         let key_str = buf
             .get(..written)
             .and_then(|filled| std::str::from_utf8(filled).ok())
@@ -633,8 +650,7 @@ impl MetricsCollector {
                 DbSeries::Query => &mut shard.by_query,
                 DbSeries::Hold => &mut shard.holds,
             };
-            // Probe by borrow first: every sample after a key's first sighting
-            // finds its entry without building an owned key just to drop it.
+            // Probe by borrow so only a key's first sample allocates.
             if let Some(entry) = map.get_mut(key) {
                 entry.observe_query(latency_ms);
             } else {
@@ -675,10 +691,7 @@ impl MetricsCollector {
         key: std::fmt::Arguments<'_>,
         latency_ms: u64,
     ) {
-        // Same stack-buffer composition as `record_route`: `Cursor::position`
-        // reports the bytes written, so the filled prefix is read back without
-        // deriving a length from the remaining slice.
-        let mut buf = [0u8; 256];
+        let mut buf = [0u8; STACK_KEY_LEN];
         let written = {
             let mut cursor = std::io::Cursor::new(buf.as_mut_slice());
             if std::io::Write::write_fmt(&mut cursor, key).is_ok() {
@@ -977,7 +990,6 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
         return Percentiles::default();
     }
 
-    // Pre-allocate to exact capacity and use fast slice copying instead of iterating
     let mut data = Vec::with_capacity(len);
     let (slice1, slice2) = latencies.as_slices();
     data.extend_from_slice(slice1);
@@ -989,10 +1001,10 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
     let p95_idx = len.saturating_sub(1).min(len.saturating_mul(95) / 100);
     let p99_idx = len.saturating_sub(1).min(len.saturating_mul(99) / 100);
 
-    // Use select_nth_unstable to find percentiles in O(N) time instead of O(N log N) sort
+    // `select_nth_unstable` is O(N), against O(N log N) for a sort.
     let (_, &mut p99, _) = data.select_nth_unstable(p99_idx);
 
-    // We only need to search the left partition for p95 since p95_idx <= p99_idx
+    // p95_idx <= p99_idx, so only the left partition is searched.
     let p95 = if p95_idx == p99_idx {
         p99
     } else {
@@ -1000,7 +1012,7 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
         p95_val
     };
 
-    // We only need to search the left partition for p50 since p50_idx <= p95_idx
+    // p50_idx <= p95_idx, so only the left partition is searched.
     let p50 = if p50_idx == p95_idx {
         p95
     } else {
@@ -1268,9 +1280,7 @@ mod tests {
 
     #[test]
     fn route_counter_saturates_at_the_ceiling() {
-        // A long-lived process can in principle drive a per-route counter to
-        // `u64::MAX`; the bump must stick there rather than overflow-panic the
-        // request path in a debug build.
+        // At `u64::MAX` the bump must saturate, not overflow-panic the request path in debug.
         let collector = MetricsCollector::new();
         collector.record_route("GET", "/saturating", 200, Duration::from_millis(5));
         pin_counter_at_ceiling(&collector, "/saturating", "GET /saturating");
@@ -1534,7 +1544,6 @@ mod tests {
         use std::task::{Context, Poll};
         use tower::{Service, ServiceExt};
 
-        // A custom service that fails instead of returning a response
         #[derive(Clone)]
         struct FailingService;
 
@@ -1555,7 +1564,6 @@ mod tests {
         let collector = MetricsCollector::new();
         let mut svc = MetricsLayer::new(collector.clone()).layer(FailingService);
 
-        // Active should be 0 initially
         assert_eq!(collector.inner.requests_active.load(Ordering::Relaxed), 0);
 
         let request = Request::builder()
@@ -1564,12 +1572,47 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        // We know it will error
         let result = svc.ready().await.unwrap().call(request).await;
         assert!(result.is_err());
 
-        // Ensure that even though it errored, the active connection count was decremented
+        // The error path decrements the active count too.
         assert_eq!(collector.inner.requests_active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_stack_key_is_the_formatted_key() {
+        let long = "a".repeat(300);
+        let fits_exactly = format!("/{}", "b".repeat(STACK_KEY_LEN - 5));
+        let one_over = format!("/{}", "c".repeat(STACK_KEY_LEN - 4));
+        let non_ascii = "/caf\u{e9}/\u{4e2d}".repeat(3);
+        for (method, route) in [
+            ("GET", "/"),
+            ("GET", "/users/{id}"),
+            ("", ""),
+            ("", "/only-route"),
+            ("DELETE", ""),
+            ("GET", non_ascii.as_str()),
+            ("GET", fits_exactly.as_str()),
+            ("GET", one_over.as_str()),
+            ("GET", long.as_str()),
+            (long.as_str(), "/"),
+            (long.as_str(), long.as_str()),
+        ] {
+            let formatted = format!("{method} {route}");
+            let mut buf = [0u8; STACK_KEY_LEN];
+            let written = compose_route_key(&mut buf, method, route);
+            if formatted.len() <= STACK_KEY_LEN {
+                assert_eq!(
+                    &buf[..written],
+                    formatted.as_bytes(),
+                    "{method:?} {route:?}"
+                );
+            } else {
+                assert_eq!(written, 0, "a key over the buffer takes the owned path");
+            }
+        }
+        assert_eq!(format!("GET {fits_exactly}").len(), STACK_KEY_LEN);
+        assert_eq!(format!("GET {one_over}").len(), STACK_KEY_LEN + 1);
     }
 
     #[test]
@@ -1582,12 +1625,11 @@ mod tests {
         let snap = collector.snapshot();
         assert_eq!(snap.http.requests_total, 1);
 
-        // Let's verify the route was recorded correctly.
         let key = format!("GET {long_route}");
         let route_snap = snap.http.by_route.get(&key).unwrap();
         assert_eq!(route_snap.count, 1);
 
-        // Record again to hit the other path
+        // The second sample takes the existing-entry path.
         collector.record("GET", &long_route, 200, 20);
         let snap2 = collector.snapshot();
         let route_snap2 = snap2.http.by_route.get(&key).unwrap();

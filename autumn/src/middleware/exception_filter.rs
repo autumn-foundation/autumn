@@ -177,7 +177,7 @@ impl ExceptionFilter for ProblemDetailsFilter {
         // A caught panic's identity must survive the rebuild: the capsule
         // replay driver reads it to compare panic against panic rather than
         // accepting any response with the same status.
-        #[cfg(feature = "reporting")]
+        #[cfg(feature = "error-reporting")]
         if let Some(caught) = response
             .extensions()
             .get::<crate::reporting::CaughtPanic>()
@@ -320,7 +320,6 @@ where
         let this = self.project();
         match this.inner.poll(cx) {
             Poll::Ready(Ok(response)) => {
-                // Check if this response came from AutumnError and clone the info out
                 if let Some(error_info) = response.extensions().get::<AutumnErrorInfo>().cloned() {
                     let mut response = response;
                     let filters = this.filters;

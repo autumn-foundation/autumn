@@ -2,7 +2,7 @@
 //!
 //! Autumn exposes a [`Clock`] extractor so handlers can read the current time
 //! through the framework's injected clock instead of calling
-//! [`chrono::Utc::now`] directly. In tests, replace the clock with
+//! [`Timestamp::now`] directly. In tests, replace the clock with
 //! [`FixedClock`] or [`TickingClock`] via [`crate::test::TestApp::with_clock`]
 //! to control time without sleeping.
 //!
@@ -23,14 +23,13 @@
 //! ```rust,no_run
 //! use autumn_web::prelude::*;
 //! use autumn_web::test::TestApp;
-//! use autumn_web::time::{Clock, TickingClock};
-//! use chrono::{TimeZone, Utc};
+//! use autumn_web::time::{Clock, SignedDuration, TickingClock, Timestamp};
 //! use std::time::Duration;
 //!
 //! #[get("/token")]
 //! async fn check_token(clock: Clock) -> axum::http::StatusCode {
-//!     let issued = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
-//!     if clock.now() < issued + chrono::Duration::days(30) {
+//!     let issued: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
+//!     if clock.now() < issued + SignedDuration::from_hours(30 * 24) {
 //!         axum::http::StatusCode::OK
 //!     } else {
 //!         axum::http::StatusCode::UNAUTHORIZED
@@ -39,7 +38,7 @@
 //!
 //! # #[tokio::main]
 //! # async fn main() {
-//! let issued = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+//! let issued: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
 //! let client = TestApp::new()
 //!     .routes(routes![check_token])
 //!     .with_clock(TickingClock::starting_at(issued))
@@ -53,7 +52,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -62,7 +61,10 @@
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+pub use jiff::{SignedDuration, Span, Timestamp, Unit, ZonedDateTime, civil, fmt, tz};
+
+pub mod compat;
+pub(crate) mod cron;
 
 // ── Monotonic instant ─────────────────────────────────────────────────────────
 
@@ -86,7 +88,7 @@ static MONOTONIC_ORIGIN: LazyLock<std::time::Instant> = LazyLock::new(std::time:
 ///
 /// # Why this exists
 ///
-/// [`ClockSource`] models only `DateTime<Utc>`, so framework code that needed a
+/// [`ClockSource`] models only a [`Timestamp`], so framework code that needed a
 /// duration (request latency, query timings, task run times, uptime) reached
 /// for [`std::time::Instant`] directly — off the injected seam. `Instant` is
 /// opaque and cannot be constructed at an arbitrary point, and tokio's
@@ -208,7 +210,7 @@ impl MonotonicInstant {
 /// property-testing generator).
 pub trait ClockSource: Send + Sync + 'static {
     /// Returns the current UTC instant.
-    fn now(&self) -> DateTime<Utc>;
+    fn now(&self) -> Timestamp;
 
     /// Returns the current *monotonic* instant, for measuring elapsed time.
     ///
@@ -236,7 +238,7 @@ pub trait ClockSource: Send + Sync + 'static {
 /// `impl ClockSource` by value, without a hand-written forwarding newtype at
 /// every call site.
 impl ClockSource for std::sync::Arc<dyn ClockSource> {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         (**self).now()
     }
 
@@ -250,7 +252,7 @@ impl ClockSource for std::sync::Arc<dyn ClockSource> {
 /// Axum extractor that resolves the current framework time.
 ///
 /// Use as a handler argument to get the current time through the injected clock
-/// instead of calling [`chrono::Utc::now`] directly. This lets tests control
+/// instead of calling [`Timestamp::now`] directly. This lets tests control
 /// time via [`crate::test::TestApp::with_clock`] and
 /// [`crate::test::TestClient::advance_clock`].
 ///
@@ -262,12 +264,12 @@ impl ClockSource for std::sync::Arc<dyn ClockSource> {
 /// }
 /// ```
 #[derive(Debug, Clone, Copy)]
-pub struct Clock(DateTime<Utc>, MonotonicInstant);
+pub struct Clock(Timestamp, MonotonicInstant);
 
 impl Clock {
     /// Returns the UTC instant captured when this extractor was resolved.
     #[must_use]
-    pub const fn now(&self) -> DateTime<Utc> {
+    pub const fn now(&self) -> Timestamp {
         self.0
     }
 
@@ -293,7 +295,7 @@ impl Clock {
 }
 
 impl std::ops::Deref for Clock {
-    type Target = DateTime<Utc>;
+    type Target = Timestamp;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -317,8 +319,8 @@ impl axum::extract::FromRequestParts<crate::state::AppState> for Clock {
 /// Real wall-clock implementation of [`ClockSource`].
 ///
 /// This is the default when no custom clock is configured. It delegates to
-/// [`chrono::Utc::now`] and carries zero overhead compared to calling
-/// `Utc::now()` directly.
+/// [`Timestamp::now`] and carries zero overhead compared to calling
+/// `Timestamp::now()` directly.
 ///
 /// It deliberately does **not** override [`ClockSource::monotonic`]: the trait's
 /// default body already reads the real process-monotonic clock, so an elapsed
@@ -337,8 +339,8 @@ impl ClockSource for SystemClock {
         reason = "this IS the seam: SystemClock is the production ClockSource, \
                   the one place the real wall clock is allowed to be read."
     )]
-    fn now(&self) -> DateTime<Utc> {
-        Utc::now()
+    fn now(&self) -> Timestamp {
+        Timestamp::now()
     }
 }
 
@@ -352,24 +354,24 @@ impl ClockSource for SystemClock {
 /// Calling `advance_clock` when this clock is active is a safe no-op.
 ///
 /// ```rust,ignore
-/// use autumn_web::time::FixedClock;
-/// use chrono::{TimeZone, Utc};
+/// use autumn_web::time::{FixedClock, Timestamp};
 ///
-/// let clock = FixedClock::at(Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap());
+/// let start: Timestamp = "2025-06-01T00:00:00Z".parse().unwrap();
+/// let clock = FixedClock::at(start);
 /// ```
 #[derive(Debug, Clone, Copy)]
-pub struct FixedClock(DateTime<Utc>);
+pub struct FixedClock(Timestamp);
 
 impl FixedClock {
-    /// Create a clock pinned to `dt`.
+    /// Create a clock pinned to `ts`.
     #[must_use]
-    pub const fn at(dt: DateTime<Utc>) -> Self {
-        Self(dt)
+    pub const fn at(ts: Timestamp) -> Self {
+        Self(ts)
     }
 }
 
 impl ClockSource for FixedClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         self.0
     }
 
@@ -393,11 +395,11 @@ impl ClockSource for FixedClock {
 /// [`crate::test::TestClient::advance_clock`]:
 ///
 /// ```rust,ignore
-/// use autumn_web::time::TickingClock;
-/// use chrono::{TimeZone, Utc};
+/// use autumn_web::time::{TickingClock, Timestamp};
 /// use std::time::Duration;
 ///
-/// let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
+/// let start: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
+/// let clock = TickingClock::starting_at(start);
 /// let client = TestApp::new().with_clock(clock.clone()).build();
 ///
 /// client.advance_clock(Duration::from_secs(3600)); // advance 1 hour
@@ -405,40 +407,41 @@ impl ClockSource for FixedClock {
 #[derive(Clone, Debug)]
 pub struct TickingClock {
     /// Shared current virtual instant, stepped by [`advance`](Self::advance).
-    current: Arc<Mutex<DateTime<Utc>>>,
+    current: Arc<Mutex<Timestamp>>,
     /// The instant this clock started at. Copied (not shared) on clone, which is
     /// harmless because it is immutable — every clone agrees on the origin, so
     /// every clone reports the same [`monotonic`](ClockSource::monotonic).
-    start: DateTime<Utc>,
+    start: Timestamp,
 }
 
 impl TickingClock {
-    /// Create a ticking clock starting at `dt`.
+    /// Create a ticking clock starting at `ts`.
     #[must_use]
-    pub fn starting_at(dt: DateTime<Utc>) -> Self {
+    pub fn starting_at(ts: Timestamp) -> Self {
         Self {
-            current: Arc::new(Mutex::new(dt)),
-            start: dt,
+            current: Arc::new(Mutex::new(ts)),
+            start: ts,
         }
     }
 
-    /// Step this clock forward by `duration`.
+    /// Step this clock forward by `duration`, to nanosecond precision.
     ///
-    /// Sub-millisecond durations are truncated to zero (chrono's minimum resolution
-    /// is microseconds). This method never panics.
+    /// A step past the last representable instant stops at
+    /// [`Timestamp::MAX`]. This method never panics.
     pub fn advance(&self, duration: std::time::Duration) {
         let mut guard = self
             .current
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Ok(delta) = chrono::Duration::from_std(duration) {
-            *guard += delta;
-        }
+        *guard = SignedDuration::try_from(duration)
+            .ok()
+            .and_then(|delta| guard.checked_add(delta).ok())
+            .unwrap_or(Timestamp::MAX);
     }
 }
 
 impl ClockSource for TickingClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         *self
             .current
             .lock()
@@ -454,11 +457,8 @@ impl ClockSource for TickingClock {
     /// (currently impossible) backwards step saturates to the origin rather than
     /// panicking.
     fn monotonic(&self) -> MonotonicInstant {
-        let elapsed = self
-            .now()
-            .signed_duration_since(self.start)
-            .to_std()
-            .unwrap_or(Duration::ZERO);
+        let elapsed =
+            Duration::try_from(self.now().duration_since(self.start)).unwrap_or(Duration::ZERO);
         MonotonicInstant::from_origin_elapsed(elapsed)
     }
 }
@@ -485,12 +485,10 @@ pub fn monotonic_now() -> MonotonicInstant {
 
 // ── Ambient clock ─────────────────────────────────────────────────────────────
 //
-// Framework code with no clock handle in scope used to read the OS clock
-// directly, which a `Sim` cannot control (issue #2967). The ambient clock is
-// the fix: a `Sim` installs its virtual clock for its own thread while it
-// lives, and the `ambient_*` helpers read it. The sim runtime is a
-// current-thread runtime, so every task it polls runs on that thread. Other
-// threads, and code that runs with no `Sim`, see the system clock.
+// For framework code with no clock handle in scope (#2967). A `Sim` installs its virtual clock
+// for its own thread while it lives, and the `ambient_*` helpers read it. The sim runtime is
+// current-thread, so every task it polls sees that clock. Other threads, and code that runs with
+// no `Sim`, see the system clock.
 
 thread_local! {
     /// The clocks installed on this thread, newest last, with a liveness flag.
@@ -510,8 +508,9 @@ struct AmbientEntry {
     start: Duration,
 }
 
-/// The latest [`ambient_instant`] given out in this process, in nanoseconds
-/// after `MONOTONIC_ORIGIN`.
+/// The latest [`ambient_instant`] an installed clock gave out in this
+/// process, in nanoseconds after `MONOTONIC_ORIGIN`. Instants read from the
+/// system clock are not recorded: [`instant_floor`] reads that clock itself.
 ///
 /// A clock installed later starts its instants here, so a new timeline never
 /// starts before an earlier one's instants. State that outlives one `Sim` then
@@ -716,7 +715,7 @@ fn with_ambient<T>(read: impl FnOnce(&dyn ClockSource) -> T) -> T {
 pub struct AmbientClock;
 
 impl ClockSource for AmbientClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         ambient_now()
     }
 
@@ -725,11 +724,19 @@ impl ClockSource for AmbientClock {
     }
 }
 
-/// The ambient wall-clock time. Replaces `Utc::now()` where no clock is in
-/// scope. See [`AmbientClock`].
+/// The ambient wall-clock time. Replaces `Timestamp::now()` where no clock is
+/// in scope. See [`AmbientClock`].
 #[must_use]
-pub fn ambient_now() -> DateTime<Utc> {
+pub fn ambient_now() -> Timestamp {
     with_ambient(ClockSource::now)
+}
+
+/// The ambient wall-clock time as a UTC civil date and time, for columns that
+/// store a timezone-naive UTC value (soft-delete `deleted_at`, generated
+/// `created_at`). See [`AmbientClock`].
+#[must_use]
+pub fn ambient_civil_utc() -> civil::DateTime {
+    tz::Offset::UTC.to_datetime(ambient_now())
 }
 
 /// The ambient monotonic instant. Replaces `Instant::now()` for elapsed time
@@ -753,15 +760,23 @@ pub fn ambient_monotonic() -> MonotonicInstant {
 #[must_use]
 pub fn ambient_instant() -> std::time::Instant {
     let offset = match ambient_entry() {
-        Some((clock, floor, start)) => keep_thread_instants_forward(
-            floor.saturating_add(clock.monotonic().since_origin().saturating_sub(start)),
-        ),
+        Some((clock, floor, start)) => {
+            let offset = keep_thread_instants_forward(
+                floor.saturating_add(clock.monotonic().since_origin().saturating_sub(start)),
+            );
+            // Only an installed clock can give an instant ahead of the system
+            // clock, so only its instants move the mark.
+            INSTANT_HIGH_WATER.fetch_max(
+                u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            offset
+        }
+        // A system reading is never after the system reading `instant_floor`
+        // takes later, so it needs no mark. A served request reads this arm
+        // several times, on every worker: it must not write shared state.
         None => SystemClock.monotonic().since_origin(),
     };
-    INSTANT_HIGH_WATER.fetch_max(
-        u64::try_from(offset.as_nanos()).unwrap_or(u64::MAX),
-        std::sync::atomic::Ordering::Relaxed,
-    );
     *MONOTONIC_ORIGIN + offset
 }
 
@@ -792,36 +807,34 @@ pub fn clock_unix_secs(clock: &dyn ClockSource) -> u64 {
 /// Compute the elapsed duration since the Unix epoch from the given clock.
 #[must_use]
 pub fn clock_unix_duration(clock: &dyn ClockSource) -> std::time::Duration {
-    let now = clock.now();
-    let ts = now.timestamp();
-    if ts >= 0 {
-        std::time::Duration::new(ts.cast_unsigned(), now.timestamp_subsec_nanos())
-    } else {
-        std::time::Duration::ZERO
-    }
+    std::time::Duration::try_from(clock.now().as_duration()).unwrap_or(std::time::Duration::ZERO)
 }
-
-// ── Module-level unit tests ───────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+
+    /// The UTC instant at a civil date and time.
+    fn utc(year: i16, month: i8, day: i8, hour: i8, minute: i8, second: i8) -> Timestamp {
+        tz::Offset::UTC
+            .to_timestamp(civil::date(year, month, day).at(hour, minute, second, 0))
+            .unwrap()
+    }
 
     #[test]
     fn system_clock_returns_time_close_to_utc_now() {
         let clock = SystemClock;
         let a = clock.now();
-        let b = Utc::now();
+        let b = Timestamp::now();
         assert!(
-            (b - a).num_seconds().abs() < 1,
-            "SystemClock should be within 1s of Utc::now()"
+            b.duration_since(a).as_secs().abs() < 1,
+            "SystemClock should be within 1s of Timestamp::now()"
         );
     }
 
     #[test]
     fn fixed_clock_always_returns_same_time() {
-        let pinned = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let pinned = utc(2025, 1, 1, 0, 0, 0);
         let clock = FixedClock::at(pinned);
         assert_eq!(clock.now(), pinned);
         assert_eq!(clock.now(), pinned);
@@ -829,45 +842,71 @@ mod tests {
 
     #[test]
     fn ticking_clock_starts_at_given_time() {
-        let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let start = utc(2025, 1, 1, 0, 0, 0);
         let clock = TickingClock::starting_at(start);
         assert_eq!(clock.now(), start);
     }
 
     #[test]
     fn ticking_clock_advances_correctly() {
-        let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let start = utc(2025, 1, 1, 0, 0, 0);
         let clock = TickingClock::starting_at(start);
         clock.advance(std::time::Duration::from_secs(3600));
-        assert_eq!(clock.now(), start + chrono::Duration::hours(1));
+        assert_eq!(clock.now(), start + SignedDuration::from_hours(1));
     }
 
     #[test]
     fn ticking_clock_clone_shares_state() {
-        let start = Utc.with_ymd_and_hms(2025, 6, 1, 12, 0, 0).unwrap();
+        let start = utc(2025, 6, 1, 12, 0, 0);
         let clock = TickingClock::starting_at(start);
         let clone = clock.clone();
 
         clock.advance(std::time::Duration::from_hours(24));
-        assert_eq!(clone.now(), start + chrono::Duration::days(1));
+        assert_eq!(clone.now(), start + SignedDuration::from_hours(24));
+    }
+
+    #[test]
+    fn ticking_clock_keeps_nanoseconds_and_saturates_at_the_end_of_time() {
+        let start = utc(2025, 1, 1, 0, 0, 0);
+        let clock = TickingClock::starting_at(start);
+        clock.advance(Duration::from_nanos(1));
+        assert_eq!(clock.now(), start + SignedDuration::from_nanos(1));
+        clock.advance(Duration::MAX);
+        assert_eq!(clock.now(), Timestamp::MAX);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(clock.now(), Timestamp::MAX);
+    }
+
+    #[test]
+    fn ambient_civil_utc_reads_the_ambient_clock_in_utc() {
+        let pinned = utc(2024, 3, 10, 6, 7, 8) + SignedDuration::from_millis(250);
+        let _guard = install_ambient(Arc::new(FixedClock::at(pinned)));
+        assert_eq!(
+            ambient_civil_utc(),
+            civil::date(2024, 3, 10).at(6, 7, 8, 250_000_000)
+        );
+    }
+
+    #[test]
+    fn clock_display_is_rfc3339_with_z() {
+        let clock = FixedClock::at(utc(2024, 1, 1, 0, 0, 0));
+        assert_eq!(clock.now().to_string(), "2024-01-01T00:00:00Z");
     }
 
     #[test]
     fn clock_unix_secs_uses_clock_timestamp() {
-        let pinned = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let pinned = utc(2025, 1, 1, 0, 0, 0);
         let clock = FixedClock::at(pinned);
         let secs = clock_unix_secs(&clock);
-        assert_eq!(secs, pinned.timestamp().cast_unsigned());
+        assert_eq!(secs, pinned.as_second().cast_unsigned());
     }
 
     // ── Monotonic seam (issue #1797) ─────────────────────────────────────
 
     #[test]
     fn monotonic_saturates_instead_of_underflowing_on_inversion() {
-        // The one behaviour every caller depends on: subtracting a LATER
-        // instant from an earlier one yields zero rather than panicking or
-        // wrapping. `Duration` has no negative representation, so an unchecked
-        // subtraction here would be an arithmetic panic in production.
+        // Subtracting a later instant yields zero. `Duration` cannot be negative, so an
+        // unchecked subtraction would panic in production.
         let early = MonotonicInstant::from_origin_elapsed(Duration::from_secs(1));
         let late = MonotonicInstant::from_origin_elapsed(Duration::from_secs(5));
         assert_eq!(
@@ -898,13 +937,13 @@ mod tests {
 
     #[test]
     fn ticking_clock_monotonic_moves_in_lockstep_with_wall_time() {
-        let start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let start = utc(2020, 1, 1, 0, 0, 0);
         let clock = TickingClock::starting_at(start);
         assert_eq!(clock.monotonic(), MonotonicInstant::ORIGIN);
 
         clock.advance(Duration::from_secs(90));
         assert_eq!(clock.monotonic().since_origin(), Duration::from_secs(90));
-        assert_eq!(clock.now(), start + chrono::Duration::seconds(90));
+        assert_eq!(clock.now(), start + SignedDuration::from_secs(90));
 
         // A clone shares the instant, so it reports the same elapsed time — the
         // property `TestApp::with_clock` and `Sim::advance` both rely on.
@@ -915,9 +954,9 @@ mod tests {
 
     #[test]
     fn ticking_clock_monotonic_is_reproducible_across_instances() {
-        // Two clocks constructed identically and stepped identically must agree
-        // exactly — this is what makes a sim run replay from its seed.
-        let start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        // Identical clocks stepped identically must agree exactly, so a sim run replays from
+        // its seed.
+        let start = utc(2020, 1, 1, 0, 0, 0);
         let a = TickingClock::starting_at(start);
         let b = TickingClock::starting_at(start);
         for step in [1u64, 60, 3_600, 86_400] {
@@ -932,7 +971,7 @@ mod tests {
     fn fixed_clock_monotonic_never_advances() {
         // A clock whose wall time is pinned must not let elapsed time tick past,
         // or a test that pins the clock would still see real durations.
-        let clock = FixedClock::at(Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap());
+        let clock = FixedClock::at(utc(2025, 1, 1, 0, 0, 0));
         let first = clock.monotonic();
         std::thread::yield_now();
         assert_eq!(first, MonotonicInstant::ORIGIN);
@@ -951,11 +990,9 @@ mod tests {
         // And it is the same timeline the free helper reads.
         assert!(monotonic_now() >= second);
 
-        // The default body must read a REAL clock. Without this, a body that
-        // simply returned `ORIGIN` would keep every other test in this file
-        // green while silently making production elapsed-time measurements
-        // always zero. Bounded spin rather than a sleep, so the test stays fast
-        // and never depends on scheduler behaviour.
+        // The default body must read a real clock: one that returned `ORIGIN` would pass every
+        // other test here while zeroing every production elapsed time. A bounded spin, not a
+        // sleep, keeps the test fast and independent of the scheduler.
         let base = clock.monotonic();
         let mut advanced = base;
         for _ in 0..50_000_000u64 {
@@ -972,15 +1009,13 @@ mod tests {
 
     #[test]
     fn a_custom_clock_keeps_compiling_and_gets_real_monotonic_by_default() {
-        // Backward-compatibility guard: `monotonic()` ships with a default body,
-        // so a downstream `impl ClockSource` that predates it still compiles and
-        // still reports real process-monotonic time. If someone ever removes the
-        // default body, this test stops compiling — which is the point.
+        // `monotonic()` has a default body, so an `impl ClockSource` without it still compiles
+        // and reports real monotonic time. Removing the default body breaks this test's build.
         #[derive(Debug)]
         struct LegacyClock;
         impl ClockSource for LegacyClock {
-            fn now(&self) -> DateTime<Utc> {
-                Utc.with_ymd_and_hms(1999, 12, 31, 23, 59, 59).unwrap()
+            fn now(&self) -> Timestamp {
+                utc(1999, 12, 31, 23, 59, 59)
             }
         }
         let clock = LegacyClock;
@@ -990,11 +1025,9 @@ mod tests {
 
     #[test]
     fn a_backwards_wall_clock_cannot_produce_a_negative_elapsed() {
-        // A clock whose `now()` runs backwards (a crude NTP-jump model) must not
-        // be able to corrupt an elapsed measurement taken through the seam.
-        // `TickingClock` derives monotonic from its own start, and its
-        // subtraction saturates, so the worst case is zero — never a panic.
-        let start = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        // A wall clock that jumps backwards (as after an NTP correction) cannot corrupt an
+        // elapsed measurement: the subtraction saturates, so the worst case is zero.
+        let start = utc(2020, 1, 1, 0, 0, 0);
         let clock = TickingClock::starting_at(start);
         clock.advance(Duration::from_secs(10));
         let later = clock.monotonic();
@@ -1004,24 +1037,22 @@ mod tests {
 
     #[test]
     fn clock_unix_secs_exact_epoch() {
-        let epoch = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap();
+        let epoch = utc(1970, 1, 1, 0, 0, 0);
         let clock = FixedClock::at(epoch);
         assert_eq!(clock_unix_secs(&clock), 0);
     }
 
     #[test]
     fn clock_unix_duration_zero_for_pre_epoch() {
-        // Chrono timestamps before the epoch should not underflow.
-        let pre_epoch = Utc.with_ymd_and_hms(1969, 12, 31, 23, 59, 59).unwrap();
+        // Timestamps before the epoch should not underflow.
+        let pre_epoch = utc(1969, 12, 31, 23, 59, 59);
         let clock = FixedClock::at(pre_epoch);
         assert_eq!(clock_unix_duration(&clock), std::time::Duration::ZERO);
     }
 
     #[test]
     fn clock_unix_duration_exact_epoch_with_nanos() {
-        // Test exact epoch with some nanos to ensure the true branch logic is exercised
-        let epoch_with_nanos =
-            Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::nanoseconds(100);
+        let epoch_with_nanos = utc(1970, 1, 1, 0, 0, 0) + SignedDuration::from_nanos(100);
         let clock = FixedClock::at(epoch_with_nanos);
         assert_eq!(
             clock_unix_duration(&clock),
@@ -1031,7 +1062,7 @@ mod tests {
 
     #[test]
     fn clock_unix_duration_post_epoch() {
-        let post_epoch = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 1).unwrap();
+        let post_epoch = utc(1970, 1, 1, 0, 0, 1);
         let clock = FixedClock::at(post_epoch);
         assert_eq!(
             clock_unix_duration(&clock),
@@ -1041,8 +1072,8 @@ mod tests {
 
     #[test]
     fn ambient_clock_is_installed_nested_and_removed() {
-        let pinned = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let later = Utc.with_ymd_and_hms(2021, 1, 1, 0, 0, 0).unwrap();
+        let pinned = utc(2020, 1, 1, 0, 0, 0);
+        let later = utc(2021, 1, 1, 0, 0, 0);
         let outer = install_ambient(Arc::new(FixedClock::at(pinned)));
         assert_eq!(ambient_now(), pinned);
         let inner = install_ambient(Arc::new(FixedClock::at(later)));
@@ -1055,7 +1086,7 @@ mod tests {
 
     #[test]
     fn a_later_timeline_starts_after_earlier_instants() {
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = utc(2020, 1, 1, 0, 0, 0);
         let hour = std::time::Duration::from_secs(3600);
         let first = TickingClock::starting_at(epoch);
         let guard = install_ambient(Arc::new(first.clone()));
@@ -1072,6 +1103,39 @@ mod tests {
         assert!(fresh >= stored, "a new timeline does not go back");
         second.advance(hour);
         assert_eq!(ambient_instant().saturating_duration_since(fresh), hour);
+    }
+
+    #[test]
+    fn a_timeline_starts_after_system_instants_given_out_before_it() {
+        // No clock is installed on this thread, so these read the system
+        // clock and record nothing. A clock installed next still starts at or
+        // after them.
+        let before: Vec<std::time::Instant> = (0..64).map(|_| ambient_instant()).collect();
+        let epoch = utc(2020, 1, 1, 0, 0, 0);
+        let clock = TickingClock::starting_at(epoch);
+        let guard = install_ambient(Arc::new(clock.clone()));
+        let first = ambient_instant();
+        for earlier in &before {
+            assert!(first >= *earlier, "a timeline does not start in the past");
+        }
+        clock.advance(std::time::Duration::from_secs(90));
+        let stored = ambient_instant();
+        drop(guard);
+
+        // The system clock is behind the 90 s the timeline gave out. A second
+        // timeline on a new thread has no instants of its own to stay ahead
+        // of, so only the process-wide mark can start it after them.
+        let on_a_new_thread = std::thread::spawn(move || {
+            let second = TickingClock::starting_at(epoch);
+            let _guard = install_ambient(Arc::new(second));
+            ambient_instant()
+        })
+        .join()
+        .unwrap();
+        assert!(
+            on_a_new_thread >= stored,
+            "the mark keeps a later timeline forward on any thread"
+        );
     }
 
     #[test]
@@ -1115,7 +1179,7 @@ mod tests {
         seat.take();
         let before = crate::sim::gate::give_ups();
         rt.block_on(async {
-            let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+            let epoch = utc(2020, 1, 1, 0, 0, 0);
             let clock = TickingClock::starting_at(epoch);
             let _guard = install_ambient(Arc::new(clock.clone()));
             let here = ambient_now();
@@ -1133,7 +1197,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_blocking_reads_the_callers_ambient_clock() {
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = utc(2020, 1, 1, 0, 0, 0);
         let clock = TickingClock::starting_at(epoch);
         let guard = install_ambient(Arc::new(clock.clone()));
         clock.advance(std::time::Duration::from_secs(3600));
@@ -1146,12 +1210,12 @@ mod tests {
 
         // With no ambient clock, the blocking thread reads the system clock.
         let there = spawn_blocking(ambient_now).await.unwrap();
-        assert!((Utc::now() - there).num_seconds().abs() < 5);
+        assert!(Timestamp::now().duration_since(there).as_secs().abs() < 5);
     }
 
     #[test]
     fn an_outer_timeline_goes_on_after_a_nested_one() {
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = utc(2020, 1, 1, 0, 0, 0);
         let hour = std::time::Duration::from_secs(3600);
         let outer = TickingClock::starting_at(epoch);
         let _outer = install_ambient(Arc::new(outer.clone()));
@@ -1173,7 +1237,7 @@ mod tests {
 
     #[test]
     fn ambient_guard_dropped_on_another_thread_uninstalls() {
-        let pinned = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let pinned = utc(2020, 1, 1, 0, 0, 0);
         let guard = install_ambient(Arc::new(FixedClock::at(pinned)));
         assert_eq!(ambient_now(), pinned);
         std::thread::spawn(move || drop(guard)).join().unwrap();

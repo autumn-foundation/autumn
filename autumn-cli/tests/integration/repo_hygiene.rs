@@ -644,6 +644,66 @@ fn webauthn_docs_do_not_require_openssl() {
     }
 }
 
+/// A feature PR merged into `trunk` instead of `trunk-dev` lands there as one
+/// squash commit, and the next release PR conflicts on every file it touched:
+/// #3705 gave the 0.11.0 release PR 116 conflicting files. The rule is written
+/// where agents read it, and a workflow fails such a PR.
+#[test]
+fn pull_requests_target_trunk_dev() {
+    let root = workspace_root();
+
+    for path in ["CLAUDE.md", "AGENTS.md", "CONTRIBUTING.md"] {
+        let doc = std::fs::read_to_string(root.join(path))
+            .unwrap_or_else(|err| panic!("read {path}: {err}"));
+        assert!(
+            doc.contains("**Every PR targets `trunk-dev`.**"),
+            "{path} must tell an agent that every PR targets trunk-dev",
+        );
+    }
+
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/base-branch.yml"))
+        .expect("read .github/workflows/base-branch.yml");
+    assert!(
+        workflow.contains("run: bash scripts/check-base-branch.sh"),
+        "base-branch.yml must run the base-branch gate",
+    );
+    // A `branches:` filter would stop the check from re-running when a PR's
+    // base moves from `trunk` to `trunk-dev`, leaving the old failure on it.
+    assert!(
+        !workflow.contains("branches:"),
+        "base-branch.yml must run on every PR, not only PRs into trunk",
+    );
+    // Whole list items: `labeled` is also a substring of `unlabeled`.
+    let types: Vec<&str> = workflow
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("types:"))
+        .and_then(|rest| rest.trim().strip_prefix('[')?.strip_suffix(']'))
+        .expect("base-branch.yml must list its pull_request types")
+        .split(',')
+        .map(str::trim)
+        .collect();
+    for event in ["edited", "labeled", "unlabeled"] {
+        assert!(
+            types.contains(&event),
+            "base-branch.yml must re-run on `{event}`",
+        );
+    }
+
+    let output = bash_command()
+        .arg("scripts/check-base-branch.sh")
+        .arg("--self-test")
+        .current_dir(&root)
+        .output()
+        .expect("run scripts/check-base-branch.sh --self-test");
+    assert!(
+        output.status.success(),
+        "check-base-branch.sh --self-test failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 /// A release note belongs in its own file under `changelog.d/`, never at the
 /// top of the `## [Unreleased]` section — the lines every other open PR also
 /// edits. The rule only holds while the gate runs and the instruction files
@@ -991,6 +1051,55 @@ fn trybuild_shards_run_from_the_workspace_nextest_archive() {
         }),
         "every nextest archive must carry `target/debug/.fingerprint` and fail without it; \
          got {includes:?}"
+    );
+}
+
+/// trybuild's cross-process lock is a lock file that another process breaks
+/// after 1.5 s without a touch. nextest runs each test in its own process, so
+/// only a one-slot test group keeps two trybuild runs out of one fixture
+/// directory on a loaded runner.
+#[test]
+fn trybuild_tests_share_one_nextest_slot() {
+    let root = workspace_root();
+    let config_path = root.join(".config/nextest.toml");
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(&config_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", config_path.display())),
+    )
+    .expect(".config/nextest.toml parses");
+    let field = |entry: &toml::Value, key: &str| {
+        entry
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    let group_threads = config
+        .get("test-groups")
+        .and_then(|g| g.get("trybuild"))
+        .and_then(|g| g.get("max-threads"))
+        .and_then(toml::Value::as_integer);
+    assert_eq!(
+        group_threads,
+        Some(1),
+        "`[test-groups.trybuild]` must exist with `max-threads = 1`"
+    );
+    let overrides = config
+        .get("profile")
+        .and_then(|p| p.get("default"))
+        .and_then(|p| p.get("overrides"))
+        .and_then(toml::Value::as_array)
+        .expect("`[[profile.default.overrides]]` must exist");
+    assert!(
+        overrides.iter().any(|entry| {
+            field(entry, "test-group").as_deref() == Some("trybuild")
+                && field(entry, "filter").is_some_and(|filter| {
+                    filter.contains("binary_id(autumn-web::integration_tests)")
+                        && filter.contains("test(compile_fail::)")
+                })
+        }),
+        "every `compile_fail::` test of the consolidated binary must run in the \
+         `trybuild` group, on the default profile so that every profile inherits it; \
+         got {overrides:?}"
     );
 }
 

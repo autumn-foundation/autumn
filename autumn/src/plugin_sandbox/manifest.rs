@@ -273,8 +273,8 @@ pub const MAX_ROUTES: usize = 256;
 /// long enough to reach it is already unreadable.
 pub const MAX_PATH_LEN: usize = 1024;
 
-// The refusal reasons below name this ceiling in prose, and a `&'static str`
-// cannot interpolate a constant. Asserted equal so the two cannot drift.
+// The refusal reasons spell out "1024" because a `&'static str` cannot interpolate a
+// constant. This assert keeps them in step.
 const _: () = assert!(MAX_PATH_LEN == 1024);
 
 /// The per-request resource ceilings the host enforces for this plugin.
@@ -354,48 +354,24 @@ impl ResourceLimits {
     #[must_use]
     pub const fn request_footprint_bytes(&self) -> u128 {
         (self.memory_bytes as u128)
-            // Four. At `to_line` the body is live twice (caller, frame clone) and
-            // the base64 text is written straight into the line (4/3). That is
-            // 10/3 of the body. There is no encode temporary, and `to_line`
-            // sizes the line exactly, so it holds no spare capacity.
+            // Body: live twice (caller, frame clone) plus its base64 text in the line (4/3):
+            // 10/3, rounded up to 4. Base64 is written straight into the line (no encode
+            // temporary), and `to_exact_line` sizes the line with no spare capacity.
             .saturating_add((self.max_request_body_bytes as u128).saturating_mul(4))
             .saturating_add((self.max_response_bytes as u128).saturating_mul(5))
-            // The instance's tables, bounded by `MAX_TABLE_ELEMENTS` at a
-            // generous 16 bytes a reference. Small, but per-instance storage
-            // the footprint would otherwise not know about at all.
+            // Table storage, at a generous 16 bytes a reference.
             .saturating_add(crate::plugin_sandbox::host::MAX_TABLE_ELEMENTS as u128 * 16)
-            // The request's metadata: the caller's strings, the frame's clone of
-            // them, and the serialised line — the term that was wrong. `4 x`
-            // priced the line at the raw byte count, but JSON is an escaping
-            // encoding: `serde_json` writes a control character as a six-byte
-            // `\uXXXX` escape, and every byte of a metadata field can be one. An
-            // HTTP request cannot carry them — the `http` crate refuses control
-            // characters in header values and URIs — but `SandboxHost::run` is
-            // public and an embedder builds the `SandboxRequest` by hand, so the
-            // bound has to hold for the API rather than for the adapter that is
-            // merely its politest caller.
-            //
-            // The ceiling that bounds the raw bytes is the host's rather than this
-            // manifest's, but it is per-request storage all the same: leaving it
-            // out entirely made this product understate a near-maximum-concurrency
-            // plugin by hundreds of megabytes, and pricing it unescaped understated
-            // it again by as much.
+            // Metadata: the caller's strings, the frame's clone, and the serialised line.
+            // `serde_json` escapes a control character as six bytes (`\uXXXX`), so the line
+            // alone can be 6x the raw bytes. The `http` crate refuses control characters,
+            // but `SandboxHost::run` is public and takes a hand-built `SandboxRequest`.
             .saturating_add(crate::plugin_sandbox::host::MAX_REQUEST_METADATA_BYTES as u128 * 8)
-            // The instance's globals, at a generous 16 bytes each. Per-instance
-            // storage the footprint would otherwise not know about at all — the
-            // same omission the tables term above exists to correct.
+            // Globals, at a generous 16 bytes each.
             .saturating_add(crate::plugin_sandbox::host::MAX_GLOBALS as u128 * 16)
-            // The instance's function entries, at 32 bytes each. Same argument
-            // as globals: per-instance storage the product would not otherwise
-            // know about.
+            // Function entries, at 32 bytes each.
             .saturating_add(crate::plugin_sandbox::host::MAX_FUNCTIONS as u128 * 32)
-            // The host buffers that do not scale with any ceiling this manifest
-            // names, and were therefore left to a flat 4 KiB of slack that did
-            // not cover them: the 64 KiB stderr budget held for the whole
-            // request, the 64 KiB scratch an `fd_write` allocates while that
-            // budget is still resident, and the bounded denial ledger. Fixed
-            // per request is still per request — at a concurrency near this
-            // product's own ceiling they are tens of megabytes.
+            // Host buffers that scale with no manifest ceiling: the stderr budget, the
+            // `fd_write` scratch allocated while it is resident, and the denial ledger.
             .saturating_add(crate::plugin_sandbox::host::FIXED_HOST_BUFFER_BYTES as u128)
     }
 
@@ -452,9 +428,8 @@ impl ResourceLimits {
             ),
         ];
         for (field, value, max) in checks {
-            // Zero is refused as well as oversized: a zero ceiling is not "no
-            // limit" but "cannot run", and a manifest that says it by accident
-            // should say so at load rather than at the first request.
+            // A zero ceiling means "cannot run", not "no limit": refuse it at load rather
+            // than fail at the first request.
             if value == 0 || value > max {
                 return Err(ManifestError::LimitOutOfRange { field, value, max });
             }
@@ -860,11 +835,8 @@ impl SandboxManifest {
                 ..RouteInfo::default()
             };
             infos.push(info(&route.method));
-            // HTTP defines HEAD as GET without the body, and axum's method
-            // router dispatches a HEAD with no HEAD route to the GET one. That
-            // is correct behaviour, but it means a manifest listing only GET
-            // serves a method its own consent screen never named — so the
-            // implication is reported rather than left implicit.
+            // axum dispatches a HEAD with no HEAD route to the GET one, so a GET route also
+            // serves HEAD. Report it so the listing names every method served.
             if route.method == "GET" && !self.declares("HEAD", &route.path) {
                 infos.push(info("HEAD"));
             }
@@ -886,8 +858,8 @@ impl SandboxManifest {
         use std::fmt::Write as _;
 
         let mut out = String::new();
-        // `write!` to a `String` is infallible; the results are dropped rather
-        // than unwrapped so this stays panic-free by construction.
+        // `write!` to a `String` is infallible; results are dropped, not unwrapped, to stay
+        // panic-free.
         let _ = writeln!(
             out,
             "Sandboxed plugin: {name} {version}",
@@ -916,10 +888,8 @@ impl SandboxManifest {
                 describe = capability.describe()
             );
         }
-        // The scope of each grant, right under the capability list, because a
-        // capability name answers "may it?" and nothing in it answers "to
-        // what?". An operator reading `http-outbound` alone has approved the
-        // open internet.
+        // The scope of each grant: a capability name says "may it?" but not "to what?".
+        // `http-outbound` alone would read as the open internet.
         for (label, capability) in [
             (
                 "outbound hosts it may call",
@@ -941,10 +911,8 @@ impl SandboxManifest {
                 let _ = writeln!(out, "    {entry}");
             }
         }
-        // Only the authority this build cannot grant at all. Printing "no
-        // database access" under a manifest that was just granted `db` is a
-        // consent screen contradicting itself, and the reader believes the
-        // reassuring half.
+        // List only authority this manifest was not granted: "no database access" under a
+        // `db` grant would contradict the lines above.
         out.push_str("  denied, with no way to ask for it in this version:\n    ");
         let mut ungranted: Vec<&'static str> = vec![
             "filesystem access",
@@ -1011,13 +979,9 @@ impl SandboxManifest {
                 .into_iter()
                 .zip(self.quotas.fields())
                 .filter(|((field, _), _)| {
-                    // A quota bounding a capability this upgrade no longer asks
-                    // for is not new authority: the calls it bounds cannot be
-                    // made at all. Reporting it made a *narrowing* upgrade —
-                    // dropping `kv` while leaving a raised `kv_reads` behind —
-                    // exit non-zero from `plugin inspect --against`, which is
-                    // exactly the prompt this delta exists to avoid, on the
-                    // change least in need of one.
+                    // A quota for a capability this manifest no longer asks for is not new
+                    // authority: the calls it bounds cannot be made. Dropping `kv` while
+                    // raising `kv_reads` must not prompt.
                     super::grants::CapabilityQuotas::governed_by(field)
                         .is_none_or(|capability| self.is_granted(capability))
                 })
@@ -1025,10 +989,7 @@ impl SandboxManifest {
                     (requested > approved).then_some((field, approved, requested))
                 })
                 .collect(),
-            // Routes are the router, not a description of it — an added one is
-            // an endpoint the approved manifest did not serve. Compared as the
-            // consent screen prints them, including the HEAD a declared GET
-            // implies, so a GET added to an existing path is caught with it.
+            // Compared as the consent screen prints them, including the HEAD a GET implies.
             added_routes: added(&previous.consent_routes(), &self.consent_routes()),
             raised_limits: previous
                 .limits
@@ -1064,11 +1025,8 @@ impl SandboxManifest {
             });
         }
         validate_name(&self.name)?;
-        // `version` is rendered verbatim on the consent screen an operator reads
-        // before agreeing to run the artifact. A free-form field there can
-        // rewrite the lines above it with terminal escapes — hide a route, hide
-        // a capability, forge a verdict — so it gets the same treatment as the
-        // name: printable ASCII, no spaces, bounded.
+        // `version` is printed verbatim on the consent screen, where terminal escapes could
+        // rewrite the lines above it. Like the name: printable ASCII, no spaces, bounded.
         let version_ok = !self.version.is_empty()
             && self.version.len() <= MAX_NAME_LEN
             && self.version.chars().all(|ch| ch.is_ascii_graphic());
@@ -1081,33 +1039,12 @@ impl SandboxManifest {
                 SandboxCapability::HttpRequest,
             ));
         }
-        // A repeat grants nothing the first did, so no manifest is made legal by one —
-        // and every request clones this vector and serialises it into the frame. Left
-        // unbounded it is per-request work `request_footprint_bytes` never counted and
-        // `encoding_fuel` never priced, bought once in a manifest and paid for on every
-        // call. Refusing here, rather than deduplicating, keeps the list an operator reads
-        // on the consent screen the same list the guest is handed.
+        // Every request clones this list into its frame, so repeats are refused rather than
+        // deduplicated: the consent screen and the guest then see the same list.
         //
-        // Scanned in place rather than into a `Vec::with_capacity`: that vector was only
-        // ever a duplicate set, dropped below without being read, so sizing it from
-        // `self.capabilities.len()` performed — on a list a direct caller chose — exactly
-        // the unbounded allocation this check exists to refuse.
-        //
-        // The pigeonhole principle bounds the scan: a list longer than the number of distinct
-        // capabilities must repeat one, so a duplicate is certain within the first
-        // `ALL.len() + 1` entries and looking past them cannot change the answer. Derived
-        // from `ALL` rather than written as a number, so it stays right as the vocabulary
-        // grows.
-        //
-        // Sized from the vocabulary, never from `self.capabilities.len()`. That
-        // length is the caller's to choose — `from_module` takes a manifest an
-        // embedder filled in by hand, where no byte ceiling applies — and this
-        // type is no longer the ZST it was when it had one variant, so a
-        // capacity taken from it is an allocation an untrusted number sizes.
-        // The pigeonhole principle makes the smaller capacity sufficient, not
-        // merely cheaper: a list longer than the number of distinct
-        // capabilities must repeat one, so the loop below returns before it
-        // could ever push entry `ALL.len() + 1`.
+        // Capacity comes from the vocabulary, never from `self.capabilities.len()`, which a
+        // direct `from_module` caller chooses. It is enough: a list longer than `ALL` must
+        // repeat an entry, so the loop returns before pushing entry `ALL.len() + 1`.
         let mut granted: Vec<SandboxCapability> =
             Vec::with_capacity(SandboxCapability::ALL.len().saturating_add(1));
         for capability in &self.capabilities {
@@ -1116,18 +1053,12 @@ impl SandboxManifest {
             }
             granted.push(*capability);
         }
-        // After the duplicate scan, so `granted` is the deduplicated list, and
-        // before the routes, so a manifest whose grant table contradicts its
-        // capability list is refused on the contradiction rather than on
-        // whichever route happens to be malformed too.
+        // Before the routes, so a grant table that contradicts the capability list is
+        // reported as that, not as whichever route is also malformed.
         self.grants.validate(&granted)?;
         self.quotas.validate()?;
-        // A granted table whose physical name cannot be derived — because the
-        // plugin's name and the table's together overrun the identifier ceiling
-        // — is authority the consent screen displays and every call then denies
-        // as `malformed`. Refusing at load is the difference between an
-        // operator learning at install and an author learning at 3am: the same
-        // argument `FuelBelowFixedCharges` rests on.
+        // A table whose physical name overruns the identifier ceiling would be shown on the
+        // consent screen and then denied on every call. Refuse it at install instead.
         for table in &self.grants.tables {
             if !crate::plugin_sandbox::capability::db::is_derivable(&self.name, table) {
                 return Err(ManifestError::InvalidGrantEntry {
@@ -1143,9 +1074,8 @@ impl SandboxManifest {
         if self.routes.is_empty() {
             return Err(ManifestError::NoRoutes);
         }
-        // Before the indexes below are reserved or scanned: both are linear per
-        // route and so quadratic over the list, and `with_capacity` would size
-        // them from a number the caller chose.
+        // Before the indexes below are reserved or scanned: the scans are quadratic over the
+        // list, and `with_capacity` would size them from a number the caller chose.
         if self.routes.len() > MAX_ROUTES {
             return Err(ManifestError::TooManyRoutes {
                 found: self.routes.len(),
@@ -1153,10 +1083,8 @@ impl SandboxManifest {
             });
         }
         let mut seen: Vec<(&str, &str)> = Vec::with_capacity(self.routes.len());
-        // The same engine the mount will use, so "these two are one route" is
-        // decided here rather than discovered by a panic at boot. Two routes
-        // that differ only by method share one template legitimately, so a path
-        // already inserted is skipped instead of self-conflicting.
+        // The mount's own engine, so a conflict is found here rather than by a panic at boot.
+        // Routes differing only by method share a template, so a path is inserted once.
         let mut shapes: matchit::Router<()> = matchit::Router::new();
         let mut inserted: Vec<&str> = Vec::with_capacity(self.routes.len());
         for route in &self.routes {
@@ -1300,11 +1228,8 @@ fn validate_digest(digest: &str) -> Result<(), ManifestError> {
 /// failure detail is evidence and has to survive to be read.
 pub(super) const fn is_display_reordering(ch: char) -> bool {
     matches!(ch,
-        // Unicode's format class (general category Cf) that is *not* also
-        // default-ignorable. Enumerated rather than queried because the
-        // standard library exposes no general-category predicate — `is_control`
-        // answers for Cc only, and `is_whitespace` for the separators, so a
-        // format character passes both.
+        // Format characters (category Cf) that are not also default-ignorable. Enumerated
+        // because std has no general-category predicate; `is_control` covers only Cc.
         '\u{0600}'..='\u{0605}'            // Arabic number signs
         | '\u{06DD}'                        // Arabic end of ayah
         | '\u{070F}'                        // Syriac abbreviation mark
@@ -1315,21 +1240,13 @@ pub(super) const fn is_display_reordering(ch: char) -> bool {
         | '\u{13430}'..='\u{1343F}'        // Egyptian hieroglyph formats
         | '\u{FFF9}'..='\u{FFFB}'          // interlinear annotation
 
-        // Unicode's `Default_Ignorable_Code_Point` set, in full. This is the
-        // property that actually names the hazard — "a renderer may show
-        // nothing here" — and it is not the same set as Cf. Enumerating Cf and
-        // adding exceptions was the shape of two bugs in a row: first U+00AD
-        // SOFT HYPHEN, then U+115F HANGUL CHOSEONG FILLER, which is general
-        // category Lo. A *letter*, neither whitespace nor control nor format,
-        // that renders as nothing — so `/hello/ad\u{115F}min` reads as
-        // `/hello/admin` on the consent screen while the router mounts a path
-        // that is not it. The Hangul fillers below are the same trick four
-        // times over.
+        // Unicode's `Default_Ignorable_Code_Point` set, in full: the property that names
+        // the hazard ("a renderer may show nothing here"). It is not a subset of Cf: the
+        // Hangul fillers are letters (Lo), so `/hello/ad\u{115F}min` displays as
+        // `/hello/admin` while the router mounts something else.
         //
-        // Ranges that are partly unassigned (U+2065, U+FFF0..U+FFF8, most of
-        // the U+E0000 block) are covered deliberately: the property is stable
-        // for them, and a code point reserved to be invisible is exactly what a
-        // future spoof would reach for.
+        // Partly unassigned ranges (U+2065, U+FFF0..U+FFF8, most of U+E0000) are covered on
+        // purpose: the property is stable for them.
         | '\u{00AD}'                        // soft hyphen
         | '\u{034F}'                        // combining grapheme joiner
         | '\u{061C}'                        // Arabic letter mark
@@ -1378,9 +1295,8 @@ fn validate_prefix(prefix: &str) -> Result<(), ManifestError> {
             reason,
         })
     };
-    // Before the scan below, and before anything clones it: a prefix is
-    // compared against every route path and then carried for the plugin's
-    // lifetime, and a direct `from_module` caller chose its length.
+    // First: the prefix is compared against every route path and kept for the plugin's
+    // lifetime, and a direct `from_module` caller chooses its length.
     if prefix.len() > MAX_PATH_LEN {
         return refuse("a prefix must be at most 1024 bytes");
     }
@@ -1447,9 +1363,8 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
             reason,
         })
     };
-    // Before the segment walk below and before the `matchit` insert that
-    // follows it — both of which are linear in this path — and before the
-    // accepted route is cloned into `OwnedRoutes`.
+    // First: the segment walk, the `matchit` insert and the `OwnedRoutes` clone are all
+    // linear in this path.
     if path.len() > MAX_PATH_LEN {
         return refuse("a route path must be at most 1024 bytes");
     }
@@ -1466,10 +1381,9 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
         if segment.is_empty() {
             return refuse("a route path must not contain an empty path segment");
         }
-        // A route has one spelling, or the router's literal comparisons are
-        // wrong. A client removes `%2e` as it removes `.`, and a proxy may
-        // decode any ASCII escape or upper-case any hex, so the plugin could
-        // mount beside the application route it arrives at (#2463).
+        // A route has one spelling, or the router's literal comparisons are wrong. A client
+        // removes `%2e` as it removes `.`, and a proxy may decode any ASCII escape or
+        // upper-case any hex, so the plugin could mount beside the app route it reaches (#2463).
         if dot_segment_len(segment).is_some() {
             return refuse("a route path must not contain `.` or `..` segments in any spelling");
         }
@@ -1482,47 +1396,32 @@ fn validate_route_path(path: &str) -> Result<(), ManifestError> {
         if segment.chars().any(char::is_whitespace) {
             return refuse("a route path must not contain whitespace");
         }
-        // Not just whitespace: an ESC in a route path is printed verbatim on the
-        // consent screen, where it can rewrite what the operator reads.
+        // An ESC is printed verbatim on the consent screen, where it can rewrite what the
+        // operator reads.
         if segment.chars().any(char::is_control) {
             return refuse("a route path must not contain control characters");
         }
-        // `is_control` covers the C0/C1 categories and stops there, so it lets
-        // through the Unicode formatting characters, which do the same job by
-        // other means: U+202E reverses the run that follows it, so a path can
-        // be made to *display* on the consent screen as something other than
-        // what the manifest contains and the router mounts. The operator reads
-        // that screen to decide whether to trust the artifact, so a character
-        // whose only effect is on rendering is exactly the wrong thing to admit.
+        // `is_control` misses Unicode formatting characters: U+202E reverses the run after
+        // it, so a path could display differently from what the router mounts.
         if segment.chars().any(is_display_reordering) {
             return refuse(
                 "a route path must not contain Unicode formatting characters; they change what \
                  the consent screen displays without changing what is mounted",
             );
         }
-        // The router compares against the raw, percent-encoded path as it
-        // arrived on the wire, while the manifest is written in decoded text.
-        // A literal non-ASCII character can therefore never match: every
-        // ordinary client encodes it before sending, so a manifest declaring
-        // `/hello/café` mounts a route no client can reach while `plugin
-        // inspect` prints it as a route the plugin serves (#2481). Refuse
-        // rather than normalise, like every other rule in this function: the
-        // encoded spelling is already the working one, and the consent screen
-        // must show exactly what the router mounts. Captures (`{name}`,
-        // `{*rest}`) are matched by position at request time, so the rule
-        // applies to literal segments only. It runs after the whitespace,
-        // control and formatting checks so those keep their more specific
-        // refusals for the non-ASCII characters they cover.
+        // The router matches the raw, percent-encoded wire path, and clients encode
+        // non-ASCII before sending, so a literal `/hello/café` could never be reached
+        // (#2481). Refuse rather than normalise, so the consent screen shows exactly what is
+        // mounted. Captures match by position, so only literal segments are checked. Runs
+        // after the checks above so they keep their more specific refusals.
         if !is_capture_segment(segment) && segment.bytes().any(|b| !b.is_ascii()) {
             return refuse(
                 "a literal route segment must be ASCII; percent-encode each non-ASCII \
                  character as its upper-case UTF-8 bytes (e.g. `café` as `caf%C3%A9`)",
             );
         }
-        // axum 0.8 spells captures `{name}` / `{*rest}` and *panics* on a
-        // segment starting with the 0.7 spelling, before matchit ever sees it.
-        // Naming the fix beats reporting matchit's message for a path it never
-        // received.
+        // axum 0.8 panics on the 0.7 capture spelling before matchit sees it, so name the
+        // fix here.
         if segment.starts_with(':') {
             return refuse("axum 0.8 spells a capture `{name}`, not `:name`");
         }
@@ -1583,12 +1482,8 @@ max_concurrency = 8
 
     #[test]
     fn a_manifest_over_the_route_ceiling_is_refused_before_it_is_scanned() {
-        // `MAX_MANIFEST_BYTES` bounds a manifest that was *parsed*, but
-        // `SandboxHost::from_module` is public and takes a `SandboxManifest` an
-        // embedder built in memory, where no byte ceiling applies. Validation
-        // then scans the routes already seen for each new one, so the work
-        // grows with the square of the list, and an accepted list is held again
-        // for the lifetime of the plugin.
+        // A manifest built in memory for `from_module` has no byte ceiling, and route
+        // validation is quadratic in the list.
         let mut manifest = SandboxManifest::parse(&valid_toml()).expect("valid manifest");
         manifest.routes = (0..=MAX_ROUTES)
             .map(|index| DeclaredRoute {
@@ -1610,8 +1505,7 @@ max_concurrency = 8
             "{err}",
         );
 
-        // Exactly at the ceiling still validates, so this bounds the list
-        // rather than shrinking what a plugin may declare.
+        // Exactly at the ceiling still validates.
         let mut at_ceiling = SandboxManifest::parse(&valid_toml()).expect("valid manifest");
         at_ceiling.routes = (0..MAX_ROUTES)
             .map(|index| DeclaredRoute {
@@ -1626,13 +1520,8 @@ max_concurrency = 8
 
     #[test]
     fn a_route_path_past_the_byte_ceiling_is_refused_before_it_is_scanned() {
-        // The count ceiling above bounds how many paths a manifest declares;
-        // this bounds how large any one of them may be. On the count thread I
-        // wrote that path length was "already bounded per route by
-        // `validate_route_path`" — it was not, and the review that pushed back
-        // on that was right: the function checked shape and never length, so a
-        // direct `from_module` caller chose how much work the segment walk, the
-        // `matchit` insert, and the `OwnedRoutes` clone each did.
+        // Without a length bound, a direct `from_module` caller chooses how much work the
+        // segment walk, the `matchit` insert and the `OwnedRoutes` clone do.
         let long = format!("/hello/{}", "a".repeat(MAX_PATH_LEN));
         assert!(long.len() > MAX_PATH_LEN);
         let mut manifest = SandboxManifest::parse(&valid_toml()).expect("valid manifest");
@@ -1648,16 +1537,14 @@ max_concurrency = 8
             "{err}",
         );
 
-        // The refusal carries a bounded excerpt rather than the path it
-        // objected to the size of — the whole point of `rejected`.
+        // The refusal carries a bounded excerpt, not the oversized path.
         assert!(
             err.to_string().len() < MAX_PATH_LEN,
             "the refusal is as large as the thing it refused: {} bytes",
             err.to_string().len(),
         );
 
-        // Exactly at the ceiling still validates, so this bounds the path
-        // rather than quietly shrinking what a plugin may declare.
+        // Exactly at the ceiling still validates.
         let mut at_ceiling = SandboxManifest::parse(&valid_toml()).expect("valid manifest");
         let exact = format!("/hello/{}", "a".repeat(MAX_PATH_LEN - "/hello/".len()));
         assert_eq!(exact.len(), MAX_PATH_LEN);
@@ -1672,8 +1559,6 @@ max_concurrency = 8
 
     #[test]
     fn a_prefix_past_the_byte_ceiling_is_refused_before_it_is_scanned() {
-        // Same ceiling, same reason: the prefix is compared against every
-        // declared route and then carried for the plugin's lifetime.
         let mut manifest = SandboxManifest::parse(&valid_toml()).expect("valid manifest");
         manifest.prefix = format!("/{}", "a".repeat(MAX_PATH_LEN));
         let err = manifest
@@ -1772,8 +1657,6 @@ max_concurrency = 8
     #[test]
     fn a_route_path_that_reorders_its_own_display_is_refused() {
         // U+202E makes the rendered path read differently from the mounted one.
-        // The consent screen is where an operator decides whether to trust the
-        // artifact, so a path that lies to it is refused outright.
         let toml =
             valid_toml().replace(r#"path = "/hello/greet""#, "path = \"/hello/\u{202E}terg\"");
         let err = SandboxManifest::parse(&toml).expect_err("must be refused");
@@ -1805,10 +1688,7 @@ max_concurrency = 8
 
     #[test]
     fn a_route_path_the_router_would_refuse_is_refused_here() {
-        // Each of these makes `axum::Router::route` panic. A manifest that
-        // validates and then takes the app down at boot is the worst failure
-        // this lane could have, so the validator has to speak the router's
-        // language rather than a plausible imitation of it.
+        // Each of these makes `axum::Router::route` panic at boot.
         for bad in [
             "/hello/:id",       // axum 0.7 capture syntax
             "/hello/*rest",     // axum 0.7 wildcard syntax
@@ -1831,9 +1711,7 @@ max_concurrency = 8
 
     #[test]
     fn a_route_path_with_a_second_spelling_is_refused() {
-        // #2463. Each of these names another route once a client or a proxy
-        // normalises it. The router compares literals, so it would mount the
-        // plugin beside the application route it arrives at.
+        // #2463. Each names another route once a client or proxy normalises it.
         for bad in [
             "/hello/./transfer",
             "/hello/../transfer",
@@ -1883,14 +1761,8 @@ max_concurrency = 8
 
     #[test]
     fn a_route_path_with_a_literal_non_ascii_segment_is_refused() {
-        // #2481. The router compares against the raw, percent-encoded path as
-        // it arrived on the wire, and every ordinary client encodes a
-        // non-ASCII character before sending — so `/hello/café` mounts a
-        // route no client can reach while `plugin inspect` prints it as a
-        // route the plugin serves. The fix is refusal, not normalisation: the
-        // encoded spelling is already the working one.
-        // `{{…}}` is matchit's escaped-brace literal, not a capture, so its
-        // text is compared against the wire like any other literal.
+        // #2481. Clients encode non-ASCII, so a literal `/hello/café` is unreachable.
+        // `{{…}}` is matchit's escaped-brace literal, not a capture.
         for bad in [
             "/hello/café",
             "/café/x",
@@ -1908,10 +1780,7 @@ max_concurrency = 8
             );
         }
 
-        // The refusal says how to write the working spelling, so the author is
-        // not left guessing. The message is input-independent (it cannot
-        // name the rejected segment's own encoding), so it states the rule and
-        // labels its `café` spelling as an example.
+        // The refusal is a static string, so it explains the encoding by example.
         let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/hello/中文""#);
         let err = SandboxManifest::parse(&src).expect_err("must be refused");
         let message = format!("{err}");
@@ -1923,11 +1792,8 @@ max_concurrency = 8
 
     #[test]
     fn an_encoded_non_ascii_segment_is_the_one_spelling_the_consent_screen_reports() {
-        // The percent-encoded spelling is what clients send, so it validates —
-        // and the consent screen must show exactly the spelling the router
-        // mounts, or the screen lies about what the plugin serves (#2481).
-        // Mounting takes `route.path` verbatim, so the assertion here is that
-        // the consent text carries the same bytes the router gets.
+        // Mounting takes `route.path` verbatim, so the consent text must carry the same
+        // bytes (#2481).
         let src = valid_toml().replace(r#"path = "/hello/greet""#, r#"path = "/hello/caf%C3%A9""#);
         let manifest = SandboxManifest::parse(&src).expect("the encoded spelling is valid");
         assert!(
@@ -1938,8 +1804,7 @@ max_concurrency = 8
 
     #[test]
     fn plain_ascii_routes_are_unaffected_by_the_non_ascii_rule() {
-        // The new rule fires on non-ASCII bytes only: anything that validated
-        // before still validates, punctuation and captures included.
+        // The non-ASCII rule leaves ASCII punctuation and captures alone.
         for good in [
             "/hello/greet",
             "/hello/a.b-c_d~e!f$g&h'i(j)k*l+m,n;o=p",
@@ -1986,8 +1851,7 @@ max_concurrency = 8
 
     #[test]
     fn a_version_that_could_forge_a_consent_screen_is_refused() {
-        // `version` is the one free-form field on the screen an operator reads
-        // before agreeing to run the artifact.
+        // `version` is the one free-form field on the consent screen.
         for bad in [
             "",
             "0.1.0 \u{1b}[2K",
@@ -2007,8 +1871,7 @@ max_concurrency = 8
 
     #[test]
     fn a_route_path_carrying_a_control_character_is_refused() {
-        // A TOML `\u001B` escape decodes to a real ESC byte in the path — one
-        // that would rewrite the consent screen an operator reads it from.
+        // A TOML `\u001B` escape decodes to a real ESC byte in the path.
         let src = valid_toml().replace(
             r#"path = "/hello/greet""#,
             r#"path = "/hello/\u001B[2Kgreet""#,
@@ -2024,15 +1887,8 @@ max_concurrency = 8
 
     #[test]
     fn an_invisible_letter_is_refused_though_no_format_class_contains_it() {
-        // The reason the Cf-plus-exceptions shape kept leaking. U+115F HANGUL
-        // CHOSEONG FILLER is general category Lo — a *letter*. It is not a
-        // control, not whitespace, not a format character, and `is_alphabetic`
-        // says yes about it. It also renders as nothing, which is the only
-        // property that matters here.
-        //
-        // So the predicate is written against `Default_Ignorable_Code_Point`,
-        // the property that actually names the hazard, rather than against a
-        // general category that happens to contain most of it.
+        // These are letters (category Lo) that render as nothing, so only
+        // `Default_Ignorable_Code_Point`, not the format class, catches them.
         for (ch, what) in [
             ('\u{115F}', "hangul choseong filler"),
             ('\u{1160}', "hangul jungseong filler"),
@@ -2053,16 +1909,8 @@ max_concurrency = 8
 
     #[test]
     fn an_invisible_format_character_in_a_route_is_refused_like_a_visible_one() {
-        // The predicate listed the bidi and zero-width ranges and stopped
-        // there, which left the most literally invisible case through: U+00AD
-        // SOFT HYPHEN renders as nothing, and neither `is_control` (Cc only)
-        // nor `is_whitespace` claims it. `/hello/ad\u{00AD}min` therefore reads
-        // as `/hello/admin` on the consent screen while mounting a path that is
-        // not it — the same substitution the bidi overrides buy, with no
-        // reordering needed.
-        //
-        // The whole format class is covered now, so this walks the classes
-        // rather than the one character that was reported.
+        // `/hello/ad\u{00AD}min` displays as `/hello/admin` but mounts another path. One
+        // character from each invisible class.
         for (ch, what) in [
             ('\u{00AD}', "soft hyphen"),
             ('\u{200B}', "zero-width space"),
@@ -2074,8 +1922,7 @@ max_concurrency = 8
             ('\u{034F}', "combining grapheme joiner"),
             ('\u{FE0F}', "variation selector-16"),
             ('\u{E0041}', "tag latin capital A"),
-            // Default-ignorable but *not* format characters, which is how the
-            // Cf-plus-exceptions shape let them through a second time.
+            // Default-ignorable but not format characters.
             ('\u{115F}', "hangul choseong filler"),
             ('\u{1160}', "hangul jungseong filler"),
             ('\u{3164}', "hangul filler"),
@@ -2107,8 +1954,7 @@ max_concurrency = 8
             );
         }
 
-        // And ordinary text is unaffected — a path is allowed to be non-ASCII,
-        // it is only allowed not to lie about what it is.
+        // Ordinary non-ASCII text is not display-altering.
         for ch in ['é', 'ß', '日', '🦀'] {
             assert!(
                 !is_display_reordering(ch),
@@ -2151,12 +1997,7 @@ max_concurrency = 8
 
     #[test]
     fn a_capability_granted_twice_is_refused() {
-        // A repeat conveys no authority the first grant did not, so there is no
-        // manifest it makes legal — and the cost is not zero. Every request
-        // hands the grant list to the frame and serialises it, work that
-        // `request_footprint_bytes` never counted and `encoding_fuel` never
-        // priced. Thousands of repeats fit inside the manifest size limit, and
-        // a `SandboxManifest` built in-process has no size limit at all.
+        // A repeat adds no authority, but every request serialises the list into its frame.
         let src = valid_toml().replace(
             r#"capabilities = ["http-request"]"#,
             r#"capabilities = ["http-request", "http-request"]"#,
@@ -2167,8 +2008,6 @@ max_concurrency = 8
             "{err}",
         );
 
-        // Granted once, it still parses — the point is the repetition, not the
-        // capability.
         SandboxManifest::parse(&valid_toml()).expect("one grant is the normal case");
     }
 
@@ -2219,12 +2058,8 @@ max_concurrency = 8
 
     #[test]
     fn the_footprint_counts_the_host_buffers_a_request_holds_too() {
-        // Linear memory is not the only thing a concurrent request pins: the
-        // buffered request body, the pending stdout frame and the decoded
-        // response all live in host memory outside the guest limiter. A
-        // manifest with tiny `memory_bytes` and 64 MiB body/response ceilings
-        // would otherwise pass the product check and still allocate hundreds of
-        // gigabytes.
+        // Tiny `memory_bytes` with 64 MiB body/response ceilings: the host buffers alone
+        // put this over the ceiling.
         let src = valid_toml()
             .replace("memory_bytes = 33554432", "memory_bytes = 65536")
             .replace(
@@ -2245,11 +2080,8 @@ max_concurrency = 8
 
     #[test]
     fn the_body_term_covers_the_body_twice_and_the_encoded_line() {
-        // Live at the peak: the caller's body, the frame's clone, and the
-        // base64 text in the line. The encoder writes into the line, so there is
-        // no fourth copy.
-        //
-        // Measured, not derived: if the encoding stops being ~4/3 this fails.
+        // Live at the peak: the caller's body, the frame's clone, and the base64 text in the
+        // line. Measured, not derived: if the encoding stops being ~4/3 this fails.
         use crate::plugin_sandbox::wire::{HostFrame, SandboxRequest, to_line};
 
         let granted = [SandboxCapability::HttpRequest];
@@ -2272,7 +2104,6 @@ max_concurrency = 8
             .expect("serialises")
             .len();
 
-        // What one raw body byte becomes in the line: base64 is 4/3.
         let expansion = (with.saturating_sub(without) * 100) / 30_000;
         assert!(
             (130..=140).contains(&expansion),
@@ -2302,20 +2133,11 @@ max_concurrency = 8
 
     #[test]
     fn the_footprint_counts_the_host_buffers_that_scale_with_nothing() {
-        // Every other term scales with a ceiling the manifest names, so a
-        // reviewer reading the manifest can see it. These do not scale with
-        // anything, which is how they went missing: the stderr budget the state
-        // holds for the whole request, and the scratch buffer an `fd_write`
-        // allocates while that budget is still resident. A flat 4 KiB of slack
-        // stood in for them and was two orders of magnitude short.
-        //
-        // Fixed per request is still per request. At a concurrency near this
-        // product's own 1 GiB ceiling the difference is tens of megabytes of
-        // host memory the advertised bound did not account for.
+        // The stderr budget and the `fd_write` scratch scale with no manifest ceiling, but
+        // multiplied by concurrency they are tens of megabytes.
         use crate::plugin_sandbox::host::FIXED_HOST_BUFFER_BYTES;
 
-        // A manifest that declares nothing: every scaling term is zero, so what
-        // is left is exactly the fixed cost and nothing can hide inside it.
+        // Every manifest-scaled term is zero, leaving the host constants alone.
         let bare = ResourceLimits {
             memory_bytes: 0,
             max_request_body_bytes: 0,
@@ -2331,12 +2153,8 @@ max_concurrency = 8
             FIXED_HOST_BUFFER_BYTES as u128,
         );
 
-        // And the constant is really the buffers, not a number that drifted
-        // away from them: it covers the stderr budget and one I/O chunk with
-        // the denial ledger still to fit, and it is not back to the order of
-        // the flat slack it replaced. Both are known at compile time, so they
-        // are checked there — a term that stopped covering the buffers should
-        // not build, rather than fail a test somebody has to run.
+        // The constant covers the 64 KiB stderr budget plus one 64 KiB I/O chunk. Checked at
+        // compile time so a drift fails the build.
         const {
             assert!(
                 FIXED_HOST_BUFFER_BYTES >= 64 * 1024 + 64 * 1024,
@@ -2351,9 +2169,6 @@ max_concurrency = 8
 
     #[test]
     fn the_footprint_counts_every_buffer_a_request_holds_at_once() {
-        // The request body is buffered, cloned into the frame, and base64-encoded
-        // into the NDJSON line that becomes the guest's stdin — all live at
-        // once — and the instance's tables are per-instance host storage too.
         let limits = ResourceLimits {
             memory_bytes: 1_000_000,
             max_request_body_bytes: 100_000,
@@ -2373,11 +2188,8 @@ max_concurrency = 8
 
     #[test]
     fn the_footprint_counts_the_peak_while_a_response_is_being_decoded() {
-        // Parsing the guest's answer is where the response side actually
-        // peaks: the raw NDJSON line is still live (up to 2x the ceiling), the
-        // base64 field may be copied out of it, and the decoded body is
-        // allocated while both are held. A term that counted only "the line
-        // plus the decoded response" described a moment that never happens.
+        // The response peaks while it is parsed: the raw line (up to 2x the ceiling), a
+        // possible copy of its base64 field, and the decoded body are live at once.
         let limits = ResourceLimits {
             memory_bytes: 0,
             max_request_body_bytes: 0,
@@ -2398,12 +2210,8 @@ max_concurrency = 8
 
     #[test]
     fn the_footprint_counts_the_metadata_a_request_may_carry() {
-        // The ceiling that bounds request metadata is the host's rather than
-        // this manifest's, but it is per-request storage all the same, cloned
-        // into the frame and serialised around. Left out, this product
-        // understated a near-maximum-concurrency plugin by hundreds of
-        // megabytes — and this product is exactly what the validator checks and
-        // what a reviewer reads.
+        // The metadata ceiling is the host's, not the manifest's, but it is still
+        // per-request storage.
         let bare = ResourceLimits {
             memory_bytes: 0,
             max_request_body_bytes: 0,
@@ -2425,17 +2233,8 @@ max_concurrency = 8
 
     #[test]
     fn a_value_rejected_for_its_size_is_not_copied_at_that_size() {
-        // `SandboxManifest`'s fields are public, so a direct
-        // `SandboxHost::from_module` caller reaches validation with a value the
-        // container reader's `MAX_MANIFEST_BYTES` never saw. Rejecting a name
-        // for being too long, and then carrying the whole thing into the error
-        // to say so, holds the original plus a copy plus the string
-        // `from_module` formats out of it — three of the thing whose size was
-        // the objection.
-        //
-        // The bound is what is asserted, not the exact excerpt: the point is
-        // that the error's size is decided by this crate rather than by the
-        // caller.
+        // A direct `from_module` caller can pass fields `MAX_MANIFEST_BYTES` never bounded.
+        // The error's size must be set by this crate, not by the rejected value.
         let huge = "x".repeat(512 * 1024);
 
         let mut manifest = SandboxManifest::parse(&valid_toml()).expect("valid");
@@ -2451,7 +2250,6 @@ max_concurrency = 8
             huge.len(),
         );
 
-        // The sibling fields reject on shape too, and each was its own copy.
         let mut manifest = SandboxManifest::parse(&valid_toml()).expect("valid");
         manifest.sha256.clone_from(&huge);
         let rendered = manifest
@@ -2493,10 +2291,8 @@ max_concurrency = 8
 
     #[test]
     fn a_name_carrying_a_newline_is_refused() {
-        // TOML itself refuses a raw newline inside a basic string, so this one
-        // never reaches the name check — but it must still be a refusal, and
-        // the test exists so a future manifest format that *does* accept it
-        // cannot silently let a log-forging name through.
+        // TOML refuses a raw newline in a basic string before the name check runs. This
+        // keeps it refused if the format ever accepts one.
         let src = valid_toml().replace("autumn-plugin-hello", "plugin\nname");
         assert!(SandboxManifest::parse(&src).is_err());
     }
@@ -2565,9 +2361,8 @@ slots = ["order-summary"]
 
     #[test]
     fn a_grant_list_without_its_capability_is_refused() {
-        // The operator read "no outbound network" in the capability list and
-        // "api.example.com" three lines below it. One of those is a lie, and
-        // the runtime must not pick which.
+        // The capability list and the grant list contradict each other; the runtime must
+        // refuse rather than pick which one the operator meant.
         let src = vocabulary_toml().replace(r#", "http-outbound""#, "");
         assert_eq!(
             SandboxManifest::parse(&src),
@@ -2634,10 +2429,8 @@ slots = ["order-summary"]
                 "{bad} was accepted for {field}"
             );
         }
-        // A name carrying a quote cannot even be written in the manifest's own
-        // syntax without escaping, so the shape rule is asserted directly as
-        // well — `SandboxHost::from_module` takes a manifest an embedder built
-        // in memory, where TOML never ran.
+        // Quoted names need escaping in TOML, so check the shape rule directly: a manifest
+        // built in memory for `from_module` never went through TOML.
         for bad in ["\"orders\"", "orders`", "orders'", "ord ers", ""] {
             assert!(!is_grantable_ident(bad), "{bad} is not an identifier");
             assert!(!is_grantable_name(bad), "{bad} is not a name");
@@ -2684,10 +2477,7 @@ slots = ["order-summary"]
 
     #[test]
     fn an_upgrade_that_asks_for_more_needs_fresh_consent() {
-        // Same plugin, same routes, same ceilings — only the grant grows, so
-        // the delta isolates the thing under test. Diffing two *different*
-        // plugins would report every route as new and prove nothing about
-        // capabilities.
+        // Same plugin, routes and ceilings; only the grant grows.
         let previous = SandboxManifest::parse(
             &vocabulary_toml()
                 .replace(
@@ -2721,9 +2511,8 @@ slots = ["order-summary"]
         let summary = delta.summary();
         assert!(summary.contains("api.example.com"), "{summary}");
 
-        // The same manifest twice asks for nothing new.
         assert!(!next.consent_delta_from(&next).requires_consent());
-        // Dropping a capability is not something to re-prompt for.
+        // Dropping a capability does not re-prompt.
         assert!(!previous.consent_delta_from(&next).requires_consent());
     }
 
@@ -2746,10 +2535,7 @@ slots = ["order-summary"]
 
     #[test]
     fn an_upgrade_that_mounts_a_new_route_needs_fresh_consent() {
-        // A route is the router, not a description of it: the host builds its
-        // mount from exactly this list, and the consent screen promises the
-        // plugin serves "these and only these". An upgrade adding one exposes
-        // an endpoint nobody approved.
+        // The host mounts exactly the declared routes, so a new one is an unapproved endpoint.
         let previous = SandboxManifest::parse(&vocabulary_toml()).expect("valid");
         let next = SandboxManifest::parse(&format!(
             "{}\n[[routes]]\nmethod = \"POST\"\npath = \"/shop/checkout\"\n",
@@ -2774,10 +2560,7 @@ slots = ["order-summary"]
 
     #[test]
     fn the_head_a_new_get_implies_is_part_of_the_upgrade_too() {
-        // HTTP serves HEAD wherever it serves GET and the runtime mounts it, so
-        // a manifest adding one bare GET adds two mounted routes. Both are
-        // authority, and the diff is taken over the list the consent screen
-        // prints rather than the literal `[[routes]]`.
+        // A bare GET also mounts HEAD, so adding one adds two routes.
         let previous = SandboxManifest::parse(&vocabulary_toml()).expect("valid");
         let next = SandboxManifest::parse(&format!(
             "{}\n[[routes]]\nmethod = \"GET\"\npath = \"/shop/orders\"\n",
@@ -2795,11 +2578,7 @@ slots = ["order-summary"]
 
     #[test]
     fn a_quota_for_a_dropped_capability_is_not_new_authority() {
-        // The narrowing upgrade this delta exists to wave through, made to look
-        // like growth by a number left behind. Dropping `kv` while a raised
-        // `kv_reads` stays in the table is not new authority — no KV call can
-        // be made at all — but it made `plugin inspect --against` exit
-        // non-zero, prompting on the change least in need of a prompt.
+        // Dropping `kv` while raising `kv_reads` is a narrowing: no KV call can be made.
         let approved =
             SandboxManifest::parse(&format!("{}\n[quotas]\nkv_reads = 8\n", vocabulary_toml()))
                 .expect("valid");
@@ -2827,8 +2606,7 @@ slots = ["order-summary"]
             delta.raised_quotas
         );
 
-        // And the same raise *with* `kv` still granted is still reported, so
-        // the filter narrows the delta rather than defeating it.
+        // The same raise with `kv` still granted is still reported.
         let greedy =
             SandboxManifest::parse(&format!("{}\n[quotas]\nkv_reads = 64\n", vocabulary_toml()))
                 .expect("valid");
@@ -2844,10 +2622,8 @@ slots = ["order-summary"]
 
     #[test]
     fn every_quota_says_which_capability_it_bounds() {
-        // The pairing `governed_by` relies on, asserted rather than assumed:
-        // a quota added to `fields` without a mapping would silently become
-        // ungoverned, and an ungoverned quota is always reported — which is the
-        // behaviour the filter above exists to remove.
+        // A quota added to `fields` without a `governed_by` mapping would be ungoverned, and
+        // so always reported by the consent delta.
         let ungoverned = ["calls", "calls_per_second"];
         for (field, _) in CapabilityQuotas::default().fields() {
             let governed = super::super::grants::CapabilityQuotas::governed_by(field).is_some();
@@ -2861,10 +2637,7 @@ slots = ["order-summary"]
 
     #[test]
     fn an_upgrade_that_raises_a_resource_ceiling_needs_fresh_consent() {
-        // The kind of growth that touches no capability name: `fuel`,
-        // `memory_bytes` and `max_concurrency` are what one plugin may cost the
-        // host, and an upgrade can multiply them by thousands while every word
-        // on the consent screen stays the same.
+        // Growth that changes no capability name.
         let modest = SandboxManifest::parse(&format!(
             "{}\n[limits]\nfuel = 5000000\nmemory_bytes = 16777216\nmax_concurrency = 4\n",
             vocabulary_toml()
@@ -2887,15 +2660,12 @@ slots = ["order-summary"]
             delta.raised_limits
         );
         assert!(delta.summary().contains("fuel"));
-        // Lowering a ceiling asks for less.
         assert!(!modest.consent_delta_from(&greedy).requires_consent());
     }
 
     #[test]
     fn a_db_grant_whose_physical_name_cannot_be_derived_is_refused_at_load() {
-        // The alternative is a capability the consent screen displays and every
-        // call then denies as `malformed` — an operator approving authority the
-        // runtime can never honour.
+        // A 40-byte plugin name plus a 30-byte table overruns the 63-byte identifier.
         let src = vocabulary_toml()
             .replace("autumn-plugin-shop", &"p".repeat(40))
             .replace("\"orders\"", &format!("\"{}\"", "t".repeat(30)));
@@ -2928,8 +2698,7 @@ slots = ["order-summary"]
                 "{expected} missing from {summary}"
             );
         }
-        // The blanket "no database, no network" line must not survive next to a
-        // manifest that was just granted both.
+        // The "denied" line must not list network access for a manifest granted it.
         assert!(
             !summary.contains("filesystem access, outbound network access"),
             "{summary}"
@@ -2955,8 +2724,7 @@ slots = ["order-summary"]
         assert!(summary.contains("http-request"), "{summary}");
         assert!(summary.contains(&"a".repeat(64)), "{summary}");
         assert!(summary.contains("GET /hello/greet"), "{summary}");
-        // Everything the sandbox denies is named too, so the reader sees the
-        // shape of the "no" and not just the "yes".
+        // The denied authority is named too.
         assert!(summary.contains("filesystem"), "{summary}");
         assert!(summary.contains("network"), "{summary}");
         assert!(summary.contains("environment"), "{summary}");
@@ -2965,10 +2733,7 @@ slots = ["order-summary"]
 
     #[test]
     fn a_declared_get_reports_the_head_it_also_serves() {
-        // HTTP says HEAD is GET without the body, and axum's method router
-        // dispatches a HEAD with no HEAD route to the GET one. A manifest that
-        // listed only GET would therefore serve a method its own consent screen
-        // never named.
+        // axum dispatches a HEAD with no HEAD route to the GET one.
         let manifest = SandboxManifest::parse(&valid_toml()).expect("valid");
         let infos = manifest.route_infos();
         assert_eq!(infos.len(), 2, "{infos:?}");

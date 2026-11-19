@@ -2734,25 +2734,36 @@ mod tests {
         assert_eq!(md("<pre>````x</pre>"), "`````\n````x\n`````\n");
     }
 
+    /// How many times longer `large` takes to parse than `small`.
+    ///
+    /// The runs alternate, so load on a busy runner slows both inputs alike.
+    /// The fastest of five runs of each input counts.
+    fn growth(small: &str, large: &str) -> f64 {
+        let run = |html: &str| {
+            let started = std::time::Instant::now();
+            let _ = md(html);
+            started.elapsed()
+        };
+        let (mut fastest_small, mut fastest_large) =
+            (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..5 {
+            fastest_small = fastest_small.min(run(small));
+            fastest_large = fastest_large.min(run(large));
+        }
+        fastest_large.as_secs_f64() / fastest_small.as_secs_f64()
+    }
+
     #[test]
     fn unterminated_tags_parse_in_linear_time() {
         // The growth rate, not a wall-clock budget, as in the test below: four
         // times the input must take about four times as long (a quadratic
-        // parse takes sixteen). Best of three runs.
-        let time = |html: &str| {
-            (0..3)
-                .map(|_| {
-                    let started = std::time::Instant::now();
-                    let _ = md(html);
-                    started.elapsed()
-                })
-                .min()
-                .unwrap()
-        };
+        // parse takes sixteen).
         for unit in ["<a b", "<a b=\""] {
-            let small = time(&unit.repeat(50_000));
-            let large = time(&unit.repeat(200_000));
-            assert!(large < small * 10, "{unit:?}: {small:?} -> {large:?}");
+            let growth = growth(&unit.repeat(50_000), &unit.repeat(200_000));
+            assert!(
+                growth < 10.0,
+                "{unit:?}: 4x the input took {growth:.1}x as long"
+            );
         }
     }
 
@@ -2760,18 +2771,7 @@ mod tests {
     fn unmatched_end_tags_past_the_depth_limit_parse_in_linear_time() {
         // The growth rate, not a wall-clock budget: a debug build on a busy
         // runner is slow, but four times the input must take about four
-        // times as long (a quadratic parse takes sixteen). Best of three
-        // runs keeps a scheduler hiccup out of it.
-        let time = |html: &str| {
-            (0..3)
-                .map(|_| {
-                    let started = std::time::Instant::now();
-                    let _ = md(html);
-                    started.elapsed()
-                })
-                .min()
-                .unwrap()
-        };
+        // times as long (a quadratic parse takes sixteen). See [`growth`].
         let cases: [fn(usize) -> String; 2] = [
             // Many dropped start tags, then many end tags that match none.
             |n| {
@@ -2793,9 +2793,8 @@ mod tests {
             },
         ];
         for case in cases {
-            let small = time(&case(5_000));
-            let large = time(&case(20_000));
-            assert!(large < small * 10, "{small:?} -> {large:?}");
+            let growth = growth(&case(5_000), &case(20_000));
+            assert!(growth < 10.0, "4x the input took {growth:.1}x as long");
         }
     }
 

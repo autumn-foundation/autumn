@@ -81,8 +81,8 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   macros or other internals need to reach, but user code must not depend on
   them.
 - Anything under `autumn_web::reexports`. The crates re-exported there
-  (`axum`, `diesel`, `diesel_async`, `http`, `tokio`, `tokio_util`,
-  `tracing`, `validator`, `chrono`) follow *their own* versioning. See
+  (`axum`, `diesel`, `diesel_async`, `http`, `jiff`, `tokio`, `tokio_util`,
+  `tracing`, `validator`) follow *their own* versioning. See
   [Dependencies and re-exports](#dependencies-and-re-exports).
 - Exact error messages (`Display` output, log lines, rendered HTML error
   pages). Only *types* and *status codes* are stable.
@@ -331,6 +331,16 @@ The widget families (`widgets-search`, `widgets-social`, `widgets-workflow`,
 `test-features` CI job checks `maud,htmx` with neither, each and both, checks
 that `jsonwebtoken`, `rsa`, `crypto-bigint` 0.5 and `p256` are in the graph
 only when their feature is on, and runs the specs with both off.
+
+`error-reporting` has a lane as well: `reporting` turns it on, so the
+default build never has the panic-catch layer without failure capture. The
+`error-reporting` lane compiles the no-DB daemon starter's feature set and
+runs the reporter specs with `reporting` off.
+
+`plugin-conformance`, `runtime-config` and `axum-ws` have the
+`daemon-starter` lane. It checks that the daemon starter's dependency tree
+has no WebSocket crate, compiles that feature set and the CLI alone, and
+runs the specs with the three features off.
 
 `db` alone selects no backend, so it stops at a `compile_error!`. The sweep
 skips it and the features that enable `db` but no backend (`seed`, `repl`,

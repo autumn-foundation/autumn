@@ -27,13 +27,12 @@ use autumn_web::feed::{Feed, FeedEntry};
 use autumn_web::prelude::*;
 ```
 
-Timestamps are `chrono::DateTime<Utc>`, so a handler that dates its entries also
-pulls in `chrono`:
+Timestamps are `autumn_web::time::Timestamp` (a `jiff::Timestamp`), so a
+handler that dates its entries needs no extra crate:
 
 ```toml
 [dependencies]
-autumn-web = "0.10"
-chrono = "0.4"
+autumn-web = "0.11"
 ```
 
 ## Building a feed
@@ -53,9 +52,9 @@ channel fields with the chainable builders:
 
 ```rust,ignore
 use autumn_web::feed::{Feed, FeedEntry};
-use chrono::{TimeZone, Utc};
+use autumn_web::time::Timestamp;
 
-let published = Utc.with_ymd_and_hms(2026, 5, 31, 12, 0, 0).unwrap();
+let published: Timestamp = "2026-05-31T12:00:00Z".parse().unwrap();
 
 let feed = Feed::atom(
     "My Blog",
@@ -113,8 +112,11 @@ panic.
 
 | Format | Earliest date | Latest date |
 | --- | --- | --- |
-| Atom (RFC 3339) | `0000-01-01T00:00:00Z` | `9999-12-31T23:59:59Z` |
-| RSS (RFC 2822) and `Last-Modified` | `1900-01-01T00:00:00Z` | `9999-12-31T23:59:59Z` |
+| Atom (RFC 3339) | `0000-01-01T00:00:00Z` | `9999-12-30T22:00:00Z` (`Timestamp::MAX`) |
+| RSS (RFC 2822) and `Last-Modified` | `1900-01-01T00:00:00Z` | `9999-12-30T22:00:00Z` (`Timestamp::MAX`) |
+
+`Timestamp::MAX` is the latest instant a `Timestamp` can hold. Dates are
+written in whole seconds.
 
 ## Serving a feed from a handler
 
@@ -125,8 +127,19 @@ response carries the format's `Content-Type` (`application/atom+xml` for Atom,
 ```rust,ignore
 use autumn_web::feed::{Feed, FeedEntry};
 use autumn_web::prelude::*;
+use autumn_web::time::tz::TimeZone;
+use autumn_web::time::{Timestamp, civil};
 
 const SITE: &str = "https://example.com";
+
+/// A stored UTC wall-clock value (a `TIMESTAMP` column) as the instant it
+/// names. A value outside the range an instant can hold clamps to the
+/// nearer end.
+fn utc_instant(utc: civil::DateTime) -> Timestamp {
+    TimeZone::UTC.to_timestamp(utc).unwrap_or_else(|_| {
+        if utc.year() < 1970 { Timestamp::MIN } else { Timestamp::MAX }
+    })
+}
 
 #[get("/feed.xml")]
 async fn feed_xml(mut db: Db) -> AutumnResult<impl IntoResponse> {
@@ -138,13 +151,16 @@ async fn feed_xml(mut db: Db) -> AutumnResult<impl IntoResponse> {
             let url = format!("{SITE}/posts/{}", p.slug);
             FeedEntry::new(url.clone(), p.title.as_str(), url)
                 .summary(p.body.as_str())
-                .published(p.created_at.and_utc())
-                .updated(p.updated_at.and_utc())
+                .published(utc_instant(p.created_at))
+                .updated(utc_instant(p.updated_at))
         }));
 
     Ok(feed)
 }
 ```
+
+A `Timestamp` column (`TIMESTAMPTZ`) is already an instant: pass it straight
+to `published` and `updated`.
 
 Because the entries come straight from an iterator over your rows, the feed is
 always a projection of live data — there is no separate feed store to keep in
@@ -190,6 +206,7 @@ use autumn_web::prelude::*;
 
 const SITE: &str = "https://example.com";
 
+// `utc_instant` is the helper from the previous example.
 #[get("/feed.xml")]
 async fn feed_xml(mut db: Db, headers: HeaderMap) -> AutumnResult<Response> {
     let posts = Post::published(&mut db).await?;
@@ -200,8 +217,8 @@ async fn feed_xml(mut db: Db, headers: HeaderMap) -> AutumnResult<Response> {
             let url = format!("{SITE}/posts/{}", p.slug);
             FeedEntry::new(url.clone(), p.title.as_str(), url)
                 .summary(p.body.as_str())
-                .published(p.created_at.and_utc())
-                .updated(p.updated_at.and_utc())
+                .published(utc_instant(p.created_at))
+                .updated(utc_instant(p.updated_at))
         }));
 
     Ok(feed.conditional(&headers))

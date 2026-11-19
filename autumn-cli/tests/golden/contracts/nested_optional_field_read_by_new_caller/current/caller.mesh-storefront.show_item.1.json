@@ -8,7 +8,7 @@
       "reads": [
         "details",
         "details.color",
-        "details.size"
+        "id"
       ],
       "writes": null
     }

@@ -29,24 +29,16 @@
 //! [`EdgeCache`]: autumn_edge::EdgeCache
 //! [`EdgeKv`]: autumn_edge::EdgeKv
 
-// This module runs on the request path: `EdgeKv::get` is called by the
-// `EdgeCache` extractor while a request is in flight, so production code here
-// must be panic-free. The deny block below IS compiled — and therefore enforced
-// — by the `lint` job's `cargo clippy --workspace --all-targets -- -D warnings`:
-// `examples/edge-greeting` is a workspace member whose native build enables
-// `autumn-web/edge`, and cargo unifies features across the graph.
+// The `EdgeCache` extractor calls `EdgeKv::get` mid-request, so production code
+// here must not panic. The workspace clippy lane enforces the deny block below:
+// `examples/edge-greeting` enables `autumn-web/edge`, and cargo unifies features.
 //
-// It nevertheless carries no panic-gate marker comment and no
-// `scripts/check-panic-gate.sh` manifest entry, on purpose. (Not even a
-// *mention* of the marker tag: the gate's reverse-manifest scan greps for the
-// literal tag text, so naming it here would enroll this module.) That script counts a
-// non-default feature as linted only when an enforcing
+// This module has no panic-gate marker and no `scripts/check-panic-gate.sh`
+// manifest entry, on purpose, and must not name the marker tag (the gate greps
+// for it). The gate counts a feature as linted only when a
 // `cargo clippy -p autumn-web --features "…" -- -D warnings` lane names it, and
-// none does (nor should one — the workspace lane already covers this module).
-// So: the marker alone fails its reverse-manifest check, a manifest entry fails
-// its feature-reachability check, and a `:default` suffix would be exactly the
-// mislabelling that check exists to catch. Revisit only if `edge` ever gains a
-// dedicated `-p autumn-web --features` clippy lane.
+// none names `edge`, so either one would fail the gate. Add both only if `edge`
+// gets such a lane.
 #![cfg_attr(
     not(test),
     deny(
@@ -319,8 +311,7 @@ impl CacheEdgeKv {
 
 impl fmt::Debug for CacheEdgeKv {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `dyn Cache` is not `Debug`, and a cache's contents are the last thing
-        // that belongs in a log line anyway.
+        // `dyn Cache` is not `Debug`, and cache contents do not belong in logs.
         f.write_str("CacheEdgeKv(..)")
     }
 }
@@ -505,10 +496,9 @@ mod tests {
 
     #[test]
     fn a_serializing_backend_round_trips_through_the_raw_bytes_path() {
-        // What a cross-replica backend (Redis) stores: JSON bytes under
-        // `RawCacheBytes`, not the concrete `Vec<u8>`. The seam must read that
-        // shape too, or a value published on one replica would vanish at the
-        // edge of another.
+        // A cross-replica backend (Redis) stores JSON bytes under
+        // `RawCacheBytes`, not a `Vec<u8>`. Without reading that shape, a value
+        // published on one replica would be missing at another's edge.
         let cache = MokaCache::new(16, None);
         let json = serde_json::to_vec(&b"hello".to_vec()).expect("Vec<u8> serializes");
         cache.insert_value("banner", Arc::new(crate::cache::RawCacheBytes(json)));

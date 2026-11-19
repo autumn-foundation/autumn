@@ -132,13 +132,9 @@ impl ExecProvider {
     fn secrets(&self) -> Vec<String> {
         let inherited = self.env_override.as_ref().map_or_else(
             || {
-                // `vars_os` rather than `vars`: the latter PANICS if any
-                // inherited key or value is not UTF-8, and this runs while
-                // building the diagnostic for a failed hook — a panic there
-                // takes the renewal task down and leaves the served certificate
-                // to expire. Lossy conversion is also what makes the match work:
-                // the hook's stderr is decoded the same way, so a non-UTF-8
-                // credential still lines up with its lossy spelling there.
+                // `vars_os`, not `vars`: `vars` panics on non-UTF-8, and a panic while
+                // reporting a failed hook kills the renewal task. The hook's stderr is
+                // decoded lossily too, so a non-UTF-8 credential still matches.
                 let vars: Vec<(String, String)> = std::env::vars_os()
                     .map(|(k, v)| {
                         (
@@ -166,24 +162,18 @@ impl ExecProvider {
 
         let mut cmd = tokio::process::Command::new(program);
         cmd.args(leading)
-            // Exactly the three documented arguments, with no end-of-options
-            // marker: the action is always first and always a bare literal, so
-            // an argument parser stops there before it can mistake the value
-            // that follows for an option. A `--` here would instead shift every
-            // argument by one for the shell scripts most hooks are, silently
-            // sending a publish down the cleanup branch.
+            // Exactly the three documented arguments, with no `--`: the action is a
+            // bare literal first, so a parser stops before the value. A `--` would
+            // shift `$1` in shell hooks and send a publish down the cleanup branch.
             .arg(action)
             .arg(&record.fqdn)
             .arg(&record.value)
             .stdin(Stdio::null())
-            // Nothing reads the hook's stdout, so it goes straight to /dev/null
-            // rather than into a buffer this process would have to hold.
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
-            // The hook inherits the process environment, which may hold the
-            // provider's own credentials — that is how an `nsupdate`/CLI hook is
-            // expected to authenticate. Autumn passes no secret of its own, and
-            // scrubs credential-shaped environment values back out of `stderr`.
+            // The hook inherits the environment, which may hold the provider's
+            // credentials (how an `nsupdate`/CLI hook authenticates). Credential-shaped
+            // values are scrubbed from `stderr`.
             .kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|e| {
@@ -192,9 +182,8 @@ impl ExecProvider {
                  [server.tls.acme.dns] command names an executable file this process can run"
             )
         })?;
-        // Taken before `wait`, so draining the pipe and reaping the child can
-        // borrow the child disjointly and run concurrently. Without the
-        // concurrent drain a chatty hook deadlocks on a full pipe buffer.
+        // Taken before `wait` so the drain and `child.wait()` borrow disjointly and
+        // run concurrently; without the drain a chatty hook deadlocks on a full pipe.
         let mut pipe = child
             .stderr
             .take()
@@ -208,9 +197,8 @@ impl ExecProvider {
         })
         .await;
 
-        // On timeout the async block is dropped, releasing its borrow of
-        // `child`; `child` itself is dropped when `run` returns just below, and
-        // `kill_on_drop` kills the hook then.
+        // On timeout `child` is dropped when `run` returns, and `kill_on_drop` kills
+        // the hook.
         let (stderr, status) = finished.map_err(|_| {
             format!(
                 "the DNS-01 exec hook `{program}` did not finish within {}s while running \
@@ -331,13 +319,13 @@ impl DnsProvider for ExecProvider {
 mod tests {
     use super::*;
 
+    // The `#[cfg(unix)]` tests drive `/bin/sh`, which Windows lacks. The provider itself
+    // is portable: it spawns an argv array.
+
     fn record() -> TxtRecord {
         TxtRecord::new("myapp.com", "challenge-value")
     }
 
-    // Drives a POSIX shell, which windows-latest does not have. The provider
-    // itself is portable — it spawns an argv array — but these assertions are
-    // about `/bin/sh` argument handling and stream behaviour.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_zero_exit_publishes_the_record() {
@@ -347,9 +335,6 @@ mod tests {
         assert!(provider.delete_txt(&record()).await.is_ok());
     }
 
-    // Drives a POSIX shell, which windows-latest does not have. The provider
-    // itself is portable — it spawns an argv array — but these assertions are
-    // about `/bin/sh` argument handling and stream behaviour.
     #[cfg(unix)]
     /// Regression (#1620): the hook's argv must be exactly the three documented
     /// arguments, with `$1` the action.
@@ -390,9 +375,6 @@ mod tests {
             .expect("cleanup action");
     }
 
-    // Drives a POSIX shell, which windows-latest does not have. The provider
-    // itself is portable — it spawns an argv array — but these assertions are
-    // about `/bin/sh` argument handling and stream behaviour.
     #[cfg(unix)]
     /// The exact script the TLS guide ships must work when copied verbatim.
     ///
@@ -435,9 +417,6 @@ esac
             .expect("the documented script must take the `delete` branch on cleanup");
     }
 
-    // Drives a POSIX shell, which windows-latest does not have. The provider
-    // itself is portable — it spawns an argv array — but these assertions are
-    // about `/bin/sh` argument handling and stream behaviour.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_non_zero_exit_fails_the_order_and_quotes_stderr() {
@@ -467,9 +446,6 @@ esac
         assert!(err.contains("command"), "got: {err}");
     }
 
-    // Drives a POSIX shell, which windows-latest does not have. The provider
-    // itself is portable — it spawns an argv array — but these assertions are
-    // about `/bin/sh` argument handling and stream behaviour.
     #[cfg(unix)]
     // The value is an argv entry, never shell syntax: a hook invoked with a
     // value containing `;` or backticks must still see it verbatim.
@@ -498,13 +474,9 @@ esac
         assert!(excerpt.chars().count() <= super::super::UPSTREAM_EXCERPT_CHARS + 3);
     }
 
-    // Drives a POSIX shell, which windows-latest does not have. The provider
-    // itself is portable — it spawns an argv array — but these assertions are
-    // about `/bin/sh` argument handling and stream behaviour.
     #[cfg(unix)]
-    // A hook written with `set -x` traces its own credentials to stderr, and
-    // that stderr is published on `/actuator/health` and to the operator's alert
-    // destination. It must not carry the token through.
+    // A `set -x` hook traces its credentials to stderr, which is published on
+    // `/actuator/health` and in alerts, so the token must be scrubbed.
     #[tokio::test]
     async fn a_hook_cannot_leak_a_traced_credential_through_its_stderr() {
         const TOKEN: &str = "cf-live-token-DO-NOT-LEAK-9f3a";
@@ -526,15 +498,9 @@ esac
         assert!(err.contains("exit status 1"), "got: {err}");
     }
 
-    // Drives a POSIX shell, which windows-latest does not have. The provider
-    // itself is portable — it spawns an argv array — but these assertions are
-    // about `/bin/sh` argument handling and stream behaviour.
     #[cfg(unix)]
-    // The TXT value is base64url, whose alphabet includes `-`, so ~1 in 64
-    // challenge values starts with one. It still arrives as `$3`: the action
-    // precedes it and is not an option, so any conventional parser has already
-    // stopped by then — which is why no `--` marker is needed (or wanted, since
-    // one would shift the whole documented contract by an argument).
+    // The TXT value is base64url, so ~1 in 64 values starts with `-`. It still
+    // arrives as `$3`: the action comes first, so a parser has already stopped.
     #[tokio::test]
     async fn a_value_starting_with_a_dash_still_reaches_the_hook_as_a_value() {
         let provider = ExecProvider::new(vec![
@@ -550,9 +516,6 @@ esac
             .expect("a leading-dash value reaches the hook as the third argument");
     }
 
-    // Drives a POSIX shell, which windows-latest does not have. The provider
-    // itself is portable — it spawns an argv array — but these assertions are
-    // about `/bin/sh` argument handling and stream behaviour.
     #[cfg(unix)]
     /// Regression (#1620): a hook that authenticates from an *inherited*
     /// environment variable — the documented way to reach a provider autumn does
@@ -629,9 +592,6 @@ esac
         );
     }
 
-    // Drives a POSIX shell, which windows-latest does not have. The provider
-    // itself is portable — it spawns an argv array — but these assertions are
-    // about `/bin/sh` argument handling and stream behaviour.
     #[cfg(unix)]
     /// Regression (#1620): a hook that never stops writing must not be able to
     /// grow this process's memory. The 120s timeout bounds how *long* a hook
@@ -666,9 +626,6 @@ esac
         );
     }
 
-    // Drives a POSIX shell, which windows-latest does not have. The provider
-    // itself is portable — it spawns an argv array — but these assertions are
-    // about `/bin/sh` argument handling and stream behaviour.
     #[cfg(unix)]
     /// A hook writing a lot of stdout is never buffered at all: stdout goes to
     /// `/dev/null`, so it cannot pressure this process either.

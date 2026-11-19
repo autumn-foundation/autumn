@@ -24,10 +24,12 @@ pub struct CallSite {
     pub snippet: String,
     /// The client method invoked — the endpoint's name.
     pub method: String,
-    /// Response fields the caller names, by Rust identifier.
+    /// Response fields the caller names, by Rust identifier. A nested field
+    /// is a dotted path: `details.color`.
     pub reads: Vec<String>,
     /// Request fields the caller sets, or `None` when the request is not an
-    /// inline struct literal and the write-set is therefore unknowable.
+    /// inline struct literal and the write-set is therefore unknowable. A
+    /// nested field is a dotted path.
     pub writes: Option<Vec<String>>,
 }
 
@@ -87,6 +89,22 @@ impl Violation {
     }
 }
 
+/// The top-level field of each path, sorted and unique: `details.color`
+/// gives `details`.
+///
+/// One build shares the nested types between caller and callee, so rustc
+/// already checks a nested field. Only the top level needs a check here.
+#[must_use]
+pub fn top_level(paths: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = paths
+        .iter()
+        .map(|p| p.split('.').next().unwrap_or_default().to_owned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Compare one call site against the endpoint's descriptor.
 #[must_use]
 pub fn check(site: &CallSite, endpoint: &ResolvedEndpoint) -> Vec<Violation> {
@@ -101,16 +119,16 @@ pub fn check(site: &CallSite, endpoint: &ResolvedEndpoint) -> Vec<Violation> {
         });
     };
 
-    for read in &site.reads {
+    for read in &top_level(&site.reads) {
         if endpoint.response.produced(read).is_none() {
             report(ViolationKind::ResponseFieldMissing(read.clone()));
         }
     }
 
-    let Some(writes) = &site.writes else {
+    let Some(writes) = site.writes.as_deref().map(top_level) else {
         return out;
     };
-    for write in writes {
+    for write in &writes {
         if endpoint.request.accepted(write).is_none() {
             report(ViolationKind::RequestFieldUnknown(write.clone()));
         }
@@ -205,6 +223,24 @@ mod tests {
         assert!(
             v.is_empty(),
             "compatible call site must not be rejected: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_path_is_judged_by_its_top_level_field() {
+        let v = check(
+            &site(
+                &["id", "id.part", "sku.part"],
+                Some(&["name", "name.first", "colour.x"]),
+            ),
+            &endpoint(),
+        );
+        assert_eq!(
+            v.iter().map(|v| v.kind.clone()).collect::<Vec<_>>(),
+            vec![
+                ViolationKind::ResponseFieldMissing("sku".to_owned()),
+                ViolationKind::RequestFieldUnknown("colour".to_owned()),
+            ]
         );
     }
 

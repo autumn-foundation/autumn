@@ -127,11 +127,8 @@ impl ShadowConfig {
                     .to_owned(),
             );
         };
-        // Parsed, not prefix-matched: `"http://"` passes a `starts_with` check
-        // but has no authority to dial, so the replica would boot reporting an
-        // enabled mirror while every selected request failed as a transport
-        // error. A target that cannot be dialed must fail boot, which is what
-        // the rest of this function promises.
+        // Parsed, not prefix-matched: `"http://"` passes a `starts_with` check but has no host
+        // to dial. A target that cannot be dialed must fail boot.
         let parsed = url::Url::parse(target)
             .map_err(|error| format!("shadow.target is not a valid URL ({error}): {target:?}"))?;
         if !matches!(parsed.scheme(), "http" | "https") {
@@ -144,13 +141,9 @@ impl ShadowConfig {
                 "shadow.target must name a host to dial, got {target:?}"
             ));
         }
-        // A query or fragment on the base is unusable: `shadow_url` appends the
-        // live request target to it, so `http://candidate/base?token=x` would
-        // produce `…/base?token=x/api/orders?page=2` — the request path folded
-        // into the query — and a fragment is never transmitted at all. Every
-        // mirrored request would reach the wrong resource on the candidate,
-        // quietly. A base *path* (`http://candidate/base`) is fine and is what
-        // an operator mounting the candidate under a prefix needs.
+        // `shadow_url` appends the request target to the base, so a query on the base would
+        // swallow the path (`…/base?token=x/api/orders`), and a fragment is never sent. A base
+        // *path* (`http://candidate/base`) is fine: it mounts the candidate under a prefix.
         if parsed.query().is_some() {
             return Err(format!(
                 "shadow.target must not carry a query string — the request target is \
@@ -163,10 +156,7 @@ impl ShadowConfig {
                  the wire: {target:?}"
             ));
         }
-        // Userinfo would be echoed by the actuator endpoint and by the startup
-        // log line. Refuse it rather than quietly publishing a credential; the
-        // candidate should be reached without one, or behind something that
-        // adds it.
+        // Userinfo would be echoed by the actuator endpoint and the startup log line.
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(
                 "shadow.target must not embed credentials — the value is published by the \
@@ -347,8 +337,7 @@ mod tests {
 
     #[test]
     fn validation_is_skipped_while_disabled() {
-        // An operator may leave a half-finished `[shadow]` block in the file;
-        // it must not fail boot until they actually switch it on.
+        // A half-finished `[shadow]` block must not fail boot until it is switched on.
         let config = ShadowConfig {
             enabled: false,
             target: Some("not-a-url".to_owned()),
@@ -373,17 +362,13 @@ mod tests {
         assert_eq!(config.target.as_deref(), Some("http://127.0.0.1:9091"));
         assert!((config.sample_rate - 0.25).abs() < f64::EPSILON);
         assert_eq!(config.routes, vec!["/api/*".to_owned()]);
-        // Unspecified keys still carry their bounded defaults.
         assert_eq!(config.timeout_ms, ShadowConfig::default().timeout_ms);
     }
 
     #[test]
     fn a_target_with_no_host_to_dial_is_rejected() {
-        // `"http://"` passes a `starts_with` check but has nothing to dial, so
-        // the replica would boot reporting an enabled mirror while every
-        // request failed as a transport error.
-        // NB `"http:///path"` is deliberately absent: WHATWG normalizes it to
-        // host `path`, which is dialable, so rejecting it would be wrong.
+        // `"http:///path"` is absent on purpose: WHATWG normalizes it to host `path`, which is
+        // dialable.
         for bad in ["http://", "https://"] {
             let config = ShadowConfig {
                 enabled: true,
@@ -399,10 +384,6 @@ mod tests {
 
     #[test]
     fn a_target_carrying_a_query_or_fragment_is_rejected() {
-        // The request target is appended to the base, so a query on the base
-        // would swallow the mirrored path (`…?token=x/api/orders`) and a
-        // fragment is never sent at all — either way every mirrored request
-        // would silently reach the wrong resource.
         for bad in [
             "http://candidate/base?token=x",
             "http://candidate#fragment",
@@ -419,7 +400,7 @@ mod tests {
             assert!(error.contains("shadow.target"), "{error}");
         }
 
-        // A base *path* is legitimate — mounting the candidate under a prefix.
+        // A base *path* is legitimate: it mounts the candidate under a prefix.
         let config = ShadowConfig {
             enabled: true,
             target: Some("http://candidate/base".to_owned()),
@@ -430,8 +411,6 @@ mod tests {
 
     #[test]
     fn a_target_carrying_credentials_is_rejected() {
-        // The value is echoed by the shadow actuator endpoint and logged at
-        // startup, so it must not be a place to put a password.
         let config = ShadowConfig {
             enabled: true,
             target: Some("http://user:pass@candidate.internal".to_owned()),
@@ -443,8 +422,7 @@ mod tests {
 
     #[test]
     fn route_patterns_that_can_never_match_are_rejected() {
-        // A pattern without a leading slash matches no request path, so the
-        // allowlist would silently mirror nothing at all.
+        // A pattern without a leading slash matches no path and would silently mirror nothing.
         for bad in ["api/*", "  ", ""] {
             let config = ShadowConfig {
                 enabled: true,

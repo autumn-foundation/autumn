@@ -352,20 +352,28 @@ fn the_unguard_helper_is_omitted_when_no_column_can_carry_a_formula() {
 
 #[test]
 fn the_datetime_parser_accepts_the_format_the_export_writes() {
-    // The export writes a timestamp with chrono's `Display` (a SPACE between
-    // date and time); the browser's `datetime-local` control sends a `T`. An
-    // import scaffold has to accept both or an exported file fails to re-import
-    // on exactly the column it just wrote.
+    // The export writes a timestamp with its `Display` (`…T…Z` for a TZ-aware
+    // column), and files exported before the move to jiff use a SPACE between
+    // date and time and a ` UTC` suffix; the browser's `datetime-local`
+    // control sends a `T`. An import scaffold has to accept all of them or an
+    // exported file fails to re-import on exactly the column it just wrote.
     let (_tmp, project, _) = scaffold_project(
         "import-datetime",
         &["title:String", "published_at:NaiveDateTime"],
         &["--import"],
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    assert!(
-        routes.contains(r#"parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")"#),
-        "the datetime parser must accept the exported format:\n{routes}"
-    );
+    for needle in [
+        r#"DateTime::strptime("%Y-%m-%d %H:%M:%S%.f", bare)"#,
+        r#"DateTime::strptime("%Y-%m-%dT%H:%M:%S%.f", bare)"#,
+        r#".strip_suffix(" UTC")"#,
+        ".strip_suffix('Z')",
+    ] {
+        assert!(
+            routes.contains(needle),
+            "the datetime parser must accept the exported format ({needle}):\n{routes}"
+        );
+    }
 
     // ...and without the flag the helper is the pre-#1393 one, byte for byte.
     let (_tmp2, plain, _) = scaffold_project(
@@ -379,8 +387,8 @@ fn the_datetime_parser_accepts_the_format_the_export_writes() {
         "the plain scaffold still emits the helper:\n{plain_routes}"
     );
     assert!(
-        !plain_routes.contains(r#"parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")"#),
-        "a scaffold without --import must keep the pre-#1393 helper:\n{plain_routes}"
+        !plain_routes.contains(r#"DateTime::strptime("%Y-%m-%d %H:%M:%S%.f", bare)"#),
+        "a scaffold without --import must keep the plain helper:\n{plain_routes}"
     );
 }
 
@@ -1489,7 +1497,7 @@ fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
 /// back does not end the wait too early.
 fn wait_until_after(stamp: &str) {
     use std::time::{Duration, Instant};
-    let now = || chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let now = || jiff::Timestamp::now().strftime("%Y%m%d%H%M%S").to_string();
     let deadline = Instant::now() + Duration::from_secs(30);
     while now().as_str() <= stamp {
         assert!(

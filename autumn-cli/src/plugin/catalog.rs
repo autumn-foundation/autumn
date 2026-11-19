@@ -88,9 +88,8 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         mount_arg: "autumn_admin_plugin::AdminPlugin",
         constructor: "AdminPlugin::new(",
         // The admin panel reads framework-owned tables (`autumn_experiments`,
-        // `autumn_experiment_changes`) created by `autumn-web`'s OWN
-        // migrations, not by the plugin. Removing the plugin leaves nothing of
-        // the plugin's behind, so there is nothing to declare.
+        // `autumn_experiment_changes`) created by `autumn-web`'s own migrations, so the
+        // plugin leaves nothing of its own behind.
         migrations: &[],
         tables: &[],
         config_keys: &["[database]\nprimary_url = \"postgres://localhost/my_app\""],
@@ -184,11 +183,10 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         mount_call: ".plugin(",
         mount_arg: "autumn_search::SearchPlugin",
         constructor: "SearchPlugin::new(",
-        // The Postgres engine bootstraps its schema at runtime with
-        // `CREATE TABLE IF NOT EXISTS` (`autumn-search/src/postgres.rs`)
-        // rather than through `diesel_migrations`, so nothing is recorded in
-        // `__diesel_schema_migrations` — but the tables are still the
-        // plugin's, and still there after it is unwired.
+        // The Postgres engine creates its tables at runtime with `CREATE TABLE IF NOT
+        // EXISTS` (`autumn-search/src/postgres.rs`), not through `diesel_migrations`,
+        // so no migration is recorded. The tables are still the plugin's and outlive
+        // its removal.
         migrations: &[],
         tables: &["autumn_search_documents", "autumn_search_deletes"],
         config_keys: &["[search]\nengine = \"postgres\""],
@@ -217,8 +215,8 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
         mount_call: ".with_blob_store(",
         mount_arg: "autumn_storage_s3::S3BlobStore",
         constructor: "S3BlobStore::from_config(",
-        // Blobs live in the S3 bucket, which this command never touches: it is
-        // not the app's database and may well outlive the app.
+        // Blobs live in the S3 bucket, which this command never touches: it is not the
+        // app's database and may outlive the app.
         migrations: &[],
         tables: &[],
         config_keys: &[

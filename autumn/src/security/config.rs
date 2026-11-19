@@ -271,12 +271,6 @@ pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     mac_hex(&keyed_mac(key), message)
 }
 
-/// Constant-time string comparison for HMAC verification.
-fn ct_eq_str(a: &str, b: &str) -> bool {
-    use subtle::ConstantTimeEq;
-    a.as_bytes().ct_eq(b.as_bytes()).into()
-}
-
 /// Generate a random 32-byte ephemeral key from two UUID v4 values.
 fn generate_ephemeral_key() -> Vec<u8> {
     let a = uuid::Uuid::new_v4();
@@ -328,6 +322,29 @@ fn mac_hex(mac: &Hmac<Sha256>, message: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// The length of a hex-encoded HMAC-SHA256.
+const MAC_HEX_LEN: usize = 64;
+
+/// [`mac_hex`] into a stack buffer: the same lowercase hex bytes, with no
+/// heap `String`. A verify compares the MAC and drops it, on every request
+/// that carries a signed cookie, so it does not need an owned one.
+fn mac_hex_bytes(mac: &Hmac<Sha256>, message: &[u8]) -> [u8; MAC_HEX_LEN] {
+    let mut mac = mac.clone();
+    mac.update(message);
+    let mut out = [0_u8; MAC_HEX_LEN];
+    // A SHA-256 output is 32 bytes and the buffer is twice that, so the
+    // length check inside cannot fail. If it did, the zeroed buffer holds no
+    // hex digit and matches no signature.
+    let _ = hex::encode_to_slice(mac.finalize().into_bytes(), &mut out);
+    out
+}
+
+/// Constant-time comparison of a computed MAC with a presented signature.
+fn ct_eq_mac(expected: &[u8; MAC_HEX_LEN], hex_sig: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    expected.as_slice().ct_eq(hex_sig.as_bytes()).into()
+}
+
 fn keyed_mac(key: &[u8]) -> Hmac<Sha256> {
     <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length")
 }
@@ -354,14 +371,14 @@ impl ResolvedSigningKeys {
     /// `message` under any key. It computes one MAC per key, whatever the
     /// number of candidates. All comparisons are constant-time.
     pub fn verify_any(&self, message: &[u8], hex_sigs: &[&str]) -> bool {
-        let expected: Vec<String> = std::iter::once(&self.current_mac)
+        let expected: Vec<[u8; MAC_HEX_LEN]> = std::iter::once(&self.current_mac)
             .chain(&self.previous_macs)
-            .map(|mac| mac_hex(mac, message))
+            .map(|mac| mac_hex_bytes(mac, message))
             .collect();
         let mut matched = false;
         for candidate in hex_sigs {
             for mac in &expected {
-                matched |= ct_eq_str(mac, candidate);
+                matched |= ct_eq_mac(mac, candidate);
             }
         }
         matched
@@ -370,11 +387,11 @@ impl ResolvedSigningKeys {
     /// Returns `true` when `hex_sig` is a valid HMAC-SHA256 of `message` under
     /// any key (current first, then previous). All comparisons are constant-time.
     pub fn verify(&self, message: &[u8], hex_sig: &str) -> bool {
-        if ct_eq_str(&mac_hex(&self.current_mac, message), hex_sig) {
+        if ct_eq_mac(&mac_hex_bytes(&self.current_mac, message), hex_sig) {
             return true;
         }
         for prev_mac in &self.previous_macs {
-            if ct_eq_str(&mac_hex(prev_mac, message), hex_sig) {
+            if ct_eq_mac(&mac_hex_bytes(prev_mac, message), hex_sig) {
                 return true;
             }
         }
@@ -511,7 +528,6 @@ impl SecurityConfig {
             self.rate_limit.trust_forwarded_headers || !self.rate_limit.trusted_proxies.is_empty();
 
         if new_set && old_set {
-            // Check for value-level conflicts.
             let new_ranges: std::collections::HashSet<&str> = self
                 .trusted_proxies
                 .ranges
@@ -981,10 +997,8 @@ impl SubmitTokenConfig {
         {
             return SubmitTokenMemoryGuard::Ok;
         }
-        // Resolved to the in-memory store in production. `backend == Some(Memory)`
-        // is an explicit opt-in (hard fail); `backend == None` inherited the
-        // memory idempotency backend (warn only). `Some(Redis)` cannot reach here
-        // because it would not resolve to memory.
+        // Memory in production: an explicit `Some(Memory)` is an opt-in and fails; `None` inherited
+        // the memory idempotency backend and only warns.
         match self.backend {
             Some(IdempotencyBackend::Memory) => SubmitTokenMemoryGuard::FailExplicit,
             _ => SubmitTokenMemoryGuard::WarnInherited,
@@ -1632,7 +1646,7 @@ mod tests {
     use super::*;
     use crate::config::IdempotencyBackend;
 
-    // ── submit-token backend resolution (Finding D: inherit idempotency) ─────
+    // ── submit-token backend resolution ─────────────────────────────────────
 
     #[test]
     fn verify_any_matches_one_of_many_candidates_under_any_key() {
@@ -1646,17 +1660,13 @@ mod tests {
 
     #[test]
     fn submit_token_backend_defaults_to_none_and_inherits_idempotency() {
-        // Unset `[security.submit_token].backend` deserializes to `None`.
         let cfg: SubmitTokenConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.backend, None, "unset backend must deserialize to None");
-        // With idempotency on Redis, the resolved submit-token backend follows
-        // it — NOT the old hardcoded Memory default.
         assert_eq!(
             cfg.resolved_backend(IdempotencyBackend::Redis),
             IdempotencyBackend::Redis,
             "an unset submit-token backend must inherit the Redis idempotency backend"
         );
-        // A dev app on the default Memory idempotency backend stays Memory.
         assert_eq!(
             cfg.resolved_backend(IdempotencyBackend::Memory),
             IdempotencyBackend::Memory,
@@ -1666,7 +1676,6 @@ mod tests {
 
     #[test]
     fn submit_token_explicit_backend_overrides_inherited_idempotency() {
-        // An explicit `backend = "memory"` wins even when idempotency is Redis.
         let cfg: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
         assert_eq!(cfg.backend, Some(IdempotencyBackend::Memory));
         assert_eq!(
@@ -1675,7 +1684,6 @@ mod tests {
             "an explicit submit-token backend override must win over the inherited backend"
         );
 
-        // An explicit `backend = "redis"` wins even when idempotency is Memory.
         let cfg: SubmitTokenConfig = toml::from_str("backend = \"redis\"").unwrap();
         assert_eq!(cfg.backend, Some(IdempotencyBackend::Redis));
         assert_eq!(
@@ -1685,13 +1693,12 @@ mod tests {
         );
     }
 
-    // ── submit-token production memory guard (Finding O) ────────────────────
+    // ── submit-token production memory guard ────────────────────────────────
 
     #[test]
     fn submit_token_explicit_memory_in_production_fails_fast() {
-        // EXPLICIT `[security.submit_token].backend = "memory"` in production
-        // is a deliberate unsafe opt-in → hard fail, mirroring idempotency's
-        // explicit enabled+memory prod guard.
+        // An explicit memory backend in production is an unsafe opt-in, so it fails like
+        // idempotency's explicit memory guard.
         let cfg: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
         assert_eq!(cfg.backend, Some(IdempotencyBackend::Memory));
         assert_eq!(
@@ -1706,16 +1713,13 @@ mod tests {
 
     #[test]
     fn submit_token_inherited_memory_in_production_only_warns() {
-        // INHERITED default (`backend = None`) resolving to Memory in production
-        // must NOT fail — upgrading Autumn must not turn into "prod won't boot
-        // without Redis". It only warns.
+        // An inherited memory backend only warns, so an upgrade cannot make production need Redis.
         let cfg: SubmitTokenConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.backend, None);
         assert_eq!(
             cfg.production_memory_guard(IdempotencyBackend::Memory, true),
             SubmitTokenMemoryGuard::WarnInherited,
         );
-        // Inherited Redis resolves to Redis → no warning, no fail.
         assert_eq!(
             cfg.production_memory_guard(IdempotencyBackend::Redis, true),
             SubmitTokenMemoryGuard::Ok,
@@ -1724,8 +1728,6 @@ mod tests {
 
     #[test]
     fn submit_token_memory_outside_production_is_ok() {
-        // Dev / non-production → no warn, no fail, regardless of explicit or
-        // inherited memory.
         let explicit: SubmitTokenConfig = toml::from_str("backend = \"memory\"").unwrap();
         assert_eq!(
             explicit.production_memory_guard(IdempotencyBackend::Memory, false),
@@ -1740,8 +1742,6 @@ mod tests {
 
     #[test]
     fn submit_token_explicit_redis_backend_never_triggers_guard() {
-        // An explicit Redis override never resolves to memory, so the guard is
-        // a no-op even in production.
         let cfg: SubmitTokenConfig = toml::from_str("backend = \"redis\"").unwrap();
         assert_eq!(
             cfg.production_memory_guard(IdempotencyBackend::Memory, true),
@@ -1749,7 +1749,7 @@ mod tests {
         );
     }
 
-    // ── validate_signing_secret (RED phase) ─────────────────────────────────
+    // ── validate_signing_secret ─────────────────────────────────────────────
 
     #[test]
     fn signing_secret_dev_skips_validation_with_none() {
@@ -1905,9 +1905,8 @@ mod tests {
 
     #[test]
     fn default_csp_does_not_allow_unsafe_eval() {
-        // htmx works without unsafe-eval; only `hx-on` opts into it.
-        // Keep the default tight so that the baseline policy passes
-        // Mozilla Observatory and similar automated scanners.
+        // htmx works without unsafe-eval; only `hx-on` needs it. A tight default passes Mozilla
+        // Observatory and similar scanners.
         let csp = default_content_security_policy();
         assert!(!csp.contains("'unsafe-eval'"), "csp = {csp}");
         assert!(
@@ -2118,9 +2117,8 @@ mod tests {
 
     #[test]
     fn rate_limit_named_key_accepts_short_macro_spellings() {
-        // `#[throttle(key = "principal")]` / `key = "token"` use the SHORT macro
-        // spellings; an operator moving an inline policy into config must be able
-        // to use the same words. Serde aliases bridge macro and config vocabularies.
+        // Serde aliases accept the `#[throttle(key = ...)]` spellings, so an inline policy can move
+        // into config unchanged.
         let toml_str = r#"
             [named.login]
             limit = 5
@@ -2147,7 +2145,6 @@ mod tests {
 
     #[test]
     fn rate_limit_named_key_still_accepts_long_config_spellings() {
-        // The canonical long spellings must keep working unchanged.
         let toml_str = r#"
             [named.login]
             limit = 5
@@ -2175,9 +2172,7 @@ mod tests {
 
     #[test]
     fn global_key_strategy_still_accepts_existing_spellings() {
-        // The aliases live on the shared `KeyStrategy` enum, so the global
-        // `key_strategy` field also accepts them — but its existing canonical
-        // spellings must remain valid.
+        // The aliases live on the shared `KeyStrategy`, so the global `key_strategy` gets them too.
         for (toml_str, expected) in [
             (
                 "key_strategy = \"authenticated_principal\"",
@@ -2185,7 +2180,7 @@ mod tests {
             ),
             ("key_strategy = \"api_token\"", KeyStrategy::ApiToken),
             ("key_strategy = \"ip\"", KeyStrategy::Ip),
-            // Aliases also work here (a beneficial side effect).
+            // Aliases.
             (
                 "key_strategy = \"principal\"",
                 KeyStrategy::AuthenticatedPrincipal,
@@ -2250,7 +2245,7 @@ mod tests {
         assert_eq!(config.upload.allowed_mime_types, vec!["text/plain"]);
     }
 
-    // ── ResolvedSigningKeys + resolve_signing_keys (RED phase) ─────────────
+    // ── ResolvedSigningKeys + resolve_signing_keys ──────────────────────────
 
     #[test]
     fn resolve_signing_keys_dev_generates_non_empty_ephemeral() {
@@ -2308,6 +2303,90 @@ mod tests {
         assert!(new_keys.verify(b"session-id", &old_sig));
     }
 
+    /// The check a verify made before it compared a stack buffer: the MAC as
+    /// an owned hex string, compared in constant time.
+    fn verify_by_string(keys: &ResolvedSigningKeys, message: &[u8], hex_sig: &str) -> bool {
+        use subtle::ConstantTimeEq;
+        std::iter::once(&keys.current_mac)
+            .chain(&keys.previous_macs)
+            .any(|mac| {
+                mac_hex(mac, message)
+                    .as_bytes()
+                    .ct_eq(hex_sig.as_bytes())
+                    .into()
+            })
+    }
+
+    #[test]
+    fn the_stack_mac_is_the_bytes_of_the_string_mac() {
+        let keys = ResolvedSigningKeys::new(b"k".to_vec(), vec![b"older".to_vec()]);
+        for message in [&b""[..], b"a", b"session-id", &[0xff; 200]] {
+            for mac in std::iter::once(&keys.current_mac).chain(&keys.previous_macs) {
+                let on_stack = mac_hex_bytes(mac, message);
+                assert_eq!(on_stack.as_slice(), mac_hex(mac, message).as_bytes());
+                assert!(
+                    on_stack
+                        .iter()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn verify_accepts_and_rejects_what_the_string_check_did() {
+        let keys = ResolvedSigningKeys::new(
+            b"current-key-32-bytes-xxxxxxxxxx".to_vec(),
+            vec![b"previous-key".to_vec(), b"oldest-key".to_vec()],
+        );
+        let stranger = ResolvedSigningKeys::new(b"another-key".to_vec(), vec![]);
+        let message = b"session-id";
+        let current = keys.sign(message);
+        let previous = mac_hex(&keys.previous_macs[0], message);
+        let oldest = mac_hex(&keys.previous_macs[1], message);
+        let mut candidates = vec![
+            current.clone(),
+            previous,
+            oldest,
+            stranger.sign(message),
+            keys.sign(b"another message"),
+            String::new(),
+            // A hex signature is lowercase. The same digits in upper case,
+            // a prefix, and a longer string are other strings.
+            current.to_uppercase(),
+            current[..63].to_owned(),
+            format!("{current}0"),
+            format!(" {current}"),
+            "0".repeat(64),
+            "z".repeat(64),
+            "é".repeat(32),
+        ];
+        // One changed digit at each end and in the middle.
+        for at in [0, 31, 63] {
+            let mut flipped = current.clone().into_bytes();
+            flipped[at] = if flipped[at] == b'0' { b'1' } else { b'0' };
+            candidates.push(String::from_utf8(flipped).unwrap());
+        }
+        for candidate in &candidates {
+            assert_eq!(
+                keys.verify(message, candidate),
+                verify_by_string(&keys, message, candidate),
+                "{candidate:?}"
+            );
+            assert_eq!(
+                keys.verify_any(message, &[candidate.as_str(), "not-a-signature"]),
+                verify_by_string(&keys, message, candidate),
+                "verify_any: {candidate:?}"
+            );
+        }
+        // The three real signatures pass, and nothing else in the list does.
+        let passed = candidates
+            .iter()
+            .filter(|c| keys.verify(message, c))
+            .count();
+        assert_eq!(passed, 3);
+    }
+
     #[test]
     fn resolved_keys_verify_wrong_key_fails() {
         let keys_a = ResolvedSigningKeys::new(b"key-a-32-bytes-xxxxxxxxxxxxxxxx".to_vec(), vec![]);
@@ -2324,7 +2403,7 @@ mod tests {
         assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
-    // ── CspNonceConfig (RED phase) ────────────────────────────────────────────
+    // ── CspNonceConfig ────────────────────────────────────────────────────────
 
     #[test]
     fn csp_nonce_config_defaults_to_disabled() {

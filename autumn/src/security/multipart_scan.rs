@@ -70,9 +70,8 @@ pub fn scan_multipart_field<'a>(
         }
 
         let next = find_bytes(&bytes[value_start..], end_bytes)?;
-        // Advance to the start of the boundary delimiter (skip only the leading
-        // \r\n of end_bytes so the next loop iteration finds --boundary at
-        // rel=0 and processes it normally).
+        // Skip only the leading \r\n of `end_bytes`, so the next iteration finds `--boundary`
+        // at rel=0.
         pos = value_start + next + 2;
     }
 
@@ -123,8 +122,7 @@ mod tests {
 
     #[test]
     fn scan_multipart_field_finds_field_after_other_field() {
-        // Regression: skipping a non-matching part must not advance `pos`
-        // past the next part's headers (the +2 fix in scan_multipart_field).
+        // Skipping a non-matching part must not advance `pos` past the next part's headers.
         let boundary = "B";
         let body = multipart_body(boundary, &[("name", "alice"), ("_csrf", "tok-2")]);
         assert_eq!(

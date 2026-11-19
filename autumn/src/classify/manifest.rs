@@ -130,10 +130,8 @@ impl DataFlowManifest {
         fields: &[ClassifiedFieldDescriptor],
         releases: &[DeclassificationDescriptor],
     ) -> Self {
-        // Key on the full path, not the bare name. Two linked crates can each
-        // define a `Customer` with a classified `email`. So can two versions
-        // of one crate. A merge would hide one model's column behind the
-        // row of the other.
+        // Key on the full path, not the bare name: two linked crates (or two versions of one
+        // crate) can each define a `Customer.email`, and merging them would hide one row.
         let mut rows: BTreeMap<(&str, &str), ClassifiedFieldFlow> = BTreeMap::new();
         for descriptor in fields {
             rows.entry((descriptor.model_path, descriptor.field))
@@ -146,11 +144,8 @@ impl DataFlowManifest {
                 });
         }
         for release in releases {
-            // A boundary for a column no `#[model]` published cannot happen
-            // through `declassify!` (the field marker comes from the model), so
-            // there is nothing to report -- but the row is created rather than
-            // dropped, because silently losing a release edge is the one failure
-            // mode a leak manifest must not have.
+            // `declassify!` cannot release a column no `#[model]` published, but create the
+            // row anyway: a leak manifest must never silently drop a release edge.
             let row = rows
                 .entry((release.model_path, release.field))
                 .or_insert_with(|| ClassifiedFieldFlow {
@@ -168,11 +163,8 @@ impl DataFlowManifest {
         }
         let mut fields: Vec<ClassifiedFieldFlow> = rows.into_values().collect();
         for row in &mut fields {
-            // Sort on every field `dedup` compares. `inventory` hands descriptors
-            // back in link order, which is unspecified across builds, so two
-            // boundaries sharing a sink and purpose but differing in reason would
-            // otherwise reorder between builds and show up as spurious drift in
-            // `autumn data-flow --check`.
+            // Sort on every field `dedup` compares: `inventory` yields link order, which varies
+            // across builds and would show up as spurious drift in `autumn data-flow --check`.
             row.reachable_sinks.sort_by(|a, b| {
                 (a.sink, &a.purpose, &a.reason).cmp(&(b.sink, &b.purpose, &b.reason))
             });

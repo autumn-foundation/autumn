@@ -83,11 +83,7 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        // A request in a scope for the same path already keeps it: the
-        // SSG/ISG path has two scope layers. An MCP replay has another path,
-        // so it gets a scope of its own.
-        // An internal SSG/ISR render has no client: it gets no faults, as it
-        // gets no request timeout.
+        // An internal SSG/ISR render has no client: like the request timeout, faults skip it.
         if req
             .extensions()
             .get::<crate::static_gen::RenderDeadlineExempt>()
@@ -96,6 +92,8 @@ where
             return Box::pin(self.inner.call(req));
         }
         let path = req.uri().path();
+        // A request already in a scope for this path keeps it: the SSG/ISG path has two scope
+        // layers. An MCP replay has another path, so it gets a scope of its own.
         let outer = SCOPE.try_with(|scope| &*scope.path == path);
         if matches!(outer, Ok(true)) {
             return Box::pin(self.inner.call(req));
@@ -115,7 +113,7 @@ where
         // the scope in its `call`, before the future is polled.
         let inner = SCOPE.sync_scope(Arc::clone(&scope), || self.inner.call(req));
         let inner = SCOPE.scope(Arc::clone(&scope), inner);
-        // Before the first poll: a fault can fire in `call` already.
+        // Armed before the first poll: a fault can already fire in `call`.
         let mut pending = Pending(Some(scope));
         Box::pin(async move {
             let result = inner.await;
@@ -145,8 +143,6 @@ impl Drop for Pending {
         let Some(scope) = self.0.take() else {
             return;
         };
-        // Each matched request counts. A dropped one is bad only when a
-        // fault fired in it.
         let fired = scope.fired.load(Ordering::Relaxed);
         if let Some(sequence) = scope.injector.record(scope.generation, fired) {
             scope.injector.audit_stop(sequence, STOP_REASON);
@@ -248,8 +244,7 @@ where
                 None => Box::pin(self.inner.call(req)),
             };
         }
-        // Use the service that `poll_ready` made ready. Keep a clone in its
-        // place.
+        // Call the service that `poll_ready` made ready; leave a clone in its place.
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let Placement::Outer { deadline } = self.placement else {
@@ -261,10 +256,9 @@ where
                 }
             });
         };
-        // Outside the timeout layer: let the inner route layer apply the
-        // fault. A response that did not pass it (a cached page) gets the
-        // fault here: a wait of at most the request timeout, then a failure
-        // as a timeout gives.
+        // Outside the timeout layer: hand the fault to the inner route layer. A response that
+        // never reached it (a cached page) gets the fault here, with the wait capped at the
+        // request timeout and a 503 past it, as a timeout would give.
         let deferred = DeferredFault::new(fault);
         req.extensions_mut().insert(deferred.clone());
         Box::pin(async move {

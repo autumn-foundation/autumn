@@ -15,10 +15,10 @@ autotests = false
 exclude = ["tests/fixtures/axe-core/"]
 
 [features]
-# The last 19 names are the compile gates (#2795, ADR 0027, ADR 0045). Default-on; the
-# no-DB daemon starter drops them. Keep this on one line: the panic gate
-# (scripts/check-panic-gate.sh) reads it with grep.
-default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt", "push", "cluster"]
+# The last 23 names are the compile gates (#2795, ADR 0027, ADR 0045, ADR 0046, ADR 0049).
+# Default-on. The no-DB daemon starter drops all but `error-reporting`. Keep the list on one
+# line: the panic gate (scripts/check-panic-gate.sh) reads it with grep.
+default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt", "push", "cluster", "error-reporting", "plugin-conformance", "runtime-config", "axum-ws"]
 # Compile gates (#2795, ADR 0027). Each gates one module. See the default list.
 ledger = ["version-history"]
 experiments = ["feature-flags"]
@@ -48,7 +48,16 @@ jwt = ["dep:jsonwebtoken"]
 # Web Push (`autumn_web::push`, issue #1392): VAPID signing and RFC 8291
 # payload encryption over `p256`.
 push = ["dep:p256"]
-ws = ["dep:tokio-stream"]
+# The plugin conformance harness (`autumn_web::plugin_conformance`). A plugin
+# runs it in its tests, and `autumn plugin-check` uses its rules.
+plugin-conformance = []
+# Live-tunable keys (`autumn_web::runtime_config`), and the cost signal that
+# follows one of them.
+runtime-config = []
+# axum's own WebSocket extractor (`reexports::axum::extract::ws`) and the
+# tungstenite stack. `ws` turns it on.
+axum-ws = ["axum/ws"]
+ws = ["axum-ws", "dep:tokio-stream"]
 presence = ["ws"]
 # Conflict-free collaborative editing (issue #1806). Adds
 # `autumn_web::collab`: an in-tree RGA text CRDT (`CollabText`), the
@@ -129,7 +138,6 @@ db = [
     "dep:scoped-futures",
     # The fleet core takes OS file locks on its root (path and volume locks).
     "dep:fd-lock",
-    "diesel/chrono",
     "diesel/serde_json",
     # The repository layer records history, money and retention itself.
     "ledger",
@@ -264,7 +272,11 @@ variants = ["storage", "dep:image"]
 # panics + 5xx responses to configured `ErrorReporter`s. Ships a `tracing`-based
 # `LogReporter` as the default. On by default; disable to drop the panic-catch
 # layer and the reporting machinery.
-reporting = []
+error-reporting = []
+# `error-reporting` plus failure capture: the `capsule` module, its effect
+# hooks and `autumn replay` (#1598). On by default. The no-DB daemon starter
+# names `error-reporting` only (#2795).
+reporting = ["error-reporting"]
 mail = ["dep:lettre", "dep:css-inline", "maud"]
 # First-class inbound email handling with provider webhooks and routing DSL.
 # Adds `autumn_web::inbound_mail` with the generic RFC 5322 adapter.
@@ -366,7 +378,7 @@ edge = ["dep:autumn-edge"]
 plugin-sandbox = ["dep:wasmi"]
 
 [dependencies]
-autumn-edge = { version = "0.10.0", path = "../autumn-edge", optional = true }
+autumn-edge = { version = "0.11.0", path = "../autumn-edge", optional = true }
 # Pure-Rust WebAssembly interpreter behind the `plugin-sandbox` feature. Already
 # resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
 # new crate to the workspace graph. Licensed MIT OR Apache-2.0.
@@ -381,11 +393,11 @@ wasmi = { version = "0.40", optional = true }
 # could never reach those macros anyway (their re-exports are `#[cfg(feature =
 # "db")]` in `src/lib.rs`), and skipping them cuts macro compile time by ~90%
 # on the no-DB onboarding path (issue #2309).
-autumn-macros = { version = "0.10.0", path = "../autumn-macros", default-features = false }
+autumn-macros = { version = "0.11.0", path = "../autumn-macros", default-features = false }
 # Database-layer proc macros, split out of `autumn-macros` so a no-database
 # build never compiles their codegen. Optional: enabled by the `db` feature.
-autumn-macros-model = { version = "0.10.0", path = "../autumn-macros-model", optional = true }
-autumn-macros-repository = { version = "0.10.0", path = "../autumn-macros-repository", optional = true }
+autumn-macros-model = { version = "0.11.0", path = "../autumn-macros-model", optional = true }
+autumn-macros-repository = { version = "0.11.0", path = "../autumn-macros-repository", optional = true }
 axum.workspace = true
 # 1.9 for `Bytes::from_owner`, which is what lets a response buffer own the
 # sandbox concurrency permit and release it exactly when the last handle drops.
@@ -494,7 +506,6 @@ opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
-tokio-cron-scheduler.workspace = true
 validator.workspace = true
 # `serde` is library-side, not test-only: `db::sqlite_types::SqliteUuid` is
 # `#[serde(transparent)]` over `uuid::Uuid`, so the lib does not compile under
@@ -502,11 +513,10 @@ validator.workspace = true
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.10"
 rand_chacha = "0.10"
-chrono = { workspace = true }
-chrono-tz.workspace = true
+jiff.workspace = true
 # `serde` is a default feature, named here because `SqliteDecimal` depends on it.
 rust_decimal = { workspace = true, features = ["serde"] }
-croner = "4.0.2"
+croner = { version = "4.0.3", default-features = false }
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 proptest = { version = "1.4", optional = true }
@@ -542,6 +552,9 @@ webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"]
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"], optional = true }
 secrecy = { version = "0.10.3", features = ["serde"] }
 lru = "0.19"
+# The hasher of the app-metrics registry. Already in the graph: `lru` uses
+# `hashbrown`, and `hashbrown` uses this.
+foldhash = "0.2"
 hmac = "0.13"
 sha2 = "0.11"
 backtrace = { version = "0.3", optional = true }
@@ -578,7 +591,7 @@ lettre = { version = "0.11.21", default-features = false, features = ["builder",
 # optional network (`http`/reqwest) and local-file stylesheet fetchers — Autumn
 # only inlines embedded `<style>` blocks, never remote CSS — keeping the added
 # graph to the html5ever/selectors parsing stack. Gated behind the `mail` feature.
-css-inline = { version = "0.23", default-features = false, optional = true }
+css-inline = { version = "0.24", default-features = false, optional = true }
 chromiumoxide = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 
@@ -626,7 +639,7 @@ autumn-schema-core = { path = "../autumn-schema-core" }
 # Criterion benches (issue #3068, `benches/admission.rs`). No plots: only the
 # statistics and the `cargo bench` harness.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-diesel = { version = "2", features = ["chrono", "postgres"] }
+diesel = { version = "2", features = ["postgres"] }
 # `rust_decimal`'s diesel impls (`AsExpression<Numeric>`, `ToSql`/`FromSql` on
 # the Pg backend) back the `#[model]` Postgres-`Decimal` integration test
 # (issue #2597): generated apps get `db-diesel2-postgres` from the model
@@ -694,7 +707,7 @@ features = [
   "ledger", "experiments", "feature-flags", "idempotency", "custom-domains",
   "job-tracking", "upgrade", "nested-form", "alerts", "data-retention",
   "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt",
-  "push", "cluster",
+  "push", "cluster", "plugin-conformance", "runtime-config", "axum-ws",
   # The widget families (#3408). Default-on, named for the same reason.
   "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts",
 ]
@@ -736,6 +749,11 @@ harness = false
 # Fixed-iteration held-handle recording workload (profilers).
 [[bench]]
 name = "metrics_held"
+harness = false
+
+# Fixed-iteration per-call recording workload (profilers).
+[[bench]]
+name = "metrics_per_call"
 harness = false
 
 [[bench]]

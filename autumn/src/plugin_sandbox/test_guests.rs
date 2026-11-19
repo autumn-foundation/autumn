@@ -3415,10 +3415,8 @@ pub fn padded_frame(pad: u32) -> String {
 /// `2 × max_response_bytes + 4096` for the write to be refused.
 #[must_use]
 pub fn call_then_overrun(pad: usize) -> String {
-    // Written out rather than escaped from a Rust literal: the WAT string needs
-    // `\"` for its quotes and `\0a` for the newline, and getting that wrong
-    // silently produces a frame the host cannot parse — which would make this
-    // guest prove nothing while still passing.
+    // Already in WAT string escapes (`\"`, `\0a`). A wrong escape yields a frame the host cannot
+    // parse, and the guest would prove nothing while still passing.
     const FRAME: &str = r#"{\"op\":\"call\",\"call\":\"kv-set\",\"id\":1,\"key\":\"cart\",\"value\":\"one item\"}\0a"#;
     // The frame's length in bytes, not in source characters: `\"` is one byte
     // and `\0a` is one byte.

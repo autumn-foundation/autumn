@@ -149,11 +149,8 @@ macro_rules! text_backed_newtype_impls {
 /// # }
 /// ```
 //
-// Declared literally rather than inside `text_backed_newtype_impls!`: the docs
-// name `autumn_web::db::sqlite_types::SqliteUuid` in front of readers, and
-// `scripts/check-docs-symbols.sh` resolves such a path by reading the source
-// surface. A type whose `pub struct` line only exists as a macro metavariable
-// is invisible to that scan — and to anyone grepping for the name.
+// Declared literally, not through `text_backed_newtype_impls!`, so `scripts/check-docs-symbols.sh`
+// (and grep) can find the `pub struct` line behind this documented path.
 #[derive(
     Debug,
     Clone,

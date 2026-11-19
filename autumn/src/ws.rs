@@ -104,8 +104,6 @@ pub trait WsHandler: Send + 'static {
     ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
-// ── Blanket impl: closure taking (WebSocket) ───────────────────────
-
 impl<F, Fut> WsHandler for F
 where
     F: FnOnce(WebSocket) -> Fut + Send + 'static,
@@ -120,8 +118,8 @@ where
     }
 }
 
-// NOTE: We cannot have a second blanket impl for `FnOnce(WebSocket, CancellationToken)`
-// because it conflicts with the above. Instead, we provide a newtype wrapper.
+// A second blanket impl for `FnOnce(WebSocket, CancellationToken)` would conflict with the one
+// above, hence the `WithShutdown` newtype.
 
 /// Wrapper that enables `|socket, shutdown|` closures as [`WsHandler`].
 ///
@@ -835,7 +833,7 @@ impl futures::Sink<Message> for WebSocket {
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // A socket that the stream already closed is closed.
+        // No transport means `finish` already ran: the socket is closed, so closing succeeds.
         let poll = match self.inner.as_mut() {
             Some(socket) => Pin::new(socket).poll_close(cx),
             None => return Poll::Ready(Ok(())),
@@ -856,7 +854,6 @@ mod tests {
 
     #[test]
     fn ws_handler_is_object_safe_enough() {
-        // Verify the trait can be used as a generic bound
         fn accept_handler<H: WsHandler>(_h: H) {}
 
         let handler = |_socket: WebSocket| async {};

@@ -1,5 +1,5 @@
 {
-  "format": 2,
+  "format": 4,
   "endpoints": [
     {
       "service": "catalog",
@@ -17,24 +17,41 @@
             "rust_name": "name",
             "wire_name": "name",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "note",
             "wire_name": "note",
             "ty": "Option<String>",
+            "wire_type": {
+              "kind": "nullable",
+              "of": {
+                "kind": "string"
+              }
+            },
             "required": true
           },
           {
             "rust_name": "price_cents",
             "wire_name": "price_cents",
             "ty": "u32",
+            "wire_type": {
+              "kind": "integer",
+              "bits": 32,
+              "signed": false
+            },
             "required": true
           },
           {
             "rust_name": "request_id",
             "wire_name": "request_id",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": false
           }
         ],
@@ -43,24 +60,41 @@
             "rust_name": "name",
             "wire_name": "name",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "note",
             "wire_name": "note",
             "ty": "Option<String>",
+            "wire_type": {
+              "kind": "nullable",
+              "of": {
+                "kind": "string"
+              }
+            },
             "required": false
           },
           {
             "rust_name": "price_cents",
             "wire_name": "price_cents",
             "ty": "u32",
+            "wire_type": {
+              "kind": "integer",
+              "bits": 32,
+              "signed": false
+            },
             "required": true
           },
           {
             "rust_name": "request_id",
             "wire_name": "request_id",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           }
         ],
@@ -73,18 +107,30 @@
             "rust_name": "id",
             "wire_name": "id",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "name",
             "wire_name": "name",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "subtitle",
             "wire_name": "subtitle",
             "ty": "Option<String>",
+            "wire_type": {
+              "kind": "nullable",
+              "of": {
+                "kind": "string"
+              }
+            },
             "required": true
           }
         ],
@@ -93,18 +139,30 @@
             "rust_name": "id",
             "wire_name": "id",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "name",
             "wire_name": "name",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "subtitle",
             "wire_name": "subtitle",
             "ty": "Option<String>",
+            "wire_type": {
+              "kind": "nullable",
+              "of": {
+                "kind": "string"
+              }
+            },
             "required": false
           }
         ],
@@ -133,18 +191,30 @@
             "rust_name": "id",
             "wire_name": "id",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "name",
             "wire_name": "name",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "subtitle",
             "wire_name": "subtitle",
             "ty": "Option<String>",
+            "wire_type": {
+              "kind": "nullable",
+              "of": {
+                "kind": "string"
+              }
+            },
             "required": true
           }
         ],
@@ -153,18 +223,30 @@
             "rust_name": "id",
             "wire_name": "id",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "name",
             "wire_name": "name",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "subtitle",
             "wire_name": "subtitle",
             "ty": "Option<String>",
+            "wire_type": {
+              "kind": "nullable",
+              "of": {
+                "kind": "string"
+              }
+            },
             "required": false
           }
         ],
@@ -212,12 +294,20 @@
             "rust_name": "id",
             "wire_name": "id",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "price_cents",
             "wire_name": "price_cents",
             "ty": "u32",
+            "wire_type": {
+              "kind": "integer",
+              "bits": 32,
+              "signed": false
+            },
             "required": true
           }
         ],
@@ -226,12 +316,20 @@
             "rust_name": "id",
             "wire_name": "id",
             "ty": "String",
+            "wire_type": {
+              "kind": "string"
+            },
             "required": true
           },
           {
             "rust_name": "price_cents",
             "wire_name": "price_cents",
             "ty": "u32",
+            "wire_type": {
+              "kind": "integer",
+              "bits": 32,
+              "signed": false
+            },
             "required": true
           }
         ],

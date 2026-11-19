@@ -7,11 +7,11 @@ statement = "UPDATE autumn_repository_commit_hooks SET status = CASE WHEN status
 tables = [
   "autumn_repository_commit_hooks",
 ]
-indexes = []
-findings = [
-  "full-scan: autumn_repository_commit_hooks (no index serves it, even with enable_seqscan = off)",
+indexes = [
+  "idx_autumn_repository_commit_hooks_after_hook_recovery",
 ]
-notes = ""
+findings = []
+notes = "Served by idx_autumn_repository_commit_hooks_after_hook_recovery (migration 20261115143207). Deep profile: docs/perf/commit-hook-recovery/."
 
 [[site]]
 file = "autumn/src/repository_commit_hooks.rs"
@@ -20,14 +20,16 @@ function = "autumn_web::repository_commit_hooks::recover_stale_repository_commit
 [plan]
 status = "ok"
 method = "EXPLAIN (GENERIC_PLAN, COSTS OFF)"
-planned_on = "schema mirror of a Postgres 11 test database"
+planned_on = "test database, Postgres 16"
 generic = [
   "Update on autumn_repository_commit_hooks",
-  "  ->  Seq Scan on autumn_repository_commit_hooks",
-  "        Filter: ((status = ANY ('{pending_after_hook,after_hook_succeeded}'::text[])) AND (claimed_at < (now() - (($2)::double precision * '00:00:00.001'::interval))))",
+  "  ->  Index Scan using idx_autumn_repository_commit_hooks_after_hook_recovery on autumn_repository_commit_hooks",
+  "        Index Cond: (claimed_at < (now() - (($2)::double precision * '00:00:00.001'::interval)))",
+  "        Filter: (status = ANY ('{pending_after_hook,after_hook_succeeded}'::text[]))",
 ]
 index_forced = [
   "Update on autumn_repository_commit_hooks",
-  "  ->  Seq Scan on autumn_repository_commit_hooks",
-  "        Filter: ((status = ANY ('{pending_after_hook,after_hook_succeeded}'::text[])) AND (claimed_at < (now() - (($2)::double precision * '00:00:00.001'::interval))))",
+  "  ->  Index Scan using idx_autumn_repository_commit_hooks_after_hook_recovery on autumn_repository_commit_hooks",
+  "        Index Cond: (claimed_at < (now() - (($2)::double precision * '00:00:00.001'::interval)))",
+  "        Filter: (status = ANY ('{pending_after_hook,after_hook_succeeded}'::text[]))",
 ]

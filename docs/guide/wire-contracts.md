@@ -5,7 +5,10 @@ the callee's handler signatures. A breaking change to a request or response
 fails the caller's build, at the call site, naming the field — instead of
 failing a customer's request.
 
-There is no IDL, no codegen step, and nothing to keep in sync by hand.
+Inside the workspace there is no IDL, no codegen step, and nothing to keep in
+sync by hand. For a consumer outside the workspace, an IDL is an export of the
+contract, not its source. See
+[ADR 0048](../adr/0048-wire-contracts-idl-at-the-edge.md).
 
 ## The shape of it
 
@@ -113,12 +116,14 @@ missing.
   macro body (`html! { (item.name) }`);
 * the **write-set** — every request field an inline struct literal sets.
 
-A field inside a field is a dotted path. `item.details.color` reads
-`details` and `details.color`. `NewItem { name, details: Details { color } }` writes
-`details`, `details.color` and `name`. The const assertions check the first segment
-only. Both ends of one build share the nested type, so rustc checks the rest.
+A nested field is a dotted path. `item.details.color` reads `details.color`.
+`details: Details { color: Some(c), ..Default::default() }` sets it. Each set
+also holds the prefix, `details`.
 
-Each becomes a const assertion against the callee's own const field table:
+The const assertions check only the top-level fields. In one build, the
+caller and the callee use the same nested type. So rustc checks each nested
+field. Each top-level field becomes a const assertion against the callee's
+own const field table:
 
 ```rust
 const _: () = assert!(
@@ -218,7 +223,7 @@ source file:
 
 `--from <dir>` joins a directory of descriptors that a build already wrote.
 No build runs, and there is no dependency graph, so a bare name can come
-from any crate in the directory.
+from any crate in the directory. `--from <file>` reads a bundle file.
 
 Use `-p` to export some packages only. The default is the whole workspace. The
 pass checks libraries and binaries. Callers in tests and examples are not part
@@ -265,11 +270,8 @@ serves with the types of its release. The rules:
 * **Response decode.** The callee must always produce each field the caller's
   type needs to decode, also when the caller does not read it.
 * **Request required.** The caller must always send each field the callee
-  requires. A field is sent when the caller's type always serializes it. A
-  field the type may skip (`skip_serializing_if`) is sent when the caller's
-  own release requires it and the call site sets it. A set field alone is
-  not enough: `tags: vec![]` is not on the wire. When the request is not an
-  inline literal, the first condition is enough.
+  requires. A field is sent when the caller's type always serializes it, or
+  when the call site sets it.
 * **Request dropped.** The callee must accept each field the call site sets.
 * **Closed objects.** With `#[serde(deny_unknown_fields)]`, the other side must
   not send an unknown key.
@@ -281,15 +283,20 @@ serves with the types of its release. The rules:
   both orders. This also holds for list elements and nested types.
 * **Nested types.** A field whose type is a `WireShape` type is compared
   field by field, with the same rules. A break names the path, for example
-  `details.color`. The read-set and the write-set apply at each level. So the
-  removal of an optional nested field that a caller reads is a break. A
-  nested field that the call site sets, and the callee drops, is a break.
+  `details.color`. The read and write rules also apply one level down. The
+  callee must produce each nested field that the caller reads. The callee
+  must accept each nested field that an inline literal sets. This is also
+  true for an optional nested field. One build does not check a nested
+  field against the caller's own release. So a nested rule reports only a
+  change from that release: a field it did not produce or accept is not a
+  break.
 * **Field types.** A field's Rust type must not change. Path prefixes do not
   count: `std::string::String` is `String`. A decoder may read `T` as
   `Option<T>`.
 * **Wire types.** A field's JSON form must not change. This is also true
-  when the Rust type stays the same, for example `DateTime<Utc>` that gets
-  `#[serde(with = "ts_seconds")]` and `#[wire(type = "integer")]`. A nullable
+  when the Rust type stays the same, for example a `Timestamp` that gets
+  `#[serde(with = "autumn_web::time::fmt::serde::timestamp::second::required")]` and
+  `#[wire(type = "integer")]`. A nullable
   form reads the form it wraps. `any` is not compared. See
   [Wire types](#wire-types).
 * **Duplicate keys.** One object must not hold a field's name and its alias.
@@ -317,9 +324,8 @@ The rules:
 
 * **A producer may add fields.** A new field is not a break, unless the
   consumer's type has `#[serde(deny_unknown_fields)]`.
-* **A producer may not remove a field any deployed consumer reads.** This
-  includes a nested field, such as `address.city`. Remove it from the
-  consumers first.
+* **A producer may not remove a field any deployed consumer reads.** Remove
+  it from the consumers first.
 * **A consumer may not start to require a field that deployed producers do
   not send.** Add it to the producer first.
 * **A field's type must not change**, with the same rules as a response.
@@ -355,14 +361,19 @@ the removal of a topic that no bundled consumer reads. An event without
 `name` is not in the bundle. A bundle from an older CLI has no events. Then
 the check finds no deployed consumer to protect.
 
-The export writes bundle format 5. It records dotted paths in read-sets and
-write-sets, the wire type of each field, nested types, the `unit` flag, and
-endpoints that no router registers. An older CLI refuses it. This CLI reads
-formats 1 to 5. A bundle older than format 5 has top-level paths only. When
-one of the two bundles is format 3 or older, the check does not compare wire
-types. With a bundle of format 1 or 2, the check compares nested types by
-name only. It does not compare the `unit` flag of a body or a nested type. It
-compares the `unit` flag of an event in every format.
+The export writes bundle format 4. It records the wire type of each field,
+nested types, the `unit` flag, and endpoints that no router registers. An
+older CLI refuses it. This CLI reads formats 1 to 4. When one of the two
+bundles is format 3 or older, the check does not compare wire types. With a
+bundle of format 1 or 2, the check compares nested types by name only. It
+does not compare the `unit` flag of a body or a nested type. It compares the
+`unit` flag of an event in every format.
+
+Nested reads and writes do not change the format. Each dotted path also
+lists its prefix, so an older CLI reads the top-level fields as before. A
+bundle from an earlier export has no nested reads or writes. Then the check
+compares nested fields as before. Export the deployed release again to get
+them.
 
 ### Deploy order
 
@@ -473,7 +484,7 @@ A descriptor that is not true of the code is worse than none, so
 
 The export refuses a field whose type has no `WireShape` descriptor and is
 not a known leaf (a primitive, `String`, a standard container,
-`serde_json::Value`, `Uuid`, a `chrono` or `time` type, `Decimal`, `Url`,
+`serde_json::Value`, `Uuid`, a `jiff`, `chrono` or `time` type, `Decimal`, `Url`,
 and similar). An enum is the usual case. Mark such a field
 `#[wire(opaque)]` to compare it by type name only:
 
@@ -514,6 +525,9 @@ export can map it. The cross-release check compares both.
 | `HashMap<K, V>`, `BTreeMap<K, V>`, `IndexMap<K, V>`, `serde_json::Map` | `map` of `V`, when `K` is a string or an integer. Else `any` |
 | `Option<T>` | `nullable` of `T` |
 | `Box<T>`, `Rc<T>`, `Arc<T>`, `Cow<T>`, `Cell<T>`, `RefCell<T>`, `Reverse<T>`, `Wrapping<T>` | the wire type of `T` |
+| `Timestamp` (`jiff::Timestamp`, `autumn_web::time::Timestamp`) | `string`, format `date-time` |
+| `civil::DateTime`, `civil::Date`, `civil::Time` | `string`, format `local-date-time`, `date`, `local-time` |
+| `ZonedDateTime` | `string` |
 | `chrono::DateTime<Tz>` | `string`, format `date-time` |
 | `chrono::NaiveDateTime`, `NaiveDate`, `NaiveTime` | `string`, format `local-date-time`, `date`, `local-time` |
 | `uuid::Uuid` | `string`, format `uuid` |
@@ -524,8 +538,12 @@ export can map it. The cross-release check compares both.
 | a field with `#[serde(with)]`, `serialize_with` or `deserialize_with` | `any` in that direction |
 
 A `time` crate type is `any`: its JSON form depends on a feature of the
-`time` crate, which the macro cannot see. A `DateTime` with no time zone
-argument is not chrono's, so it is `any` too.
+`time` crate, which the macro cannot see. `jiff`'s `DateTime`, `Date` and
+`Time` are known only behind `civil::`, because other crates use those names
+for values with other JSON forms: write `civil::DateTime`, not a bare
+`DateTime`. A bare `DateTime` with no type arguments is `any`. A
+`ZonedDateTime` writes its offset and a bracketed zone name (RFC 9557), which
+no format names, so it is a plain `string`.
 
 The macro finds a type by its last name, as the export finds a known leaf.
 In a `#[wire(opaque)]` field, a type that the macro does not know, and
@@ -541,9 +559,9 @@ When the macro cannot see the JSON form, name it with `#[wire(type = …)]`:
 ```rust
 #[derive(serde::Serialize, serde::Deserialize, WireShape)]
 pub struct Item {
-    #[serde(with = "chrono::serde::ts_seconds")]
+    #[serde(with = "autumn_web::time::fmt::serde::timestamp::second::required")]
     #[wire(type = "integer", format = "unix-seconds")]
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     #[wire(type = "string", nullable)]
     pub nickname: Nickname, // type Nickname = Option<String>;
 }
@@ -570,8 +588,9 @@ keeps the form that the macro reads off the Rust type, and is not opaque.
 
 An `#[event]` payload is a wire contract too. `#[event]` derives `WireShape`
 and gives the event a topic and a version. A `#[listener]`, or an
-`#[event_consumer]` on an outbox topic handler, records its read-set. Each
-read becomes a const assertion against the event's field table:
+`#[event_consumer]` on an outbox topic handler, records its read-set. A
+nested read is a dotted path, as for a caller. Each top-level read becomes a
+const assertion against the event's field table:
 
 ```rust
 const _: () = assert!(
@@ -586,9 +605,350 @@ const _: () = assert!(
 See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 [Events across releases](#events-across-releases) for the deploy rules.
 
+## Consumers outside the workspace
+
+The check protects callers in one Cargo workspace. A consumer in another
+repository, team or language cannot build against the Rust types. Give it a
+protobuf schema of the contract, or an Avro schema of each event (see
+[Avro schemas for events](#avro-schemas-for-events)):
+
+```bash
+autumn contracts export --proto --out contracts/proto/
+```
+
+`--proto` takes the same `-p`, feature and `--from` flags as the bundle
+export. It writes text only. The CLI does not need `protoc`. The Rust types
+stay the source of truth, and JSON stays the wire format.
+
+The export writes:
+
+| File | Holds |
+|---|---|
+| `autumn/<service>/<service>.proto` | one `<Service>Service`, its rpcs and their messages |
+| `autumn/<crate>/events/events.proto` | one message per `#[event]` of the crate |
+| `buf.yaml` | the lint and breaking rules for these files |
+| `proto.lock`, beside `--out` | the field numbers (`--lock <path>` moves it) |
+
+```proto
+// Rust type `Item`.
+message Item {
+  string id = 1 [json_name = "id"]; // required
+  string name = 2 [json_name = "name"]; // required
+  optional string sku = 3 [json_name = "sku"];
+}
+
+service CatalogService {
+  // GET /items/{id}
+  rpc GetItem(GetItemRequest) returns (Item);
+}
+```
+
+* `json_name` is always the serde wire name. A protobuf JSON parser reads the
+  JSON that Autumn sends. A wrapper is the exception. See below.
+* The path parameters and the body of an endpoint go into one
+  `<Rpc>Request` message. When a body field has the name of a path
+  parameter, the body is one field, `body`, so it stays whole.
+* The HTTP method and path go in a comment. `--http-annotations` also writes
+  `google.api.http` options, with each path parameter named by its proto
+  field. The export adds the googleapis dependency to `buf.yaml`. Run
+  `buf dep update` to fetch it. A GET or DELETE rule has no `body`.
+* An event message has the name of the event type. A comment gives its
+  topic.
+* Each file holds every message it needs, so a consumer can use one file.
+* An endpoint that no router serves is not in the files.
+* A response with no body, or a unit struct, is `google.protobuf.Empty`. A
+  comment says what Autumn sends: no body, or JSON `null`.
+* A Rust type with the name of a generated message (`<Rpc>Request`, a
+  wrapper, `<Service>Service`) stops the export. Rename the type.
+
+### Type mapping
+
+| Wire type | Proto |
+|---|---|
+| `string` (any format) | `string`. With `--well-known-types`, `date-time` is `google.protobuf.Timestamp` |
+| `integer` | `int32`, `int64`, `uint32` or `uint64` by width and sign. 128 bits is `google.protobuf.Value`, read as a double |
+| `number` | `double`. serde_json writes NaN and infinity as `null`, which reads as 0 |
+| `boolean` | `bool` |
+| `array` | `repeated T` |
+| `map` | `map<string, T>` |
+| `object` | a message |
+| `nullable` | `optional T`. A message field and `google.protobuf.Value` hold null already, so they stay plain fields |
+| `any` | `google.protobuf.Value` |
+
+A format, such as `uuid`, goes in the field comment. When one side of a
+field is `any`, for example with a custom serde function on that side only,
+the field is `google.protobuf.Value`. So is a field whose two sides have
+different forms, for example a `#[wire(type = …)]` on the serializer only.
+
+Protobuf cannot write some shapes in place. The export writes a wrapper
+message for each. Its name ends in `Wrapper`, so it is easy to find:
+
+| Shape | Proto |
+|---|---|
+| `Vec<Vec<T>>` | `repeated TListWrapper` |
+| `Vec<Option<T>>` | `repeated NullableTWrapper` |
+| `HashMap<String, Option<T>>` | `map<string, NullableTWrapper>` |
+| a map of lists or maps | `map<string, TListWrapper>`, `map<string, TMapWrapper>` |
+| a list of maps | `repeated TMapWrapper` |
+| a list response (`Json<Vec<Item>>`) | `ItemListWrapper` |
+| a list request body | a `repeated` field `items` in `<Rpc>Request` |
+
+A wrapper is not the JSON that Autumn sends. Autumn sends the bare value: an
+array, a map, or a value or `null`. A protobuf JSON parser expects an object
+with a `values` or `value` field, so it refuses Autumn's JSON for a wrapper
+field. Wrap the value yourself before you parse it: `[1, 2]` becomes
+`{"values": [1, 2]}`. A comment on each wrapper says so. With
+`--http-annotations`, a list response has `response_body: "values"`, so a
+transcoder uses the bare array.
+
+A `nullable` list or map is a plain `repeated` or `map` field. Protobuf JSON
+reads `null` as empty.
+
+### Requests from a protobuf consumer
+
+The schema is made to read Autumn's JSON. A consumer that writes a request
+with a protobuf JSON writer must do two things:
+
+* Write fields with default values. By default a writer leaves out `0`,
+  `""` and `false`, and serde then refuses a required field. Turn on the
+  writer's option to emit unpopulated fields.
+* Not send a 64-bit integer field. Protobuf JSON writes `int64` and `uint64`
+  as strings, and serde reads an integer only as a JSON number.
+
+### Field numbers
+
+JSON has no field numbers, so the export gives them. A number must never move
+after you publish it.
+
+* The lock keeps each number, by message and wire name. It is
+  sorted TOML. Commit it.
+* A new field gets the next free number. The numbers 19000 to 19999 are not
+  used.
+* A removed field moves to `reserved`, with its number and its name. No other
+  field gets that number. When the field comes back with the same wire name,
+  it gets its old number again.
+* `#[wire(tag = N)]` on a field sets its number. It wins over the lock, and
+  the number it replaces stays reserved. Two
+  equal tags on one type, or a tag outside protobuf's range, is a compile
+  error. A tag on the number of another field, or on a reserved number,
+  stops the export.
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize, WireShape)]
+pub struct Item {
+    #[wire(tag = 1)]
+    pub id: String,
+}
+```
+
+* The lock is `proto.lock` beside `--out`: `--out contracts/proto/` uses
+  `contracts/proto.lock`.
+* `--check` writes nothing. It exits 1 when the lock is missing or would
+  change, or when a file would change or go away. It reads CRLF as LF. Run
+  it in CI, so a lock that is not committed fails the build:
+
+```bash
+autumn contracts export --proto --out contracts/proto/ --check
+```
+
+The export removes a `.proto` file under `<out>/autumn/` that it wrote
+before and does not write now, and names it. A file without the export's
+first line stays.
+
+Two exports of the same source give the same bytes. `--from` takes a
+published bundle file, so you can export the schema of any release with no
+build. This updates the lock. Pass `--lock` with a scratch path to keep the
+committed lock as it is:
+
+```bash
+autumn contracts export --from release-1.json --proto \
+  --out target/proto-1/ --lock target/proto-1.lock
+```
+
+A lock key is the full message name. A message that gets a new name, for
+example because a second Rust type with the same name is now in the file,
+gets new numbers.
+
+### Required fields
+
+proto3 has no `required`. A field that serde requires stays a plain field,
+with `// required` in its comment. The `.proto` files are a schema for
+consumers. They are not the gate: `autumn contracts check` stays the gate for
+a field that a deployed caller reads.
+
+### buf
+
+The `buf.yaml` uses the `STANDARD` lint rules, with three exceptions:
+
+* `RPC_RESPONSE_STANDARD_NAME`: an rpc returns the message that Autumn sends.
+* `RPC_REQUEST_RESPONSE_UNIQUE`: two rpcs can return one message.
+* `PACKAGE_VERSION_SUFFIX`: the package is the service name.
+
+Breaking changes use `WIRE_JSON`, because JSON is the wire format.
+
+`buf breaking` finds no break in a change that `autumn contracts check`
+approves. They differ by design on some changes that the check refuses:
+
+* A new required request field, or a removed required nested field. proto3
+  has no required fields.
+* A removed response field that a caller reads, and a new field that a new
+  caller reads. buf cannot see read-sets.
+* A changed path or method, and an endpoint removed from its router. buf
+  does not compare comments, and `WIRE_JSON` does not check removed rpcs.
+
+`autumn-cli/tests/integration/contracts_proto.rs` names each case.
+
+### Avro schemas for events
+
+Event data often goes to a broker, a data pipeline or a warehouse loader.
+Avro is the usual schema there. Export one Avro schema per event topic:
+
+```bash
+autumn contracts export --avro --out contracts/avro/
+```
+
+`--avro` takes the same `-p`, feature and `--from` flags as the bundle
+export. It writes text only. The CLI has no Avro dependency.
+
+The export writes one `.avsc` file per topic: `contact.updated.avsc`,
+`contact.updated.v2.avsc`. A new version is a new topic, so it is a new
+subject in a schema registry.
+
+```json
+{
+  "type": "record",
+  "name": "ContactUpdated",
+  "namespace": "autumn.core",
+  "doc": "topic: contact.updated, version 1",
+  "autumn.topic": "contact.updated",
+  "fields": [
+    { "name": "id", "type": { "type": "string", "logicalType": "uuid" } },
+    { "name": "email", "type": "string" },
+    { "name": "phone", "type": ["null", "string"], "default": null }
+  ]
+}
+```
+
+* The record name comes from the topic, and the namespace from the crate:
+  `autumn.<crate>` (`mesh-catalog` is `autumn.mesh_catalog`). A Rust rename
+  of the event type does not change it.
+* A field name is the serde wire name. A `#[serde(alias)]` is an Avro
+  `aliases` entry, so a rename with an alias resolves in Avro as it does in
+  Autumn.
+* A nested type is a record. Its name comes from its type id:
+  `shop::model::Address` is `autumn.shop.model.Address`. A file defines it
+  once, then names it.
+* A unit event (`struct Ping;`) is a record with no fields. Autumn sends JSON
+  `null` for it. The `doc` says so.
+* An opaque event (`#[event(opaque)]`) is `bytes`: the JSON text.
+* `autumn.topic` names the topic, and `autumn.endpoint` the endpoint. The
+  export removes a stale `.avsc` in `--out` or `--out/endpoints/` only when
+  it has one of these keys, and names each removal. It does not look in
+  other directories.
+* `--check` writes nothing. It exits 1 when a file is missing, would change
+  or would go away.
+* Two exports of the same source give the same bytes.
+
+`--endpoints` also writes the body of each routed endpoint:
+`endpoints/<service>.<endpoint>.request.avsc` and `.response.avsc`. A route
+with no body has no file. A list body is an Avro `array` of the record. It is
+off by default: `--proto` is the schema for endpoints. Use the same flags in
+each run: an export without `--endpoints` removes the body schemas.
+
+#### Avro type mapping
+
+| Wire type | Avro |
+|---|---|
+| `string` | `string`. `uuid` has `"logicalType": "uuid"`. Another format stays `string` with an `"autumn.format"` key, because Avro has no logical string type for it |
+| `integer`, `i8` to `i32`, `u8`, `u16` | `int` |
+| `integer`, `i64`, `isize`, `u32` | `long` |
+| `integer`, `u64`, `usize`, 128 bits | refused |
+| `number` | `double` |
+| `boolean` | `boolean` |
+| `array`, `map` | `array`, `map` |
+| `object` | a named `record` |
+| `nullable` | `["null", T]` with `"default": null` |
+| `any` | refused, unless the event is `#[event(opaque)]` |
+
+An integer format, such as `unix-seconds`, also goes in `"autumn.format"`.
+
+A field that the JSON can leave out gets a default, so an Avro reader can
+read data without it. This is a field with `#[serde(default)]` or
+`skip_serializing_if`, or a field on one serde side only. A list gets `[]`, a
+map gets `{}`, and another form becomes `["null", T]` with `null`. There,
+`null` means that the key is absent. In a body schema, a request field counts
+when serde reads it, and a response field when serde writes it.
+
+The export stops on a form that Avro cannot hold, and names each field and
+its fix:
+
+* `u64`, `usize` and 128-bit integers. Use a smaller type. Or send the value
+  as a string with a serde adapter, such as `serde_with::DisplayFromStr`, and
+  name that form with `#[wire(type = "string")]`. Use
+  `#[wire(type = "integer")]` only when a custom serializer writes an `i64`.
+  On a released field, each of these is a new JSON form, which the check
+  reports.
+* `any`: `serde_json::Value`, a custom serde function, a `#[wire(opaque)]`
+  field. Name the form with `#[wire(type = …)]`.
+* A nested type with no shape in the bundle.
+* A field whose serialized and deserialized forms differ.
+* A wire name that is not an Avro name, such as `price-cents`. An Avro name
+  has only ASCII letters, digits and `_`.
+* A topic or endpoint that is not a safe file name, such as `../x` or a
+  Windows device name like `aux`, and two files that differ only in case.
+* Two types that map to one Avro name.
+
+#### The data, not Avro's JSON encoding
+
+Autumn sends plain JSON. Avro's JSON encoding is different: it wraps a union
+value (`{"string": "x"}`). So the schema describes the data. A bridge that
+writes Avro binary to a broker reads Autumn's JSON and encodes it with the
+schema. Do not give Autumn's JSON to an Avro JSON decoder.
+
+#### Registry compatibility
+
+A schema registry checks each new schema of a subject against the last one.
+Use the mode that matches the deploy order you check with
+`autumn contracts check`:
+
+| `autumn contracts check` | Who ships first | Registry mode |
+|---|---|---|
+| no `--order` (safe in any order) | either | `FULL` |
+| `--order callee-first` | producers | `FORWARD`: old consumers read new data |
+| `--order caller-first` | consumers | `BACKWARD`: new consumers read old data |
+
+The check compares the new build with the deployed release only, so use the
+non-transitive modes.
+
+The registry is not the gate. `autumn contracts check` stays the gate. Avro
+resolution agrees with the check in each window, but they differ by design
+on some changes:
+
+* Read-sets. Avro checks only the fields in the schema, and fills a missing
+  nullable field with `null`. The check sees that a consumer reads it.
+* `deny_unknown_fields`. An Avro reader skips a field it does not know.
+* Topics. A new version is a new subject. A registry does not know which
+  topics a producer still sends.
+* Presence. Avro data holds each field, so a field that the JSON can leave
+  out gets a default. The check sees that a deployed consumer needs it.
+* Unit events. Fields on a unit event change its JSON from `null` to an
+  object. In Avro, nullable fields added to a record with no fields are
+  compatible.
+* Opaque events. The check does not compare them. Avro compares a record
+  with `bytes`.
+* Integer widths. Avro promotes `int` to `long`. The check compares Rust
+  types: `i32` is not `i64`, so it reports a break in both windows.
+
+`autumn-cli/src/contracts/avro/agreement.rs` names each case.
+
 ## Limits of the first slice
 
-* One workspace. Both ends must be present at build time.
+* One workspace. Both ends must be present at build time. A consumer outside
+  the workspace gets a protobuf or Avro schema, not a build check. See
+  [Consumers outside the workspace](#consumers-outside-the-workspace).
+* Contracts come from Rust types only. Autumn does not import `.proto` or
+  Avro files. [ADR 0048](../adr/0048-wire-contracts-idl-at-the-edge.md) gives
+  the reasons. It also says which new limits reopen the decision.
 * Synchronous request/response and events, as JSON. No streaming or
   websockets.
 * Path parameters and a JSON body. Query parameters are not part of the
@@ -621,7 +981,9 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
 * The cross-release check compares two releases: the deployed one and the
   current one. More than two live releases need one check per pair.
 * The cross-release check knows only the callers in the bundle. It cannot see
-  a client outside the workspace, so it keeps every deployed route.
+  a client outside the workspace, so it keeps every deployed route. Give such
+  a client a protobuf schema. See
+  [Consumers outside the workspace](#consumers-outside-the-workspace).
 * A field with `#[wire(opaque)]` is compared by its type name only. A change
   inside its type does not show.
 * A nested type pair reports at most 100 issues. The verdict does not
@@ -656,19 +1018,27 @@ See [Events: wire contracts](events.md#wire-contracts) for the attributes, and
   crate (through a `use`), registers that handler. It does not judge that
   crate, because the name can also be a local function. Write
   `routes![mesh_catalog::get_item]` to have the check judge it.
-* A nested read is found through a field (`item.details.color`), a binding
-  of a field (`let d = &item.details;`), a struct pattern, an adapter such as
-  `.unwrap()` or `.as_ref()`, a callback such as `.map(|d| d.color)`, and a
-  maud `@let` or `@if let` such as `@if let Some(d) = &item.details`. A
-  read through an index, a loop, a method or another function stops at the
-  field before it. `item.lines[0].sku` reads `lines`. Then the check does not see
-  the removal of an *optional* field inside it. A *required* nested field is
-  safe: the caller's type cannot decode without it.
-* A nested write is found in a struct literal, also in `Some(…)` or
-  `Box::new(…)`. A nested value that is not a struct literal, such as a
-  variable or a function call, has an unknown write-set. Then the check
-  counts a field that serde can skip as sent only when the caller's own
-  release requires it.
+* The check sees a nested read through field access, a struct pattern, a
+  `let`, `if let` or `match` binding, a macro body, a maud `@let`,
+  `@if let`, `@match` or `@for`, `unwrap`, `clone`, `as_ref`, and the
+  `Option` and `Result` callbacks (`item.details.as_ref().map(|d| d.color)`).
+  A typed binding keeps the path: `@let d: &Details = &item.details`.
+* A loop or an index over a nested list keeps the path.
+  `for l in &item.lines { l.price }` and `item.lines[0].price` read
+  `lines.price`. A loop or an index over the whole response does not read
+  its fields.
+* Another method call stops the path. `item.lines.first()` and
+  `item.lines.iter().map(…)` read `lines` only.
+* In a macro body, a binding holds the value only for `x`, `Some(x)` and
+  `Ok(x)`, also with `&`, `ref` or `mut`. Another pattern, such as
+  `Some(Details { color, .. })`, does not read the fields it names. A
+  closure parameter in a macro body does not hold the value:
+  `html! { (item.details.as_ref().map(|d| d.color)) }` reads `details` only.
+* A field with more than one nested type, such as `Envelope<Payload>`, gives
+  the same nested reads and writes to each type.
+* The check knows a nested write-set only when the call site sets a named
+  field in an inline literal, or in `Some(literal)`. For other values, the
+  check uses the type, as for a request built elsewhere.
 * A request or response type is found by the path in the signature. A path
   through a re-export, such as `crate::dto::Item` for `shared::Item`, is
   refused when another crate has a type of that name. Write the path where the

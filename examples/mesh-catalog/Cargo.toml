@@ -16,6 +16,18 @@ path = "src/main.rs"
 autumn-web = { path = "../../autumn", default-features = false, features = ["http-client", "maud"] }
 serde = { version = "1", features = ["derive"] }
 
+# The protobuf round trip in `tests/proto_consumer.rs`: a consumer generated
+# with buffa from the committed `.proto` export reads the catalog's JSON.
+# Test only: no part of the framework or the CLI depends on protobuf.
+[dev-dependencies]
+buffa = { version = "0.9.2", features = ["json"] }
+buffa-codegen = "0.9.2"
+buffa-descriptor = "0.9.2"
+prost = "0.14"
+protox = "0.10"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 
@@ -23,3 +35,4 @@ unsafe_code = "forbid"
 # lint table grandfather the determinism-seam lint themselves.
 [lints.clippy]
 disallowed_methods = "allow"
+

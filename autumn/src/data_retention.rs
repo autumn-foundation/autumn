@@ -25,7 +25,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -33,7 +33,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::AutumnResult;
@@ -301,13 +301,9 @@ impl RetentionDataset {
                 Duration::from_secs(config.session.max_age_secs),
             )),
             Self::WebhookReplay => {
-                // Replay windows are declared per endpoint; the longest one
-                // is the bound that actually governs how long any marker can
-                // survive, so that is what the unified window competes with.
-                // Only endpoints that actually write markers count, matching
-                // `AutumnConfig::validate_retention_against_replay_protection`
-                // — an endpoint with replay protection off stores nothing, so
-                // its window must not set this dataset's reported bound.
+                // The longest per-endpoint window bounds how long any marker survives. Only
+                // endpoints with replay protection on store markers, matching
+                // `AutumnConfig::validate_retention_against_replay_protection`.
                 let longest = config
                     .security
                     .webhooks
@@ -629,13 +625,16 @@ async fn run_one_dataset(
 ) -> RetentionDatasetReport {
     let started = crate::time::ambient_monotonic();
     let effective = effective_retention(config, dataset);
-    // A provisional cutoff, so a dataset with no database still reports one.
-    // The sweep path replaces it with the instant Postgres itself resolved —
-    // see `sweep_postgres`.
+    // Provisional, so a dataset with no database still reports a cutoff. A database sweep
+    // replaces it with the instant the database resolved.
     let cutoff = effective
         .window
-        .and_then(|window| chrono::Duration::from_std(window).ok())
-        .map(|window| crate::time::ambient_now() - window);
+        .and_then(|window| jiff::SignedDuration::try_from(window).ok())
+        .map(|window| {
+            crate::time::ambient_now()
+                .checked_sub(window)
+                .unwrap_or(Timestamp::MIN)
+        });
 
     let mut report = RetentionDatasetReport {
         dataset: dataset.key().to_owned(),
@@ -643,7 +642,7 @@ async fn run_one_dataset(
         enforcement: dataset.enforcement_for(config).to_string(),
         window_secs: effective.window.map(|w| w.as_secs()),
         source: effective.source.to_string(),
-        cutoff: cutoff.map(|c| c.to_rfc3339()),
+        cutoff: cutoff.map(crate::time::compat::rfc3339),
         eligible_rows: None,
         rows_removed: 0,
         truncated: false,
@@ -659,8 +658,7 @@ async fn run_one_dataset(
         return report;
     };
 
-    // The sweep deletes from a table. Off Postgres, job history is not in it.
-    // Say so, so a zero is not read as "already clean".
+    // Under a backend without the jobs table, say so, so a zero is not read as "already clean".
     if dataset == RetentionDataset::JobHistory && dataset.table_for(config).is_none() {
         report.skipped = Some(format!(
             "NOT enforced: jobs.backend = {:?} keeps finished jobs outside autumn_jobs, \
@@ -671,8 +669,7 @@ async fn run_one_dataset(
         return report;
     }
 
-    // A legal hold outranks the window: check it before doing any counting,
-    // so a held dataset never even reads the rows it must not delete.
+    // A legal hold outranks the window: a held dataset never reads the rows it must not delete.
     let registry = state.extension::<GdprRegistry>();
     if let Some(reason) = legal_hold_for(dataset, registry.as_deref()) {
         report.skipped = Some(if dataset.table_for(config).is_some() {
@@ -695,17 +692,9 @@ async fn run_one_dataset(
             apply_sweep(state, dataset, window, dry_run, &mut report).await;
         }
         RetentionEnforcement::BackendTtl => {
-            // Not a sweep: the window is applied when the record is written,
-            // by capping its TTL (`AutumnConfig::apply_retention_caps`).
-            // There is nothing here to count or delete — and saying so beats
-            // reporting a fake zero.
-            //
-            // The caveat is stated rather than glossed: a write-time cap
-            // cannot reach a record that already exists. Records written
-            // before the window was shortened keep the TTL they were stored
-            // with and age out under it, so enforcement is complete only once
-            // the previous TTL has elapsed. Claiming otherwise would make the
-            // report assert a bound the data does not yet satisfy.
+            // The window caps the TTL at write time (`AutumnConfig::apply_retention_caps`), so
+            // there is nothing to count or delete here. Records written before the window was
+            // shortened keep their old TTL; the note says so rather than report a fake zero.
             report.skipped = Some(backend_ttl_note(
                 dataset,
                 config,
@@ -738,11 +727,8 @@ fn backend_ttl_note(
     window_secs: u64,
     registry: Option<&GdprRegistry>,
 ) -> String {
-    // `session.backend = "memory"` is the default, and `MemoryStore` is a
-    // plain `HashMap` with no expiry: capping `session.max_age_secs` shortens
-    // only the browser cookie while the server-side record lives as long as
-    // the process. That is not retention, and the report must not call it
-    // that.
+    // The default `MemoryStore` has no expiry: capping `session.max_age_secs` shortens only
+    // the cookie, while the server-side record lives as long as the process.
     if dataset == RetentionDataset::Sessions
         && config.session.backend == crate::session::SessionBackend::Memory
     {
@@ -825,7 +811,7 @@ fn elapsed_ms(started: crate::time::MonotonicInstant) -> u64 {
 #[allow(clippy::unused_async)]
 async fn apply_custom_domain_prune(
     _state: &AppState,
-    _cutoff: DateTime<Utc>,
+    _cutoff: Timestamp,
     _dry_run: bool,
     report: &mut RetentionDatasetReport,
 ) {
@@ -836,7 +822,7 @@ async fn apply_custom_domain_prune(
 #[cfg(feature = "custom-domains")]
 async fn apply_custom_domain_prune(
     state: &AppState,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     dry_run: bool,
     report: &mut RetentionDatasetReport,
 ) {
@@ -847,7 +833,7 @@ async fn apply_custom_domain_prune(
             Some("custom domains are not enabled ([server.tls.acme.custom_domains])".to_owned());
         return;
     };
-    match pruner.prune(cutoff.timestamp(), dry_run).await {
+    match pruner.prune(cutoff.as_second(), dry_run).await {
         Ok(removed) => report.rows_removed = removed,
         Err(e) => report.error = Some(e),
     }
@@ -856,7 +842,7 @@ async fn apply_custom_domain_prune(
 /// Purge stale audit-archive entries through the installed [`AuditLogger`].
 async fn apply_archive_purge(
     state: &AppState,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     dry_run: bool,
     report: &mut RetentionDatasetReport,
 ) {
@@ -864,13 +850,10 @@ async fn apply_archive_purge(
         report.skipped = Some("no audit logger is installed".to_owned());
         return;
     };
-    // One pass, not two: on a real run `entries_removed` *is* what was
-    // eligible, and the archive can be large enough that reading it twice per
-    // sweep is a cost worth not paying.
+    // One pass: on a real run `entries_removed` is what was eligible, and the archive can be
+    // too large to read twice.
     let summary = logger.purge_before(cutoff, dry_run).await;
-    // Record what was removed even when a sink failed. A partial purge has
-    // already deleted those entries; reporting `rows_removed = 0` alongside
-    // the error would understate a deletion that really happened.
+    // Record what was removed even when a sink failed: a partial purge has already deleted it.
     if summary.supported {
         report.eligible_rows = Some(summary.entries_removed);
         if !dry_run {
@@ -933,29 +916,18 @@ const fn stale_row_predicate(dataset: RetentionDataset) -> Option<(&'static str,
         )),
         RetentionDataset::CommitHooks => Some((
             "autumn_repository_commit_hooks",
-            // `after_hook_failed` is terminal too: it records `finished_at`
-            // and the row is only ever revived by an `ON CONFLICT (id)`
-            // upsert, which inserts cleanly if the row is gone. Omitting it
-            // would leave every permanently-failed after-hook accumulating
-            // forever despite a configured window.
+            // `after_hook_failed` is terminal: it records `finished_at`, and the row is only
+            // revived by an `ON CONFLICT (id)` upsert, which inserts cleanly if it is gone.
             "status IN ('completed', 'failed', 'after_hook_failed') \
              AND finished_at IS NOT NULL AND finished_at < $1",
         )),
         RetentionDataset::JobTracking => Some(("autumn_job_tracking", "updated_at < $1")),
         RetentionDataset::ExperimentAssignments => Some((
             "autumn_experiment_assignments",
-            // Only `archived` is terminal. `ExperimentService::start` restores
-            // a `draft` OR `concluded` experiment to `running` and refuses only
-            // `archived` — so a concluded experiment's sticky assignments are
-            // still live data (#1605 review round 13). Sweeping them and then
-            // restarting re-buckets every returning actor through the current
-            // weights, which is the precise corruption this predicate was
-            // written to avoid; the original set just drew the line at the
-            // wrong state.
-            //
-            // Assignments whose experiment row is gone entirely are still
-            // swept: a deleted experiment cannot be restarted, so nothing can
-            // re-read them.
+            // Only `archived` is terminal: `ExperimentService::start` can restart a `draft` or
+            // `concluded` experiment, and sweeping its sticky assignments would re-bucket every
+            // returning actor (#1605). Assignments of a deleted experiment are swept: it cannot
+            // be restarted.
             "assigned_at < $1 AND NOT EXISTS (                  SELECT 1 FROM autumn_experiments e                  WHERE e.name = autumn_experiment_assignments.experiment                    AND e.state IN ('draft', 'running', 'concluded')              )",
         )),
         RetentionDataset::Idempotency
@@ -1007,26 +979,18 @@ async fn apply_sweep(
     };
     match outcome {
         Ok(swept) => {
-            // Overwrite the provisional app-clock cutoff with the instant the
-            // database actually applied, so the report and the audit record
-            // state the real one.
-            report.cutoff = Some(swept.cutoff.to_rfc3339());
+            // The cutoff the database applied replaces the provisional app-clock one.
+            report.cutoff = Some(crate::time::compat::rfc3339(swept.cutoff));
             report.eligible_rows = Some(swept.eligible);
             report.rows_removed = swept.removed;
             report.truncated = swept.truncated;
         }
         Err(failure) => {
-            // Batches are separate autocommit statements, so whatever earlier
-            // ones deleted is permanently gone. Report it alongside the
-            // failure rather than auditing a real deletion as zero, and mark
-            // the pass truncated — it certainly did not drain the table.
-            //
-            // The cutoff comes with it once the database resolved one: those
-            // deletes used *that* boundary, and leaving the provisional
-            // app-clock value in place would have the audit record name a
-            // different one under clock skew.
+            // Each batch autocommits, so earlier batches' deletes are permanent: report them,
+            // and the database's cutoff they used, alongside the failure, and mark the pass
+            // truncated.
             if let Some(cutoff) = failure.cutoff {
-                report.cutoff = Some(cutoff.to_rfc3339());
+                report.cutoff = Some(crate::time::compat::rfc3339(cutoff));
             }
             report.eligible_rows = failure.eligible;
             report.rows_removed = failure.removed;
@@ -1054,7 +1018,7 @@ async fn apply_sweep(
 /// against it.
 ///
 /// The cutoff is `NOW() - <window>` evaluated by Postgres, not
-/// `Utc::now() - window` in the app. Every column these predicates compare
+/// `Timestamp::now() - window` in the app. Every column these predicates compare
 /// against is written with the database's `NOW()` (`finished_at`,
 /// `updated_at`, `assigned_at`), so using the app's clock would compare two
 /// different clocks: a worker replica running fast by δ would delete rows δ
@@ -1111,25 +1075,19 @@ async fn sweep_postgres(
 
     // Batched deletes: never one unbounded DELETE over a hot table.
     //
-    // The predicate is repeated on the OUTER delete, not only in the
-    // id sub-select. Without it the delete's only qual is `id IN {…}`, so a
-    // row that stops qualifying between the sub-select and the delete — an
-    // operator replaying a dead letter back to `enqueued` mid-sweep — would
-    // be deleted while live. Repeating the predicate makes the row's
-    // re-checked qual under READ COMMITTED include its current state.
+    // The predicate is repeated on the outer delete so READ COMMITTED re-checks it: a row that
+    // stops qualifying after the sub-select (a dead letter replayed to `enqueued`) survives.
     let mut removed: u64 = 0;
     for _ in 0..SWEEP_MAX_BATCHES {
         let affected = diesel::sql_query(format!(
             "DELETE FROM {table} WHERE {predicate} AND {key} IN \
              (SELECT {key} FROM {table} WHERE {predicate} LIMIT $2)"
         ))
-        .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+        .bind::<diesel::sql_types::Timestamptz, _>(crate::db::SqlTimestamp(cutoff))
         .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
         .execute(&mut *conn)
         .await
-        // `removed`, not 0: each batch is its own autocommit statement, so
-        // everything earlier batches deleted is permanently gone even though
-        // this one failed.
+        // `removed`, not 0: earlier batches autocommitted.
         .map_err(|e| {
             sweep_failed_at(
                 cutoff,
@@ -1139,24 +1097,16 @@ async fn sweep_postgres(
             )
         })?;
         removed = removed.saturating_add(u64::try_from(affected).unwrap_or(u64::MAX));
-        // Stop only on a batch that deleted *nothing*, not merely fewer than
-        // `SWEEP_BATCH_ROWS`. A short batch does not mean the table is
-        // drained: the outer predicate is re-checked at delete time, so rows
-        // that stopped qualifying between the sub-select and the delete (a
-        // dead letter replayed back to `enqueued`, a refreshed tracking row)
-        // make the batch short while thousands of stale rows remain.
+        // Stop on a batch that deleted nothing, not a short one: rows that stopped qualifying
+        // after the sub-select make a batch short while stale rows remain.
         if affected == 0 {
             break;
         }
     }
 
-    // Ask the database what is left rather than inferring it from the last
-    // batch size. Inferring gets it wrong in both directions: a short batch
-    // reports a complete sweep that isn't, and an exact multiple of
-    // `SWEEP_BATCH_ROWS * SWEEP_MAX_BATCHES` reports a truncated sweep that
-    // is actually done. `truncated` ends up in the audit record, so a wrong
-    // answer here is a compliance trail claiming enforcement that did not
-    // happen.
+    // Count what is left rather than infer it from the last batch size: a short batch would
+    // claim a complete sweep, and an exact multiple of the batch limits a truncated one.
+    // `truncated` goes into the audit record.
     let remaining =
         count_stale(&mut conn, table, predicate, cutoff, removed, Some(eligible)).await?;
 
@@ -1189,7 +1139,7 @@ fn sweep_failed(removed: u64, message: String) -> SweepFailure {
 /// the one actually applied.
 #[cfg(feature = "db")]
 fn sweep_failed_at(
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     removed: u64,
     eligible: Option<u64>,
     message: String,
@@ -1207,7 +1157,7 @@ fn sweep_failed_at(
 /// autocommit batches already deleted, and the error itself.
 #[cfg(feature = "db")]
 struct SweepFailure {
-    cutoff: Option<DateTime<Utc>>,
+    cutoff: Option<Timestamp>,
     removed: u64,
     /// Rows counted before the batches ran. `None` when the failure came first.
     eligible: Option<u64>,
@@ -1229,13 +1179,16 @@ async fn resolve_cutoff(
     conn: &mut diesel_async::AsyncPgConnection,
     table: &str,
     window: Duration,
-) -> Result<DateTime<Utc>, SweepFailure> {
+) -> Result<Timestamp, SweepFailure> {
     use diesel_async::RunQueryDsl as _;
 
     #[derive(diesel::QueryableByName)]
     struct CutoffRow {
-        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        cutoff: DateTime<Utc>,
+        #[diesel(
+            sql_type = diesel::sql_types::Timestamptz,
+            deserialize_as = crate::db::SqlTimestamp
+        )]
+        cutoff: Timestamp,
     }
 
     let Ok(window_secs) = u32::try_from(window.as_secs()) else {
@@ -1249,8 +1202,7 @@ async fn resolve_cutoff(
         ));
     };
 
-    // Seconds bound as a parameter rather than a formatted interval literal,
-    // so nothing about the window is ever interpolated into SQL text.
+    // Bound as a parameter so the window is never interpolated into SQL text.
     diesel::sql_query("SELECT NOW() - make_interval(secs => $1) AS cutoff")
         .bind::<diesel::sql_types::Double, _>(f64::from(window_secs))
         .get_result::<CutoffRow>(conn)
@@ -1273,7 +1225,7 @@ async fn count_stale(
     conn: &mut diesel_async::AsyncPgConnection,
     table: &str,
     predicate: &str,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     removed_so_far: u64,
     eligible: Option<u64>,
 ) -> Result<u64, SweepFailure> {
@@ -1288,7 +1240,7 @@ async fn count_stale(
     diesel::sql_query(format!(
         "SELECT COUNT(*) AS count FROM {table} WHERE {predicate}"
     ))
-    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .bind::<diesel::sql_types::Timestamptz, _>(crate::db::SqlTimestamp(cutoff))
     .get_result::<CountRow>(conn)
     .await
     .map(|row| u64::try_from(row.count).unwrap_or(0))
@@ -1306,7 +1258,7 @@ async fn count_stale(
 #[cfg(feature = "db")]
 struct SweptDataset {
     /// The instant the database itself resolved for the window.
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     /// Rows matching the predicate before the pass ran.
     eligible: u64,
     /// Rows actually deleted.
@@ -1460,8 +1412,8 @@ async fn sweep_sqlite(
         }
     }
 
-    // The job runtime adds `unique_ttl_ms` when it starts. A sweep that runs
-    // first on an older file must not guess: skip it and delete nothing.
+    // The job runtime adds `unique_ttl_ms` when it starts. Without it the sweep cannot check
+    // TTL holds, so it deletes nothing.
     if dataset == RetentionDataset::JobHistory
         && !sqlite_column_exists(&mut conn, table, "unique_ttl_ms").await?
     {
@@ -1483,9 +1435,8 @@ async fn sweep_sqlite(
         }));
     }
 
-    // The same indexes the Postgres migration adds. The SQLite migration for
-    // them is a no-op shim that existing files have already applied, so the
-    // sweep creates them. Without one, every batch rescans the table.
+    // The indexes the Postgres migration adds. The SQLite migration for them is a no-op shim
+    // existing files already applied, so the sweep creates them; otherwise every batch rescans.
     if let Some(index) = sqlite_sweep_index(dataset) {
         diesel::sql_query(index)
             .execute(&mut *conn)
@@ -1603,7 +1554,7 @@ async fn resolve_sqlite_cutoff(
     table: &str,
     window: Duration,
     clock: SqliteClock,
-) -> Result<(DateTime<Utc>, SqliteCutoff), SweepFailure> {
+) -> Result<(Timestamp, SqliteCutoff), SweepFailure> {
     use diesel_async::RunQueryDsl as _;
 
     #[derive(diesel::QueryableByName)]
@@ -1636,13 +1587,18 @@ async fn resolve_sqlite_cutoff(
     let ms = row.cutoff_ms.ok_or_else(too_wide)?;
     // A text column holds whole seconds. Report the instant that is applied.
     let at = match clock {
-        SqliteClock::Millis => DateTime::<Utc>::from_timestamp_millis(ms),
-        SqliteClock::Text => DateTime::<Utc>::from_timestamp(ms.div_euclid(1000), 0),
+        SqliteClock::Millis => Timestamp::from_millisecond(ms),
+        SqliteClock::Text => Timestamp::from_second(ms.div_euclid(1000)),
     }
-    .ok_or_else(too_wide)?;
+    .map_err(|_| too_wide())?;
     let cutoff = match clock {
         SqliteClock::Millis => SqliteCutoff::Millis(ms),
-        SqliteClock::Text => SqliteCutoff::Text(at.format("%Y-%m-%d %H:%M:%S").to_string()),
+        SqliteClock::Text => SqliteCutoff::Text(
+            jiff::tz::Offset::UTC
+                .to_datetime(at)
+                .strftime("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        ),
     };
     Ok((at, cutoff))
 }
@@ -1655,7 +1611,7 @@ async fn count_stale_sqlite(
     cutoff: &SqliteCutoff,
     removed_so_far: u64,
     eligible: Option<u64>,
-    cutoff_at: DateTime<Utc>,
+    cutoff_at: Timestamp,
 ) -> Result<u64, SweepFailure> {
     use diesel_async::RunQueryDsl as _;
 
@@ -1687,7 +1643,7 @@ async fn count_stale_sqlite(
     })
 }
 
-// ── Audit record (AC #6) ─────────────────────────────────────────────────
+// ── Audit record ─────────────────────────────────────────────────────────
 
 /// Write the auditable record for one dataset's pass: dataset, cutoff, and
 /// rows removed (AC #6).
@@ -1804,7 +1760,7 @@ pub fn purge_refusal(profile: Option<&str>, force: bool) -> Option<String> {
     ))
 }
 
-// ── Scheduled task (AC #2) ───────────────────────────────────────────────
+// ── Scheduled task ───────────────────────────────────────────────────────
 
 /// Turn dataset errors into one task error.
 ///
@@ -2285,7 +2241,12 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn a_failure_after_the_count_keeps_the_eligible_count() {
-        let failure = sweep_failed_at(Utc::now(), 500, Some(5_000_000), "timeout".to_owned());
+        let failure = sweep_failed_at(
+            Timestamp::UNIX_EPOCH,
+            500,
+            Some(5_000_000),
+            "timeout".to_owned(),
+        );
         assert_eq!(failure.eligible, Some(5_000_000));
         assert_eq!(failure.removed, 500);
         assert_eq!(sweep_failed(0, "no pool".to_owned()).eligible, None);
@@ -2368,14 +2329,9 @@ mod tests {
 
     #[test]
     fn job_history_never_matches_a_live_job_row() {
-        // Regression guard for the single most dangerous thing this module
-        // could get wrong: a predicate that reaches an enqueued, running, or
-        // retry-scheduled job.
-        //
-        // Asserts on the *set* of statuses rather than a substring of the
-        // rendered SQL: a substring match breaks the moment a new terminal
-        // status is added (as `discarded` was), which tells you nothing about
-        // whether the predicate is still safe.
+        // The predicate must never reach an enqueued, running or retry-scheduled job. Compares
+        // the parsed status set, not an SQL substring: a substring check breaks on a new terminal
+        // status and says nothing about whether the predicate is still safe.
         let (table, predicate) =
             stale_row_predicate(RetentionDataset::JobHistory).expect("job_history is sweepable");
         assert_eq!(table, "autumn_jobs");

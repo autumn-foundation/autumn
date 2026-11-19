@@ -4,35 +4,35 @@
 
               Ir   share  function
 
-          61,873   16.9%  __memcpy_avx_unaligned_erms
-          30,426    8.3%  _int_malloc
-          28,539    7.8%  _int_free
-          21,188    5.8%  malloc
-          21,187    5.8%  core::ptr::drop_glue
-          20,862    5.7%  sha2::sha256::compress256
-          14,508    4.0%  free
-           9,911    2.7%  <autumn_web::state::AppState as core::clone::Clone>::clone
-           6,972    1.9%  <tower::util::map_future::MapFuture as tower::util::boxed_clone_sync::CloneService>::clone_box
-           6,700    1.8%  malloc_consolidate
-           4,260    1.2%  <core::iter::adapters::map::Map as core::iter::traits::iterator::Iterator>::next
-           4,212    1.2%  __rustc::__rdl_alloc
-           4,083    1.1%  <hashbrown::raw::RawTable>::reserve_rehash
-           3,807    1.0%  <tokio::task::task_local::TaskLocalFuture as core::future::future::Future>::poll
-           3,733    1.0%  unlink_chunk.isra.0
-           3,717    1.0%  <hashbrown::map::HashMap>::insert
-           3,714    1.0%  autumn_web::security::csrf::constant_time_eq
-           3,243    0.9%  <alloc::string::String as core::iter::traits::collect::FromIterator>::from_iter
-           3,192    0.9%  <http::header::map::HeaderMap>::try_insert2
-           2,730    0.7%  <tokio::task::task_local::LocalKey>::sync_scope
-           2,445    0.7%  <tower::util::either::Either as core::clone::Clone>::clone
-           2,322    0.6%  <alloc::raw_vec::RawVecInner>::finish_grow
-           2,235    0.6%  <hex::BytesToHexChars as core::iter::traits::iterator::Iterator>::next
-           2,178    0.6%  http::header::map::hash_elem_using
-           2,065    0.6%  <autumn_web::router::TrustedHostService as core::clone::Clone>::clone
-           2,026    0.6%  <autumn_web::test::RequestBuilder>::send::{closure#0}
-           1,869    0.5%  <autumn_web::security::config::ResolvedSigningKeys>::verify
-           1,820    0.5%  core::slice::memchr::memchr_aligned
-           1,815    0.5%  subtle::black_box
-           1,800    0.5%  <autumn_web::session::SessionService as core::clone::Clone>::clone
+          30,950   12.1%  __memcpy_avx_unaligned_erms
+          26,969   10.6%  _int_malloc
+          20,232    7.9%  sha2::sha256::soft::unroll::compress
+          20,119    7.9%  _int_free
+          14,245    5.6%  malloc
+          10,404    4.1%  core::ptr::drop_glue
+           9,765    3.8%  free
+           6,643    2.6%  malloc_consolidate
+           4,260    1.7%  <core::iter::adapters::map::Map as core::iter::traits::iterator::Iterator>::next
+           3,714    1.5%  autumn_web::security::csrf::constant_time_eq
+           3,519    1.4%  <hashbrown::map::HashMap>::insert
+           3,341    1.3%  unlink_chunk.isra.0
+           3,192    1.2%  <http::header::map::HeaderMap>::try_insert2
+           3,110    1.2%  <tower::util::map_future::MapFuture as tower::util::boxed_clone_sync::CloneService>::clone_box
+           2,835    1.1%  __rustc::__rdl_alloc
+           2,595    1.0%  <tokio::task::task_local::TaskLocalFuture as core::future::future::Future>::poll
+           2,385    0.9%  <tokio::task::task_local::LocalKey>::sync_scope
+           2,103    0.8%  <hashbrown::raw::RawTable>::reserve_rehash
+           2,037    0.8%  <autumn_web::security::config::ResolvedSigningKeys>::verify
+           2,025    0.8%  <autumn_web::test::RequestBuilder>::send::{closure#0}
+           1,976    0.8%  http::header::map::hash_elem_using
+           1,921    0.8%  core::slice::memchr::memchr_aligned
+           1,914    0.7%  <autumn_web::middleware::access_log::AccessLogService as tower_service::Service>::call
+           1,815    0.7%  subtle::black_box
+           1,682    0.7%  <alloc::raw_vec::RawVecInner>::finish_grow
+           1,656    0.6%  <tower::util::oneshot::Oneshot as core::future::future::Future>::poll'2
+           1,485    0.6%  autumn_web::security::config::mac_hex_bytes
+           1,425    0.6%  <futures_util::future::future::map::Map as core::future::future::Future>::poll
+           1,322    0.5%  <http::header::map::HeaderMap>::get
+           1,251    0.5%  <alloc::string::String as core::fmt::Write>::write_str
 
-         365,227  100.0%  TOTAL
+         255,441  100.0%  TOTAL

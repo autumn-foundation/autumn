@@ -33,6 +33,19 @@ scripts/verify-verus.sh                          # uses `verus` on PATH
 VERUS_BIN=/path/to/verus scripts/verify-verus.sh
 ```
 
+## Protobuf field numbers
+
+`proto_field_numbers.rs` models how `autumn contracts export --proto` gives
+field numbers (`autumn-cli/src/contracts/proto/lock.rs`). Verify it with:
+
+```sh
+verus verification/proto_field_numbers.rs
+```
+
+It proves three rules. Each new number is a valid field number. New numbers
+are distinct and above every used number. A new name does not change the
+number of another name.
+
 ## Lease-lock fencing
 
 `lease_fencing.rs` models the `autumn_lease_locks` statements in
@@ -605,3 +618,36 @@ a task with queues runs only where the role runs job workers and its pin
 admits one of the queues. The test
 `place_matches_the_model` in `autumn/src/background.rs` checks the runtime
 against the same rules.
+
+## Avro integer widths
+
+`avro_integer_width.rs` models how `autumn contracts export --avro` maps a
+Rust integer to an Avro `int` or `long`
+(`autumn-cli/src/contracts/avro/mod.rs`). It proves that the mapping never
+narrows, gives the smallest type, and refuses only when no Avro integer holds
+the range. Verify it with:
+
+```sh
+verus verification/avro_integer_width.rs
+```
+
+## Tenant resolution
+
+`tenant_resolution.rs` models `extract_tenant_impl` in
+`autumn/src/tenancy.rs`. Verify it with:
+
+```sh
+verus verification/tenant_resolution.rs
+```
+
+It proves these rules:
+
+- The header source with no `header_trust` selects no tenant.
+- With `trusted_proxy`, a peer that is not trusted selects no tenant.
+- Two or more header values select no tenant.
+- A session that holds a tenant binds the request to that tenant.
+- Thus a tenant-A user cannot select tenant B by header.
+
+The model does not include the token check, the host parse or capsule replay.
+The tests in `autumn/tests/integration/tenancy_header_trust.rs` cover the
+runtime.

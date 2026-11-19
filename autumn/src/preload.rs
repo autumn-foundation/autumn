@@ -212,8 +212,7 @@ impl<T> From<T> for Preloaded<T> {
 
 impl<T: serde::Serialize> serde::Serialize for Preloaded<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Serialize transparently as the inner record. Associations are a
-        // server-side loading concern, not part of the record's wire shape.
+        // Associations are a server-side loading concern, not part of the wire shape.
         self.inner.serialize(serializer)
     }
 }
@@ -463,7 +462,6 @@ mod tests {
             author_id: 99,
             title: "t".into(),
         });
-        // Preloaded, but no matching parent row exists.
         post.associations_mut()
             .insert::<Option<Arc<Preloaded<User>>>>("author", None);
 

@@ -1158,6 +1158,9 @@ pub(crate) struct TunnelGuard {
 /// Extract `KeepTunnel` and keep it for the life of the socket.
 /// `autumn_web::ws::WebSocketUpgrade` does this for you.
 ///
+/// axum's own extractor needs the `axum-ws` feature. It is in `default`, and
+/// `ws` turns it on.
+///
 /// It never rejects. On HTTP/1, or for a request that is not `CONNECT`, it
 /// holds nothing.
 ///
@@ -1538,8 +1541,7 @@ mod tests {
     #[test]
     fn a_small_header_limit_does_not_panic() {
         // hyper's `max_buf_size` panics below its minimum. `HttpLimits` is
-        // public, so a value that skipped config validation must still be
-        // safe: it is raised to the minimum.
+        // public, so a value that skipped config validation is raised to it.
         let limits = HttpLimits {
             max_header_bytes: Some(4096),
             ..HttpLimits::default()

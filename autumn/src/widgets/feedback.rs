@@ -305,11 +305,9 @@ pub fn confirm_action(
         modal_config = modal_config.class(class);
     }
 
-    // No-JS / no-Invoker-Commands fallback: the trigger above can't open the
-    // dialog without either the native `command`/`commandfor` API or the
-    // `autumn-widgets.js` fallback running, so this plain, always-working
-    // (unconfirmed) submit button keeps the action reachable — the same
-    // fallback pattern `active_search`/`autocomplete_input` use.
+    // The trigger cannot open the dialog without the native `command`/`commandfor` API or
+    // `autumn-widgets.js`. This plain (unconfirmed) submit button keeps the action reachable
+    // without either, as `active_search` and `autocomplete_input` do.
     let mut noscript_options = crate::links::ButtonToOptions::new().attrs(config.attrs);
     if let Some(class) = config.trigger_class {
         noscript_options = noscript_options.class(class);
@@ -638,9 +636,8 @@ pub fn alert(variant: AlertVariant, body: maud::Markup) -> maud::Markup {
 /// assert!(out.contains("autumn-alert__dismiss"));
 /// assert!(!out.contains("<script")); // no JS
 /// ```
-// `body` is taken by value to match the issue's `alert(variant, body: Markup)`
-// signature and keep `alert(v, html! { .. })` ergonomic (no `&` at the call
-// site); Maud renders it by reference, hence the allow.
+// `body` is taken by value so `alert(v, html! { .. })` needs no `&`; Maud renders it by
+// reference, hence the allow.
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
 pub fn alert_with(
@@ -677,10 +674,8 @@ fn alert_root(
                 div class="autumn-alert__body" { (body) }
             }
             @if config.dismissible {
-                // The checkbox stays in tab order (visually hidden but focusable
-                // via `.autumn-alert__dismiss-toggle`, never `hidden`/`display:none`) so
-                // keyboard and screen-reader users can dismiss; the accessible
-                // name is on the control itself.
+                // The checkbox is visually hidden but stays focusable (never `hidden` or
+                // `display:none`), so keyboard and screen-reader users can dismiss.
                 label class="autumn-alert__dismiss" {
                     input type="checkbox" class="autumn-alert__dismiss-toggle"
                         aria-label="Dismiss this message";
@@ -739,7 +734,7 @@ pub fn error_summary<T>(changeset: &crate::form::Changeset<T>) -> Option<maud::M
     if changeset.is_valid() {
         return None;
     }
-    // Stable order: sort by field so the summary is deterministic.
+    // Sorted so the summary order is deterministic.
     let mut fields: Vec<&String> = changeset.all_errors().keys().collect();
     fields.sort();
     let body = maud::html! {
@@ -856,19 +851,12 @@ const DEFAULT_TOAST_CLOSE_LABEL: &str = "Dismiss notification";
 /// ```
 #[must_use]
 pub fn toast_region(id: &str) -> maud::Markup {
-    // Accept either a bare id or a `#selector` (a natural caller slip); strip a
-    // leading `#` so the element id is always bare, matching the id that
-    // `toast_in`'s `beforeend:#…` OOB target points at.
+    // Accept `#id` too, so the id matches `toast_in`'s `beforeend:#…` OOB target.
     let id = selector_to_id(id);
-    // The region is a PERSISTENT polite live region: a `role="status"`/
-    // `aria-live="polite"` element inserted already-populated is not reliably
-    // announced, so instead this empty region lives in the layout and toasts are
-    // appended into it (screen readers announce the mutation). `aria-atomic` is
-    // explicitly `false` so only the newly-appended toast is read, not every
-    // toast currently in the region — and `role="status"` is deliberately NOT
-    // used because it implies `aria-atomic="true"`, which would re-announce all
-    // of them. Non-error toasts inherit this politeness (they carry no own
-    // `aria-live`); error toasts announce assertively on their own.
+    // A live region inserted already populated is not reliably announced, so this empty
+    // region lives in the layout and toasts are appended into it. `aria-atomic="false"` reads
+    // only the new toast; `role="status"` is avoided because it implies `aria-atomic="true"`.
+    // Non-error toasts inherit this politeness; error toasts announce on their own.
     maud::html! {
         div id=(id) class="autumn-toast-region" popover="manual" data-autumn-toast-region
             aria-live="polite" aria-atomic="false" {}
@@ -1058,14 +1046,10 @@ pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::
 /// ```
 #[must_use]
 pub fn toast_with(message: &str, variant: AlertVariant, config: &ToastConfig<'_>) -> maud::Markup {
-    // Error toasts announce assertively on their own — `role="alert"` elements
-    // ARE reliably announced on insertion, so they don't depend on the
-    // persistent region. The alert is on the message only, so the close
-    // button label is not part of the announcement. Non-error toasts carry NO `role`/`aria-live`: they
-    // inherit the `aria-live="polite"` of the `toast_region` they're appended
-    // into (a freshly-inserted, already-populated polite element is otherwise
-    // not reliably announced). Every toast keeps `aria-atomic="true"` so its
-    // message is read as one unit.
+    // `role="alert"` is reliably announced on insertion, so error toasts do not depend on the
+    // region. It sits on the message only, so the close label is not announced. Other toasts
+    // carry no `role`/`aria-live` and inherit the region's `aria-live="polite"`. Every toast
+    // has `aria-atomic="true"` so its message is read as one unit.
     let (role, live): (Option<&str>, Option<&str>) = match variant {
         AlertVariant::Error => (Some("alert"), Some("assertive")),
         AlertVariant::Info | AlertVariant::Success | AlertVariant::Warning => (None, None),
@@ -1080,35 +1064,16 @@ pub fn toast_with(message: &str, variant: AlertVariant, config: &ToastConfig<'_>
         .filter(|_| !config.persistent)
         .map(|d| d.as_millis().to_string());
     let close_label = config.close_label.unwrap_or(DEFAULT_TOAST_CLOSE_LABEL);
-    // Accept a bare id or a `#selector`; strip one leading `#` so a caller
-    // passing `"#toast-region"` doesn't produce an invalid `beforeend:##…`.
+    // Strip one leading `#` so `"#toast-region"` does not produce `beforeend:##…`.
     let region_id = selector_to_id(config.region.unwrap_or(DEFAULT_TOAST_REGION_ID));
     let oob = format!("beforeend:#{region_id}");
-    // For a POSITIONAL OOB swap (`beforeend:#…`) htmx inserts the carrier's
-    // *children* into the target and discards the carrier itself, so the carrier
-    // must be a plain, discardable `<div>` — NOT a `<template>`.
+    // A positional OOB swap (`beforeend:#…`) appends the carrier's children and discards the
+    // carrier, so the carrier must be a plain `<div>`. htmx 2 treats a top-level `<template>`
+    // as the carrier itself, and its children live in `.content`, so nothing would be
+    // appended. `hx-swap-oob` on `.autumn-toast` itself would drop it and append only its
+    // children.
     //
-    // Authority — vendored htmx 2.0.4 (`vendor/htmx.min.js`):
-    //   * `oobSwap` (minified `He`): for a non-outerHTML style it swaps
-    //     `f(clone)`, i.e. the *carrier element* (`f` returns the element as-is),
-    //     then `_e("beforeend", …)` → `Be` → `a`, whose insert loop is
-    //     `while(n.childNodes.length>0)` — it iterates the carrier's `childNodes`.
-    //   * The response OOB scan `ze` matches a top-level `<template hx-swap-oob=…>`
-    //     (`parentElement===null`), so the template is processed as the carrier
-    //     itself, not unwrapped. A `<template>` keeps its children in `.content`,
-    //     so `template.childNodes` is EMPTY → htmx appends nothing and the toast
-    //     never shows. (The template-content rescan only helps when `hx-swap-oob`
-    //     sits on a CHILD *inside* `.content`, which is not this positional case.)
-    //
-    // This mirrors the repo's own tested SSE convention in `channels.rs` (see the
-    // passing `broadcast_publish_oob_custom_strategy` test →
-    // `<div hx-swap-oob="beforeend:#badge"><span>3</span></div>`). The styled/ARIA
-    // `.autumn-toast` element stays the carrier's CHILD; putting `hx-swap-oob`
-    // directly on it would throw the wrapper away and append only the inner
-    // `<span>`.
-    //
-    // The close button is `hidden` because it needs the runtime. The runtime
-    // shows it.
+    // The close button needs the runtime, so it starts `hidden` and the runtime shows it.
     maud::html! {
         div hx-swap-oob=(oob) {
             div class=(class) data-autumn-toast data-autumn-toast-duration=[duration]

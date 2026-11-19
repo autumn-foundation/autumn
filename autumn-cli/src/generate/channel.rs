@@ -88,19 +88,15 @@ pub fn plan_channel(
             format!("{}: {e}", main_path.display()),
         ))
     })?;
-    // Drop any route entries a prior generation of this channel left behind
-    // under a different transport (e.g. `--ws --force` after a plain SSE
-    // run) before splicing in the current transport's entries — otherwise
-    // main.rs would keep referencing functions the just-overwritten
-    // src/channels/<snake>.rs no longer defines.
+    // Drop route entries a prior generation left under another transport (e.g. `--ws --force`
+    // after SSE): the overwritten channel file no longer defines those handlers.
     let main_existing =
         remove_routes_entries_with_prefix(&main_existing, &format!("channels::{snake_name}::"));
     let route_entries = route_entries(&snake_name, transport);
     let updated_main = update_main_rs(&main_existing, &["channels"], &route_entries);
     plan.modify(main_path.clone(), updated_main);
-    // `mod channels;` is a shared infrastructure declaration (see
-    // `emit::sync_main_rs_mod_declarations`) — only this channel's own
-    // route entries are reverted here.
+    // `mod channels;` is shared (see `emit::sync_main_rs_mod_declarations`), so only this
+    // channel's route entries are reverted.
     plan.push_revert(crate::generate::emit::Revert::RoutesEntries {
         path: main_path,
         entries: route_entries,
@@ -118,12 +114,9 @@ pub fn plan_channel(
     let cargo_path = project_root.join("Cargo.toml");
     let cargo_existing = read_or_empty(&cargo_path);
     let mut updated_cargo = cargo_existing.clone();
-    // `channels`/`sse::stream`/`#[ws]` are all gated behind "ws". The SSE
-    // transport's generated view additionally uses `Markup`/`html!` and the
-    // `HTMX_JS_PATH`/`HTMX_SSE_JS_PATH` constants, which are gated behind
-    // "maud"/"htmx" — both are in autumn-web's default feature set, but a
-    // project that opts out with `default-features = false` needs them
-    // enabled explicitly too (mirrors `generate scaffold --live`).
+    // `channels`/`sse::stream`/`#[ws]` need "ws". The SSE view also uses `Markup`/`html!` and
+    // `HTMX_JS_PATH`/`HTMX_SSE_JS_PATH`, gated behind "maud"/"htmx": default features, but a
+    // project with `default-features = false` needs them enabled explicitly.
     let autumn_web_features: &[&str] = match transport {
         Transport::Sse => &["ws", "htmx", "maud"],
         Transport::Ws => &["ws"],
@@ -140,11 +133,9 @@ pub fn plan_channel(
     if updated_cargo != cargo_existing {
         plan.modify(cargo_path.clone(), updated_cargo);
     }
-    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
-    // model.rs: destroy recomputes this plan against the already-generated
-    // Cargo.toml, where these entries are by definition already present.
-    // `maud` is excluded: `autumn new`'s own template already ships it as a
-    // direct dependency (see `TEMPLATE_SHIPPED_CARGO_DEPS`).
+    // Pushed unconditionally: destroy recomputes this plan against the generated Cargo.toml,
+    // where these entries are already present. Deps the `autumn new` template ships (`maud`,
+    // see `TEMPLATE_SHIPPED_CARGO_DEPS`) are never reverted.
     let dep_names: Vec<String> = deps
         .iter()
         .map(|(name, _)| *name)
@@ -494,10 +485,9 @@ async fn main() {
     #[test]
     fn generate_then_destroy_channel_ws_round_trips_to_original_project_state() {
         let tmp = project_with_main(default_main());
-        // Mirrors a real `autumn new` project's Cargo.toml: a `tokio`
-        // dev-dependency with `rt`/`macros` already present, so
-        // `ensure_dev_dependency_tokio_test_features` (which has no destroy
-        // wiring yet — a documented gap) is a no-op here, matching reality.
+        // Mirrors an `autumn new` Cargo.toml: the `tokio` dev-dependency already has
+        // `rt`/`macros`, so `ensure_dev_dependency_tokio_test_features` (which destroy does
+        // not revert) is a no-op.
         let cargo_path = tmp.path().join("Cargo.toml");
         fs::write(
             &cargo_path,
@@ -524,7 +514,7 @@ async fn main() {
         assert_eq!(fs::read_to_string(&cargo_path).unwrap(), original_cargo);
     }
 
-    // ── RED: file plan assertions ─────────────────────────────────────────
+    // ── File plan ─────────────────────────────────────────────────────────
 
     #[test]
     fn plan_creates_channel_file() {
@@ -596,7 +586,7 @@ async fn main() {
         assert!(matches!(err, GenerateError::InvalidName(_, _)));
     }
 
-    // ── GREEN: SSE transport content assertions ───────────────────────────
+    // ── SSE transport content ─────────────────────────────────────────────
 
     #[test]
     fn sse_execute_writes_page_with_htmx_wiring() {
@@ -646,9 +636,8 @@ async fn main() {
 
     #[test]
     fn sse_publish_handler_does_not_clone_fragment_for_a_discarded_response() {
-        // The view's form uses hx-swap="none", so the POST response body is
-        // never used by the browser — publishing must not clone the
-        // rendered fragment just to also return it.
+        // The view's form uses hx-swap="none", so the browser ignores the POST response body;
+        // publishing must not clone the rendered fragment just to return it.
         let tmp = project_with_main(default_main());
         plan_channel(tmp.path(), "Chat", Transport::Sse)
             .unwrap()
@@ -660,7 +649,7 @@ async fn main() {
         assert!(src.contains(r"AutumnResult<&'static str>"), "{src}");
     }
 
-    // ── GREEN: WS transport content assertions ────────────────────────────
+    // ── WS transport content ──────────────────────────────────────────────
 
     #[test]
     fn ws_execute_writes_handler_with_ws_macro() {
@@ -725,7 +714,7 @@ async fn main() {
         assert!(src.contains("tracing::warn!"), "{src}");
     }
 
-    // ── GREEN: main.rs / mod.rs wiring ─────────────────────────────────────
+    // ── main.rs / mod.rs wiring ───────────────────────────────────────────
 
     #[test]
     fn execute_updates_main_rs_with_mod_declaration() {
@@ -820,10 +809,6 @@ async fn main() {
 
     #[test]
     fn force_regenerating_with_different_transport_does_not_strand_stale_routes() {
-        // Regression test: switching transports via `--force` must not leave
-        // main.rs referencing functions the regenerated channel file no
-        // longer defines (previously left `chat_page`/`chat_events` behind
-        // after switching to `--ws`, which failed to compile).
         let tmp = project_with_main(default_main());
         plan_channel(tmp.path(), "Chat", Transport::Sse)
             .unwrap()
@@ -874,7 +859,7 @@ async fn main() {
         assert!(main.contains("channels::chat::chat_events"), "{main}");
     }
 
-    // ── GREEN: smoke test content ───────────────────────────────────────────
+    // ── Smoke test content ────────────────────────────────────────────────
 
     #[test]
     fn execute_writes_smoke_test_with_testapp_and_subscriber_assertion() {
@@ -913,10 +898,8 @@ async fn main() {
 
     #[test]
     fn sse_smoke_test_publish_handler_matches_production_handler() {
-        // Regression test: the test's re-declared publish handler must
-        // actually exercise message_fragment/maud rendering, the same as
-        // the real src/channels/chat.rs handler — not a simplified copy
-        // that only proves the pub/sub transport works.
+        // The smoke test's re-declared publish handler must render through
+        // message_fragment/maud like the real one, not a copy that only proves pub/sub works.
         let tmp = project_with_main(default_main());
         plan_channel(tmp.path(), "Chat", Transport::Sse)
             .unwrap()
@@ -933,11 +916,8 @@ async fn main() {
         );
         assert!(test_src.contains("Markup"), "{test_src}");
 
-        // Extract each file's chat_publish body (brace-balanced, so trailing
-        // content like an inline #[cfg(test)] module or the smoke test's own
-        // #[tokio::test] fn is never swept in) and confirm they match — the
-        // doc comment promises this is "a re-declaration of the same
-        // handler", so it must actually be one.
+        // Compare each file's brace-balanced chat_publish body, so trailing items (an inline
+        // #[cfg(test)] module, the smoke test's own fn) are not swept in.
         let extract_publish_body = |src: &str| {
             let name_start = src.find("chat_publish(").expect("chat_publish present");
             let brace_start = src[name_start..].find('{').unwrap() + name_start;
@@ -1033,12 +1013,8 @@ async fn main() {
 
     #[test]
     fn sse_transport_ensures_htmx_and_maud_autumn_web_features() {
-        // Regression test: SSE-mode generated code uses Markup/html!/
-        // HTMX_JS_PATH/HTMX_SSE_JS_PATH, which are gated behind the
-        // "maud"/"htmx" autumn-web features. Those are on by default, but a
-        // project with `default-features = false` needs them ensured
-        // explicitly — the same fix `generate scaffold --live` already
-        // applies.
+        // SSE code uses Markup/html!/HTMX_JS_PATH/HTMX_SSE_JS_PATH, gated behind "maud"/"htmx".
+        // They are default features, but a `default-features = false` project needs them.
         let tmp = project_with_main(default_main());
         plan_channel(tmp.path(), "Chat", Transport::Sse)
             .unwrap()

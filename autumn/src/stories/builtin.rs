@@ -20,7 +20,7 @@ use super::{Story, story};
 pub(super) fn all_stories() -> Vec<Story> {
     #[allow(unused_mut, reason = "each family extend has its own #[cfg]")]
     let mut stories = Vec::new();
-    // Widget families (#3408). Search comes first, as before the split.
+    // Widget families (#3408). Search stays first in the gallery.
     #[cfg(feature = "widgets-search")]
     stories.extend(search_stories());
     stories.extend(builtin_stories());
@@ -47,7 +47,7 @@ fn builtin_stories() -> Vec<Story> {
                     select_input_with, text_input_with, textarea_input_with,
                 };
 
-                // Field wrapper v2 (#3395): hint, required marker, typed
+                // The field wrapper (#3395): hint, required marker, typed
                 // attributes, and the error state.
                 let mut errors = std::collections::HashMap::new();
                 errors.insert("handle".to_string(), vec!["is taken".to_string()]);
@@ -597,9 +597,8 @@ fn builtin_stories() -> Vec<Story> {
                     .title("Delete this post?")
                     .message(maud::html! { p { "This permanently removes the post." } })
                     .confirm_label("Delete post");
-                // The rendered form is live, so this demo points it at a
-                // synthetic target (nothing is mounted there — submitting on
-                // a served gallery is a 404 no-op) with a fake CSRF token.
+                // A demo target (nothing is mounted there, so submitting is a
+                // 404) and a fake CSRF token.
                 confirm_action(
                     "delete-post",
                     "Delete…",
@@ -1155,18 +1154,12 @@ fn search_stories() -> Vec<Story> {
                     active_search_input, active_search_results,
                 };
 
-                // A real, live-wired demo — unlike most story action URLs,
-                // which stay synthetic 404s on purpose (see e.g. the Confirm
-                // action or Bulk actions stories): a search box that visibly
-                // does nothing while typing reads as broken. The gallery
-                // itself serves this path (see `stories::demo_search`).
+                // Live: the gallery serves this path (`stories::demo_search`).
                 let config = ActiveSearchConfig::new("/_stories/demo/search", "#post-search-results")
                     .placeholder("Search posts…");
                 maud::html! {
-                    // The claim below only holds when htmx is actually on
-                    // the page — story_page only loads it under the `htmx`
-                    // feature. A maud-only, no-htmx build still compiles this
-                    // story, and its hx-* attributes stay inert there.
+                    // The gallery loads htmx only under the `htmx` feature;
+                    // without it the hx-* attributes are inert.
                     @if cfg!(feature = "htmx") {
                         p { em { "Try it — this box is live, searching a small demo post list." } }
                     } @else {
@@ -1175,12 +1168,9 @@ fn search_stories() -> Vec<Story> {
                     (active_search("post-search", "Search posts", &config))
                     p { em { "For reference — not live — what your handler returns when nothing matches:" } }
                     (active_search_empty_state("No posts matched your search."))
-                    // Compose the pieces yourself when you need custom layout
-                    // between the input and the results container: this needs
-                    // its own config, targeting its own results container —
-                    // reusing `config` above would target
-                    // "#post-search-results" (the first demo's), leaving this
-                    // one empty on a successful response.
+                    // Compose the pieces yourself for custom layout between the
+                    // input and the results. Give it its own config: `config`
+                    // above targets the first demo's results container.
                     div {
                         (active_search_input(
                             "post-search-split",
@@ -1202,13 +1192,11 @@ fn search_stories() -> Vec<Story> {
                     autocomplete_option,
                 };
 
-                // Real, live-wired demo — see the Active search story above
-                // for why (and `stories::demo_tag_search` for the handler).
+                // Live: the gallery serves this path (`stories::demo_tag_search`).
                 let config = AutocompleteConfig::new("/_stories/demo/tags/search", "tag_id")
                     .placeholder("Start typing a tag…");
                 maud::html! {
-                    // See the Active search story above for why this is
-                    // conditional.
+                    // The gallery loads htmx only under the `htmx` feature.
                     @if cfg!(feature = "htmx") {
                         p { em { "Try it — this box is live, matching against a small demo tag list." } }
                     } @else {
@@ -1333,12 +1321,9 @@ fn social_stories() -> Vec<Story> {
                 let next = maud::html! {
                     article class="post" { h3 { "Third post" } }
                 };
-                // Reveal mode's sentinel fires on scroll-into-view with no
-                // click needed (`hx-trigger="revealed, click"`), so this
-                // points at a real demo backend rather than the synthetic
-                // 404 URLs most other stories use — otherwise the sentinel
-                // below would 404-swap the instant this page loads, not on
-                // any visitor action. See `stories::demo_infinite_feed`.
+                // Reveal mode's sentinel fires on scroll-into-view
+                // (`hx-trigger="revealed, click"`), so it needs a live route
+                // (`stories::demo_infinite_feed`) or it 404-swaps on page load.
                 let config = FeedConfig::new("/_stories/demo/posts/feed").mode(FeedMode::Reveal);
                 maud::html! {
                     // Initial view: the feed container + an auto-loading sentinel.
@@ -1390,9 +1375,8 @@ fn social_stories() -> Vec<Story> {
                     .csrf_token("story-token")
                     .return_to("/posts/42");
 
-                // Anything linking to one comment — a notification, an email —
-                // needs the id the widget actually renders, so the convention
-                // has one definition rather than a copy per caller.
+                // Link to one comment (from a notification or an email) with
+                // the id the widget renders.
                 let deep_link = comment_dom_id("comments-post-42", 8);
 
                 maud::html! {
@@ -1551,11 +1535,9 @@ fn workflow_stories() -> Vec<Story> {
                     Column::new("Title", |row: &Post| maud::html! { (row.title) }),
                 ];
 
-                // A second bulk action, driving a hand-rolled list instead of a
-                // `data_table`. `bulk_actions_form` already appends a toolbar, so
-                // `bulk_actions_toolbar` is called directly only here, where the
-                // surrounding <form> is hand-built -- a bare toolbar outside any
-                // form would render a submit button that does nothing.
+                // A second bulk action on a hand-built list. `bulk_actions_form`
+                // appends its own toolbar; call `bulk_actions_toolbar` directly
+                // only inside a hand-built <form>, or its submit button does nothing.
                 let archive = BulkActionsConfig::new("/posts/bulk_archive")
                     .submit_label("Archive selected");
 

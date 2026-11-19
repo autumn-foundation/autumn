@@ -92,7 +92,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -102,13 +102,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{AutumnError, AutumnResult};
 use crate::pagination::{ListQuery, Page, PageRequest, SortDir};
 use crate::state::AppState;
+use crate::time::Timestamp;
 
 /// The `notifications` table name shared by [`DbNotificationStore`] and the
 /// `autumn generate notifications` scaffolding.
@@ -128,9 +128,11 @@ pub struct Notification {
     /// Application-defined JSON payload.
     pub payload: Value,
     /// When the notification was marked read; `None` while unread.
-    pub read_at: Option<DateTime<Utc>>,
+    #[serde(with = "crate::time::compat::serde_autosi_option")]
+    pub read_at: Option<Timestamp>,
     /// Creation time.
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub created_at: Timestamp,
 }
 
 impl Notification {
@@ -667,9 +669,8 @@ impl ListFilter {
                 _ => {}
             }
         }
-        // Without an explicit sort the feed reads newest-first; an explicit
-        // sort key uses the requested direction (`ListQuery` defaults to
-        // ascending).
+        // An allowlisted sort key uses the requested direction (`ListQuery`
+        // defaults to ascending).
         let (sort, dir) = match query.sort() {
             Some("created_at") => (FeedSort::CreatedAt, query.direction()),
             Some("id") => (FeedSort::Id, query.direction()),
@@ -696,16 +697,14 @@ mod db_store {
         FeedSort, ListFilter, Notification, NotificationStore, NotificationStoreError, Value,
     };
     use crate::db::RuntimeConnection;
+    use crate::db::SqlTimestamp;
     use crate::pagination::{ListQuery, Page, PageRequest, SortDir};
-    use chrono::{DateTime, Utc};
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::deadpool::Pool;
 
-    // The `notifications` table as scaffolded by `autumn generate
-    // notifications`. Timestamps are TIMESTAMPTZ on Postgres and RFC 3339
-    // TEXT on SQLite (diesel's `TimestamptzSqlite`), matching the DDL the
-    // generator emits per backend.
+    // Matches the DDL `autumn generate notifications` emits: timestamps are
+    // TIMESTAMPTZ on Postgres and RFC 3339 TEXT on SQLite (`TimestamptzSqlite`).
     #[cfg(not(feature = "sqlite"))]
     mod schema {
         diesel::table! {
@@ -744,15 +743,14 @@ mod db_store {
         recipient_id: i64,
         kind: String,
         payload: String,
-        read_at: Option<DateTime<Utc>>,
-        created_at: DateTime<Utc>,
+        read_at: Option<SqlTimestamp>,
+        created_at: SqlTimestamp,
     }
 
     impl From<NotificationRow> for Notification {
         fn from(row: NotificationRow) -> Self {
-            // A payload that no longer parses as JSON (e.g. edited out of
-            // band) degrades to a JSON string of the raw text rather than
-            // failing the whole feed.
+            // A payload that no longer parses as JSON (e.g. edited out of band)
+            // degrades to a JSON string rather than failing the whole feed.
             let payload = match serde_json::from_str(&row.payload) {
                 Ok(parsed) => parsed,
                 Err(_) => Value::String(row.payload),
@@ -762,8 +760,8 @@ mod db_store {
                 recipient_id: row.recipient_id,
                 kind: row.kind,
                 payload,
-                read_at: row.read_at,
-                created_at: row.created_at,
+                read_at: row.read_at.map(Into::into),
+                created_at: row.created_at.into(),
             }
         }
     }
@@ -775,7 +773,7 @@ mod db_store {
         recipient_id: i64,
         kind: String,
         payload: String,
-        created_at: DateTime<Utc>,
+        created_at: SqlTimestamp,
     }
 
     /// [`NotificationStore`] backed by the app's database pool.
@@ -810,10 +808,8 @@ mod db_store {
 
     fn store_err(e: &diesel::result::Error) -> NotificationStoreError {
         let message = e.to_string();
-        // A missing table means the app has a database but never scaffolded
-        // the notifications feed — turn the bare SQL error into an
-        // actionable one ("relation … does not exist" on Postgres, "no such
-        // table" on SQLite).
+        // Turn schema errors into actionable ones. A missing table reads
+        // "relation … does not exist" on Postgres and "no such table" on SQLite.
         if message.contains("tenant_id") && message.contains("column") {
             return NotificationStoreError::new(format!(
                 "query failed: {e}. The `notifications` table has no `tenant_id` column — \
@@ -845,7 +841,7 @@ mod db_store {
                     recipient_id,
                     kind,
                     payload,
-                    created_at: crate::time::ambient_now(),
+                    created_at: crate::time::ambient_now().into(),
                 })
                 .returning(NotificationRow::as_returning())
                 .get_result(&mut conn)
@@ -936,7 +932,7 @@ mod db_store {
         ) -> Result<u64, NotificationStoreError> {
             use notifications::dsl;
             let mut conn = self.conn().await?;
-            let now = crate::time::ambient_now();
+            let now = SqlTimestamp::from(crate::time::ambient_now());
             // `read_at IS NULL` in the predicate makes the update idempotent:
             // an already-read row matches zero rows and keeps its original
             // timestamp.
@@ -978,7 +974,7 @@ mod db_store {
                     .filter(dsl::recipient_id.eq(recipient_id))
                     .filter(dsl::read_at.is_null()),
             )
-            .set(dsl::read_at.eq(Some(crate::time::ambient_now())))
+            .set(dsl::read_at.eq(Some(SqlTimestamp::from(crate::time::ambient_now()))))
             .execute(&mut conn)
             .await
             .map_err(|e| store_err(&e))?;

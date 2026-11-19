@@ -248,9 +248,6 @@ pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
     if redacted.is_empty() || text.is_empty() {
         return text.to_owned();
     }
-    // Longest first, so a longer secret wins over one that is a substring of
-    // it: masking `hunter2` before `hunter2secret` would leave the longer
-    // secret's tail behind.
     let mut needles: Vec<(&str, bool)> = Vec::new();
     for value in redacted.longest_first() {
         // Only values that were UTF-8 to begin with can appear in a message;
@@ -261,33 +258,24 @@ pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
         if needle.is_empty() {
             continue;
         }
-        // A short value — a three-digit CVV, a PIN — and any structural field
-        // are masked only where they stand as a whole token. Replacing them
-        // everywhere would shred timestamps, identifiers, byte counts and
-        // ordinary words that merely contain those characters, in failures
-        // that have nothing to do with the secret; leaving them alone entirely
-        // wrote the secret to disk whenever the failure quoted it back, as
-        // `CVV 123 rejected` does.
+        // A short value (a CVV, a PIN) or a structural field is masked only as a whole token.
+        // Masking it everywhere would shred timestamps, identifiers and ordinary words; skipping
+        // it would write the secret to disk when a failure quotes it (`CVV 123 rejected`).
         let whole_token_only = needle.len() < MIN_ECHO_LEN || redacted.is_whole_token_only(value);
         needles.push((needle, whole_token_only));
     }
 
-    // One left-to-right pass over the *original* text, emitting placeholders
-    // as it goes. Replacing each needle in turn across the accumulating output
-    // instead would let a later secret match a placeholder an earlier one had
-    // just written — with `FILTER` in the set, `[FILTERED]` became
-    // `[[FILTERED]ED]`, which replay's own scrubbing never reproduces, turning
-    // a matching failure into a `mismatch`. Text this pass has emitted is
-    // never looked at again.
+    // One left-to-right pass over the original text; emitted text is never scanned again.
+    // Replacing each needle in turn over the output would let a later needle match an earlier
+    // placeholder (`FILTER` turns `[FILTERED]` into `[[FILTERED]ED]`), which replay's own
+    // scrubbing never reproduces.
     let mut masked = String::with_capacity(text.len());
     let mut cursor = 0_usize;
     while let Some(rest) = text.get(cursor..).filter(|rest| !rest.is_empty()) {
-        // A placeholder an earlier pass wrote is not a secret to hide: with
-        // `FILTER` in the set it would be rewritten to `[[FILTERED]ED]`, which
-        // no longer matches the live text on replay.
+        // An existing placeholder is copied through, not masked again...
         let at_placeholder = rest.starts_with(FILTERED_PLACEHOLDER);
-        // ...unless a retained value itself begins with it (a decoded
-        // `[FILTERED]hunter2`), which has to be masked whole.
+        // ...unless a retained value itself begins with it (a decoded `[FILTERED]hunter2`),
+        // which is masked whole.
         let matched = needles.iter().find(|(needle, whole_token_only)| {
             rest.starts_with(*needle)
                 && (!at_placeholder
@@ -325,11 +313,9 @@ fn stands_alone(text: &str, cursor: usize, needle: &str, rest: &str) -> bool {
     let head = text.get(..cursor).unwrap_or_default();
     let tail = rest.get(needle.len()..).unwrap_or_default();
 
-    // A dot only joins an identifier when it has one on *both* sides:
-    // `api.v1.error` is one dotted name, but the dot in `CVV 123.` ends a
-    // sentence. Treating every dot as interior would leave a secret before a
-    // full stop unmasked, which trades a false mismatch for a real leak — so
-    // the neighbour *past* the dot decides.
+    // A dot joins an identifier only with an alphanumeric past it: `api.v1.error` is one name,
+    // but the dot in `CVV 123.` ends a sentence. Treating every dot as interior would leave a
+    // secret before a full stop unmasked.
     let mut before = head.chars().rev();
     let joined_before = match before.next() {
         Some('.') => before.next().is_some_and(char::is_alphanumeric),
@@ -515,18 +501,14 @@ pub fn redact_effects(
     values: &mut RedactedValues,
     keys: &mut BTreeSet<String>,
 ) {
-    // The job-entry payload first: it is the *input* the recorded run ran on,
-    // so anything masked out of it must be maskable out of every effect that
-    // quoted it back.
+    // The job-entry payload first: it is the run's input, so whatever is masked out of it must
+    // be in `values` before any effect that quotes it is scrubbed.
     let mut job = job;
     if let Some(job) = job.as_mut() {
         job.payload = scrub_value(&job.payload, filter, "job_entry", values, keys);
     }
     for (index, exchange) in effects.http.iter_mut().enumerate() {
-        // The query string of an *outbound* URL carries secrets as readily as
-        // an inbound one's does — an API key passed as `?key=…` is the classic
-        // case — so it is masked by the same rules, before anything else reads
-        // the URL.
+        // An outbound query string carries secrets (`?key=…`) as readily as an inbound one.
         exchange.url = redact_url_query(
             &exchange.url,
             filter,
@@ -534,10 +516,8 @@ pub fn redact_effects(
             keys,
             &format!("http[{index}].url"),
         );
-        // The URL a redirect *landed on* carries credentials at least as often
-        // as the one the call started with — an OAuth callback with
-        // `?access_token=` is the whole point of the pattern — so it is masked
-        // by the same rules rather than trusted for having been server-chosen.
+        // The URL a redirect landed on carries credentials too (an OAuth callback's
+        // `?access_token=`), even though the server chose it.
         if let Some(final_url) = exchange.final_url.as_ref() {
             exchange.final_url = Some(redact_url_query(
                 final_url,
@@ -636,12 +616,11 @@ pub fn redact_effects(
         );
     }
 
-    // Echo pass — everything free-form, with the fully-seeded set.
+    // Echo pass: everything free-form, with the fully seeded set.
     //
-    // A field replay hands to the code (a response body or header, a cache
-    // hit, the job entry payload) records a key when this pass changes it, as
-    // the filter pass does. Replay refuses a capsule with masked input
-    // (#2351 item 8).
+    // A field replay hands to the code (a response body or header, a cache hit, the job entry
+    // payload) records a key when this pass changes it, because replay refuses a capsule with
+    // masked input (#2351).
     for (index, exchange) in effects.http.iter_mut().enumerate() {
         let (masked_url, host_masked) = mask_url_echoes(&exchange.url, values);
         if host_masked {
@@ -683,10 +662,7 @@ pub fn redact_effects(
         match entry {
             crate::capsule::schema::CacheEffect::Get { key, .. }
             | crate::capsule::schema::CacheEffect::Insert { key, .. } => {
-                // A cache key is routinely built out of the very arguments a
-                // request supplied (`make_cache_key` hashes them into it, and
-                // hand-built keys interpolate them), so it is free-form text
-                // that can quote a secret back.
+                // A cache key is often built from request arguments, so it can quote a secret.
                 *key = mask_echoes(key, values);
             }
             crate::capsule::schema::CacheEffect::Invalidate { key, error }
@@ -710,18 +686,13 @@ pub fn redact_effects(
         mail.subject = mask_echoes(&mail.subject, values);
         mask_body_echoes(&mut mail.body, values);
         mask_body_echoes(&mut mail.alternate_body, values);
-        // Recipients are the PII on this seam: an operator who filters
-        // `email` must not find the address sitting in the clear one field
-        // over, which is exactly the "filter defeated through a side door"
-        // the client-identity handling refuses to allow.
+        // Recipients are this seam's PII: filtering `email` must not leave the address in the
+        // clear one field over.
         for recipient in &mut mail.to {
             *recipient = mask_echoes(recipient, values);
         }
-        // Every free-form field a caller can put a request value into, not just
-        // the obvious two: an address submitted in a form and reused as
-        // `Reply-To`, an unsubscribe link carrying a token, a filename built
-        // from user input. A value masked one field over must not sit in the
-        // clear here.
+        // Every other free-form field a request value can reach: a form address reused as
+        // `Reply-To`, an unsubscribe link carrying a token, a filename built from user input.
         if let Some(reply_to) = mail.reply_to.as_mut() {
             *reply_to = mask_echoes(reply_to, values);
         }
@@ -745,15 +716,12 @@ pub fn redact_effects(
             *error = masked;
         }
     }
-    // Job payloads and cache values are structured, so the filter pass masked
-    // them *by key*; this catches the other half — a value the request already
-    // had masked that reappears under a key the filter does not name.
+    // The filter pass masked job payloads and cache values by key. This catches a masked value
+    // that reappears under a key the filter does not name.
     for (index, effect) in effects.jobs.iter_mut().enumerate() {
         effect.payload = mask_json_echoes(&effect.payload, values);
-        // A rejection's text is free-form and written by whatever refused the
-        // enqueue — a `JobInterceptor` can quote the payload field or the
-        // credential it rejected — so it can carry a value masked everywhere
-        // else in the capsule.
+        // A rejection's text is free-form: a `JobInterceptor` can quote the field or credential
+        // it rejected.
         if let Some(error) = effect.error.as_mut() {
             let masked = mask_echoes(error, values);
             if masked != *error {
@@ -792,11 +760,9 @@ pub fn redact_effects(
         && let Some(id) = tenant.id.as_mut()
     {
         let masked = mask_echoes(id, values);
-        // The tenant is *input*: replay serves it to tenant-scoped code and to
-        // every database bind that scopes by it. A placeholder there would run
-        // the whole request under a tenant production never resolved, so the
-        // masking is recorded as a key and the capsule refused rather than
-        // replayed. (`mask_echoes` leaves an unmasked id untouched.)
+        // The tenant is input: replay serves it to tenant-scoped code and database binds. A
+        // placeholder would run the request under a tenant production never resolved, so the
+        // masking records a key and replay refuses the capsule.
         if masked != *id {
             keys.insert("tenant.id".to_owned());
         }
@@ -975,10 +941,8 @@ fn redact_url_query(
     keys: &mut BTreeSet<String>,
     location: &str,
 ) -> String {
-    // Userinfo (`https://user:secret@host/..`) is the same downstream
-    // credential an `Authorization: Basic` header carries — the HTTP client
-    // turns it into one — so it is masked like that header, not left in the
-    // clear because it lives in the authority instead of a header or query.
+    // Userinfo (`https://user:secret@host/..`) is the credential the HTTP client turns into an
+    // `Authorization: Basic` header, so it is masked like that header.
     let url = mask_url_userinfo(url, values, keys, location);
     let url = url.as_str();
     let Some(split) = url.find('?') else {
@@ -1105,17 +1069,13 @@ fn redact_effect_body(
     location: &str,
 ) -> CapsuleBody {
     let CapsuleBody::Text(text) = body else {
-        // `Base64` is opaque bytes and `Absent`/`Skipped` hold nothing; there
-        // are no keys to match, so there is nothing this pass can do. The echo
-        // pass still sweeps `Text` bodies, and a binary body cannot quote a
-        // masked string back in a form a reader would recognise.
+        // `Base64` is opaque bytes and `Absent`/`Skipped` hold nothing: no keys to match.
         return body.clone();
     };
     if content_type.contains("json") {
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) else {
-            // Same posture as an unparseable inbound JSON body: keys the
-            // filter could have matched may be in there, so retain the raw
-            // text for the echo set and do not copy it.
+            // As for an unparseable inbound JSON body: it may hold keys the filter would match,
+            // so retain the raw text for the echo set and do not copy it.
             values.insert(text.as_bytes());
             keys.insert(format!("{location}:<unparseable json>"));
             return CapsuleBody::Text(FILTERED_PLACEHOLDER.to_owned());
@@ -1228,10 +1188,9 @@ fn redact_headers(
     values: &mut RedactedValues,
     keys: &mut BTreeSet<String>,
 ) -> RedactedHeaders {
-    // A name with *any* obs-text value moves wholesale into the binary list:
-    // splitting one name's values across the two lists would lose their
-    // relative order (replay appends text headers before binary ones), and
-    // `headers.get_all(name)` order is metadata code legitimately reads.
+    // A name with any obs-text value moves wholly into the binary list. Replay appends text
+    // headers before binary ones, so splitting one name's values would reorder
+    // `headers.get_all(name)`, which code may read.
     let mut binary_names: BTreeSet<String> = BTreeSet::new();
     for (name, value) in headers {
         if !header_is_sensitive(name.as_str(), filter) && value.to_str().is_err() {
@@ -1295,27 +1254,18 @@ fn redact_headers(
 /// `Cookie:` line records at most [`MAX_COOKIE_PAIRS`] values.
 pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
     let trimmed = trim_ows(value);
-    // Only headers whose *syntax* this understands. A custom sensitive header
-    // named by `filter_parameters` carries whatever its application likes, and
-    // reading `password: not valid` as a scheme and a credential would put
-    // `valid` in the echo set — masking unrelated prose, and blanking any SQL
-    // bind that happens to equal it, which also drops that bind from replay's
-    // comparison. Guessing structure is worse here than recording nothing:
-    // the whole header value is already retained either way.
+    // Parse only headers whose syntax is known. A custom sensitive header can hold anything:
+    // reading `password: not valid` as scheme and credential would put `valid` in the echo set,
+    // masking unrelated prose and equal SQL binds. The whole value is retained either way.
     let name = name.to_ascii_lowercase();
     let is_authorization = matches!(name.as_str(), "authorization" | "proxy-authorization");
     let is_cookie = matches!(name.as_str(), "cookie" | "set-cookie");
 
-    // `Authorization: <scheme> <credential>` / `Proxy-Authorization: …`.
-    // Any syntactically valid scheme counts, not a list of the familiar ones:
-    // `Negotiate`, `AWS4-HMAC-SHA256` and every vendor scheme carry exactly
-    // the same risk, and a name this code has not heard of is precisely the
-    // case where the credential would go unmasked. A scheme is an RFC 7235
-    // token, so anything containing characters a token cannot hold — `=`, `;`,
-    // `,` — is not a scheme, which is what keeps a `Cookie:` line from being
-    // read as one. The rest of the value is kept whole, so a credential that
-    // itself contains spaces (`AWS4-HMAC-SHA256 Credential=…, Signature=…`)
-    // stays intact.
+    // `Authorization: <scheme> <credential>` / `Proxy-Authorization: …`. Any RFC 7235 token is a
+    // scheme, not only familiar ones: an unknown vendor scheme is exactly where a credential
+    // would go unmasked. A token cannot hold `=`, `;` or `,`, so a `Cookie:` line never parses
+    // as a scheme. The credential is kept whole, spaces included
+    // (`AWS4-HMAC-SHA256 Credential=…, Signature=…`).
     if is_authorization && let Some((scheme, credential)) = split_scheme(trimmed) {
         let credential = trim_ows(credential);
         if is_auth_scheme(scheme) && !credential.is_empty() {
@@ -1323,32 +1273,22 @@ pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mu
             if scheme.eq_ignore_ascii_case(b"basic") {
                 record_basic_credentials(credential, values);
             }
-            // A `token68` is one opaque blob, not a `name=value` list — its
-            // trailing `=` is Base64 padding. Reading `dTpwdw==` as a param
-            // would put a bare `=` in the echo set, and a lone `=` masked as a
-            // whole token rewrites `x = y` in any later failure text and
-            // blanks any bind equal to it.
+            // A `token68` is one opaque blob whose trailing `=` is Base64 padding. Reading
+            // `dTpwdw==` as a param would put a bare `=` in the echo set, which rewrites `x = y`
+            // in failure text and blanks any bind equal to it.
             if !is_token68(credential) {
                 record_auth_params(credential, values);
             }
         }
     }
 
-    // `Cookie: a=1; b=2` carries one pair per cookie, all of them candidate
-    // secrets. `Set-Cookie: session=abc; Path=/; Max-Age=0` carries *one*
-    // cookie followed by attributes — and those attribute values are not
-    // secrets. Retaining them was actively harmful: whole-token masking
-    // matches a standalone `/` or `0`, so `failed at /` and `status 0` would
-    // be rewritten in the outcome, and a SQL bind equal to either would be
-    // blanked and dropped from replay's comparison.
+    // `Cookie: a=1; b=2` carries one candidate secret per pair. `Set-Cookie: session=abc;
+    // Path=/; Max-Age=0` carries one cookie and then attributes, which are not secrets:
+    // whole-token masking of `/` or `0` would rewrite `failed at /` and blank equal binds.
     //
-    // Cookie values are whole-token-only for the same reason auth-param
-    // values are: a cookie jar mixes a session token with `theme=dark`, and
-    // only the *name* separates them — which is the ranking this code declines
-    // to make. Substring-masking `dark` would turn a later `darkness check
-    // failed` into `[FILTERED]ness check failed`, and replay, which scrubs
-    // with the same set but produces the static message, would call that a
-    // mismatch.
+    // Cookie values are whole-token-only: a jar mixes a session token with `theme=dark`, and only
+    // the name tells them apart. Substring-masking `dark` would turn `darkness check failed` into
+    // `[FILTERED]ness check failed`, which replay reports as a mismatch.
     if is_cookie && trimmed.contains(&b'=') {
         // `Set-Cookie` holds one cookie, first: later segments are attributes.
         let segments = if name == "set-cookie" { 1 } else { usize::MAX };
@@ -1663,11 +1603,8 @@ fn strip_leading_whitespace(mut bytes: &[u8]) -> &[u8] {
 
 // ── Byte equivalents of the `str` methods the parse above needs ─────────────
 //
-// All three exist because `str` has them and slices do not. They are written
-// with `get`/`strip_*` rather than indexing or `split_at`: `split_at` panics
-// when the midpoint is out of range, which `clippy::indexing_slicing` does not
-// catch, and avoiding panics — not merely avoiding the lint — is what this
-// module's request-path gate is for.
+// Written with `get`/`strip_*`, not indexing or `split_at`: `split_at` panics when the midpoint is
+// out of range, which `clippy::indexing_slicing` does not catch.
 
 /// Split on the first occurrence of `delimiter`, as [`str::split_once`] does
 /// for text.
@@ -1753,11 +1690,8 @@ fn redact_uri(
     let Some(masked) = mask_raw_urlencoded(query, "query", filter, values, keys) else {
         return original;
     };
-    // Splice the masked query onto the original prefix rather than rebuilding
-    // from `uri.path()`: an absolute-form target
-    // (`https://api.example/items?...`) keeps its scheme and authority, so a
-    // proxy-style route that reads the full request target sees the same
-    // shape during replay.
+    // Splice onto the original prefix rather than rebuild from `uri.path()`, so an absolute-form
+    // target (`https://api.example/items?...`) keeps its scheme and authority on replay.
     let prefix = original.split_once('?').map_or("", |(prefix, _)| prefix);
     format!("{prefix}?{masked}")
 }
@@ -1794,8 +1728,7 @@ fn mask_raw_urlencoded(
             let Some((decoded_key, decoded_value)) =
                 url::form_urlencoded::parse(raw_pair.as_bytes()).next()
             else {
-                // An empty segment (`a=1&&b=2`): sloppy, but the client sent
-                // it, so it stays.
+                // An empty segment (`a=1&&b=2`) stays as the client sent it.
                 return raw_pair.to_owned();
             };
             if !key_is_sensitive(&decoded_key, filter) {
@@ -1897,31 +1830,22 @@ fn redact_body(
         .to_ascii_lowercase();
 
     if content_type.contains("json") {
-        // A body that claims to be JSON but is not one — malformed, or the
-        // prefix the tap copied before the handler abandoned the read — has no
-        // keys for the filter to match, so copying it verbatim would write
-        // `{"password":"secret",` straight into the capsule. Mask it instead,
-        // and seed the echo set from the raw text so an outcome that quotes
-        // the body (or a value inside it) is still scrubbed.
+        // Malformed JSON (or a prefix teed before the handler abandoned the read) has no keys
+        // to filter, so copying it would write `{"password":"secret",` into the capsule. Skip it
+        // and seed the echo set from the raw text instead.
         let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             return unparseable_body(bytes, UNPARSEABLE_JSON_NOTE, values, keys, notes);
         };
         let keys_before = keys.len();
         let scrubbed = scrub_value(&parsed, filter, "body", values, keys);
         if keys.len() > keys_before {
-            // The echo set holds the *decoded* masked values, but an error
-            // that quotes the raw request body carries the on-wire spelling —
-            // `"token"` does not contain `token`. Walk the raw text's
-            // string literals and retain every spelling whose decoded form
-            // was just masked, so `scrub_outcome` catches either.
+            // An error quoting the raw body carries the escaped on-wire spelling, not the
+            // decoded value in the echo set. Retain those spellings too.
             retain_raw_json_string_spellings(bytes, values);
         }
         if keys.len() == keys_before {
-            // Nothing was masked: keep the exact bytes the client sent.
-            // Re-serializing would drift whitespace, number spellings and key
-            // order, and a handler that verifies a signature over the raw
-            // body would reject the replay of a request it accepted in
-            // production. (serde_json just proved the bytes are UTF-8.)
+            // Nothing was masked: keep the exact bytes. Re-serializing would drift whitespace,
+            // numbers and key order, and break a signature over the raw body on replay.
             return std::str::from_utf8(bytes).map_or(CapsuleBody::Absent, |text| {
                 CapsuleBody::Text(text.to_owned())
             });
@@ -1930,30 +1854,21 @@ fn redact_body(
     }
 
     if content_type.contains("application/x-www-form-urlencoded") {
-        // Same conservatism, one step earlier: the urlencoded parser is lossy
-        // and accepts anything, so a JSON document sent under a form content
-        // type would come back as one giant key that matches no filter and is
-        // then copied verbatim. `form_text` says whether this really is a
-        // form before any of it is copied.
+        // The urlencoded parser accepts anything: a JSON document sent as a form would parse
+        // as one giant key that matches no filter and be copied verbatim. Validate first.
         let Some(text) = form_text(bytes) else {
             return unparseable_body(bytes, UNPARSEABLE_FORM_NOTE, values, keys, notes);
         };
-        // The masking splices only the matched pairs, so an untouched form —
-        // or the untouched neighbours of a masked field — keeps the exact
-        // bytes the client sent, and a signature computed over the raw body
-        // still verifies during replay.
+        // Only matched pairs are spliced, so the rest keeps its exact bytes and a signature over
+        // the raw body still verifies on replay.
         return CapsuleBody::Text(
             mask_raw_urlencoded(text, "body", filter, values, keys)
                 .unwrap_or_else(|| text.to_owned()),
         );
     }
 
-    // A multipart body *has* key structure — a file upload's form fields are
-    // exactly the kind of thing `filter_parameters` names — but this slice does
-    // not parse multipart, and copying it verbatim would write every part
-    // through unredacted, password field and uploaded file alike. Skip it: the
-    // capsule records the length and says why, rather than becoming the one
-    // place a submitted secret survives in the clear.
+    // Multipart has key structure, but it is not parsed here, so copying it would write every
+    // part unredacted. Skip it; the capsule records the length and says why.
     if content_type.starts_with("multipart/") || content_type.contains("multipart/form-data") {
         return unparseable_body(bytes, MULTIPART_BODY_NOTE, values, keys, notes);
     }
@@ -2082,12 +1997,8 @@ pub(crate) fn record_masked_value(value: &serde_json::Value, values: &mut Redact
     match value {
         serde_json::Value::String(text) => values.insert(text.as_bytes()),
         serde_json::Value::Null => {}
-        // A masked container's *leaves* are what a handler extracts, echoes,
-        // or binds — `{"value":"hunter2"}` in the set would never match the
-        // `hunter2` an error quotes or an INSERT binds. Keep the container's
-        // serialization (an error may echo the whole thing) and recurse so
-        // every scalar beneath the matched key is retained too. Depth is
-        // bounded by serde_json's own recursion limit at parse time.
+        // A handler extracts, echoes or binds a masked container's leaves, so retain the whole
+        // serialization and every scalar beneath it. serde_json's recursion limit bounds depth.
         serde_json::Value::Object(map) => {
             values.insert(value.to_string().as_bytes());
             for child in map.values() {
@@ -2122,7 +2033,6 @@ fn record_string_literal_values(text: &str, values: &mut RedactedValues) {
         let Some(after_quote) = rest.get(start.saturating_add(1)..) else {
             return;
         };
-        // Find the closing quote, skipping escaped characters.
         let mut end = None;
         let mut escape = false;
         for (index, c) in after_quote.char_indices() {
@@ -2184,7 +2094,6 @@ fn retain_raw_json_string_spellings(bytes: &[u8], values: &mut RedactedValues) {
         let Some(after_quote) = rest.get(start.saturating_add(1)..) else {
             return;
         };
-        // Find the closing quote, skipping escaped characters.
         let mut end = None;
         let mut escape = false;
         for (index, c) in after_quote.char_indices() {
@@ -2265,9 +2174,8 @@ mod tests {
 
         #[test]
         fn an_outbound_credential_header_is_masked_whatever_the_app_filter_says() {
-            // `x-api-key` is in no default inbound filter list, but on the
-            // outbound seam the credential is the *application's* and the
-            // operator never sees the header in a log to think to name it.
+            // `x-api-key` is in no default filter list, but outbound the credential is the
+            // application's, and the operator never sees the header in a log to name it.
             let mut effects = CapsuleEffects {
                 http: vec![exchange("https://api.example/charge")],
                 ..CapsuleEffects::default()
@@ -2643,9 +2551,8 @@ mod tests {
 
         #[test]
         fn a_value_masked_out_of_the_request_is_masked_wherever_an_effect_echoes_it() {
-            // The two-pass design: the filter pass seeds the echo set, the echo
-            // pass sweeps everything free-form — including seams whose own keys
-            // never matched the filter.
+            // The filter pass seeds the echo set; the echo pass sweeps everything free-form,
+            // including seams whose own keys never matched the filter.
             let mut values = RedactedValues::default();
             values.insert(b"hunter2secret");
             let mut effects = CapsuleEffects {
@@ -2899,8 +2806,8 @@ mod tests {
             format!("theme {FILTERED_PLACEHOLDER} rejected"),
             "it is still masked where it stands as a whole token"
         );
-        // `Set-Cookie` attributes are not secrets, and retaining them is worse
-        // than useless: whole-token masking matches a standalone `/` or `0`.
+        // `Set-Cookie` attributes are not secrets: whole-token masking would match a standalone
+        // `/` or `0`.
         let (_request, set_cookie) = redact(
             Request::get("/").header("set-cookie", "session=abc-secret; Path=/; Max-Age=0"),
             CapturedBody::Absent,
@@ -2978,8 +2885,7 @@ mod tests {
             !is_auth_scheme("session=abc;"),
             "a cookie line is not an auth scheme"
         );
-        // The point of all of it: the outcome is scrubbed of what the handler
-        // actually carried.
+        // The outcome is scrubbed of what the handler actually carried.
         let masked = mask_echoes("token hunter2secret was rejected", &values);
         assert!(!masked.contains("hunter2secret"), "{masked}");
     }
@@ -3175,8 +3081,7 @@ mod tests {
             "param names are not values and must stay out of the echo set"
         );
 
-        // The point of all of it: what the handler actually extracted is
-        // masked out of a bind and out of the outcome text.
+        // What the handler extracted is masked out of a bind and out of the outcome text.
         let mut binds = vec![
             BindValue::Value(b"deadbeef".to_vec()),
             BindValue::Value(b"\xffalice".to_vec()),
@@ -3204,8 +3109,8 @@ mod tests {
             "the extracted param value is scrubbed from the outcome"
         );
 
-        // The same gap closed for cookies: one obs-text cookie must not take
-        // the session token beside it down with it.
+        // Cookies too: one obs-text cookie must not stop the session token beside it from being
+        // retained.
         let mut cookie = b"pref=".to_vec();
         cookie.push(0xFF);
         cookie.extend_from_slice(b"dark; session=sess-abcdef");
@@ -3255,9 +3160,7 @@ mod tests {
             "the credential after a known scheme is retained even when it does not decode"
         );
 
-        // No space: there is no scheme/credential split to make, so the whole
-        // header value — already inserted by `redact_headers` — is all there
-        // is. Nothing is invented from the bytes.
+        // No space means no scheme/credential split: only the whole header value is retained.
         let mut no_space = b"hunter2".to_vec();
         no_space.push(0xFF);
         let values = authorization(&no_space);

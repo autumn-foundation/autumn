@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
@@ -198,8 +198,8 @@ struct Entry {
     /// The size of a stored result, in bytes of JSON.
     bytes: usize,
     state: TaskState,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    created_at: Timestamp,
+    updated_at: Timestamp,
     abort: Option<AbortHandle>,
 }
 
@@ -213,8 +213,8 @@ pub struct TaskStore {
 }
 
 /// Format a timestamp as ISO 8601 with milliseconds.
-fn iso(at: DateTime<Utc>) -> String {
-    at.to_rfc3339_opts(SecondsFormat::Millis, true)
+fn iso(at: Timestamp) -> String {
+    crate::time::compat::rfc3339_opts(at, crate::time::compat::Digits::Millis, true)
 }
 
 /// A duration in whole milliseconds for the wire, at most
@@ -254,12 +254,14 @@ impl TaskStore {
     }
 
     /// Remove the tasks whose TTL ended, and stop their work.
-    fn purge(&self, tasks: &mut HashMap<String, Entry>, now: DateTime<Utc>) {
-        let ttl = chrono::Duration::from_std(self.config.ttl).unwrap_or(chrono::Duration::MAX);
+    fn purge(&self, tasks: &mut HashMap<String, Entry>, now: Timestamp) {
+        let ttl = SignedDuration::try_from(self.config.ttl).unwrap_or(SignedDuration::MAX);
         tasks.retain(|_, entry| {
+            // A TTL past the end of the timestamp range never expires.
             let alive = entry
                 .created_at
-                .checked_add_signed(ttl)
+                .checked_add(ttl)
+                .ok()
                 .is_none_or(|expires| now < expires);
             if !alive && let Some(abort) = entry.abort.take() {
                 abort.abort();
@@ -296,7 +298,7 @@ impl TaskStore {
 
     /// Add a `working` task. Returns the `CreateTaskResult`. Returns `None`
     /// if the store is full or the `quota` key has its quota of tasks.
-    pub fn create(&self, id: &str, owner: Owner, quota: &str, now: DateTime<Utc>) -> Option<Value> {
+    pub fn create(&self, id: &str, owner: Owner, quota: &str, now: Timestamp) -> Option<Value> {
         let mut tasks = self.lock();
         self.purge(&mut tasks, now);
         if tasks.len() >= self.config.max_tasks {
@@ -347,7 +349,7 @@ impl TaskStore {
     /// Move a `working` task to a terminal state. A terminal task does not
     /// change. A result that does not fit in `max_stored_bytes` becomes a
     /// tool error.
-    pub fn finish(&self, id: &str, state: TaskState, now: DateTime<Utc>) {
+    pub fn finish(&self, id: &str, state: TaskState, now: Timestamp) {
         // Measure outside the lock: a result can be 10 MiB.
         let bytes = match &state {
             TaskState::Completed(result) => serde_json::to_vec(&**result).map_or(0, |v| v.len()),
@@ -380,7 +382,7 @@ impl TaskStore {
 
     /// The `tasks/get` result, or `None` when no task with this ID belongs to
     /// `owner`.
-    pub fn get(&self, id: &str, owner: &Owner, now: DateTime<Utc>) -> Option<Value> {
+    pub fn get(&self, id: &str, owner: &Owner, now: Timestamp) -> Option<Value> {
         let mut tasks = self.lock();
         self.purge(&mut tasks, now);
         let view = tasks
@@ -393,7 +395,7 @@ impl TaskStore {
 
     /// Cancel a `working` task and stop its work. Returns `false` when no
     /// task with this ID belongs to `owner`.
-    pub fn cancel(&self, id: &str, owner: &Owner, now: DateTime<Utc>) -> bool {
+    pub fn cancel(&self, id: &str, owner: &Owner, now: Timestamp) -> bool {
         let mut tasks = self.lock();
         self.purge(&mut tasks, now);
         let Some(entry) = tasks.get_mut(id).filter(|entry| entry.owner.matches(owner)) else {
@@ -412,13 +414,13 @@ impl TaskStore {
 
     /// Delete the tasks whose TTL ended, and stop their work. A timer calls
     /// this at the end of each TTL, so an idle server also frees memory.
-    pub fn sweep(&self, now: DateTime<Utc>) {
+    pub fn sweep(&self, now: Timestamp) {
         let mut tasks = self.lock();
         self.purge(&mut tasks, now);
     }
 
     /// Whether a task with this ID belongs to `owner`.
-    pub fn contains(&self, id: &str, owner: &Owner, now: DateTime<Utc>) -> bool {
+    pub fn contains(&self, id: &str, owner: &Owner, now: Timestamp) -> bool {
         let mut tasks = self.lock();
         self.purge(&mut tasks, now);
         tasks
@@ -452,10 +454,8 @@ fn with_result(mut out: Value, result: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone as _;
-
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(1_700_000_000 + secs).unwrap()
     }
 
     fn owner(name: &str) -> Owner {

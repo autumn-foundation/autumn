@@ -239,11 +239,9 @@ impl Download {
             .head(&key)
             .await?
             .ok_or_else(|| crate::storage::BlobStoreError::NotFound(key.clone()))?;
-        // Only metadata is read here; the byte stream is opened lazily when the
-        // response is built. The retained store handle + key + size let the
-        // non-ranged path open the whole-object stream and a ranged request
-        // fetch only the requested slice — the full object is never buffered
-        // for a seek.
+        // Only metadata is read here. The stream opens when the response is
+        // built, so a ranged request fetches only its slice and the object is
+        // never buffered.
         Ok(Self {
             body: DownloadBody::Blob {
                 store: std::sync::Arc::clone(store),
@@ -341,8 +339,7 @@ impl Download {
             HeaderValue::from_str(&content_type)
                 .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
         );
-        // `disposition` is ASCII and CR/LF-free by construction, so this
-        // never falls back in practice.
+        // `disposition` is ASCII and CR/LF-free, so this never falls back.
         headers.insert(
             CONTENT_DISPOSITION,
             HeaderValue::from_str(&disposition)
@@ -392,13 +389,11 @@ impl Download {
     ///
     /// This is the documented path to a seekable media response; see the
     /// [`range`] module docs for a `#[secured]` video example.
-    // The method is `async` for the blob path (which awaits a ranged store
-    // read); without the `storage` feature that arm is compiled out, leaving no
-    // `.await`, but the signature stays stable across feature sets.
+    // `async` for the blob arm. Without `storage` nothing awaits, but the
+    // signature stays the same across feature sets.
     #[cfg_attr(not(feature = "storage"), allow(clippy::unused_async))]
     pub async fn into_response_ranged(self, req_headers: &HeaderMap) -> Response {
-        // Opaque streams cannot be re-seeked: serve the full body exactly as
-        // the plain `IntoResponse` conversion would.
+        // An opaque stream cannot seek, so it gets the full body.
         if !self.body.is_range_capable() {
             return self.into_response();
         }
@@ -406,17 +401,13 @@ impl Download {
         let total = self.content_length.unwrap_or(0);
         let resolution = range::resolve(req_headers, total, self.range_validator());
 
-        // Precompute the metadata headers while `self` is still whole, then
-        // move the body out below.
         let mut meta = HeaderMap::new();
         self.apply_metadata_headers(&mut meta);
 
         match self.body {
             DownloadBody::Bytes(bytes) => {
                 let mut response = range::partial_bytes_response(&resolution, bytes);
-                // `partial_bytes_response` already set status, Accept-Ranges,
-                // Content-Range, and Content-Length; layer the download's own
-                // Content-Type / Content-Disposition / validators on top.
+                // `meta` holds no range headers, so the merge keeps the ones set above.
                 merge_headers(response.headers_mut(), &meta);
                 response
             }
@@ -424,7 +415,6 @@ impl Download {
             DownloadBody::Blob { store, key, size } => {
                 blob_ranged_response(&resolution, &store, &key, size, &meta).await
             }
-            // Not range-capable — handled by the early return above.
             DownloadBody::Stream(_) => unreachable!("opaque streams return early"),
         }
     }
@@ -451,8 +441,6 @@ async fn blob_ranged_response(
 
     match *resolution {
         range::RangeResolution::Full => {
-            // Open the whole-object stream only now (never up-front), so a
-            // non-ranged request streams without buffering the object.
             let stream = match store.get_stream(key).await {
                 Ok(stream) => stream,
                 Err(err) => return err.into_autumn_error().into_response(),
@@ -514,7 +502,6 @@ impl IntoResponse for Download {
     fn into_response(self) -> Response {
         let content_length = self.content_length;
 
-        // Compute metadata before moving the body out of `self`.
         let mut header_scratch = HeaderMap::new();
         self.apply_metadata_headers(&mut header_scratch);
 
@@ -535,10 +522,8 @@ impl IntoResponse for Download {
         if let Some(len) = content_length {
             headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
         }
-        // This plain conversion cannot inspect the request's `Range` header and
-        // always returns the full body, so it deliberately does **not**
-        // advertise `Accept-Ranges` — that promise is honored only by
-        // `into_response_ranged`, which can actually answer with `206`/`416`.
+        // No `Accept-Ranges`: this conversion cannot see the `Range` header.
+        // Only `into_response_ranged` can answer `206`/`416`.
         response
     }
 }
@@ -591,9 +576,7 @@ fn build_content_disposition(disposition: Disposition, filename: Option<&str>) -
 
     let clean = strip_header_controls(raw);
     let clean = clean.trim();
-    // Defense-in-depth: reduce a caller-supplied path to its basename so
-    // `.filename("../../etc/passwd")` emits `filename="passwd"` rather than
-    // leaking directory components into the header.
+    // Keep only the basename, so a path's directories do not reach the header.
     let clean = clean.rsplit(['/', '\\']).next().unwrap_or(clean).trim();
     if clean.is_empty() {
         return kind.to_owned();
@@ -670,8 +653,8 @@ mod tests {
     #[test]
     fn non_ascii_filename_gets_extended_param() {
         let disp = build_content_disposition(Disposition::Attachment, Some("naïve.txt"));
-        // Exact encoding: ASCII fallback with non-ASCII replaced by `_`, plus
-        // the RFC 5987 extended value (ï → %C3%AF).
+        // ASCII fallback with `_` for non-ASCII, plus the RFC 5987 extended
+        // value.
         assert_eq!(
             disp,
             "attachment; filename=\"na_ve.txt\"; filename*=UTF-8''na%C3%AFve.txt"

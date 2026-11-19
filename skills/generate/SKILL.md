@@ -75,8 +75,9 @@ accept aliases like `Integer` or `Boolean`.
 | `f32` | `REAL NOT NULL` | `f32` |
 | `f64` | `DOUBLE PRECISION NOT NULL` | `f64` |
 | `bool` | `BOOLEAN NOT NULL` | `bool` |
-| `NaiveDateTime` | `TIMESTAMP NOT NULL` | `NaiveDateTime` |
-| `DateTime` | `TIMESTAMPTZ NOT NULL` | `DateTime<Utc>` |
+| `CivilDateTime` (alias `NaiveDateTime`) | `TIMESTAMP NOT NULL` | `autumn_web::time::civil::DateTime` |
+| `Timestamp` (alias `DateTime`) | `TIMESTAMPTZ NOT NULL` | `autumn_web::time::Timestamp` |
+| `Date` (aliases `date`, `NaiveDate`) | `DATE NOT NULL` (`TEXT` on SQLite) | `autumn_web::time::civil::Date`; the form renders `<input type="date">` |
 | `Uuid` | `UUID NOT NULL` | `Uuid` |
 | `Bytea` | `BYTEA NOT NULL` | `Vec<u8>` |
 | `Attachment` | `JSONB NULL` (blob metadata) | `Option<Blob>` (always nullable) — **requires the `storage` feature**. **(trunk-dev)** the scaffold auto-enables autumn-web's `storage` + `multipart` (and uuid `v4`) in the project's Cargo.toml when an Attachment field is present, so it compiles with no manual edits; on published 0.5.0 add the `storage` feature by hand. **(trunk-dev)** the scaffold's create/update handlers take a `Multipart` extractor and stream to the blob store via `save_to_blob_store`, and the show/edit views render the stored file as a signed download link (issue #1236) |
@@ -84,7 +85,7 @@ accept aliases like `Integer` or `Boolean`.
 | `references` **(trunk-dev)** | `post:references` → `post_id BIGINT NOT NULL REFERENCES posts(id)` + auto index | `i64` (field name gets `_id` appended; `post:references?` for `Option<i64>`) |
 | `enum{a,b,c}` **(trunk-dev)** | `TEXT` + `CHECK (col IN (...))` | Generated PascalCase Rust enum with Diesel/serde impls + `<select>` widget; `--default field=variant` sets SQL DEFAULT + `#[default]`. Quote the token in bash/zsh (brace expansion) |
 | `decimal` / `decimal{10,2}` **(trunk-dev)** | `NUMERIC(12,2)` default, or explicit precision/scale | `rust_decimal::Decimal` (dependency added automatically); use for money, never `f64` |
-| `time` (alias `NaiveTime`) **(trunk-dev, #3405)** | `TIME NOT NULL` (`TEXT` on SQLite) | `chrono::NaiveTime`; the form renders `<input type="time">` |
+| `time` (aliases `Time`, `NaiveTime`) **(trunk-dev, #3405)** | `TIME NOT NULL` (`TEXT` on SQLite) | `autumn_web::time::civil::Time`; the form renders `<input type="time">` |
 | `phone` (alias `tel`) / `color` **(trunk-dev, #3405)** | `TEXT NOT NULL` | `String`; the form renders `<input type="tel">` / `<input type="color">`. No `{…}` modifier (use `String{…}`); `Option<color>` is refused because a color input always posts a value |
 | `money` **(trunk-dev, #3405)** | `NUMERIC(12,2)` | Alias of bare `decimal`; `money{…}` is refused (use `decimal{p,s}`) |
 | `:unique` modifier **(trunk-dev)** | `email:String:unique` → `CREATE UNIQUE INDEX` in the migration | Also generates a free `find_by_<field>` lookup and 23505 → 422 inline "already exists" form error. `--unique FIELD` is the flag equivalent |
@@ -643,5 +644,5 @@ The wizard subcommand has stricter naming rules than other generators:
 
 If `autumn generate` exits nonzero, show the stderr output and diagnose:
 - File conflict: offer to show the conflicting file
-- Missing autumn-cli: instruct `cargo install autumn-cli --version 0.5.0`
+- Missing autumn-cli: instruct `cargo install autumn-cli --version 0.11.0`
 - Schema error: check `src/schema.rs` is up to date (`autumn migrate`)

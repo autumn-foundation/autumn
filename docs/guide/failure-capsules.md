@@ -152,6 +152,11 @@ max_capsule_bytes = 1048576       # default: 1048576 (1 MiB)
 max_capsules = 50                 # default: 50
 ```
 
+Capture needs the `reporting` Cargo feature, which is in `default`. In a
+build without it, `enabled = true` fails boot. The no-DB daemon starter
+(`autumn new --daemon`) names `error-reporting` only: add `"reporting"` to
+its `autumn-web` features before you turn capture on.
+
 - **`enabled`** arms the whole feature: the capture layer, the recording
   database pool, and the recording clock. Off, none of it is installed and there
   is nothing to pay for.
@@ -195,7 +200,7 @@ has one, which is how a capsule on disk is tied back to a log line.
   "format_version": 4,
   "id": "01JB2K7Q8N4W",
   "captured_at": "2026-08-12T10:14:13.882104Z",
-  "autumn_version": "0.10.0",
+  "autumn_version": "0.11.0",
   "app": { "name": "invoices", "profile": "production" },
   "request": {
     "method": "GET",

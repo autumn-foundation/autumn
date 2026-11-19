@@ -18,7 +18,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -211,20 +211,16 @@ impl CapabilityRateLimiter {
             .iter()
             .position(|known| *known == capability)
         else {
-            // A capability this build does not know cannot have been granted —
-            // `SandboxCapability::parse` refuses the name — so this is
-            // unreachable through the manifest. Refusing rather than allowing
-            // keeps it fail-closed if it ever becomes reachable.
+            // Unreachable through the manifest (`SandboxCapability::parse` refuses unknown
+            // names); refuse so it stays fail-closed.
             return false;
         };
         let Some(bucket) = self.buckets.get(index) else {
             return false;
         };
-        // A poisoned lock means another thread panicked while holding it. The
-        // bucket is a pair of plain numbers with no invariant a panic could
-        // break, so the count is taken rather than the request being failed —
-        // and `PoisonError::into_inner` is how that is spelled without
-        // `unwrap`, which this module's panic gate forbids.
+        // The bucket is two plain numbers with no invariant a panic could break, so a
+        // poisoned lock is recovered rather than failing the request. `into_inner`, not
+        // `unwrap`, which the panic gate forbids.
         let mut bucket = bucket
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -232,19 +228,15 @@ impl CapabilityRateLimiter {
         let now = crate::time::ambient_instant();
         let micros = u64::try_from(now.saturating_duration_since(bucket.last).as_micros())
             .unwrap_or(u64::MAX);
-        // `as_micros` rather than `as_secs_f64`: the refill has to be monotone
-        // in elapsed time and identical on every platform, and a float divide
-        // is neither.
+        // Integer micros, not `as_secs_f64`: the refill must be monotone and identical on
+        // every platform, and a float divide is neither.
         let rate = u64::from(self.per_second).saturating_mul(SCALE);
         let refill = micros.saturating_mul(rate) / 1_000_000;
         bucket.tokens = bucket.tokens.saturating_add(refill).min(full);
-        // Advance the clock only by the time that actually became tokens, and
-        // carry the remainder. Assigning `now` unconditionally *discards* every
-        // interval shorter than one token's worth — 5 µs at the default 200/s —
-        // so a plugin whose calls arrive faster than that quantum refills
-        // strictly slower than its declared rate, and under contention could sit
-        // at zero tokens while time passed. Clamped at `micros` so the clock can
-        // only ever move forward to `now` at most.
+        // Advance `last` only by the time that became tokens and carry the remainder.
+        // Setting it to `now` would discard every interval shorter than one token (5 µs at
+        // 200/s), so fast callers would refill slower than the declared rate. Clamped at
+        // `micros` so `last` never passes `now`.
         let converted = refill
             .saturating_mul(1_000_000)
             .checked_div(rate)
@@ -267,14 +259,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use chrono::{TimeZone, Utc};
-
     use super::{CapabilityRateLimiter, SandboxCapability};
     use crate::time::{TickingClock, install_ambient};
 
     #[test]
     fn a_bucket_from_a_nested_timeline_refills_on_the_outer_one() {
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let capability = SandboxCapability::ALL[0];
         let outer = TickingClock::starting_at(epoch);
         let _outer = install_ambient(Arc::new(outer.clone()));

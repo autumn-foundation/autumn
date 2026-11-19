@@ -53,6 +53,7 @@ fn build_app_with_state() -> (Router, AppState) {
     let mut config = autumn_web::config::AutumnConfig::default();
     config.tenancy.enabled = true;
     config.tenancy.source = "header".to_string();
+    config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
     config.tenancy.header_name = "x-tenant-id".to_string();
     config.tenancy.quota_bytes = 1000;
     state.insert_extension(config);

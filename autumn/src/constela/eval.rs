@@ -175,9 +175,8 @@ impl EvalCtx<'_> {
             )));
         }
         Ok(Self {
-            // Guarded by the zero check above; `saturating_sub` rather than
-            // `-` so a future edit to that guard cannot turn this into a panic
-            // on a hostile document.
+            // The zero check above guards this; `saturating_sub` keeps it
+            // panic-free if that guard ever changes.
             depth: self.depth.saturating_sub(1),
             ..*self
         })
@@ -286,11 +285,9 @@ fn number_to_string(n: &serde_json::Number) -> String {
         return "0".to_string();
     }
 
-    // ECMAScript switches to exponential notation at |x| >= 1e21 and again at
-    // 0 < |x| < 1e-6; Rust's `f64::to_string` switches nowhere, so it prints
-    // 1e21 as twenty-two digits and 1e-7 as 0.0000001. Inside those thresholds
-    // both agree, and Rust's shortest-round-trip digits are what ECMAScript
-    // specifies too.
+    // ECMAScript switches to exponential notation at |x| >= 1e21 and at
+    // 0 < |x| < 1e-6; Rust's `f64::to_string` never does. Inside those bounds
+    // both print the same shortest-round-trip digits.
     let magnitude = f.abs();
     if !(1e-6..1e21).contains(&magnitude) {
         let exponential = format!("{f:e}");
@@ -791,11 +788,8 @@ fn eval_binary<'a>(
                 _ => ordering.is_ge(),
             })
         }
-        // Short-circuited at the top of this function, so this arm is dead.
-        // It returns a value rather than panicking: an `unreachable!` here
-        // would be a crash on a request carrying a hostile document if that
-        // reasoning ever stopped holding, and `false` is the honest answer for
-        // a logical operator that somehow reached the non-logical path.
+        // Dead: short-circuited at the top of this function. Returns a value
+        // rather than `unreachable!` so a broken invariant is not a crash.
         BinaryOp::And | BinaryOp::Or => {
             debug_assert!(false, "&& and || are short-circuited above");
             Value::Bool(false)

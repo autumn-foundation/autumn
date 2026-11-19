@@ -258,7 +258,6 @@ fn parse_single_spec(spec: &str, total: u64) -> SpecOutcome {
         return SpecOutcome::Invalid;
     };
     if start > end {
-        // Backwards range (`5-2`) is invalid — ignore this spec.
         return SpecOutcome::Invalid;
     }
     if total == 0 || start >= total {
@@ -281,9 +280,8 @@ fn if_range_matches(if_range: &str, validator: Option<&Validator<'_>>) -> bool {
     };
     let trimmed = if_range.trim();
 
-    // Entity-tag form starts with a quote or the weak prefix.
     if trimmed.starts_with('"') || trimmed.starts_with("W/") {
-        // Weak validators are not usable for `If-Range`.
+        // `If-Range` requires a strong validator (RFC 9110 §13.1.5).
         if trimmed.starts_with("W/") {
             return false;
         }
@@ -295,9 +293,8 @@ fn if_range_matches(if_range: &str, validator: Option<&Validator<'_>>) -> bool {
         }
         trimmed.trim_matches('"') == etag.tag()
     } else {
-        // HTTP-date form: must equal the current `Last-Modified` exactly.
-        // Clients echo the value verbatim, so a byte comparison is correct and
-        // avoids a second date-parsing dependency.
+        // HTTP-date form. Clients echo `Last-Modified` verbatim, so a byte
+        // comparison is correct and avoids a date-parsing dependency.
         validator
             .last_modified
             .is_some_and(|lm| lm.trim() == trimmed)

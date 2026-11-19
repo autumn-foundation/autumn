@@ -133,10 +133,9 @@ pub fn markdown(report: &Report<'_>) -> String {
                 );
             }
         }
-        // Never truncated. Findings sort by path within a severity, so a capped
-        // widening table would let an author bury the real one under
-        // twenty-five harmless additions — while the acknowledgment digest
-        // still covered it.
+        // Never truncated: findings sort by path within a severity, so a capped table would let an
+        // author bury a real widening under harmless additions while the ack digest still covered
+        // it.
         table_all(&mut out, &widening);
     }
 
@@ -247,9 +246,8 @@ fn code(value: &str) -> String {
 /// stripped rather than escaped, since a value carrying one would otherwise
 /// close the code span it is rendered inside.
 fn escape(value: &str) -> String {
-    // Backslashes first: escaping `|` into `\|` after a literal `\` would
-    // produce `\\|`, which GFM renders as a backslash followed by a LIVE cell
-    // delimiter — the very breakout this is here to prevent.
+    // Backslashes first: escaping `|` after a literal `\` would yield `\\|`, which GFM renders as a
+    // backslash plus a live cell delimiter.
     value
         .replace('\\', "\\\\")
         .replace('|', "\\|")

@@ -4,7 +4,7 @@ Enable the optional mail subsystem when your app needs password resets, signup
 confirmations, or transactional notifications:
 
 ```toml
-autumn-web = { version = "0.10", features = ["mail"] }
+autumn-web = { version = "0.11", features = ["mail"] }
 ```
 
 ## Configuration
@@ -410,7 +410,7 @@ from your mail provider, which Autumn verifies, parses into an
 Receiving is its own Cargo feature, and it does not come with `mail`:
 
 ```toml
-autumn-web = { version = "0.10", features = ["mail", "inbound-mailgun"] }
+autumn-web = { version = "0.11", features = ["mail", "inbound-mailgun"] }
 ```
 
 `inbound-mail` is the base feature — it carries the router, the RFC 5322 parser,
@@ -505,6 +505,18 @@ let endpoint = InboundMailEndpointConfig::ses("/inbound/ses")
 A notification carrying any other `TopicArn` is rejected with `401`. SNS
 subscription confirmation is handled for you — Autumn fetches the `SubscribeURL`
 and answers `500` if that fetch fails, so SNS retries.
+
+Autumn fetches only from SNS. Both URLs must be
+`https://sns.<region>.amazonaws.com/…` (`.amazonaws.com.cn` for a `cn-`
+region), with no user info and no port. The `aws`, `aws-cn` and `aws-us-gov`
+partitions are supported. Other partitions get `401`.
+
+- `SigningCertURL` must name one `.pem` file. Any other URL gets `401`.
+- The certificate fetch does not follow redirects. A redirect, a transport
+  error, or a body with no `Content-Length` or more than 16 KiB gets `502`.
+  An error status gets `503`, so SNS tries again.
+- `SubscribeURL` must be `/?Action=ConfirmSubscription` with your `TopicArn`.
+  Any other URL gets `400` and Autumn does not fetch it.
 
 The SES adapter also needs the `inbound-ses` feature specifically: with only
 `inbound-mail` enabled the SNS signature verifier is not compiled in, and rather

@@ -284,8 +284,7 @@ impl<S> LoadShedService<S> {
     /// Shed `req` as class `criticality`: count it and build the `503`.
     fn shed<B, F>(&self, req: &Request<B>, criticality: Criticality) -> LoadShedFuture<F> {
         self.layer.metrics.record_request_shed_for(criticality);
-        // Capture the request Origin before it's dropped, so a
-        // mirrored CORS response can echo it back (see with_cors).
+        // The mirrored CORS headers echo the request's Origin (see `with_cors`).
         let cors_origin = self
             .layer
             .cors
@@ -321,11 +320,9 @@ where
             };
         }
         if req.extensions().get::<LoadShedExempt>().is_some() {
-            // An outer admission (the `/mcp` envelope) already holds this
-            // request's slot, as `critical`, because it did not know the
-            // route. Claim a slot at the route's own class now. The claim
-            // counts only classified requests, so other unclassified
-            // envelopes do not shed this one.
+            // The `/mcp` envelope already holds this request's slot as `critical`, since it did
+            // not know the route. Claim one at the route's own class now, counting only
+            // classified requests so other unclassified envelopes do not shed this one.
             let Some(&criticality) = req.extensions().get::<Criticality>() else {
                 return LoadShedFuture::Forward {
                     inner: self.inner.call(req),
@@ -411,8 +408,7 @@ fn claim(counter: &AtomicUsize, threshold: usize) -> Option<usize> {
         if current >= threshold {
             return None;
         }
-        // `current < threshold` is checked above, so the bump is exact;
-        // `saturating_add` only guards the theoretical `usize::MAX` limit.
+        // `current < threshold`, so this never saturates.
         match counter.compare_exchange_weak(
             current,
             current.saturating_add(1),
@@ -589,12 +585,7 @@ where
                 if let Some(guard) = guard.as_mut() {
                     guard.complete(output.as_ref().ok().map(Response::status));
                 }
-                // Release the slot as soon as the inner future resolves,
-                // rather than waiting for this whole future to be dropped —
-                // if a caller (middleware combinator, logging, post-
-                // processing) holds onto the resolved future, the slot would
-                // otherwise stay occupied longer than the request is
-                // actually in flight.
+                // Release the slot now, not on drop: a caller may hold the resolved future.
                 guard.take();
                 Poll::Ready(output)
             }
@@ -641,7 +632,6 @@ mod tests {
     async fn disabled_zero_limit_never_sheds() {
         let layer = LoadShedLayer::new(0, MetricsCollector::new());
         let app = make_app(layer);
-        // Fire several requests sequentially; a zero limit must never 503.
         for _ in 0..5 {
             assert_eq!(status(app.clone(), "/").await, axum::http::StatusCode::OK);
         }
@@ -694,7 +684,6 @@ mod tests {
         let entered = Arc::new(StdAtomicUsize::new(0));
         let app = make_blocking_app(layer, gate.clone(), entered.clone());
 
-        // Occupy both slots concurrently.
         let mut handles = Vec::new();
         for _ in 0..2 {
             let app = app.clone();
@@ -712,7 +701,6 @@ mod tests {
         }
         wait_for_entered(&entered, 2).await;
 
-        // The third concurrent request must be shed immediately.
         let resp = app
             .clone()
             .oneshot(
@@ -730,7 +718,6 @@ mod tests {
         );
         assert_eq!(metrics.snapshot().http.requests_shed_total, 1);
 
-        // Release the held requests; both must have completed successfully.
         gate.notify_waiters();
         for handle in handles {
             assert_eq!(handle.await.unwrap(), axum::http::StatusCode::OK);
@@ -762,7 +749,6 @@ mod tests {
         wait_for_entered(&entered, 1).await;
         assert_eq!(layer.in_flight.load(Ordering::Acquire), 1);
 
-        // Release: the slot must return to the pool.
         gate.notify_waiters();
         assert_eq!(held.await.unwrap(), axum::http::StatusCode::OK);
 
@@ -774,7 +760,7 @@ mod tests {
         .await
         .expect("in-flight counter should return to 0 after completion");
 
-        // A fresh request must be admitted again (slot was released, not leaked).
+        // Admitted again: the slot was released, not leaked.
         assert_eq!(
             status(app, "/actuator/health").await,
             axum::http::StatusCode::OK
@@ -783,9 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_request_still_releases_its_slot() {
-        // A dropped in-flight future (client disconnect / cancellation) must
-        // still free its slot via InFlightGuard's Drop — not only the
-        // successful-completion path.
+        // A dropped in-flight future frees its slot through `InFlightGuard`'s Drop.
         let metrics = MetricsCollector::new();
         let layer = LoadShedLayer::new(1, metrics);
         let gate = Arc::new(Notify::new());
@@ -799,8 +783,7 @@ mod tests {
                 .unwrap(),
         );
         let mut fut = Box::pin(fut);
-        // Poll once to admit the request (increments in_flight), then drop
-        // the future before it resolves.
+        // Poll once to admit the request, then drop the future before it resolves.
         let () = futures::future::poll_fn(|cx| {
             let _ = Pin::new(&mut fut).poll(cx);
             Poll::Ready(())
@@ -815,11 +798,6 @@ mod tests {
 
     #[tokio::test]
     async fn guard_is_released_as_soon_as_inner_future_resolves() {
-        // A completed `LoadShedFuture` releases its slot immediately when
-        // polled to `Poll::Ready`, rather than waiting for the whole future to
-        // be dropped — a caller that holds onto the resolved future (a
-        // combinator, logging, post-processing) must not keep the slot
-        // occupied any longer than the request was actually in flight.
         let metrics = MetricsCollector::new();
         let layer = LoadShedLayer::new(1, metrics);
         let app = make_app(layer.clone());
@@ -829,7 +807,7 @@ mod tests {
         let resp = std::future::poll_fn(|cx| Pin::new(&mut fut).poll(cx)).await;
         assert_eq!(resp.unwrap().status(), axum::http::StatusCode::OK);
 
-        // The slot must already be free here, before `fut` is dropped.
+        // `fut` is not dropped yet.
         assert_eq!(
             layer.in_flight.load(Ordering::Acquire),
             0,
@@ -1092,14 +1070,12 @@ mod tests {
         assert_eq!(layer.in_flight.load(Ordering::Acquire), 0);
     }
 
-    // ── MCP replay exemption (avoids double-counting a tools/call) ────────
+    // ── MCP replay exemption ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn load_shed_exempt_marker_bypasses_the_ceiling() {
-        // A request carrying the `LoadShedExempt` marker must pass through
-        // uncounted, even with the single slot already occupied — this is
-        // how a `tools/call` replay avoids consuming a second slot for the
-        // same logical request already counted at the `/mcp` envelope.
+        // A `tools/call` replay carries `LoadShedExempt`: the `/mcp` envelope already counted it,
+        // so it passes uncounted even with the one slot held.
         let metrics = MetricsCollector::new();
         let layer = LoadShedLayer::new(1, metrics);
         let gate = Arc::new(Notify::new());
@@ -1122,18 +1098,13 @@ mod tests {
         };
         wait_for_entered(&entered, 1).await;
 
-        // The single shared slot is occupied: an ordinary (non-exempt)
-        // request to the same route is shed...
         assert_eq!(
             status(app.clone(), "/block").await,
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "sanity: the ceiling is actually saturated"
         );
 
-        // ...but a request marked exempt is admitted regardless (proves the
-        // marker bypasses accounting rather than merely reserving another
-        // slot — this would otherwise deadlock, since the layer's one slot
-        // is already held by `held`).
+        // Admitted despite the full ceiling: the marker bypasses accounting.
         let mut exempt_req = Request::builder()
             .uri("/block")
             .body(Body::empty())
@@ -1162,8 +1133,8 @@ mod tests {
         let entered = Arc::new(StdAtomicUsize::new(0));
         let app = make_blocking_app(layer, gate.clone(), entered.clone());
 
-        // One ordinary request in flight, then the envelope's own slot: the
-        // replay below sees in_flight = 2 (simulated by a second holder).
+        // Two envelopes fill the ceiling but count toward no class: replays are checked against
+        // the classified count only.
         let mut held = Vec::new();
         for _ in 0..2 {
             let app = app.clone();

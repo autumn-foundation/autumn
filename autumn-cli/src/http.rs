@@ -28,28 +28,39 @@ const RETRY_DELAY: Duration = Duration::from_secs(2);
 /// own error type (both [`crate::setup::SetupError`] and
 /// [`crate::assets::AssetsError`] wrap `reqwest::Error` via `#[from]`).
 pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, reqwest::Error> {
-    retry_transient(
-        MAX_ATTEMPTS,
-        RETRY_DELAY,
-        |e: &reqwest::Error| retryable_status(e.status()),
-        || fetch_bytes_once(url),
-    )
+    retry_transient(MAX_ATTEMPTS, RETRY_DELAY, is_retryable, || {
+        fetch_bytes_once(url, false)
+    })
+}
+
+/// Download `url` like [`fetch_bytes`], but over `https` only.
+///
+/// The client rejects an `http` URL and an `http` redirect target. Thus an
+/// `https` source cannot redirect the download to plain `http`.
+pub fn fetch_bytes_https_only(url: &str) -> Result<Vec<u8>, reqwest::Error> {
+    retry_transient(MAX_ATTEMPTS, RETRY_DELAY, is_retryable, || {
+        fetch_bytes_once(url, true)
+    })
+}
+
+/// Whether a failed download is worth another try. A bad URL or a refused
+/// redirect is not transient.
+fn is_retryable(e: &reqwest::Error) -> bool {
+    !e.is_builder() && !e.is_redirect() && retryable_status(e.status())
 }
 
 /// Fetch `url` as UTF-8 text (used for the small Tailwind checksums
 /// manifest). Retries transient failures the same as [`fetch_bytes`].
 pub fn fetch_text(url: &str) -> Result<String, reqwest::Error> {
-    retry_transient(
-        MAX_ATTEMPTS,
-        RETRY_DELAY,
-        |e: &reqwest::Error| retryable_status(e.status()),
-        || fetch_text_once(url),
-    )
+    retry_transient(MAX_ATTEMPTS, RETRY_DELAY, is_retryable, || {
+        fetch_text_once(url)
+    })
 }
 
-fn fetch_bytes_once(url: &str) -> Result<Vec<u8>, reqwest::Error> {
+fn fetch_bytes_once(url: &str, https_only: bool) -> Result<Vec<u8>, reqwest::Error> {
     let response = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .https_only(https_only)
         .build()?
         .get(url)
         .send()?
@@ -221,5 +232,22 @@ mod tests {
         );
         assert_eq!(result, Ok(7));
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn https_only_fetch_rejects_http_without_a_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/x.js", listener.local_addr().unwrap());
+        let err = fetch_bytes_https_only(&url).expect_err("http must be rejected");
+        assert!(
+            !is_retryable(&err),
+            "a scheme error is not transient: {err}"
+        );
+        let accepted = listener.accept();
+        assert!(
+            matches!(&accepted, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "no connection may be made: {accepted:?}"
+        );
     }
 }

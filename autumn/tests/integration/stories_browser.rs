@@ -139,6 +139,38 @@ async fn seeded_busy_history() -> Markup {
     })
 }
 
+/// A form with a tags box, an ID box and a reset button. Each box starts
+/// with a server value. Empty without `widgets-search`.
+#[get("/seeded/search-reset")]
+async fn seeded_search_reset() -> Markup {
+    #[cfg(feature = "widgets-search")]
+    {
+        search_reset_page()
+    }
+    #[cfg(not(feature = "widgets-search"))]
+    {
+        busy_page(&html! {})
+    }
+}
+
+#[cfg(feature = "widgets-search")]
+fn search_reset_page() -> Markup {
+    use autumn_web::widgets::{AutocompleteConfig, autocomplete_input};
+
+    let tags = AutocompleteConfig::new("/_stories/demo/tags/suggest", "tags")
+        .multiple()
+        .free_text()
+        .selected(&[("rust", "rust"), ("say", "say \"hi\"")]);
+    let pick = AutocompleteConfig::new("/_stories/demo/tags/suggest", "pick").initial_value("7");
+    busy_page(&html! {
+        form id="reset-form" {
+            (autocomplete_input("rs-tags", "Tags", &tags))
+            (autocomplete_input("rs-pick", "Pick", &pick))
+            button type="reset" id="reset-go" { "Reset" }
+        }
+    })
+}
+
 /// The markup of the Tabs story.
 fn story_tabs() -> Markup {
     let panels = [
@@ -179,7 +211,8 @@ async fn runner() -> SystemTestRunner {
                 seeded_axe,
                 seeded_tabs,
                 seeded_busy_indicators,
-                seeded_busy_history
+                seeded_busy_history,
+                seeded_search_reset
             ])
             .build(),
     )
@@ -835,6 +868,103 @@ async fn keyboard_tags_input() {
     })
     .await;
     assert_eq!(eval_string(&page, VALUES).await, "web");
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// The values a form would send, without the `q` query fields.
+#[cfg(feature = "widgets-search")]
+const FORM_VALUES: &str = "JSON.stringify([...new FormData(\
+    document.getElementById('reset-form')).entries()].filter(e => e[0] !== 'q'))";
+
+/// A form reset restores the chips and the picked value from the server
+/// markup, and clears the query and the popup (issue #3618).
+#[cfg(feature = "widgets-search")]
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn search_widgets_restore_the_server_state_on_form_reset() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/seeded/search-reset").await;
+    let start = eval_string(&page, FORM_VALUES).await;
+    assert_eq!(
+        start, r#"[["tags","rust"],["tags","say"],["pick","7"]]"#,
+        "server state"
+    );
+
+    // Edit the tags: remove both chips, add "zig" and "axum" (Enter adds
+    // free text).
+    for _ in 0..2 {
+        page.click("#rs-tags-chips [data-ac-chip-remove]")
+            .await
+            .expect("remove chip");
+    }
+    for tag in ["zig", "axum"] {
+        page.fill("#rs-tags-query", tag).await.expect("type");
+        focus(&page, "#rs-tags-query").await;
+        press(&page, "Enter").await;
+    }
+    // Edit the ID box: typing clears its value.
+    page.fill("#rs-pick-query", "new").await.expect("type");
+    // Leave text in the tags query, too.
+    page.fill("#rs-tags-query", "half").await.expect("type");
+    let edited = eval_string(&page, FORM_VALUES).await;
+    assert_eq!(edited, r#"[["tags","zig"],["tags","axum"]]"#, "edited");
+
+    page.click("#reset-go").await.expect("reset");
+    wait_for(&page, &format!("{FORM_VALUES} === '{start}'")).await;
+    assert_eq!(
+        eval_string(&page, "document.getElementById('rs-tags-query').value").await,
+        "",
+        "the query is clear"
+    );
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.querySelector('#rs-tags-wrapper [data-ac-status]').textContent"
+        )
+        .await,
+        "",
+        "the status text is clear"
+    );
+    assert_eq!(
+        eval_string(
+            &page,
+            "[...document.querySelectorAll('#rs-tags-chips [data-ac-chip-label]')]\
+             .map(e => e.textContent).join('|')"
+        )
+        .await,
+        "rust|say \"hi\"",
+        "labels come back exactly"
+    );
+    assert_eq!(
+        eval_string(&page, "document.getElementById('rs-pick-query').value").await,
+        "7",
+        "the native reset restores the pick text"
+    );
+
+    // The restored chip still works.
+    page.click("#rs-tags-chips [data-ac-chip-remove]")
+        .await
+        .expect("remove restored chip");
+    assert_eq!(
+        eval_string(&page, FORM_VALUES).await,
+        r#"[["tags","say"],["pick","7"]]"#,
+        "a restored chip is live"
+    );
+
+    // A reset that the page cancels changes nothing.
+    page.evaluate(
+        "document.getElementById('reset-form').addEventListener('reset', e => e.preventDefault())",
+    )
+    .await
+    .expect("cancel resets");
+    page.fill("#rs-tags-query", "keep").await.expect("type");
+    focus(&page, "#rs-tags-query").await;
+    press(&page, "Enter").await;
+    let kept = eval_string(&page, FORM_VALUES).await;
+    page.click("#reset-go").await.expect("cancelled reset");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(eval_string(&page, FORM_VALUES).await, kept, "cancelled");
     page.expect_no_console_errors().await.expect("no errors");
 }
 

@@ -3,7 +3,7 @@
 Autumn relies on procedural macros to eliminate boilerplate. This guide shows
 you exactly what those macros generate so there are no surprises at runtime.
 
-Examples in this guide track the Autumn 0.10.x line and Rust 1.97.0+ as of
+Examples in this guide track the Autumn 0.11.x line and Rust 1.97.0+ as of
 2026-10-01.
 
 The code snippets are **illustrative**, not compiled doctests: the "what it
@@ -38,7 +38,7 @@ When your application starts, Autumn logs every decision it makes. A typical
 startup sequence looks like this:
 
 ```
-  INFO autumn: Autumn starting version="0.10.0" profile="dev"
+  INFO autumn: Autumn starting version="0.11.0" profile="dev"
   INFO autumn: Database pool configured max_connections=10
   INFO autumn: Registered task name="db_cleanup" schedule="every 5m"
   INFO autumn: Listening addr=127.0.0.1:3000
@@ -47,7 +47,7 @@ startup sequence looks like this:
 If you omit the database:
 
 ```
-  INFO autumn: Autumn starting version="0.10.0" profile="dev"
+  INFO autumn: Autumn starting version="0.11.0" profile="dev"
   INFO autumn: Database not configured
   INFO autumn: Listening addr=127.0.0.1:3000
 ```
@@ -74,7 +74,7 @@ AUTUMN_SHOW_CONFIG=1 cargo run
 This produces output like:
 
 ```
-  INFO autumn: Autumn starting version="0.10.0" profile="dev"
+  INFO autumn: Autumn starting version="0.11.0" profile="dev"
   INFO autumn: Registered routes:
     /            GET      -> index
     /todos       GET      -> list_todos
@@ -291,7 +291,7 @@ A WebSocket upgrade route built on a **two-function** pattern: your outer
 function runs at upgrade time (with normal extractors) and returns a value
 implementing `WsHandler` that owns the live socket.
 
-Behind the non-default `ws` Cargo feature — `autumn-web = { version = "0.10",
+Behind the non-default `ws` Cargo feature — `autumn-web = { version = "0.11",
 features = ["ws"] }`. Without it the attribute does not exist, and the block
 below fails to compile against your own file. See
 [WebSockets](./websockets.md).
@@ -864,7 +864,7 @@ The key `K` must be the group column's **non-nullable** Rust type.
 #[repository(Order)]
 pub trait OrderRepository {
     fn sum_total_grouped_by_status() -> Vec<(String, Option<i64>)>;
-    fn count_grouped_by_created_at() -> Vec<(DateTime<Utc>, i64)>;
+    fn count_grouped_by_created_at() -> Vec<(Timestamp, i64)>;
 }
 
 let top = repo
@@ -889,11 +889,11 @@ Builder methods available on **every** aggregate builder regardless of key type:
 interpolated).
 
 `.bucket(bucket)` (`DateBucket::Day` / `Week` / `Month`) is **only** defined when
-the group key `K` is a timestamp type — `NaiveDateTime` or `DateTime<Utc>` — since
+the group key `K` is a timestamp type — `civil::DateTime` or `Timestamp` — since
 it swaps the raw group column for `date_trunc('<unit>', <col>)`. Calling it on a
 non-temporal aggregate (e.g. the `String`-keyed `sum_total_grouped_by_status()`
 above) is a compile error, because the method does not exist for that key. A
-`timestamptz` (`DateTime<Utc>`) bucket uses `date_trunc(.., 'UTC')` for
+`timestamptz` (`Timestamp`) bucket uses `date_trunc(.., 'UTC')` for
 timezone-stable buckets.
 
 **Gotchas:** on a sharded, tenant-scoped repo, *every* grouped aggregate —
@@ -1054,7 +1054,7 @@ impl SendPasswordResetJob {
 
     pub async fn enqueue(args: ResetArgs) -> AutumnResult<()> { ... }
     pub async fn enqueue_in(args: ResetArgs, delay: Duration) -> AutumnResult<()> { ... }
-    pub async fn enqueue_at(args: ResetArgs, when: DateTime<Utc>) -> AutumnResult<()> { ... }
+    pub async fn enqueue_at(args: ResetArgs, when: Timestamp) -> AutumnResult<()> { ... }
     pub async fn enqueue_tracked(args: ResetArgs) -> AutumnResult<TrackedJobHandle> { ... }
     pub async fn enqueue_tracked_for(args: ResetArgs, owner: TrackedJobOwner)
         -> AutumnResult<TrackedJobHandle> { ... }
@@ -1650,7 +1650,7 @@ Every macro in this section is behind a non-default Cargo feature:
 and `#[inbound_mail]` needs `inbound-mail`.
 
 ```toml
-autumn-web = { version = "0.10", features = ["mail", "inbound-mail"] }
+autumn-web = { version = "0.11", features = ["mail", "inbound-mail"] }
 ```
 
 See [Mail](./mail.md) for the subsystem itself.
@@ -1733,7 +1733,7 @@ full matching rules.
 
 Translates an i18n key, with **compile-time validation** that the key exists in
 the default locale's `.ftl` file. Behind the non-default `i18n` feature —
-`autumn-web = { version = "0.10", features = ["i18n"] }`; see
+`autumn-web = { version = "0.11", features = ["i18n"] }`; see
 [Internationalization](./i18n.md).
 
 **You write:**

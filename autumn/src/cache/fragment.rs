@@ -141,7 +141,6 @@ pub fn cache_fragment(
     render: impl FnOnce() -> Markup,
 ) -> Markup {
     let Some(cache) = cache else {
-        // Graceful fallback: no cache configured → render every time, no panic.
         return render();
     };
 
@@ -150,11 +149,10 @@ pub fn cache_fragment(
     let key = fragment_key("fragment:", tenant.as_deref(), &identity, version);
 
     if let Some(html) = get_cached::<String>(cache, &key) {
-        // Hit: reconstruct Markup from the cached String without re-escaping.
+        // The cached HTML is already escaped.
         return PreEscaped(html);
     }
 
-    // Miss: render once, store the inner String (serde-transparent for Redis).
     let markup = render();
     insert_cached(cache, &key, markup.0.clone(), ttl);
     markup
@@ -238,22 +236,14 @@ pub fn cache_fragment_in(
         return render();
     };
 
-    // Sampled BEFORE the lookup, so the fence covers the whole miss-and-render
-    // window. Being namespaced is exactly what exposes this helper to the race
-    // `cache_fragment` cannot have: an invalidation can now clear these entries
-    // mid-render, and an unfenced insert would put the pre-write markup back
-    // after the clear — stale until its TTL, or forever without one.
+    // Sample before the lookup so the fence covers the whole miss-and-render window. An
+    // invalidation can clear this namespace mid-render; an unfenced insert would then restore
+    // the pre-write markup until its TTL, or forever without one.
     let epoch = super::coherence::namespace_epoch(namespace);
     let sampled = epoch.load(std::sync::atomic::Ordering::Acquire);
 
-    // Same length-prefixed identity as `cache_fragment`, behind the namespace
-    // that `invalidate_namespace` scans for: `{namespace}:` is exactly the
-    // prefix `MokaCache` matches on and `RedisCache` builds its `SCAN MATCH`
-    // from, so the declared id and the runtime key space finally agree. The
-    // ambient tenant (see `tenant_key_component`) is folded in *after* that
-    // prefix — when resolved — so a namespace sweep is unaffected by which
-    // tenant wrote a given entry; when unresolved, the key is the exact
-    // pre-fix `{namespace}:fragment:{identity}:{version}` key.
+    // `{namespace}:` must lead the key: it is the prefix `invalidate_namespace` sweeps. The
+    // tenant goes after it, so one sweep reaches every tenant's entries.
     let identity = identity.to_string();
     let tenant = tenant_key_component();
     let key = fragment_key(
@@ -267,14 +257,12 @@ pub fn cache_fragment_in(
         return PreEscaped(html);
     }
 
-    // The shared epoch is read after the miss and before the render. It fences
-    // out an invalidation on another replica. The read is one round trip, on a
-    // miss only.
+    // The shared epoch fences out an invalidation on another replica. Reading it costs one round
+    // trip, on a miss only.
     let shared = super::sample_fill_epoch(cache, namespace);
     let markup = render();
-    // Check and insert as one step, the same way `#[cached]` does — see
-    // `with_fill_fence`. A fenced-out fill still returns its markup to *this*
-    // caller; it just does not publish it.
+    // Check and insert as one step, as `#[cached]` does. A fenced-out fill still returns its
+    // markup to this caller; it just does not publish it.
     super::coherence::with_fill_fence(&epoch, sampled, || {
         super::insert_cached_fenced(cache, &key, markup.0.clone(), ttl, namespace, shared);
     });
@@ -297,8 +285,6 @@ pub fn cache_fragment_global_in(
     cache_fragment_in(global.as_deref(), namespace, identity, version, ttl, render)
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(all(test, feature = "cache-moka"))]
 mod tests {
     use std::sync::Arc;
@@ -319,14 +305,11 @@ mod tests {
         MokaCache::new(capacity, None)
     }
 
-    // ── AC1 + AC5: miss renders+stores; closure NOT executed on a hit ──────
-
     #[test]
     fn hit_does_not_run_closure() {
         let cache = make_cache(100);
         let counter = Arc::new(AtomicUsize::new(0));
 
-        // First call → miss; closure runs once.
         let first = {
             let counter = counter.clone();
             cache_fragment(Some(&cache), "post:1", "v1", None, move || {
@@ -341,7 +324,6 @@ mod tests {
         );
         assert!(first.into_string().contains("rendered"));
 
-        // Second call (same identity + version) → hit; closure must NOT run.
         let second = {
             let counter = counter.clone();
             cache_fragment(Some(&cache), "post:1", "v1", None, move || {
@@ -356,8 +338,6 @@ mod tests {
         );
         assert!(second.into_string().contains("rendered"));
     }
-
-    // ── AC2: version bump → miss → re-render ──────────────────────────────
 
     #[test]
     fn version_bump_causes_miss() {
@@ -374,7 +354,6 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert!(v1.into_string().contains("version-one"));
 
-        // Same identity, NEW version → must miss and re-render.
         let v2 = {
             let counter = counter.clone();
             cache_fragment(Some(&cache), "post:7", "2024-06-01", None, move || {
@@ -390,8 +369,6 @@ mod tests {
         assert!(v2.into_string().contains("version-two"));
     }
 
-    // ── AC6: no cache → renders directly, never panics ────────────────────
-
     #[test]
     fn no_cache_renders_directly_without_panic() {
         let counter = Arc::new(AtomicUsize::new(0));
@@ -405,7 +382,6 @@ mod tests {
             assert!(result.into_string().contains("fallback"));
         }
 
-        // No cache → every call renders.
         assert_eq!(
             counter.load(Ordering::SeqCst),
             3,
@@ -413,14 +389,12 @@ mod tests {
         );
     }
 
-    // ── AC3: TTL forwarded to backend (insert_cached honours ttl arg) ─────
-
     #[test]
     fn ttl_parameter_accepted_and_hit_still_works() {
         let cache = make_cache(100);
         let counter = Arc::new(AtomicUsize::new(0));
 
-        // Store with a TTL (in-process moka ignores per-call TTL, but must not panic).
+        // Moka ignores a per-call TTL; the entry must still be stored.
         {
             let counter = counter.clone();
             cache_fragment(
@@ -436,7 +410,6 @@ mod tests {
         }
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-        // Hit must still work immediately after.
         {
             let counter = counter.clone();
             cache_fragment(
@@ -453,13 +426,9 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1, "hit must not re-render");
     }
 
-    // ── AC4: Russian-doll nesting ─────────────────────────────────────────
-    //
-    // Two inner fragments live inside an outer fragment. We derive the outer
-    // version from its children. When one inner record changes:
-    //   - the outer re-renders (its version bumped),
-    //   - the changed inner re-renders,
-    //   - the *unchanged sibling* is served from cache (closure not run).
+    // Russian-doll nesting: the outer fragment's version derives from its two inner fragments.
+    // When one inner record changes, the outer and that inner re-render; the unchanged sibling
+    // is served from cache.
 
     /// Render inner fragment `id` at `version`, counting closure invocations.
     fn inner(cache: &dyn Cache, id: &str, version: &str, counter: &Arc<AtomicUsize>) -> Markup {
@@ -480,7 +449,7 @@ mod tests {
         let inner_b = Arc::new(AtomicUsize::new(0));
         let outer = Arc::new(AtomicUsize::new(0));
 
-        // --- Pass 1: warm everything (outer v1, a v1, b v1) ---
+        // Pass 1: warm everything.
         {
             let a = inner(cache_ref, "inner:a", "v1", &inner_a);
             let b = inner(cache_ref, "inner:b", "v1", &inner_b);
@@ -494,7 +463,7 @@ mod tests {
         assert_eq!(inner_b.load(Ordering::SeqCst), 1, "inner-b warmed once");
         assert_eq!(outer.load(Ordering::SeqCst), 1, "outer warmed once");
 
-        // --- Pass 2: identical → outer hit, inner closures never invoked ---
+        // Pass 2: unchanged. `inner()` runs again, but its own lookups hit.
         {
             let a = inner(cache_ref, "inner:a", "v1", &inner_a);
             let b = inner(cache_ref, "inner:b", "v1", &inner_b);
@@ -504,8 +473,6 @@ mod tests {
                 html! { ul { (a) (b) } }
             });
         }
-        // The inner() helper above *does* run when the outer is a hit, but it
-        // hits its own cache so the closures don't run. The outer itself hits.
         assert_eq!(inner_a.load(Ordering::SeqCst), 1, "inner-a stays cached");
         assert_eq!(inner_b.load(Ordering::SeqCst), 1, "inner-b stays cached");
         assert_eq!(
@@ -514,8 +481,7 @@ mod tests {
             "outer hit: not re-rendered"
         );
 
-        // --- Pass 3: inner-a changes (v2), outer version bumps. ---
-        // inner-a re-renders, inner-b sibling stays cached, outer re-renders.
+        // Pass 3: inner-a changes, so the outer version bumps too.
         {
             let a = inner(cache_ref, "inner:a", "v2", &inner_a); // bumped
             let b = inner(cache_ref, "inner:b", "v1", &inner_b); // unchanged
@@ -541,8 +507,6 @@ mod tests {
             "outer re-renders when its version bumped"
         );
     }
-
-    // ── cache_fragment_global: uses process-global cache ─────────────────
 
     #[test]
     fn global_variant_hits_process_global_cache() {
@@ -578,8 +542,6 @@ mod tests {
         clear_global_cache();
     }
 
-    // ── cache_fragment_global: no global → renders without panicking ──────
-
     #[test]
     fn global_variant_no_global_cache_renders_fallback() {
         let _guard = GLOBAL_CACHE_TEST_LOCK
@@ -595,8 +557,6 @@ mod tests {
         );
     }
 
-    // ── Returned Markup is byte-identical to the rendered Markup ──────────
-
     #[test]
     fn cached_markup_matches_rendered_markup() {
         let cache = make_cache(10);
@@ -606,7 +566,6 @@ mod tests {
         });
         let first_html = first.into_string();
 
-        // Retrieve from cache; the alternate closure must be ignored.
         let second: Markup = cache_fragment(Some(&cache), "post:html", "v1", None, || {
             html! { span { "WRONG" } }
         });
@@ -617,8 +576,6 @@ mod tests {
         assert!(second_html.contains("World"));
         assert!(!second_html.contains("WRONG"));
     }
-
-    // ── Different identities are cached independently ─────────────────────
 
     #[test]
     fn different_identities_are_independent() {
@@ -645,16 +602,12 @@ mod tests {
         );
     }
 
-    // ── Key boundary is unambiguous even when identity contains `:` ───────
-
     #[test]
     fn colon_in_identity_does_not_alias_distinct_fragments() {
         let cache = make_cache(100);
         let counter = Arc::new(AtomicUsize::new(0));
 
-        // These two pairs join to the same naive "fragment:{id}:{ver}" string
-        // ("fragment:a:b:c") but are semantically distinct fragments. The
-        // length prefix must keep them apart.
+        // Both pairs join to the naive "fragment:a:b:c"; the length prefix must keep them apart.
         let first = {
             let counter = counter.clone();
             cache_fragment(Some(&cache), "a:b", "c", None, move || {
@@ -672,7 +625,6 @@ mod tests {
                 html! { p { "right" } }
             })
         };
-        // Must be a MISS (distinct key), not a hit serving "left".
         assert_eq!(
             counter.load(Ordering::SeqCst),
             2,
@@ -775,8 +727,7 @@ mod tests {
             ));
             html! { p { "stale" } }
         });
-        // The caller still gets what it rendered — the fence withholds the
-        // publish, it does not fail the call.
+        // The fence withholds the publish; it does not fail the call.
         assert!(markup.into_string().contains("stale"));
 
         // The next call must be a MISS: nothing stale was left behind.
@@ -949,18 +900,10 @@ mod tests {
         );
     }
 
-    // ── Compatibility: no tenant resolved → exact pre-fix key (Codex review
-    // round 2, PR #2884) ────────────────────────────────────────────────────
-
     #[test]
     fn no_tenant_context_reads_a_pre_fix_legacy_key() {
-        // An app upgrading with an existing, permanent (`ttl = None`) cache
-        // entry must not go cold across the board just because this
-        // primitive learned about tenancy. Hand-write the exact key the
-        // pre-fix `cache_fragment` computed and confirm a post-fix call with
-        // no tenant context resolved (`CURRENT_TENANT` unset — the case
-        // every other plain `#[test]` in this module runs under) still
-        // reads it.
+        // Existing permanent (`ttl = None`) entries must stay readable without a tenant: the
+        // tenant-less key keeps the format `cache_fragment` used before tenancy.
         let cache = make_cache(100);
         let identity = "post:1";
         let legacy_key = format!("fragment:{}:{identity}:v1", identity.len());
@@ -972,15 +915,10 @@ mod tests {
         assert_eq!(markup.into_string(), "legacy markup");
     }
 
-    // ── Security: an empty resolved tenant must not alias no tenant context
-    // (Codex review round 2, PR #2884) ──────────────────────────────────────
-
     #[tokio::test]
     async fn empty_string_tenant_does_not_alias_no_tenant_context() {
-        // `Some(String::new())` (reachable through the public `with_tenant`)
-        // must not collapse to the same key component as `None` (no tenant
-        // context at all) — otherwise an app that resolves an empty tenant
-        // id would alias whatever the no-tenant/background-job entry holds.
+        // `with_tenant(String::new())` must not share the no-tenant entry, which background jobs
+        // also use.
         let cache = make_cache(100);
         let identity = "post:1";
 

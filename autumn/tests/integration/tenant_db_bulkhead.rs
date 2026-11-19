@@ -23,6 +23,7 @@ mod tenant_db_bulkhead_tests {
         let mut config = AutumnConfig::default();
         config.tenancy.enabled = true;
         config.tenancy.source = "header".into();
+        config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
         config.tenancy.header_name = "x-tenant-id".into();
         config.tenancy.max_db_connections = max_db_connections;
         config

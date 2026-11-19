@@ -180,6 +180,7 @@ fn the_capability_grant_is_reviewable_before_the_plugin_serves() {
     }
 }
 
+#[cfg(feature = "plugin-conformance")]
 #[test]
 fn a_sandboxed_plugin_passes_the_existing_conformance_checks() {
     let builder = autumn_web::app().plugin(plugin(guests::HELLO, ResourceLimits::default()));

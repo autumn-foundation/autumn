@@ -1062,9 +1062,7 @@ pub fn tabs(
         .iter()
         .map(|(panel_id, _, _)| format!("{id}-tab-{panel_id}"))
         .collect();
-    // Which panel is default-active. `Some(id)` that matches a panel selects
-    // it; `None` or an unknown id falls back to the first panel (the historic
-    // behavior). The chosen index only sets the server's *default* selection —
+    // `None` or an unknown id selects the first panel. This is only the default selection:
     // `:target` deep-linking still overrides it in pure CSS.
     let active_index = active_id
         .and_then(|target| {
@@ -1814,11 +1812,9 @@ mod tests {
 
     #[test]
     fn card_config_defaults() {
-        // no title/action → no autumn-card__header rendered
         let html = card(&maud::html! {}, &CardConfig::new()).into_string();
         assert!(!html.contains("autumn-card__header"), "{html}");
         assert!(!html.contains("autumn-card__footer"), "{html}");
-        // default heading level is H2: setting a title renders <h2
         let html2 = card(&maud::html! {}, &CardConfig::new().title("X")).into_string();
         assert!(html2.contains("<h2"), "{html2}");
     }
@@ -1993,7 +1989,6 @@ mod tests {
         let html = hero(&HeroConfig::new("Welcome")).into_string();
         assert!(html.contains("Welcome"), "{html}");
         assert!(html.contains(r#"class="autumn-hero""#), "{html}");
-        // Single top-level heading, no subtitle, no CTA container.
         assert!(html.contains("<h1"), "{html}");
         assert_eq!(html.matches("<h1").count(), 1, "{html}");
         assert!(!html.contains("autumn-hero__subtitle"), "{html}");
@@ -2058,9 +2053,8 @@ mod tests {
 
     #[test]
     fn hero_cta_and_class_accept_owned_strings_built_inline() {
-        // Cta::primary/secondary and .class() take `impl Into<String>` so a
-        // caller can build them from owned data (e.g. a DB row) in the same
-        // expression, without a `let` binding to extend a temporary's lifetime.
+        // These take `impl Into<String>`, so owned values built inline need no `let` binding
+        // to outlive the expression.
         let post_id = 42;
         let html = hero(
             &HeroConfig::new("Welcome")
@@ -2209,8 +2203,8 @@ mod tests {
 
     #[test]
     fn button_attrs_pass_through_but_cannot_replace_owned_ones() {
-        // The app owns its CSP (CLAUDE.md): handlers and `style` pass
-        // through. The widget's own attributes win.
+        // The app owns its CSP: handlers and `style` pass through. The widget's own
+        // attributes win.
         let attrs = [
             ("hx-post", "/save?a=1&b=2"),
             ("hx-indicator", "this"),

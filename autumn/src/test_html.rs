@@ -136,14 +136,12 @@ impl<'a> Parser<'a> {
                     self.handle_open_tag(&mut roots, &mut stack);
                     continue;
                 }
-                // A stray '<' that isn't markup falls through and is treated
-                // as text by the shared consumer below.
+                // A stray '<' that isn't markup falls through and is consumed as text.
             }
             self.consume_text_until_lt(&mut roots, &mut stack);
         }
 
-        // Auto-close any still-open elements (well-formed input won't hit this,
-        // but malformed input shouldn't lose nodes).
+        // Auto-close elements left open by malformed input so no nodes are lost.
         while let Some(el) = stack.pop() {
             attach(&mut roots, &mut stack, Node::Element(el));
         }
@@ -215,11 +213,9 @@ impl<'a> Parser<'a> {
             let mut el = element;
             let raw = self.read_raw_text(&tag);
             if !raw.is_empty() {
-                // `<title>`/`<textarea>` are escapable raw text (RCDATA): their
-                // character references are decoded just like ordinary element
-                // text, so `assert_text("title", "Tom & Jerry")` works against
-                // Maud's escaped `<title>Tom &amp; Jerry</title>`. `<script>`/
-                // `<style>` are true raw text and kept verbatim.
+                // `<title>`/`<textarea>` are RCDATA: entities are decoded, so
+                // `assert_text("title", "Tom & Jerry")` matches Maud's escaped
+                // `<title>Tom &amp; Jerry</title>`. `<script>`/`<style>` stay verbatim.
                 let text = if ESCAPABLE_RAW_TEXT_ELEMENTS.contains(&tag.as_str()) {
                     decode_entities(&raw)
                 } else {
@@ -237,7 +233,6 @@ impl<'a> Parser<'a> {
     fn handle_close_tag(&mut self, roots: &mut Vec<Node>, stack: &mut Vec<Element>) {
         self.pos += 2; // consume '</'
         let tag = self.read_name().to_ascii_lowercase();
-        // Skip to '>'.
         while self.pos < self.bytes.len() && self.bytes[self.pos] != b'>' {
             self.pos += 1;
         }
@@ -245,8 +240,7 @@ impl<'a> Parser<'a> {
             self.pos += 1; // consume '>'
         }
 
-        // Find the matching open element, closing any intervening unclosed
-        // elements (well-formed input closes the top of the stack).
+        // Close the matching open element and any unclosed elements above it.
         if let Some(idx) = stack.iter().rposition(|e| e.tag == tag) {
             while stack.len() > idx {
                 let el = stack.pop().expect("stack non-empty above idx");
@@ -284,7 +278,6 @@ impl<'a> Parser<'a> {
                 None | Some(b'>') => break,
                 Some(b'/') if self.peek_at(1) == Some(b'>') => break,
                 Some(b'/') => {
-                    // Stray slash; skip it.
                     self.pos += 1;
                     continue;
                 }
@@ -364,10 +357,8 @@ impl<'a> Parser<'a> {
                 return text;
             };
             let match_pos = search_from + rel;
-            // `</script` is only a real close tag when the matched name ends
-            // here — i.e. the next char is `>`, `/`, whitespace, or EOF. This
-            // prevents `</scripture>` inside a JS string from terminating a
-            // `<script>` block early.
+            // `</script` only closes the block when the name ends here (`>`, `/`,
+            // whitespace or EOF), so `</scripture>` inside a JS string does not.
             let after = self.input[match_pos + needle.len()..].chars().next();
             let is_close = match after {
                 None | Some('>' | '/') => true,
@@ -376,7 +367,6 @@ impl<'a> Parser<'a> {
             if is_close {
                 let text = self.input[start..match_pos].to_string();
                 self.pos = match_pos;
-                // Consume the closing tag through '>'.
                 while self.pos < self.bytes.len() && self.bytes[self.pos] != b'>' {
                     self.pos += 1;
                 }
@@ -385,7 +375,6 @@ impl<'a> Parser<'a> {
                 }
                 return text;
             }
-            // False match (e.g. `</scripture`): keep scanning past it.
             search_from = match_pos + needle.len();
         }
     }
@@ -556,7 +545,6 @@ impl Complex {
         if !self.parts[n - 1].1.matches(el) {
             return false;
         }
-        // Match the remaining compounds against the ancestor chain.
         self.match_prefix(n - 1, ancestors)
     }
 
@@ -580,7 +568,7 @@ impl Complex {
                 target.matches(parent) && self.match_prefix(idx - 1, rest)
             }
             Combinator::Descendant => {
-                // Try each ancestor from nearest to farthest, backtracking.
+                // Nearest ancestor first, backtracking on failure.
                 (0..ancestors.len()).rev().any(|k| {
                     target.matches(ancestors[k]) && self.match_prefix(idx - 1, &ancestors[..k])
                 })
@@ -802,9 +790,8 @@ fn parse_compound(input: &str, full: &str) -> Result<Compound, String> {
                 compound.attrs.push(pred);
             }
             ':' => {
-                // Pseudo-classes/elements are out of scope; reject rather than
-                // folding `:` into a tag/class identifier (which would let a
-                // typo like `.flash:first-child` silently match `.flash`).
+                // Pseudo-classes are unsupported. Rejecting them stops
+                // `.flash:first-child` from silently matching `.flash`.
                 return Err(format!(
                     "pseudo-classes/elements are not supported in selector `{full}`"
                 ));
@@ -830,7 +817,6 @@ fn parse_attr_pred(chars: &[char], i: &mut usize, full: &str) -> Result<AttrPred
         return Err(format!("empty attribute name in selector `{full}`"));
     }
     skip_ws(chars, i);
-    // Determine the operator.
     let op_kind = match chars.get(*i) {
         Some(']') => {
             *i += 1;
@@ -901,8 +887,7 @@ fn read_ident(chars: &[char], i: &mut usize) -> String {
 }
 
 const fn is_ident_char(c: char) -> bool {
-    // Note: `:` is intentionally excluded so pseudo-classes (`tr:first-child`)
-    // are rejected rather than folded into a tag/class/id name.
+    // `:` is excluded so pseudo-classes are rejected, not folded into a name.
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_')
 }
 
@@ -1067,8 +1052,7 @@ mod tests {
 
     #[test]
     fn escapable_raw_text_decodes_entities_but_script_stays_verbatim() {
-        // `<title>`/`<textarea>` are RCDATA: their entities are decoded, like
-        // ordinary element text — matching Maud's escaped output.
+        // `<title>`/`<textarea>` are RCDATA: entities are decoded, matching Maud's escaped output.
         let title = parse("<title>Tom &amp; Jerry</title>");
         let Node::Element(el) = &title[0] else {
             panic!("expected element");
@@ -1120,8 +1104,7 @@ mod tests {
 
     #[test]
     fn repeated_ids_must_match_all() {
-        // A compound with two distinct ids matches nothing (it must satisfy
-        // both), rather than silently using the last id.
+        // A compound with two distinct ids must satisfy both, not just the last.
         let html = r#"<div id="go">x</div>"#;
         assert_eq!(count(html, "#go"), 1);
         assert_eq!(count(html, "#missing#go"), 0);
@@ -1134,7 +1117,6 @@ mod tests {
         // make `assert_no_selector`-style checks pass when a `.flash` exists.
         let html = r#"<div class="flash">oops</div>"#;
         assert!(SelectorList::parse(".flash:first-child").is_err());
-        // The plain class selector still matches as expected.
         assert_eq!(count(html, ".flash"), 1);
     }
 
@@ -1153,18 +1135,16 @@ mod tests {
             </div>
         "#;
         assert_eq!(count(html, ".foo > .bar span"), 1);
-        // Sanity: the child combinator itself still rejects a too-deep parent.
+        // The child combinator still rejects a too-deep parent.
         assert_eq!(count(html, ".foo > span"), 0);
     }
 
     #[test]
     fn raw_text_close_tag_requires_name_boundary() {
-        // A `</scripture>` substring inside a JS string must not terminate the
-        // `<script>` block early and resume markup parsing.
         let html = r#"<div><script>var s = "</scripture><b>x</b>";</script><p>after</p></div>"#;
         // The `<b>` lives inside the script string, so it is not an element.
         assert_eq!(count(html, "b"), 0);
-        // Only the real `<p>` after the (correctly closed) script is seen.
+        // The script closed at the real `</script>`, so `<p>` is a child of the div.
         assert_eq!(count(html, "div > p"), 1);
         let roots = parse(html);
         let scripts = SelectorList::parse("script").unwrap();

@@ -87,7 +87,7 @@ pub struct Document {
     pub id: i64,
     pub title: String,
     pub score: i64,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 fn main() {}

@@ -116,9 +116,9 @@ pub struct RememberRecord {
     /// When the **current** token was minted (i.e. the moment of the last
     /// rotation). Combined with the grace duration this bounds how long the
     /// [`previous_token_hash`](Self::previous_token_hash) stays acceptable.
-    pub rotated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub rotated_at: Option<crate::time::Timestamp>,
     /// Absolute expiry of this series.
-    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: crate::time::Timestamp,
 }
 
 /// Outcome of evaluating a presented remember cookie against the stored record.
@@ -184,8 +184,6 @@ pub fn hash_remember_token(token: &str) -> String {
 /// without early-exit so timing does not leak how many leading bytes matched.
 #[must_use]
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // `subtle::ConstantTimeEq` folds the whole slice into a single Choice with
-    // no data-dependent branches.
     use subtle::ConstantTimeEq as _;
     if a.len() != b.len() {
         return false;
@@ -265,13 +263,13 @@ pub fn build_remember_clear_cookie(config: &RememberConfig) -> String {
 /// truth for callers (e.g. the generated middleware).
 pub const DEFAULT_ROTATION_GRACE_SECS: i64 = 60;
 
-/// The default rotation grace window as a [`chrono::Duration`].
+/// The default rotation grace window as a [`SignedDuration`](crate::time::SignedDuration).
 ///
 /// Convenience wrapper over [`DEFAULT_ROTATION_GRACE_SECS`] so callers share one
 /// source of truth for the grace window.
 #[must_use]
-pub const fn default_rotation_grace() -> chrono::Duration {
-    chrono::Duration::seconds(DEFAULT_ROTATION_GRACE_SECS)
+pub const fn default_rotation_grace() -> crate::time::SignedDuration {
+    crate::time::SignedDuration::from_secs(DEFAULT_ROTATION_GRACE_SECS)
 }
 
 /// Evaluate a presented remember token against the stored record for its series.
@@ -294,8 +292,8 @@ pub const fn default_rotation_grace() -> chrono::Duration {
 pub fn evaluate_remember(
     presented_token: &str,
     record: Option<&RememberRecord>,
-    now: chrono::DateTime<chrono::Utc>,
-    grace: chrono::Duration,
+    now: crate::time::Timestamp,
+    grace: crate::time::SignedDuration,
 ) -> RememberDecision {
     let Some(record) = record else {
         return RememberDecision::Reject;
@@ -308,7 +306,7 @@ pub fn evaluate_remember(
     }
     if let (Some(prev), Some(rotated_at)) = (&record.previous_token_hash, record.rotated_at)
         && verify_remember_token(presented_token, prev)
-        && now - rotated_at <= grace
+        && now.duration_since(rotated_at) <= grace
     {
         return RememberDecision::Accept;
     }
@@ -318,15 +316,15 @@ pub fn evaluate_remember(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
+    use crate::time::{SignedDuration, Timestamp};
 
-    fn ts(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(secs, 0).expect("valid timestamp")
+    fn ts(secs: i64) -> Timestamp {
+        Timestamp::from_second(secs).expect("valid timestamp")
     }
 
     /// A fixed 60-second grace window for the evaluation tests.
-    fn grace() -> chrono::Duration {
-        chrono::Duration::seconds(60)
+    fn grace() -> SignedDuration {
+        SignedDuration::from_secs(60)
     }
 
     #[test]
@@ -402,8 +400,6 @@ mod tests {
 
     #[test]
     fn evaluate_current_token_rotates_even_with_previous_present() {
-        // With a previous token recorded, the CURRENT token must still Rotate
-        // (not merely Accept).
         let current = "current-token";
         let record = RememberRecord {
             series: "series-1".to_owned(),
@@ -420,8 +416,7 @@ mod tests {
 
     #[test]
     fn evaluate_previous_token_within_grace_is_accept() {
-        // A benign concurrent request: it presents the just-rotated-out token,
-        // and we are still inside the grace window since the rotation.
+        // A benign concurrent request still holding the just-rotated-out token.
         let previous = "just-rotated-out";
         let record = RememberRecord {
             series: "series-1".to_owned(),
@@ -444,8 +439,6 @@ mod tests {
 
     #[test]
     fn evaluate_previous_token_after_grace_is_theft() {
-        // Same previous token, but the grace window has elapsed → genuine
-        // replay of a rotated-out token → Theft.
         let previous = "rotated-out-long-ago";
         let record = RememberRecord {
             series: "series-1".to_owned(),
@@ -478,8 +471,7 @@ mod tests {
 
     #[test]
     fn evaluate_unknown_token_with_previous_present_is_theft() {
-        // A token that matches neither current nor previous → Theft, even
-        // within the grace window.
+        // Matches neither current nor previous: Theft even within the grace window.
         let record = RememberRecord {
             series: "series-1".to_owned(),
             token_hash: hash_remember_token("current-token"),
@@ -495,8 +487,7 @@ mod tests {
 
     #[test]
     fn evaluate_wrong_token_no_previous_is_theft_not_accept() {
-        // A record with no previous token presenting a wrong token must be
-        // Theft — the Accept path requires a recorded previous hash.
+        // Accept requires a recorded previous hash, so this is Theft.
         let record = RememberRecord {
             series: "series-1".to_owned(),
             token_hash: hash_remember_token("the-current-token"),
@@ -533,7 +524,6 @@ mod tests {
             evaluate_remember(token, Some(&record), ts(1_000), grace()),
             RememberDecision::Reject
         );
-        // now strictly after expiry.
         assert_eq!(
             evaluate_remember(token, Some(&record), ts(1_001), grace()),
             RememberDecision::Reject
@@ -545,7 +535,7 @@ mod tests {
         assert_eq!(DEFAULT_ROTATION_GRACE_SECS, 60);
         assert_eq!(
             default_rotation_grace(),
-            chrono::Duration::seconds(DEFAULT_ROTATION_GRACE_SECS)
+            SignedDuration::from_secs(DEFAULT_ROTATION_GRACE_SECS)
         );
     }
 
@@ -615,9 +605,7 @@ mod tests {
     fn config_deserializes_partial_toml() {
         let config: RememberConfig =
             toml::from_str("duration_secs = 3600").expect("valid partial config");
-        // Overridden field takes effect...
         assert_eq!(config.duration_secs, 3_600);
-        // ...while the others fall back to their defaults.
         assert!(config.enabled);
         assert_eq!(config.cookie_name, "autumn.remember");
     }

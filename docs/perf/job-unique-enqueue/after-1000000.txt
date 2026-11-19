@@ -1,0 +1,93 @@
+psql:schema.sql:2: NOTICE:  table "autumn_jobs" does not exist, skipping
+=== fixture: hist=1000000, N=2000
+      name      | unique_window |  status   | count  
+----------------+---------------+-----------+--------
+ audit.export   |               | completed |  33620
+ audit.export   |               | failed    |   1060
+ billing.charge |               | completed |  40305
+ billing.charge |               | failed    |   1258
+ cleanup.tmp    |               | completed |  36636
+ cleanup.tmp    |               | failed    |   1147
+ digest.send    | running       | completed | 242367
+ digest.send    | running       | enqueued  |   3000
+ digest.send    | running       | failed    |   7400
+ index.update   |               | completed |  45777
+ index.update   |               | failed    |   1324
+ mail.deliver   |               | completed | 171704
+ mail.deliver   |               | failed    |   5293
+ report.build   | ttl           | completed |  97025
+ report.build   | ttl           | enqueued  |    300
+ report.build   | ttl           | failed    |   2982
+ sitemap.build  |               | completed |  31372
+ sitemap.build  |               | failed    |    978
+ sync.pull      | pending       | completed | 145651
+ sync.pull      | pending       | enqueued  |    500
+ sync.pull      | pending       | failed    |   4522
+ thumb.render   |               | completed |  54534
+ thumb.render   |               | failed    |   1730
+ webhook.send   |               | completed |  71140
+ webhook.send   |               | enqueued  |  20000
+ webhook.send   |               | failed    |   2175
+(26 rows)
+
+  heap  | heap_blocks 
+--------+-------------
+ 288 MB |       36906
+(1 row)
+
+=== workload
+pgbench: setting random seed to 3742
+number of transactions actually processed: 2000/2000
+number of failed transactions: 0 (0.000%)
+SQL script 1: /tmp/tmp.FIfQuKPUjW/plain.pgbench
+ - weight: 50 (targets 50.0% of total)
+ - number of failed transactions: 0 (0.000%)
+SQL script 2: /tmp/tmp.FIfQuKPUjW/running.pgbench
+ - weight: 25 (targets 25.0% of total)
+ - number of failed transactions: 0 (0.000%)
+SQL script 3: /tmp/tmp.FIfQuKPUjW/pending.pgbench
+ - weight: 15 (targets 15.0% of total)
+ - number of failed transactions: 0 (0.000%)
+SQL script 4: /tmp/tmp.FIfQuKPUjW/ttl.pgbench
+ - weight: 10 (targets 10.0% of total)
+ - number of failed transactions: 0 (0.000%)
+--- pg_stat_statements (workload) ---
+ calls | buffers |  hit  | read | rows | temp_blks_written | wal_bytes | pct_buffers | pct_calls |             stmt              
+-------+---------+-------+------+------+-------------------+-----------+-------------+-----------+-------------------------------
+  1006 |   19188 | 18181 | 1007 | 1006 |                 0 |   8905604 |        73.1 |      45.7 | insert plain
+   794 |    4966 |  4863 |  103 |  103 |                 0 |   1455912 |        18.9 |      36.1 | insert running/pending window
+   200 |    1528 |  1499 |   29 |   29 |                 0 |    446403 |         5.8 |       9.1 | insert ttl window
+   200 |     561 |   561 |    0 |    0 |                 0 |         0 |         2.1 |       9.1 | evict (ttl)
+     1 |       0 |     0 |    0 |    1 |                 0 |         0 |         0.0 |       0.0 | SELECT pg_current_wal_lsn()
+(5 rows)
+
+--- totals ---
+ calls | buffers | temp_blks_written | wal_bytes | lsn_wal_bytes 
+-------+---------+-------------------+-----------+---------------
+  2201 |   26243 |                 0 |  10807919 |      10892512
+(1 row)
+
+--- pg_stat_user_tables / indexes ---
+   relname   | seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_ins | n_tup_upd 
+-------------+----------+--------------+----------+---------------+-----------+-----------
+ autumn_jobs |        0 |            0 |     1326 |           163 |      1138 |         0
+(1 row)
+
+            indexrelname             | idx_scan | idx_tup_read | idx_tup_fetch 
+-------------------------------------+----------+--------------+---------------
+ autumn_jobs_pkey                    |        0 |            0 |             0
+ idx_autumn_jobs_concurrency_running |        0 |            0 |             0
+ idx_autumn_jobs_enqueued_dashboard  |        0 |            0 |             0
+ idx_autumn_jobs_queue_name_ready    |        0 |            0 |             0
+ idx_autumn_jobs_queue_ready         |        0 |            0 |             0
+ idx_autumn_jobs_ready               |        0 |            0 |             0
+ idx_autumn_jobs_stale_recovery      |        0 |            0 |             0
+ idx_autumn_jobs_status_finished     |        0 |            0 |             0
+ idx_autumn_jobs_unique_inflight     |     1126 |          852 |           163
+ idx_autumn_jobs_unique_key_enqueued |      200 |          171 |             0
+(10 rows)
+
+=== end state
+rows: 1024978
+unique holds by name/window/status: digest.send/running/enqueued=72, report.build/ttl/enqueued=29, sync.pull/pending/enqueued=31
+evicted ttl holds (fixture rows): 0

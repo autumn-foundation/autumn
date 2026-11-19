@@ -21,7 +21,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use chrono::{DateTime, Utc};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_query;
@@ -32,6 +31,7 @@ use serde::de::DeserializeOwned;
 
 use super::SyncError;
 use super::protocol::{Change, ChangeOutcome, Op, RemoteRow, Version};
+use crate::time::Timestamp;
 
 const SCHEMA_DDL: &str = "
 CREATE TABLE IF NOT EXISTS autumn_sync_rows (
@@ -129,10 +129,8 @@ struct PendingRecord {
     updated_at: String,
 }
 
-fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, SyncError> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(store_err)
+fn parse_timestamp(value: &str) -> Result<Timestamp, SyncError> {
+    value.parse::<Timestamp>().map_err(store_err)
 }
 
 fn get_state(conn: &mut SqliteConnection, key: &str) -> Result<Option<String>, SyncError> {
@@ -214,7 +212,7 @@ fn replace_pending(
     .bind::<Nullable<Text>, _>(payload)
     .bind::<BigInt, _>(base_version)
     .bind::<Text, _>(updated_at)
-    .bind::<Text, _>(crate::time::ambient_now().to_rfc3339())
+    .bind::<Text, _>(crate::time::compat::rfc3339(crate::time::ambient_now()))
     .execute(conn)
     .map(|_| ())
 }
@@ -261,7 +259,7 @@ fn upsert_remote_row(
         payload.as_deref(),
         row.version,
         row.deleted,
-        &row.updated_at.to_rfc3339(),
+        &crate::time::compat::rfc3339(row.updated_at),
     )
 }
 
@@ -429,12 +427,9 @@ impl SyncStore {
         // instead of failing with "database is locked".
         conn.batch_execute("PRAGMA busy_timeout = 5000;")
             .map_err(store_err)?;
-        // Converting a database into WAL mode needs a moment of exclusive
-        // access, and SQLite returns SQLITE_BUSY for that WITHOUT
-        // consulting the busy handler when another connection holds any
-        // lock (a deliberate deadlock-avoidance rule). Concurrent first
-        // opens of one file hit exactly this, so retry the conversion +
-        // schema DDL briefly instead of failing the open.
+        // Switching to WAL needs brief exclusive access, and SQLite returns SQLITE_BUSY for it
+        // without consulting the busy handler while another connection holds a lock. Concurrent
+        // first opens hit this, so retry the conversion and schema DDL briefly.
         let mut attempts = 0_u32;
         loop {
             let result = conn
@@ -454,11 +449,8 @@ impl SyncStore {
             }
         }
 
-        // Race-safe first-open id generation: concurrent opens of a fresh
-        // file each offer a candidate id, exactly one INSERT wins
-        // (`DO NOTHING` on conflict), and every opener reads back the
-        // winning value — no instance can end up caching a device id that
-        // was never persisted.
+        // Concurrent first opens each offer a candidate id; one INSERT wins and every opener reads
+        // back the winner, so no instance caches a device id that was never persisted.
         sql_query(
             "INSERT INTO autumn_sync_state (key, value) VALUES (?, ?) \
              ON CONFLICT (key) DO NOTHING",
@@ -549,17 +541,15 @@ impl SyncStore {
         op: Op,
         payload: Option<&str>,
     ) -> Result<(), SyncError> {
-        let now = crate::time::ambient_now().to_rfc3339();
+        let now = crate::time::compat::rfc3339(crate::time::ambient_now());
         let op_name = match op {
             Op::Upsert => "upsert",
             Op::Delete => "delete",
         };
         let mut conn = self.lock()?;
-        // BEGIN IMMEDIATE: take the write lock up front so a concurrent
-        // writer on ANOTHER connection to the same file (a second
-        // SyncStore::open) makes this transaction queue on the busy
-        // timeout, instead of failing its read→write snapshot upgrade
-        // with SQLITE_BUSY_SNAPSHOT (which bypasses the busy handler).
+        // BEGIN IMMEDIATE takes the write lock up front, so a writer on another connection to the
+        // same file makes this queue on the busy timeout instead of failing the read-to-write
+        // upgrade with SQLITE_BUSY_SNAPSHOT, which bypasses the busy handler.
         conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
             let base_version = base_version_for(conn, collection, pk)?;
             let server_version = current_server_version(conn, collection, pk)?;
@@ -768,17 +758,14 @@ impl SyncStore {
                     ChangeOutcome::Applied { version }
                     | ChangeOutcome::AlreadyApplied { version } => {
                         record_acked_version(conn, &change.collection, &change.pk, *version)?;
-                        // A coalesced write made while this push was in
-                        // flight inherited this change's (now acked) base —
-                        // re-base it so it doesn't false-conflict against
-                        // our own acknowledged write.
+                        // A write coalesced while this push was in flight inherited its base;
+                        // re-base it so it does not conflict with our own acked write.
                         rebase_surviving_pending(conn, change, *version)?;
                     }
                     ChangeOutcome::Resolved { row } => {
                         if has_pending(conn, &row.collection, &row.pk)? {
-                            // Read-your-writes: keep the newer local
-                            // payload; just record the resolved version so
-                            // future (post-journal) writes base correctly.
+                            // Read-your-writes: keep the newer local payload, but record the
+                            // resolved version so later writes base on it.
                             record_acked_version(conn, &row.collection, &row.pk, row.version)?;
                         } else {
                             upsert_remote_row(conn, row)?;
@@ -874,10 +861,8 @@ impl SyncStore {
         let mut conn = self.lock()?;
         conn.immediate_transaction::<_, diesel::result::Error, _>(|conn| {
             let applied = apply_remote_rows_inner(conn, rows)?;
-            // Drop synced rows the snapshot no longer contains (their
-            // deletions may have been tombstone-GC'd server-side). Rows
-            // with a pending journal entry are preserved — unsynced local
-            // writes always survive and get replayed.
+            // Drop synced rows the snapshot no longer contains (their tombstones may be GC'd
+            // server-side). Rows with a pending journal entry survive and get replayed.
             let snapshot_keys: std::collections::HashSet<(&str, &str)> = rows
                 .iter()
                 .map(|row| (row.collection.as_str(), row.pk.as_str()))
@@ -933,7 +918,6 @@ impl SyncStore {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
     use serde_json::json;
 
     use super::*;
@@ -951,7 +935,7 @@ mod tests {
             payload: (!deleted).then(|| json!({"title": format!("server v{version}")})),
             version,
             deleted,
-            updated_at: Utc::now(),
+            updated_at: crate::time::ambient_now(),
             device_id: "server-device".to_owned(),
         }
     }
@@ -1029,11 +1013,9 @@ mod tests {
         assert_eq!(store.cursor().expect("cursor"), 5);
         assert_eq!(store.pending_count().expect("pending"), 1);
 
-        // A DIFFERENT identity resets the cache: rows, the pending outbox
-        // (the outgoing account's edits must not replay as the new one),
-        // and the cursor (versions are one global sequence across scopes,
-        // so an inherited higher cursor would skip the new account's own
-        // rows). The device id identifies the installation and survives.
+        // A different identity resets rows, the outbox (the old account's edits must not replay as
+        // the new one) and the cursor (versions are global, so an inherited cursor would skip the
+        // new account's rows). The device id identifies the installation and survives.
         store.set_identity("user:bob").expect("bind bob");
         assert_eq!(store.cursor().expect("cursor"), 0, "cursor reset");
         assert_eq!(store.pending_count().expect("pending"), 0, "outbox reset");
@@ -1144,12 +1126,9 @@ mod tests {
 
     #[test]
     fn clean_ack_rebases_the_surviving_coalesced_write() {
-        // The user edits the row while a clean push is in flight: the
-        // journal coalesces to a NEW change_id that inherited the in-flight
-        // change's base_version (0). After the server acks Applied, the
-        // survivor must be re-based onto the acked version — pushing the
-        // stale base would false-conflict against this device's own
-        // acknowledged write (wrong under non-LWW resolvers).
+        // An edit during a clean push coalesces to a new change_id that inherits base_version 0.
+        // After the Applied ack it must be re-based onto the acked version, or it would conflict
+        // with this device's own write under non-LWW resolvers.
         let (_dir, store) = open_temp();
         store
             .put("notes", "n1", &json!({"title": "pushed"}))
@@ -1239,11 +1218,9 @@ mod tests {
 
     #[test]
     fn null_documents_round_trip_through_journal_rows_and_pulls() {
-        // `put(&None::<T>)` stores the JSON document `null` — TEXT 'null'
-        // in the payload column, distinct from the SQL NULL a delete
-        // writes. The journal must surface it as Some(Value::Null) (a
-        // PRESENT payload the server accepts), reads must see the row, and
-        // a pulled remote row with a null payload must materialize.
+        // `put(&None::<T>)` stores TEXT 'null', distinct from the SQL NULL a delete writes. The
+        // journal must carry it as `Some(Value::Null)`, reads must see the row, and a pulled row
+        // with a null payload must materialize.
         let (_dir, store) = open_temp();
         store
             .put("notes", "opt", &None::<String>)
@@ -1262,8 +1239,7 @@ mod tests {
             Some(serde_json::Value::Null),
             "a null document is a present row"
         );
-        // A DELETE journals an absent payload — the distinction the
-        // TEXT-'null'-vs-column-NULL storage preserves.
+        // A delete journals an absent payload.
         store.delete("notes", "opt").expect("delete");
         let pending = store.pending_changes(10).expect("pending");
         assert_eq!(pending[0].op, Op::Delete);
@@ -1316,9 +1292,7 @@ mod tests {
             .apply_remote_rows(&[remote_row("notes", "n1", 4, false)])
             .expect("apply");
         assert!(store.has_synced_rows().expect("synced row"));
-        // Reconciling against an empty snapshot clears it (the pending
-        // write survives) — the shape `SyncEngine::resync_from_snapshot`
-        // lands after fetching a full snapshot.
+        // Reconciling against an empty snapshot clears it; the pending write survives.
         store.reconcile_snapshot(&[], 0).expect("reconcile");
         assert!(!store.has_synced_rows().expect("after reconcile"));
         assert_eq!(store.pending_count().expect("count"), 1);
@@ -1386,7 +1360,6 @@ mod tests {
             ids.windows(2).all(|w| w[0] == w[1]),
             "every concurrent opener must see the same persisted device id: {ids:?}"
         );
-        // And a reopen still agrees.
         let reopened = SyncStore::open(&path).expect("reopen");
         assert_eq!(reopened.device_id().expect("device id"), ids[0]);
     }

@@ -1,0 +1,5 @@
+error: tag 1 is also on field `id`; give each field its own tag
+ --> tests/compile-fail/wire_shape_tag_clash.rs:9:18
+  |
+9 |     #[wire(tag = 1)]
+  |                  ^

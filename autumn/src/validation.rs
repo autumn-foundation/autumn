@@ -243,15 +243,11 @@ fn validation_errors_to_autumn_error(errors: &validator::ValidationErrors) -> cr
 
 // ── Conditional validation (autoref specialization) ─────────────
 //
-// The `#[repository(api = ...)]` macro needs to validate a decoded write
-// payload *only when its type implements `validator::Validate`* — the
-// generated `NewModel` derives `Validate` solely when the model declares
-// `#[validate(...)]` rules, and a hand-written `NewModel` may not implement
-// it at all. Rust has no stable negative/​specialization reasoning, so we use
-// autoref-based specialization (Kalbertodt/dtolnay): a value that implements
-// `Validate` resolves to the real validating impl (fewer autorefs), while
-// everything else falls through to a no-op. This keeps existing repositories
-// compiling with zero migration burden.
+// The `#[repository(api = ...)]` macro validates a decoded write payload only when its type
+// implements `validator::Validate`: a generated `NewModel` derives it only when the model declares
+// `#[validate(...)]` rules, and a hand-written one may not. Stable Rust has no specialization, so
+// autoref specialization picks the validating impl when `Validate` is implemented and a no-op
+// otherwise.
 
 /// Wrapper carrying a reference to a candidate write payload for the autoref
 /// specialization used by the generated API write handlers.
@@ -342,10 +338,8 @@ mod tests {
 
     #[test]
     fn update_patch_field_validates_via_derive() {
-        // #1719: a generated `UpdateModel` derives `validator::Validate` and
-        // carries `#[validate(...)]` on `Patch<T>` fields. A `Set` value runs
-        // the rule (and surfaces a per-field error keyed by the field name),
-        // while an absent (`Unchanged`/`Clear`) field is skipped.
+        // #1719: a generated `UpdateModel` carries `#[validate(...)]` on `Patch<T>` fields. A `Set`
+        // value runs the rule; an `Unchanged` field is skipped.
         use crate::hooks::Patch;
 
         #[derive(validator::Validate)]
@@ -354,7 +348,6 @@ mod tests {
             title: Patch<String>,
         }
 
-        // `Set("")` violates `length(min = 1)` → 422-shaped field error map.
         let bad = UpdatePost {
             title: Patch::Set(String::new()),
         };
@@ -363,13 +356,11 @@ mod tests {
         assert!(map.contains_key("title"));
         assert_eq!(map["title"][0], "validation failed: length");
 
-        // Absent field → rule skipped → passes.
         let unchanged = UpdatePost {
             title: Patch::Unchanged,
         };
         assert!(validator::Validate::validate(&unchanged).is_ok());
 
-        // `Set` with a satisfying value → passes.
         let good = UpdatePost {
             title: Patch::Set("hello".into()),
         };
@@ -455,7 +446,6 @@ mod tests {
     #[test]
     fn validation_errors_to_map_fallback_message() {
         let mut errors = validator::ValidationErrors::new();
-        // Create an error with no custom message
         let error = validator::ValidationError::new("custom_code");
         errors.add("my_field", error);
 
@@ -493,8 +483,6 @@ mod tests {
     // repository macro emits: both traits in scope, explicit leading borrow.
     #[allow(clippy::needless_borrow, unused_imports)]
     fn maybe_validate_runs_for_validate_types() {
-        // Autoref specialization: a type implementing `Validate` resolves to
-        // the real validating branch and surfaces a 422 on failure.
         use super::{MaybeValidate, MaybeValidateFallback as _, MaybeValidateViaValidator as _};
 
         #[derive(validator::Validate)]
@@ -523,12 +511,9 @@ mod tests {
     #[test]
     #[allow(clippy::needless_borrow, unused_imports)]
     fn maybe_validate_survives_an_extra_borrow() {
-        // #2586: the repository insert path holds its payload as `&New*`. An
-        // extra borrow makes `T` a reference type, which reaches the validating
-        // arm only through `validator`'s blanket `impl<T: Validate> Validate
-        // for &T`. Both forms must validate — if that blanket impl ever goes,
-        // the wrapped-reference form silently starts accepting everything, and
-        // this is what catches it.
+        // #2586: the repository insert path holds its payload as `&New*`. With an extra borrow `T`
+        // is a reference, which reaches the validating arm only through `validator`'s blanket
+        // `impl<T: Validate> Validate for &T`. Without that impl it would silently accept anything.
         use super::{MaybeValidate, MaybeValidateFallback as _, MaybeValidateViaValidator as _};
 
         #[derive(validator::Validate)]
@@ -554,8 +539,6 @@ mod tests {
     #[test]
     #[allow(clippy::needless_borrow, unused_imports)]
     fn maybe_validate_is_noop_for_non_validate_types() {
-        // Autoref specialization: a type that does NOT implement `Validate`
-        // falls through to the no-op branch and compiles + always succeeds.
         use super::{MaybeValidate, MaybeValidateFallback as _, MaybeValidateViaValidator as _};
 
         struct NoRules {

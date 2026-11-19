@@ -641,6 +641,66 @@ impl ContractsPassArgs {
     }
 }
 
+/// The schema options of `autumn contracts export`: `--proto` or `--avro`.
+// Each bool is one CLI flag.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[command(group(clap::ArgGroup::new("schema").args(["proto", "avro"])))]
+pub struct ContractsSchemaArgs {
+    /// Write protobuf schemas to `--out <DIR>` instead of the bundle.
+    #[arg(long, requires = "out")]
+    proto: bool,
+    /// The lock file of protobuf field numbers. Commit it. The default is
+    /// `proto.lock` beside the `--out` directory.
+    #[arg(long, value_name = "PATH", requires = "proto")]
+    lock: Option<PathBuf>,
+    /// Write nothing. Exit 1 when the lock or a schema file would change.
+    #[arg(long, requires = "schema")]
+    check: bool,
+    /// Add `google.api.http` options to each rpc.
+    #[arg(long, requires = "proto")]
+    http_annotations: bool,
+    /// Map a `date-time` string to `google.protobuf.Timestamp`.
+    #[arg(long, requires = "proto")]
+    well_known_types: bool,
+    /// Write Avro schemas (`.avsc`) to `--out <DIR>`: one per event topic.
+    #[arg(
+        long,
+        requires = "out",
+        conflicts_with_all = ["proto", "lock", "http_annotations", "well_known_types"]
+    )]
+    avro: bool,
+    /// With `--avro`, also write the request and response body of each
+    /// endpoint.
+    #[arg(long, requires = "avro")]
+    endpoints: bool,
+}
+
+impl ContractsSchemaArgs {
+    fn into_proto(self) -> Option<contracts::ProtoArgs> {
+        self.proto.then_some(contracts::ProtoArgs {
+            lock: self.lock,
+            check: self.check,
+            options: contracts::proto::ProtoOptions {
+                http_annotations: self.http_annotations,
+                well_known_types: self.well_known_types,
+            },
+        })
+    }
+
+    const fn to_avro(&self) -> Option<contracts::AvroArgs> {
+        if !self.avro {
+            return None;
+        }
+        Some(contracts::AvroArgs {
+            check: self.check,
+            options: contracts::avro::AvroOptions {
+                endpoints: self.endpoints,
+            },
+        })
+    }
+}
+
 /// Subcommands for `autumn contracts`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum ContractsSubcommands {
@@ -649,14 +709,24 @@ pub enum ContractsSubcommands {
     /// Runs a dedicated `cargo check` pass, so a cached build cannot leave a
     /// descriptor out. The bundle is sorted JSON. Two exports of the same
     /// source give the same bytes. Store it with each release.
+    ///
+    /// With `--proto`, write protobuf schemas for consumers outside the
+    /// workspace instead: one file per service, one per crate for events,
+    /// and a `buf.yaml`. The lock file keeps each field number.
+    ///
+    /// With `--avro`, write one Avro schema per event topic instead.
+    /// `--endpoints` adds the request and response bodies.
     Export {
-        /// Write the bundle to this file. The default is stdout.
+        /// Write the bundle to this file. The default is stdout. With
+        /// `--proto` or `--avro`, write the schema files to this directory.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
-        /// Join the descriptors already in this directory. No build runs,
-        /// and there is no dependency graph.
-        #[arg(long, value_name = "DIR")]
+        /// Use this bundle file, or join the descriptors in this directory.
+        /// No build runs, and there is no dependency graph.
+        #[arg(long, value_name = "BUNDLE|DIR")]
         from: Option<PathBuf>,
+        #[command(flatten)]
+        proto: ContractsSchemaArgs,
         #[command(flatten)]
         pass: ContractsPassArgs,
     },
@@ -1110,7 +1180,7 @@ fn run_plugin_index(action: IndexSubcommands) -> i32 {
                 reports.iter().map(std::path::PathBuf::from).collect();
             let inspects: Vec<std::path::PathBuf> =
                 inspects.iter().map(std::path::PathBuf::from).collect();
-            let today = chrono::Local::now().date_naive().to_string();
+            let today = jiff::ZonedDateTime::now().date().to_string();
             plugin::curate::run_record(&plugin::curate::RecordOptions {
                 index: std::path::Path::new(&index),
                 reports: &reports,
@@ -2055,7 +2125,9 @@ enum Commands {
     ///   bool                         (BOOLEAN)
     ///   f32, f64                     (REAL, DOUBLE PRECISION)
     ///   Uuid                         (UUID)
-    ///   `NaiveDateTime`, `DateTime`      (TIMESTAMP, TIMESTAMPTZ)
+    ///   `CivilDateTime`, `NaiveDateTime` (TIMESTAMP, `civil::DateTime`)
+    ///   Timestamp, `DateTime`          (TIMESTAMPTZ, `Timestamp`)
+    ///   Date                         (DATE, `civil::Date`)
     ///   `Vec<u8>`, Bytea               (BYTEA)
     ///   decimal{precision,scale}     (NUMERIC, default {12,2})
     ///   Option<...>                  (any of the above, nullable)
@@ -2673,8 +2745,10 @@ enum Commands {
         #[arg(long = "target", value_name = "PATH")]
         targets: Vec<String>,
         /// Seed for the request profile, so a calibration is replayable.
+        /// At most 9223372036854775807: the contract is TOML, and that is its
+        /// largest integer.
         /// [default: 1733; with --check, the committed contract's own seed]
-        #[arg(long, value_name = "SEED")]
+        #[arg(long, value_name = "SEED", value_parser = clap::value_parser!(u64).range(..=i64::MAX.cast_unsigned()))]
         seed: Option<u64>,
         /// Concurrency ladder to walk (comma-separated).
         /// [default: 1,2,4,8,16,32,64; with --check, the committed ladder]
@@ -4672,8 +4746,9 @@ enum DeployMaintenanceCommands {
 enum GenerateCommands {
     /// Generate a `#[model]` struct, Diesel migration, and schema entry.
     ///
-    /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, `NaiveDateTime`,
-    /// `DateTime`, `Vec<u8>`/Bytea, Attachment, references, `enum{a,b,...}`, `Option<...>`.
+    /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, Timestamp
+    /// (alias `DateTime`), `CivilDateTime` (alias `NaiveDateTime`), Date,
+    /// `Vec<u8>`/Bytea, Attachment, references, `enum{a,b,...}`, `Option<...>`.
     ///
     /// `field:references` scaffolds a foreign key: a `field_id BIGINT` column
     /// with a `REFERENCES <table>(id)` constraint and an index, where `<table>`
@@ -5353,8 +5428,9 @@ enum GenerateCommands {
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
     ///
-    /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, `NaiveDateTime`,
-    /// `DateTime`, `Vec<u8>`/Bytea, Attachment, references, `enum{a,b,...}`, `Option<...>`.
+    /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, Timestamp
+    /// (alias `DateTime`), `CivilDateTime` (alias `NaiveDateTime`), Date,
+    /// `Vec<u8>`/Bytea, Attachment, references, `enum{a,b,...}`, `Option<...>`.
     ///
     /// `field:references` scaffolds a foreign key (`field_id BIGINT
     /// REFERENCES <table>(id)` plus an index), e.g.
@@ -5597,7 +5673,7 @@ fn run_command(command: Commands) {
                 // Forwarded to the app binary via `AUTUMN_ROLE`. `None` lets
                 // the child pick its default (combined) or read its own env.
                 role,
-                // Forwarded via `AUTUMN_JOBS__PIN` (#1623, AC3).
+                // Forwarded via `AUTUMN_JOBS__PIN` (#1623).
                 pin: normalize_pin(&pin),
             };
             if let Some(service_action) = service_action {
@@ -5614,10 +5690,8 @@ fn run_command(command: Commands) {
             profile,
             wait,
         } => {
-            // `new` and `check-collisions` are pure filesystem/git operations
-            // with no database target — handle them before the DB-target
-            // resolution below, which every other `MigrateCommands` variant
-            // needs.
+            // `new` and `check-collisions` touch only files and git, so they run before the
+            // database target is resolved.
             match &action {
                 Some(MigrateCommands::New { name }) => {
                     migrate::versions::run_new(name);
@@ -5880,9 +5954,9 @@ fn run_command(command: Commands) {
                     );
                     std::process::exit(1);
                 }
-                // AC #6: every `--with` name is resolved and version-checked
-                // BEFORE the scaffold writes a byte, so a typo or an
-                // incompatible plugin never leaves a half-built project behind.
+                // Every `--with` name is resolved and version-checked before the scaffold
+                // writes a byte, so a typo or an incompatible plugin never leaves a
+                // half-built project behind.
                 let plugins = resolve_scaffold_plugins(&with, None);
                 starters::run(
                     &name,
@@ -6169,11 +6243,18 @@ fn run_command(command: Commands) {
             });
         }
         Commands::Graph(command) => run_graph(command),
-        Commands::Contracts(ContractsSubcommands::Export { out, from, pass }) => {
+        Commands::Contracts(ContractsSubcommands::Export {
+            out,
+            from,
+            proto,
+            pass,
+        }) => {
             contracts::run_export(&contracts::ExportOptions {
                 out,
                 from,
                 pass: pass.into_pass(),
+                avro: proto.to_avro(),
+                proto: proto.into_proto(),
             });
         }
         Commands::Contracts(ContractsSubcommands::Check {
@@ -6882,8 +6963,8 @@ fn resolve_scaffold_plugins(
         eprintln!("autumn new: {err}");
         std::process::exit(1);
     });
-    // The trust review, before any file is written and before a refusal, so
-    // a refused listing still shows its facts (#1625, AC 6).
+    // The trust review runs before any file is written and before a refusal, so
+    // a refused listing still shows its facts (#1625).
     let mut shown: Vec<String> = Vec::new();
     for name in names {
         let standing = plugin::standing(&loaded.index, name);
@@ -7257,12 +7338,10 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             force,
         } => {
             // Precedence: CLI --id > [generate] id in autumn.generate.toml > BigSerial.
-            // The CLI flag is parsed first and wins outright, so a valid --id
-            // overrides a stale or invalid project default rather than being
-            // blocked by it.
+            // A valid --id wins outright, so a stale or invalid project default cannot
+            // block it.
             let id_type = id.as_deref().map_or_else(
                 || {
-                    // No CLI --id: fall back to the auto-discovered project default.
                     let auto_cfg = std::env::current_dir()
                         .unwrap_or_default()
                         .join(generate::config::GENERATE_CONFIG_FILENAME);
@@ -7292,10 +7371,9 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 ..Default::default()
             };
             let timestamp = generate::timestamp_now();
-            // `destroy model` recomputes the plan it is about to revert, so it
-            // must not be blocked by generation-only semantic checks: a model
-            // created before those checks existed still has to be removable, and
-            // the refusal would land before `Plan::revert` ever sees `--force`.
+            // `destroy model` skips the generation-only semantic checks: a model created
+            // before those checks existed must stay removable, and a refusal would land
+            // before `Plan::revert` ever sees `--force`.
             let project_root = std::env::current_dir().unwrap_or_default();
             let plan = match mode {
                 ApplyMode::Generate => generate::model::plan_model_with_options(
@@ -7331,15 +7409,10 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 &timestamp,
                 &unique,
             );
-            // `plan_migration_with_options` needs the model's `#[searchable]`
-            // config to render `AddSearchTo<Table>`'s SQL — meaningless (and
-            // an error) once the model is already gone. A common cleanup
-            // order like `destroy model Post` then `destroy migration
-            // AddSearchToPosts` would otherwise strand the migration
-            // directory, since the failure happens before `Plan::revert`
-            // ever sees `--force` (issue #1048 PR review). Fall back to a
-            // suffix-only removal plan in destroy mode when the real plan
-            // can't be built.
+            // The real plan reads the model's `#[searchable]` config, which fails once the
+            // model is gone (`destroy model Post`, then `destroy migration
+            // AddSearchToPosts`). Destroy falls back to a suffix-only removal plan so the
+            // migration directory is not stranded (#1048).
             let plan = if mode == ApplyMode::Destroy && plan.is_err() {
                 generate::migration::plan_migration_destroy_fallback(
                     &project_root,
@@ -7375,11 +7448,8 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             dry_run,
             force,
         } => {
-            // The SQLite generate-time rejection is generate-only: `destroy
-            // mailer` recomputes this same plan before reverting it, so the
-            // destroy path passes `for_revert` to skip the reject and let
-            // cleanup remove generated files on a SQLite app (mirrors the auth
-            // destroy path, which uses a distinct `_for_revert` builder).
+            // Destroy passes `for_revert` for symmetry with the other generators; the mailer
+            // plan no longer branches on it.
             let cwd = resolve_cwd();
             let plan = match mode {
                 ApplyMode::Generate => generate::mailer::plan_mailer(
@@ -7452,9 +7522,8 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let options = generate::webhook::WebhookOptions { path, secret_env };
             let project_root = resolve_cwd();
-            // `destroy` recovers a `--path`/`--secret-env` it was not given from
-            // the endpoint block `generate` recorded, so cleanup does not depend
-            // on the user repeating flags (issue #1366, Codex review).
+            // `destroy` recovers a `--path`/`--secret-env` it was not given from the
+            // endpoint block `generate` recorded, so the user need not repeat flags (#1366).
             let plan = match mode {
                 ApplyMode::Generate => {
                     generate::webhook::plan_webhook(&project_root, &provider, &name, &options)
@@ -7467,9 +7536,8 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 ),
             };
             apply_plan(plan, generate::Flags { dry_run, force }, mode);
-            // Printed after the file list, and only for a real generate run:
-            // `apply_plan` exits on failure, and neither a dry run nor a
-            // destroy has next steps to take (issue #1366 AC #5).
+            // Only a real generate run has next steps; `apply_plan` already exited on
+            // failure.
             if mode == ApplyMode::Generate
                 && !dry_run
                 && let Some(steps) = generate::webhook::next_steps(&provider, &name, &options)
@@ -7487,13 +7555,8 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         }
         GenerateCommands::Pwa { dry_run, force } => {
             let project_root = resolve_cwd();
-            // `plan_pwa` validates `src/main.rs`'s `layout()` arity — needed
-            // so a fresh generate never emits a call with the wrong shape,
-            // but irrelevant to destroy (which never consults that arity)
-            // and can wrongly block cleanup if `main.rs` no longer matches
-            // (issue #1048 PR review). Always use the destroy-only fallback
-            // for `ApplyMode::Destroy`; it produces the identical plan for
-            // every other case.
+            // `plan_pwa` validates the `layout()` arity in `src/main.rs`. Destroy does not
+            // need it, and it would block cleanup once `main.rs` no longer matches (#1048).
             let plan = match mode {
                 ApplyMode::Generate => generate::pwa::plan_pwa(&project_root),
                 ApplyMode::Destroy => generate::pwa::plan_pwa_destroy_fallback(&project_root),
@@ -7507,15 +7570,11 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let flags = generate::Flags { dry_run, force };
             let project_root = resolve_cwd();
-            // Mixed-mode guard (issue #1506): generating one Tauri mode over
-            // the other's files is rejected outright, even with --force —
-            // --force means "overwrite within the same mode", and the other
-            // mode's leftovers would actively break the new scaffold's build
-            // (stale capability files fail tauri-build validation on desktop;
-            // stale per-OS overlays keep running the sidecar staging scripts
-            // for a thin client). Destroy is exempt: `autumn destroy tauri
-            // [--remote-url <URL>]` is the documented remedy and must keep
-            // working on a mixed tree.
+            // Generating one Tauri mode over the other's files is rejected even with
+            // --force (#1506): the other mode's leftovers break the new build (stale
+            // capability files fail tauri-build on desktop; stale per-OS overlays run the
+            // sidecar staging scripts for a thin client). Destroy is exempt: it is the
+            // documented remedy for a mixed tree.
             let guard = if mode == ApplyMode::Generate {
                 generate::tauri::ensure_no_opposite_mode_scaffold(
                     &project_root,
@@ -7557,13 +7616,9 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             let flags = generate::Flags { dry_run, force };
             let opts = generate::tauri_mobile::TauriMobileOptions { offline_sync };
             let project_root = resolve_cwd();
-            // Mixed-mode guard (mirrors the `tauri` arm above): generating
-            // the mobile in-process shell over a desktop-sidecar or
-            // thin-client src-tauri/ is rejected outright, even with --force
-            // — the other mode's leftovers (per-OS overlay confs, staging
-            // scripts, capability files) actively break the mobile build.
-            // Destroy is exempt: it is the documented remedy and must keep
-            // working on a mixed tree.
+            // As in the `tauri` arm: generating the mobile shell over a desktop-sidecar or
+            // thin-client src-tauri/ is rejected even with --force, since the leftovers
+            // break the mobile build. Destroy is exempt.
             let guard = if mode == ApplyMode::Generate {
                 generate::tauri_mobile::ensure_no_other_mode_scaffold(&project_root)
             } else {
@@ -7598,12 +7653,8 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let oauth_options = generate::auth::AuthOAuthOptions { providers: oauth };
             let timestamp = generate::timestamp_now();
-            // `destroy auth` recomputes this same plan before reverting it. The
-            // shared-layout preflight in the plan builder is a generate-time
-            // guard only: running it on the destroy path would hard-fail cleanup
-            // in a project whose shared `pub fn layout` is missing or renamed,
-            // stranding the generated files (issue #1353 follow-up). Use the
-            // revert-only plan builder for `ApplyMode::Destroy`, which skips it.
+            // The shared-layout preflight is generate-only: on destroy it would fail
+            // cleanup when `pub fn layout` is missing or renamed (#1353).
             let plan = match mode {
                 ApplyMode::Generate => generate::auth::plan_auth_full_ex2(
                     &resolve_cwd(),
@@ -7652,13 +7703,9 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 ..Default::default()
             };
             let project_root = resolve_cwd();
-            // `plan_admin_with_options` reads `src/models/<name>.rs` to
-            // detect fields/encrypted columns for rendering — meaningless
-            // (and an error) once the model is gone. A common cleanup order
-            // like `destroy model Post` then `destroy admin Post` would
-            // otherwise fail before ever reaching `Plan::revert`, stranding
-            // `src/admin/post.rs` (issue #1048 PR review). Fall back to a
-            // model-independent plan in that specific case.
+            // `plan_admin_with_options` reads `src/models/<name>.rs`, which fails once the
+            // model is gone (`destroy model Post`, then `destroy admin Post`). Destroy falls
+            // back to a model-independent plan so `src/admin/post.rs` is not stranded (#1048).
             let model_missing = mode == ApplyMode::Destroy
                 && !project_root
                     .join("src")
@@ -7716,17 +7763,14 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             dry_run,
             force,
         } => {
-            // Resolve the scaffold config entry. Precedence for id_type:
-            //   CLI --id > [scaffold.X] id > [generate] id > BigSerial.
+            // id_type precedence: CLI --id > [scaffold.X] id > [generate] id > BigSerial.
             //
-            // An explicit --config opts into the full per-resource recipe and is
-            // treated strictly (a missing [scaffold.X] section is an error unless
-            // the file is a pure [generate] defaults file or the fields came from
-            // the CLI), preserving typo protection.
+            // An explicit --config is strict: a missing [scaffold.X] section is an error
+            // unless the file holds only [generate] defaults or the fields came from the CLI.
             //
-            // An auto-discovered autumn.generate.toml contributes ONLY the
-            // project-level [generate] defaults — a checked-in [scaffold.X]
-            // recipe must not silently change an ordinary CLI scaffold.
+            // An auto-discovered autumn.generate.toml contributes only its [generate]
+            // defaults, so a checked-in [scaffold.X] recipe cannot silently change a CLI
+            // scaffold.
             let cli_has_fields = !fields.is_empty();
             let exit_on_err = |result| match result {
                 Ok(e) => e,
@@ -7783,12 +7827,8 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 }
             };
             let timestamp = generate::timestamp_now();
-            // `destroy scaffold` recomputes this same plan before reverting it.
-            // The shared-layout preflight in the plan builder is a generate-time
-            // guard only: running it on the destroy path would hard-fail cleanup
-            // in a project whose shared `pub fn layout` is missing or renamed,
-            // stranding the generated files (issue #1834). Use the revert-only
-            // plan builder for `ApplyMode::Destroy`, which skips it.
+            // The shared-layout preflight is generate-only: on destroy it would fail
+            // cleanup when `pub fn layout` is missing or renamed (#1834).
             let plan = match mode {
                 ApplyMode::Generate => generate::scaffold::plan_scaffold_with_options(
                     &resolve_cwd(),
@@ -7815,14 +7855,10 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
         } => {
             let cwd = resolve_cwd();
             let flags = generate::Flags { dry_run, force };
-            // `plan_plugin` refuses a non-empty target directory unless
-            // `--force` — a generate-time collision guard that makes no
-            // sense in destroy mode, where the directory legitimately
-            // exists (holding the files this destroy is about to remove).
-            // Always bypass it when building the plan for destroy, while
-            // still passing the user's real `flags` to `revert` below so
-            // its own, per-file content-divergence check still applies
-            // (issue #1048 PR review).
+            // `plan_plugin` refuses a non-empty target directory without `--force`, but on
+            // destroy that directory holds the files being removed. Force only the plan;
+            // `revert` still gets the real `flags`, so its per-file divergence check
+            // applies (#1048).
             let plan_flags = match mode {
                 ApplyMode::Generate => flags,
                 ApplyMode::Destroy => generate::Flags {
@@ -8150,7 +8186,6 @@ mod tests {
 
     #[test]
     fn parse_new_list_starters_without_name() {
-        // `--list-starters` makes the positional name optional.
         let cli = Cli::try_parse_from(["autumn", "new", "--list-starters"]).unwrap();
         match cli.command {
             Commands::New {
@@ -8490,10 +8525,8 @@ mod tests {
 
     #[test]
     fn new_without_name_parses_with_name_none() {
-        // The positional name is optional at the clap level so `--list-starters`
-        // can run without one. When neither a name nor `--list-starters` is
-        // given, the requirement is enforced at dispatch (a clean runtime error),
-        // not by the parser.
+        // The name is optional to clap so `--list-starters` can run alone; dispatch
+        // rejects a run with neither.
         let cli = Cli::try_parse_from(["autumn", "new"]).unwrap();
         match cli.command {
             Commands::New {
@@ -8870,12 +8903,10 @@ mod tests {
 
     #[test]
     fn serve_flags_belong_to_serve_not_to_the_service_subcommand() {
-        // clap gives everything after a subcommand NAME to that subcommand, and
-        // `install-service` takes no arguments — so `serve install-service
-        // --bundled-pg` is a parse error, not a bundled install. The supported
-        // spelling puts the flag before the subcommand, exactly as `--pin` and
-        // `--role` already do for `restart`. Pinned here because the failure is
-        // silent in a script: exit 2 with a usage message.
+        // clap hands everything after a subcommand name to that subcommand, and
+        // `install-service` takes no arguments, so the flag must come before it (as
+        // `--pin` and `--role` do for `restart`). In a script the wrong order only
+        // shows as exit 2.
         let cli = Cli::try_parse_from(["autumn", "serve", "--bundled-pg", "install-service"])
             .expect("flags before the subcommand must parse");
         match cli.command {
@@ -10153,15 +10184,13 @@ mod tests {
 
     #[test]
     fn parse_seed_with_count_only() {
-        // `--count` declares `requires = "model"`, so clap rejects it at parse
-        // time when `--model` is absent. `resolve_fake_request` remains as a
-        // secondary run-time guard for callers that bypass clap.
+        // clap rejects `--count` without `--model`; `resolve_fake_request` re-checks
+        // for callers that bypass clap.
         assert!(Cli::try_parse_from(["autumn", "seed", "--count", "50"]).is_err());
     }
 
     #[test]
     fn parse_seed_with_model_only() {
-        // Symmetrically, `--model` requires `--count`.
         assert!(Cli::try_parse_from(["autumn", "seed", "--model", "Post"]).is_err());
     }
 
@@ -10639,13 +10668,102 @@ mod tests {
     fn parse_contracts_export_defaults_to_the_workspace_and_stdout() {
         let cli = Cli::try_parse_from(["autumn", "contracts", "export"]).expect("parses");
         match cli.command {
-            Commands::Contracts(ContractsSubcommands::Export { out, from, pass }) => {
+            Commands::Contracts(ContractsSubcommands::Export {
+                out,
+                from,
+                proto,
+                pass,
+            }) => {
                 assert!(out.is_none());
                 assert!(from.is_none(), "the default runs the pass");
                 assert!(pass.package.is_empty());
+                assert!(
+                    proto.into_proto().is_none(),
+                    "the default writes the bundle"
+                );
             }
             _ => panic!("expected contracts export"),
         }
+    }
+
+    #[test]
+    fn parse_contracts_export_proto_with_its_options() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "contracts",
+            "export",
+            "--proto",
+            "--out",
+            "contracts/proto",
+            "--check",
+            "--http-annotations",
+            "--well-known-types",
+        ])
+        .expect("parses");
+        let Commands::Contracts(ContractsSubcommands::Export { proto, .. }) = cli.command else {
+            panic!("expected contracts export");
+        };
+        let proto = proto.into_proto().expect("proto");
+        assert_eq!(proto.lock, None, "the default is beside `--out`");
+        assert_eq!(
+            contracts::default_lock(std::path::Path::new("contracts/proto")),
+            PathBuf::from("contracts/proto.lock")
+        );
+        assert!(proto.check);
+        assert!(proto.options.http_annotations && proto.options.well_known_types);
+    }
+
+    #[test]
+    fn parse_contracts_export_avro_with_its_options() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "contracts",
+            "export",
+            "--avro",
+            "--out",
+            "contracts/avro",
+            "--endpoints",
+            "--check",
+        ])
+        .expect("parses");
+        let Commands::Contracts(ContractsSubcommands::Export { proto, out, .. }) = cli.command
+        else {
+            panic!("expected contracts export");
+        };
+        assert_eq!(out, Some(PathBuf::from("contracts/avro")));
+        let avro = proto.to_avro().expect("avro");
+        assert!(avro.check && avro.options.endpoints);
+        assert!(proto.into_proto().is_none(), "avro is not proto");
+    }
+
+    #[test]
+    fn parse_contracts_export_avro_needs_out_and_refuses_proto_options() {
+        for args in [
+            &["--avro"][..],
+            &["--avro", "--proto", "--out", "x"],
+            &["--endpoints", "--out", "x"],
+            &["--avro", "--lock", "x.lock", "--out", "x"],
+            &["--avro", "--http-annotations", "--out", "x"],
+            &["--check", "--out", "x"],
+        ] {
+            let mut argv = vec!["autumn", "contracts", "export"];
+            argv.extend(args);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn parse_contracts_export_proto_needs_out_and_its_options_need_proto() {
+        assert!(Cli::try_parse_from(["autumn", "contracts", "export", "--proto"]).is_err());
+        for flag in ["--check", "--http-annotations", "--well-known-types"] {
+            assert!(
+                Cli::try_parse_from(["autumn", "contracts", "export", flag]).is_err(),
+                "{flag} without --proto"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "contracts", "export", "--lock", "x.lock"]).is_err()
+        );
     }
 
     #[test]
@@ -10755,7 +10873,7 @@ mod tests {
                 assert!(args.features.is_empty());
                 assert!(!args.all_features);
                 assert!(!args.no_default_features);
-                // No flag keeps the debug build existing callers audit.
+                // Without a flag the audit uses the debug build.
                 assert!(!args.release);
                 assert!(args.profile.is_none());
             }
@@ -11449,9 +11567,7 @@ mod tests {
             } => {
                 assert_eq!(artifact, "hello.autumn-plugin");
                 assert_eq!(format, "text");
-                // No `--against`: reviewing an artifact on its own, not as an
-                // upgrade. The upgrade gate must not fire when nobody asked
-                // for it (issue #1632).
+                // Without `--against` the upgrade gate must not fire (#1632).
                 assert_eq!(against, None);
             }
             _ => panic!("expected plugin inspect"),
@@ -12261,7 +12377,6 @@ mod tests {
 
     #[test]
     fn parse_generate_scaffold_no_policy_flag() {
-        // Default: policy on.
         let cli = Cli::try_parse_from(["autumn", "generate", "scaffold", "Post", "title:String"])
             .unwrap();
         let Commands::Generate(GenerateCommands::Scaffold { no_policy, .. }) = cli.command else {
@@ -12269,7 +12384,6 @@ mod tests {
         };
         assert!(!no_policy, "policy is on by default");
 
-        // --no-policy opts out.
         let cli = Cli::try_parse_from([
             "autumn",
             "generate",
@@ -12287,7 +12401,6 @@ mod tests {
 
     #[test]
     fn parse_generate_scaffold_belongs_to_flag() {
-        // Default: flat scaffold, no parent.
         let cli = Cli::try_parse_from(["autumn", "generate", "scaffold", "Comment", "body:Text"])
             .unwrap();
         let Commands::Generate(GenerateCommands::Scaffold { belongs_to, .. }) = cli.command else {
@@ -12295,7 +12408,6 @@ mod tests {
         };
         assert_eq!(belongs_to, None, "flat scaffolds have no parent");
 
-        // `--belongs-to Post` binds the child to its parent resource.
         let cli = Cli::try_parse_from([
             "autumn",
             "generate",
@@ -12979,6 +13091,23 @@ mod tests {
         assert!((tolerance_p99 - capacity::DEFAULT_P99_TOLERANCE).abs() < f64::EPSILON);
     }
 
+    /// The contract is TOML, and a TOML integer is a signed 64-bit number.
+    #[test]
+    fn parse_calibrate_refuses_a_seed_above_the_toml_integer_range() {
+        let largest = i64::MAX.to_string();
+        let cli = Cli::try_parse_from(["autumn", "calibrate", "--seed", &largest]).unwrap();
+        let Commands::Calibrate { seed, .. } = cli.command else {
+            panic!("expected Calibrate");
+        };
+        assert_eq!(seed, Some(u64::try_from(i64::MAX).unwrap()));
+
+        let too_large = (u64::try_from(i64::MAX).unwrap() + 1).to_string();
+        let Err(err) = Cli::try_parse_from(["autumn", "calibrate", "--seed", &too_large]) else {
+            panic!("a seed above the range must not parse");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
     #[test]
     fn parse_calibrate_check_mode_with_custom_ladder_and_tolerances() {
         let cli = Cli::try_parse_from([
@@ -13269,7 +13398,7 @@ mod tests {
         assert!(Cli::try_parse_from(["autumn", "config"]).is_err());
     }
 
-    // ── autumn generate auth --oauth tests (RED phase) ─────────────────────
+    // ── autumn generate auth --oauth tests ─────────────────────────────────
 
     #[test]
     fn parse_generate_auth_with_oauth_flag_single_provider() {

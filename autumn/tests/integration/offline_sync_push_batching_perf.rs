@@ -48,7 +48,7 @@
 use autumn_web::sync::{
     Change, ChangeOutcome, LwwResolver, Op, PgSyncBackend, PushRequest, SyncBackend, SyncScope,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use autumn_web::time::{SignedDuration, Timestamp};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Text};
@@ -59,8 +59,8 @@ use testcontainers_modules::postgres::Postgres;
 const SCOPE: &str = SyncScope::GLOBAL;
 const SEED_ROWS: usize = 20_000;
 
-fn base_time() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+fn base_time() -> Timestamp {
+    "2026-01-01T00:00:00Z".parse().unwrap()
 }
 
 fn seeded_pk(i: usize) -> String {
@@ -188,7 +188,7 @@ fn build_batch(device_id: &str, m: usize, offset: usize) -> Batch {
             op: Op::Upsert,
             payload: Some(serde_json::json!({"edit": "update", "idx": idx})),
             base_version: idx as i64,
-            updated_at: base + chrono::Duration::seconds(1_000_000 + idx as i64),
+            updated_at: base + SignedDuration::from_secs(1_000_000 + idx as i64),
         });
     }
     // 20%: brand-new pk, never seen by the server.
@@ -200,7 +200,7 @@ fn build_batch(device_id: &str, m: usize, offset: usize) -> Batch {
             op: Op::Upsert,
             payload: Some(serde_json::json!({"edit": "insert", "k": k})),
             base_version: 0,
-            updated_at: base + chrono::Duration::seconds(2_000_000 + k as i64),
+            updated_at: base + SignedDuration::from_secs(2_000_000 + k as i64),
         });
     }
     // 5%: delete of an existing row.
@@ -214,7 +214,7 @@ fn build_batch(device_id: &str, m: usize, offset: usize) -> Batch {
             op: Op::Delete,
             payload: None,
             base_version: idx as i64,
-            updated_at: base + chrono::Duration::seconds(3_000_000 + idx as i64),
+            updated_at: base + SignedDuration::from_secs(3_000_000 + idx as i64),
         });
     }
     // 8%: two queued local edits of the SAME existing pk in one batch, both
@@ -232,7 +232,7 @@ fn build_batch(device_id: &str, m: usize, offset: usize) -> Batch {
             op: Op::Upsert,
             payload: Some(serde_json::json!({"edit": "dup-existing-1", "p": p})),
             base_version: idx as i64,
-            updated_at: base + chrono::Duration::seconds(4_000_000 + p as i64 * 10),
+            updated_at: base + SignedDuration::from_secs(4_000_000 + p as i64 * 10),
         });
         changes.push(Change {
             change_id: next_change_id(),
@@ -244,7 +244,7 @@ fn build_batch(device_id: &str, m: usize, offset: usize) -> Batch {
             // Strictly later than the first edit's timestamp: LwwResolver
             // deterministically picks this (the client / second edit) as
             // the winner, so the outcome is knowable ahead of time.
-            updated_at: base + chrono::Duration::seconds(4_000_000 + p as i64 * 10 + 5),
+            updated_at: base + SignedDuration::from_secs(4_000_000 + p as i64 * 10 + 5),
         });
     }
     // 2%: create-then-edit of a brand-new pk within the same batch.
@@ -257,7 +257,7 @@ fn build_batch(device_id: &str, m: usize, offset: usize) -> Batch {
             op: Op::Upsert,
             payload: Some(serde_json::json!({"edit": "dup-new-1", "p": p})),
             base_version: 0,
-            updated_at: base + chrono::Duration::seconds(5_000_000 + p as i64 * 10),
+            updated_at: base + SignedDuration::from_secs(5_000_000 + p as i64 * 10),
         });
         changes.push(Change {
             change_id: next_change_id(),
@@ -266,7 +266,7 @@ fn build_batch(device_id: &str, m: usize, offset: usize) -> Batch {
             op: Op::Upsert,
             payload: Some(serde_json::json!({"edit": "dup-new-2", "p": p})),
             base_version: 0,
-            updated_at: base + chrono::Duration::seconds(5_000_000 + p as i64 * 10 + 5),
+            updated_at: base + SignedDuration::from_secs(5_000_000 + p as i64 * 10 + 5),
         });
     }
 

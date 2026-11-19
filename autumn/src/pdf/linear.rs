@@ -14,8 +14,9 @@ const SCALE: usize = 8;
 /// times, so the limit leaves 4 times above linear.
 const MAX_RATIO: f64 = 32.0;
 
-/// Runs per input. The fastest run counts.
-const RUNS: usize = 3;
+/// Runs per input. The fastest run counts. Five runs keep a burst of load
+/// on a slow runner out of the result.
+const RUNS: usize = 5;
 
 /// Assert that `run` takes about linear time in the size of its input.
 ///

@@ -888,13 +888,12 @@ impl PricedRoutes {
                 return None;
             }
             // axum picked the route: price exactly that one, so a wildcard
-            // listed first never prices a more specific static route. A route
-            // the router nested is not at its own path but at
-            // `/{locale}{path}`: a priced `/en/report` is mounted at
-            // `/en/en/report`, and `/en/report` is the free `/report`.
-            // The exact spelling first: a merged router's routes are not in
-            // `mounted`, so `another_route` cannot tell `/report` from
-            // `/report/` there, but an entry for each still prices each.
+            // listed first never prices a more specific static route. The exact
+            // spelling goes first: a merged router's routes are not in
+            // `mounted`, so `another_route` cannot tell `/report` from `/report/`,
+            // but an exact entry for each still prices each. A nested route sits at `/{locale}{path}`, not its own path: a
+            // priced `/en/report` is mounted at `/en/en/report`, and `/en/report`
+            // is the free `/report`.
             let unnested = |r: &&PaidRoute| !self.nested.iter().any(|n| same_template(n, &r.path));
             return routes
                 .clone()
@@ -1857,7 +1856,7 @@ mod tests {
 
     #[test]
     fn a_trailing_slash_route_of_its_own_keeps_its_price() {
-        // Codex review (P1): axum routes `/report` and `/report/` apart.
+        // axum routes `/report` and `/report/` apart.
         let priced = |paths: &[&str], mounted: &[&str]| PricedRoutes {
             routes: paths
                 .iter()
@@ -1893,15 +1892,16 @@ mod tests {
         // One form only: the config's slash does not matter.
         assert!(charged(&priced(&["/report/"], &["/report"]), "/report"));
         assert!(charged(&priced(&["/report"], &["/report/"]), "/report/"));
-        // Nothing recorded (a router built without the extension): as before.
+        // Nothing recorded (a router built without the extension): the slash
+        // does not matter.
         assert!(charged(&priced(&["/report"], &[]), "/report/"));
     }
 
     #[test]
     fn a_route_the_router_nested_is_priced_under_a_locale() {
-        // Codex review (P1): `locale_prefix_exclude_exact = ["/report/"]`
-        // names the priced path but not the route `/report`, which the
-        // router (slash-exact) still nests at `/en/report`.
+        // `locale_prefix_exclude_exact = ["/report/"]` names the priced path
+        // but not the route `/report`, which the router (slash-exact) still
+        // nests at `/en/report`.
         let matched = |template: &str| {
             let mut req = axum::http::Request::get(template)
                 .body(axum::body::Body::empty())
@@ -1928,8 +1928,8 @@ mod tests {
 
     #[test]
     fn a_locale_redirect_is_never_priced() {
-        // Codex review (P1): the router answers a nested route's bare path
-        // with a 308 to `/{locale}/...`; only the nested route is charged.
+        // The router answers a nested route's bare path with a 308 to
+        // `/{locale}/...`; only the nested route is charged.
         let priced = PricedRoutes {
             routes: vec![PaidRoute::new("POST", "/submit", "1")],
             locales: vec!["en".to_owned()],
@@ -1951,8 +1951,8 @@ mod tests {
 
     #[test]
     fn a_nested_route_is_priced_at_its_mounted_path() {
-        // Codex review (P1): a free `/report` is mounted at `/en/report`, a
-        // priced top-level `/en/report` at `/en/en/report`.
+        // A free `/report` is mounted at `/en/report`, a priced top-level
+        // `/en/report` at `/en/en/report`.
         let priced = PricedRoutes {
             routes: vec![PaidRoute::new("GET", "/en/report", "1")],
             locales: vec!["en".to_owned()],
@@ -1974,8 +1974,8 @@ mod tests {
 
     #[test]
     fn an_exact_entry_wins_without_a_route_inventory() {
-        // Codex review: a merged router's `/report` and `/report/` are not in
-        // `mounted`; an entry for each still prices its own route.
+        // A merged router's `/report` and `/report/` are not in `mounted`; an
+        // entry for each still prices its own route.
         let priced = PricedRoutes {
             routes: vec![
                 PaidRoute::new("GET", "/report", "1"),
@@ -2452,7 +2452,7 @@ mod tests {
                 .is_none()
         );
 
-        // With both forms in the spec, the exact one is priced (Codex review).
+        // With both forms in the spec, the exact one is priced.
         let mut both = json!({
             "paths": {
                 "/report": { "get": { "responses": {} } },

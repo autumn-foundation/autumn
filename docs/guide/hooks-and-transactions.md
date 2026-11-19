@@ -131,7 +131,7 @@ Every hook receives a `&mut MutationContext`. It carries:
 | `op` | `MutationOp` | `Create`, `Update`, or `Delete` |
 | `actor` | `Option<String>` | User ID or service name |
 | `request_id` | `Option<String>` | UUID v4, auto-generated per mutation |
-| `now` | `DateTime<Utc>` | Timestamp, auto-populated |
+| `now` | `Timestamp` | Timestamp, auto-populated |
 | `invalidate_keys` | `Vec<String>` | User-managed list of cache keys; Autumn collects them but does not act on them automatically |
 | `idempotency_key` | `Option<String>` | Scoped HTTP idempotency key |
 
@@ -327,7 +327,7 @@ this up automatically.
 // Constructing an update request — Patch<T> is the type of UpdateModel fields:
 let update = UpdateArticle {
     status:       Patch::Set(Status::Published),  // explicitly set
-    published_at: Patch::Set(Utc::now()),         // explicitly set
+    published_at: Patch::Set(clock.now()),        // explicitly set
     title:        Patch::Unchanged,               // leave as-is (default)
     summary:      Patch::Clear,                   // explicitly clear to NULL
     ..Default::default()

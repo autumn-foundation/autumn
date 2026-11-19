@@ -332,9 +332,8 @@ pub const fn path_params_are(template: &str, declared: &[&str]) -> bool {
             }
             if end >= bytes.len() {
                 // An unterminated placeholder is a malformed template, not a
-                // parameter list that happens to be shorter. Refusing it here
-                // is what keeps `render_path` from emitting the stray `{` into
-                // a URL.
+                // shorter parameter list. Refusing it keeps `render_path` from
+                // emitting the stray `{` into a URL.
                 return false;
             }
             if seen >= declared.len() || !str_eq(declared[seen], slice_str(template, start, end)) {
@@ -363,8 +362,8 @@ const fn slice_str(s: &str, start: usize, end: usize) -> &str {
         }
         i += 1;
     }
-    // SAFETY-free alternative to slicing: `str::split_at` is const-stable and
-    // panics on a non-boundary, which the ASCII check above rules out.
+    // Range slicing is not const; `str::split_at` is. It panics on a
+    // non-boundary, which the ASCII check above rules out.
     let (head, _) = s.split_at(end);
     let (_, tail) = head.split_at(start);
     tail
@@ -391,9 +390,8 @@ pub fn render_path(template: &str, params: &[(&str, &str)]) -> String {
         if let Some((_, value)) = params.iter().find(|(k, _)| *k == name) {
             out.push_str(&encode_segment(value));
         } else {
-            // `wire_client!` supplies every placeholder, so this is
-            // unreachable from generated code; leaving the placeholder intact
-            // is better than producing a URL that silently drops it.
+            // Unreachable from `wire_client!`, which supplies every placeholder.
+            // Leaving it intact beats a URL that silently drops it.
             out.push('{');
             out.push_str(name);
             out.push('}');
@@ -536,7 +534,7 @@ mod tests {
         assert!(!omittable_required_covered(&[], DE, &["sku"]));
     }
 
-    // The checks must hold in const context — that is the whole mechanism.
+    // Generated code runs these checks in const assertions, so they must work in const context.
     const _: () = assert!(has_field(FIELDS, "name"));
     const _: () = assert!(!has_field(FIELDS, "sku"));
     const _: () = assert!(omittable_required_covered(FIELDS, FIELDS, &[]));

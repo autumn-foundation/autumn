@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "CatalogItemRepriced",
+  "namespace": "autumn.mesh_catalog",
+  "doc": "topic: catalog.item_repriced, version 1",
+  "autumn.topic": "catalog.item_repriced",
+  "fields": [
+    { "name": "id", "type": "string" },
+    { "name": "price_cents", "type": "long" }
+  ]
+}

@@ -28,7 +28,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -679,7 +679,7 @@ mod sql_store {
             &self,
             decide: impl FnOnce(&mut OwnershipTable, i64) -> Result<T, OwnershipError> + Send + 'static,
         ) -> Result<T, OwnershipError> {
-            let now_ms = self.clock.now().timestamp_millis();
+            let now_ms = self.clock.now().as_millisecond();
             let mut conn = self.pool.get().await.map_err(store_error)?;
             conn.spawn_blocking(move |conn| {
                 conn.immediate_transaction(|conn| {
@@ -881,7 +881,7 @@ mod pg_store {
             &self,
             decide: impl FnOnce(&mut OwnershipTable, i64) -> Result<T, OwnershipError> + Send + 'static,
         ) -> Result<T, OwnershipError> {
-            let now_ms = self.clock.now().timestamp_millis();
+            let now_ms = self.clock.now().as_millisecond();
             let mut conn = self.pool.get().await.map_err(store_error)?;
             conn.transaction::<_, diesel::result::Error, _>(async move |conn| {
                 diesel::sql_query(LOCK).execute(conn).await?;
@@ -1549,13 +1549,13 @@ impl crate::actuator::HealthIndicator for OwnershipIndicator {
 /// An ownership table in memory, for tests of one process and the fleet
 /// conformance kit. Each call is one [`OwnershipTable`] decision at the
 /// clock's time.
-#[cfg(any(test, feature = "sqlite"))]
+#[cfg(any(test, all(feature = "sqlite", feature = "plugin-conformance")))]
 pub(crate) struct MemoryOwnership {
     table: Mutex<OwnershipTable>,
     clock: Arc<dyn crate::time::ClockSource>,
 }
 
-#[cfg(any(test, feature = "sqlite"))]
+#[cfg(any(test, all(feature = "sqlite", feature = "plugin-conformance")))]
 impl MemoryOwnership {
     pub(crate) fn new(clock: Arc<dyn crate::time::ClockSource>) -> Self {
         Self {
@@ -1568,7 +1568,7 @@ impl MemoryOwnership {
         &self,
         decide: impl FnOnce(&mut OwnershipTable, i64) -> Result<T, OwnershipError>,
     ) -> Result<T, OwnershipError> {
-        let now = self.clock.now().timestamp_millis();
+        let now = self.clock.now().as_millisecond();
         let mut table = self.table.lock().unwrap_or_else(PoisonError::into_inner);
         let mut after = table.clone();
         let decided = decide(&mut after, now);
@@ -1580,7 +1580,7 @@ impl MemoryOwnership {
     }
 }
 
-#[cfg(any(test, feature = "sqlite"))]
+#[cfg(any(test, all(feature = "sqlite", feature = "plugin-conformance")))]
 impl SlotOwnershipStore for MemoryOwnership {
     fn claim<'a>(
         &'a self,
@@ -1870,7 +1870,9 @@ mod tests {
     }
 
     fn clock_at(ms: i64) -> crate::time::TickingClock {
-        crate::time::TickingClock::starting_at(chrono::DateTime::from_timestamp_millis(ms).unwrap())
+        crate::time::TickingClock::starting_at(
+            crate::time::Timestamp::from_millisecond(ms).unwrap(),
+        )
     }
 
     async fn store(dir: &std::path::Path, clock: &crate::time::TickingClock) -> SqlSlotOwnership {

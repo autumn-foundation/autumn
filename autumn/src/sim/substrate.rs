@@ -204,22 +204,14 @@ impl SqliteSubstrate {
         // not see it (issue #3067).
         crate::sim::trace::alias("sim db", url.split('?').next().unwrap_or(&url));
 
-        // 1. Open the guard connection FIRST so the shared-cache in-memory
-        //    database exists and cannot be reclaimed while we migrate + build the
-        //    pool. This connection is reused to apply the migrations and then held
-        //    for the substrate's lifetime.
+        // Open the guard connection first: it keeps the shared in-memory database alive while
+        // we migrate and build the pool, and for the substrate's lifetime.
         let mut guard_conn = crate::db::establish_sqlite_migration_connection(&url)
             .map_err(|e| SubstrateError::Connection(e.to_string()))?;
 
-        // 2. Apply the framework's SQLite repository-commit-hook migration set
-        //    FIRST, so the `autumn_repository_commit_hooks` control-plane table
-        //    always exists on the substrate. An app mounted here (which has a DB
-        //    pool) is drained by `Sim::run_to_idle`, whose drain does an
-        //    unconditional COUNT(*) on that table — without it, `run_to_idle`
-        //    panics with "no such table". Because this file lives in the `autumn`
-        //    crate it can reference the `pub(crate)`-reachable migration symbol
-        //    directly; the whole substrate is `#[cfg(feature = "sqlite")]`, so
-        //    `REPOSITORY_COMMIT_HOOK_MIGRATIONS` here is the SQLite variant.
+        // `Sim::run_to_idle` counts rows in `autumn_repository_commit_hooks` unconditionally,
+        // so the table must exist before any caller migration. Under `sqlite` this is the
+        // SQLite migration set.
         {
             let mut harness = HarnessWithOutput::write_to_stdout(&mut guard_conn);
             harness
@@ -229,11 +221,8 @@ impl SqliteSubstrate {
                 .map_err(|e| SubstrateError::Migration(e.to_string()))?;
         }
 
-        // 3. Apply each caller-registered migration set directly via the harness.
-        //    We bypass `run_pending_sqlite` deliberately: its in-memory reject is a
-        //    conservative guard for the "no one is keeping the DB alive" case,
-        //    which does not hold here — the guard connection above is exactly what
-        //    makes migrating a shared in-memory database safe.
+        // Bypasses `run_pending_sqlite`, which rejects in-memory targets because nothing keeps
+        // them alive. The guard connection does here.
         for set in migrations {
             let mut harness = HarnessWithOutput::write_to_stdout(&mut guard_conn);
             harness
@@ -241,11 +230,8 @@ impl SqliteSubstrate {
                 .map_err(|e| SubstrateError::Migration(e.to_string()))?;
         }
 
-        // 4. Build the async runtime pool over the SAME shared-cache database. A
-        //    single slot keeps the sim deterministic (`SQLite` is single-writer),
-        //    and every checkout attaches to the guard-anchored in-memory DB and
-        //    sees the migrated schema. Its connections are gated, so their
-        //    queries end at the same point of every run (issue #3067).
+        // One slot keeps the sim deterministic (`SQLite` is single-writer). The connections are
+        // gated, so their queries end at the same point of every run (#3067).
         let pool = crate::sim::dblink::pool(&url, None)
             .map_err(|e| SubstrateError::Pool(e.to_string()))?;
 
@@ -316,9 +302,6 @@ fn unique_sim_db_url() -> String {
 mod tests {
     use super::{SqliteSubstrate, unique_sim_db_url};
 
-    // Each minted substrate URL is unique (UUID + sequence), so two substrates
-    // are fully isolated databases — the core "two sims never share state"
-    // guarantee, verified at the URL level without opening a database.
     #[test]
     fn minted_urls_are_unique_and_shared_cache_in_memory() {
         let a = unique_sim_db_url();
@@ -331,9 +314,6 @@ mod tests {
         }
     }
 
-    // A bare substrate (no migrations) builds and hands out a live pool. This is
-    // the boot-free DB lane the sim consumes; it needs a running tokio runtime
-    // only to check the pool out, so it is a plain async test.
     #[tokio::test]
     async fn empty_substrate_builds_and_serves_a_pool() {
         use diesel_async::RunQueryDsl as _;
@@ -341,8 +321,6 @@ mod tests {
         let substrate = SqliteSubstrate::new().expect("empty substrate builds");
         let pool = substrate.pool();
         let mut conn = pool.get().await.expect("checkout a substrate connection");
-        // A trivial query proves the pool is live against the guard-anchored
-        // in-memory database.
         diesel::sql_query("SELECT 1")
             .execute(&mut *conn)
             .await

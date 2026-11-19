@@ -64,8 +64,7 @@ fn next_topic_epoch() -> u64 {
     static SEED: OnceLock<u64> = OnceLock::new();
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seed = *SEED.get_or_init(|| {
-        // Truncating the u128 nanosecond count to its low 64 bits is fine: this
-        // value is only a per-process epoch seed, not a precise clock.
+        // Truncating to the low 64 bits is fine: this is a per-process seed, not a clock.
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64)
@@ -533,27 +532,22 @@ fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &s
     use crate::htmx::{OobMethod, OobSwap};
     match strategy {
         OobSwap::Delete => {
-            // The id may be derived from user data: escape it so a `"` cannot
-            // break out of the attribute (same XSS class as `inject_oob_attr`).
+            // The id may come from user data: escape it so a `"` cannot break out of the attribute.
             let id = crate::htmx::escape_attribute_string(id);
             format!("<div id=\"{id}\" hx-swap-oob=\"delete\"></div>")
         }
         OobSwap::True => inject_oob_attr(fragment_html, "true"),
         OobSwap::OuterHTML => inject_oob_attr(fragment_html, "outerHTML"),
-        // For targeted outerHTML, htmx replaces the CSS-selected element with
-        // whichever element carries hx-swap-oob. Inject the attribute onto the
-        // fragment root instead of wrapping it so the rendered row (not a synthetic
-        // div) becomes the replacement.
+        // htmx replaces the selected element with whichever element carries hx-swap-oob, so
+        // inject onto the fragment root: the rendered row, not a wrapper div, is the replacement.
         OobSwap::Target(OobMethod::OuterHTML, selector) => {
             let value = format!("outerHTML:{selector}");
             inject_oob_attr(fragment_html, &value)
         }
         OobSwap::Raw => fragment_html.to_string(),
-        // For outerHTML custom values inject the attribute on the fragment root
-        // so htmx replaces the selected element with this element directly.
-        // For all other strategies (beforeend, afterbegin, …) wrap in a <div>
-        // so htmx inserts the div's *children* at the target rather than the
-        // carrier element's children, which would strip the fragment's root tag.
+        // outerHTML custom values inject onto the fragment root, as above. Other strategies wrap
+        // in a <div>: htmx inserts the carrier's children, which would otherwise strip the
+        // fragment's root tag.
         OobSwap::Custom(val) if val == "outerHTML" || val.starts_with("outerHTML:") => {
             inject_oob_attr(fragment_html, val)
         }
@@ -574,16 +568,12 @@ fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &s
 /// before it, e.g. `<li id="x">` → `<li hx-swap-oob="true" id="x">`.
 #[cfg(feature = "maud")]
 pub(crate) fn inject_oob_attr(html: &str, value: &str) -> String {
-    // Split at the first `<`, then at the first byte that terminates the tag
-    // name (a space or `>`); the attribute goes between the two. Splitting
-    // rather than index-slicing keeps every boundary char-safe by
-    // construction, so no UTF-8 reasoning is needed here.
+    // Splitting rather than index-slicing keeps every boundary on a char boundary.
     if let Some((before_tag, after_lt)) = html.split_once('<')
         && let Some(name_end) = after_lt.find([' ', '>'])
         && let Some((tag_name, rest)) = after_lt.split_at_checked(name_end)
     {
-        // Escape the attribute value: a caller-supplied `"><script>` must not
-        // break out of the quoted attribute (XSS, see the security tests).
+        // Escape so a caller-supplied `"><script>` cannot break out of the attribute.
         let value = crate::htmx::escape_attribute_string(value);
         return format!("{before_tag}<{tag_name} hx-swap-oob=\"{value}\"{rest}");
     }
@@ -742,11 +732,9 @@ impl LocalChannelsBackend {
 
     fn send_without_publish_metric(&self, topic: &str, msg: ChannelMessage) -> usize {
         let state = self.get_or_create_topic(topic);
-        // Assign the id, append to the replay buffer, and broadcast — all while
-        // holding the replay lock. `resume` subscribes under this same lock, so
-        // every message a resumed subscriber receives is published strictly
-        // after its snapshot, keeping the replay/live seam gapless. The id is
-        // assigned even when there are zero receivers so ids stay dense.
+        // Assign, buffer and broadcast under the replay lock: `resume` subscribes under the same
+        // lock, so the replay/live seam is gapless. Ids are assigned with zero receivers too, so
+        // they stay dense.
         let mut replay = state
             .replay
             .lock()
@@ -774,11 +762,8 @@ impl LocalChannelsBackend {
         self.inner.metrics.ensure_topic(topic);
         let epoch = state.epoch;
 
-        // Subscribe and snapshot under the replay lock so the seam is clean:
-        // publish holds this same lock while assigning seqs and broadcasting, so
-        // `rx` can only ever observe messages published strictly after this
-        // point (seqs `start_seq + 1, start_seq + 2, ...`), none of which are in
-        // the snapshot below.
+        // Subscribe and snapshot under the replay lock that `publish` holds, so `rx` sees only
+        // seqs after `start_seq`, none of which are in the snapshot.
         let replay_guard = state
             .replay
             .lock()
@@ -788,16 +773,9 @@ impl LocalChannelsBackend {
         let oldest = replay_guard.buf.front().map(|(seq, _)| *seq);
 
         let (replay, gap) = match last_event_id {
-            // Cold connection: no replay, just live events.
             None => (Vec::new(), false),
-            // Epoch mismatch: the client last saw a DIFFERENT epoch (this topic
-            // was garbage-collected/recreated or the process restarted, resetting
-            // the seq counter). An old-epoch seq is meaningless against the
-            // current seq space, so EVERY retained current-epoch event is new to
-            // this client — replay all of them and flag the gap so the client
-            // knows its pre-reset history is unrecoverable. This is the fix for
-            // the epoch-reset collision where a stale seq the new epoch had
-            // already passed would otherwise drop the new epoch's early events.
+            // A different epoch (topic recreated or process restarted) makes the client's seq
+            // meaningless: replay every retained event and flag the gap.
             Some(ev) if ev.epoch != epoch => {
                 let replay: Vec<SequencedMessage> = replay_guard
                     .buf
@@ -809,8 +787,6 @@ impl LocalChannelsBackend {
                     .collect();
                 (replay, true)
             }
-            // Same-epoch resume: replay buffered entries newer than the client's
-            // seq.
             Some(ev) => {
                 let replay: Vec<SequencedMessage> = replay_guard
                     .buf
@@ -821,15 +797,8 @@ impl LocalChannelsBackend {
                         message: message.clone(),
                     })
                     .collect();
-                // Gap in two cases:
-                //  1. The requested resume point precedes the oldest retained
-                //     seq: the client's next-expected seq (`ev.seq + 1`) aged out
-                //     of the window, so the replay would be partial.
-                //  2. The client's `ev.seq` is in the future relative to the
-                //     current server state (`ev.seq > start_seq`) — defensive:
-                //     within the same epoch this should not happen, but if it
-                //     does, flag it rather than silently returning an empty
-                //     replay.
+                // A gap when the client's next seq aged out of the buffer, or (defensively) when
+                // the client claims a seq the server has not reached.
                 let gap = oldest.is_some_and(|oldest| oldest > ev.seq.saturating_add(1))
                     || ev.seq > start_seq;
                 (replay, gap)
@@ -860,12 +829,8 @@ impl ChannelsBackend for LocalChannelsBackend {
     }
 
     fn ensure_topic(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
-        // NOTE: this returns the RAW `broadcast::Sender`; sending directly on it
-        // bypasses replay-id assignment and the replay buffer. Publish via
-        // `Channels::publish` / `Broadcast::publish` / `Channels::sender().send()`
-        // (all of which route through `publish` and stay id-assigned) to keep
-        // resumable topics resumable (see the resumable-SSE limitations in
-        // docs/guide/realtime.md, issue #1356).
+        // The raw `broadcast::Sender` bypasses replay ids and the replay buffer. Publish through
+        // `Channels::publish` and friends to keep topics resumable (#1356).
         self.inner.metrics.ensure_topic(topic);
         self.get_or_create_sender(topic)
     }
@@ -893,10 +858,8 @@ impl ChannelsBackend for LocalChannelsBackend {
     }
 
     fn gc(&self) {
-        // NOTE: removing a topic here drops its replay buffer with it, so a
-        // topic kept alive only by transient SSE subscribers can lose its
-        // replay history during a disconnect window (resumable-SSE is in-process
-        // best-effort — see docs/guide/realtime.md, issue #1356).
+        // Removing a topic drops its replay buffer, so a topic held only by SSE subscribers can
+        // lose its history during a disconnect window (#1356).
         let mut registry = self
             .inner
             .registry
@@ -904,9 +867,8 @@ impl ChannelsBackend for LocalChannelsBackend {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut removed_topics = HashSet::new();
         registry.retain(|topic, state| {
-            // Keep topics with live receivers, or with outstanding keepalive
-            // `Sender` handles (which hold clones of `state.sender`, bumping its
-            // strong count above the single reference held by `state`).
+            // Keep topics with live receivers or outstanding `Sender` handles (each holds a clone
+            // of `state.sender`).
             let keep = state.sender.receiver_count() > 0 || Arc::strong_count(&state.sender) > 1;
             if !keep {
                 removed_topics.insert(topic.clone());
@@ -919,9 +881,8 @@ impl ChannelsBackend for LocalChannelsBackend {
     }
 
     fn snapshot(&self) -> HashMap<String, ChannelStats> {
-        // Keep registry and metrics collection in separate phases. Publish and
-        // subscribe paths touch metrics before registry, so snapshot must never
-        // hold the registry mutex while reading metrics.
+        // Publish and subscribe lock metrics before the registry, so never hold the registry
+        // while reading metrics.
         let subscriber_counts: HashMap<String, usize> = {
             let registry = self
                 .inner
@@ -1200,17 +1161,15 @@ fn deliver_redis_envelope(
 #[cfg(feature = "redis")]
 impl ChannelsBackend for RedisChannelsBackend {
     fn publish(&self, topic: &str, msg: ChannelMessage) -> Result<usize, ChannelPublishError> {
-        // Encoded here, from borrows. An owned envelope handed to the
-        // publisher task to encode later copied the origin id, the topic and
-        // the whole payload on every publish, each dropped once encoded.
+        // Encode here from borrows: handing the task an owned envelope would copy the payload
+        // on every publish.
         let encoded = serde_json::to_string(&RedisEnvelope {
             origin: std::borrow::Cow::Borrowed(self.origin_id.as_str()),
             topic: std::borrow::Cow::Borrowed(topic),
             payload: std::borrow::Cow::Borrowed(msg.as_str()),
         });
         let Ok(payload) = encoded else {
-            // Three strings always encode. Kept so a failure is still a log
-            // line and a local delivery, as when the task did the encoding.
+            // Three strings always encode; a failure still logs and delivers locally.
             tracing::warn!("failed to serialize Redis channel envelope");
             return Ok(self.local.publish_local(topic, msg));
         };
@@ -1278,8 +1237,7 @@ fn run_chain(
     interceptors: &[Arc<dyn crate::interceptor::ChannelsInterceptor>],
     inner: &dyn ChannelsBackend,
 ) -> Result<usize, ChannelPublishError> {
-    // Walking the chain by `split_first` instead of an index cursor keeps the
-    // recursion free of both slice indexing and index arithmetic.
+    // `split_first` keeps the recursion free of slice indexing (panic gate).
     if let Some((interceptor, rest)) = interceptors.split_first() {
         let next = |t: &str, m: &ChannelMessage| run_chain(t, m, rest, inner);
         interceptor.intercept_publish(topic, msg, &next)
@@ -2340,9 +2298,7 @@ mod tests {
 
     #[test]
     fn resume_cross_epoch_replays_full_epoch_and_gaps() {
-        // A stale id from a different epoch whose seq the current epoch has
-        // already passed must NOT drop the early current-epoch events: it gaps
-        // and replays the whole retained current epoch.
+        // The stale epoch's seq 4 must not filter out the current epoch's seqs 1..=4.
         let backend = LocalChannelsBackend::with_replay_capacity(16, 8);
         for i in 1..=5 {
             backend.publish_local("t", ChannelMessage::from(format!("m{i}")));

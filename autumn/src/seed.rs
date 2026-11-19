@@ -139,8 +139,8 @@ impl SeedContext {
 
         let pool = create_pool(&config)?.ok_or(SeedContextError::NoDatabaseUrl)?;
 
-        // `autumn console --repl` (issue #2148): open the prompt here and end
-        // the process, so no playground code after `build()` runs.
+        // `autumn console --repl` (#2148): run the prompt here and exit, so no playground code
+        // after `build()` runs.
         #[cfg(feature = "repl")]
         if crate::repl::requested() {
             crate::repl::run_in_place(&pool);
@@ -260,14 +260,12 @@ fn first_database_url(database: Option<&toml::Value>) -> Option<String> {
     None
 }
 
-// ── #1343 AC4: model-name → factory fake-seeder registry ────────────────────
+// ── Fake-seeder registry (#1343) ────────────────────────────────────────────
 //
-// The `autumn` CLI cannot name a project's generated model types directly, so
-// each `#[model]` registers a `FakeSeeder` via `inventory` (see the
-// `__autumn_register_fake_seeder!` forwarding macro in `lib.rs`). A seed binary
-// (or `autumn seed --count N --model M`) then looks a model up by name and runs
-// its factory's `.fake().create_many(count, pool)`, all without editing
-// `src/bin/seed.rs`.
+// The CLI cannot name a project's model types, so each `#[model]` registers a `FakeSeeder`
+// through `inventory` (see `__autumn_register_fake_seeder!` in `lib.rs`). A seed binary or
+// `autumn seed --count N --model M` looks the model up by name and runs its factory's
+// `.fake().create_many(count, pool)`, with no edit to `src/bin/seed.rs`.
 
 /// A registered model factory that `fake_seed_model` can drive by name.
 ///
@@ -421,12 +419,9 @@ pub async fn maybe_fake_seed(pool: &Pool<RuntimeConnection>) -> Result<bool, Fak
     Ok(true)
 }
 
-// ── #1343 AC4: fake-seeder registry test fixture ────────────────────────────
+// ── Fake-seeder registry test fixture ───────────────────────────────────────
 //
-// Register a dummy model so the registry-lookup tests below have a known entry
-// to find without depending on any other crate's `#[model]`s. The `run` closure
-// never touches the pool (the lookup tests never invoke it), so it is safe to
-// leave a placeholder body.
+// A known entry for the lookup tests. Its `run` never touches the pool.
 #[cfg(test)]
 inventory::submit! {
     FakeSeeder {
@@ -439,7 +434,7 @@ inventory::submit! {
 mod tests {
     use super::*;
 
-    // ── fake-seeder registry (#1343 AC4) ───────────────────────────────────
+    // ── fake-seeder registry ───────────────────────────────────────────────
 
     #[test]
     fn registry_collects_submitted_seeder() {
@@ -471,8 +466,7 @@ mod tests {
 
     #[test]
     fn unknown_model_error_lists_available_models() {
-        // Build the error the way `fake_seed_model` does for an unknown name,
-        // without needing a live pool.
+        // Built as `fake_seed_model` builds it, without a live pool.
         let available = registered_fake_models().join(", ");
         let err = FakeSeedError::UnknownModel {
             requested: "NoSuchModelXYZ".to_string(),
@@ -489,15 +483,14 @@ mod tests {
         );
     }
 
-    // ── maybe_fake_seed dispatch (#1343 AC4 centralization) ────────────────
+    // ── maybe_fake_seed dispatch ───────────────────────────────────────────
 
     /// A lazily-built pool (deadpool does not connect until first use), so these
     /// tests exercise `maybe_fake_seed`'s pre-connection branches without a live
     /// database.
     fn lazy_pool() -> Pool<RuntimeConnection> {
         crate::db::create_pool(&DatabaseConfig {
-            // Backend-parametric: `build_sqlite_pool` refuses a `postgres://`
-            // target, so a literal here panics under `--features "sqlite,seed"`.
+            // `build_sqlite_pool` refuses a `postgres://` URL, so use the backend's test URL.
             primary_url: Some(crate::test_urls::primary("unused")),
             ..DatabaseConfig::default()
         })
@@ -567,10 +560,7 @@ mod tests {
 
     #[test]
     fn maybe_fake_seed_allows_count_at_max() {
-        // The boundary itself (MAX_FAKE_SEED_COUNT exactly) must not be
-        // rejected by the ceiling check — only values strictly above it.
-        // DummyFakeSeederModel's `run` just echoes `count` back without
-        // allocating, so this exercises the guard without a live database.
+        // The dummy `run` echoes `count` without allocating, so no database is needed.
         let pool = lazy_pool();
         let at_max = MAX_FAKE_SEED_COUNT.to_string();
         temp_env::with_vars(
@@ -601,7 +591,6 @@ mod tests {
 
     #[test]
     fn resolve_profile_defaults_to_dev() {
-        // Isolate from the real environment using temp_env.
         temp_env::with_vars(
             [
                 ("AUTUMN_ENV", None::<&str>),
@@ -687,13 +676,9 @@ mod tests {
                 ("DATABASE_URL", None::<&str>),
             ],
             || {
-                // No autumn.toml in the test runner's cwd (we rely on that
-                // directory not having one; if it does, this test is a no-op).
+                // The result depends on whether the cwd has an autumn.toml, so this only checks
+                // that the call does not panic.
                 let url = resolve_database_url("dev");
-                // Either None (no autumn.toml) or Some (if autumn.toml exists
-                // with a database.url in the test runner cwd). We can't assert
-                // None unconditionally, so we just assert the function returns
-                // without panicking.
                 let _ = url;
             },
         );

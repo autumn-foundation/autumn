@@ -63,8 +63,12 @@ primary_pool_size = 4
 
 [tenancy]
 enabled = true
-source = "header"        # the tenant id doubles as the shard routing key
+source = "session"       # the tenant id is also the shard key
 ```
+
+The tenant id selects the shard. Take it from a credential (`session` or
+`jwt`). With `source = "header"`, set `header_trust`. See
+[Tenant sources](tenant-cells.md#tenant-sources).
 
 `slots` is all-or-none: either every shard declares it (the map must
 cover `0..16384` exactly once; an explicit empty list marks a drained

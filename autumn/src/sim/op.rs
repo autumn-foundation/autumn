@@ -308,9 +308,8 @@ impl Sim {
         F: Fn(&mut Self, &[T]),
         H: FnMut(),
     {
-        // `TestRunner::run` requires the test closure to be `Fn`, but the hook
-        // is `FnMut` (it accumulates into a caller-owned set across calls) —
-        // a `RefCell` lets a single `Fn` closure call it repeatedly.
+        // `TestRunner::run` takes an `Fn` closure but the hook is `FnMut`, so it sits in a
+        // `RefCell`.
         let on_case = std::cell::RefCell::new(on_case);
         let mut runner =
             TestRunner::new_with_rng(embedded_config(), stream_rng(seed, OP_GEN_STREAM_SALT));
@@ -362,8 +361,7 @@ mod tests {
 
     #[test]
     fn gen_ops_with_is_independent_of_seeded_entropy_stream() {
-        // Drawing from the app-facing RNG before `gen_ops_with` must not perturb
-        // the op-generation stream — they're salted independently.
+        // Drawing from the app-facing RNG must not perturb the op-generation stream.
         let mut sim = Sim::from_seed(7);
         let baseline = sim.gen_ops_with(tiny_op_strategy());
 
@@ -376,13 +374,8 @@ mod tests {
 
     #[test]
     fn embedded_config_forces_fork_and_timeout_off() {
-        // `Config::default()` folds in whatever `PROPTEST_FORK`/`PROPTEST_TIMEOUT`
-        // env vars happen to be set process-wide (proptest's `contextualize_config`,
-        // cached process-lifetime via a `LazyLock` — not something a per-test env var
-        // override could exercise reliably here). Both embedded runners have no
-        // `test_name` to hand proptest's forking machinery, so inheriting fork mode
-        // would panic with "Must supply test_name when forking enabled" before a
-        // single op could be generated. Assert the override directly instead.
+        // proptest reads `PROPTEST_FORK`/`PROPTEST_TIMEOUT` once per process, so a per-test
+        // env override cannot exercise this. Assert the override on the config instead.
         let config = embedded_config();
         assert!(
             !config.fork,
@@ -396,16 +389,7 @@ mod tests {
 
     #[test]
     fn embedded_config_pins_the_case_count_ignoring_proptest_cases() {
-        // `PROPTEST_CASES=0` in the environment would otherwise make
-        // `Config::default().cases` zero, so `TestRunner::run` returns
-        // `Ok(())` without ever invoking the case closure — `body` (and any
-        // `always!`/`sometimes!` inside it) never runs, yet `run_proptest`
-        // still reports success. A bare `.max(1)` clamp would avoid that but
-        // also collapse proptest's automatic shrink budget
-        // (`cases.saturating_mul(4)`) to 4 iterations — assert the exact
-        // pinned value instead, same reasoning as
-        // `embedded_config_forces_fork_and_timeout_off` above (the env var
-        // is read once, process-lifetime, via a `LazyLock`).
+        // `PROPTEST_CASES` is read once per process, so assert the pinned value on the config.
         assert_eq!(
             embedded_config().cases,
             EMBEDDED_CASES,
@@ -430,8 +414,7 @@ mod tests {
 
     #[test]
     fn run_proptest_shrinks_a_failing_sequence_to_a_minimal_reproduction() {
-        // Fails whenever three or more `Inc`s appear back to back — proptest
-        // should shrink an arbitrary failing sequence down to exactly that.
+        // Fails on three `Inc`s in a row, so the minimal counterexample is exactly that.
         let result = Sim::run_proptest(123, tiny_op_strategy(), |_sim, ops| {
             let mut run = 0;
             for op in ops {

@@ -71,15 +71,9 @@ const STRIPPED_HEADERS: [&str; 16] = [
     "upgrade",
     // Describes a body a GET/HEAD mirror does not carry.
     "content-length",
-    // The forwarding family. This layer runs OUTSIDE
-    // `TrustedProxiesLayer`, so these still hold whatever the client put on
-    // the wire: the primary is about to discard them (its peer is not a
-    // trusted proxy), but the candidate would receive them from *this
-    // process's* address, which a production-cloned `trusted_proxies` config
-    // very likely does trust. Forwarding them would launder a header the
-    // primary correctly rejects into one an internal build accepts — a
-    // spoofed client IP past the candidate's own IP allowlists and per-IP
-    // limits, or a poisoned absolute-URL host.
+    // The forwarding family. This layer runs outside `TrustedProxiesLayer`, so these hold
+    // whatever the client sent. The candidate likely trusts this process as a proxy, so
+    // forwarding them would launder a spoofed client IP or host the primary rejects.
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-proto",
@@ -196,14 +190,9 @@ pub fn forwarded_headers(
         }
         out.append(name.clone(), value.clone());
     }
-    // Re-stamp the forwarding family from the VALIDATED identity — never from
-    // the client's raw claims, which were stripped above. Dropping them
-    // entirely left the candidate resolving this process as the client: its
-    // per-IP rate limiter would bucket every mirror together (and answer `429`,
-    // a divergence), and `ClientScheme` would fall back to `http`, diverging on
-    // any route that behaves differently under TLS. A candidate that does not
-    // trust this process as a proxy simply ignores these, which is exactly
-    // where it was before.
+    // Re-stamp the forwarding family from the validated identity, never the client's raw claims.
+    // Without them the candidate resolves this process as the client: its per-IP limiter buckets
+    // every mirror together (a `429` divergence) and `ClientScheme` falls back to `http`.
     if let Some(identity) = resolved {
         if let Some(host) = identity.host.as_deref()
             && let Ok(value) = HeaderValue::from_str(host)
@@ -272,12 +261,8 @@ pub(crate) fn decode_body(
     body: bytes::Bytes,
     max_body_bytes: usize,
 ) -> Result<bytes::Bytes, ShadowError> {
-    // Nothing to decode. A `HEAD` response carries no body while keeping its
-    // representation headers, so it arrives here as zero bytes still declaring
-    // `Content-Encoding: gzip` — and a decoder handed zero bytes fails with an
-    // unexpected EOF. Reporting that as a transport error would have two
-    // identical builds counted as errors and never compared at all, on every
-    // precompressed route that answers `HEAD`.
+    // A `HEAD` response arrives as zero bytes still declaring `Content-Encoding: gzip`, and a
+    // decoder handed zero bytes fails with an unexpected EOF.
     if body.is_empty() {
         return Ok(body);
     }
@@ -286,12 +271,8 @@ pub(crate) fn decode_body(
         return Ok(body);
     };
 
-    // `Content-Encoding` is a LIST: `gzip, br` means brotli was applied to the
-    // gzip output, so it unwinds in reverse. Matching the header as a single
-    // string left a stacked value unrecognised and passed encoded bytes through
-    // to be compared against a plain body — a divergence produced by a header,
-    // which the contract says is not compared. `identity` contributes nothing
-    // and drops out of the chain.
+    // `Content-Encoding` is a list: `gzip, br` means brotli was applied to the gzip output, so it
+    // unwinds in reverse. `identity` contributes nothing.
     let codings: Vec<&str> = encoding
         .split(',')
         .map(str::trim)
@@ -300,10 +281,8 @@ pub(crate) fn decode_body(
     if codings.is_empty() {
         return Ok(body);
     }
-    // An unrecognised coding anywhere makes the whole chain unsafe to unwind:
-    // decoding the layers around it would produce bytes that were never a
-    // representation of anything. Pass the body through untouched — exactly
-    // what a single unknown coding does — and let the byte comparison show it.
+    // An unknown coding anywhere makes the chain unsafe to unwind: decoding the layers around it
+    // would produce bytes that were never a representation. Pass the body through untouched.
     if !codings.iter().all(|coding| is_known_coding(coding)) {
         return Ok(body);
     }
@@ -403,14 +382,9 @@ impl HttpShadowTransport {
         Ok(Self {
             client: crate::reqwest_tls::client_builder()
                 .timeout(timeout)
-                // No ambient proxy. Mirrored requests carry the end user's
-                // session cookie and `Authorization` header, and reqwest
-                // honours `HTTP_PROXY`/`HTTPS_PROXY` by default with no
-                // loopback bypass — so on a host that sets those (a corporate
-                // egress proxy, a sidecar) every mirrored request would ship
-                // live credentials to a third party the operator never chose
-                // as a shadow target. The target is an address the operator
-                // named; this client dials it directly or not at all.
+                // No ambient proxy: mirrored requests carry the user's cookie and `Authorization`,
+                // and reqwest honours `HTTP_PROXY`/`HTTPS_PROXY` with no loopback bypass, which
+                // would ship live credentials to a proxy the operator never chose.
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
@@ -445,11 +419,8 @@ impl ShadowTransport for HttpShadowTransport {
                 .and_then(|value| value.to_str().ok())
                 .map(ToOwned::to_owned);
             let content_encoding = joined_content_encoding(response.headers());
-            // Streamed, not `.bytes()`: collecting the whole body first would
-            // buffer an arbitrarily large candidate response into this
-            // process's memory before anyone could check its size. A candidate
-            // that streams a gigabyte must cost this replica the budget, not
-            // the gigabyte.
+            // Streamed, not `.bytes()`, so an oversized candidate response costs at most the
+            // budget before it is refused.
             let mut collected = bytes::BytesMut::new();
             let mut response = response;
             loop {
@@ -462,18 +433,14 @@ impl ShadowTransport for HttpShadowTransport {
                 })?;
                 let Some(chunk) = chunk else { break };
                 if collected.len().saturating_add(chunk.len()) > max_body_bytes {
-                    // Drop the response here: the connection is closed and the
-                    // remaining bytes are never read.
+                    // Returning drops the response, closing the connection unread.
                     return Err(ShadowError::Oversize);
                 }
                 collected.extend_from_slice(&chunk);
             }
 
-            // The encoding travels WITH the facts rather than being consumed
-            // here. Decoding only this side would report identical builds as
-            // divergent whenever a handler serves a precompressed
-            // representation, because the primary tee captures those encoded
-            // bytes too. Both sides are decoded together in the mirror task.
+            // Not decoded here: the primary tee also captures a precompressed handler's encoded
+            // bytes, so both sides are decoded together in the mirror task.
             Ok(ResponseFacts::encoded(
                 status,
                 content_type,
@@ -549,11 +516,9 @@ mod tests {
 
     #[test]
     fn the_accepted_host_is_preserved() {
-        // The candidate is dialed at the operator's target address, but the
-        // request's logical authority is the one the live build accepted.
-        // Re-deriving it from the dial address would make a candidate that
-        // clones production's trusted-host policy reject every mirror with a
-        // 400, and a subdomain-keyed tenant app resolve the wrong tenant.
+        // The candidate is dialed at the target address, but the logical authority is the one the
+        // live build accepted. Re-deriving it from the dial address would fail a cloned
+        // trusted-host policy with a 400 and resolve the wrong tenant in a subdomain-keyed app.
         let forwarded = forwarded_headers(&headers(&[("host", "app.example.com")]), None);
         assert_eq!(
             forwarded.get("host").and_then(|v| v.to_str().ok()),
@@ -563,9 +528,7 @@ mod tests {
 
     #[test]
     fn accept_encoding_travels_so_both_stacks_answer_the_same_request() {
-        // A handler or user layer may vary its body on this header; stripping it
-        // would have the two stacks answering different logical requests. The
-        // candidate's response is decoded on arrival instead.
+        // A handler may vary its body on this header; the candidate's response is decoded instead.
         let forwarded = forwarded_headers(&headers(&[("accept-encoding", "gzip, br")]), None);
         assert_eq!(
             forwarded
@@ -594,10 +557,7 @@ mod tests {
 
     #[test]
     fn repeated_content_encoding_fields_join_into_one_chain() {
-        // `Content-Encoding: gzip` then `Content-Encoding: br` means the same
-        // chain as `gzip, br`. Reading only the first field hands the decoder an
-        // incomplete chain, which fails — recording two identical builds as
-        // decode errors instead of comparing them.
+        // Two `Content-Encoding` fields mean the same chain as one `gzip, br` field.
         let mut headers = HeaderMap::new();
         headers.append(
             axum::http::header::CONTENT_ENCODING,
@@ -620,10 +580,7 @@ mod tests {
 
     #[test]
     fn a_stacked_content_encoding_is_unwound_in_reverse() {
-        // `gzip, br` means brotli was applied to the gzip output, so it unwinds
-        // br-then-gzip. Treating the header as one opaque string left it
-        // unrecognised and passed encoded bytes through to be compared against
-        // a plain body.
+        // `gzip, br` means brotli was applied to the gzip output, so it unwinds br-then-gzip.
         use std::io::Write as _;
         let plain = br#"{"ok":true}"#;
 
@@ -656,8 +613,6 @@ mod tests {
 
     #[test]
     fn an_unknown_coding_anywhere_leaves_the_whole_chain_alone() {
-        // Unwinding the layers around an unknown coding would produce bytes
-        // that were never a representation of anything.
         let body = bytes::Bytes::from_static(b"opaque");
         for encoding in ["exotic-v2", "gzip, exotic-v2", "exotic-v2, gzip"] {
             assert_eq!(
@@ -670,8 +625,7 @@ mod tests {
 
     #[test]
     fn an_empty_body_needs_no_decoding_whatever_it_declares() {
-        // A `HEAD` keeps its representation headers and sends no body, so this
-        // is the shape that reaches the decoder for a precompressed route.
+        // A `HEAD` to a precompressed route reaches the decoder in this shape.
         for encoding in [
             Some("gzip"),
             Some("br"),
@@ -698,8 +652,7 @@ mod tests {
 
     #[test]
     fn a_decompression_bomb_is_refused_by_the_output_budget() {
-        // The wire read is capped, but a decoder turns a small body into an
-        // arbitrarily large one — so the OUTPUT is capped too.
+        // The wire read is capped, but decoding can grow a small body, so the output is capped too.
         use std::io::Write as _;
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
         encoder.write_all(&vec![b'a'; 512 * 1024]).expect("encode");
@@ -714,10 +667,6 @@ mod tests {
 
     #[test]
     fn the_forwarding_family_is_stripped() {
-        // This layer runs outside TrustedProxiesLayer, so these still carry
-        // whatever the client sent. Forwarding them would launder a spoofed
-        // client IP or host into a candidate that trusts this process's
-        // address as a proxy.
         let forwarded = forwarded_headers(
             &headers(&[
                 ("x-forwarded-for", "10.0.0.1"),
@@ -773,13 +722,8 @@ mod tests {
 
     #[test]
     fn the_validated_identity_replaces_the_clients_own_claims() {
-        // Behind a proxy the raw `Host` is the INTERNAL address and the public
-        // one arrives in `X-Forwarded-Host` — which is stripped here, because a
-        // client can forge it. What travels instead is what the trusted-proxy
-        // layer ACCEPTED: host, client address, and scheme. Dropping the last
-        // two left the candidate resolving this process as the client, so its
-        // per-IP limiter bucketed every mirror together and `ClientScheme` fell
-        // back to `http`.
+        // Behind a proxy the raw `Host` is the internal address. The client's forwarding headers
+        // are stripped; what travels is what the trusted-proxy layer accepted.
         let forwarded = forwarded_headers(
             &headers(&[
                 ("host", "10.0.0.7:3000"),
@@ -815,8 +759,6 @@ mod tests {
 
     #[test]
     fn no_forwarding_headers_are_synthesized_without_a_resolved_identity() {
-        // Nothing validated the client's claims, so nothing is asserted to the
-        // candidate on its behalf.
         let forwarded = forwarded_headers(
             &headers(&[("x-forwarded-for", "203.0.113.9"), ("host", "app.local")]),
             None,
@@ -853,8 +795,8 @@ mod tests {
 
     #[test]
     fn application_headers_including_credentials_are_forwarded() {
-        // Documented trust boundary: the candidate build must see the same
-        // request the live build saw, or every authenticated route diverges.
+        // The candidate must see the request the live build saw, or every authenticated route
+        // diverges.
         let forwarded = forwarded_headers(
             &headers(&[
                 ("cookie", "session=abc"),

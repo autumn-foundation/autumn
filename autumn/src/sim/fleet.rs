@@ -34,7 +34,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use chrono::TimeDelta;
+use jiff::SignedDuration;
 use serde_json::{Value, json};
 
 use super::substrate::SqliteSubstrate;
@@ -115,7 +115,7 @@ enum Step {
     MidQuery(&'static str, &'static str, f64),
     CommitAmbiguity(&'static str, &'static str, f64),
     ClearFaults(&'static str),
-    JumpClock(&'static str, TimeDelta),
+    JumpClock(&'static str, SignedDuration),
     /// Send a GET to a replica, through its `Db` extractor route.
     Get(&'static str, &'static str),
 }
@@ -187,8 +187,7 @@ impl Fleet {
                 sim.mount_replica(spec, app);
             }
             Step::Kill(name) => {
-                // A crash stops the replica's job runs: they no longer count
-                // as running.
+                // A crash stops the replica's job runs: they no longer count as running.
                 note_crash(name);
                 sim.kill_replica(name);
             }
@@ -608,7 +607,7 @@ async fn scheduler(sim: &mut Sim) {
         let by = i64::try_from(draw.between(0, 2_000)).unwrap_or(0) - 1_000;
         plan.push((
             late_boot + draw.millis(0, 120_000),
-            Step::JumpClock(draw.pick(&names), TimeDelta::milliseconds(by)),
+            Step::JumpClock(draw.pick(&names), SignedDuration::from_millis(by)),
         ));
     }
     if draw.one_in(2) {

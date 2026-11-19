@@ -58,8 +58,8 @@ fn code_of(line: &str) -> &str {
 
 /// `Timestamptz` is a Postgres-only SQL type. `SQLite` does not implement
 /// `HasSqlType<Timestamptz>`, so every `load` of a row that declares one fails
-/// to compile under the flipped backend. Use `Timestamp` with `NaiveDateTime`
-/// instead: it is the one timestamp type that both backends share, and
+/// to compile under the flipped backend. Use `Timestamp` with
+/// `civil::DateTime` instead: it is the one timestamp type that both backends share, and
 /// Postgres sends `timestamptz` in the same binary form, in UTC.
 #[test]
 fn no_source_declares_the_postgres_only_timestamptz_type() {
@@ -77,7 +77,7 @@ fn no_source_declares_the_postgres_only_timestamptz_type() {
         hits.is_empty(),
         "these lines declare the Postgres-only `Timestamptz` SQL type, so the crate \
          cannot compile under `autumn-web/sqlite`. Use `Timestamp` with \
-         `NaiveDateTime` (issue #2108):\n  {}",
+         `civil::DateTime` (issue #2108):\n  {}",
         hits.join("\n  ")
     );
 }
@@ -140,14 +140,14 @@ fn every_array_bind_sits_in_the_postgres_arm_of_a_backend_fork() {
 
 /// The typed `ExperimentChange` model feeds the grouped-aggregate roll-up on the
 /// experiment history page. Its `changed_at` field decides which SQL type the
-/// generated DSL binds, so it must be `NaiveDateTime` too.
+/// generated DSL binds, so it must be `civil::DateTime` too.
 #[test]
 fn the_experiment_change_model_uses_a_portable_timestamp_field() {
     let body = std::fs::read_to_string(src_dir().join("experiments.rs")).expect("experiments.rs");
     assert!(
-        body.contains("pub changed_at: chrono::NaiveDateTime"),
-        "`ExperimentChange::changed_at` must be `chrono::NaiveDateTime`. \
-         `DateTime<Utc>` maps to the Postgres-only `Timestamptz` type and \
+        body.contains("pub changed_at: autumn_web::time::civil::DateTime,"),
+        "`ExperimentChange::changed_at` must be `civil::DateTime`. \
+         `Timestamp` maps to the Postgres-only `Timestamptz` type and \
          breaks the generated DSL under `autumn-web/sqlite` (issue #2108)"
     );
     assert!(

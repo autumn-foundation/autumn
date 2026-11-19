@@ -1,0 +1,12 @@
+{
+  "type": "record",
+  "name": "ContactUpdated",
+  "namespace": "autumn.core",
+  "doc": "topic: contact.updated, version 1",
+  "autumn.topic": "contact.updated",
+  "fields": [
+    { "name": "id", "type": { "type": "string", "logicalType": "uuid" } },
+    { "name": "email", "type": "string" },
+    { "name": "phone", "type": ["null", "string"], "default": null }
+  ]
+}

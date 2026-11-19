@@ -94,7 +94,7 @@ pub struct BenchProduct {
     pub price_cents: i64,
     pub in_stock: bool,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[autumn_web::repository(BenchProduct, table = "bolt_bench_products")]

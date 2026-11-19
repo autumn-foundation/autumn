@@ -1,0 +1,12 @@
+       relname        | heap_blks_read | heap_blks_hit | idx_blks_read | idx_blks_hit | toast_blks_read | toast_blks_hit 
+----------------------+----------------+---------------+---------------+--------------+-----------------+----------------
+ comments             |         126997 |         90127 |          3474 |          827 |               0 |              0
+ votes                |         123520 |          1120 |             0 |           24 |                 |               
+ posts                |           8071 |         29977 |           225 |          698 |               0 |              0
+ users                |           3887 |          5558 |           262 |         1813 |               0 |              0
+ subreddits           |              7 |           150 |            14 |           95 |               0 |              0
+ tags                 |              9 |            27 |            12 |           28 |               0 |              0
+ post_tags            |              4 |            20 |            45 |           71 |                 |               
+ autumn_feature_flags |              5 |             3 |             0 |            0 |               0 |              0
+(8 rows)
+

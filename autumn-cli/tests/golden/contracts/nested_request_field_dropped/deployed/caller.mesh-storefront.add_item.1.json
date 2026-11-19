@@ -11,6 +11,7 @@
       "writes": [
         "details",
         "details.color",
+        "details.size",
         "name"
       ]
     }

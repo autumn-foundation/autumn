@@ -208,8 +208,7 @@ pin_project! {
     pub struct CurrentActorBody<B> {
         #[pin]
         inner: B,
-        // `None` only when the body was wrapped outside any request scope, in
-        // which case poll_frame is a transparent pass-through (never panics).
+        // `None` when wrapped outside any request scope: `poll_frame` then passes through.
         scope: Option<ActorScope>,
     }
 }
@@ -248,8 +247,7 @@ impl<B: HttpBody> HttpBody for CurrentActorBody<B> {
 mod tests {
     use super::*;
 
-    // Serialize tests that touch the process-wide default actor so they don't
-    // race each other (the default is global state).
+    // Serializes tests that touch the process-wide default actor.
     static DEFAULT_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[tokio::test]
@@ -275,7 +273,6 @@ mod tests {
                 assert_eq!(Current::actor(), Some("inner".to_owned()));
             })
             .await;
-            // Back in the outer scope the outer actor is restored.
             assert_eq!(Current::actor(), Some("outer".to_owned()));
         })
         .await;
@@ -283,8 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_actor_publishes_onto_an_established_scope() {
-        // Mirrors the request path: an empty scope is established, then the
-        // auth layer publishes the principal via set_actor.
+        // The request path: an empty scope first, then the auth layer publishes the principal.
         scope_request(async {
             assert_eq!(Current::actor(), None);
             Current::set_actor("resolved-user");
@@ -297,27 +293,23 @@ mod tests {
     async fn set_actor_is_a_noop_outside_a_scope() {
         let _g = DEFAULT_GUARD.lock().unwrap();
         Current::set_default_actor(None);
-        // Must not panic and must not somehow persist a value.
         Current::set_actor("nobody");
         assert_eq!(Current::actor(), None);
     }
 
     #[tokio::test]
     async fn default_actor_is_used_only_out_of_scope() {
-        // The default-dependent assertions touch process-global state, so guard
-        // them (and reset) without holding the lock across an `.await`.
+        // Guard the process-global default without holding the lock across an `.await`.
         {
             let _g = DEFAULT_GUARD.lock().unwrap();
             Current::set_default_actor(Some("scheduler".to_owned()));
-            // Out of scope: falls back to the configured default.
             assert_eq!(Current::actor(), Some("scheduler".to_owned()));
             // Reset before releasing the guard so no other test observes it.
             Current::set_default_actor(None);
             assert_eq!(Current::actor(), None);
         }
 
-        // The scoped reads below do not depend on the process default: an empty
-        // request scope reads None, and an explicit scope overrides everything.
+        // Scoped reads ignore the process default.
         scope_request(async {
             assert_eq!(Current::actor(), None);
         })
@@ -331,26 +323,21 @@ mod tests {
 
     #[test]
     fn reads_never_panic_without_a_runtime_scope() {
-        // No tokio task-local scope in effect; must be inert, not panic.
         let _ = Current::actor();
         Current::set_actor("x");
     }
 
     #[tokio::test]
     async fn captured_actor_scope_handle_is_reentrant() {
-        // Mirrors the streaming-body path: establish a request scope, let the
-        // auth layer publish the principal, and capture the interior-mutable
-        // scope handle while still inside the request.
+        // Capture the scope handle inside the request, as the streaming-body path does.
         let handle = scope_request(async {
             Current::set_actor("streamed-user");
             current_scope().expect("a scope is established here")
         })
         .await;
 
-        // The original request scope has now ended. Re-enter the captured handle
-        // from a DIFFERENT task-local frame (exactly what `CurrentActorBody` does
-        // on each `poll_frame`) and confirm the actor set during the request is
-        // still visible — so writes performed while streaming stay attributed.
+        // The request scope has ended. Re-enter the handle from another frame, as
+        // `CurrentActorBody::poll_frame` does: the actor set during the request is still visible.
         let seen = CURRENT_ACTOR.sync_scope(handle, Current::actor);
         assert_eq!(seen, Some("streamed-user".to_owned()));
     }

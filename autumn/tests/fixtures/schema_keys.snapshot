@@ -697,6 +697,7 @@ tenancy
 tenancy.base_domain
 tenancy.enabled
 tenancy.header_name
+tenancy.header_trust
 tenancy.idle_ttl_secs
 tenancy.jwt_audience
 tenancy.jwt_claim

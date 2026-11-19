@@ -260,16 +260,10 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
                             lines[j] = format!("{ind2}{new_line}");
                         }
                     } else {
-                        // Multiline `features = [` … `]` array: find the closing
-                        // `]`, collect the existing entries, and rebuild the list
-                        // (collapsed to one line) with the missing features
-                        // appended. A `#` comment is not TOML, so a stray `]`
-                        // or trailing text inside one is never real syntax —
-                        // every raw-text scan and join below works only on
-                        // each line's code portion (before its first `#`), and
-                        // only outside any quoted value (Cargo allows unusual
-                        // feature names on a path/git dependency, so a quoted
-                        // `]` or `,` is data, not an array boundary).
+                        // Multiline `features = [` … `]` array: rebuild it on one line with the
+                        // missing features appended. Scan only each line's code before `#`, and
+                        // only outside quotes: a `]` or `,` in a comment or a quoted feature name
+                        // is not an array boundary.
                         let mut close_line = None;
                         let mut k = j;
                         while k < lines.len() {
@@ -387,9 +381,8 @@ fn ensure_totp_rs_features(toml: &str) -> String {
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Merge `TOTP_RS_FEATURES` into the `[ ... ]` list embedded in `line`,
-    // returning the rewritten line, or `None` if nothing changed (already
-    // complete) / no list found.
+    // Merge `TOTP_RS_FEATURES` into the `[ ... ]` list in `line`. Returns `None` when there is no
+    // list and `Some(None)` when it is already complete.
     let merge_into_list = |line: &str, bracket_search: &str| -> Option<Option<String>> {
         let feat_bracket = find_unquoted_str(strip_line_comment(line), bracket_search)?;
         let list_start = feat_bracket + bracket_search.len();
@@ -427,9 +420,7 @@ fn ensure_totp_rs_features(toml: &str) -> String {
 
         // `totp-rs = "5"` → promote to a table carrying the required features.
         if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
-            // `rest` is everything after `totp-rs = "`. Take up to the closing
-            // quote so a trailing inline comment (`"5" # note`) isn't folded into
-            // the version string (which would make Cargo.toml invalid).
+            // Stop at the closing quote so a trailing `# note` stays out of the version string.
             let (version, trailing) = rest.find('"').map_or_else(
                 || (rest.trim_end_matches('"'), ""),
                 |close| (&rest[..close], rest[close + 1..].trim()),
@@ -492,16 +483,10 @@ fn ensure_totp_rs_features(toml: &str) -> String {
                         None => {}
                     }
                 } else {
-                    // Multiline `features = [` … `]` array: find the closing `]`,
-                    // collect the existing entries, and rebuild the list (collapsed
-                    // to one line) with the missing features appended. A `#`
-                    // comment is not TOML, so a stray `]` or trailing text
-                    // inside one is never real syntax — every raw-text scan
-                    // and join below works only on each line's code portion
-                    // (before its first `#`), and only outside any quoted value
-                    // (Cargo allows unusual feature names on a path/git
-                    // dependency, so a quoted `]` or `,` is data, not an array
-                    // boundary).
+                    // Multiline `features = [` … `]` array: rebuild it on one line with the missing
+                    // features appended. Scan only each line's code before `#`, and only outside
+                    // quotes: a `]` or `,` in a comment or a quoted feature name is not an array
+                    // boundary.
                     let mut close_line = None;
                     let mut k = fl;
                     while k < lines.len() {
@@ -615,10 +600,8 @@ pub fn plan_auth_with_providers_ex(
     totp: bool,
     magic_link: bool,
 ) -> Result<Plan, GenerateError> {
-    // Generation path: run the full plan, including the shared-layout preflight.
-    // `autumn destroy auth` recomputes the identical plan before reverting it,
-    // and must bypass that generate-only preflight (issue #1353 follow-up); it
-    // reaches the builder through `plan_auth_full_ex2_for_revert` instead.
+    // `autumn destroy auth` skips the generate-only shared-layout preflight by calling
+    // `plan_auth_full_ex2_for_revert` instead.
     plan_auth_with_providers_ex_impl(
         project_root,
         name,
@@ -648,22 +631,17 @@ fn plan_auth_with_providers_ex_impl(
     ensure_project_root(project_root)?;
     super::model::validate_resource_name(name)?;
 
-    // Determine the target app's database backend so the scaffolded migrations
-    // emit backend-aware DDL (issue #1927): a SQLite app gets SQLite-dialect DDL
-    // (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT CURRENT_TIMESTAMP`) instead
-    // of the Postgres-only `BIGSERIAL`/`NOW()` form. Detected identically on the
-    // generate and destroy/revert paths (both read the same config), so a
-    // `destroy auth` round-trip recomputes byte-identical migration content.
+    // Backend-aware DDL (#1927): SQLite gets `INTEGER PRIMARY KEY AUTOINCREMENT` and
+    // `CURRENT_TIMESTAMP` instead of Postgres `BIGSERIAL`/`NOW()`. Generate and destroy read the
+    // same config, so a `destroy auth` round-trip recomputes identical migrations.
     let backend = super::detect_backend(project_root);
 
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let table = pluralize(&snake_name);
 
-    // Under `--totp` the generator unconditionally emits a `recovery_code` model
-    // and a `recovery_codes` table. If the auth resource itself resolves to those
-    // names, the two collide — the same model file and `CREATE TABLE` would be
-    // emitted twice, producing an unusable app. Reject it up front.
+    // `--totp` always emits a `recovery_code` model and `recovery_codes` table, so an auth resource
+    // with either name would emit the same file and `CREATE TABLE` twice.
     if totp && (snake_name == "recovery_code" || table == "recovery_codes") {
         return Err(GenerateError::InvalidName(
             name.to_owned(),
@@ -673,11 +651,8 @@ fn plan_auth_with_providers_ex_impl(
         ));
     }
 
-    // Under `--magic-link` the generator unconditionally emits a `magic_link_token`
-    // model and a `magic_link_tokens` table. If the auth resource itself resolves to
-    // those names, the two collide — the same `CREATE TABLE` would be emitted twice
-    // and the helper model file would overwrite the auth model file, producing an
-    // unusable scaffold. Reject it up front (mirrors the `--totp` guard above).
+    // `--magic-link` always emits a `magic_link_token` model and `magic_link_tokens` table, so an
+    // auth resource with either name would collide with them.
     if magic_link && (snake_name == "magic_link_token" || table == "magic_link_tokens") {
         return Err(GenerateError::InvalidName(
             name.to_owned(),
@@ -687,32 +662,19 @@ fn plan_auth_with_providers_ex_impl(
         ));
     }
 
-    // Issue #1353: the generated auth views render through the application's
-    // shared `crate::layout(title, current_path, flash, content)` (nav bar,
-    // stylesheet links, skip-link, footer) rather than a private per-file
-    // layout stub, so the target app must expose a shared layout with the
-    // matching 4-arg signature (as `autumn new` emits). Detect it by looking
-    // for a `pub fn layout` in `src/main.rs`. If it is missing — or present
-    // with the wrong arity (e.g. an older/custom 2-arg
-    // `pub fn layout(title, content)`) — fail early with an actionable message
-    // rather than emitting routes that call a nonexistent or mismatched
-    // `crate::layout`. This mirrors the scaffold generator's preflight
-    // (issue #1130) and reuses its lexically-aware detector.
+    // The generated views render through the app's shared
+    // `crate::layout(title, current_path, flash, content)` (#1353). Fail early with an actionable
+    // message when `src/main.rs` has no `pub fn layout` with that 4-arg signature. Same preflight
+    // as the scaffold generator (#1130).
     //
-    // The preflight is a generate-time guard only. `autumn destroy auth`
-    // recomputes this same plan before reverting it, so running the preflight
-    // on that path would hard-fail cleanup in a project whose shared
-    // `pub fn layout` is missing or renamed — stranding the very files destroy
-    // is meant to remove. Skip it when `for_revert` is set.
+    // Skipped on revert: `autumn destroy auth` recomputes this plan and must still remove the
+    // generated files from a project whose layout is missing or renamed.
     if !for_revert {
         let main_for_layout_check = project_root.join("src").join("main.rs");
         let main_src = match std::fs::read_to_string(&main_for_layout_check) {
             Ok(src) => src,
-            // `main.rs` genuinely absent: surface the actionable message below by
-            // treating it as an empty source (no `pub fn layout` present).
+            // A missing `main.rs` reports the actionable layout error below.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            // Any other io error (e.g. PermissionDenied) preserves its original
-            // `ErrorKind` + OS message rather than being masked.
             Err(e) => return Err(GenerateError::Io(e)),
         };
         if !super::scaffold::has_shared_layout(&main_src) {
@@ -752,7 +714,6 @@ fn plan_auth_with_providers_ex_impl(
     let model_mod_path = models_dir.join("mod.rs");
     let mut model_mod = add_mod_declaration(&read_or_empty(&model_mod_path), &snake_name);
     if totp {
-        // Recovery codes live in their own model + table.
         plan.create(
             models_dir.join("recovery_code.rs"),
             render_recovery_code_model_file(&pascal_name, &table),
@@ -773,9 +734,7 @@ fn plan_auth_with_providers_ex_impl(
     );
     let remember_mod_name = format!("{snake_name}_remember_token");
     model_mod = add_mod_declaration(&model_mod, &remember_mod_name);
-    // Passwordless magic-link tokens (issue #1328) live in their own model +
-    // table, mirroring the reset-token invariants: only the SHA-256 digest is
-    // stored, plus an expiry and a single-use `consumed_at` marker.
+    // Passwordless magic-link tokens (#1328) live in their own model + table.
     if magic_link {
         plan.create(
             models_dir.join("magic_link_token.rs"),
@@ -810,13 +769,8 @@ fn plan_auth_with_providers_ex_impl(
     });
 
     // ── src/schema.rs entry ────────────────────────────────────────────────
-    // The generated model references `crate::schema::<table>`, so we must
-    // emit a `diesel::table! { }` block just like `generate model` does.
-    // Auth-specific fields (id and created_at are added automatically):
-    //   email            String   → Text      NOT NULL
-    //   password_digest  String   → Text      NOT NULL
-    //   reset_token_digest         Option<String>         → Nullable<Text>
-    //   reset_token_expires_at     Option<NaiveDateTime>  → Nullable<Timestamp>
+    // The model references `crate::schema::<table>`, so emit its `diesel::table!` block as
+    // `generate model` does. `id` and `created_at` are added automatically.
     let mut user_field_tokens: Vec<&str> = vec![
         "email:String",
         "time_zone:Option<String>",
@@ -845,17 +799,10 @@ fn plan_auth_with_providers_ex_impl(
 
     let schema_path = project_root.join("src").join("schema.rs");
     let schema_existing = read_or_empty(&schema_path);
-    // Under `--totp` we unconditionally create a helper `recovery_codes` table.
-    // If the project already declares one (in `src/schema.rs`), the migration
-    // would emit a second `CREATE TABLE recovery_codes` and `diesel migration
-    // run` would fail with "relation already exists" (or clobber an unrelated
-    // table). Reject up front rather than generate an unusable app.
-    //
-    // Only reject a *foreign* `recovery_codes` table: when the auth table
-    // itself is also already present, this is a re-run over our own output
-    // (`--force`, or `autumn destroy` recomputing this same plan against
-    // already-generated files — issue #1048), where the schema append below
-    // is an idempotent no-op. Mirrors the analogous `sess_table` guard below.
+    // `--totp` adds a `recovery_codes` table; an existing one would make the migration fail with
+    // "relation already exists". It is allowed only when the auth table exists too: that is a
+    // re-run over our own output (`--force`, or destroy recomputing this plan, #1048), where the
+    // schema append below is a no-op. The guards below follow the same rule.
     if totp
         && schema_has_table(&schema_existing, "recovery_codes")
         && !schema_has_table(&schema_existing, &table)
@@ -867,10 +814,7 @@ fn plan_auth_with_providers_ex_impl(
                 .to_owned(),
         ));
     }
-    // Same guard for the session-tracking helper table (issue #819). Only
-    // reject a *foreign* table: when the auth table itself is also present,
-    // this is a re-run over our own output (`--force`), where the schema
-    // append below is an idempotent no-op.
+    // Same guard for the session table (#819).
     let sess_table = sessions_table_name(&snake_name);
     if schema_has_table(&schema_existing, &sess_table)
         && !schema_has_table(&schema_existing, &table)
@@ -898,10 +842,7 @@ fn plan_auth_with_providers_ex_impl(
             ),
         ));
     }
-    // Same guard for the magic-link helper table (issue #1328). Only under
-    // `--magic-link`, and only reject a *foreign* table: when the auth table
-    // itself is also present, this is a re-run over our own output (`--force`),
-    // where the schema append below is an idempotent no-op.
+    // Same guard for the magic-link table (#1328), under `--magic-link` only.
     if magic_link
         && schema_has_table(&schema_existing, "magic_link_tokens")
         && !schema_has_table(&schema_existing, &table)
@@ -941,9 +882,8 @@ fn plan_auth_with_providers_ex_impl(
     .map(|t| super::dsl::parse_field(t).expect("session field tokens are always valid"))
     .collect();
     schema_new = append_schema_table(&schema_new, &sess_table, &session_fields);
-    // Persistent "remember-me" login chains (issue #1397). Mirrors the sessions
-    // table shape: a synthetic `id` primary key plus a unique opaque `series`
-    // that is the stable per-device lookup key.
+    // Remember-me login chains (#1397): the unique opaque `series` is the stable per-device
+    // lookup key.
     let rem_table = remember_table_name(&snake_name);
     let remember_fields: Vec<super::dsl::Field> = [
         "series:String",
@@ -964,9 +904,8 @@ fn plan_auth_with_providers_ex_impl(
     .map(|t| super::dsl::parse_field(t).expect("remember field tokens are always valid"))
     .collect();
     schema_new = append_schema_table(&schema_new, &rem_table, &remember_fields);
-    // Passwordless magic-link tokens (issue #1328). Dedicated table mirroring
-    // the reset-token invariants: only the SHA-256 digest of the raw token is
-    // stored, plus an expiry and a single-use `consumed_at` marker.
+    // Magic-link tokens (#1328): only the SHA-256 digest of the raw token is stored, plus an expiry
+    // and a single-use `consumed_at` marker.
     let magic_link_fields: Vec<super::dsl::Field> = magic_link_token_fields();
     if magic_link {
         schema_new = append_schema_table(&schema_new, "magic_link_tokens", &magic_link_fields);
@@ -998,8 +937,7 @@ fn plan_auth_with_providers_ex_impl(
         table: sess_table,
         expected_block: sess_table_expected_block,
     });
-    // Remember-me table is appended last (before the optional magic-link table),
-    // so it is reverted just after it (issue #1397).
+    // Appended before the optional magic-link table, so reverted just after it (#1397).
     let rem_table_expected_block = append_schema_table("", &rem_table, &remember_fields);
     plan.push_revert(crate::generate::emit::Revert::SchemaTable {
         path: schema_path.clone(),
@@ -1052,7 +990,6 @@ fn plan_auth_with_providers_ex_impl(
             render_2fa_tests_file(&pascal_name, &snake_name),
         );
     }
-    // Active-session management integration tests (issue #819).
     plan.create(
         tests_dir.join("auth_sessions.rs"),
         render_sessions_tests_file(&pascal_name, &snake_name),
@@ -1080,9 +1017,8 @@ fn plan_auth_with_providers_ex_impl(
     })?;
     let entries = auth_route_entries(totp, magic_link);
     let updated = update_main_rs(&main_existing, &["models", "routes", "schema"], &entries);
-    // Auto-wire the remember-me middleware layer + startup hook into the
-    // `AppBuilder` chain so a freshly generated app actually consumes the
-    // remember cookie it issues (issue #1397.7).
+    // Wire the remember-me middleware and startup hook so the app honours the remember cookie it
+    // issues (#1397).
     let updated = add_remember_middleware_to_app(&updated);
     plan.modify(main_path.clone(), updated);
     plan.push_revert(crate::generate::emit::Revert::RoutesEntries {
@@ -1100,12 +1036,10 @@ fn plan_auth_with_providers_ex_impl(
         .chain(AUTH_EXTRA_DEPS.iter().copied())
         .chain(if totp { TOTP_EXTRA_DEPS } else { &[] }.iter().copied())
         .collect();
-    // `ensure_cargo_dependencies` is name-only, so an app that pins an older
-    // crate keeps it. The generated code uses the `rand` 0.10 API. Warn.
+    // `ensure_cargo_dependencies` is name-only, so an app pinning an older crate keeps it. The
+    // generated code needs the `rand` 0.10 API, so warn.
     super::model::warn_if_existing_dep_below_version(&mut plan, &cargo_existing, "rand", 0, 10);
-    // The `--totp` routes add `base64 = "0.23"` and use its 0.21+ `Engine`
-    // API; `ensure_cargo_dependencies` is name-only, so an app pinning an older
-    // `base64` keeps it and the generated 2FA code won't compile. Warn instead.
+    // The `--totp` routes use `base64`'s `Engine` API; warn on a pin below 0.22.
     if totp {
         super::model::warn_if_existing_dep_below_version(
             &mut plan,
@@ -1115,7 +1049,6 @@ fn plan_auth_with_providers_ex_impl(
             22,
         );
     }
-    // Apply dep additions then enable the mail feature in a single write.
     let with_deps = ensure_cargo_dependencies(&cargo_existing, &all_deps);
     // `ensure_cargo_dependencies` no-ops on an already-declared `totp-rs`, so
     // merge the required features into any pre-existing declaration.
@@ -1128,16 +1061,9 @@ fn plan_auth_with_providers_ex_impl(
     if final_cargo != cargo_existing {
         plan.modify(cargo_toml_path.clone(), final_cargo);
     }
-    // Pushed unconditionally — see `plan_cargo_deps`'s matching comment in
-    // model.rs: destroy recomputes this plan against the already-generated
-    // Cargo.toml, where these entries are by definition already present.
-    // `owner_dir` is `src/models`: every auth resource always creates at
-    // least `<snake>.rs` and `<snake>_session.rs` there, and (unlike
-    // channels/mailers) an auth resource's routes file isn't
-    // name-parameterized (`src/routes/auth.rs` always, regardless of the
-    // resource name), so a second auth resource can't coexist under a
-    // different name anyway — `src/models` is a reliable "this auth resource
-    // still exists" marker.
+    // Pushed unconditionally: destroy recomputes this plan against the generated Cargo.toml,
+    // where these deps are already present (see `plan_cargo_deps`). `src/models` is the owner dir
+    // because every auth resource writes `<snake>.rs` and `<snake>_session.rs` there.
     let models_owner_dir = project_root.join("src").join("models");
     let dep_names: Vec<String> = all_deps
         .iter()
@@ -1311,10 +1237,8 @@ pub fn plan_auth_full_ex2_for_revert(
 /// Shared implementation: base (optionally TOTP-aware, optionally passkey-aware,
 /// optionally magic-link-aware) scaffold plus, when providers are supplied, the
 /// OAuth artifacts.
-// The three feature flags (`totp`/`passkeys`/`magic_link`) already saturate the
-// bool/arg budget; the fourth (`for_revert`) is an internal generate-vs-destroy
-// toggle threaded only from this crate's two public wrappers, so keep the flat
-// signature rather than wrap it in a one-off options struct.
+// The flat signature stays: `for_revert` is an internal generate-vs-destroy toggle threaded
+// from the two public wrappers, not worth a one-off options struct.
 #[allow(
     clippy::too_many_lines,
     clippy::too_many_arguments,
@@ -1330,9 +1254,6 @@ fn plan_auth_options_impl(
     magic_link: bool,
     for_revert: bool,
 ) -> Result<Plan, GenerateError> {
-    // Start with the base auth plan with providers (and optional TOTP, and
-    // optional magic-link) applied. `for_revert` threads through to suppress the
-    // generate-only shared-layout preflight on the `autumn destroy auth` path.
     let mut plan = plan_auth_with_providers_ex_impl(
         project_root,
         name,
@@ -1343,8 +1264,7 @@ fn plan_auth_options_impl(
         for_revert,
     )?;
 
-    // Determine the target app's database backend so the scaffolded migrations
-    // emit backend-aware DDL (issue #1927), matching the base auth plan above.
+    // Same backend detection as the base plan (#1927).
     let backend = super::detect_backend(project_root);
     let pascal_name = pascal(name);
     let snake_name = snake(name);
@@ -1352,8 +1272,7 @@ fn plan_auth_options_impl(
 
     if !oauth.providers.is_empty() {
         // ── oauth_identities migration ─────────────────────────────────────────
-        // Increment the timestamp by one second so Diesel never sees two migrations
-        // with the same version number.
+        // One second after the base migration, so Diesel sees distinct versions.
         let oauth_ts_str: String = timestamp
             .parse::<i64>()
             .map_or_else(|_| format!("{timestamp}1"), |t| (t + 1).to_string());
@@ -1401,8 +1320,7 @@ fn plan_auth_options_impl(
             ),
         );
 
-        // Add `pub mod oauth;` to src/routes/mod.rs — use the base plan's already-modified
-        // content so the base `pub mod auth;` declaration is not overwritten.
+        // Build on the base plan's routes/mod.rs so its `pub mod auth;` is kept.
         let route_mod_path = routes_dir.join("mod.rs");
         let route_mod_base = find_plan_content_for_path(&plan, &route_mod_path)
             .unwrap_or_else(|| read_or_empty(&route_mod_path));
@@ -1422,7 +1340,7 @@ fn plan_auth_options_impl(
             ))
         })?;
         let oauth_entries = oauth_route_entries();
-        // The base plan has already modified main.rs; find current state in plan or use existing.
+        // Build on the base plan's main.rs edits, if any.
         let base_main =
             find_plan_content_for_path(&plan, &main_path).unwrap_or_else(|| main_existing.clone());
         let updated_main = super::schema_edit::update_main_rs(
@@ -1446,7 +1364,7 @@ fn plan_auth_options_impl(
         // ── Cargo.toml: add oauth2 feature to autumn-web ─────────────────────
         let cargo_toml_path = project_root.join("Cargo.toml");
         let cargo_existing = read_or_empty(&cargo_toml_path);
-        // The base plan may have already updated Cargo.toml; use its content if present.
+        // Build on the base plan's Cargo.toml edits, if any.
         let base_cargo = find_plan_content_for_path(&plan, &cargo_toml_path)
             .unwrap_or_else(|| cargo_existing.clone());
         let with_oauth2 = ensure_autumn_web_oauth2_feature(&base_cargo);
@@ -1476,14 +1394,9 @@ fn plan_auth_options_impl(
 
     if passkeys {
         // ── webauthn_credentials collision check ───────────────────────────────
-        // If the project already has webauthn_credentials in schema.rs, the
-        // migration below would fail at `diesel migration run`. Reject upfront.
-        //
-        // Only reject a *foreign* `webauthn_credentials` table: when the auth
-        // user table itself is also already present, this is a re-run over
-        // our own output (`--force`, or `autumn destroy` recomputing this
-        // same plan against already-generated files — issue #1048), where
-        // the schema append below is an idempotent no-op.
+        // An existing `webauthn_credentials` table would make the migration fail. It is allowed
+        // only when the auth table exists too: that is a re-run over our own output (`--force`, or
+        // destroy recomputing this plan, #1048), where the schema append below is a no-op.
         let schema_for_check = project_root.join("src").join("schema.rs");
         let schema_existing_for_passkey = find_plan_content_for_path(&plan, &schema_for_check)
             .unwrap_or_else(|| read_or_empty(&schema_for_check));
@@ -1499,8 +1412,7 @@ fn plan_auth_options_impl(
         }
 
         // ── webauthn_credentials migration ─────────────────────────────────────
-        // Use timestamp+2 when oauth is also requested (oauth uses timestamp+1),
-        // so both migrations get unique Diesel version numbers.
+        // OAuth takes timestamp+1, so passkeys take +2 when both are requested.
         let passkey_offset: i64 = if oauth.providers.is_empty() { 1 } else { 2 };
         let passkey_ts_str: String = timestamp.parse::<i64>().map_or_else(
             |_| format!("{timestamp}{passkey_offset}"),
@@ -1630,9 +1542,7 @@ fn plan_auth_options_impl(
         let base_cargo = find_plan_content_for_path(&plan, &cargo_toml_path)
             .unwrap_or_else(|| read_or_empty(&cargo_toml_path));
         let all_passkey_deps: Vec<(&str, &str)> = PASSKEY_EXTRA_DEPS.to_vec();
-        // `ensure_cargo_dependencies` is name-only, so an app that already pins
-        // an older `base64` keeps it and never gets `0.23`; the emitted
-        // `encode_cred_id` needs the 0.21+ `Engine` API, so warn if it's too old.
+        // `encode_cred_id` needs `base64`'s `Engine` API; warn on a pin below 0.22.
         super::model::warn_if_existing_dep_below_version(&mut plan, &base_cargo, "base64", 0, 22);
         // The emitted passkey code uses the `webauthn-rs` 0.6 API.
         super::model::warn_if_existing_dep_below_version(
@@ -1643,8 +1553,7 @@ fn plan_auth_options_impl(
             6,
         );
         let with_deps = super::model::ensure_cargo_dependencies(&base_cargo, &all_passkey_deps);
-        // If the project already declared webauthn-rs without the required features,
-        // ensure_cargo_dependencies would have skipped it; merge them here.
+        // `ensure_cargo_dependencies` skips an already-declared `webauthn-rs`; merge its features.
         let with_deps = ensure_webauthn_rs_features(&with_deps);
         let with_webauthn = ensure_autumn_web_webauthn_feature(&with_deps);
         if with_webauthn != base_cargo {
@@ -1736,9 +1645,7 @@ fn ensure_autumn_web_feature(toml: &str, feature_name: &str) -> String {
         }
 
         if trimmed.starts_with(&table_prefix) {
-            // A trailing `# comment` mentioning the feature is not TOML —
-            // check only the code portion of the line, the same guard the
-            // subtable branch below needs against a commented-out mention.
+            // Check only the code before `#`: a comment mentioning the feature is not TOML.
             if strip_line_comment(&trimmed).contains(feature) {
                 break; // already present
             }
@@ -1761,76 +1668,13 @@ fn ensure_autumn_web_feature(toml: &str, feature_name: &str) -> String {
                         &trimmed[list_end..]
                     );
                 } else {
-                    // Multiline `features = [` … `]` array inside the
-                    // inline-table form (legal TOML since 1.0): mirror the
-                    // subtable branch's own multiline handling below rather
-                    // than a same-line-only scan. Codex review on #3084
-                    // found this thinner version could both lose the
-                    // separator before a feature appended after an entry
-                    // with no trailing comma, and miss an already-merged
-                    // feature sitting on a continuation line — the same two
-                    // defects #2948 already fixed once for the subtable
-                    // form.
-                    let mut k = i + 1;
-                    let mut already_present = false;
-                    let mut close_line = None;
-                    while k < lines.len() {
-                        let tk = lines[k].trim();
-                        if tk.starts_with('[') {
-                            break;
-                        }
-                        let code = strip_line_comment(tk);
-                        if let Some(close_idx) = find_unquoted(code, ']') {
-                            // Unlike the subtable form, an inline table's `}`
-                            // can carry more comma-separated fields after the
-                            // array's `]` on this same line (`], path = "…" }`)
-                            // — Codex review on #3084 found a field whose own
-                            // string value happened to equal the feature name
-                            // (`path = "<feature>"`) made this look merged
-                            // already when the array itself was not. Only the
-                            // portion before `]` is the array.
-                            if code[..close_idx].contains(feature) {
-                                already_present = true;
-                            }
-                            close_line = Some(k);
-                            break;
-                        }
-                        if code.contains(feature) {
-                            already_present = true;
-                        }
-                        k += 1;
-                    }
-                    if !already_present && let Some(k) = close_line {
-                        let tk = lines[k].trim().to_owned();
-                        let close_idx = find_unquoted(&tk, ']').unwrap_or(tk.len());
-                        let before_close = tk[..close_idx].trim();
-                        // The closing bracket's own line may have no entry
-                        // before it, in which case the last real entry is on
-                        // an earlier line — including possibly the opener
-                        // line itself, past `features = [`.
-                        let last_entry = (i..=k).rev().find_map(|idx| {
-                            let raw: &str = if idx == k {
-                                before_close
-                            } else if idx == i {
-                                &trimmed[list_start..]
-                            } else {
-                                &lines[idx]
-                            };
-                            let raw = strip_line_comment(raw).trim();
-                            (!raw.is_empty()).then(|| raw.to_owned())
-                        });
-                        let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
-                            ", "
-                        } else {
-                            ""
-                        };
-                        let indent_k: String = lines[k]
-                            .chars()
-                            .take_while(char::is_ascii_whitespace)
-                            .collect();
-                        lines[k] =
-                            format!("{indent_k}{before_close}{sep}{feature}{}", &tk[close_idx..]);
-                    }
+                    // Multiline `features = [` … `]` array (legal TOML since 1.0).
+                    merge_feature_into_multiline_array(
+                        &mut lines,
+                        i,
+                        &trimmed[list_start..],
+                        feature,
+                    );
                 }
             } else {
                 let close = trimmed.rfind('}').unwrap();
@@ -1849,12 +1693,10 @@ fn ensure_autumn_web_feature(toml: &str, feature_name: &str) -> String {
             break;
         }
 
-        // Cargo does not normalize `-`/`_` in a dependency table key: unlike
-        // `[dependencies.autumn-web]`, `[dependencies.autumn_web]` names an
-        // unrelated package `autumn_web` unless its body renames it back with
-        // `package = "autumn-web"` (confirmed via `cargo metadata`). Require
-        // that declaration before treating the underscore form as a match, the
-        // same way `find_section_start_with_autumn_web_package` does.
+        // Cargo does not normalize `-`/`_` in a dependency table key: `[dependencies.autumn_web]`
+        // names an unrelated package unless its body says `package = "autumn-web"`. Require that
+        // before treating the underscore form as a match, as
+        // `find_section_start_with_autumn_web_package` does.
         let underscore_aliases_autumn_web = trimmed == subtable_header_underscore && {
             let body_end = lines[i + 1..]
                 .iter()
@@ -1876,12 +1718,8 @@ fn ensure_autumn_web_feature(toml: &str, feature_name: &str) -> String {
                 }
                 if t.starts_with("features") {
                     found_features = true;
-                    // A trailing `# comment` on the opener line is not TOML —
-                    // check only the code portion, both for "is the feature
-                    // already mentioned" and for locating a real closing `]`
-                    // (a `]` inside the comment would misclassify a genuinely
-                    // multiline array as single-line and merge into dead text
-                    // past the `#`).
+                    // Check only the code before `#`: a mention of the feature there is not TOML,
+                    // and a `]` there would make a multiline array look single-line.
                     if strip_line_comment(&t).contains(feature) {
                         break;
                     }
@@ -1899,72 +1737,13 @@ fn ensure_autumn_web_feature(toml: &str, feature_name: &str) -> String {
                                 .collect();
                             lines[j] = format!("{indent_j}features = [{new_inner}]");
                         } else {
-                            // Multiline `features = [` … `]` array: scan every
-                            // line up to the closing bracket. The feature may
-                            // already be merged on a line other than the
-                            // opener, in which case nothing should be
-                            // appended (it would otherwise be duplicated on
-                            // every re-run of the generator).
-                            let mut k = j + 1;
-                            let mut already_present = false;
-                            let mut close_line = None;
-                            while k < lines.len() {
-                                let tk = lines[k].trim();
-                                if tk.starts_with('[') {
-                                    break;
-                                }
-                                // A `#`-commented-out mention of the feature or
-                                // a stray `]` inside a comment is not TOML —
-                                // check only the code portion of the line.
-                                let code = strip_line_comment(tk);
-                                if code.contains(feature) {
-                                    already_present = true;
-                                }
-                                if find_unquoted(code, ']').is_some() {
-                                    close_line = Some(k);
-                                    break;
-                                }
-                                k += 1;
-                            }
-                            if !already_present && let Some(k) = close_line {
-                                let tk = lines[k].trim().to_owned();
-                                let close_idx = find_unquoted(&tk, ']').unwrap_or(tk.len());
-                                let before_close = tk[..close_idx].trim();
-                                // The closing bracket's own line may have no
-                                // entry before it (just `]`, or just a
-                                // comment), in which case the last real entry
-                                // — needed to know whether a comma must be
-                                // inserted — is on an earlier line. A trailing
-                                // `# comment` never counts as the entry: strip
-                                // it before checking, or a commented `"ws", #
-                                // note` line reads as not ending in ',' and
-                                // gets a second, invalid comma inserted ahead
-                                // of it.
-                                let last_entry = (j..=k).rev().find_map(|idx| {
-                                    let raw: &str = if idx == k {
-                                        before_close
-                                    } else if idx == j {
-                                        lines[idx].split_once('[').map_or("", |(_, rest)| rest)
-                                    } else {
-                                        &lines[idx]
-                                    };
-                                    let raw = strip_line_comment(raw).trim();
-                                    (!raw.is_empty()).then(|| raw.to_owned())
-                                });
-                                let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
-                                    ", "
-                                } else {
-                                    ""
-                                };
-                                let indent_k: String = lines[k]
-                                    .chars()
-                                    .take_while(char::is_ascii_whitespace)
-                                    .collect();
-                                lines[k] = format!(
-                                    "{indent_k}{before_close}{sep}{feature}{}",
-                                    &tk[close_idx..]
-                                );
-                            }
+                            // Multiline `features = [` … `]` array.
+                            merge_feature_into_multiline_array(
+                                &mut lines,
+                                j,
+                                &t[open + 1..],
+                                feature,
+                            );
                         }
                     }
                     break;
@@ -1985,6 +1764,74 @@ fn ensure_autumn_web_feature(toml: &str, feature_name: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Merge `feature` into a multiline `features = [` … `]` array whose
+/// opening `[` is on `lines[open_idx]`, with `opener_tail` the text already
+/// on that same line after the `[`. No-ops if `feature` is already present
+/// anywhere in the array. Shared by both the inline-table and subtable forms
+/// `ensure_autumn_web_feature` parses — the only difference between those
+/// two copies was ever how each one located the opener line's tail text,
+/// never the merge logic itself (see the missed-fix history across
+/// #2948/#3084, cited at both call sites).
+fn merge_feature_into_multiline_array(
+    lines: &mut [String],
+    open_idx: usize,
+    opener_tail: &str,
+    feature: &str,
+) {
+    let mut k = open_idx + 1;
+    let mut already_present = false;
+    let mut close_line = None;
+    while k < lines.len() {
+        let tk = lines[k].trim();
+        if tk.starts_with('[') {
+            break;
+        }
+        let code = strip_line_comment(tk);
+        if let Some(close_idx) = find_unquoted(code, ']') {
+            // In an inline table more fields can follow the `]` on this line (`], path = "…" }`),
+            // so only the text before `]` belongs to the array.
+            if code[..close_idx].contains(feature) {
+                already_present = true;
+            }
+            close_line = Some(k);
+            break;
+        }
+        if code.contains(feature) {
+            already_present = true;
+        }
+        k += 1;
+    }
+    let (true, Some(k)) = (!already_present, close_line) else {
+        return;
+    };
+    let tk = lines[k].trim().to_owned();
+    let close_idx = find_unquoted(&tk, ']').unwrap_or(tk.len());
+    let before_close = tk[..close_idx].trim();
+    // The closing line may hold no entry, so the last entry can be on an earlier line, including
+    // the opener's text after `[`.
+    let last_entry = (open_idx..=k).rev().find_map(|idx| {
+        let raw: &str = if idx == k {
+            before_close
+        } else if idx == open_idx {
+            opener_tail
+        } else {
+            &lines[idx]
+        };
+        let raw = strip_line_comment(raw).trim();
+        (!raw.is_empty()).then(|| raw.to_owned())
+    });
+    let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
+        ", "
+    } else {
+        ""
+    };
+    let indent_k: String = lines[k]
+        .chars()
+        .take_while(char::is_ascii_whitespace)
+        .collect();
+    lines[k] = format!("{indent_k}{before_close}{sep}{feature}{}", &tk[close_idx..]);
 }
 
 /// Ensure `autumn-web` in `[dependencies]` has `features = ["oauth2"]`.
@@ -2247,9 +2094,7 @@ fn render_migration_up(
         ts = d.ts,
         created_at = d.ts_not_null_default_now,
     );
-    // `email`'s uniqueness is expressed through the same shared primitive
-    // `field:String:unique` scaffolds elsewhere (issue #1032), rather than a
-    // parallel hand-rolled `UNIQUE` column constraint.
+    // `email` uniqueness uses the same index helper as `field:String:unique` (#1032).
     out.push_str(&unique_index_sql(table, "email", &[]));
     if totp {
         let _ = write!(
@@ -2270,19 +2115,16 @@ fn render_migration_up(
             created_at = d.ts_not_null_default_now,
         );
     }
-    // Active login sessions (issue #819): one row per login, keyed by the
-    // SHA-256 digest of the opaque server-side session id. Only the digest
-    // is stored so a database leak cannot be replayed as a session cookie.
+    // Active login sessions (#819), keyed by the SHA-256 digest of the session id so a database
+    // leak cannot be replayed as a session cookie.
     let _ = write!(
         out,
         "\n{ddl}",
         ddl = render_sessions_table_ddl(backend, snake_name, table),
     );
-    // Persistent "remember-me" login chains (issue #1397): one row per device
-    // login-chain, keyed by the stable opaque `series`. `token_hash` rotates on
-    // every use so a replayed rotated-out cookie is detected as theft. Only the
-    // SHA-256 hash of the current token is stored — never the raw token — so a
-    // database leak cannot be replayed as a remember cookie.
+    // Remember-me login chains (#1397), one row per device keyed by `series`. `token_hash` rotates
+    // on every use, so replaying a rotated-out cookie is detected as theft. Only the hash of the
+    // current token is stored.
     let rem_table = remember_table_name(snake_name);
     let _ = write!(
         out,
@@ -2311,10 +2153,8 @@ fn render_migration_up(
         ts = d.ts,
         created_at = d.ts_not_null_default_now,
     );
-    // Passwordless magic-link tokens (issue #1328): one row per issued link,
-    // keyed by the SHA-256 digest of the raw token. Only the digest is stored —
-    // the raw token appears only in the emailed link. `consumed_at` is the
-    // single-use marker; `expires_at` enforces the configurable TTL.
+    // Magic-link tokens (#1328): only the SHA-256 digest is stored; the raw token is only in the
+    // emailed link. `consumed_at` makes it single-use; `expires_at` enforces the TTL.
     if magic_link {
         let _ = write!(
             out,
@@ -2342,7 +2182,6 @@ fn render_migration_down(snake_name: &str, table: &str, totp: bool, magic_link: 
     // Drop the dependent tables first so the FK constraints are satisfied.
     let sess_table = sessions_table_name(snake_name);
     let rem_table = remember_table_name(snake_name);
-    // Magic-link tokens FK the user table, so drop them before it (issue #1328).
     let magic_drop = if magic_link {
         "DROP TABLE magic_link_tokens;\n"
     } else {
@@ -2360,12 +2199,9 @@ fn render_migration_down(snake_name: &str, table: &str, totp: bool, magic_link: 
 }
 
 fn render_model_file(pascal_name: &str, _snake_name: &str, table: &str, totp: bool) -> String {
-    // TOTP columns mirror the migration/schema order (after password_digest).
-    // TOTP columns mirror the migration/schema order (after password_digest).
-    // `totp_secret_encrypted` holds the AES-GCM-encrypted secret (never plaintext),
-    // and `totp_last_used_step` is the replay guard. All three are `#[default]`
-    // so they are excluded from `NewUser` and fall back to their DB defaults
-    // (disabled / NULL) on signup.
+    // TOTP fields follow the migration/schema order (after password_digest).
+    // `totp_secret_encrypted` is AES-GCM ciphertext and `totp_last_used_step` is the replay guard.
+    // All three are `#[default]`, so `NewUser` omits them and signup gets the DB defaults.
     let totp_fields = if totp {
         "    #[default]\n\
          \x20   pub totp_secret_encrypted: Option<String>,\n\
@@ -2394,26 +2230,26 @@ pub struct {pascal_name} {{
 {totp_fields}    #[default]
     pub failed_attempts: i32,
     #[default]
-    pub locked_at: Option<chrono::NaiveDateTime>,
+    pub locked_at: Option<autumn_web::time::civil::DateTime>,
     pub reset_token_digest: Option<String>,
-    pub reset_token_expires_at: Option<chrono::NaiveDateTime>,
+    pub reset_token_expires_at: Option<autumn_web::time::civil::DateTime>,
     pub confirm_token_digest: Option<String>,
-    pub confirm_token_expires_at: Option<chrono::NaiveDateTime>,
+    pub confirm_token_expires_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub email_confirmed_at: Option<chrono::NaiveDateTime>,
+    pub email_confirmed_at: Option<autumn_web::time::civil::DateTime>,
     // Pending email-change target (issue #1396). Nullable: set when a change is
     // requested, cleared when the new-address token is confirmed. The old
     // `email` stays valid for sign-in until confirmation swaps it.
     #[default]
     pub pending_email: Option<String>,
     #[default]
-    pub export_requested_at: Option<chrono::NaiveDateTime>,
+    pub export_requested_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub delete_requested_at: Option<chrono::NaiveDateTime>,
+    pub delete_requested_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub delete_scheduled_at: Option<chrono::NaiveDateTime>,
+    pub delete_scheduled_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 "
     )
@@ -2440,9 +2276,9 @@ pub struct RecoveryCode {{
     pub user_id: i64,
     pub code_digest: String,
     // Kept in `NewRecoveryCode` so inserts set it explicitly to `None`.
-    pub used_at: Option<chrono::NaiveDateTime>,
+    pub used_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 "
     )
@@ -2492,9 +2328,9 @@ pub struct {user_pascal}Session {{
     #[default]
     pub label: Option<String>,
     #[default]
-    pub last_seen_at: chrono::NaiveDateTime,
+    pub last_seen_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 
 impl {user_pascal}Session {{
@@ -2647,8 +2483,8 @@ pub struct {user_pascal}RememberToken {{
     /// When the current token was minted (the last rotation); bounds how long
     /// `previous_token_hash` stays acceptable.
     #[default]
-    pub rotated_at: Option<chrono::NaiveDateTime>,
-    pub expires_at: chrono::NaiveDateTime,
+    pub rotated_at: Option<autumn_web::time::civil::DateTime>,
+    pub expires_at: autumn_web::time::civil::DateTime,
     pub ip: String,
     pub user_agent: String,
     pub ua_family: String,
@@ -2657,16 +2493,20 @@ pub struct {user_pascal}RememberToken {{
     #[default]
     pub label: Option<String>,
     #[default]
-    pub last_used_at: Option<chrono::NaiveDateTime>,
+    pub last_used_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 
 impl {user_pascal}RememberToken {{
-    /// Absolute expiry as a UTC datetime, for `autumn_web::auth::evaluate_remember`.
+    /// Absolute expiry as an instant, for `autumn_web::auth::evaluate_remember`.
+    /// The column holds a UTC wall-clock time; one past the end of the
+    /// supported range reads as the latest representable instant.
     #[must_use]
-    pub fn expires_at_utc(&self) -> chrono::DateTime<chrono::Utc> {{
-        self.expires_at.and_utc()
+    pub fn expires_at_utc(&self) -> autumn_web::time::Timestamp {{
+        autumn_web::time::tz::TimeZone::UTC
+            .to_timestamp(self.expires_at)
+            .unwrap_or(autumn_web::time::Timestamp::MAX)
     }}
 
     /// Human-readable device line for the sessions page, preferring the
@@ -2689,7 +2529,7 @@ impl {user_pascal}RememberToken {{
 /// Persist a new remember chain for a successful "remember me" login.
 pub async fn insert_remember_token(
     conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
-    row: &New{user_pascal}RememberToken,
+    row: New{user_pascal}RememberToken,
 ) -> autumn_web::AutumnResult<()> {{
     diesel::insert_into({rem_table}::table)
         .values(row)
@@ -2732,8 +2572,8 @@ pub async fn rotate_remember_token(
     series: &str,
     old_hash: &str,
     new_hash: &str,
-    new_expiry: chrono::NaiveDateTime,
-    now: chrono::NaiveDateTime,
+    new_expiry: autumn_web::time::civil::DateTime,
+    now: autumn_web::time::civil::DateTime,
 ) -> autumn_web::AutumnResult<usize> {{
     diesel::update(
         {rem_table}::table
@@ -2743,9 +2583,9 @@ pub async fn rotate_remember_token(
     .set((
         {rem_table}::previous_token_hash.eq(Some(old_hash)),
         {rem_table}::token_hash.eq(new_hash),
-        {rem_table}::rotated_at.eq(Some(now)),
-        {rem_table}::expires_at.eq(new_expiry),
-        {rem_table}::last_used_at.eq(Some(now)),
+        {rem_table}::rotated_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
+        {rem_table}::expires_at.eq(autumn_web::db::SqlDateTime::from(new_expiry)),
+        {rem_table}::last_used_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
     ))
     .execute(conn)
     .await
@@ -2877,12 +2717,12 @@ pub struct MagicLinkToken {{
     // References {user_table}(id).
     pub user_id: i64,
     pub token_digest: String,
-    pub expires_at: chrono::NaiveDateTime,
+    pub expires_at: autumn_web::time::civil::DateTime,
     // Single-use marker: set to `now` on the first successful verify. A second
     // verify of the same token finds it non-NULL and is rejected.
-    pub consumed_at: Option<chrono::NaiveDateTime>,
+    pub consumed_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 "
     )
@@ -2926,8 +2766,7 @@ fn render_routes_file(
 ) -> String {
     let sess_table = sessions_table_name(snake_name);
     let rem_table = remember_table_name(snake_name);
-    // Passwordless magic-link login (issue #1328). All output is gated on the
-    // `--magic-link` flag so the flow composes with `--oauth`/`--totp`/`--passkeys`.
+    // Passwordless magic-link login (#1328), emitted only under `--magic-link`.
     let (magic_link_imports, magic_link_section, magic_link_login_link) = if magic_link {
         (
             "use crate::models::magic_link_token::{MagicLinkToken, NewMagicLinkToken};\n\
@@ -2940,12 +2779,10 @@ fn render_routes_file(
     } else {
         (String::new(), String::new(), String::new())
     };
-    // Magic-link token cleanup spliced into the `change_password` (#7),
-    // `confirm_email_change` (#10) and `reset_password` (#11) credential-change
-    // transactions. Gated on `--magic-link` so the `magic_link_tokens` reference
-    // only appears when the table (and its import) exist. (For 2FA-enabled users
-    // the reset commit is deferred to `login_verify`, which carries its own gated
-    // cleanup — see `magic_link_reset_commit_clear_txn_src`.)
+    // Magic-link token cleanup for the `change_password`, `confirm_email_change` and
+    // `reset_password` transactions, emitted only under `--magic-link` (when the table and its
+    // import exist). For 2FA users the reset commits in `login_verify`, which has its own cleanup
+    // (`magic_link_reset_commit_clear_txn_src`).
     let (
         magic_link_change_password_clear,
         magic_link_email_change_clear,
@@ -3169,14 +3006,18 @@ async fn rebind_tracked_session_on_rotation(
     Ok(())
 }}
 
-/// The sliding expiry `duration_secs` in the future, as a naive UTC timestamp
+/// The sliding expiry `duration_secs` in the future, as a UTC wall-clock time
 /// (the column type), guarding the `u64 → i64` cast and saturating (rather than
 /// panicking) on an absurd configured duration.
-fn remember_expiry(config: &RememberConfig, now: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDateTime {{
+fn remember_expiry(
+    config: &RememberConfig,
+    now: autumn_web::time::Timestamp,
+) -> autumn_web::time::civil::DateTime {{
     let secs = i64::try_from(config.duration_secs).unwrap_or(2_592_000);
-    now.checked_add_signed(chrono::Duration::seconds(secs))
-        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-        .naive_utc()
+    let expiry = now
+        .checked_add(autumn_web::time::SignedDuration::from_secs(secs))
+        .unwrap_or(autumn_web::time::Timestamp::MAX);
+    autumn_web::time::tz::TimeZone::UTC.to_datetime(expiry)
 }}
 
 /// Whether to set the `Secure` cookie attribute — mirrors the session cookie by
@@ -3234,14 +3075,14 @@ pub async fn issue_remember_cookie(
         series: cred.series.clone(),
         user_id: {snake_name}_id,
         token_hash: hash_remember_token(&cred.token),
-        expires_at: remember_expiry(config, chrono::Utc::now()),
+        expires_at: remember_expiry(config, autumn_web::time::ambient_now()),
         ip: ip.to_string(),
         user_agent,
         ua_family: parsed.family,
         ua_os: parsed.os,
         ua_device: parsed.device_class.to_string(),
     }};
-    insert_remember_token(&mut **db, &row).await?;
+    insert_remember_token(&mut **db, row).await?;
     Ok(build_remember_cookie(
         config,
         &cred.series,
@@ -3274,7 +3115,9 @@ fn to_remember_record(r: &{pascal_name}RememberToken) -> RememberRecord {{
         series: r.series.clone(),
         token_hash: r.token_hash.clone(),
         previous_token_hash: r.previous_token_hash.clone(),
-        rotated_at: r.rotated_at.map(|t| t.and_utc()),
+        rotated_at: r
+            .rotated_at
+            .and_then(|t| autumn_web::time::tz::TimeZone::UTC.to_timestamp(t).ok()),
         expires_at: r.expires_at_utc(),
     }}
 }}
@@ -3376,7 +3219,7 @@ pub async fn remember_me(
         }}
     }};
 
-    let now = chrono::Utc::now();
+    let now = autumn_web::time::ambient_now();
     let secure = remember_secure(request.headers());
     let grace = autumn_web::auth::default_rotation_grace();
     let ip = request
@@ -3403,7 +3246,7 @@ pub async fn remember_me(
                 &row.token_hash,
                 &new_hash,
                 new_expiry,
-                now.naive_utc(),
+                autumn_web::time::tz::TimeZone::UTC.to_datetime(now),
             )
             .await
             {{
@@ -3662,12 +3505,12 @@ pub async fn require_tracked_session(
     // would deep-clone every section to read one field on a request path.
     let config = state.config_arc();
     let sessions_cfg = &config.auth.sessions;
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
     let window =
-        chrono::Duration::seconds(i64::try_from(sessions_cfg.last_seen_update_secs).unwrap_or(60));
-    if now.signed_duration_since(tracked.last_seen_at) >= window {{
+        autumn_web::time::SignedDuration::from_secs(i64::try_from(sessions_cfg.last_seen_update_secs).unwrap_or(60));
+    if now.duration_since(tracked.last_seen_at) >= window {{
         let _ = diesel::update({sess_table}::table.find(tracked.id))
-            .set({sess_table}::last_seen_at.eq(now))
+            .set({sess_table}::last_seen_at.eq(autumn_web::db::SqlDateTime::from(now)))
             .execute(&mut **db)
             .await;
     }}
@@ -3709,9 +3552,9 @@ fn sessions_list_fragment(
                             @if current {{ " — this device" }}
                         }}
                         p {{
-                            "Signed in " (s.created_at.format("%Y-%m-%d %H:%M UTC").to_string())
+                            "Signed in " (s.created_at.strftime("%Y-%m-%d %H:%M UTC").to_string())
                             " from " (s.ip)
-                            " · last seen " (s.last_seen_at.format("%Y-%m-%d %H:%M UTC").to_string())
+                            " · last seen " (s.last_seen_at.strftime("%Y-%m-%d %H:%M UTC").to_string())
                         }}
                         @if !current {{
                             // Real form so revocation works without JavaScript;
@@ -3748,10 +3591,10 @@ fn sessions_list_fragment(
                             " — Persistent login (Remember me)"
                         }}
                         p {{
-                            "Created " (r.created_at.format("%Y-%m-%d %H:%M UTC").to_string())
+                            "Created " (r.created_at.strftime("%Y-%m-%d %H:%M UTC").to_string())
                             " from " (r.ip)
                             @if let Some(last) = r.last_used_at {{
-                                " · last used " (last.format("%Y-%m-%d %H:%M UTC").to_string())
+                                " · last used " (last.strftime("%Y-%m-%d %H:%M UTC").to_string())
                             }}
                         }}
                         // Revoke this persistent chain by its stable series id,
@@ -4071,7 +3914,7 @@ pub async fn signup(
 
     let raw_confirm_token = generate_confirmation_token();
     let confirm_digest = sha256_hex(&raw_confirm_token);
-    let confirm_expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::hours(24);
+    let confirm_expires_at = autumn_web::time::ambient_civil_utc() + autumn_web::time::SignedDuration::from_hours(24);
 
     let password_digest = hash_password(&form.password).await?;
     let new_{snake_name} = New{pascal_name} {{
@@ -4085,7 +3928,7 @@ pub async fn signup(
     }};
 
     let result: Result<{pascal_name}, _> = diesel::insert_into({table}::table)
-        .values(&new_{snake_name})
+        .values(new_{snake_name})
         .returning({pascal_name}::as_returning())
         .get_result(&mut *db)
         .await;
@@ -4196,7 +4039,7 @@ async fn stamp_lockout(db: &mut Db, id: i64, threshold: i32) -> AutumnResult<boo
             .filter({table}::failed_attempts.ge(threshold))
             .filter({table}::locked_at.is_null()),
     )
-    .set({table}::locked_at.eq(Some(chrono::Utc::now().naive_utc())))
+    .set({table}::locked_at.eq(Some(autumn_web::db::SqlDateTime::from(autumn_web::time::ambient_civil_utc()))))
     .execute(&mut **db)
     .await
     .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
@@ -4252,8 +4095,8 @@ pub async fn login(
 
     if let Some(ref {snake_name}) = found_{snake_name} {{
         if lockout_enabled {{
-            let now = chrono::Utc::now().naive_utc();
-            let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+            let now = autumn_web::time::ambient_civil_utc();
+            let cooloff = autumn_web::time::SignedDuration::from_secs(lockout_cfg.cooloff_secs as i64);
 
             // Track local state; reset if cool-off has elapsed so the first new
             // failure after expiry is counted as attempt #1, not a re-lock.
@@ -4297,7 +4140,7 @@ pub async fn login(
                     diesel::update({table}::table.find({snake_name}.id))
                         .set((
                             {table}::failed_attempts.eq(1i32),
-                            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+                            {table}::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
                         ))
                         .execute(&mut *db)
                         .await
@@ -4382,20 +4225,20 @@ pub async fn login(
     // If zero rows match after excluding active (non-expired) locks, the
     // account was just locked concurrently — reject the login.
     if lockout_enabled {{
-        let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
-        let lock_expired_before = chrono::Utc::now().naive_utc() - cooloff;
+        let cooloff = autumn_web::time::SignedDuration::from_secs(lockout_cfg.cooloff_secs as i64);
+        let lock_expired_before = autumn_web::time::ambient_civil_utc() - cooloff;
         let rows_cleared = diesel::update(
             {table}::table
                 .find({snake_name}.id)
                 .filter(
                     {table}::locked_at.is_null().or(
-                        {table}::locked_at.le(lock_expired_before)
+                        {table}::locked_at.le(autumn_web::db::SqlDateTime::from(lock_expired_before))
                     )
                 ),
         )
         .set((
             {table}::failed_attempts.eq(0),
-            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+            {table}::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
         ))
         .execute(&mut *db)
         .await
@@ -4548,7 +4391,7 @@ pub async fn unlock_account(
     diesel::update({table}::table.filter({table}::email.eq(&email)))
         .set((
             {table}::failed_attempts.eq(0),
-            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+            {table}::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
         ))
         .execute(&mut *db)
         .await
@@ -4586,7 +4429,7 @@ pub async fn account(session: Session, State(state): State<AppState>, mut db: Db
             div style="border:1px solid #c00;padding:0.75rem;margin-bottom:1rem;" {{
                 p {{
                     "⚠️ Your account is scheduled for deletion on "
-                    (scheduled.format("%Y-%m-%d").to_string())
+                    (scheduled.strftime("%Y-%m-%d").to_string())
                     ". Log in before then to cancel."
                 }}
                 form action="/account/delete/cancel" method="post" {{
@@ -4816,7 +4659,7 @@ pub async fn change_password(
                     // an unexpired reset_token_digest, so a link minted before this
                     // change could otherwise overwrite the just-secured password.
                     {table}::reset_token_digest.eq(None::<String>),
-                    {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                    {table}::reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
                 ))
                 .execute(conn)
                 .await?;
@@ -4998,7 +4841,7 @@ pub async fn change_email(
     // prior pending change is superseded (AC4).
     let raw_token = generate_confirmation_token();
     let confirm_digest = sha256_hex(&raw_token);
-    let confirm_expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::hours(24);
+    let confirm_expires_at = autumn_web::time::ambient_civil_utc() + autumn_web::time::SignedDuration::from_hours(24);
 
     // Send the confirmation link to the NEW address first; only persist the
     // pending change on success, so a transient mail failure leaves the account
@@ -5009,7 +4852,7 @@ pub async fn change_email(
         .set((
             {table}::pending_email.eq(Some(&new_email)),
             {table}::confirm_token_digest.eq(Some(&confirm_digest)),
-            {table}::confirm_token_expires_at.eq(Some(confirm_expires_at)),
+            {table}::confirm_token_expires_at.eq(Some(autumn_web::db::SqlDateTime::from(confirm_expires_at))),
         ))
         .execute(&mut *db)
         .await
@@ -5044,7 +4887,7 @@ pub async fn confirm_email_change(
     Path(params): Path<ConfirmEmailPath>,
 ) -> AutumnResult<Response> {{
     let token_digest = sha256_hex(&params.token);
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
     let generic = || {{
         AutumnError::unprocessable_msg(
             "This email-change link is invalid or has expired. \
@@ -5057,7 +4900,7 @@ pub async fn confirm_email_change(
     // shares the `confirm_token_digest` column but never sets `pending_email`.
     let {snake_name}: {pascal_name} = {table}::table
         .filter({table}::confirm_token_digest.eq(Some(&token_digest)))
-        .filter({table}::confirm_token_expires_at.gt(now))
+        .filter({table}::confirm_token_expires_at.gt(autumn_web::db::SqlDateTime::from(now)))
         .filter({table}::pending_email.is_not_null())
         .select({pascal_name}::as_select())
         .first(&mut *db)
@@ -5088,13 +4931,13 @@ pub async fn confirm_email_change(
                 {table}::email.eq(&new_email),
                 {table}::pending_email.eq(None::<String>),
                 {table}::confirm_token_digest.eq(None::<String>),
-                {table}::confirm_token_expires_at.eq(None::<chrono::NaiveDateTime>),
-                {table}::email_confirmed_at.eq(Some(now)),
+                {table}::confirm_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
+                {table}::email_confirmed_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
                 // Invalidate any outstanding reset token: a link sent to the OLD
                 // mailbox before this change must not be usable to reset the
                 // account after it has moved to the new address.
                 {table}::reset_token_digest.eq(None::<String>),
-                {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                {table}::reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
             ))
             .execute(conn)
             .await?;
@@ -5284,7 +5127,7 @@ pub async fn reauth(
         }})
         .is_some_and(|(ts, id)| {{
             id == {snake_name}.id
-                && chrono::Utc::now().timestamp() - ts < REAUTH_PW_VALID_SECS
+                && autumn_web::time::ambient_now().as_second() - ts < REAUTH_PW_VALID_SECS
         }});
     if !pw_verified_recently {{
         // Helper to render the reauth error form without duplicating markup.
@@ -5310,8 +5153,8 @@ pub async fn reauth(
         let lockout_enabled = lockout_cfg.enabled && lockout_cfg.threshold > 0;
 
         if lockout_enabled {{
-            let now = chrono::Utc::now().naive_utc();
-            let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+            let now = autumn_web::time::ambient_civil_utc();
+            let cooloff = autumn_web::time::SignedDuration::from_secs(lockout_cfg.cooloff_secs as i64);
 
             // Local mutable counters reset when cool-off has elapsed.
             let mut current_attempts = {snake_name}.failed_attempts;
@@ -5345,7 +5188,7 @@ pub async fn reauth(
                     diesel::update({table}::table.find({snake_name}.id))
                         .set((
                             {table}::failed_attempts.eq(1i32),
-                            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+                            {table}::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
                         ))
                         .execute(&mut *db)
                         .await
@@ -5363,19 +5206,19 @@ pub async fn reauth(
             // Correct password — reset lockout counters. The WHERE guard
             // excludes accounts locked by a concurrent bad-password request
             // between our check and now, treating that race as auth failure.
-            let lock_expired_before = chrono::Utc::now().naive_utc() - cooloff;
+            let lock_expired_before = autumn_web::time::ambient_civil_utc() - cooloff;
             let rows_cleared = diesel::update(
                 {table}::table
                     .find({snake_name}.id)
                     .filter(
                         {table}::locked_at.is_null().or(
-                            {table}::locked_at.le(lock_expired_before)
+                            {table}::locked_at.le(autumn_web::db::SqlDateTime::from(lock_expired_before))
                         ),
                     ),
             )
             .set((
                 {table}::failed_attempts.eq(0i32),
-                {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+                {table}::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
             ))
             .execute(&mut *db)
             .await
@@ -5398,7 +5241,7 @@ pub async fn reauth(
         session
             .insert(
                 "reauth_pw_ok",
-                format!("{{}}:{{}}", chrono::Utc::now().timestamp(), {snake_name}.id),
+                format!("{{}}:{{}}", autumn_web::time::ambient_now().as_second(), {snake_name}.id),
             )
             .await;
     }}
@@ -5493,12 +5336,12 @@ pub async fn forgot_password(
         let raw_token = generate_reset_token();
         let token_digest = sha256_hex(&raw_token);
         let expires_at =
-            chrono::Utc::now().naive_utc() + chrono::Duration::hours(2);
+            autumn_web::time::ambient_civil_utc() + autumn_web::time::SignedDuration::from_hours(2);
 
         diesel::update({table}::table.find({snake_name}.id))
             .set((
                 {table}::reset_token_digest.eq(Some(&token_digest)),
-                {table}::reset_token_expires_at.eq(Some(expires_at)),
+                {table}::reset_token_expires_at.eq(Some(autumn_web::db::SqlDateTime::from(expires_at))),
             ))
             .execute(&mut *db)
             .await?;
@@ -5629,11 +5472,11 @@ pub async fn reset_password(
     }}
 
     let token_digest = sha256_hex(&form.token);
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
 
     let {snake_name}: {pascal_name} = {table}::table
         .filter({table}::reset_token_digest.eq(Some(&token_digest)))
-        .filter({table}::reset_token_expires_at.gt(now))
+        .filter({table}::reset_token_expires_at.gt(autumn_web::db::SqlDateTime::from(now)))
         .select({pascal_name}::as_select())
         .first(&mut *db)
         .await
@@ -5677,7 +5520,7 @@ pub async fn reset_password(
                 .set((
                     {table}::password_digest.eq(&new_digest),
                     {table}::reset_token_digest.eq(None::<String>),
-                    {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                    {table}::reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
                 ))
                 .execute(conn)
                 .await?;
@@ -5821,7 +5664,7 @@ pub async fn confirm_email(
     Path(params): Path<ConfirmEmailPath>,
 ) -> AutumnResult<Response> {{
     let token_digest = sha256_hex(&params.token);
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
 
     // Atomic UPDATE…RETURNING: filter, stamp, and invalidate in a single
     // statement so concurrent requests with the same token cannot both
@@ -5829,7 +5672,7 @@ pub async fn confirm_email(
     let {snake_name}: {pascal_name} = diesel::update(
         {table}::table
             .filter({table}::confirm_token_digest.eq(Some(&token_digest)))
-            .filter({table}::confirm_token_expires_at.gt(now))
+            .filter({table}::confirm_token_expires_at.gt(autumn_web::db::SqlDateTime::from(now)))
             // Disambiguate from an email-CHANGE token, which shares the
             // `confirm_token_digest` column but sets `pending_email`. Without this
             // reverse guard a change-email token could satisfy this signup-confirm
@@ -5839,9 +5682,9 @@ pub async fn confirm_email(
             .filter({table}::pending_email.is_null()),
     )
     .set((
-        {table}::email_confirmed_at.eq(Some(now)),
+        {table}::email_confirmed_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
         {table}::confirm_token_digest.eq(None::<String>),
-        {table}::confirm_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+        {table}::confirm_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
     ))
     .returning({pascal_name}::as_returning())
     .get_result(&mut *db)
@@ -5927,7 +5770,7 @@ pub async fn resend_confirmation(
 
     // Throttle: skip re-issue if a token was minted in the last 5 minutes
     // (expires_at would still be > 23h55m from now).  Non-enumerating.
-    let throttle_threshold = chrono::Utc::now().naive_utc() + chrono::Duration::minutes(23 * 60 + 55);
+    let throttle_threshold = autumn_web::time::ambient_civil_utc() + autumn_web::time::SignedDuration::from_mins(23 * 60 + 55);
 
     // Check eligibility before generating a new token.  We send the email
     // FIRST and only overwrite the stored token on success — so a transient
@@ -5939,7 +5782,7 @@ pub async fn resend_confirmation(
         .filter(
             {table}::confirm_token_expires_at
                 .is_null()
-                .or({table}::confirm_token_expires_at.le(throttle_threshold)),
+                .or({table}::confirm_token_expires_at.le(autumn_web::db::SqlDateTime::from(throttle_threshold))),
         )
         .count()
         .get_result::<i64>(&mut *db)
@@ -5950,7 +5793,7 @@ pub async fn resend_confirmation(
     if eligible {{
         let raw_confirm_token = generate_confirmation_token();
         let confirm_digest = sha256_hex(&raw_confirm_token);
-        let confirm_expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::hours(24);
+        let confirm_expires_at = autumn_web::time::ambient_civil_utc() + autumn_web::time::SignedDuration::from_hours(24);
 
         match send_confirmation_email(&mailer, &email, &raw_confirm_token).await {{
             Ok(()) => {{
@@ -5962,7 +5805,7 @@ pub async fn resend_confirmation(
                 )
                 .set((
                     {table}::confirm_token_digest.eq(Some(&confirm_digest)),
-                    {table}::confirm_token_expires_at.eq(Some(confirm_expires_at)),
+                    {table}::confirm_token_expires_at.eq(Some(autumn_web::db::SqlDateTime::from(confirm_expires_at))),
                 ))
                 .execute(&mut *db)
                 .await;
@@ -6083,17 +5926,17 @@ pub async fn data_export(
     let {snake_name}_id: i64 = require_tracked_session(&session, &mut db, &state).await?.id;
 
     let mailer = state.extension::<Mailer>();
-    let now = chrono::Utc::now().naive_utc();
-    let one_hour_ago = now - chrono::Duration::hours(1);
+    let now = autumn_web::time::ambient_civil_utc();
+    let one_hour_ago = now - autumn_web::time::SignedDuration::from_hours(1);
 
     // Idempotency: only update (and enqueue) if no export was requested in the last hour.
     let updated = diesel::update({table}::table.find({snake_name}_id))
         .filter(
             {table}::export_requested_at
                 .is_null()
-                .or({table}::export_requested_at.lt(Some(one_hour_ago))),
+                .or({table}::export_requested_at.lt(Some(autumn_web::db::SqlDateTime::from(one_hour_ago)))),
         )
-        .set({table}::export_requested_at.eq(Some(now)))
+        .set({table}::export_requested_at.eq(Some(autumn_web::db::SqlDateTime::from(now))))
         .execute(&mut *db)
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to record export request."))?;
@@ -6228,13 +6071,13 @@ pub async fn delete_account(
         }}).into_response());
     }}
 
-    let now = chrono::Utc::now().naive_utc();
-    let grace_until = now + chrono::Duration::days(30);
+    let now = autumn_web::time::ambient_civil_utc();
+    let grace_until = now + autumn_web::time::SignedDuration::from_hours(30 * 24);
 
     diesel::update({table}::table.find({snake_name}_id))
         .set((
-            {table}::delete_requested_at.eq(Some(now)),
-            {table}::delete_scheduled_at.eq(Some(grace_until)),
+            {table}::delete_requested_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
+            {table}::delete_scheduled_at.eq(Some(autumn_web::db::SqlDateTime::from(grace_until))),
         ))
         .execute(&mut *db)
         .await
@@ -6284,10 +6127,10 @@ pub async fn cancel_delete_account(
 
     // Only cancel if a future deletion is scheduled; reject once the deadline has passed.
     let rows = diesel::update({table}::table.find({snake_name}_id))
-        .filter({table}::delete_scheduled_at.gt(Some(chrono::Utc::now().naive_utc())))
+        .filter({table}::delete_scheduled_at.gt(Some(autumn_web::db::SqlDateTime::from(autumn_web::time::ambient_civil_utc()))))
         .set((
-            {table}::delete_requested_at.eq(None::<chrono::NaiveDateTime>),
-            {table}::delete_scheduled_at.eq(None::<chrono::NaiveDateTime>),
+            {table}::delete_requested_at.eq(None::<autumn_web::db::SqlDateTime>),
+            {table}::delete_scheduled_at.eq(None::<autumn_web::db::SqlDateTime>),
         ))
         .execute(&mut *db)
         .await
@@ -6352,9 +6195,9 @@ pub async fn admin_data_export(
 
     let mailer = state.extension::<Mailer>();
 
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
     let updated = diesel::update({table}::table.find(user_id))
-        .set({table}::export_requested_at.eq(Some(now)))
+        .set({table}::export_requested_at.eq(Some(autumn_web::db::SqlDateTime::from(now))))
         .execute(&mut *db)
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to record export request."))?;
@@ -6404,13 +6247,13 @@ pub async fn admin_delete_account(
         return Err(AutumnError::unprocessable_msg("Reason is required for admin GDPR actions."));
     }}
 
-    let now = chrono::Utc::now().naive_utc();
-    let grace_until = now + chrono::Duration::days(30);
+    let now = autumn_web::time::ambient_civil_utc();
+    let grace_until = now + autumn_web::time::SignedDuration::from_hours(30 * 24);
 
     let updated = diesel::update({table}::table.find(user_id))
         .set((
-            {table}::delete_requested_at.eq(Some(now)),
-            {table}::delete_scheduled_at.eq(Some(grace_until)),
+            {table}::delete_requested_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
+            {table}::delete_scheduled_at.eq(Some(autumn_web::db::SqlDateTime::from(grace_until))),
         ))
         .execute(&mut *db)
         .await
@@ -6441,9 +6284,8 @@ pub async fn admin_delete_account(
 
 #[allow(clippy::too_many_lines)]
 fn render_tests_file(pascal_name: &str, _snake_name: &str, magic_link: bool) -> String {
-    // Passwordless magic-link live-DB integration test (issue #1328, AC7).
-    // Emitted only under `--magic-link`; `#[ignore]`d so it compiles and passes
-    // out of the box, like the sibling live-DB tests in this file.
+    // Live-DB magic-link test (issue #1328), emitted only under `--magic-link`. It is `#[ignore]`d
+    // like the other live-DB tests in this file, so it compiles and passes without a database.
     let magic_link_tests = if magic_link {
         MAGIC_LINK_TESTS_SECTION
     } else {
@@ -7582,15 +7424,11 @@ fn render_docs_file(
     } else {
         ""
     };
-    // The lockout retrofit DDL and the confirm-existing-accounts statement are
-    // copy-paste SQL for the operator, so both must be in the app's own dialect
-    // (issue #1927), matching `render_sessions_docs_file` /
-    // `render_oauth_docs_file`. `SQLite` takes one `ADD COLUMN` per `ALTER
-    // TABLE`, has no `IF NOT EXISTS` / `IF EXISTS` on either, and no `NOW()`.
+    // The lockout and confirm-existing-accounts SQL is copy-paste SQL for the operator, so it
+    // must be in the app's own dialect (issue #1927).
     let (lockout_up, lockout_down, confirmed_now, confirm_up, confirm_down) = match backend {
-        // `{table}` stays a literal placeholder for the reader, exactly as the
-        // template emitted it before this fork — these fragments are inserted
-        // as data, so they are NOT format-escaped the way `{{table}}` was.
+        // `{table}` is a literal placeholder for the reader. These fragments are `format!`
+        // arguments, not part of the format string, so their braces are not escaped.
         autumn_web::config::DatabaseBackend::Postgres => (
             "ALTER TABLE {table}\n  \
              ADD COLUMN IF NOT EXISTS failed_attempts INT NOT NULL DEFAULT 0,\n  \
@@ -8746,10 +8584,9 @@ fn totp_reauth_field_src() -> String {
 /// pass through without any second-factor check.
 #[allow(clippy::too_many_lines)]
 fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
-    // This string is substituted verbatim into the outer format!() as a named argument.
-    // format!() does NOT further process the substituted value, so {{ and }} in this
-    // template appear literally in the output. Use single { } for Rust control flow,
-    // and {{ }} only inside maud html! invocations.
+    // The result is a named argument to the outer `format!`, which inserts it verbatim, so `{{`
+    // and `}}` here are emitted literally. Use single braces for Rust code and `{{ }}` only inside
+    // maud `html!`.
     const TPL: &str = r#"    // If the account uses TOTP, also require the second factor.
     if __SNAKE__.totp_enabled {
         let code = form.totp_code.trim().to_owned();
@@ -8809,7 +8646,7 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                             .find(rc.id)
                             .filter(recovery_codes::used_at.is_null()),
                     )
-                    .set(recovery_codes::used_at.eq(Some(chrono::Utc::now().naive_utc())))
+                    .set(recovery_codes::used_at.eq(Some(autumn_web::db::SqlDateTime::from(autumn_web::time::ambient_civil_utc()))))
                     .execute(&mut *db)
                     .await?;
                     if affected == 1 {
@@ -9497,7 +9334,7 @@ pub async fn login_verify(
                         .find(rc.id)
                         .filter(recovery_codes::used_at.is_null()),
                 )
-                .set(recovery_codes::used_at.eq(Some(chrono::Utc::now().naive_utc())))
+                .set(recovery_codes::used_at.eq(Some(autumn_web::db::SqlDateTime::from(autumn_web::time::ambient_civil_utc()))))
                 .execute(&mut *db)
                 .await?;
                 if affected == 1 {
@@ -9523,7 +9360,7 @@ pub async fn login_verify(
         session.remove("totp_pending_reset_digest").await;
         session.remove("totp_pending_reset_token").await;
         let committed = if let Some(token) = stored_token {
-            let now = chrono::Utc::now().naive_utc();
+            let now = autumn_web::time::ambient_civil_utc();
             // Commit the password change and the session revocation
             // atomically; a transaction error rolls both back (token
             // preserved) and is treated as not-committed below.
@@ -9534,11 +9371,11 @@ pub async fn login_verify(
                 .transaction::<_, diesel::result::Error, _>(async move |conn| {
                     let updated = diesel::update(__TABLE__::table.find(user_id))
                         .filter(__TABLE__::reset_token_digest.eq(Some(token.as_str())))
-                        .filter(__TABLE__::reset_token_expires_at.gt(now))
+                        .filter(__TABLE__::reset_token_expires_at.gt(autumn_web::db::SqlDateTime::from(now)))
                         .set((
                             __TABLE__::password_digest.eq(&new_digest),
                             __TABLE__::reset_token_digest.eq(None::<String>),
-                            __TABLE__::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                            __TABLE__::reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
                         ))
                         .execute(conn)
                         .await?;
@@ -9605,21 +9442,16 @@ __MAGIC_LINK_RESET_CLEAR__                    Ok(updated == 1)
     Ok(redirect_to(&format!("/account?recovery_remaining={}", remaining)))
 }
 "#;
-    // Magic-link token cleanup spliced into the deferred (2FA-gated) password-reset
-    // commit inside `login_verify` (#11). Gated on `--magic-link` so the
-    // `magic_link_tokens` reference only appears when the table (and its import)
-    // exist; empty otherwise so the transaction is unchanged.
+    // Magic-link token cleanup in the deferred (2FA-gated) password-reset commit in `login_verify`.
+    // Empty without `--magic-link`, where the `magic_link_tokens` table and its import do not exist.
     let magic_link_reset_clear = if magic_link {
         magic_link_reset_commit_clear_txn_src()
     } else {
         ""
     };
-    // Magic-link token cleanup spliced into the `two_factor_disable` transaction
-    // (Codex review). Disabling TOTP removes the second factor that gated a
-    // still-outstanding magic link, so a link minted while 2FA was on must not
-    // become a direct single-factor login afterwards. Gated on `--magic-link` so
-    // the `magic_link_tokens` reference only appears when the table (and its
-    // import) exist; empty otherwise so the transaction is unchanged.
+    // Magic-link token cleanup in the `two_factor_disable` transaction: a link minted while 2FA
+    // was on must not become a single-factor login once 2FA is off. Empty without `--magic-link`,
+    // where the `magic_link_tokens` table and its import do not exist.
     let magic_link_totp_disable_clear = if magic_link {
         magic_link_totp_disable_clear_txn_src()
     } else {
@@ -9788,7 +9620,7 @@ pub async fn magic_link_request(
     }
 
     let email = form.email.trim().to_lowercase();
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
     // Sourced from `[auth.magic_link]` in autumn.toml (defaults: 15 min TTL, 60s
     // cooldown). Keep `ttl_minutes` ≤ 15 for a tight link-lifetime window.
     // One shared read for both fields; `config()` would deep-clone every
@@ -9813,12 +9645,12 @@ pub async fn magic_link_request(
     if let Some(__SNAKE__) = maybe___SNAKE__ {
         // Per-email cooldown (AC6): skip re-minting when an unexpired,
         // unconsumed token was issued for this account within the window.
-        let cooldown_start = now - chrono::Duration::seconds(email_cooldown_secs as i64);
+        let cooldown_start = now - autumn_web::time::SignedDuration::from_secs(email_cooldown_secs as i64);
         let recent: i64 = magic_link_tokens::table
             .filter(magic_link_tokens::user_id.eq(__SNAKE__.id))
             .filter(magic_link_tokens::consumed_at.is_null())
-            .filter(magic_link_tokens::expires_at.gt(now))
-            .filter(magic_link_tokens::created_at.gt(cooldown_start))
+            .filter(magic_link_tokens::expires_at.gt(autumn_web::db::SqlDateTime::from(now)))
+            .filter(magic_link_tokens::created_at.gt(autumn_web::db::SqlDateTime::from(cooldown_start)))
             .count()
             .get_result(&mut *db)
             .await
@@ -9829,7 +9661,7 @@ pub async fn magic_link_request(
             // SHA-256 digest is stored; the raw token appears only in the link.
             let raw_token = generate_reset_token();
             let token_digest = sha256_hex(&raw_token);
-            let expires_at = now + chrono::Duration::minutes(ttl_minutes as i64);
+            let expires_at = now + autumn_web::time::SignedDuration::from_mins(ttl_minutes as i64);
             let new_token = NewMagicLinkToken {
                 user_id: __SNAKE__.id,
                 token_digest,
@@ -9839,7 +9671,7 @@ pub async fn magic_link_request(
             // Persist the digest, then email the raw link. A mail failure is
             // logged but never surfaced (stays non-enumerating).
             if let Err(e) = diesel::insert_into(magic_link_tokens::table)
-                .values(&new_token)
+                .values(new_token)
                 .execute(&mut *db)
                 .await
             {
@@ -9937,16 +9769,16 @@ pub async fn magic_link_verify(
     Form(form): Form<MagicLinkVerifyForm>,
 ) -> AutumnResult<Response> {
     let token_digest = sha256_hex(&form.token);
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
 
     // Atomic single-use consume. Only one concurrent verify can match.
     let consumed: MagicLinkToken = match diesel::update(
         magic_link_tokens::table
             .filter(magic_link_tokens::token_digest.eq(&token_digest))
             .filter(magic_link_tokens::consumed_at.is_null())
-            .filter(magic_link_tokens::expires_at.gt(now)),
+            .filter(magic_link_tokens::expires_at.gt(autumn_web::db::SqlDateTime::from(now))),
     )
-    .set(magic_link_tokens::consumed_at.eq(Some(now)))
+    .set(magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now))))
     .returning(MagicLinkToken::as_returning())
     .get_result(&mut *db)
     .await
@@ -9990,20 +9822,20 @@ pub async fn magic_link_verify(
     let lockout_cfg = &config.auth.lockout;
     let lockout_enabled = lockout_cfg.enabled && lockout_cfg.threshold > 0;
     if lockout_enabled {
-        let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+        let cooloff = autumn_web::time::SignedDuration::from_secs(lockout_cfg.cooloff_secs as i64);
         let lock_expired_before = now - cooloff;
         let rows_cleared = diesel::update(
             __TABLE__::table
                 .find(__SNAKE__.id)
                 .filter(
                     __TABLE__::locked_at.is_null().or(
-                        __TABLE__::locked_at.le(lock_expired_before)
+                        __TABLE__::locked_at.le(autumn_web::db::SqlDateTime::from(lock_expired_before))
                     )
                 ),
         )
         .set((
             __TABLE__::failed_attempts.eq(0),
-            __TABLE__::locked_at.eq(None::<chrono::NaiveDateTime>),
+            __TABLE__::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
         ))
         .execute(&mut *db)
         .await
@@ -10091,21 +9923,19 @@ async fn send_magic_link_email(
     })
 }
 "#;
-    // When TOTP is enabled, magic-link verify must honor the second factor just
-    // like confirm_email: park a `totp_pending_confirmation` session and redirect
-    // to /login/verify. Reusing the confirm branch means completion in
-    // `login_verify` deliberately SKIPS the strong-auth stamp (email + TOTP does
-    // not prove password knowledge). The branch is already `__SNAKE__`-substituted.
+    // With TOTP, magic-link verify honors the second factor like confirm_email: park a
+    // `totp_pending_confirmation` session and redirect to /login/verify. Completion through the
+    // confirm branch skips the strong-auth stamp on purpose: email + TOTP does not prove the
+    // password. The branch is already `__SNAKE__`-substituted.
     let totp_branch = if totp {
         totp_confirm_branch_src(snake_name)
     } else {
         String::new()
     };
-    // `rotate_id()` preserves session data, so the DIRECT (non-2FA) login path must
-    // scrub any abandoned pending-2FA / parked-reset handoff left in this browser
-    // before writing the auth keys — otherwise `/login/verify` could resume it under
-    // the freshly authenticated session (mirrors password login / reset). Gated on
-    // `--totp` so a magic-link-only app never references TOTP-only session keys.
+    // `rotate_id()` keeps session data, so the direct (non-2FA) login must scrub any abandoned
+    // pending-2FA or parked-reset handoff before writing the auth keys, or `/login/verify` could
+    // resume it under the new session. Only under `--totp`: a magic-link-only app has no TOTP
+    // session keys.
     let clear_pending = if totp { totp_clear_pending_src() } else { "" };
     TPL.replace("__MAGIC_LINK_TOTP_BRANCH__", &totp_branch)
         .replace("__MAGIC_LINK_CLEAR_PENDING__", clear_pending)
@@ -10383,8 +10213,8 @@ pub struct WebauthnCredential {{
     pub credential_json: String,
     pub name: String,
     #[default]
-    pub last_used_at: Option<chrono::NaiveDateTime>,
-    pub created_at: chrono::NaiveDateTime,
+    pub last_used_at: Option<autumn_web::time::civil::DateTime>,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 
 diesel::joinable!(webauthn_credentials -> {user_table} (user_id));
@@ -10825,12 +10655,12 @@ pub async fn passkey_login_finish(
             .await
             .map_err(|_| AutumnError::unauthorized_msg("Unknown credential."))?
     };
-    let (__SNAKE___email, email_confirmed_at): (String, Option<chrono::NaiveDateTime>) = {
+    let (__SNAKE___email, email_confirmed_at): (String, Option<autumn_web::db::SqlDateTime>) = {
         use crate::schema::__TABLE__;
         __TABLE__::table
             .find(__SNAKE___id)
             .select((__TABLE__::email, __TABLE__::email_confirmed_at))
-            .first::<(String, Option<chrono::NaiveDateTime>)>(&mut *db)
+            .first::<(String, Option<autumn_web::db::SqlDateTime>)>(&mut *db)
             .await
             .map_err(|_| AutumnError::unauthorized_msg("User not found."))?
     };
@@ -10840,7 +10670,7 @@ pub async fn passkey_login_finish(
             "Email address not confirmed. Please check your email for a confirmation link.",
         ));
     }
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
     if auth_result.needs_update() {
         let mut passkey: Passkey = serde_json::from_str(&cred_json)
             .unwrap_or_else(|_| serde_json::from_value(serde_json::Value::Null).unwrap());
@@ -10849,7 +10679,7 @@ pub async fn passkey_login_finish(
         diesel::update(crate::schema::webauthn_credentials::table.find(wc_id))
             .set((
                 crate::schema::webauthn_credentials::credential_json.eq(&new_json),
-                crate::schema::webauthn_credentials::last_used_at.eq(now),
+                crate::schema::webauthn_credentials::last_used_at.eq(autumn_web::db::SqlDateTime::from(now)),
             ))
             .execute(&mut *db)
             .await
@@ -10858,7 +10688,7 @@ pub async fn passkey_login_finish(
             })?;
     } else {
         diesel::update(crate::schema::webauthn_credentials::table.find(wc_id))
-            .set(crate::schema::webauthn_credentials::last_used_at.eq(now))
+            .set(crate::schema::webauthn_credentials::last_used_at.eq(autumn_web::db::SqlDateTime::from(now)))
             .execute(&mut *db)
             .await
             .map_err(|_| {
@@ -10901,7 +10731,7 @@ pub async fn passkey_list(
     let __SNAKE___id: i64 = crate::routes::auth::require_tracked_session(&session, &mut db, &state)
         .await?
         .id;
-    let rows: Vec<(i64, String, chrono::NaiveDateTime)> = {
+    let rows: Vec<(i64, String, autumn_web::db::SqlDateTime)> = {
         use crate::schema::webauthn_credentials;
         webauthn_credentials::table
             .filter(webauthn_credentials::user_id.eq(__SNAKE___id))
@@ -11752,11 +11582,8 @@ mod tests {
 
     // ── generate/destroy round trips (issue #1048) ──────────────────────────
     //
-    // `autumn destroy auth` recomputes the exact same plan `generate` did and
-    // interprets it in reverse (see `Plan::revert`): every `Create`d file is
-    // deleted, and every shared-file edit recorded via `plan.push_revert(...)`
-    // is undone. These tests assert the round trip is byte-identical for the
-    // base scaffold plus each optional feature flag.
+    // `autumn destroy auth` replays the `generate` plan in reverse (`Plan::revert`). These tests
+    // assert the round trip is byte-identical for the base scaffold and each optional flag.
 
     /// The scaffolded `docs/guide/authentication.md` hands the operator
     /// copy-paste SQL, so it must be in the app's own dialect too (issue
@@ -11769,7 +11596,7 @@ mod tests {
         let pg = render_docs_file(DatabaseBackend::Postgres, "User", true, true);
         let sqlite = render_docs_file(DatabaseBackend::Sqlite, "User", true, true);
 
-        // Postgres output is unchanged by the fork: each retrofit block verbatim.
+        // Postgres keeps each retrofit block verbatim.
         assert!(
             pg.contains(
                 "ALTER TABLE {table}\n  \
@@ -11958,10 +11785,9 @@ mod tests {
         for url in ["sqlite://app.db", "postgres://localhost/app"] {
             let files = auth_scaffold_rust_files(url);
             for (path, body) in &files {
-                // The whole path, not just the connection bound: a regression
-                // could reintroduce Postgres as `SelectableHelper<diesel::pg::Pg>`
-                // or `check_for_backend(diesel::pg::Pg)`. The auth surface emits
-                // no legitimate `Pg` reference, so absence is the right bar.
+                // Check the whole path, not only the connection bound: the auth surface has no
+                // legitimate `Pg` reference, so any `diesel::pg::Pg` (e.g. in
+                // `SelectableHelper<diesel::pg::Pg>`) is a regression.
                 assert!(
                     !body.contains("diesel::pg::Pg"),
                     "{} hard-codes the Postgres backend ({url})",
@@ -12433,12 +12259,8 @@ mod tests {
     #[test]
     fn generate_then_destroy_auth_with_totp_oauth_and_passkeys_round_trips_to_original_project_state()
      {
-        // Combines every optional flag in one plan, exercising the trickiest
-        // case for the `autumn.toml` reverts: `--oauth` appends its stub
-        // block first, then `--passkeys` appends `[auth.webauthn]` on top of
-        // that (reading the base plan's already-updated content) — both
-        // edits must unwind cleanly regardless of their relative order in
-        // the file.
+        // Every optional flag at once: `--oauth` appends its stub block, then `--passkeys` appends
+        // `[auth.webauthn]` after it. Both `autumn.toml` edits must unwind cleanly.
         let tmp = project_with_main();
         let cargo_path = tmp.path().join("Cargo.toml");
         fs::write(&cargo_path, template_shipped_cargo_toml()).unwrap();
@@ -12521,13 +12343,11 @@ mod tests {
 
     #[test]
     fn magic_link_verify_get_renders_confirm_without_consuming() {
-        // Scanner-safety: the GET verify handler renders a "Confirm sign-in" page
-        // and must NOT consume the token or establish a session. Consumption +
-        // login lives entirely in the POST handler.
+        // Link scanners follow GETs, so the GET handler only renders a confirm page. Consuming the
+        // token and logging in happen in the POST handler.
         let tmp = project_with_main();
         let routes = magic_link_routes(tmp.path());
 
-        // GET handler body: from its signature up to the POST consume handler.
         let get_start = routes
             .find("pub async fn magic_link_verify_form(")
             .expect("GET confirm handler present");
@@ -12537,24 +12357,26 @@ mod tests {
             .expect("POST verify handler follows the GET form");
         let get_body = &routes[get_start..get_end];
         assert!(
-            !get_body.contains("magic_link_tokens::consumed_at.eq(Some(now))"),
+            !get_body.contains(
+                "magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))"
+            ),
             "GET verify must NOT consume the token: {get_body}"
         );
         assert!(
             !get_body.contains("session.insert(state.auth_session_key()"),
             "GET verify must NOT establish an authenticated session: {get_body}"
         );
-        // It renders a POST-back confirmation form carrying the token.
         assert!(
             get_body.contains("form action=\"/login/magic/verify\" method=\"post\"")
                 && get_body.contains("name=\"token\" value=(query.token)"),
             "GET verify must render a form that POSTs the token back: {get_body}"
         );
 
-        // POST handler body: it DOES consume + establish the session.
         let post_body = magic_link_verify_body(&routes);
         assert!(
-            post_body.contains("magic_link_tokens::consumed_at.eq(Some(now))"),
+            post_body.contains(
+                "magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))"
+            ),
             "POST verify must consume the token: {post_body}"
         );
         assert!(
@@ -12612,17 +12434,14 @@ mod tests {
             .find("pub async fn magic_link_verify(")
             .map_or(routes.len(), |o| start + o);
         let body = &routes[start..end];
-        // Minting only happens inside the account-exists branch.
         assert!(
             body.contains("if let Some(user)"),
             "token minting must be gated on the account existing: {body}"
         );
-        // The final response is the same shared page regardless of existence.
         assert!(
             body.contains("If that address is registered"),
             "must render the same non-enumerating check-your-email response: {body}"
         );
-        // Constant-time padding so hit/miss are latency-indistinguishable.
         assert!(
             body.contains("tokio::time::sleep"),
             "request handler must pad response time to avoid a timing oracle"
@@ -12637,7 +12456,6 @@ mod tests {
             routes.contains("let token_digest = sha256_hex(&raw_token);"),
             "only the SHA-256 digest of the raw token may be stored"
         );
-        // The migration stores a digest column, never a raw-token column.
         let up = fs::read_to_string(
             tmp.path()
                 .join("migrations/20260508000000_create_users/up.sql"),
@@ -12665,8 +12483,7 @@ mod tests {
             .map(|o| start + o)
             .expect("mailer helper follows verify");
         let body = &routes[start..end];
-        // The explanatory comment mentions the name, so assert on the actual
-        // CALL form (with the `step_up::` path + open paren), not the bare name.
+        // The generated comment names the function, so match the call form, not the bare name.
         assert!(
             !body.contains("step_up::set_last_strong_auth_at("),
             "magic-link verify must NOT stamp step-up (proves email possession, \
@@ -12703,13 +12520,11 @@ mod tests {
     fn magic_link_verify_is_single_use_and_generic_failure() {
         let tmp = project_with_main();
         let routes = magic_link_routes(tmp.path());
-        // Atomic consume: stamp consumed_at while filtering unconsumed + unexpired.
         assert!(
             routes.contains("magic_link_tokens::consumed_at.is_null()")
-                && routes.contains("magic_link_tokens::consumed_at.eq(Some(now))"),
+                && routes.contains("magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))"),
             "verify must atomically consume the token (single-use)"
         );
-        // Expired/consumed/unknown all funnel to one generic failure page.
         assert!(
             routes.contains("fn magic_link_invalid_page()"),
             "a single generic failure page must exist (no oracle)"
@@ -12742,8 +12557,8 @@ mod tests {
 
     #[test]
     fn magic_link_verify_honors_totp_second_factor() {
-        // With `--magic-link --totp`, a 2FA-enrolled account must be parked and
-        // redirected to /login/verify — NOT straight-logged-in (Fix 1).
+        // With `--magic-link --totp`, a 2FA-enrolled account is parked and sent to /login/verify,
+        // not logged in.
         let routes = render_routes_file("User", "user", "users", &[], true, true);
         let body = magic_link_verify_body(&routes);
         assert!(
@@ -12754,8 +12569,8 @@ mod tests {
             body.contains(".insert(\"totp_pending_id\""),
             "must set the totp_pending_id marker for the interstitial: {body}"
         );
-        // Mirror confirm_email: mark the pending login confirmation-origin so
-        // login_verify skips the strong-auth stamp (email + TOTP ≠ password).
+        // Like confirm_email: mark the pending login as confirmation-origin so login_verify skips
+        // the strong-auth stamp (email plus TOTP is not a password).
         assert!(
             body.contains("session.insert(\"totp_pending_confirmation\", \"1\")"),
             "must mark the pending login as confirmation-origin: {body}"
@@ -12764,8 +12579,6 @@ mod tests {
             body.contains("return Ok(redirect_to(\"/login/verify\"));"),
             "a 2FA account must be redirected to /login/verify, not logged in: {body}"
         );
-        // The direct auth-session insert must sit AFTER the 2FA early-return, so a
-        // TOTP-enrolled user is never logged in without the second factor.
         let pending_return = body
             .find("return Ok(redirect_to(\"/login/verify\"));")
             .expect("2FA early-return present");
@@ -12780,41 +12593,35 @@ mod tests {
 
     #[test]
     fn magic_link_verify_rechecks_account_lock() {
-        // #1777: the POST verify handler must re-check `locked_at` AFTER the
-        // atomic token consume and BEFORE establishing the session, so a link
-        // minted before a lockout cannot complete a login after it. Non-totp
-        // variant. Mirrors the password-login success-path guard.
+        // #1777: re-check `locked_at` after the token consume and before the session is set, so a
+        // link minted before a lockout cannot log in after it.
         let routes = render_routes_file("User", "user", "users", &[], false, true);
         let body = magic_link_verify_body(&routes);
-        // Reads the same [auth.lockout] config the password-login path uses.
         assert!(
             body.contains("let lockout_cfg = &config.auth.lockout;")
                 && body.contains("let config = state.config_arc();"),
             "verify must read [auth.lockout] through the shared config handle: {body}"
         );
-        // TOCTOU-safe: the recheck must NOT trust the stale in-memory `user` row
-        // SELECTed earlier — it must re-read `locked_at` at the DB. The stale
-        // in-memory check (`if let Some(locked_at) = user.locked_at`) is gone.
         assert!(
             !body.contains("if let Some(locked_at) = user.locked_at {"),
             "verify must NOT gate on the stale in-memory user.locked_at row \
              (TOCTOU race): {body}"
         );
-        // Fresh DB read: a guarded UPDATE predicated on `locked_at` re-reads the
-        // current lock state, clearing an expired lock and rejecting an active one
-        // — the same guard the password success path uses right before the session.
+        // A guarded UPDATE on `locked_at` reads the lock state at the DB: it clears an expired lock
+        // and matches no row for an active one.
         assert!(
             body.contains("let rows_cleared = diesel::update(")
                 && body.contains("users::locked_at.is_null().or(")
-                && body.contains("users::locked_at.le(lock_expired_before)")
+                && body.contains(
+                    "users::locked_at.le(autumn_web::db::SqlDateTime::from(lock_expired_before))"
+                )
                 && body.contains("users::failed_attempts.eq(0),")
                 && body.contains("if rows_cleared == 0 {"),
             "verify must re-read locked_at at the DB via a guarded UPDATE (mirrors \
              password login), not the stale in-memory row: {body}"
         );
-        // Ordering: guard sits AFTER the atomic consume and BEFORE the auth insert.
         let consume = body
-            .find("magic_link_tokens::consumed_at.eq(Some(now))")
+            .find("magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))")
             .expect("token consume present");
         let recheck = body
             .find("let rows_cleared = diesel::update(")
@@ -12831,9 +12638,8 @@ mod tests {
 
     #[test]
     fn magic_link_verify_rechecks_account_lock_with_totp() {
-        // #1777: the same fresh-DB lock recheck must be present in the
-        // `--magic-link --totp` variant, and must gate BOTH the 2FA park and the
-        // direct login (it sits before the /login/verify early-return).
+        // #1777: the `--magic-link --totp` variant runs the same recheck, before the /login/verify
+        // early-return, so it gates both paths.
         let routes = render_routes_file("User", "user", "users", &[], true, true);
         let body = magic_link_verify_body(&routes);
         assert!(
@@ -12849,12 +12655,14 @@ mod tests {
         assert!(
             body.contains("let rows_cleared = diesel::update(")
                 && body.contains("users::locked_at.is_null().or(")
-                && body.contains("users::locked_at.le(lock_expired_before)")
+                && body.contains(
+                    "users::locked_at.le(autumn_web::db::SqlDateTime::from(lock_expired_before))"
+                )
                 && body.contains("if rows_cleared == 0 {"),
             "totp variant must re-read locked_at at the DB via a guarded UPDATE: {body}"
         );
         let consume = body
-            .find("magic_link_tokens::consumed_at.eq(Some(now))")
+            .find("magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))")
             .expect("token consume present");
         let recheck = body
             .find("let rows_cleared = diesel::update(")
@@ -12870,18 +12678,16 @@ mod tests {
 
     #[test]
     fn magic_link_verify_locked_account_uses_generic_failure_page() {
-        // #1777 (no oracle): a locked account must be indistinguishable from a
-        // bad/expired/consumed token — both render magic_link_invalid_page().
+        // #1777: a locked account renders the same page as a bad token, so the response is no lock
+        // oracle.
         for (totp, label) in [(false, "--magic-link"), (true, "--magic-link --totp")] {
             let routes = render_routes_file("User", "user", "users", &[], totp, true);
             let body = magic_link_verify_body(&routes);
-            // The token-failure path already returns the generic page.
             assert!(
                 body.contains("Err(_) => return Ok(magic_link_invalid_page().into_response())"),
                 "{label}: token-failure path must render the generic page: {body}"
             );
-            // The fresh-DB lock guard returns the SAME generic page when zero rows
-            // match (account actively locked) — no distinct response, no oracle.
+            // Zero rows cleared means the account is locked.
             let recheck = body
                 .find("if rows_cleared == 0 {")
                 .expect("lock recheck present");
@@ -12898,7 +12704,6 @@ mod tests {
 
     #[test]
     fn magic_link_verify_without_totp_logs_in_directly() {
-        // With `--magic-link` and no `--totp`, verify logs in directly.
         let routes = render_routes_file("User", "user", "users", &[], false, true);
         let body = magic_link_verify_body(&routes);
         assert!(
@@ -12921,8 +12726,8 @@ mod tests {
 
     #[test]
     fn magic_link_verify_never_stamps_strong_auth_with_or_without_totp() {
-        // In NEITHER case may magic-link verify stamp password-grade strong-auth:
-        // magic-link proves email possession, not password knowledge (Fix 1).
+        // A magic link proves email possession, not password knowledge, so it never stamps strong
+        // auth.
         for totp in [false, true] {
             let routes = render_routes_file("User", "user", "users", &[], totp, true);
             let body = magic_link_verify_body(&routes);
@@ -12935,12 +12740,9 @@ mod tests {
 
     #[test]
     fn magic_link_verify_clears_stale_totp_pending_under_totp() {
-        // Direct (non-2FA) magic-link login rotates the session id, which PRESERVES
-        // session data. An abandoned `totp_pending_*` / parked-reset handoff left in
-        // this browser from a prior `/login/verify` would otherwise survive and could
-        // be resumed under the freshly authenticated session. Mirror the
-        // `totp_clear_pending` scrub password login / reset perform, BEFORE the auth
-        // keys are written.
+        // `rotate_id()` keeps session data, so an abandoned `totp_pending_*` handoff from an
+        // earlier /login/verify would survive into the new session. Verify scrubs it, as password
+        // login does, before writing the auth keys.
         let routes = render_routes_file("User", "user", "users", &[], true, true);
         let body = magic_link_verify_body(&routes);
         for key in [
@@ -12955,7 +12757,6 @@ mod tests {
                 "magic-link direct login must clear stale pending state ({key}): {body}"
             );
         }
-        // The scrub must run BEFORE the authenticated session key is written.
         let clear = body
             .find("session.remove(\"totp_pending_id\").await;")
             .expect("pending-id scrub present");
@@ -12970,8 +12771,7 @@ mod tests {
 
     #[test]
     fn magic_link_verify_without_totp_omits_pending_cleanup() {
-        // A magic-link-only build (no --totp) must not reference the TOTP-only
-        // pending session keys at all — there is no /login/verify handoff to scrub.
+        // Without --totp there is no /login/verify handoff and no pending keys to scrub.
         let routes = render_routes_file("User", "user", "users", &[], false, true);
         let body = magic_link_verify_body(&routes);
         assert!(
@@ -12982,17 +12782,14 @@ mod tests {
 
     #[test]
     fn magic_link_verify_clears_reauth_pw_ok_before_parking_and_promoting() {
-        // Magic-link proves EMAIL possession, not password knowledge. An
-        // unfinished /reauth in this browser may have left a `reauth_pw_ok`
-        // "password already verified" marker; `rotate_id()` preserves it. If it
-        // survived a magic-link login, a later /reauth POST could skip the
-        // password and mint a fresh step-up claim off an email-only login. Verify
-        // the marker is scrubbed on BOTH the parked (TOTP) and direct paths,
-        // mirroring `establish_remember_login` (issue #833/#1397).
+        // A magic link proves email possession, not password knowledge. `rotate_id()` keeps a
+        // `reauth_pw_ok` marker left by an unfinished /reauth, which would let a later /reauth POST
+        // skip the password. Both the parked (TOTP) and direct paths drop it, as
+        // `establish_remember_login` does (#833, #1397).
         const REMOVE: &str = "session.remove(\"reauth_pw_ok\").await;";
 
-        // Under --totp the marker must be dropped BEFORE the 2FA early-return
-        // parks the session (which returns before the direct-path cleanup).
+        // Under --totp, drop the marker before the 2FA early-return, which skips the direct-path
+        // cleanup.
         let routes_totp = render_routes_file("User", "user", "users", &[], true, true);
         let body_totp = magic_link_verify_body(&routes_totp);
         assert!(
@@ -13017,9 +12814,8 @@ mod tests {
             "reauth_pw_ok must be cleared BEFORE the direct-path promotion: {body_totp}"
         );
 
-        // Without --totp the direct path must ALSO scrub the marker before it
-        // promotes the session, and use a plain string key so the magic-link-only
-        // build still compiles (no TOTP-only session-key reference).
+        // Without --totp the direct path drops it too, by a plain string key: that build has no
+        // TOTP session-key references.
         let routes = render_routes_file("User", "user", "users", &[], false, true);
         let body = magic_link_verify_body(&routes);
         assert!(
@@ -13038,13 +12834,9 @@ mod tests {
 
     #[test]
     fn two_factor_disable_clears_magic_link_tokens_under_magic_link() {
-        // Codex review: an outstanding magic-link token issued while TOTP was on is
-        // gated by `magic_link_verify`'s `if user.totp_enabled` branch (routes to
-        // /login/verify). Disabling TOTP flips that flag to false, so the SAME
-        // still-unconsumed token would then take the DIRECT single-factor path and
-        // log the account in fully. The disable transaction must therefore delete
-        // the user's outstanding `magic_link_tokens` so disabling 2FA cannot
-        // retroactively un-gate a previously second-factor-protected link.
+        // A token issued while TOTP was on is sent to /login/verify by `if user.totp_enabled`. Once
+        // 2FA is disabled the same token would log in on one factor, so the disable transaction
+        // deletes the user's outstanding magic-link tokens.
         let routes = render_routes_file("User", "user", "users", &[], true, true);
         let start = routes
             .find("pub async fn two_factor_disable(")
@@ -13060,8 +12852,7 @@ mod tests {
             ),
             "disable transaction must delete the user's outstanding magic-link tokens: {body}"
         );
-        // The delete must sit INSIDE the transaction (before the closing `Ok(())`),
-        // so a mid-operation failure can't leave the tokens live after 2FA is off.
+        // Inside the transaction, so a failure cannot leave the tokens live after 2FA is off.
         let delete_at = body
             .find("magic_link_tokens::table.filter(magic_link_tokens::user_id.eq(user_id))")
             .expect("magic-link delete present");
@@ -13076,9 +12867,7 @@ mod tests {
 
     #[test]
     fn two_factor_disable_without_magic_link_omits_token_clear() {
-        // A `--totp` build with no `--magic-link` has no `magic_link_tokens` table,
-        // so the disable transaction must not reference it (or the crate won't
-        // compile).
+        // Without --magic-link the table does not exist, so referencing it would not compile.
         let routes = render_routes_file("User", "user", "users", &[], true, false);
         let start = routes
             .find("pub async fn two_factor_disable(")
@@ -13098,19 +12887,15 @@ mod tests {
     fn magic_link_ttl_is_config_sourced_with_15_minute_default() {
         let tmp = project_with_main();
         let routes = magic_link_routes(tmp.path());
-        // TTL is sourced from autumn.toml via the shared config handle, not a const.
         assert!(
             routes.contains("let ttl_minutes = config.auth.magic_link.ttl_minutes;")
                 && routes.contains("let config = state.config_arc();"),
             "TTL must be sourced from auth.magic_link via config_arc: {routes}"
         );
-        // The documented default (15) and the ≤ 15-minute guidance must survive
-        // the move to config so operators keep the tight-window recommendation.
         assert!(
             routes.contains("ttl_minutes = 15") && routes.contains("≤ 15 min"),
             "generated docs/comments must keep the 15-minute default and ≤ 15 min guidance: {routes}"
         );
-        // The per-email cooldown is likewise config-sourced.
         assert!(
             routes
                 .contains("let email_cooldown_secs = config.auth.magic_link.email_cooldown_secs;"),
@@ -13120,22 +12905,19 @@ mod tests {
 
     #[test]
     fn magic_link_config_knobs_are_unsigned_to_reject_negative_values() {
-        // `MagicLinkConfig::{ttl_minutes,email_cooldown_secs}` are `u64`, so a
-        // negative value in autumn.toml fails deserialization instead of
-        // silently breaking the throttle/expiry. The generated code proves it
-        // consumes those unsigned knobs: the chrono math casts through `as i64`
-        // (a negative cooldown would push `cooldown_start` into the future and
-        // defeat the per-email email-bomb throttle), and the mailer helper takes
-        // an unsigned `ttl_minutes`. Assert for BOTH the --magic-link and
-        // --magic-link --totp variants.
+        // The config knobs are `u64`, so a negative value in autumn.toml fails to deserialize; a
+        // negative cooldown would put `cooldown_start` in the future and disable the per-email
+        // throttle. The duration math casts them with `as i64`.
         for totp in [false, true] {
             let routes = render_routes_file("User", "user", "users", &[], totp, true);
             assert!(
-                routes.contains("chrono::Duration::seconds(email_cooldown_secs as i64)"),
+                routes.contains(
+                    "autumn_web::time::SignedDuration::from_secs(email_cooldown_secs as i64)"
+                ),
                 "cooldown math must cast the unsigned config knob via `as i64` (totp={totp}): {routes}"
             );
             assert!(
-                routes.contains("chrono::Duration::minutes(ttl_minutes as i64)"),
+                routes.contains("autumn_web::time::SignedDuration::from_mins(ttl_minutes as i64)"),
                 "TTL math must cast the unsigned config knob via `as i64` (totp={totp}): {routes}"
             );
             assert!(
@@ -13211,7 +12993,7 @@ mod tests {
         assert!(
             model.contains("pub struct MagicLinkToken")
                 && model.contains("pub token_digest: String")
-                && model.contains("pub consumed_at: Option<chrono::NaiveDateTime>"),
+                && model.contains("pub consumed_at: Option<autumn_web::time::civil::DateTime>"),
             "magic_link_token model must mirror the reset-token invariants: {model}"
         );
         let model_mod = fs::read_to_string(tmp.path().join("src/models/mod.rs")).unwrap();
@@ -13591,9 +13373,8 @@ mod tests {
 
     #[test]
     fn confirm_email_does_not_stamp_step_up_claim() {
-        // Email confirmation proves inbox access, not password knowledge.
-        // set_last_strong_auth_at must NOT be called in confirm_email so that
-        // an attacker with a stolen confirmation link cannot bypass #[step_up].
+        // Email confirmation proves inbox access, not password knowledge. Stamping the step-up
+        // claim here would let a stolen confirmation link bypass #[step_up].
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -13610,9 +13391,8 @@ mod tests {
             !confirm_body.contains("set_last_strong_auth_at"),
             "confirm_email must NOT stamp set_last_strong_auth_at (email != password proof): {confirm_body}"
         );
-        // confirm_email must also actively remove any inherited step-up claim so a
-        // browser session that previously held last_strong_auth_at cannot carry it
-        // into the newly confirmed account's session.
+        // It also drops any step-up claim the browser session already held, so the claim does not
+        // carry into the newly confirmed account.
         assert!(
             confirm_body.contains("STEP_UP_SESSION_KEY"),
             "confirm_email must remove STEP_UP_SESSION_KEY after rotate_id: {confirm_body}"
@@ -13621,11 +13401,9 @@ mod tests {
 
     #[test]
     fn confirm_email_rejects_pending_email_change_tokens() {
-        // A change-email token shares the `confirm_token_digest` column but sets
-        // `pending_email`. The signup confirm_email UPDATE must guard on
-        // `pending_email IS NULL` so a change-email token can never satisfy it
-        // (Fix 2 — otherwise it consumes the token, stamps email_confirmed_at,
-        // orphans pending_email, and mints an unintended session).
+        // A change-email token shares `confirm_token_digest` but sets `pending_email`. The signup
+        // UPDATE filters on `pending_email IS NULL`, so a change-email token cannot be consumed
+        // here, stamp email_confirmed_at and mint a session.
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -13638,7 +13416,6 @@ mod tests {
             .find("\npub async fn ")
             .unwrap_or(after_confirm.len());
         let confirm_body = &after_confirm[..next_fn];
-        // The reverse guard must be present in the signup-confirm UPDATE filter.
         assert!(
             confirm_body.contains("pending_email.is_null()"),
             "confirm_email UPDATE must filter on pending_email IS NULL to reject \
@@ -13648,9 +13425,8 @@ mod tests {
 
     #[test]
     fn reauth_rotates_session_before_stamping_step_up() {
-        // Rotating the session ID at the privilege-elevation point invalidates
-        // any attacker-held copy of the old cookie, preventing a stolen session
-        // from benefiting from the legitimate user's reauth.
+        // Rotating the id when privilege rises invalidates any attacker-held copy of the old
+        // cookie.
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -13673,8 +13449,8 @@ mod tests {
 
     #[test]
     fn totp_reauth_does_not_embed_password_in_form() {
-        // The TOTP re-render form must not include the raw password in a hidden
-        // field — that would expose it in the DOM to any script on the page.
+        // A hidden password field in the re-rendered TOTP form would expose the password to any
+        // script on the page.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -13682,8 +13458,6 @@ mod tests {
             .find("pub async fn reauth(")
             .expect("reauth handler missing");
         let reauth_body = &routes[reauth_pos..];
-        // The only password input in reauth should be type="password" (visible field),
-        // never type="hidden" with name="password".
         assert!(
             !reauth_body.contains("name=\"password\" value"),
             "TOTP reauth must not embed the raw password in a hidden field: {reauth_body}"
@@ -13692,8 +13466,6 @@ mod tests {
 
     #[test]
     fn totp_reauth_requires_second_factor_for_enrolled_accounts() {
-        // When --totp is enabled, the reauth handler must verify the TOTP code
-        // for accounts with totp_enabled = true. Password alone is insufficient.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -13717,8 +13489,6 @@ mod tests {
 
     #[test]
     fn totp_reauth_form_has_totp_field() {
-        // The reauth form must include a TOTP input when --totp is enabled so
-        // that users with two-factor authentication can provide their code.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -13765,8 +13535,7 @@ mod tests {
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
-        // Scope the assertion to the logout handler body so it cannot be
-        // satisfied by `session.destroy()` calls in other handlers.
+        // Scope to the logout body so calls in other handlers cannot satisfy the assertion.
         let logout_pos = routes
             .find("pub async fn logout(")
             .expect("logout handler missing");
@@ -13775,11 +13544,9 @@ mod tests {
             .find("\npub async fn ")
             .map_or(after.len(), |p| p + 1);
         let logout_body = &after[..next_fn];
-        // Logout must invalidate the session so the pre-logout cookie cannot be
-        // replayed: clear the data (drops auth keys) and rotate the id (the old
-        // id is destroyed in the store on save). This is equivalent to
-        // `destroy()` for replay safety while letting a one-shot logout notice
-        // ride the rotated session to the login page.
+        // Clearing the data drops the auth keys and rotating the id destroys the old one in the
+        // store, so the pre-logout cookie cannot be replayed. Unlike `destroy()`, this lets a
+        // logout flash ride the new session to the login page.
         assert!(
             logout_body.contains("session.clear()") && logout_body.contains("session.rotate_id()"),
             "logout must invalidate the session via clear + rotate: {logout_body}"
@@ -13905,9 +13672,6 @@ mod tests {
             .map_or(after.len(), |p| p + 1);
         let logout_body = &after[..next_fn];
 
-        // The error branch must build its own response and attach the clear
-        // cookie rather than bailing out with a bare `revoke_result?;` that
-        // hands back the framework's default error response untouched.
         assert!(
             !logout_body.contains("revoke_result?;"),
             "a bare `revoke_result?;` skips attaching the remember-clear \
@@ -13948,9 +13712,7 @@ mod tests {
             routes.contains("flash.info(\"Account created"),
             "signup must set a flash: {routes}"
         );
-        // Issue #1353/#1240: the redirect-target pages render pending flashes
-        // through the shared, accessible `flash_messages()` helper threaded into
-        // the layout's 3rd argument — NOT the older in-content `flash.render()`.
+        // #1353/#1240: flashes render through `flash_messages()` in the layout's 3rd argument.
         assert!(
             !routes.contains("flash.render().await"),
             "auth pages must not use the old in-content flash.render() path: {routes}"
@@ -13973,12 +13735,10 @@ mod tests {
     #[test]
     fn auth_views_render_through_shared_layout() {
         let routes = render_routes_file("User", "user", "users", &[], false, false);
-        // The private layout stub is gone.
         assert!(
             !routes.contains("fn layout(title: &str, content: Markup)"),
             "the private 2-arg layout stub must be removed: {routes}"
         );
-        // Views render through the shared 4-arg layout.
         assert!(
             routes.contains("crate::layout("),
             "auth views must render through crate::layout: {routes}"
@@ -13987,23 +13747,19 @@ mod tests {
             !routes.contains(" layout(") || routes.contains("crate::layout("),
             "no bare 2-arg layout() calls may remain: {routes}"
         );
-        // Login renders through the shared layout with its own current_path and
-        // the flash threaded to the 3rd arg (mirrors scaffold's assertions).
         assert!(
             routes.contains(
                 "crate::layout(\"Log In\", \"/login\", flash_messages(&flash.consume().await),"
             ),
             "login_form must render through crate::layout with /login + flash: {routes}"
         );
-        // The account page likewise threads its current_path + flash.
         assert!(
             routes.contains(
                 "crate::layout(\"Your Account\", \"/account\", flash_messages(&flash.consume().await),"
             ),
             "account must render through crate::layout with /account + flash: {routes}"
         );
-        // A page that shows no flash still passes a per-page current_path and an
-        // empty flash markup as the 3rd arg.
+        // A page with no flash passes empty markup as the 3rd argument.
         assert!(
             routes.contains("crate::layout(\"Sign Up\", \"/signup\", html! {},"),
             "signup form must render through crate::layout with /signup: {routes}"
@@ -14089,13 +13845,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
-        // A project with NO shared `pub fn layout` — the exact input the
-        // generate-time preflight rejects.
+        // No shared `pub fn layout`: the input the generate-time preflight rejects.
         fs::write(tmp.path().join("src/main.rs"), main_without_layout()).unwrap();
         let oauth = AuthOAuthOptions {
             providers: Vec::new(),
         };
-        // The revert builder must not consult the shared layout at all.
         let plan = plan_auth_full_ex2_for_revert(
             tmp.path(),
             "User",
@@ -14106,15 +13860,12 @@ mod tests {
             false,
         )
         .expect("destroy auth must build its revert plan without a shared layout");
-        // Sanity: it produced the auth routes file a normal auth plan would, so
-        // `Plan::revert` has something to remove.
         assert!(
             find_plan_content_for_path(&plan, &tmp.path().join("src/routes/auth.rs")).is_some(),
             "revert plan should still include the auth routes it will remove"
         );
 
-        // And the generate path over the SAME project still fails fast — the
-        // guard is bypassed only for revert, never weakened for generation.
+        // Generation over the same project still fails: only revert skips the layout check.
         let err = plan_auth(tmp.path(), "User", "20260508000000").unwrap_err();
         assert!(
             matches!(err, GenerateError::Config(ref msg) if msg.contains("pub fn layout")),
@@ -14170,7 +13921,6 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
 
-        // Find the account_destroy fn and verify #[step_up] precedes it.
         let destroy_pos = routes
             .find("pub async fn account_destroy")
             .expect("account_destroy handler missing from scaffold");
@@ -14189,9 +13939,8 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
 
-        // two_factor_disable already verifies the user's TOTP code or password
-        // in its body; a separate #[step_up] would cause a double re-auth prompt
-        // (once via /reauth, once in the form itself). The handler must be present.
+        // two_factor_disable re-verifies the TOTP code or password in its own form, so a #[step_up]
+        // would prompt twice.
         assert!(
             routes.contains("pub async fn two_factor_disable"),
             "two_factor_disable handler missing from scaffold"
@@ -14224,10 +13973,8 @@ mod tests {
             routes.contains("mailer.send(mail).await"),
             "forgot_password must use async mailer.send(): {routes}"
         );
-        // The is_disabled guard must appear before the DB lookup (maybe_user)
-        // so it fires unconditionally and cannot enumerate registered addresses.
-        // Search within the forgot_password function body, which is identified
-        // by the unique `maybe_user` variable that only appears there.
+        // The guard precedes the DB lookup so it fires for every address and cannot enumerate
+        // accounts. `let maybe_user` appears only in forgot_password.
         let disabled_pos = routes.find("mailer.is_disabled()").unwrap();
         let maybe_user_pos = routes.find("let maybe_user").unwrap();
         assert!(
@@ -14291,8 +14038,7 @@ mod tests {
             .find("pub async fn change_password(")
             .expect("change_password handler missing");
         let before = &routes[..pos];
-        // The attributes immediately preceding the handler must be, in order,
-        // #[secured] then #[step_up] then #[post(...)] — matching account_destroy.
+        // In order: #[secured], #[step_up], #[post(...)], as on account_destroy.
         let secured = before
             .rfind("#[secured]")
             .expect("change_password needs #[secured]");
@@ -14354,8 +14100,6 @@ mod tests {
             body.contains("set_last_strong_auth_at"),
             "must re-stamp the step-up claim on success"
         );
-        // Revokes OTHER tracked sessions (delete where digest != current) and the
-        // remember chains.
         assert!(
             body.contains("user_sessions::token_digest.ne"),
             "must revoke other tracked sessions"
@@ -14370,8 +14114,6 @@ mod tests {
     fn change_password_wrong_current_returns_422_and_no_update() {
         let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "change_password");
-        // Wrong current password re-renders the form via form_unprocessable (422)
-        // and returns BEFORE any password_digest update.
         let wrong_pos = body
             .find("Current password is incorrect.")
             .expect("must show a clear wrong-password error");
@@ -14392,10 +14134,9 @@ mod tests {
     fn change_password_clears_reset_token() {
         let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "change_password");
-        // The same transaction that writes the new password_digest must also null
-        // any outstanding forgot-password token, so a reset link minted before the
-        // change cannot overwrite the just-secured password (reset_password
-        // authenticates SOLELY by matching an unexpired reset_token_digest).
+        // The password write also clears any reset token: reset_password authenticates by the
+        // unexpired reset_token_digest alone, so an older reset link could overwrite the new
+        // password.
         assert!(
             body.contains("password_digest.eq(&new_digest)"),
             "must update the password digest"
@@ -14405,17 +14146,15 @@ mod tests {
             "change_password must clear reset_token_digest"
         );
         assert!(
-            body.contains("reset_token_expires_at.eq(None::<chrono::NaiveDateTime>)"),
+            body.contains("reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>)"),
             "change_password must clear reset_token_expires_at"
         );
     }
 
     #[test]
     fn change_password_clears_magic_link_tokens_only_when_enabled() {
-        // #7: a magic link minted before the password change must not sign the
-        // account in afterwards, so the credential-change transaction deletes the
-        // user's outstanding magic_link_tokens — but only under --magic-link (the
-        // table exists only then).
+        // A magic link minted before the password change must not sign in afterwards. The table
+        // exists only under --magic-link.
         let with = render_routes_file("User", "user", "users", &[], false, true);
         let body = handler_body(&with, "change_password");
         assert!(
@@ -14424,8 +14163,7 @@ mod tests {
             ),
             "with --magic-link, change_password must delete the user's magic_link_tokens"
         );
-        // The delete must sit inside the credential-change transaction (before the
-        // final `Ok(())`), alongside the reset-token clear.
+        // The delete sits in the credential-change transaction, after the remember-chain delete.
         let clear_pos = body
             .find("magic_link_tokens::table.filter")
             .expect("magic-link delete present");
@@ -14447,11 +14185,9 @@ mod tests {
 
     #[test]
     fn reset_password_clears_magic_link_tokens_only_when_enabled() {
-        // #11: reset_password sets a new password digest and revokes sessions /
-        // remember chains, so — like change_password / confirm_email_change — it must
-        // delete the user's outstanding magic_link_tokens in the SAME transaction, or
-        // a sign-in link minted/intercepted before the recovery flow stays valid
-        // afterwards. Emitted only under --magic-link (the table exists only then).
+        // reset_password sets a new password and revokes sessions, so like change_password it
+        // deletes outstanding magic-link tokens in the same transaction. Otherwise a link minted
+        // before the reset stays valid.
         let with = render_routes_file("User", "user", "users", &[], false, true);
         let body = handler_body(&with, "reset_password");
         assert!(
@@ -14460,8 +14196,6 @@ mod tests {
             ),
             "with --magic-link, reset_password must delete the user's magic_link_tokens"
         );
-        // The delete must sit inside the reset transaction (before the final
-        // `Ok(())`), after the remember-chain revocation.
         let clear_pos = body
             .find("magic_link_tokens::table.filter")
             .expect("magic-link delete present");
@@ -14486,11 +14220,8 @@ mod tests {
 
     #[test]
     fn login_verify_reset_commit_clears_magic_link_tokens_only_when_enabled() {
-        // #11: for a 2FA-enabled account the password-reset commit is deferred to
-        // login_verify. That deferred commit also writes a new password_digest and
-        // revokes sessions, so it must likewise delete the user's outstanding
-        // magic_link_tokens — guarded on the commit succeeding (`updated == 1`) and
-        // only under --magic-link.
+        // For a 2FA account the reset commits in login_verify, which must also delete the
+        // magic-link tokens once the commit succeeds (`updated == 1`).
         let with = render_routes_file("User", "user", "users", &[], true, true);
         let body = handler_body(&with, "login_verify");
         assert!(
@@ -14499,8 +14230,6 @@ mod tests {
             "with --magic-link + --totp, login_verify's deferred reset commit must delete \
              magic_link_tokens"
         );
-        // The delete must sit inside the deferred-commit transaction, after the
-        // password write and before the transaction returns `Ok(updated == 1)`.
         let commit_pos = body
             .find("password_digest.eq(&new_digest)")
             .expect("deferred reset commit writes the new digest");
@@ -14514,7 +14243,6 @@ mod tests {
             commit_pos < clear_pos && clear_pos < ret_pos,
             "magic-link delete must sit inside the deferred reset commit transaction"
         );
-        // Guarded on the parked reset actually committing.
         assert!(
             body.contains("if updated == 1 {"),
             "magic-link delete must be guarded on the parked reset committing"
@@ -14530,17 +14258,15 @@ mod tests {
 
     #[test]
     fn change_password_gates_other_session_revocation_on_opt_out() {
-        // #8: the other-device sign-out honours
-        // [auth.sessions].revoke_on_credential_change, mirroring the
-        // reset/TOTP/passkey paths — but the current session is always rebound and
-        // reset tokens are always cleared regardless of the flag.
+        // Other-device sign-out honours [auth.sessions].revoke_on_credential_change, like the
+        // reset, TOTP and passkey paths. The current session is always rebound and reset tokens are
+        // always cleared.
         let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "change_password");
         assert!(
             body.contains("state.config_arc().auth.sessions.revoke_on_credential_change"),
             "change_password must read the revoke_on_credential_change opt-out"
         );
-        // The OTHER-session delete is gated on the captured flag.
         let flag_pos = body
             .find("let revoke_other_sessions_in_txn =")
             .expect("must capture the revocation flag");
@@ -14554,12 +14280,10 @@ mod tests {
             flag_pos < gate_pos && gate_pos < other_delete_pos,
             "the other-session delete must sit inside `if revoke_other_sessions_in_txn`"
         );
-        // The current session is ALWAYS rebound onto the rotated id (not gated).
         assert!(
             body.contains("token_digest.eq(&post_rotation_digest)"),
             "change_password must always rebind the current session onto the rotated id"
         );
-        // Reset tokens are cleared unconditionally (not inside the gate).
         assert!(
             body.contains("reset_token_digest.eq(None::<String>)"),
             "reset tokens must be cleared regardless of the opt-out"
@@ -14570,8 +14294,7 @@ mod tests {
     fn change_email_guards_disabled_mail_first_and_stores_pending() {
         let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "change_email");
-        // Disabled-mail guard must come before the DB session lookup, mirroring
-        // forgot_password — so it fires unconditionally.
+        // Like forgot_password, the disabled-mail guard runs before the session lookup.
         let disabled = body
             .find("mailer.is_disabled()")
             .expect("must guard disabled mail");
@@ -14598,10 +14321,9 @@ mod tests {
             body.contains("send_email_change_notice"),
             "must send a change-notice to the old address"
         );
-        // Old address stays valid: the request handler must NOT SWAP the active
-        // address here (only the later confirm sets `email`). A read-only
-        // availability filter that references `users::email.eq(&new_email)` is fine;
-        // the swap is uniquely the `.set` form with a trailing comma.
+        // The request must not swap the active address; only the confirm does. The swap is the
+        // `.set` form with a trailing comma, which the availability filter
+        // `users::email.eq(&new_email)` lacks.
         assert!(
             !body.contains("email.eq(&new_email),"),
             "change_email request must NOT swap the active address"
@@ -14610,13 +14332,10 @@ mod tests {
 
     #[test]
     fn change_email_prechecks_availability_before_sending() {
-        // If the requested address already belongs to ANOTHER account, the handler
-        // must short-circuit to the SAME generic "check your email" response
-        // WITHOUT emailing that third party and WITHOUT storing a doomed pending
-        // change (the later confirm would collide on email's unique index). The
-        // availability check must therefore run BEFORE both the mail send and the
-        // pending-state persist. Non-enumerating: the caller cannot distinguish a
-        // taken address from an available one.
+        // An address owned by another account gets the same generic response, with no mail to that
+        // owner and no pending change stored (the confirm would hit the unique index). So the check
+        // runs before the send and the persist, and the caller cannot tell a taken address from a
+        // free one.
         let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "change_email");
         let precheck = body
@@ -14655,11 +14374,10 @@ mod tests {
             "must clear pending_email on confirm"
         );
         assert!(
-            body.contains("email_confirmed_at.eq(Some(now))"),
+            body.contains("email_confirmed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))"),
             "must stamp email_confirmed_at on confirm"
         );
-        // Single generic error (no oracle): the not-found / expired / consumed
-        // paths all return the same message.
+        // Not found, expired and consumed share one message (no oracle).
         assert!(
             body.contains("This email-change link is invalid or has expired."),
             "must return a single non-revealing error"
@@ -14674,9 +14392,8 @@ mod tests {
     fn confirm_email_change_clears_reset_token() {
         let routes = render_routes_file("User", "user", "users", &[], false, false);
         let body = handler_body(&routes, "confirm_email_change");
-        // The atomic confirm UPDATE swaps the address; it must ALSO null any
-        // outstanding reset token so a reset link sent to the OLD mailbox before
-        // the change cannot reset the account after it has moved.
+        // The address swap also clears any reset token, so a reset link sent to the old mailbox
+        // cannot reset the moved account.
         assert!(
             body.contains("users::email.eq(&new_email)"),
             "must swap the active address"
@@ -14686,17 +14403,14 @@ mod tests {
             "confirm_email_change must clear reset_token_digest"
         );
         assert!(
-            body.contains("reset_token_expires_at.eq(None::<chrono::NaiveDateTime>)"),
+            body.contains("reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>)"),
             "confirm_email_change must clear reset_token_expires_at"
         );
     }
 
     #[test]
     fn confirm_email_change_clears_magic_link_tokens_only_when_enabled() {
-        // #10: a magic link sent to the OLD mailbox before the change must not
-        // sign the account in after the address moves, so the confirmation
-        // transaction deletes the user's outstanding magic_link_tokens — gated on
-        // --magic-link.
+        // A magic link sent to the old mailbox must not sign in after the address moves.
         let with = render_routes_file("User", "user", "users", &[], false, true);
         let body = handler_body(&with, "confirm_email_change");
         assert!(
@@ -14742,14 +14456,12 @@ mod tests {
     #[test]
     fn change_email_confirm_uses_secured_only_on_get_forms() {
         let routes = render_routes_file("User", "user", "users", &[], false, false);
-        // The GET form pages are #[secured] but NOT #[step_up].
         for form_fn in ["change_password_form", "change_email_form"] {
             let pos = routes
                 .find(&format!("pub async fn {form_fn}("))
                 .unwrap_or_else(|| panic!("{form_fn} missing"));
-            // Look at the attribute block immediately preceding this handler
-            // (bounded by the previous handler) so a #[step_up] on some later
-            // handler cannot satisfy the check.
+            // Only this handler's attribute block counts (from the previous handler on), so a
+            // #[step_up] on another handler cannot satisfy the check.
             let before = &routes[..pos];
             let prev_fn = before.rfind("pub async fn ").unwrap_or(0);
             let attrs = &before[prev_fn..];
@@ -15128,7 +14840,7 @@ mod tests {
         );
     }
 
-    // ── OAuth2 generator tests (RED phase) ──────────────────────────────────
+    // ── OAuth2 generator tests ──────────────────────────────────────────────
 
     #[test]
     fn plan_auth_with_oauth_creates_oauth_identities_migration() {
@@ -15158,12 +14870,10 @@ mod tests {
     #[test]
     fn plan_auth_without_oauth_is_unchanged() {
         let tmp = project_with_main();
-        // Calling with empty providers must produce the same plan as plain plan_auth.
         let oauth = AuthOAuthOptions { providers: vec![] };
         let plan_with =
             plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
         let plan_plain = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
-        // Plans should have the same number of actions and the same paths.
         let paths_with: std::collections::HashSet<String> = plan_with
             .actions
             .iter()
@@ -15203,7 +14913,7 @@ mod tests {
         let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
         plan.execute(Flags::default()).unwrap();
 
-        // Find the oauth_identities up.sql — timestamp is base+1 to avoid Diesel conflicts.
+        // The timestamp is base + 1 so it does not collide with the base migration.
         let mig_dir = tmp
             .path()
             .join("migrations/20260508000001_create_oauth_identities");
@@ -15262,8 +14972,6 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/oauth.rs")).unwrap();
-        // oauth2_finish_login handles state+nonce internally, so its presence
-        // is the contract that state/nonce checking is enforced.
         assert!(
             routes.contains("oauth2_finish_login"),
             "callback must use oauth2_finish_login (which enforces state+nonce): {routes}"
@@ -15411,8 +15119,7 @@ mod tests {
     fn oauth_callback_does_not_set_session_key_before_account_link() {
         let routes =
             render_oauth_routes_file("User", "user", "users", &["github".to_owned()], false);
-        // The TODO comment may mention the call; verify the EXECUTABLE line is absent.
-        // Executable session.insert calls are not prefixed with "//" or "#".
+        // A generated comment may mention the call; only lines that are not `//` comments count.
         let executable_insert = routes
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
@@ -15465,7 +15172,6 @@ mod tests {
         let oauth = AuthOAuthOptions {
             providers: vec!["github".to_owned(), "google".to_owned()],
         };
-        // Setup mock autumn.toml
         fs::write(tmp.path().join("autumn.toml"), "[server]\nport = 3000\n").unwrap();
 
         let plan = plan_auth_with_options(tmp.path(), "User", "20260508000000", &oauth).unwrap();
@@ -15510,7 +15216,7 @@ mod tests {
         );
     }
 
-    // ── TOTP two-factor generator tests (S-061 / #799) ──────────────────────
+    // ── TOTP two-factor generator tests (#799) ──────────────────────────────
 
     fn totp_plan(tmp: &std::path::Path) -> Plan {
         let oauth = AuthOAuthOptions::default();
@@ -15637,8 +15343,8 @@ mod tests {
 
     #[test]
     fn totp_login_clears_abandoned_reset_marker() {
-        // P2 (#1057): an ordinary password login must clear any stale
-        // totp_pending_reset_digest so it can't commit a stale password change.
+        // #1057: a password login clears any stale totp_pending_reset_digest so it cannot commit an
+        // abandoned password change.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -15653,9 +15359,8 @@ mod tests {
 
     #[test]
     fn totp_signup_clears_pending_state() {
-        // P2 (#1057 round 6): signing up establishes a fresh authenticated
-        // session, so it must clear any abandoned pending-2FA / reset / enrollment
-        // markers — otherwise a later /login/verify could switch accounts.
+        // #1057: signup starts a fresh authenticated session, so it clears abandoned pending-2FA,
+        // reset and enrollment markers; a later /login/verify could otherwise switch accounts.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -15673,8 +15378,8 @@ mod tests {
 
     #[test]
     fn totp_clear_pending_includes_enrollment_secret() {
-        // P2 (#1057 round 6): a stale totp_pending_secret must not survive a fresh
-        // full login, or two_factor_confirm could accept it for a different account.
+        // #1057: a stale totp_pending_secret must not survive a full login, or two_factor_confirm
+        // could accept it for another account.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -15689,9 +15394,8 @@ mod tests {
 
     #[test]
     fn totp_interstitial_rejects_session_key_collision() {
-        // P2 (#1057 round 6): if [auth].session_key collides with a reserved
-        // totp_pending_* key, parking the pending marker would set the trusted
-        // auth key. The interstitials must refuse such a configuration.
+        // #1057: if [auth].session_key equals a reserved totp_pending_* key, parking the pending
+        // marker would set the trusted auth key, so the interstitials refuse that config.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -15710,14 +15414,11 @@ mod tests {
 
     #[test]
     fn totp_pending_handoff_clears_live_auth_keys() {
-        // P2 (#1057 round 9): rotate_id() preserves session data, so a pending-2FA
-        // handoff started while already authenticated as another account must drop
-        // the live auth keys, or #[secured] would still trust the old account.
+        // #1057: rotate_id() keeps session data, so a 2FA handoff started while signed in as
+        // another account must drop the live auth keys, or #[secured] still trusts the old account.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
-        // Login interstitial: before parking totp_pending_id it must remove the
-        // configured auth session key.
         let login_pos = routes.find("pub async fn login(").expect("login fn");
         let logout_pos = routes.find("pub async fn logout(").unwrap_or(routes.len());
         let login_body = &routes[login_pos..logout_pos];
@@ -15729,7 +15430,6 @@ mod tests {
             before_park.contains("session.remove(state.auth_session_key())"),
             "login interstitial must clear the live auth key before parking 2FA: {login_body}"
         );
-        // Reset interstitial must do the same.
         let reset_pos = routes
             .find("pub async fn reset_password(")
             .expect("reset_password fn");
@@ -15745,17 +15445,15 @@ mod tests {
 
     #[test]
     fn totp_login_verify_falls_back_to_recovery_on_broken_secret() {
-        // P2 (#1057 round 8): a decrypt/build failure (e.g. rotated TOTP_ENC_KEY)
-        // must not abort login_verify before the recovery-code branch — recovery
-        // codes are the only escape from that lockout.
+        // #1057: a decrypt or build failure (e.g. a rotated TOTP_ENC_KEY) must not abort
+        // login_verify before the recovery-code branch: recovery codes are the only way out of that
+        // lockout.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
         let verify_pos = routes
             .find("pub async fn login_verify(")
             .expect("login_verify fn");
-        // Up to the recovery-code branch, the TOTP attempt must not use `?` on
-        // decrypt_secret/build_totp (which would abort the whole handler).
         let verify_to_recovery = &routes[verify_pos..];
         let recovery_at = verify_to_recovery
             .find("try an unused recovery code")
@@ -15773,8 +15471,8 @@ mod tests {
 
     #[test]
     fn totp_disable_falls_back_to_password_on_broken_secret() {
-        // P2 (#1057 round 8): the disable code path must likewise not abort on a
-        // decrypt failure, so the password fallback can still re-authenticate.
+        // #1057: disable must not abort on a decrypt failure either, so the password fallback still
+        // works.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -15793,8 +15491,8 @@ mod tests {
 
     #[test]
     fn totp_build_totp_sanitizes_colon_in_account_label() {
-        // P2 (#1057 round 8): totp-rs rejects account labels containing ':', so an
-        // email like a:b@example.com would 500. build_totp must strip colons.
+        // #1057: totp-rs rejects account labels containing ':', so an email like a:b@example.com
+        // would 500.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -15808,8 +15506,8 @@ mod tests {
 
     #[test]
     fn totp_oauth_pending_note_guards_session_key_collision() {
-        // P2 (#1057 round 8): the OAuth pending-2FA guidance must mirror the
-        // password/reset reserved-key rejection before parking totp_pending_id.
+        // #1057: the OAuth pending-2FA guidance rejects a reserved session key, like the password
+        // and reset paths.
         let tmp = project_with_main();
         let oauth_opts = AuthOAuthOptions {
             providers: vec!["github".to_owned()],
@@ -15827,12 +15525,10 @@ mod tests {
 
     #[test]
     fn totp_rejects_recovery_code_name_collision() {
-        // P2 (#1057 round 7): `--totp` always emits a recovery_code model/table,
-        // so an auth resource that resolves to that name would emit it twice and
-        // produce an unusable app. The generator must reject it up front.
+        // #1057: `--totp` always emits a recovery_code model and table, so an auth resource with
+        // that name would be emitted twice.
         let tmp = project_with_main();
-        // Both forms resolve to snake `recovery_code` / table `recovery_codes`,
-        // which is exactly the helper model/table emitted under --totp.
+        // Both spellings resolve to `recovery_code` / `recovery_codes`.
         for name in ["RecoveryCode", "recovery_code"] {
             let err = plan_auth_with_providers(tmp.path(), name, "20260508000000", &[], true)
                 .expect_err("recovery_code collision must be rejected under --totp");
@@ -15841,7 +15537,6 @@ mod tests {
                 "expected InvalidName for {name}, got {err:?}"
             );
         }
-        // Without --totp the same name is fine (no recovery_code table emitted).
         assert!(
             plan_auth_with_providers(tmp.path(), "RecoveryCode", "20260508000000", &[], false)
                 .is_ok(),
@@ -15851,9 +15546,8 @@ mod tests {
 
     #[test]
     fn totp_rejects_existing_recovery_codes_table() {
-        // P2 (#1057 round 11): if the project already declares a `recovery_codes`
-        // table, the unconditional --totp migration would CREATE it again and
-        // `diesel migration run` would fail. Reject up front.
+        // #1057: --totp always creates `recovery_codes`, so an existing table would make `diesel
+        // migration run` fail.
         let tmp = project_with_main();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(
@@ -15867,7 +15561,6 @@ mod tests {
             matches!(err, GenerateError::InvalidName(_, _)),
             "expected InvalidName, got {err:?}"
         );
-        // Without --totp there's no recovery_codes helper, so it's fine.
         assert!(
             plan_auth_with_providers(tmp.path(), "User", "20260508000000", &[], false).is_ok(),
             "existing recovery_codes table is irrelevant without --totp"
@@ -15876,10 +15569,8 @@ mod tests {
 
     #[test]
     fn adoption_migration_docs_include_pending_email() {
-        // The generated routes/schema always reference `pending_email` (signup-confirm
-        // disambiguation + email-change flow), so the documented "adoption path"
-        // migration for existing apps must add that column in up.sql and drop it in
-        // down.sql — otherwise the regenerated app queries a missing column.
+        // The generated code always reads `pending_email`, so the documented adoption migration for
+        // existing apps must add it in up.sql and drop it in down.sql.
         let docs = render_docs_file(
             autumn_web::config::DatabaseBackend::Postgres,
             "User",
@@ -15906,9 +15597,8 @@ mod tests {
 
     #[test]
     fn magic_link_rejects_helper_name_collision() {
-        // `--magic-link` always emits a magic_link_token model/table, so an auth
-        // resource that resolves to those names would emit the CREATE TABLE twice and
-        // overwrite the auth model with the helper model. The generator must reject it.
+        // `--magic-link` always emits a magic_link_token model and table; an auth resource with
+        // that name would create the table twice and overwrite the auth model.
         let tmp = project_with_main();
         for name in ["MagicLinkToken", "magic_link_token"] {
             let err =
@@ -15919,7 +15609,6 @@ mod tests {
                 "expected InvalidName for {name}, got {err:?}"
             );
         }
-        // Without --magic-link the same name is fine (no magic_link_tokens table emitted).
         assert!(
             plan_auth_with_providers_ex(
                 tmp.path(),
@@ -15936,8 +15625,8 @@ mod tests {
 
     #[test]
     fn magic_link_rejects_existing_magic_link_tokens_table() {
-        // If the project already declares a `magic_link_tokens` table, the
-        // unconditional --magic-link migration would CREATE it again. Reject up front.
+        // --magic-link always creates `magic_link_tokens`, so an existing table is rejected up
+        // front.
         let tmp = project_with_main();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(
@@ -15952,7 +15641,6 @@ mod tests {
             matches!(err, GenerateError::InvalidName(_, _)),
             "expected InvalidName, got {err:?}"
         );
-        // Without --magic-link there's no helper table, so it's fine.
         assert!(
             plan_auth_with_providers_ex(tmp.path(), "User", "20260508000000", &[], false, false)
                 .is_ok(),
@@ -15962,8 +15650,8 @@ mod tests {
 
     #[test]
     fn totp_enable_rejects_reserved_session_key() {
-        // P2 (#1057 round 11): two_factor_enable stashes totp_pending_secret, so it
-        // must also reject a [auth].session_key that collides with a reserved key.
+        // #1057: two_factor_enable stores totp_pending_secret, so it also rejects a reserved
+        // session key.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -15982,8 +15670,8 @@ mod tests {
 
     #[test]
     fn totp_oauth_full_login_note_rotates_session() {
-        // P2 (#1057 round 11): the non-2FA OAuth full-login guidance must rotate the
-        // session id before promoting, mirroring password login (anti-fixation).
+        // #1057: the non-2FA OAuth full-login guidance rotates the session id before promoting,
+        // like password login (anti-fixation).
         let tmp = project_with_main();
         let oauth_opts = AuthOAuthOptions {
             providers: vec!["github".to_owned()],
@@ -16021,7 +15709,6 @@ mod tests {
             out.contains("\"qr\"") && out.contains("\"gen_secret\"") && out.contains("\"otpauth\""),
             "missing features must be merged in: {out}"
         );
-        // The pre-existing feature must not be duplicated.
         assert_eq!(out.matches("\"qr\"").count(), 1, "qr duplicated: {out}");
     }
 
@@ -16049,8 +15736,6 @@ mod tests {
 
     #[test]
     fn ensure_totp_rs_features_merges_subtable_with_partial_features() {
-        // P2 (#1057 round 12): the `[dependencies.totp-rs]` subtable form must also
-        // gain the missing features.
         let toml = "[dependencies.totp-rs]\nversion = \"5\"\nfeatures = [\"qr\"]\n";
         let out = ensure_totp_rs_features(toml);
         assert!(
@@ -16075,8 +15760,8 @@ mod tests {
 
     #[test]
     fn ensure_totp_rs_features_strips_inline_comment_on_simple_version() {
-        // P2 (#1057 round 13): a trailing inline comment must not be folded into
-        // the version string (which would make Cargo.toml invalid).
+        // A trailing comment must not end up inside the version string, which would make Cargo.toml
+        // invalid.
         let toml = "[dependencies]\ntotp-rs = \"5\" # used by metrics\n";
         let out = ensure_totp_rs_features(toml);
         assert!(
@@ -16087,7 +15772,6 @@ mod tests {
             !out.contains("\"5\" # used by metrics\""),
             "the comment must not leak into the version string: {out}"
         );
-        // The comment is preserved after the rewritten table.
         assert!(
             out.contains("# used by metrics"),
             "the trailing comment should be preserved: {out}"
@@ -16096,8 +15780,6 @@ mod tests {
 
     #[test]
     fn ensure_totp_rs_features_merges_multiline_subtable_array() {
-        // P2 (#1057 round 13): a multiline `features = [` array in the subtable
-        // form must still gain the missing features.
         let toml = "[dependencies.totp-rs]\nversion = \"5\"\nfeatures = [\n    \"qr\",\n]\n";
         let out = ensure_totp_rs_features(toml);
         assert!(
@@ -16109,8 +15791,6 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_mail_feature_merges_multiline_subtable_array() {
-        // #2753 missed-fix #2: a multiline `features = [` array in the
-        // `[dependencies.autumn-web]` subtable form silently kept `mail` unset.
         let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n]\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert!(
@@ -16122,7 +15802,6 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_webauthn_feature_merges_multiline_subtable_array() {
-        // #2753 missed-fix #2: same gap as the mail copy, in the webauthn copy.
         let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n]\n";
         let out = ensure_autumn_web_webauthn_feature(toml);
         assert!(
@@ -16200,8 +15879,7 @@ mod tests {
 
     #[test]
     fn ensure_webauthn_rs_features_merges_multiline_subtable_array() {
-        // #2753 missed-fix #2: same gap as the two autumn-web copies, in the
-        // webauthn-rs copy — this one merges a list of features, not just one.
+        // Unlike the autumn-web copies, this merges a list of features.
         let toml = "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [\n    \"conditional-ui\",\n]\n";
         let out = ensure_webauthn_rs_features(toml);
         assert!(
@@ -16218,10 +15896,8 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_mail_feature_multiline_array_without_trailing_comma_stays_valid_toml() {
-        // Codex review on #2948: when the last entry before `]` has no
-        // trailing comma, inserting the new feature right before the
-        // bracket produced e.g. `"ws"\n"mail"]` — invalid TOML (missing the
-        // separator between array elements).
+        // With no comma after the last entry, inserting before `]` would give `"ws"\n"mail"]`,
+        // which is invalid TOML.
         let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\"\n]\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert!(
@@ -16235,7 +15911,6 @@ mod tests {
     #[test]
     fn ensure_autumn_web_webauthn_feature_multiline_array_without_trailing_comma_stays_valid_toml()
     {
-        // Same gap as the mail copy, in the webauthn copy.
         let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\"\n]\n";
         let out = ensure_autumn_web_webauthn_feature(toml);
         assert!(
@@ -16248,8 +15923,6 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_oauth2_feature_multiline_array_without_trailing_comma_stays_valid_toml() {
-        // Same gap as its two siblings, in the one copy that already had the
-        // multiline fallback before #2948.
         let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\"\n]\n";
         let out = ensure_autumn_web_oauth2_feature(toml);
         assert!(
@@ -16262,10 +15935,8 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_mail_feature_trailing_comment_on_last_entry_stays_valid_toml() {
-        // Codex review on #2948's first fix: the backward scan for "does the
-        // last entry already end with a comma?" read a commented entry line
-        // (`"ws", # note`) as not ending in ',' — since the comment text was
-        // still attached — and inserted a second, invalid comma ahead of it.
+        // A trailing comment on the last entry (`"ws", # note`) hides its comma from a naive scan,
+        // which would then insert a second, invalid comma.
         let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\", # websocket support\n]\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert!(
@@ -16302,10 +15973,8 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_mail_feature_ignores_commented_out_feature_mention() {
-        // Codex review on #2948's second fix: a commented-out mention of the
-        // feature (`# "mail" is intentionally disabled`) is not TOML, but the
-        // raw substring check treated it as though the feature were already
-        // present and left it unset.
+        // A commented-out mention (`# "mail" is intentionally disabled`) is not a feature, so the
+        // merge still adds it.
         let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\", # \"mail\" is intentionally disabled\n]\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert_eq!(
@@ -16339,9 +16008,7 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_mail_feature_inline_table_ignores_commented_out_mention() {
-        // Same comment-blindness bug as the subtable branch's "already
-        // present?" check, in the inline-table (`autumn-web = { ... }`)
-        // branch's own guard.
+        // A `"mail"` mention in a comment after an inline table is not a feature either.
         let toml = "autumn-web = { version = \"0.3\", features = [\"ws\"] } # \"mail\" is intentionally disabled\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert_eq!(
@@ -16373,13 +16040,7 @@ mod tests {
         );
     }
 
-    // #2753 missed-fix #3: a multiline `features = [` array inside the
-    // *inline-table* form (`autumn-web = { ..., features = [\n ... \n] }`,
-    // legal TOML since 1.0) was only handled by two of the three autumn-web
-    // copies. `oauth2`/`webauthn` already scanned forward for the real
-    // closing `]`; `mail` indexed the same-line search result with `.unwrap()`
-    // and panicked on this exact input instead of silently no-op'ing like
-    // missed-fix #1/#2 — a worse failure mode (CLI crash, not silent no-op).
+    // #2753: an inline table can hold a multiline `features = [` array (legal since TOML 1.0).
     #[test]
     fn ensure_autumn_web_mail_feature_merges_multiline_inline_table_array() {
         let toml =
@@ -16426,11 +16087,8 @@ mod tests {
         );
     }
 
-    // Codex review on #3084: a first version of the inline-table multiline
-    // fix (ported from oauth2/webauthn's own, then-unhardened branch) only
-    // looked at the closing line for the separator decision, so a last
-    // entry with no trailing comma on an earlier line produced invalid TOML
-    // — the same defect #2948 already fixed once for the subtable form.
+    // #3084: an entry with no trailing comma on an earlier line still needs a separator; the
+    // closing line alone does not decide it.
     #[test]
     fn ensure_autumn_web_mail_feature_inline_table_multiline_array_without_trailing_comma_stays_valid_toml()
      {
@@ -16473,11 +16131,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
     }
 
-    // Codex review on #3084: the first version's "already present?" check
-    // only looked at the opener line, not the rest of a multiline
-    // inline-table array, so a feature already merged on a continuation
-    // line got a duplicate appended — the same defect #2948 already fixed
-    // once for the subtable form.
+    // #3084: the "already present?" check covers every line of a multiline inline-table array, not
+    // just the opener.
     #[test]
     fn ensure_autumn_web_mail_feature_does_not_duplicate_across_multiline_inline_table_array() {
         let toml = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n    \"mail\",\n] }\n";
@@ -16507,12 +16162,8 @@ mod tests {
         );
     }
 
-    // Codex review on #3084: an inline table's `}` can carry another
-    // comma-separated field after the array's `]` on the same line, unlike
-    // the subtable form. The "already present?" check read the whole
-    // closing line, so a field whose own string value happened to equal the
-    // feature name (`path = "mail"`) made the array look already merged
-    // when it was not, and the feature never got added.
+    // #3084: in an inline table, more fields can follow `]` on the closing line. Only the array
+    // counts, so `path = "mail"` must not read as an already-present feature.
     #[test]
     fn ensure_autumn_web_mail_feature_inline_table_field_value_matching_feature_name_is_not_mistaken_for_already_present()
      {
@@ -16551,13 +16202,8 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_mail_feature_opener_comment_neither_hides_feature_nor_misclassifies() {
-        // Codex review on 40a19c56: the same comment-blindness bug in the
-        // *opener* line itself (`features = [ # ...`), one step earlier than
-        // the interior-line scans already fixed — a `"mail"` mention in the
-        // opener's comment falsely read as "already present", and a `]`
-        // inside that same comment falsely dispatched a genuinely multiline
-        // array down the single-line merge path (which would then merge
-        // into dead text past the `#`, never touching the real array below).
+        // A comment on the opener line (`features = [ # ...`) must neither count as "already
+        // present" nor, through the `]` inside it, make a multiline array look single-line.
         let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [ # \"mail\" is disabled, see [defaults] doc\n    \"ws\",\n]\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert!(
@@ -16609,12 +16255,8 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_mail_feature_respects_hash_inside_quoted_path() {
-        // Codex review on 28a9cb82: `strip_line_comment` itself was the bug
-        // this time — its naive `split_once('#')` treated a `#` inside a
-        // quoted value (a git-fork path fragment, valid TOML) as a comment
-        // start, hiding the real `features = [...]` that follows it. That
-        // made an already-satisfied feature look absent, so the generator
-        // appended a duplicate on every re-run.
+        // A `#` inside a quoted value (a git-fork path) does not start a comment. Stripping from
+        // there would hide the real `features` key and append a duplicate on every run.
         let toml = "autumn-web = { path = \"../autumn#fork\", features = [\"mail\"] }\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert!(
@@ -16660,12 +16302,8 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_mail_feature_ignores_bracket_inside_quoted_feature_name() {
-        // Codex review on e1e5d48: Cargo permits unusual feature names (e.g.
-        // on a path/git fork) containing characters like `]` or `,`. The
-        // multiline "is this the closing bracket?" scan didn't know about
-        // quoting, so a quoted `]` in an existing feature name was mistaken
-        // for the array's real terminator, truncating the rebuild and
-        // leaving the actual tail (further entries, the real `]`) behind.
+        // Cargo allows feature names containing `]` or `,` (e.g. on a fork). A quoted `]` is not
+        // the array's closing bracket.
         let toml =
             "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"foo]bar\",\n]\n";
         let out = ensure_autumn_web_mail_feature(toml);
@@ -16735,9 +16373,8 @@ mod tests {
 
     #[test]
     fn ensure_webauthn_rs_features_preserves_comma_inside_quoted_feature_name() {
-        // Codex review on e1e5d48: collapsing a multiline array split on
-        // every raw `,`, so a feature name containing a literal comma (also
-        // valid for a path/git fork) was torn into two garbage entries.
+        // A quoted comma inside a feature name must not split the entry when the array is
+        // collapsed.
         let toml =
             "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [\n    \"foo,bar\",\n]\n";
         let out = ensure_webauthn_rs_features(toml);
@@ -16756,13 +16393,8 @@ mod tests {
 
     #[test]
     fn ensure_webauthn_rs_features_finds_key_past_quoted_lookalike_text() {
-        // Codex review on 445675f2: a quoted path containing the literal
-        // text "features = [" (valid, if contrived, TOML) fooled the
-        // quote-blind `line.find("features = [")` into anchoring the
-        // bracket scan inside that quoted value instead of at the real
-        // features key, so `find_unquoted` (which only starts tracking
-        // quotes from that wrong position onward) got confused and missed
-        // the real array entirely.
+        // A quoted value can contain the text "features = ["; the key lookup must skip quoted text
+        // and find the real key.
         let toml =
             "webauthn-rs = { path = \"../features = [fork\", features = [\"conditional-ui\"] }\n";
         let out = ensure_webauthn_rs_features(toml);
@@ -16779,10 +16411,8 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_mail_feature_finds_key_past_quoted_lookalike_text_without_panicking() {
-        // Same gap as the webauthn-rs case, but mail's inline-table branch
-        // has no multiline fallback and unwraps the bracket search directly
-        // — an unfixed quote-blind key lookup here would panic, not just
-        // produce a wrong result.
+        // mail's inline-table branch unwraps the bracket search, so a wrong key match here would
+        // panic.
         let toml = "autumn-web = { path = \"../features = [fork\", features = [\"mail\"] }\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert!(
@@ -16797,13 +16427,8 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_mail_feature_ignores_commented_out_features_key() {
-        // Codex review on 4f9291f9: the "already present?" guard strips
-        // comments before checking, but the separate "does a real features
-        // key exist here?" lookup this PR just fixed for quoting still
-        // searched the raw line for comment-stripping too, so a
-        // commented-out `features = [...]` (e.g. left behind by a manual
-        // edit) was found and rewritten — inside the comment, never in
-        // real code — instead of a genuine key being inserted.
+        // A commented-out `features = [...]` is not a key: the merge must insert a real one, not
+        // rewrite the comment.
         let toml = "autumn-web = { version = \"0.3\" } # features = [\"mail\"]\n";
         let out = ensure_autumn_web_mail_feature(toml);
         let code = out.split('#').next().unwrap();
@@ -16901,11 +16526,8 @@ mod tests {
 
     #[test]
     fn ensure_webauthn_rs_features_opener_comment_bracket_does_not_misclassify() {
-        // Codex review on 40a19c56: the single-line-vs-multiline dispatch
-        // itself scanned the raw opener line, so a `]` inside a comment on
-        // that same line (`features = [ # defaults [see docs]`) made a
-        // genuinely multiline array look single-line — merging the missing
-        // feature into dead text past the `#` instead of the real array.
+        // A `]` in a comment on the opener line must not make a multiline array look single-line,
+        // which would merge into the comment instead of the array.
         let toml = "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [ # defaults [see docs]\n    \"conditional-ui\",\n]\n";
         let out = ensure_webauthn_rs_features(toml);
         assert!(
@@ -16931,11 +16553,7 @@ mod tests {
 
     #[test]
     fn ensure_webauthn_rs_features_ignores_bracket_inside_comment_before_real_close() {
-        // Codex review on #2948's second fix: a comment containing a `]`
-        // before the real closing bracket (e.g. `# defaults [see docs]`) is
-        // not TOML syntax, but the raw-text search for the array's close
-        // matched the bracket inside the comment instead of the real one,
-        // truncating the rebuilt array and leaving the true tail behind.
+        // A `]` inside an interior comment is not the array's closing bracket.
         let toml = "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [\n    \"conditional-ui\", # defaults [see docs]\n]\n";
         let out = ensure_webauthn_rs_features(toml);
         assert!(
@@ -16961,9 +16579,8 @@ mod tests {
 
     #[test]
     fn ensure_autumn_web_mail_feature_does_not_duplicate_across_multiline_array() {
-        // Codex review on #2948: the "already present?" check only looked at
-        // the `features = [` opener line, not the rest of a multiline array,
-        // so re-running the generator kept appending another `"mail"`.
+        // The "already present?" check covers every line of a multiline array, so a re-run does not
+        // append another `"mail"`.
         let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n    \"mail\",\n]\n";
         let out = ensure_autumn_web_mail_feature(toml);
         assert_eq!(out.matches("\"mail\"").count(), 1, "mail duplicated: {out}");
@@ -16993,11 +16610,8 @@ mod tests {
 
     #[test]
     fn ensure_webauthn_rs_features_preserves_valid_toml_around_interior_comment() {
-        // Codex review on #2948: collapsing every line of a multiline array
-        // onto one line without stripping trailing `# comment`s let a
-        // comment on an interior entry swallow the rest of the line
-        // (including the real closing `]`), producing an unterminated
-        // array — invalid TOML.
+        // Collapsing the array onto one line must strip `# comment`s first, or a comment swallows
+        // the closing `]`.
         let toml = "[dependencies.webauthn-rs]\nversion = \"0.5\"\nfeatures = [\n    \"conditional-ui\", # keep this one\n]\n";
         let out = ensure_webauthn_rs_features(toml);
         assert!(
@@ -17023,8 +16637,7 @@ mod tests {
 
     #[test]
     fn totp_disable_wraps_cleanup_in_transaction() {
-        // P2 (#1057 round 12): disabling 2FA must be atomic — the flag/secret clear
-        // and recovery-code delete run in one transaction.
+        // #1057: the flag/secret clear and the recovery-code delete run in one transaction.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -17039,7 +16652,6 @@ mod tests {
             body.contains(".transaction::<_, diesel::result::Error, _>"),
             "two_factor_disable must run cleanup in a transaction: {body}"
         );
-        // Both the flag clear and the recovery-code delete must be inside it.
         assert!(
             body.contains("totp_enabled.eq(false)")
                 && body.contains("delete(recovery_codes::table"),
@@ -17049,8 +16661,7 @@ mod tests {
 
     #[test]
     fn totp_login_verify_tears_down_pending_on_stale_reset() {
-        // P2 (#1057 round 7): if the parked reset token is stale, login_verify must
-        // clear totp_pending_id too — otherwise a retry skips the (now-cleared)
+        // #1057: a stale parked reset also clears totp_pending_id, or a retry skips the cleared
         // reset branch and promotes the session to a full login.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
@@ -17059,8 +16670,6 @@ mod tests {
             .find("pub async fn login_verify(")
             .expect("login_verify fn");
         let verify_body = &routes[verify_pos..];
-        // The stale-reset failure path (before the success-promotion block) must
-        // remove totp_pending_id.
         let promote_at = verify_body
             .find("Promote the pending session")
             .expect("promotion comment");
@@ -17074,8 +16683,8 @@ mod tests {
 
     #[test]
     fn totp_oauth_full_login_note_clears_pending_state() {
-        // P2 (#1057 round 7): the OAuth non-2FA full-login guidance must also clear
-        // abandoned totp_pending_* state, mirroring password login/signup.
+        // #1057: the OAuth full-login guidance clears abandoned totp_pending_* state, like password
+        // login and signup.
         let tmp = project_with_main();
         let oauth_opts = AuthOAuthOptions {
             providers: vec!["github".to_owned()],
@@ -17093,8 +16702,7 @@ mod tests {
             after.contains("totp_pending_secret") && after.contains("totp_pending_id"),
             "OAuth full-login guidance must clear pending 2FA/enrollment state: {after}"
         );
-        // P2 (#1057 round 10): the full-login guidance must also set the
-        // model-specific identity keys the generated handlers read, not only the
+        // #1057: it also sets the model identity keys the generated handlers read, not only the
         // configured auth key.
         assert!(
             after.contains("session.insert(\"user_id\", local_user.id.to_string())")
@@ -17105,11 +16713,10 @@ mod tests {
 
     #[test]
     fn totp_reset_password_routes_2fa_users_through_verify() {
-        // P1 (#1057): a reset link must not bypass the second factor.
+        // #1057: a reset link must not bypass the second factor.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
-        // The 2FA interstitial branch must appear inside reset_password too.
         let reset_pos = routes
             .find("pub async fn reset_password(")
             .expect("reset_password fn");
@@ -17124,9 +16731,8 @@ mod tests {
 
     #[test]
     fn totp_reset_password_defers_password_commit_until_verify() {
-        // P2 (#1057): for a 2FA-enabled account the password must NOT be written
-        // until /login/verify passes; the reset handler parks the digest and the
-        // verify handler commits it.
+        // #1057: for a 2FA account the reset handler parks the new digest and login_verify writes
+        // it once the factor passes.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -17135,8 +16741,6 @@ mod tests {
             .expect("reset_password fn");
         let reset_tail = &routes[reset_pos..];
         let reset_body = &reset_tail[..reset_tail.find("\n/// `").unwrap_or(reset_tail.len())];
-        // The deferral branch (which returns to /login/verify) must come BEFORE
-        // the password_digest UPDATE in the handler body.
         let park_at = reset_body
             .find("totp_pending_reset_digest")
             .expect("reset must park the pending digest");
@@ -17147,7 +16751,6 @@ mod tests {
             park_at < write_at,
             "reset must park (and return) before committing the password for 2FA users"
         );
-        // login_verify must commit a parked reset once the factor is proven.
         let verify_pos = routes
             .find("pub async fn login_verify(")
             .expect("login_verify fn");
@@ -17161,9 +16764,8 @@ mod tests {
 
     #[test]
     fn totp_reset_branch_parks_token_digest() {
-        // P2 (#1057 round 5): the reset interstitial must store totp_pending_reset_token
-        // (the authorising SHA-256 digest) in the session alongside the new password
-        // digest so login_verify can revalidate it before committing.
+        // #1057: the reset branch parks the authorising token digest next to the new password
+        // digest, so login_verify can revalidate it before committing.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -17184,9 +16786,8 @@ mod tests {
 
     #[test]
     fn totp_login_verify_revalidates_token_before_commit() {
-        // P2 (#1057 round 5): login_verify must make the deferred password commit
-        // conditional on the authorising token still matching the DB row — a
-        // superseded or expired reset token must cause 0 rows updated and be rejected.
+        // #1057: the deferred commit filters on the authorising token, so a superseded or expired
+        // token updates 0 rows and is rejected.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -17210,10 +16811,8 @@ mod tests {
 
     #[test]
     fn totp_login_verify_stamps_step_up_claim_on_success() {
-        // Issue #833 / Codex P2: TOTP login (password + second factor) proves
-        // identity at least as strongly as password-only login. login_verify must
-        // call set_last_strong_auth_at so that #[step_up]-protected routes are
-        // immediately accessible without forcing a redundant /reauth.
+        // #833: password plus TOTP proves at least as much as password alone, so login_verify
+        // stamps the step-up claim and #[step_up] routes need no extra /reauth.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -17229,9 +16828,8 @@ mod tests {
 
     #[test]
     fn totp_oauth_callback_note_clears_both_pending_markers() {
-        // P2 (#1057 round 5): the OAuth callback guidance comment must instruct
-        // developers to clear both pending-reset markers before parking the 2FA
-        // state — mirroring what the password-login handler does.
+        // #1057: the OAuth guidance clears both pending-reset markers before parking 2FA state,
+        // like password login.
         let tmp = project_with_main();
         let oauth_opts = AuthOAuthOptions {
             providers: vec!["github".to_owned()],
@@ -17251,7 +16849,6 @@ mod tests {
 
     #[test]
     fn totp_enroll_requires_password_reauth() {
-        // P2 (#1057): first enrollment must require step-up password re-auth.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -17270,7 +16867,6 @@ mod tests {
             enable_body.contains("verify_password(&form.password"),
             "two_factor_enable must verify the account password before enrolling: {enable_body}"
         );
-        // The status-page enable form must collect the password.
         assert!(
             routes.contains("Confirm your password to begin enrollment"),
             "enable form must prompt for the password: {routes}"
@@ -17279,8 +16875,8 @@ mod tests {
 
     #[test]
     fn totp_disable_applies_replay_guard_on_code() {
-        // P2 (#1057): a TOTP code used to disable must advance/respect
-        // totp_last_used_step so a code already spent on login can't be replayed.
+        // #1057: a disable code consumes its TOTP step, so a code already spent on login cannot be
+        // replayed.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -17298,8 +16894,8 @@ mod tests {
 
     #[test]
     fn totp_confirm_guards_against_double_submit() {
-        // P2 (#1057): the final enable flip is conditional on totp_enabled=false
-        // with a rollback, so concurrent confirms don't desync recovery codes.
+        // #1057: the enable flip requires totp_enabled=false and rolls back otherwise, so
+        // concurrent confirms cannot desync recovery codes.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -17319,8 +16915,8 @@ mod tests {
 
     #[test]
     fn totp_enable_does_not_disable_live_secret() {
-        // P1 (#1057): starting re-enrollment must not flip totp_enabled=false on
-        // the live account. The pending secret lives in the session instead.
+        // #1057: re-enrollment leaves the live secret active; the pending secret lives in the
+        // session.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -17347,9 +16943,8 @@ mod tests {
 
     #[test]
     fn totp_enable_rejects_reenrollment_while_active() {
-        // P2 (#1057): a hijacked session must not swap the authenticator without
-        // first disabling (which re-authenticates). Both enable and confirm guard
-        // on the live `totp_enabled` flag.
+        // #1057: a hijacked session must not swap the authenticator without disabling first, which
+        // re-authenticates.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -17377,8 +16972,8 @@ mod tests {
 
     #[test]
     fn totp_confirm_persists_codes_before_enabling_in_transaction() {
-        // P2 (#1057): enable + recovery-code replacement must be atomic and the
-        // flag flipped only after codes are persisted.
+        // #1057: enable and recovery-code replacement are atomic, and the flag flips only after the
+        // codes are stored.
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
@@ -17402,7 +16997,6 @@ mod tests {
             body.contains("hash_password"),
             "recovery codes must be bcrypt-hashed: {body}"
         );
-        // totp_enabled flip must come AFTER the recovery-code inserts.
         let enabled_at = body.find("totp_enabled.eq(true)").expect("enable flag set");
         let insert_at = body
             .find("insert_into(recovery_codes::table")
@@ -17411,7 +17005,6 @@ mod tests {
             enabled_at > insert_at,
             "totp_enabled must be set after codes are persisted"
         );
-        // The pending secret must be read from the session, not the live row.
         assert!(
             body.contains("totp_pending_secret"),
             "confirm must consume session pending secret: {body}"
@@ -17423,12 +17016,10 @@ mod tests {
         let tmp = project_with_main();
         totp_plan(tmp.path()).execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
-        // ±1 step skew window helper.
         assert!(
             routes.contains("[-1i64, 0, 1]"),
             "verification must use a ±1 step window: {routes}"
         );
-        // Atomic, conditional consumption: rows-affected guard on the step update.
         assert!(routes.contains("totp_last_used_step"), "{routes}");
         assert!(
             routes.contains("affected == 1"),
@@ -17559,7 +17150,6 @@ mod tests {
 
     #[test]
     fn totp_combines_with_oauth_and_gates_callback() {
-        // P2 (#1057): OAuth callback guidance must be TOTP-aware.
         let tmp = project_with_main();
         let oauth = AuthOAuthOptions {
             providers: vec!["github".to_owned()],
@@ -17602,7 +17192,7 @@ mod tests {
         );
     }
 
-    // ── Passkeys (WebAuthn) generator tests (S-062 / #806) ──────────────────────
+    // ── Passkeys (WebAuthn) generator tests (#806) ──────────────────────────────
 
     fn passkey_plan(tmp: &std::path::Path) -> Plan {
         plan_auth_full_ex(
@@ -17618,8 +17208,7 @@ mod tests {
 
     #[test]
     fn passkeys_flag_defaults_off() {
-        // Without --passkeys, plan_auth_full (the 5-arg form) must not emit any
-        // passkey artefacts — passkeys are opt-in.
+        // plan_auth_full has no passkeys argument, so it emits no passkey files.
         let tmp = project_with_main();
         plan_auth_full(
             tmp.path(),
@@ -17645,7 +17234,7 @@ mod tests {
     fn passkeys_plan_emits_webauthn_credentials_migration() {
         let tmp = project_with_main();
         passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
-        // The migration directory name is timestamp+1 relative to the base ts.
+        // The migration timestamp is the base + 1.
         let up = fs::read_to_string(
             tmp.path()
                 .join("migrations/20260508000001_create_webauthn_credentials/up.sql"),
@@ -17721,7 +17310,7 @@ mod tests {
             routes.contains("state.auth_session_key()"),
             "passkey_login_finish must call session.insert(state.auth_session_key(), ...): {routes}"
         );
-        // After template substitution ("User" → "user"), __SNAKE___id becomes user_id.
+        // `__SNAKE___id` renders as `user_id` for the `User` model.
         assert!(
             routes.contains("\"user_id\""),
             "passkey_login_finish must store user_id in session: {routes}"
@@ -17735,7 +17324,6 @@ mod tests {
     #[test]
     fn passkeys_plan_emits_rp_config_in_autumn_toml() {
         let tmp = project_with_main();
-        // Create an autumn.toml so the generator can update it.
         fs::write(tmp.path().join("autumn.toml"), "[server]\nport = 3000\n").unwrap();
         passkey_plan(tmp.path()).execute(Flags::default()).unwrap();
         let toml = fs::read_to_string(tmp.path().join("autumn.toml")).unwrap();
@@ -18039,7 +17627,6 @@ mod tests {
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
-        // Lockout must return the same auth_err closure as wrong password (non-enumerating).
         let auth_err_count = routes.matches("auth_err()").count();
         assert!(
             auth_err_count >= 2,
@@ -18077,7 +17664,6 @@ mod tests {
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
-        // Must check enabled flag or threshold so operators can disable lockout.
         assert!(
             routes.contains("lockout")
                 && (routes.contains("enabled") || routes.contains("threshold")),
@@ -18107,7 +17693,7 @@ mod tests {
             "login and reauth must both call `stamp_lockout`: {routes}"
         );
         assert!(
-            !routes.contains("locked_at.eq(Some(now))"),
+            !routes.contains("locked_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))"),
             "no handler may stamp `locked_at` with its request-start `now`: {routes}"
         );
         let stamp_at = routes
@@ -18124,7 +17710,7 @@ mod tests {
         );
         let following = routes.get(stamp_at..stamp_at + 120).unwrap_or_default();
         assert!(
-            following.contains("chrono::Utc::now().naive_utc()"),
+            following.contains("autumn_web::time::ambient_civil_utc()"),
             "stamp must read the clock inside the helper, at write time: {routes}"
         );
     }
@@ -18204,17 +17790,14 @@ mod tests {
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let tests = fs::read_to_string(tmp.path().join("tests/auth.rs")).unwrap();
-        // AC8a: N+1 failed attempts reject correct credentials
         assert!(
             tests.contains("auth_lockout_rejects_correct_credentials"),
             "generated tests must cover: N+1 failed attempts with correct creds are rejected: {tests}"
         );
-        // AC8b: successful login resets counter
         assert!(
             tests.contains("auth_successful_login_resets_lockout_counter"),
             "generated tests must cover: successful login resets counter: {tests}"
         );
-        // AC8c: locked-state response byte-identical to wrong-password
         assert!(
             tests.contains("auth_lockout_response_identical_to_wrong_password"),
             "generated tests must verify lockout response is byte-identical to wrong-password: {tests}"
@@ -18257,7 +17840,6 @@ mod tests {
 
     #[test]
     fn plan_auth_creates_data_export_route() {
-        // AC#1: auth starter generates a "Download my data" route
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -18270,18 +17852,15 @@ mod tests {
 
     #[test]
     fn plan_auth_data_export_route_requires_auth() {
-        // AC#1: the export route must be protected by authentication
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
-        // Find the data_export function and verify it extracts Auth
         let export_pos = routes
             .find("data_export")
             .expect("data_export route must be present");
         let export_body = &routes[export_pos..export_pos + 500.min(routes.len() - export_pos)];
-        // Authentication is enforced either via the tracked-session gate
-        // (#819) or a session/Auth extractor check.
+        // Auth comes from the tracked-session gate (#819) or a session/Auth extractor.
         assert!(
             export_body.contains("require_tracked_session")
                 || export_body.contains("Auth")
@@ -18292,7 +17871,6 @@ mod tests {
 
     #[test]
     fn plan_auth_creates_delete_account_route() {
-        // AC#3: auth starter generates a "Delete my account" flow
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -18305,7 +17883,6 @@ mod tests {
 
     #[test]
     fn plan_auth_delete_account_has_confirmation_step() {
-        // AC#3: deletion flow requires a confirmation step
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -18318,7 +17895,6 @@ mod tests {
 
     #[test]
     fn plan_auth_delete_account_writes_audit_log() {
-        // AC#3: account deletion must write an audit log entry
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -18331,7 +17907,6 @@ mod tests {
 
     #[test]
     fn plan_auth_migration_includes_deletion_tracking_columns() {
-        // AC#3: migration must include grace-period deletion tracking columns
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -18354,7 +17929,6 @@ mod tests {
 
     #[test]
     fn plan_auth_migration_includes_export_tracking_columns() {
-        // AC#1/#5: migration must include export-request tracking columns
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -18371,7 +17945,6 @@ mod tests {
 
     #[test]
     fn plan_auth_creates_export_job() {
-        // AC#5: auth starter generates a background export job
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -18386,7 +17959,6 @@ mod tests {
 
     #[test]
     fn plan_auth_gdpr_docs_file_created() {
-        // AC#7: auth starter generates a GDPR compliance documentation file
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -18412,12 +17984,10 @@ mod tests {
 
     #[test]
     fn plan_auth_gdpr_docs_references_article_15_and_17() {
-        // AC#7: GDPR docs must reference Article 15 (right of access) and Article 17 (erasure)
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
 
-        // Find the GDPR compliance docs file
         let docs_path = plan
             .actions
             .iter()
@@ -18441,7 +18011,6 @@ mod tests {
 
     #[test]
     fn plan_auth_model_includes_delete_requested_at_field() {
-        // AC#3: generated User model must include deletion tracking fields
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();

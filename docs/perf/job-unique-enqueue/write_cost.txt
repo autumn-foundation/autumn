@@ -1,0 +1,58 @@
+=== schema_before.sql, hist=1000000
+         op          | calls | wal_records | wal_fpi | wal_bytes | buffers 
+---------------------+-------+-------------+---------+-----------+---------
+ 1 plain insert      |  2000 |       14275 |    1777 |  15423909 |   33981
+ 2 unique-key insert |  2000 |       16262 |    1955 |  17144681 |   38475
+ 3 claim update      |  2000 |       14165 |    2004 |  17312488 |   43054
+ 4 ack update        |  2000 |       10911 |    2003 |  17028411 |   41428
+(4 rows)
+
+ lsn_plain | lsn_unique | lsn_claim_ack 
+-----------+------------+---------------
+  15485024 |   17202984 |      34496296
+(1 row)
+
+=== schema.sql, hist=1000000
+         op          | calls | wal_records | wal_fpi | wal_bytes | buffers 
+---------------------+-------+-------------+---------+-----------+---------
+ 1 plain insert      |  2000 |       14275 |    1777 |  15423909 |   33998
+ 2 unique-key insert |  2000 |       18283 |    1958 |  17419988 |   44518
+ 3 claim update      |  2000 |       16182 |    2004 |  17494776 |   49072
+ 4 ack update        |  2000 |       13034 |    2003 |  17227377 |   47706
+(4 rows)
+
+ lsn_plain | lsn_unique | lsn_claim_ack 
+-----------+------------+---------------
+  15485000 |   17479128 |      34879080
+(1 row)
+
+=== build on the baseline fixture (hist=1000000, plus the writes above)
+Timing is on.
+BEGIN
+Time: 0.178 ms
+CREATE INDEX
+Time: 517.204 ms
+   mode    | granted 
+-----------+---------
+ ShareLock | t
+(1 row)
+
+Time: 1.209 ms
+COMMIT
+Time: 8.336 ms
+Timing is off.
+ index_size | index_blocks | indexed_rows | table_rows | heap_size 
+------------+--------------+--------------+------------+-----------
+ 17 MB      |         2162 |       355574 |    1027840 | 288 MB
+(1 row)
+
+=== rollback (down.sql)
+Timing is on.
+DROP INDEX
+Time: 22.000 ms
+Timing is off.
+ left_behind 
+-------------
+           0
+(1 row)
+

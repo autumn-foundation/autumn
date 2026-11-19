@@ -336,11 +336,9 @@ pub fn check_contract(
         return report;
     }
 
-    // A committed envelope of zero (a degenerate calibration, or a hand-edit)
-    // would make `candidate < 0.0 * 0.85` unsatisfiable and silently neuter
-    // exactly the check this gate exists for. Refuse to compare rather than
-    // report a green pass nobody earned. `is_finite` also rejects NaN and
-    // infinities, which every ordinary comparison would wave through.
+    // A zero committed envelope (a degenerate calibration or a hand-edit) makes
+    // `candidate < 0.0 * 0.85` unsatisfiable, so every build would pass. `is_finite` also rejects
+    // NaN and infinities, which ordinary comparisons let through.
     let unusable = |value: f64| !value.is_finite() || value <= 0.0;
     if unusable(committed.envelope.sustained_rps) || unusable(committed.envelope.p99_latency_ms) {
         report.outcome = CheckOutcome::Unusable;
@@ -888,8 +886,7 @@ mod tests {
 
     #[test]
     fn a_thirty_percent_throughput_regression_fails() {
-        // The issue's Success Metric: a seeded 30% throughput regression is
-        // caught.
+        // A seeded 30% throughput regression must be caught.
         let committed = contract(1000.0, 20.0, one_route());
         let candidate = contract(700.0, 20.0, one_route());
         let report = check_contract(&committed, &candidate, &Tolerances::default());
@@ -919,9 +916,7 @@ mod tests {
 
     #[test]
     fn a_committed_envelope_of_zero_is_refused_rather_than_passed() {
-        // `candidate < 0.0 * 0.85` is unsatisfiable, so comparing against a
-        // zero envelope would report a green pass for any build at all —
-        // silently neutering the one check this gate exists for.
+        // `candidate < 0.0 * 0.85` is unsatisfiable, so a zero envelope would pass any build.
         let committed = contract(0.0, 0.0, one_route());
         let candidate = contract(3912.4, 0.8, one_route());
         let report = check_contract(&committed, &candidate, &Tolerances::default());

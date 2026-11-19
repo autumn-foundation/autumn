@@ -152,7 +152,6 @@ async fn background_open_finds_no_room_over_the_budget() {
     let tmp = tempfile::tempdir().unwrap();
     let fleet = fleet(tmp.path(), 64, 100);
     let (a, b) = (key(&fleet, "a"), key(&fleet, "b"));
-    // Make `b` on disk, then close it.
     drop(fleet.open(&b).await.unwrap());
     fleet.close(&b).await;
     let held = fleet.open(&a).await.unwrap();
@@ -426,7 +425,7 @@ async fn a_fence_retires_a_database_that_is_still_draining() {
     let tmp = tempfile::tempdir().unwrap();
     let fleet = fleet(tmp.path(), 8, 0);
     let clock = crate::time::TickingClock::starting_at(
-        chrono::DateTime::from_timestamp_millis(1_000_000).unwrap(),
+        crate::time::Timestamp::from_millisecond(1_000_000).unwrap(),
     );
     let store = Arc::new(MemoryOwnership::new(Arc::new(clock.clone())));
     let host = |owner: &str| {

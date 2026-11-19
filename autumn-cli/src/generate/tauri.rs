@@ -59,7 +59,6 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
 
-    // Core Tauri project files
     plan.create(
         tauri.join("tauri.conf.json"),
         render_tauri_conf(&package_name, &package_version, &bin_name),
@@ -78,12 +77,11 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
         render_shell_lib_rs(&package_name, &bin_name),
     );
 
-    // Icons — shared with the thin-client plan.
     plan_icons(&mut plan, project_root, &tauri)?;
 
-    // Platform-specific Tauri config overlays — Tauri CLI merges them at build/dev time.
-    // beforeBuildCommand and beforeDevCommand live here so tauri.conf.json is
-    // host-OS-agnostic and cargo tauri dev also stages the sidecar.
+    // Tauri CLI merges these per-OS overlays at build/dev time. They hold beforeBuildCommand and
+    // beforeDevCommand, so tauri.conf.json stays host-OS-agnostic and `cargo tauri dev` also
+    // stages the sidecar.
     plan.create(
         tauri.join("tauri.linux.conf.json"),
         render_tauri_linux_conf(),
@@ -97,7 +95,6 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
         render_tauri_windows_conf(),
     );
 
-    // Staging scripts
     plan.create(
         tauri.join("stage-sidecar.sh"),
         render_stage_sidecar_sh(&package_name, &bin_name, has_embed_assets, &dep_key),
@@ -284,18 +281,16 @@ pub fn resolve_dep_key(project_root: &Path, doc: &toml::Value, package_name: &st
         return package_name.to_owned();
     };
     for (key, val) in deps {
-        // Direct dependency: key matches package name.
         if key == package_name {
             return key.clone();
         }
-        // Determine the effective package name for this entry.
         let effective_pkg = if val
             .as_table()
             .and_then(|t| t.get("workspace"))
             .and_then(toml::Value::as_bool)
             == Some(true)
         {
-            // Workspace-inherited: package alias lives in [workspace.dependencies].
+            // The `package` alias lives in `[workspace.dependencies]`.
             resolve_workspace_dep_package(project_root, key)
         } else {
             val.as_table()
@@ -325,10 +320,8 @@ fn normalize_manifest_path(p: &str) -> Vec<&str> {
         match seg {
             "" | "." => {}
             ".." => {
-                // Only pop when there is a real segment to cancel.  When the stack is
-                // empty (or the top is already ".."), the path escapes the package root;
-                // preserve the ".." so that "../src/main.rs" stays distinct from
-                // "src/main.rs" and is never mistaken for the package main binary.
+                // A `..` that escapes the package root is kept, so "../src/main.rs" never
+                // matches "src/main.rs".
                 if segs.last().is_some_and(|&s| s != "..") {
                     segs.pop();
                 } else {
@@ -364,14 +357,7 @@ fn resolve_bin_name(
         }
         let main_bin = bins.iter().find(|b| {
             b.get("path").and_then(|p| p.as_str()).is_some_and(|p| {
-                // Fully normalize the path so that variants like `src/../src/main.rs`
-                // or `./src/main.rs` all compare equal to `src/main.rs`.  We process
-                // components into a stack so that `..` properly pops its parent, just
-                // as Cargo does when resolving [[bin]] paths in the manifest.
-                //
-                // For absolute paths (Cargo permits them) strip the project root
-                // first so that `/abs/path/to/project/src/main.rs` is treated
-                // the same as the relative `src/main.rs`.
+                // Cargo permits absolute paths; compare those relative to the project root.
                 let path = Path::new(p);
                 if path.is_absolute() {
                     path.strip_prefix(project_root).is_ok_and(|rel| {
@@ -392,10 +378,8 @@ fn resolve_bin_name(
         if autobins && project_root.join("src/main.rs").is_file() {
             return Ok(name.to_owned());
         }
-        // Count auto-discovered src/bin/ entries alongside the explicit ones so
-        // that a layout like `[[bin]] path="src/server.rs"` + `src/bin/helper.rs`
-        // is correctly flagged as ambiguous rather than silently picking the
-        // explicit entry.
+        // Count auto-discovered src/bin/ entries too: `[[bin]] path="src/server.rs"` plus
+        // `src/bin/helper.rs` is ambiguous, not a silent pick of the explicit entry.
         let auto_bin_count = if autobins {
             std::fs::read_dir(project_root.join("src/bin")).map_or(0, |entries| {
                 entries
@@ -435,10 +419,8 @@ fn resolve_bin_name(
     if autobins && project_root.join("src/main.rs").is_file() {
         return Ok(name.to_owned());
     }
-    // Only scan src/bin/ when autobins is enabled (the default).  When
-    // `autobins = false` is set in [package], Cargo does not auto-discover
-    // src/bin/ entries, so scanning it here would return names that Cargo
-    // itself would reject in `cargo build --bin <name>`.
+    // With `autobins = false` Cargo does not discover src/bin/, so it would reject those names
+    // in `cargo build --bin <name>`.
     if autobins && let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
         let stems: Vec<String> = entries
             .filter_map(std::result::Result::ok)
@@ -500,7 +482,6 @@ fn read_package_name_version(
         .map(str::to_owned)
         .ok_or_else(|| GenerateError::Config("Cargo.toml missing [package].name".to_owned()))?;
 
-    // Resolve version, handling workspace inheritance (`version.workspace = true`).
     let version = match pkg.get("version") {
         Some(toml::Value::String(s)) => s.clone(),
         Some(toml::Value::Table(t))
@@ -532,20 +513,13 @@ fn read_package_meta(
         .unwrap_or(true);
     let bin_name = resolve_bin_name(project_root, &name, default_run.as_deref(), autobins, &doc)?;
 
-    // Check whether the app defines an `embed-assets` Cargo feature.
-    // `autumn new` generates this; it typically expands to
-    // `["autumn-web/embed-assets"]`.  App code gates `.embedded_static()` on
-    // `#[cfg(feature = "embed-assets")]`, so the staging script must enable the
-    // *app-crate* feature — not just the dep path — to satisfy that guard.
+    // App code gates `.embedded_static()` on `#[cfg(feature = "embed-assets")]`, so the staging
+    // script must enable the app crate's feature, not just `autumn-web/embed-assets`.
     let has_embed_assets_feature = doc
         .get("features")
         .and_then(toml::Value::as_table)
         .is_some_and(|features| features.contains_key("embed-assets"));
 
-    // Resolve the dependency key for autumn-web.  Apps may alias it (e.g.
-    // `autumn_web = { package = "autumn-web" }` or via workspace inheritance);
-    // Cargo feature selectors must use the key (`autumn_web/feature`), not the
-    // package name.
     let dep_key = resolve_dep_key(project_root, &doc, "autumn-web");
 
     Ok((name, version, bin_name, has_embed_assets_feature, dep_key))
@@ -599,19 +573,12 @@ fn derive_title(package_name: &str) -> String {
 fn render_tauri_conf(package_name: &str, version: &str, bin_name: &str) -> String {
     let identifier = derive_identifier(package_name);
     let title = derive_title(package_name);
-    // beforeBuildCommand and beforeDevCommand are declared in the platform-specific
-    // overlay files (tauri.linux.conf.json, tauri.macos.conf.json,
-    // tauri.windows.conf.json) that Tauri CLI merges at build/dev time.
-    // Keeping them out of tauri.conf.json makes the generated scaffold
-    // host-OS-agnostic: it stays correct regardless of which OS generated it.
+    // beforeBuildCommand and beforeDevCommand live in the per-OS overlay files, so this file
+    // stays host-OS-agnostic.
     //
-    // Profile config entries always point to src-tauri/configs/, which the staging
-    // script (beforeBuildCommand) populates at build time — copying real files or
-    // creating empty stubs for profiles that don't yet exist.  An empty TOML file
-    // is valid and results in no overrides (AutumnConfig treats it as a no-op).
-    // This keeps the resource list in sync regardless of when profile files are created,
-    // avoiding the silent loss of production settings when autumn-prod.toml is added
-    // after `autumn generate tauri` was run.
+    // Profile resources always point at src-tauri/configs/, which the staging script fills at
+    // build time with the real files or empty stubs (an empty TOML overrides nothing). A profile
+    // file added after `autumn generate tauri` ran is still bundled.
     format!(
         r#"{{
   "$schema": "https://schema.tauri.app/config/2",
@@ -1256,17 +1223,16 @@ fn render_stage_sidecar_sh(
     has_embed_assets: bool,
     dep_key: &str,
 ) -> String {
-    // dep_key is the [dependencies] key for autumn-web; may differ from the
-    // package name when the app aliases it (e.g. `autumn_web = { package = ... }`).
+    // `dep_key` is autumn-web's `[dependencies]` key, which differs from the package name when
+    // the app aliases it.
     let embed_feature = if has_embed_assets {
         format!("embed-assets,{dep_key}/managed-pg-bundled")
     } else {
         format!("{dep_key}/embed-assets,{dep_key}/managed-pg-bundled")
     };
-    // Only fingerprint when the app-level alias exists; `autumn build --embed` passes
-    // --features embed-assets (app-level), which fails for apps without that alias.
-    // We also pass managed-pg-bundled so apps wiring ManagedPostgresPoolProvider
-    // (without a cfg gate) can compile during the fingerprint phase 1.
+    // Fingerprint only when the app defines `embed-assets`: `autumn build --embed` passes
+    // `--features embed-assets`, which fails without it. managed-pg-bundled lets apps that wire
+    // ManagedPostgresPoolProvider without a cfg gate compile during fingerprinting.
     let fingerprint = if has_embed_assets {
         format!(
             "autumn build --embed -p {package_name} --bin {bin_name} \
@@ -1503,26 +1469,22 @@ pub fn plan_tauri_thin_client(
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     let validated = validate_remote_url(remote_url)?;
-    // The capability grant is scoped to the URL's *origin* (scheme://host[:port],
-    // no path, no trailing slash) — the exact form Tauri matches remote pages
-    // against. The webview itself loads the full URL, so a path component
-    // (e.g. https://example.com/app) still lands on the right page.
+    // Tauri matches remote pages by origin (scheme://host[:port], no path or trailing slash), so
+    // the capability grant uses the origin. The webview still loads the full URL, path included.
     let remote_origin = validated.origin().ascii_serialization();
-    // Everywhere the URL lands in generated source, embed the parser's
-    // normalized serialization — it percent-encodes quotes/braces/spaces and
-    // strips newlines, so it is always safe inside a Rust string literal or
-    // doc comment. The raw flag value is not.
+    // Generated source embeds the parser's normalized serialization: it percent-encodes quotes,
+    // braces and spaces and strips newlines, so it is safe in a Rust string literal or doc
+    // comment. The raw flag value is not.
     let normalized_url = validated.as_str();
 
-    // Deliberately not read_package_meta: that helper also resolves the
-    // sidecar binary target, which a thin client neither builds nor spawns —
-    // requiring one would wrongly reject lib-only and multi-bin packages.
+    // Not `read_package_meta`: a thin client spawns no sidecar, and requiring a binary target
+    // would wrongly reject lib-only and multi-bin packages.
     let (package_name, package_version, _doc) = read_package_name_version(project_root)?;
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
 
-    // Core Tauri project files — no sidecar config, no staging scripts,
-    // no per-OS overlay confs: a thin client has nothing to build or stage.
+    // No sidecar config, staging scripts or per-OS overlays: a thin client has nothing to build
+    // or stage.
     plan.create(
         tauri.join("tauri.conf.json"),
         render_thin_client_tauri_conf(&package_name, &package_version),
@@ -1541,14 +1503,10 @@ pub fn plan_tauri_thin_client(
         render_thin_client_lib_rs(&package_name, normalized_url),
     );
 
-    // Capability grants: pages served from the remote origin may invoke the
-    // permitted plugin commands. Auto-discovered by tauri-build from
-    // src-tauri/capabilities/. The biometric grant lives in a separate,
-    // platform-restricted capability because tauri-build validates every
-    // applicable capability's permissions against the plugins compiled for
-    // the current target — and tauri-plugin-biometric is target-gated to
-    // Android/iOS in the generated Cargo.toml, so an unrestricted
-    // `biometric:default` would break desktop smoke-test builds.
+    // tauri-build auto-discovers src-tauri/capabilities/. The biometric grant is a separate,
+    // mobile-only capability: tauri-build checks each capability against the plugins compiled
+    // for the target, and tauri-plugin-biometric is Android/iOS only, so an unrestricted
+    // `biometric:default` would break desktop builds.
     plan.create(
         tauri.join("capabilities").join("remote-app.json"),
         render_thin_client_capability(&remote_origin),
@@ -1558,16 +1516,13 @@ pub fn plan_tauri_thin_client(
         render_thin_client_capability_mobile(&remote_origin),
     );
 
-    // iOS usage-description plist — the biometric plugin hard-requires
-    // NSFaceIDUsageDescription; without it the app crashes on first Face ID use.
+    // The biometric plugin requires NSFaceIDUsageDescription; without it the app crashes on
+    // first Face ID use.
     plan.create(
         tauri.join("Info.ios.plist"),
         render_thin_client_ios_plist(&package_name),
     );
 
-    // Icons — identical to the desktop path (shared helper): reuse the PWA
-    // icon when the user already ran `autumn generate pwa`, placeholder
-    // bytes otherwise.
     plan_icons(&mut plan, project_root, &tauri)?;
 
     // /gen covers the `cargo tauri android init` / `ios init` output.
@@ -1586,11 +1541,9 @@ fn validate_remote_url(raw: &str) -> Result<url::Url, GenerateError> {
             "--remote-url must be an https:// URL (got '{raw}'): {e}"
         ))
     })?;
-    // Belt and braces: the serialization is interpolated into generated Rust
-    // source, so refuse anything the parser somehow leaves unsafe there. The
-    // WHATWG serialization percent-encodes quotes and strips control
-    // characters, so this should be unreachable — but a parser upgrade must
-    // never silently turn into generated-code injection.
+    // The serialization is interpolated into generated Rust source. WHATWG serialization
+    // already percent-encodes quotes and strips control characters; this check keeps a parser
+    // change from turning into code injection.
     if parsed
         .as_str()
         .chars()
@@ -1612,11 +1565,9 @@ fn validate_remote_url(raw: &str) -> Result<url::Url, GenerateError> {
     match parsed.scheme() {
         "https" => Ok(parsed),
         "http" => {
-            // Plain http is only acceptable against a local dev server —
-            // a shipped mobile app must talk TLS to its remote origin.
-            // `Url::host_str` always returns IPv6 hosts bracketed, so only
-            // the `[::1]` form can occur. `10.0.2.2` is how an Android
-            // emulator reaches the host machine's loopback.
+            // A shipped app must use TLS; plain http is for local dev servers only.
+            // `Url::host_str` brackets IPv6 hosts, so only `[::1]` can occur. `10.0.2.2` is the
+            // Android emulator's alias for the host loopback.
             let host = parsed.host_str().unwrap_or("");
             if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "10.0.2.2") {
                 Ok(parsed)
@@ -1884,9 +1835,8 @@ fn render_thin_client_ios_plist(package_name: &str) -> String {
 /// Human-readable prerequisites message printed after a successful
 /// thin-client scaffold (`autumn generate tauri --remote-url <URL>`).
 pub fn render_thin_client_prerequisites(remote_url: &str) -> String {
-    // Echo the normalized serialization — the form actually embedded in the
-    // scaffold — rather than the raw flag value (which may differ in case or
-    // percent-encoding). The URL was already validated at plan time.
+    // Echo the normalized URL the scaffold embeds, not the raw flag value, which may differ in
+    // case or percent-encoding. The URL was already validated at plan time.
     let remote_url =
         url::Url::parse(remote_url).map_or_else(|_| remote_url.to_owned(), |u| u.to_string());
     format!(
@@ -1929,13 +1879,9 @@ Next steps for the mobile thin client (webview → {remote_url}):\n\
 }
 
 // ── Placeholder icon bytes ────────────────────────────────────────────────────
-// Duplicated byte-for-byte in `generate::tauri_mobile` — the mobile generator's
-// PLACEHOLDER_PNG/_ICO/_ICNS are the same bytes, hand-copied when
-// `tauri_mobile.rs` was built. Two instances is below Echo's rule of three
-// (see issue #2509), so these stay linked rather than merged into a shared
-// `generate::icons` module. Change one, change the other: `tests::
-// placeholder_icon_assets_match_between_desktop_and_mobile_tauri_generators`
-// in `generate::mod` fails if they drift.
+// `generate::tauri_mobile` holds a byte-for-byte copy of these (#2509). Change both:
+// `placeholder_icon_assets_match_between_desktop_and_mobile_tauri_generators` in
+// `generate::mod` fails if they drift.
 // Minimal valid 1×1 RGBA PNG (autumn green #4F7942, opaque).
 // Replace with proper icons using: cargo tauri icon static/icons/icon.svg
 pub const PLACEHOLDER_PNG: &[u8] = &[
@@ -2106,9 +2052,8 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
-        // Auto-discovered primary binary (NOT listed in [[bin]]).
+        // Auto-discovered primary binary, not listed in [[bin]].
         fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
-        // The explicit auxiliary bin.
         fs::write(tmp.path().join("src/worker.rs"), "fn main() {}\n").unwrap();
         tmp
     }
@@ -2137,8 +2082,7 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
-        // src/main.rs is present — without the default-run check it would be
-        // auto-discovered and the package name would be used instead.
+        // Without the default-run check, src/main.rs would select the package name.
         fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
         for b in extra_bins {
             fs::write(tmp.path().join(format!("src/{b}.rs")), "fn main() {}\n").unwrap();
@@ -2393,8 +2337,7 @@ mod tests {
         assert!(ensure_no_opposite_mode_scaffold(clean.path(), false).is_ok());
         assert!(ensure_no_opposite_mode_scaffold(clean.path(), true).is_ok());
 
-        // A mode's own files are never a conflict — `--force` re-generation
-        // within the same mode must stay possible.
+        // A mode's own files never conflict: `--force` regeneration within one mode must work.
         let desktop = TempDir::new().unwrap();
         for marker in DESKTOP_MARKERS {
             touch_tauri_file(desktop.path(), marker);
@@ -2481,8 +2424,7 @@ mod tests {
             sh.contains("TARGET_DIR"),
             "stage-sidecar.sh must use a TARGET_DIR variable derived from cargo metadata"
         );
-        // The hardcoded relative path is no longer used — workspace builds would
-        // look in the wrong place if we still had `target/$TARGET_TRIPLE/...`.
+        // A hardcoded `target/$TARGET_TRIPLE/...` path is wrong for workspace builds.
         assert!(
             !sh.contains(r#""target/$"#) && !sh.contains("\"target/${"),
             "stage-sidecar.sh must not use a hardcoded `target/` prefix for the copy"
@@ -2528,9 +2470,8 @@ mod tests {
     #[test]
     fn stage_sidecar_sh_stages_profile_configs() {
         let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
-        // Profile configs are staged at build time (beforeBuildCommand) so that the
-        // static resource entries in tauri.conf.json are always satisfiable — even when
-        // autumn-prod.toml is created after `autumn generate tauri` was run.
+        // Staging at build time keeps tauri.conf.json's resource entries satisfiable, even for a
+        // profile file added after `autumn generate tauri` ran.
         assert!(
             sh.contains("src-tauri/configs"),
             "stage-sidecar.sh must create src-tauri/configs/ and populate it with \
@@ -2556,21 +2497,17 @@ mod tests {
         );
     }
 
-    // When only one of a prod/production (or dev/development) alias pair exists, the
-    // staging script must copy it to BOTH names so an empty stub can never shadow
-    // real config because AutumnConfig stops at the first existing file in the lookup list.
+    // With only one name of an alias pair present (prod/production, dev/development), the script
+    // copies it to both: AutumnConfig stops at the first existing file, so an empty stub must
+    // never shadow real config.
     #[test]
     fn stage_sidecar_sh_copies_alias_to_both_names() {
         let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
-        // Must handle the case where only autumn-production.toml exists by copying it
-        // to autumn-prod.toml as well — look for the elif + both cp lines.
         assert!(
             sh.contains("autumn-production.toml") && sh.contains("autumn-prod.toml"),
             "stage-sidecar.sh must handle prod/production alias pair explicitly"
         );
-        // The alias-pair logic copies to BOTH names from a single source, so each
-        // destination path must appear at least twice (once in the both-exist branch
-        // and once in the single-file branch).
+        // Each destination appears in both the both-exist branch and the single-file branch.
         assert!(
             sh.matches("autumn-prod.toml").count() >= 2,
             "stage-sidecar.sh must copy to autumn-prod.toml in multiple alias branches"
@@ -2695,7 +2632,6 @@ mod tests {
     fn plan_reads_custom_bin_name_from_cargo_toml() {
         let tmp = project_with_custom_bin("my-app", "my-server");
         let plan = plan_tauri(tmp.path()).unwrap();
-        // The staging script must use the [[bin]] name, not the package name.
         let sh: &str = plan
             .actions
             .iter()
@@ -2720,9 +2656,7 @@ mod tests {
 
     #[test]
     fn plan_normalizes_dotslash_bin_path() {
-        // [[bin]] path = "./src/main.rs" (with ./ prefix) must be treated the same
-        // as "src/main.rs" — both point to the same file, and the [[bin]] name must
-        // override the package name just like the non-prefixed form.
+        // `./src/main.rs` names the same file as `src/main.rs`.
         let tmp = project_with_dotslash_bin("my-app", "my-server");
         let plan = plan_tauri(tmp.path()).unwrap();
         let sh: &str = plan
@@ -2749,8 +2683,6 @@ mod tests {
 
     #[test]
     fn plan_normalizes_middle_dot_bin_path() {
-        // [[bin]] path = "src/./main.rs" (CurDir component in the middle) must
-        // canonicalize to src/main.rs, identifying it as the main binary entry point.
         let tmp = project_with_middle_dot_bin("my-app", "my-server");
         let plan = plan_tauri(tmp.path()).unwrap();
         let sh: &str = plan
@@ -2777,9 +2709,8 @@ mod tests {
 
     #[test]
     fn plan_errors_on_ambiguous_multi_src_bin() {
-        // A package with multiple src/bin/ files and no default-run has no single
-        // sidecar target; the generator must return an error rather than silently
-        // using the package name (which cargo build --bin <package> would reject).
+        // There is no single sidecar target, and `cargo build --bin <package>` would reject a
+        // package-name fallback.
         let tmp = project_with_multi_src_bin("my-app", &["web", "worker"]);
         let err = plan_tauri(tmp.path()).unwrap_err();
         assert!(
@@ -2820,9 +2751,8 @@ mod tests {
 
     #[test]
     fn plan_aux_bin_does_not_override_main_binary() {
-        // A project with src/main.rs (auto-discovered as the primary binary, package
-        // name) plus an auxiliary [[bin]] for a worker should stage the package-named
-        // binary, NOT the worker.
+        // src/main.rs is the auto-discovered, package-named primary binary; the [[bin]] worker is
+        // auxiliary.
         let tmp = project_with_aux_bin("my-app", "worker");
         let plan = plan_tauri(tmp.path()).unwrap();
         let sh: &str = plan
@@ -2849,8 +2779,6 @@ mod tests {
 
     #[test]
     fn plan_honours_default_run_over_first_bin() {
-        // A package with multiple explicit [[bin]] entries and `default-run = "web"`
-        // must stage the "web" binary, not the first-listed one (e.g. "seed").
         let tmp = project_with_default_run("my-app", "web", &["seed", "web", "worker"]);
         let plan = plan_tauri(tmp.path()).unwrap();
         let sh: &str = plan
@@ -2877,10 +2805,7 @@ mod tests {
 
     #[test]
     fn plan_honours_default_run_over_main_rs_when_explicit_bins_exist() {
-        // When src/main.rs is present alongside explicit [[bin]] entries and
-        // [package] default-run = "web", the generator must use "web" (not the
-        // package-named auto-discovered binary from src/main.rs).
-        // Matches `autumn dev`/`autumn build` behaviour which prefers default_run.
+        // `autumn dev` and `autumn build` also prefer default-run over src/main.rs.
         let tmp = project_with_default_run_and_main_rs("my-app", "web", &["web", "seed"]);
         let plan = plan_tauri(tmp.path()).unwrap();
         let sh: &str = plan
@@ -2909,9 +2834,8 @@ mod tests {
 
     #[test]
     fn plan_prefers_main_rs_over_src_bin_when_both_exist() {
-        // A package with BOTH src/main.rs AND src/bin/worker.rs and NO [[bin]] table —
-        // Cargo treats src/main.rs as the primary binary (package-named), and src/bin/
-        // as an additional binary.  The generator must pick the package name, not "worker".
+        // With no [[bin]] table, Cargo treats src/main.rs as the package-named primary binary and
+        // src/bin/worker.rs as an extra one.
         let tmp = project_with_main_and_src_bin("my-app", "worker");
         let plan = plan_tauri(tmp.path()).unwrap();
         let sh: &str = plan
@@ -2939,9 +2863,6 @@ mod tests {
 
     #[test]
     fn normalize_manifest_path_resolves_dotdot_and_dot() {
-        // Cargo normalizes manifest paths before matching, so `src/../src/main.rs`
-        // is equivalent to `src/main.rs`.  Our helper must do the same so we
-        // don't miss the main_bin match and fall through to the wrong fallback.
         assert_eq!(
             normalize_manifest_path("src/../src/main.rs"),
             vec!["src", "main.rs"],
@@ -2957,21 +2878,16 @@ mod tests {
             vec!["src", "main.rs"],
             "plain src/main.rs must pass through unchanged"
         );
-        // Windows-style separator.
         assert_eq!(
             normalize_manifest_path(r"src\main.rs"),
             vec!["src", "main.rs"],
             r"src\main.rs must normalize to [src, main.rs]"
         );
-        // Multiple consecutive .. resolve correctly.
         assert_eq!(
             normalize_manifest_path("a/b/../../src/main.rs"),
             vec!["src", "main.rs"],
             "a/b/../../src/main.rs must normalize to [src, main.rs]"
         );
-        // A leading ".." escapes the package root.  The result must NOT equal
-        // ["src", "main.rs"] so that an external helper bin is never mistaken
-        // for the package's own main binary.
         assert_ne!(
             normalize_manifest_path("../src/main.rs"),
             vec!["src", "main.rs"],
@@ -2984,7 +2900,6 @@ mod tests {
             vec!["..", "src", "main.rs"],
             "../src/main.rs must normalize to ['..', 'src', 'main.rs']"
         );
-        // Multiple leading ".." are all preserved.
         assert_eq!(
             normalize_manifest_path("../../lib/main.rs"),
             vec!["..", "..", "lib", "main.rs"],
@@ -2994,8 +2909,6 @@ mod tests {
 
     #[test]
     fn plan_respects_autobins_false_ignores_main_rs() {
-        // autobins=false disables src/main.rs auto-discovery.  The explicit [[bin]]
-        // target must be used even though src/main.rs exists.
         let tmp = project_with_autobins_false("my-app", "web");
         let plan = plan_tauri(tmp.path()).unwrap();
         let sh: &str = plan
@@ -3024,10 +2937,6 @@ mod tests {
 
     #[test]
     fn plan_respects_autobins_false_ignores_src_bin_dir() {
-        // autobins=false means Cargo does NOT auto-discover src/bin/ entries.
-        // With no explicit [[bin]] the package has no bin target at all, so
-        // plan_tauri must error rather than silently use a package-name binary
-        // that `cargo build --bin` would reject.
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -3051,10 +2960,6 @@ mod tests {
 
     #[test]
     fn plan_errors_when_package_has_no_bin_target() {
-        // A lib-only package (autobins=false, no [[bin]], no src/main.rs) has no
-        // binary target to use as a sidecar.  plan_tauri must return a clear error
-        // instead of fabricating a package-named binary that `cargo build --bin`
-        // would reject.
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -3073,8 +2978,6 @@ mod tests {
 
     #[test]
     fn plan_errors_on_multiple_explicit_bins_without_default_run() {
-        // Multiple [[bin]] entries with no default-run and no src/main.rs must error
-        // rather than silently pick the first entry (which may be an auxiliary binary).
         let tmp = project_with_multiple_bins_no_default("my-app", &["worker", "web"]);
         let err = plan_tauri(tmp.path()).unwrap_err();
         let msg = err.to_string();
@@ -3091,8 +2994,7 @@ mod tests {
 
     #[test]
     fn plan_detects_src_bin_auto_discovered_binary() {
-        // A package with src/bin/web.rs and no src/main.rs or [[bin]] table —
-        // Cargo auto-discovers it as binary "web" (file stem, not package name).
+        // Cargo names an auto-discovered src/bin/ file after its stem.
         let tmp = project_with_src_bin("my-app", "web");
         let plan = plan_tauri(tmp.path()).unwrap();
         let sh: &str = plan
@@ -3119,8 +3021,7 @@ mod tests {
 
     #[test]
     fn plan_detects_src_bin_dir_style_binary() {
-        // A package with src/bin/web/main.rs and no src/main.rs or [[bin]] table —
-        // Cargo auto-discovers it as binary "web" (directory name, not package name).
+        // Cargo names an auto-discovered src/bin/<dir>/main.rs after its directory.
         let tmp = project_with_src_bin_dir("my-app", "web");
         let plan = plan_tauri(tmp.path()).unwrap();
         let sh: &str = plan
@@ -3147,9 +3048,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_uses_app_embed_feature_when_defined() {
-        // When the app defines an `embed-assets` Cargo feature, the staging
-        // script must pass it (not just the dep path) so that
-        // `#[cfg(feature = "embed-assets")]` guards in app code are active.
+        // Only the app's own feature turns on its `#[cfg(feature = "embed-assets")]` guards.
         let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
         assert!(
             sh.contains("--features embed-assets,autumn-web/managed-pg-bundled"),
@@ -3168,8 +3067,7 @@ mod tests {
 
     #[test]
     fn plan_uses_app_embed_feature_for_generated_scaffold() {
-        // The `project()` fixture matches a scaffold generated by `autumn new`,
-        // which always defines an `embed-assets` feature.
+        // Matches an `autumn new` scaffold, which always defines an `embed-assets` feature.
         let tmp = project_with_embed_assets("my-app");
         let plan = plan_tauri(tmp.path()).unwrap();
         let sh: &str = plan
@@ -3192,12 +3090,6 @@ mod tests {
 
     #[test]
     fn new_project_template_defines_embed_assets_feature() {
-        // `autumn new` must scaffold the `embed-assets` Cargo feature so that:
-        //   1. `autumn generate tauri` detects it (has_embed_assets=true) and uses
-        //      the app-crate feature path instead of the dep-only path.
-        //   2. The `#[cfg(feature = "embed-assets")]` guards in main.rs.tmpl are
-        //      activated by `--features embed-assets`, so `.embedded_static()` is
-        //      wired and desktop apps ship their CSS/JS in the sidecar binary.
         let tmpl = include_str!("../templates/Cargo.toml.tmpl");
         assert!(
             tmpl.contains("embed-assets"),
@@ -3287,8 +3179,6 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_no_before_build_command() {
-        // beforeBuildCommand lives in the platform-specific overlay files, not the
-        // main tauri.conf.json, so the generated scaffold is host-OS-agnostic.
         let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
@@ -3495,9 +3385,6 @@ mod tests {
     #[test]
     fn lib_rs_polls_for_http_response() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // Probe /health — autumn always registers this endpoint and it responds cheaply.
-        // Any valid HTTP response (200, 404, …) starts with "HTTP/" and signals the
-        // server is up, avoiding a timeout against a slow app root handler.
         assert!(
             lib.contains("HTTP/"),
             "lib.rs readiness probe must accept any HTTP response prefix"
@@ -3539,10 +3426,6 @@ mod tests {
     #[test]
     fn lib_rs_does_not_override_health_path() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // The sidecar env must NOT set AUTUMN_HEALTH__PATH.  The probe already targets
-        // GET /health directly; overriding the path via env would only move where autumn
-        // registers the endpoint, not change what the probe hits.  Leave the app's
-        // [health].path config untouched so developer expectations are not violated.
         assert!(
             !lib.contains("AUTUMN_HEALTH__PATH"),
             "lib.rs must NOT set AUTUMN_HEALTH__PATH — the probe targets /health directly \
@@ -3558,8 +3441,6 @@ mod tests {
             "lib.rs must clear AUTUMN_SERVER__UNIX_SOCKET so an inherited env var \
              cannot redirect the sidecar to a Unix socket the TCP probe cannot reach"
         );
-        // AUTUMN_SERVE_FORCE_UNIX_SOCKET is a separate out-of-band override in
-        // app.rs that bypasses the config-system socket setting; must also be cleared.
         assert!(
             lib.contains("AUTUMN_SERVE_FORCE_UNIX_SOCKET"),
             "lib.rs must also clear AUTUMN_SERVE_FORCE_UNIX_SOCKET — it overrides \
@@ -3570,10 +3451,6 @@ mod tests {
     #[test]
     fn lib_rs_clears_managed_pg_attach_url() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // If AUTUMN_MANAGED_PG_ATTACH_URL is inherited (e.g. from a terminal where
-        // `autumn serve` is running), ManagedPostgresPoolProvider connects to that
-        // existing cluster instead of starting the bundled one.  Clearing it ensures
-        // the desktop app always owns its local database.
         assert!(
             lib.contains("AUTUMN_MANAGED_PG_ATTACH_URL"),
             "lib.rs must clear AUTUMN_MANAGED_PG_ATTACH_URL so an inherited attach \
@@ -3584,11 +3461,8 @@ mod tests {
     #[test]
     fn lib_rs_sends_graceful_shutdown_signal_before_kill() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // Unix: SIGTERM triggers autumn's tokio signal handler so on_shutdown hooks run.
-        // Windows: autumn only handles ctrl_c() (CTRL_C_EVENT); taskkill sends
-        // WM_CLOSE/CTRL_CLOSE_EVENT which autumn does not handle, so we force-kill
-        // immediately without a delay rather than waiting 3 s for a signal that
-        // never arrives.
+        // SIGTERM runs autumn's on_shutdown hooks. On Windows autumn handles only CTRL_C_EVENT,
+        // so the shell force-kills at once instead of waiting for a signal that never arrives.
         assert!(
             lib.contains("SIGTERM") || lib.contains("-TERM"),
             "lib.rs on_window_event must send SIGTERM on Unix before force-killing"
@@ -3607,8 +3481,6 @@ mod tests {
     #[test]
     fn lib_rs_clears_inherited_profile_env_vars() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // AUTUMN_ENV is set conditionally: "dev" in debug Tauri builds (cargo tauri dev)
-        // and "" in release Tauri builds (cargo tauri build), using cfg!(debug_assertions).
         assert!(
             lib.contains("AUTUMN_ENV") && lib.contains("cfg!(debug_assertions)"),
             "lib.rs must set AUTUMN_ENV conditionally on cfg!(debug_assertions) \
@@ -3623,9 +3495,6 @@ mod tests {
     #[test]
     fn lib_rs_sets_dev_profile_in_debug_tauri_builds() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // cargo tauri dev compiles the shell in debug mode; the sidecar is always a
-        // --release binary (AUTUMN_IS_DEBUG=0 baked in → prod profile). Setting
-        // AUTUMN_ENV=dev in cfg!(debug_assertions) makes the sidecar load dev config.
         assert!(
             lib.contains("\"dev\"") && lib.contains("cfg!(debug_assertions)"),
             "lib.rs must set AUTUMN_ENV=\"dev\" when cfg!(debug_assertions) so \
@@ -3636,11 +3505,7 @@ mod tests {
     #[test]
     fn lib_rs_overrides_trusted_hosts_to_loopback() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // Production autumn.toml may set trusted_hosts.hosts = ["example.com"].
-        // The webview connects to http://127.0.0.1:{port} (Host: 127.0.0.1) which
-        // would be rejected by the trusted-host middleware with a 400.  The shell
-        // always overrides the setting to allow loopback — the server only binds
-        // loopback so no external traffic reaches it regardless.
+        // Overriding is safe: the sidecar binds loopback only, so no external traffic reaches it.
         assert!(
             lib.contains("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS"),
             "lib.rs must set AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS to override \
@@ -3686,9 +3551,6 @@ mod tests {
     #[test]
     fn lib_rs_kill_timeout_exceeds_default_prestop_grace() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // The default prestop_grace_secs is 5; the force-kill must wait at least
-        // that long so shutdown hooks finish even if the env override is absent.
-        // Look for from_secs(N) where N >= 5.
         let has_adequate_timeout = (5u64..=60).any(|n| lib.contains(&format!("from_secs({n})")));
         assert!(
             has_adequate_timeout,
@@ -3700,11 +3562,8 @@ mod tests {
     #[test]
     fn lib_rs_waits_300s_for_managed_postgres_cold_start() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // A first-launch managed-Postgres cluster must initialise (pg_ctl init) and
-        // run migrations before serving HTTP; on slow disks this can take several
-        // minutes.  autumn serve uses READY_TIMEOUT_MANAGED_PG = 300 s; the generated
-        // shell must match so the first-launch window is not rejected prematurely.
-        // We look for 1500 iterations × 200 ms = 300 s, or any explicit "300" in context.
+        // Matches `autumn serve`'s READY_TIMEOUT_MANAGED_PG (300 s) for a cold managed-Postgres
+        // start: 1500 polls × 200 ms.
         assert!(
             lib.contains("0..1500") || lib.contains("300 s") || lib.contains("300s"),
             "lib.rs readiness poll must allow at least 300 s (1500 × 200 ms) for \
@@ -3760,10 +3619,6 @@ mod tests {
     #[test]
     fn lib_rs_restricts_blob_storage_dir_permissions() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // The blobs/ directory must be created explicitly before the sidecar spawns
-        // so we can apply 0700 on Unix — LocalBlobStore uses create_dir_all which
-        // inherits the process umask (typically 0755), leaving files 0644 and readable
-        // by other local accounts.
         assert!(
             lib.contains("blobs_dir") && lib.contains("create_dir_all"),
             "lib.rs must create the blobs/ directory explicitly (not rely on \
@@ -3814,20 +3669,16 @@ mod tests {
              survives app restarts; re-generating on every launch would invalidate all \
              existing sessions"
         );
-        // Must NOT silently continue with zero bytes on RNG failure.
         assert!(
             !lib.contains("unwrap_or(())"),
             "getrandom failure must propagate as an error, not be silently swallowed with \
              unwrap_or(()); an all-zero signing secret is trivially guessable"
         );
-        // The function must return a Result so the caller can propagate the error.
         assert!(
             lib.contains("Result<String,") || lib.contains("Result<String, "),
             "load_or_generate_signing_secret must return Result<String, ...> so getrandom \
              failure aborts setup() rather than continuing with a predictable zero secret"
         );
-        // Write failures must also propagate — a disk-full or permission error must abort
-        // startup rather than silently returning an ephemeral secret that rotates every launch.
         assert!(
             !lib.contains("let _ = std::fs::write")
                 && !lib.contains("let _ = std::fs::OpenOptions"),
@@ -3846,7 +3697,6 @@ mod tests {
              autumn's prod mode calls fail_fast_on_invalid_signing_secret and exits before \
              binding the HTTP port, causing the TCP health probe to time out"
         );
-        // The env var must be set using the local signing_secret variable.
         assert!(
             lib.contains("signing_secret"),
             "AUTUMN_SECURITY__SIGNING_SECRET must be sourced from the signing_secret local \
@@ -3857,16 +3707,12 @@ mod tests {
     #[test]
     fn lib_rs_hardens_existing_signing_secret_permissions() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // If the file already exists (early-return path), we must still chmod it
-        // to 0600 on Unix — an existing file created by an older generated shell
-        // (0644) or manually stays world-readable otherwise.
         assert!(
             lib.contains("from_mode(0o600)"),
             "load_or_generate_signing_secret must call set_permissions(0o600) on \
              an existing signing_secret.txt before returning it; a file created by \
              an older shell at 0644 would expose the JWT key to other local accounts"
         );
-        // The chmod must appear BEFORE the early return, not only in the create path.
         let chmod_pos = lib.find("from_mode(0o600)").unwrap_or(usize::MAX);
         let early_return_pos = lib.find("return Ok(s)").unwrap_or(usize::MAX);
         assert!(
@@ -3879,11 +3725,6 @@ mod tests {
     #[test]
     fn lib_rs_documents_managed_pg_auto_migrate_opt_in() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION is safe only for desktop
-        // apps that use ManagedPostgresPoolProvider (bundled Postgres).  Emitting
-        // it unconditionally would run pending migrations against any remote /
-        // shared database on every desktop client launch.  The generated shell must
-        // include the env var as a commented-out opt-in with an explanation.
         assert!(
             lib.contains("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION"),
             "lib.rs must mention AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION (as a \
@@ -3891,8 +3732,6 @@ mod tests {
              know to uncomment it; without it, a fresh cluster is never migrated and \
              routes fail with 500 on first desktop launch"
         );
-        // Must NOT be emitted as a live .env() call — that would run migrations
-        // against any remote/shared database on every desktop client launch.
         let live = lib.lines().any(|line| {
             !line.trim_start().starts_with("//")
                 && line.contains("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION")
@@ -3949,8 +3788,6 @@ mod tests {
 
     #[test]
     fn staging_sh_uses_dep_key_not_package_name_for_features() {
-        // When the app aliases autumn-web as `autumn_web = { package = "autumn-web" }`,
-        // the feature selector must use the dep key "autumn_web", not "autumn-web".
         let sh = render_stage_sidecar_sh("my-app", "my-app", false, "autumn_web");
         assert!(
             sh.contains("autumn_web/embed-assets"),
@@ -3987,19 +3824,13 @@ mod tests {
 
     #[test]
     fn staging_ps1_guards_empty_credentials_dir_before_copy() {
-        // When config\credentials exists but is empty, Copy-Item with a wildcard
-        // source ("config\credentials\*") matches nothing.  With
-        // $ErrorActionPreference = "Stop" that becomes a terminating error.
-        // The generated script must check for children before calling Copy-Item.
         let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true, "autumn-web");
-        // Must gate Copy-Item behind a Get-ChildItem / count check.
         assert!(
             ps1.contains("Get-ChildItem") || ps1.contains("Measure-Object"),
             "stage-sidecar.ps1 must guard Copy-Item with Get-ChildItem so an empty \
              config\\credentials directory does not abort the script under \
              $ErrorActionPreference = 'Stop'"
         );
-        // The guard must appear before the Copy-Item call for credentials.
         let guard_pos = ps1
             .find("Get-ChildItem")
             .or_else(|| ps1.find("Measure-Object"))
@@ -4013,9 +3844,6 @@ mod tests {
 
     #[test]
     fn plan_uses_dep_key_alias_in_staging_scripts() {
-        // An app that aliases autumn-web as autumn_web must generate staging scripts
-        // with the correct feature key; cargo fails with "Package 'foo' does not have
-        // feature 'autumn-web/managed-pg-bundled'" when the package name is used.
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -4052,11 +3880,7 @@ mod tests {
 
     #[test]
     fn plan_uses_dep_key_for_workspace_inherited_alias() {
-        // When a workspace member has `autumn_web = { workspace = true }` and the
-        // workspace Cargo.toml defines `autumn_web = { package = "autumn-web" }`,
-        // resolve_dep_key must return "autumn_web" (the alias key), not "autumn-web".
         let tmp = TempDir::new().unwrap();
-        // Write workspace root Cargo.toml with [workspace.dependencies] alias.
         fs::write(
             tmp.path().join("Cargo.toml"),
             "[workspace]\nmembers = [\"app\"]\n\
@@ -4101,8 +3925,6 @@ mod tests {
     #[test]
     fn lib_rs_writes_signing_secret_with_restricted_permissions() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // The generated code must use platform-specific file creation so the secret
-        // is not world-readable on Unix (default umask 022 → 0644).
         assert!(
             lib.contains("0o600") || lib.contains("OpenOptionsExt"),
             "load_or_generate_signing_secret must write the secret file with mode 0600 on Unix; \
@@ -4119,7 +3941,6 @@ mod tests {
     fn tauri_conf_bundles_autumn_toml_as_resource() {
         let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
-        // Tauri v2 resources must be a map { source_path: dest_path }, not an array.
         let resources = parsed["bundle"]["resources"]
             .as_object()
             .expect("bundle.resources must be a map (Tauri v2 schema requirement)");
@@ -4131,16 +3952,14 @@ mod tests {
             "tauri.conf.json must bundle autumn.toml as a resource so the installed \
              sidecar can find the app's production configuration"
         );
-        // No glob entries — globs cause GlobPathNotFound when no files match.
         let has_glob = resources.iter().any(|(k, _)| k.contains('*'));
         assert!(
             !has_glob,
             "tauri.conf.json must not emit resource glob entries — Tauri fails with \
              GlobPathNotFound when the glob matches no files (common for fresh projects)"
         );
-        // Both alias names for prod and dev must be included so the staging script's
-        // alias-pair copy logic always has a resource destination for each name,
-        // and the sidecar finds the config regardless of AUTUMN_ENV spelling.
+        // Every alias name needs a resource entry, so the sidecar finds its config under either
+        // AUTUMN_ENV spelling.
         let has_prod = resources
             .keys()
             .any(|k| k.contains("configs/") && k.contains("autumn-prod.toml"));
@@ -4180,9 +3999,6 @@ mod tests {
         let resources = parsed["bundle"]["resources"]
             .as_object()
             .expect("bundle.resources must be a map");
-        // The staging script always creates src-tauri/configs/credentials/ (possibly
-        // empty), and the resource entry maps it to config/credentials/ in the bundle
-        // so AutumnConfig can find .toml.enc files at AUTUMN_MANIFEST_DIR/config/credentials/.
         let has_credentials = resources.iter().any(|(k, v)| {
             k.contains("credentials") || v.as_str().is_some_and(|s| s.contains("credentials"))
         });
@@ -4219,16 +4035,12 @@ mod tests {
     #[test]
     fn staging_sh_clears_credentials_before_copying() {
         let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
-        // Stale .toml.enc files from a prior build (deleted or rotated credentials)
-        // must not survive into the next installer.  The staging directory must be
-        // removed and recreated, not merely appended to.
         assert!(
             sh.contains("rm -rf") && sh.contains("configs/credentials"),
             "stage-sidecar.sh must remove src-tauri/configs/credentials/ before \
              recreating it so revoked or renamed .toml.enc files from prior builds \
              are not silently bundled into the next installer"
         );
-        // rm -rf must come before the mkdir that follows it.
         let rm_pos = sh.find("rm -rf").unwrap_or(usize::MAX);
         let mkdir_pos = sh
             .find("mkdir -p src-tauri/configs/credentials")
@@ -4243,9 +4055,6 @@ mod tests {
     #[test]
     fn staging_sh_passes_package_flag_to_cargo_build() {
         let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
-        // In workspaces where `default-members` excludes the root package,
-        // `cargo build --bin <name>` fails unless `-p <package>` is also passed.
-        // The fingerprint phase already passes -p; the final cargo build must too.
         assert!(
             sh.contains("-p my-app"),
             "stage-sidecar.sh must pass `-p my-app` to cargo build so the correct \
@@ -4268,9 +4077,6 @@ mod tests {
     #[test]
     fn lib_rs_documents_config_master_key_file_path() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // The key file is `<AUTUMN_MANIFEST_DIR>/config/master.key`, not
-        // `.autumn-master-key`.  Documenting the wrong path leads to NoKeyFound
-        // errors for developers who follow the comment.
         assert!(
             lib.contains("config/master.key"),
             "lib.rs must document the correct key file path (config/master.key) so \
@@ -4283,9 +4089,6 @@ mod tests {
     #[test]
     fn lib_rs_disables_secure_cookies_for_loopback() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // Prod profile's session.secure=true emits the Secure attribute.
-        // Browsers never send Secure cookies over plain HTTP, so sessions, auth,
-        // and flash messages silently fail on http://127.0.0.1:<port>.
         assert!(
             lib.contains("AUTUMN_SESSION__SECURE"),
             "lib.rs must set AUTUMN_SESSION__SECURE=false; prod profile sets \
@@ -4319,8 +4122,6 @@ mod tests {
     #[test]
     fn lib_rs_kills_sidecar_on_timeout() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // The timeout branch must kill the sidecar before handle.exit(1);
-        // check that .kill() appears more than once (once for Destroyed, once for timeout).
         let kill_count = lib.matches(".kill()").count();
         assert!(
             kill_count >= 2,
@@ -4458,12 +4259,8 @@ mod tests {
 
     #[test]
     fn generate_then_destroy_tauri_round_trips_to_original_project_state() {
-        // `plan_tauri` never pushes a `Modify` action (see
-        // `plan_does_not_modify_app_main_rs`/`plan_does_not_modify_root_cargo_toml`
-        // below) — everything it emits lives under the freshly-created
-        // `src-tauri/` directory, so `Plan::revert`'s generic
-        // Create-deletion + empty-directory pruning should already restore
-        // the project exactly, with no per-generator `Revert` wiring needed.
+        // `plan_tauri` only creates files under a fresh `src-tauri/`, so `Plan::revert`'s
+        // generic deletion and empty-directory pruning restores the project exactly.
         let tmp = project("my-app");
         let cargo_path = tmp.path().join("Cargo.toml");
         let main_path = tmp.path().join("src/main.rs");
@@ -4763,8 +4560,6 @@ mod tests {
 
     #[test]
     fn resolve_dep_key_no_dependencies_section_returns_package_name() {
-        // When Cargo.toml has no [dependencies] table, resolve_dep_key must fall
-        // through the early-return path and return the raw package name unchanged.
         let doc: toml::Value =
             toml::from_str("[package]\nname=\"foo\"\nversion=\"0.1.0\"\n").unwrap();
         let result = resolve_dep_key(Path::new("/"), &doc, "autumn-web");
@@ -4776,8 +4571,6 @@ mod tests {
 
     #[test]
     fn resolve_dep_key_direct_package_alias() {
-        // When a dep entry has `package = "autumn-web"` under a different key, the
-        // function must return the alias key, not the package name.
         let doc: toml::Value = toml::from_str(
             "[package]\nname=\"foo\"\nversion=\"0.1.0\"\n\
              \n[dependencies]\nautumn_web = { version = \"0.5\", package = \"autumn-web\" }\n",
@@ -4792,8 +4585,6 @@ mod tests {
 
     #[test]
     fn resolve_dep_key_no_matching_dep_returns_package_name() {
-        // When none of the [dependencies] entries match the target package name,
-        // resolve_dep_key must return the package name itself as fallback.
         let doc: toml::Value = toml::from_str(
             "[package]\nname=\"foo\"\nversion=\"0.1.0\"\n\
              \n[dependencies]\nserde = \"1.0\"\ntokio = { version = \"1.0\" }\n",
@@ -4810,8 +4601,6 @@ mod tests {
 
     #[test]
     fn resolve_workspace_dep_package_stops_at_workspace_root_without_dep() {
-        // When the workspace root Cargo.toml exists but has no [workspace.dependencies]
-        // entry for the key, the function must stop (not walk further) and return None.
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -4826,8 +4615,6 @@ mod tests {
              \n[dependencies]\nautumn_web = { workspace = true }\n",
         )
         .unwrap();
-        // resolve_workspace_dep_package must find the workspace root Cargo.toml,
-        // see that [workspace] exists but has no matching dep, and return None.
         let result = resolve_workspace_dep_package(&app, "autumn_web");
         assert_eq!(
             result, None,
@@ -4837,11 +4624,8 @@ mod tests {
 
     #[test]
     fn resolve_workspace_dep_package_returns_none_when_no_workspace_found() {
-        // When walking from the project root finds no Cargo.toml with [workspace],
-        // the function exhausts all ancestors and returns None.
         let tmp = TempDir::new().unwrap();
-        // No Cargo.toml with [workspace] — the function will walk up past tmp root
-        // to filesystem root without finding one.
+        // tmp has no Cargo.toml, so the walk continues up to the filesystem root.
         let result = resolve_workspace_dep_package(tmp.path(), "autumn_web");
         assert_eq!(
             result, None,
@@ -4853,9 +4637,6 @@ mod tests {
 
     #[test]
     fn resolve_bin_name_default_run_without_bin_section() {
-        // When [package] has default-run but no [[bin]] array, resolve_bin_name
-        // must return the default-run value (the path after the [[bin]] block is
-        // absent, so control reaches the second default_run check at line 328).
         let tmp = TempDir::new().unwrap();
         let doc: toml::Value = toml::from_str(
             "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\ndefault-run=\"webserver\"\n\
@@ -4872,13 +4653,9 @@ mod tests {
 
     #[test]
     fn resolve_bin_name_empty_src_bin_dir_errors_with_no_binary_target() {
-        // When src/bin/ exists but contains no .rs files and no dir/main.rs,
-        // the 0 => {} match arm is hit (no binary found there either) and the
-        // function falls through to the final Err path.  Also exercises the
-        // `None` arm in the filter_map for non-.rs files.
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
-        // A non-.rs file: triggers the `None` arm of the filter_map.
+        // Not a binary: the src/bin/ scan finds nothing and falls through to the error.
         fs::write(tmp.path().join("src/bin/README.md"), "# ignore me").unwrap();
         let doc: toml::Value =
             toml::from_str("[package]\nname=\"my-app\"\nversion=\"0.1.0\"\n").unwrap();
@@ -4891,9 +4668,6 @@ mod tests {
 
     #[test]
     fn resolve_bin_name_absolute_path_to_src_main_matches_package_name() {
-        // Cargo permits absolute [[bin]] path values.  When the absolute path
-        // points to <project_root>/src/main.rs it must be treated the same as
-        // the relative "src/main.rs" so the package-name bin is chosen.
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join("src")).unwrap();
@@ -4901,7 +4675,7 @@ mod tests {
 
         let abs_path = root.join("src/main.rs");
         let abs_str = abs_path.to_string_lossy();
-        // Escape backslashes for TOML (matters on Windows paths in tests).
+        // Escape backslashes for TOML (Windows paths).
         let toml_path = abs_str.replace('\\', "\\\\");
         let manifest = format!(
             "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\n\
@@ -4917,20 +4691,15 @@ mod tests {
 
     #[test]
     fn resolve_bin_name_absolute_path_outside_project_root_is_not_main() {
-        // An absolute [[bin]] path that does not live under project_root cannot
-        // be the package's src/main.rs; strip_prefix fails → treated as non-main.
-        // Use autobins=false so the autobins guard doesn't fire and the single-bin
-        // fallback picks up the "external" name directly.
+        // autobins=false skips the src/main.rs check, so the single-bin fallback applies.
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
 
-        // Point the single [[bin]] to an arbitrary absolute path outside root.
         let manifest = "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\nautobins=false\n\
              [[bin]]\nname=\"external\"\npath=\"/some/other/location/main.rs\"\n";
         let doc: toml::Value = toml::from_str(manifest).unwrap();
-        // The single non-main bin must be returned directly.
         let result = resolve_bin_name(root, "my-app", None, false, &doc).unwrap();
         assert_eq!(
             result, "external",
@@ -4942,8 +4711,6 @@ mod tests {
 
     #[test]
     fn plan_uses_fallback_version_when_no_version_field_in_cargo_toml() {
-        // When [package] has no version field at all, the `_ => "0.1.0"` arm in
-        // read_package_meta must fire and the plan must succeed with version "0.1.0".
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -4975,9 +4742,6 @@ mod tests {
 
     #[test]
     fn resolve_workspace_version_walks_up_to_find_workspace_package_version() {
-        // When the project is a workspace member and the version lives in the
-        // parent Cargo.toml under [workspace.package], resolve_workspace_version
-        // must walk up (hitting the dir = d.parent() line) and return the version.
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -4994,7 +4758,6 @@ mod tests {
         )
         .unwrap();
         fs::write(app.join("src/main.rs"), "fn main() {}\n").unwrap();
-        // resolve_workspace_version must walk from app/ up to root and find "2.7.0".
         let version = resolve_workspace_version(&app);
         assert_eq!(
             version.as_deref(),
@@ -5005,10 +4768,7 @@ mod tests {
 
     #[test]
     fn resolve_workspace_version_returns_none_when_no_ancestor_has_workspace_version() {
-        // When no ancestor Cargo.toml has [workspace.package] version, the function
-        // exhausts the directory tree and returns None (the final None after the loop).
         let tmp = TempDir::new().unwrap();
-        // A bare Cargo.toml with no [workspace.package] section.
         fs::write(
             tmp.path().join("Cargo.toml"),
             "[package]\nname=\"my-app\"\nversion.workspace = true\nedition=\"2024\"\n\
@@ -5135,11 +4895,8 @@ mod tests {
 
     #[test]
     fn thin_client_mobile_capability_gates_biometric_to_mobile_platforms() {
-        // tauri-build validates every capability's permissions against the
-        // plugins compiled for the current target; tauri-plugin-biometric is
-        // target-gated to Android/iOS in the generated Cargo.toml, so a
-        // desktop build would fail on an unknown `biometric:default` unless
-        // the grant lives in a capability restricted to mobile platforms.
+        // tauri-build checks each capability against the plugins compiled for the target, and
+        // tauri-plugin-biometric is Android/iOS only: an unrestricted grant breaks desktop builds.
         let (_tmp, plan) = thin_plan("https://app.example.com");
         let cap = created_str(&plan, "capabilities/remote-app-mobile.json");
         let parsed: serde_json::Value =
@@ -5361,8 +5118,6 @@ mod tests {
 
     #[test]
     fn thin_client_capability_scopes_grant_to_origin_not_full_url() {
-        // The capability grant must be the path-free origin, while the
-        // webview still loads the full URL including its path.
         let (_tmp, plan) = thin_plan("https://app.example.com:8443/base/");
         for capability_file in [
             "capabilities/remote-app.json",
@@ -5385,11 +5140,9 @@ mod tests {
 
     #[test]
     fn thin_client_lib_rs_embeds_normalized_url_for_adversarial_inputs() {
-        // `url::Url::parse` accepts inputs whose *raw* form is unsafe inside
-        // a Rust string literal or `//!` doc comment (quotes, backslashes,
-        // raw newlines — the parser percent-encodes or strips them only in
-        // its own serialization). The generator must embed that normalized
-        // serialization, never the raw input — or reject the URL outright.
+        // `Url::parse` accepts raw inputs that are unsafe in a Rust string or `//!` doc comment
+        // (quotes, backslashes, newlines); only its serialization encodes or strips them. The
+        // generator must embed that serialization or reject the URL.
         for raw in [
             "https://app.example.com/pa\"th",
             "https://app.example.com/x\\admin",
@@ -5442,8 +5195,6 @@ mod tests {
                 "thin-client prerequisites must mention '{anchor}':\n{text}"
             );
         }
-        // The echoed URL must be the normalized form actually granted in the
-        // capability file, not the raw flag value.
         let echoed = render_thin_client_prerequisites("HTTPS://App.Example.COM");
         assert!(
             echoed.contains("https://app.example.com/"),
@@ -5453,9 +5204,6 @@ mod tests {
 
     #[test]
     fn desktop_plan_file_set_unchanged_by_thin_client_feature() {
-        // Regression pin (issue #1506): the no-flag desktop path must stay
-        // byte-identical in shape — exactly the pre-existing file list, and
-        // in particular no capabilities/ entry leaking in from thin-client mode.
         let tmp = project("my-app");
         let plan = plan_tauri(tmp.path()).unwrap();
         assert_eq!(
@@ -5487,9 +5235,8 @@ mod tests {
 
     // ── Thin-client planning must not require a sidecar binary (#1506) ────────
     //
-    // The thin client never builds or spawns a sidecar, so packages with no
-    // selectable binary target must still scaffold. The mirror-image desktop
-    // behaviour (plan_tauri *must* error on these layouts) is pinned above by
+    // The thin client spawns no sidecar, so packages with no selectable binary target still
+    // scaffold. The desktop planner must error on these layouts:
     // `plan_errors_when_package_has_no_bin_target` and
     // `plan_errors_on_multiple_explicit_bins_without_default_run`.
 
@@ -5515,7 +5262,6 @@ mod tests {
         let tmp = project_lib_only("libonly-app");
         let plan = plan_tauri_thin_client(tmp.path(), "https://app.example.com")
             .expect("thin-client planning must not require a binary target");
-        // The package name and version must still flow into tauri.conf.json.
         let conf: serde_json::Value =
             serde_json::from_str(created_str(&plan, "src-tauri/tauri.conf.json")).unwrap();
         assert_eq!(
@@ -5532,9 +5278,6 @@ mod tests {
 
     #[test]
     fn thin_client_plan_succeeds_on_multi_bin_package_without_default_run() {
-        // Multiple explicit [[bin]] targets and no `default-run` is ambiguous
-        // for the *sidecar* — but a thin client has no sidecar, so planning
-        // must succeed without asking the user to pick one.
         let tmp = project_with_multiple_bins_no_default("multibin-app", &["worker", "web"]);
         let plan = plan_tauri_thin_client(tmp.path(), "https://app.example.com")
             .expect("thin-client planning must not resolve a sidecar binary");

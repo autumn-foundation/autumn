@@ -44,7 +44,7 @@ autumn-web = { path = "autumn" }
 [workspace.package]
 edition = "2024"
 rust-version = "1.97.0"
-version = "0.10.0"
+version = "0.11.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/autumn-foundation/autumn"
 
@@ -54,7 +54,9 @@ repository = "https://github.com/autumn-foundation/autumn"
 # `h2` in the rustls ALPN list. Autumn's serve loop needs hyper-util's `http2`
 # feature (see the `hyper-util` entry below). `axum/http2` gives the axum side
 # (HTTP/2 WebSockets, `axum::serve` in tests) the same HTTP/2 support.
-axum = { version = "0.8", features = ["macros", "ws", "http2"] }
+# `ws` is not here: autumn-web turns it on with its `axum-ws` feature, so an
+# app without WebSockets does not compile the tungstenite stack (#2795).
+axum = { version = "0.8", features = ["macros", "http2"] }
 # Multipart boundary parsing for the submit-token replay guard. `multer` is the
 # exact parser axum's `Multipart` extractor uses downstream (via `mime`), so the
 # guard and the extractor can never disagree about the boundary. Already in the
@@ -94,15 +96,16 @@ pq-src = { version = ">=0.3.13, <0.4", default-features = false }
 # diesel_migrations) over an async connection — used to run startup
 # migrations and wait checks through the rustls TLS connector, since the
 # bundled libpq (`pq-sys` below) has no SSL support.
-diesel-async = { version = "0.9", features = ["deadpool", "async-connection-wrapper"] }
+diesel-async = { version = "0.10", features = ["deadpool", "async-connection-wrapper"] }
 diesel_migrations = "2"
 http = "1"
 # The `autumn` serve loop (`autumn/src/http_server.rs`, issue #3065) drives
 # `hyper_util::server::conn::auto::Builder` itself. `server-auto` turns on both
 # HTTP/1 and HTTP/2, which the ALPN `h2` advertisement in `tls.rs` needs.
 hyper-util = { version = "0.1.20", default-features = false, features = ["server-auto", "tokio", "service"] }
-# Held at 0.38: 0.39 exists, but diesel 2.3 needs `<0.39`.
-libsqlite3-sys = { version = "0.38", features = ["bundled"] }
+# diesel 2.4 raised its libsqlite3-sys cap to `<0.41`, clearing RUSTSEC-2026-0459
+# (bundled SQLite < 3.54.0, uninitialized page-cache memory with a foreign -wal).
+libsqlite3-sys = { version = "0.40", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
@@ -126,15 +129,17 @@ opentelemetry-otlp = { version = "0.33.1", default-features = false, features = 
 # `redis::Client::open` otherwise errors immediately on that scheme with no
 # TLS feature compiled in.
 redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
-tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
-chrono-tz = "0.10"
 validator = { version = "0.21", features = ["card", "derive"] }
 bcrypt = "0.19"
 futures = "0.3"
 indexmap = "2"
 inventory = "0.3"
 moka = { version = "0.12", features = ["sync"] }
-chrono = { version = "0.4", features = ["serde"] }
+# Default features off: `tzdb-bundle-always` embeds the IANA database, and
+# leaving out `tzdb-zoneinfo` means no host /usr/share/zoneinfo is read, so
+# zone data is identical on every host (slim containers, WASI, sims).
+# `tz-system` still detects the host's own zone for `TimeZone::system()`.
+jiff = { version = "1.0.0", default-features = false, features = ["std", "serde", "tz-system", "tz-fat", "tzdb-bundle-always", "perf-inline"] }
 # Held at 0.27: 0.28 exists, but testcontainers-modules 0.15 (the newest)
 # needs `^0.27`.
 testcontainers = "0.27"
@@ -148,7 +153,7 @@ rust_decimal = "1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 # HTML allowlist sanitizer for user-submitted rich text (issue #1255). Pulled in
 # by autumn-web's `markdown` feature; see `autumn/src/markdown/user_content.rs`.
-ammonia = "4.2.4"
+ammonia = "4.2.5"
 # Interactive console prompt (issue #2148). Pulled in only by autumn-web's
 # `repl` feature; see `autumn/src/repl.rs`.
 rhai = { version = "1", default-features = false, features = ["std", "serde"] }

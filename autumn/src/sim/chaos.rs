@@ -46,16 +46,13 @@
 //! per-fault surfaces (item 5/6/7 in the W5 stack) build additively on top of
 //! this state and event log.
 
-// The builder methods intentionally take `self` by value and clamp with runtime
-// float ops, so they are not `const`-eligible; this narrowly-scoped allow keeps
-// the module clean under the workspace's `nursery` lint set (matching the parent
-// `sim` module's own allow) without masking real issues.
+// The builders take `self` by value and clamp with runtime float ops, so they cannot be `const`.
 #![allow(clippy::missing_const_for_fn)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use jiff::SignedDuration;
 
 use crate::entropy::{Entropy, SeededEntropy};
 use crate::time::{ClockSource, TickingClock};
@@ -250,8 +247,7 @@ impl Chaos {
     #[must_use]
     pub fn smtp_faults(mut self, schedule: impl IntoIterator<Item = (usize, MailFault)>) -> Self {
         for (index, fault) in schedule {
-            // A 0 index is meaningless for a 1-based send counter; ignore it so a
-            // caller typo never silently faults "send #1".
+            // Sends count from 1; ignore index 0 rather than guess it meant send #1.
             if index >= 1 {
                 self.mail_fault_schedule.insert(index, fault);
             }
@@ -411,12 +407,15 @@ impl ChaosState {
 /// still reflected (they share the same instant); only a constant skew is added.
 struct SkewClock {
     inner: TickingClock,
-    offset: ChronoDuration,
+    offset: SignedDuration,
 }
 
 impl ClockSource for SkewClock {
-    fn now(&self) -> DateTime<Utc> {
-        self.inner.now() + self.offset
+    fn now(&self) -> crate::time::Timestamp {
+        self.inner
+            .now()
+            .checked_add(self.offset)
+            .unwrap_or(crate::time::Timestamp::MAX)
     }
 
     /// Forwarded to the wrapped clock **unskewed**.
@@ -436,19 +435,19 @@ impl ClockSource for SkewClock {
 
 /// Draw the one-shot, deterministic clock-skew offset in `[0, dur]` from the
 /// skew sub-stream. Saturates a pathologically large `dur` at `i64::MAX`
-/// nanoseconds (≈292 years) so the chrono conversion never overflows.
-fn deterministic_skew(seed: u64, dur: std::time::Duration) -> ChronoDuration {
+/// nanoseconds (≈292 years) so the conversion never overflows.
+fn deterministic_skew(seed: u64, dur: std::time::Duration) -> SignedDuration {
     let max_nanos = dur.as_nanos();
     if max_nanos == 0 {
-        return ChronoDuration::zero();
+        return SignedDuration::ZERO;
     }
     let stream = SeededEntropy::shared(seed ^ CHAOS_SKEW_SALT);
     let draw = u128::from(stream.next_u64());
     // Inclusive of `dur`: pick uniformly in [0, max_nanos].
     let picked = draw % (max_nanos.saturating_add(1));
-    // `nanoseconds` takes an i64; saturate rather than wrap for an absurd `dur`.
+    // `from_nanos` takes an i64; saturate rather than wrap for an absurd `dur`.
     let nanos = i64::try_from(picked).unwrap_or(i64::MAX);
-    ChronoDuration::nanoseconds(nanos)
+    SignedDuration::from_nanos(nanos)
 }
 
 /// Install the active chaos hooks onto `app` and return it, ready to
@@ -697,9 +696,6 @@ mod tests {
         assert!(!Chaos::default().db_transient_errors(0.0).is_active());
     }
 
-    // The fast, DB-free determinism signal: the decision stream is a pure
-    // function of the seed. Same seed ⇒ identical fired-schedule; a different
-    // seed ⇒ (very likely) a different one.
     #[test]
     fn decision_stream_is_seed_deterministic() {
         let chaos = Chaos::default().db_transient_errors(0.5);
@@ -719,8 +715,6 @@ mod tests {
         );
     }
 
-    // Extremes never draw a fault outside the obvious bound, and always/never
-    // faults are exact regardless of the stream.
     #[test]
     fn decide_extremes_are_exact() {
         let state = ChaosState::new(7, &Chaos::default());
@@ -747,19 +741,18 @@ mod tests {
         let a = deterministic_skew(99, dur);
         let b = deterministic_skew(99, dur);
         assert_eq!(a, b, "same seed ⇒ same skew offset");
-        assert!(a >= chrono::Duration::zero());
+        assert!(a >= jiff::SignedDuration::ZERO);
         assert!(
-            a <= chrono::Duration::from_std(dur).unwrap(),
+            a <= jiff::SignedDuration::try_from(dur).unwrap(),
             "offset stays within [0, dur]"
         );
-        // A zero window yields no skew.
         assert_eq!(
             deterministic_skew(99, std::time::Duration::ZERO),
-            chrono::Duration::zero()
+            jiff::SignedDuration::ZERO
         );
     }
 
-    // ---- W5.a (item 5): SMTP transport fault schedule ----
+    // ---- SMTP transport fault schedule ----
 
     #[cfg(feature = "mail")]
     #[test]
@@ -775,14 +768,11 @@ mod tests {
             Chaos::default().smtp_transient_errors(0.01).is_active(),
             "a probabilistic rate activates chaos"
         );
-        // An empty schedule / zero rate leaves the config inactive (default
-        // `Sim::build` unchanged).
         assert!(!Chaos::default().smtp_faults([]).is_active());
         assert!(!Chaos::default().smtp_transient_errors(0.0).is_active());
     }
 
-    // The explicit schedule maps a 1-based send index to its fault and draws no
-    // entropy, so it is deterministic by construction — independent of seed.
+    // The explicit schedule draws no entropy, so the seed does not affect it.
     #[cfg(feature = "mail")]
     #[test]
     fn explicit_schedule_is_1_based_and_seed_independent() {
@@ -795,14 +785,11 @@ mod tests {
             assert_eq!(state.resolve_mail_fault(8), Some(MailFault::Timeout));
             assert_eq!(state.resolve_mail_fault(9), None, "send #9 is unscheduled");
         }
-        // A 0 index is rejected by the builder (the counter is 1-based).
+        // The builder ignores index 0.
         let zeroed = Chaos::default().smtp_faults([(0, MailFault::Fail)]);
         assert!(!zeroed.is_active());
     }
 
-    // An explicit schedule entry always wins over the probabilistic rate, and the
-    // probabilistic lane is drawn from the dedicated, seed-deterministic mail
-    // sub-stream.
     #[cfg(feature = "mail")]
     #[test]
     fn schedule_wins_over_probabilistic_and_prob_is_seed_deterministic() {
@@ -817,8 +804,7 @@ mod tests {
             Some(MailFault::Fail),
             "p=1.0 faults an unscheduled send transiently"
         );
-        // (send #8 would be next, but assert the precedence on a fresh state so
-        // the draw sequence does not matter.)
+        // A fresh state, so the draws above do not affect the precedence check.
         let state2 = ChaosState::new(3, &chaos);
         assert_eq!(
             state2.resolve_mail_fault(8),
@@ -826,7 +812,6 @@ mod tests {
             "an explicit entry wins over the probabilistic rate"
         );
 
-        // Same seed ⇒ identical probabilistic decisions on the mail sub-stream.
         let prob_only = Chaos::default().smtp_transient_errors(0.5);
         let draw = |seed: u64| {
             let state = ChaosState::new(seed, &prob_only);

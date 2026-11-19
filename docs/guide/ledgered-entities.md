@@ -303,7 +303,8 @@ Read valid time from your own column when the domain has one:
 pub trait InvoiceRepository {}
 ```
 
-The column may be `DateTime<Utc>`, `NaiveDateTime`, or an `Option` of either.
+The column may be a `Timestamp`, a `civil::DateTime` (read as UTC), or an
+`Option` of either.
 
 A delete or restore is valid from the instant you make it. It does not read your
 column, which holds the row's old value. Otherwise a valid-time query about an

@@ -15,16 +15,13 @@
 //! by position, not by name.
 //!
 //! A field whose type is a nested `WireShape` type is compared field by
-//! field, with the same rules, under a dotted name (`details.size`). A unit
+//! field, with the same rules, under a dotted name (`details.size`). A read
+//! or a write of a nested field is a dotted path too: `details.color`. The
+//! paths under a field are its read-set and write-set one level down. A unit
 //! struct is JSON `null`, so a unit type and an object type do not match.
 //! Both need a bundle of [`IDENTITY_FORMAT`](super::bundle::IDENTITY_FORMAT):
-//! an older bundle does not record them, and the check then compares the
-//! type names only.
-//!
-//! A read-set or a write-set holds dotted paths. Each level gets the paths
-//! under its field: `details.color` is the read `color` in `details`. A
-//! bundle older than [`NESTED_PATHS_FORMAT`](super::bundle::NESTED_PATHS_FORMAT)
-//! has top-level paths only.
+//! an older bundle does not record
+//! them, and the check then compares the type names only.
 //!
 //! A field's wire type is its JSON form. When both sides record one, a new
 //! form with the same Rust type is a break. A bundle older than
@@ -639,25 +636,25 @@ pub fn check_call(
 /// the side that decodes, `writer` the types of the side that encodes.
 ///
 /// Field names are relative to the level they are found on. The level above
-/// adds its field name, so `color` becomes `details.color`. Each comparison
-/// is kept. Fields that share a type and a read-set cost one comparison.
+/// adds its field name, so `color` becomes `details.color`. Each type pair is
+/// compared once per read-set or write-set. The result is kept, so fields
+/// that share a type and a set cost one comparison.
 struct Walk<'a> {
     reader: &'a Bundle,
     writer: &'a Bundle,
     /// Both bundles record nested types and the `unit` flag.
     typed: bool,
-    /// The comparisons on the current path, so a recursive type ends. The key
-    /// holds the read-set, which gets shorter at each level. So a recursive
-    /// type does not stop a deep read.
+    /// The comparisons on the current path, so a recursive type ends. A
+    /// read-set gets shorter at each level, so it ends too.
     path: BTreeSet<WalkKey>,
-    /// The decode result of each comparison so far.
+    /// The decode result of each type pair and read-set compared so far.
     decoded: BTreeMap<WalkKey, Vec<Decode>>,
-    /// The request result of each comparison so far.
+    /// The request result of each type pair and write-set compared so far.
     encoded: BTreeMap<WalkKey, Vec<BreakKind>>,
 }
 
 /// One comparison: the reader's type id, the writer's type id, and the
-/// read-set or write-set at that level. `None` is an unknown write-set.
+/// read-set or write-set. A write-set of `None` is unknown.
 type WalkKey = (String, String, Option<Vec<String>>);
 
 impl<'a> Walk<'a> {
@@ -697,20 +694,21 @@ impl<'a> Walk<'a> {
     }
 
     /// The decode issues of one type pair, with names relative to it.
-    /// `reads` are the paths the code reads in this type.
+    /// `reads` is the read-set at this level.
     fn decode(
         &mut self,
         reader: &'a BundleType,
         writer: &'a BundleType,
-        reads: &[String],
+        reads: Vec<String>,
     ) -> Vec<Decode> {
-        let key = (reader.id.clone(), writer.id.clone(), Some(reads.to_vec()));
+        let key = (reader.id.clone(), writer.id.clone(), Some(reads));
         if let Some(done) = self.decoded.get(&key) {
             return done.clone();
         }
         if !self.path.insert(key.clone()) {
             return Vec::new();
         }
+        let reads = key.2.as_deref().unwrap_or_default();
         let mut found = decode_issues(&reader.shape, &writer.shape.serialized, reads, self);
         found.truncate(MAX_NESTED_ISSUES);
         self.path.remove(&key);
@@ -719,26 +717,27 @@ impl<'a> Walk<'a> {
     }
 
     /// The request issues of one type pair, with names relative to it.
-    /// `receiver` decodes what `sender` sends. `writes` are the paths the
-    /// call site sets in this type, or `None` when they are not known.
+    /// `receiver` decodes what `sender` sends. `writes` is the write-set at
+    /// this level, `None` when it is unknown.
     fn encode(
         &mut self,
         receiver: &'a BundleType,
         sender: &'a BundleType,
-        writes: Option<&[String]>,
+        writes: Option<Vec<String>>,
     ) -> Vec<BreakKind> {
-        let key = (
-            receiver.id.clone(),
-            sender.id.clone(),
-            writes.map(<[String]>::to_vec),
-        );
+        let key = (receiver.id.clone(), sender.id.clone(), writes);
         if let Some(done) = self.encoded.get(&key) {
             return done.clone();
         }
         if !self.path.insert(key.clone()) {
             return Vec::new();
         }
-        let mut found = request_issues(&sender.shape, &receiver.shape, writes, self);
+        let mut found = request_issues(
+            &sender.shape,
+            &receiver.shape,
+            Level::Nested(key.2.as_deref()),
+            self,
+        );
         found.truncate(MAX_NESTED_ISSUES);
         self.path.remove(&key);
         self.encoded.insert(key, found.clone());
@@ -756,16 +755,17 @@ fn under(field: &str, name: &str) -> String {
     format!("{field}.{name}")
 }
 
-/// The first segment of each path: the fields of this level.
-fn top_fields(paths: &[String]) -> BTreeSet<&str> {
+/// The top-level field of each path: `details.color` gives `details`.
+fn top_level(paths: &[String]) -> BTreeSet<&str> {
     paths
         .iter()
-        .map(|p| p.split_once('.').map_or(p.as_str(), |(top, _)| top))
+        .map(|p| p.split('.').next().unwrap_or_default())
         .collect()
 }
 
-/// The paths under `field`, without the `field.` prefix.
-fn paths_under(paths: &[String], field: &str) -> Vec<String> {
+/// The paths under `field`, without its prefix: `details.color` under
+/// `details` gives `color`.
+fn below(paths: &[String], field: &str) -> Vec<String> {
     paths
         .iter()
         .filter_map(|p| p.strip_prefix(field)?.strip_prefix('.'))
@@ -888,10 +888,11 @@ enum Decode {
 }
 
 /// The decode rules, shared by responses and events: `reader` decodes what
-/// `produced` holds, and the code reads the paths in `reads`.
+/// `produced` holds, and the code reads the fields in `reads`.
 ///
 /// A nested type of a matched field is compared in the same way, one level
-/// down, with the reads under that field.
+/// down, with the reads under that field. A read is missing only when the
+/// reader's own release produces the field and `produced` does not.
 fn decode_issues(
     reader: &WireTypeDescriptor,
     produced: &[WireFieldDescriptor],
@@ -901,11 +902,13 @@ fn decode_issues(
     let mut out = Vec::new();
     let decoded = &reader.deserialized;
     let mut named = BTreeSet::new();
-    for read in top_fields(reads) {
+    for read in top_level(reads) {
         let Some(field) = decoded.iter().find(|f| f.rust_name == read) else {
             continue;
         };
-        if produced_for(produced, field).is_none() {
+        // A field the reader's own release never produces is not a change.
+        let own_release_produces = produced_for(&reader.serialized, field).is_some();
+        if own_release_produces && produced_for(produced, field).is_none() {
             named.insert(field.wire_name.clone());
             out.push(Decode::Missing(field.wire_name.clone()));
         }
@@ -947,7 +950,7 @@ fn decode_issues(
                         });
                         continue;
                     }
-                    let deeper = walk.decode(theirs, ours, &paths_under(reads, &field.rust_name));
+                    let deeper = walk.decode(theirs, ours, below(reads, &field.rust_name));
                     out.extend(deeper.into_iter().map(|d| d.under(&field.wire_name)));
                 }
             }
@@ -988,32 +991,51 @@ fn request_breaks(
         report(BreakKind::RequestUnitChanged);
         return;
     }
-    for kind in request_issues(&view.request, &serve.request, call.writes.as_deref(), walk) {
+    for kind in request_issues(
+        &view.request,
+        &serve.request,
+        Level::Top(call.writes.as_deref()),
+        walk,
+    ) {
         report(kind);
     }
 }
 
+/// The write-set of one request level.
+#[derive(Clone, Copy)]
+enum Level<'w> {
+    /// The body. `None` when the write-set is unknown.
+    Top(Option<&'w [String]>),
+    /// A nested type. `None` when the call site sets no field under it.
+    Nested(Option<&'w [String]>),
+}
+
 /// The request rules for one level: `sender` is the caller's type, and
-/// `receiver` the callee's. `writes` is the call site's write-set at this
-/// level, or `None` when it is not known. A nested level gets the paths under
-/// its field when the call site sets that field with a struct literal.
+/// `receiver` the callee's. `level` holds the call site's write-set there.
+///
+/// One build checks the body against the caller's own release, but not a
+/// nested type. So a nested level reports only what changed from the
+/// caller's own release: a field that release required counts as sent, and
+/// a set field counts as dropped only when that release accepted it.
 fn request_issues(
     sender: &WireTypeDescriptor,
     receiver: &WireTypeDescriptor,
-    writes: Option<&[String]>,
+    level: Level<'_>,
     walk: &mut Walk<'_>,
 ) -> Vec<BreakKind> {
+    let (writes, nested) = match level {
+        Level::Top(writes) => (writes, false),
+        Level::Nested(writes) => (writes, true),
+    };
     let mut out = Vec::new();
     let mut report = |kind| out.push(kind);
     let sent = &sender.serialized;
     let accepted = &receiver.deserialized;
-    let written = writes.map(top_fields).unwrap_or_default();
-    // A field the type may skip (`skip_serializing_if`) counts as sent only
-    // when the caller's own release requires it: the one-build check then
-    // accepted the call. The call site must also set it, or its write-set
-    // must be unknown. A set field alone can still be skipped: `tags: vec![]`
-    // is not on the wire. A requirement that is new in the serving release
-    // gets no such benefit.
+    let written = top_level(writes.unwrap_or_default());
+    // With an unknown write-set, a field the type sometimes sends counts as
+    // sent only when the caller's own release already required it: the
+    // one-build check accepted that call. A requirement that is new in the
+    // serving release gets no such benefit.
     let own_release_requires = |f: &WireFieldDescriptor| {
         sender
             .deserialized
@@ -1022,8 +1044,8 @@ fn request_issues(
     };
     let always_sent = |f: &WireFieldDescriptor| {
         f.required
-            || (own_release_requires(f)
-                && (writes.is_none() || written.contains(f.rust_name.as_str())))
+            || written.contains(f.rust_name.as_str())
+            || ((writes.is_none() || nested) && own_release_requires(f))
     };
     for need in accepted {
         if key_hits(sent, need) > 1 {
@@ -1040,7 +1062,8 @@ fn request_issues(
         let Some(field) = sent.iter().find(|f| f.rust_name == *write) else {
             continue;
         };
-        if accepting(accepted, field).is_none() && !receiver.closed {
+        let own_release_accepts = accepting(&sender.deserialized, field).is_some();
+        if accepting(accepted, field).is_none() && !receiver.closed && own_release_accepts {
             report(BreakKind::RequestFieldDropped(field.wire_name.clone()));
         }
     }
@@ -1074,13 +1097,12 @@ fn request_issues(
                         });
                         continue;
                     }
-                    // No paths under the field: the call site sets it with a
-                    // value that is not a struct literal, or does not name
-                    // it. Its write-set there is not known.
-                    let nested = writes
-                        .map(|w| paths_under(w, &field.rust_name))
+                    // A nested write-set is known when the call site sets
+                    // a field under this one.
+                    let under = writes
+                        .map(|w| below(w, &field.rust_name))
                         .filter(|w| !w.is_empty());
-                    for kind in walk.encode(theirs, ours, nested.as_deref()) {
+                    for kind in walk.encode(theirs, ours, under) {
                         report(kind.under(&field.wire_name));
                     }
                 }
@@ -1499,7 +1521,7 @@ mod tests {
         breaks.iter().map(|b| b.kind.clone()).collect()
     }
 
-    // --- the rules the issue names ---
+    // --- fields, paths and methods ---
 
     #[test]
     fn a_removed_response_field_that_a_caller_reads_fails() {
@@ -2237,7 +2259,7 @@ mod tests {
         assert!(text.contains("Deploy marketing before core."), "{text}");
     }
 
-    // --- review regressions ---
+    // --- edge cases ---
 
     #[test]
     fn a_body_on_a_route_that_had_none_is_a_break() {
@@ -2518,6 +2540,266 @@ mod tests {
     fn an_unchanged_nested_type_passes() {
         let report = compare(&nested_release(), &nested_release());
         assert_eq!(report.verdict(), Verdict::Compatible, "{report:?}");
+    }
+
+    // --- nested read-sets and write-sets ---
+
+    /// `Details { color: Option<String>, size }`, or without `color`.
+    fn optional_color(with_color: bool) -> crate::contracts::bundle::BundleType {
+        let mut sent = vec![plain("size", true)];
+        let mut decoded = vec![plain("size", true)];
+        if with_color {
+            sent.insert(0, field("color", "color", "Option<String>", true));
+            decoded.insert(0, field("color", "color", "Option<String>", false));
+        }
+        crate::contracts::bundle::BundleType {
+            id: "mesh-catalog::Details".to_owned(),
+            shape: shape("Details", sent, decoded),
+        }
+    }
+
+    /// [`nested_release`] with an optional `color`, and these sets.
+    fn nested_sets(with_color: bool, reads: &[&str], writes: Option<&[&str]>) -> Bundle {
+        let mut bundle = nested_release();
+        bundle.types = vec![optional_color(with_color)];
+        bundle.callers = vec![
+            call("add_item", "create_item", &["id"], writes),
+            call("show_item", "get_item", reads, None),
+        ];
+        bundle
+    }
+
+    #[test]
+    fn an_optional_nested_field_a_deployed_caller_reads_removed_is_a_break() {
+        let deployed = nested_sets(true, &["details", "details.color"], Some(&["name"]));
+        let current = nested_sets(false, &["details"], Some(&["name"]));
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::ResponseFieldMissing("details.color".to_owned())]
+        );
+        assert!(report.caller_first.is_empty(), "{report:?}");
+        assert_eq!(report.verdict(), Verdict::CallerFirst);
+    }
+
+    #[test]
+    fn a_new_optional_nested_field_a_new_caller_reads_needs_the_callee_first() {
+        let deployed = nested_sets(false, &["details"], Some(&["name"]));
+        let current = nested_sets(true, &["details", "details.color"], Some(&["name"]));
+        let report = compare(&deployed, &current);
+        assert!(report.callee_first.is_empty(), "{report:?}");
+        assert_eq!(
+            kinds(&report.caller_first),
+            [BreakKind::ResponseFieldMissing("details.color".to_owned())]
+        );
+        assert_eq!(report.verdict(), Verdict::CalleeFirst);
+    }
+
+    #[test]
+    fn a_nested_field_the_call_site_sets_and_the_callee_drops_is_a_break() {
+        let deployed = nested_sets(
+            true,
+            &["id"],
+            Some(&["details", "details.color", "details.size", "name"]),
+        );
+        let current = nested_sets(false, &["id"], Some(&["details", "details.size", "name"]));
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::RequestFieldDropped("details.color".to_owned())]
+        );
+        assert!(report.caller_first.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn an_optional_field_of_a_list_element_a_caller_reads_removed_is_a_break() {
+        // `lines: Vec<Details>`. A loop or an index gives the read
+        // `lines.color`: the check walks the element type.
+        let release = |with_color: bool| {
+            let mut bundle = nested_sets(with_color, &["lines", "lines.color"], None);
+            let item = ep(&mut bundle, "get_item");
+            for fields in [
+                &mut item.response.serialized,
+                &mut item.response.deserialized,
+            ] {
+                let details = fields.iter_mut().find(|f| f.rust_name == "details");
+                let lines = details.expect("details");
+                lines.rust_name = "lines".to_owned();
+                lines.wire_name = "lines".to_owned();
+                lines.ty = "Vec<Details>".to_owned();
+            }
+            bundle
+        };
+        let report = compare(&release(true), &release(false));
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::ResponseFieldMissing("lines.color".to_owned())]
+        );
+        assert!(report.caller_first.is_empty(), "{report:?}");
+        assert_eq!(report.verdict(), Verdict::CallerFirst);
+    }
+
+    #[test]
+    fn a_nested_read_without_its_prefix_still_reads_the_top_field() {
+        let deployed = nested_sets(true, &["details.color"], Some(&["name"]));
+        let mut current = nested_sets(true, &["id"], Some(&["name"]));
+        let item = ep(&mut current, "get_item");
+        for fields in [
+            &mut item.response.serialized,
+            &mut item.response.deserialized,
+        ] {
+            fields.retain(|f| f.rust_name != "details");
+        }
+        let report = compare(&deployed, &current);
+        assert!(
+            kinds(&report.callee_first)
+                .contains(&BreakKind::ResponseFieldMissing("details".to_owned())),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_read_set_applies_only_to_the_field_it_is_under() {
+        // `details` and `billing` share one type. The caller reads
+        // `details.color` only, so a cache keyed by the type pair alone
+        // would also name `billing.color`.
+        let mut deployed = nested_sets(true, &["billing", "details", "details.color"], None);
+        let mut current = nested_sets(false, &["billing", "details"], None);
+        for bundle in [&mut deployed, &mut current] {
+            let item = ep(bundle, "get_item");
+            let mut billing = item.response.serialized.last().expect("details").clone();
+            billing.rust_name = "billing".to_owned();
+            billing.wire_name = "billing".to_owned();
+            item.response.serialized.push(billing.clone());
+            item.response.deserialized.push(billing);
+        }
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::ResponseFieldMissing("details.color".to_owned())]
+        );
+    }
+
+    /// [`nested_sets`] where `Details.code` may be left off the wire. The
+    /// callee needs it when `required`. Only the request holds `details`.
+    fn optional_code(required: bool, writes: &[&str]) -> Bundle {
+        let mut bundle = nested_sets(true, &["id"], Some(writes));
+        let shape = &mut bundle.types[0].shape;
+        shape.serialized.push(plain("code", false));
+        shape.deserialized.push(plain("code", required));
+        let item = &mut ep(&mut bundle, "get_item").response;
+        for fields in [&mut item.serialized, &mut item.deserialized] {
+            fields.retain(|f| f.rust_name != "details");
+        }
+        bundle
+    }
+
+    #[test]
+    fn a_nested_write_set_counts_a_field_the_type_may_omit_only_when_set() {
+        // The new callee starts to need `details.code`.
+        let set = &["details", "details.code", "name"];
+        let report = compare(&optional_code(false, set), &optional_code(true, set));
+        assert!(report.callee_first.is_empty(), "{report:?}");
+        let unset = &["details", "details.size", "name"];
+        let report = compare(&optional_code(false, unset), &optional_code(true, unset));
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::RequestFieldNotSent("details.code".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_unchanged_release_with_nested_sets_is_compatible() {
+        // One build passes each of these. Only a change between releases is
+        // a break.
+        // A required field the type may omit, not named in the literal.
+        let omitted = optional_code(true, &["details", "details.size", "name"]);
+        assert_eq!(compare(&omitted, &omitted), Report::default());
+        // A field the type does not decode (`skip_deserializing`), set in a
+        // literal.
+        let mut skipped = nested_sets(true, &["id"], Some(&["details", "details.stamp"]));
+        skipped.types[0].shape.serialized.push(plain("stamp", true));
+        assert_eq!(compare(&skipped, &skipped), Report::default());
+        // A field the type does not encode (`skip_serializing`), read.
+        let mut secret = nested_sets(true, &["details", "details.secret"], Some(&["name"]));
+        secret.types[0]
+            .shape
+            .deserialized
+            .push(plain("secret", false));
+        assert_eq!(compare(&secret, &secret), Report::default());
+    }
+
+    #[test]
+    fn a_recursive_type_with_a_deep_read_ends_and_reports_the_path() {
+        let node = |with_x: bool| {
+            let mut child = field("child", "child", "Option<Node>", true);
+            child.nested = vec!["mesh-catalog::Node".to_owned()];
+            let mut decoded = vec![field("child", "child", "Option<Node>", false)];
+            decoded[0].nested.clone_from(&child.nested);
+            let mut sent = vec![child];
+            if with_x {
+                sent.push(field("x", "x", "Option<String>", true));
+                decoded.push(field("x", "x", "Option<String>", false));
+            }
+            crate::contracts::bundle::BundleType {
+                id: "mesh-catalog::Node".to_owned(),
+                shape: shape("Node", sent, decoded),
+            }
+        };
+        let release = |with_x: bool, reads: &[&str]| {
+            let mut bundle = typed_release();
+            let mut root = field("root", "root", "Node", true);
+            root.nested = vec!["mesh-catalog::Node".to_owned()];
+            let item = ep(&mut bundle, "get_item");
+            item.response.serialized.push(root.clone());
+            item.response.deserialized.push(root);
+            bundle.types = vec![node(with_x)];
+            bundle.callers.retain(|c| c.endpoint != "get_item");
+            bundle
+                .callers
+                .push(call("show_item", "get_item", reads, None));
+            bundle
+        };
+        let deep = &[
+            "root",
+            "root.child",
+            "root.child.child",
+            "root.child.child.x",
+        ];
+        let report = compare(&release(true, deep), &release(false, &["root"]));
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::ResponseFieldMissing(
+                "root.child.child.x".to_owned()
+            )]
+        );
+        assert_eq!(
+            compare(&release(true, deep), &release(true, deep)),
+            Report::default()
+        );
+    }
+
+    #[test]
+    fn an_optional_nested_event_field_a_deployed_consumer_reads_removed_is_a_break() {
+        let with = |color: bool, reads: &[&str]| {
+            let mut bundle = nested_sets(color, &["id"], None);
+            let mut details = field("details", "details", "Details", true);
+            details.nested = vec!["mesh-catalog::Details".to_owned()];
+            let mut payload = contact_shape(&[("id", "i64", true)]);
+            payload.serialized.push(details.clone());
+            payload.deserialized.push(details);
+            bundle.events = vec![event(1, payload)];
+            bundle.listeners = vec![listener("on_contact", "contact.updated", reads)];
+            bundle
+        };
+        let deployed = with(true, &["details", "details.color"]);
+        let current = with(false, &["details"]);
+        let report = compare(&deployed, &current);
+        assert_eq!(
+            kinds(&report.callee_first),
+            [BreakKind::EventFieldMissing("details.color".to_owned())]
+        );
+        assert!(report.caller_first.is_empty(), "{report:?}");
     }
 
     #[test]
@@ -2909,430 +3191,5 @@ mod tests {
             )),
             "{report:?}"
         );
-    }
-
-    // --- nested read-sets and write-sets ---
-
-    /// `Details` with `color: Option<String>`, which serde always writes and
-    /// does not need on decode, and a required `size`.
-    fn details_with_optional_color() -> crate::contracts::bundle::BundleType {
-        crate::contracts::bundle::BundleType {
-            id: "mesh-catalog::Details".to_owned(),
-            shape: shape(
-                "Details",
-                vec![
-                    field("color", "color", "Option<String>", true),
-                    plain("size", true),
-                ],
-                vec![
-                    field("color", "color", "Option<String>", false),
-                    plain("size", true),
-                ],
-            ),
-        }
-    }
-
-    /// [`nested_release`] with an optional `color`, and the reads of
-    /// `show_item` and the writes of `add_item` given.
-    fn nested_paths_release(with_color: bool, reads: &[&str], writes: Option<&[&str]>) -> Bundle {
-        let mut bundle = nested_release();
-        bundle.types = vec![if with_color {
-            details_with_optional_color()
-        } else {
-            details(vec![plain("size", true)])
-        }];
-        bundle.callers = vec![
-            call("add_item", "create_item", &["id"], writes),
-            call("show_item", "get_item", reads, None),
-        ];
-        bundle
-    }
-
-    #[test]
-    fn an_optional_nested_field_a_caller_reads_removed_is_a_break() {
-        let deployed = nested_paths_release(true, &["details.color"], Some(&["name"]));
-        let current = nested_paths_release(false, &["details.size"], Some(&["name"]));
-        let report = compare(&deployed, &current);
-        assert_eq!(
-            kinds(&report.callee_first),
-            [BreakKind::ResponseFieldMissing("details.color".to_owned())]
-        );
-        assert!(report.caller_first.is_empty(), "{report:?}");
-        assert_eq!(report.verdict(), Verdict::CallerFirst);
-    }
-
-    #[test]
-    fn an_optional_nested_field_no_caller_reads_removed_passes() {
-        let deployed = nested_paths_release(true, &["details.size"], Some(&["name"]));
-        let current = nested_paths_release(false, &["details.size"], Some(&["name"]));
-        assert_eq!(compare(&deployed, &current), Report::default());
-    }
-
-    #[test]
-    fn a_new_optional_nested_field_a_new_caller_reads_needs_the_callee_first() {
-        let deployed = nested_paths_release(false, &["details.size"], Some(&["name"]));
-        let current = nested_paths_release(true, &["details.color"], Some(&["name"]));
-        let report = compare(&deployed, &current);
-        assert!(report.callee_first.is_empty(), "{report:?}");
-        assert_eq!(
-            kinds(&report.caller_first),
-            [BreakKind::ResponseFieldMissing("details.color".to_owned())]
-        );
-        assert_eq!(report.verdict(), Verdict::CalleeFirst);
-    }
-
-    #[test]
-    fn a_nested_field_the_call_sets_and_the_callee_drops_is_a_break() {
-        let deployed =
-            nested_paths_release(true, &["name"], Some(&["details", "details.color", "name"]));
-        let current = nested_paths_release(false, &["name"], Some(&["details", "name"]));
-        let report = compare(&deployed, &current);
-        assert_eq!(
-            kinds(&report.callee_first),
-            [BreakKind::RequestFieldDropped("details.color".to_owned())]
-        );
-        assert!(report.caller_first.is_empty(), "{report:?}");
-        assert_eq!(report.verdict(), Verdict::CallerFirst);
-    }
-
-    #[test]
-    fn a_nested_literal_that_leaves_out_a_sometimes_sent_field_is_a_break() {
-        // `color` has `skip_serializing_if`, and the callee requires it.
-        let release = |writes: Option<&[&str]>| {
-            let mut bundle = nested_paths_release(true, &["name"], writes);
-            // Only the request holds `Details` here.
-            let response = &mut ep(&mut bundle, "get_item").response;
-            response.serialized.retain(|f| f.rust_name != "details");
-            response.deserialized.retain(|f| f.rust_name != "details");
-            let shape = &mut bundle.types[0].shape;
-            shape.serialized[0].required = false;
-            shape.deserialized[0].required = true;
-            bundle
-        };
-        let not_sent = BreakKind::RequestFieldNotSent("details.color".to_owned());
-        let left_out = release(Some(&["details", "details.size", "name"]));
-        let report = compare(&left_out, &left_out);
-        assert_eq!(kinds(&report.callee_first), std::slice::from_ref(&not_sent));
-        assert_eq!(kinds(&report.caller_first), [not_sent]);
-        for writes in [
-            Some(["details", "details.color", "name"].as_slice()),
-            Some(["details", "name"].as_slice()),
-            None,
-        ] {
-            let bundle = release(writes);
-            assert_eq!(
-                compare(&bundle, &bundle),
-                Report::default(),
-                "{writes:?}: a set or unknown `color` is sent"
-            );
-        }
-    }
-
-    #[test]
-    fn a_nested_read_applies_only_to_the_field_it_names() {
-        // `billing` shares the `Details` type, and no caller reads its
-        // `color`.
-        let with_billing = |mut bundle: Bundle| {
-            let item = ep(&mut bundle, "get_item");
-            let mut second = item.response.serialized.last().expect("details").clone();
-            second.rust_name = "billing".to_owned();
-            second.wire_name = "billing".to_owned();
-            item.response.serialized.push(second.clone());
-            item.response.deserialized.push(second);
-            bundle
-        };
-        let deployed = with_billing(nested_paths_release(
-            true,
-            &["billing.size", "details.color"],
-            Some(&["name"]),
-        ));
-        let current = with_billing(nested_paths_release(
-            false,
-            &["billing.size"],
-            Some(&["name"]),
-        ));
-        let report = compare(&deployed, &current);
-        assert_eq!(
-            kinds(&report.callee_first),
-            [BreakKind::ResponseFieldMissing("details.color".to_owned())]
-        );
-    }
-
-    #[test]
-    fn a_read_through_a_recursive_type_resolves_at_each_level() {
-        // `Details.inner: Option<Box<Details>>`.
-        let release = |with_color: bool| {
-            let mut bundle = nested_paths_release(with_color, &["details.inner.color"], None);
-            let mut inner = field("inner", "inner", "Option<Box<Details>>", true);
-            inner.nested = vec!["mesh-catalog::Details".to_owned()];
-            let shape = &mut bundle.types[0].shape;
-            shape.serialized.push(inner.clone());
-            inner.required = false;
-            shape.deserialized.push(inner);
-            bundle
-        };
-        let report = compare(&release(true), &release(false));
-        assert_eq!(
-            kinds(&report.callee_first),
-            [BreakKind::ResponseFieldMissing(
-                "details.inner.color".to_owned()
-            )]
-        );
-    }
-
-    #[test]
-    fn an_optional_nested_event_field_a_consumer_reads_removed_is_a_break() {
-        let release = |with_color: bool, reads: &[&str]| {
-            let mut bundle = nested_paths_release(with_color, &["name"], None);
-            let mut payload = contact_shape(&[("id", "i64", true)]);
-            let mut nested = field("details", "details", "Details", true);
-            nested.nested = vec!["mesh-catalog::Details".to_owned()];
-            payload.serialized.push(nested.clone());
-            payload.deserialized.push(nested);
-            bundle.events = vec![event(1, payload)];
-            bundle.listeners = vec![listener("on_contact", "contact.updated", reads)];
-            bundle
-        };
-        let report = compare(&release(true, &["details.color"]), &release(false, &["id"]));
-        assert_eq!(
-            kinds(&report.callee_first),
-            [BreakKind::EventFieldMissing("details.color".to_owned())]
-        );
-        assert!(report.caller_first.is_empty(), "{report:?}");
-    }
-
-    #[test]
-    fn a_nested_read_in_an_untyped_bundle_checks_the_first_segment_only() {
-        // Format 1 has no nested types, so `details.color` cannot be looked
-        // up. Its first segment still can.
-        let mut deployed = nested_paths_release(true, &["details.color"], None);
-        deployed.format = BUNDLE_FORMAT;
-        let mut current = deployed.clone();
-        let item = ep(&mut current, "get_item");
-        item.response
-            .serialized
-            .retain(|f| f.rust_name != "details");
-        current.callers.retain(|c| c.function != "show_item");
-        let report = compare(&deployed, &current);
-        assert!(
-            kinds(&report.callee_first)
-                .contains(&BreakKind::ResponseFieldMissing("details".to_owned())),
-            "{report:?}"
-        );
-        current = deployed.clone();
-        current.types = vec![details(vec![plain("size", true)])];
-        current.callers.clear();
-        assert!(
-            compare(&deployed, &current).callee_first.is_empty(),
-            "an untyped bundle does not look into `Details`"
-        );
-    }
-
-    #[test]
-    fn a_written_field_the_type_may_skip_is_sent_only_if_its_own_release_requires_it() {
-        // `#[serde(default, skip_serializing_if = "Vec::is_empty")] tags`.
-        // The deployed call site sets `tags: vec![]`, which serde leaves out.
-        // The new callee drops `default`.
-        let release = |required_on_decode: bool, writes: &[&str]| {
-            let mut bundle = nested_paths_release(true, &["name"], Some(writes));
-            let mut tags = field("tags", "tags", "Vec<String>", false);
-            let shape = &mut bundle.types[0].shape;
-            shape.serialized.push(tags.clone());
-            tags.required = required_on_decode;
-            shape.deserialized.push(tags);
-            bundle
-        };
-        let deployed = release(false, &["details", "details.tags", "name"]);
-        let current = release(true, &["details", "details.tags", "name"]);
-        let report = compare(&deployed, &current);
-        assert_eq!(
-            kinds(&report.callee_first),
-            [BreakKind::RequestFieldNotSent("details.tags".to_owned())]
-        );
-    }
-
-    #[test]
-    fn a_written_top_level_field_the_type_may_skip_is_sent_only_if_its_own_release_requires_it() {
-        let release = |required_on_decode: bool| {
-            let mut bundle = release_1();
-            let req = &mut ep(&mut bundle, "create_item").request;
-            req.serialized.push(plain("token", false));
-            req.deserialized.push(plain("token", required_on_decode));
-            bundle.callers[0].writes = Some(vec!["name".to_owned(), "token".to_owned()]);
-            bundle
-        };
-        let report = compare(&release(false), &release(true));
-        assert_eq!(
-            kinds(&report.callee_first),
-            [BreakKind::RequestFieldNotSent("token".to_owned())]
-        );
-        assert!(report.caller_first.is_empty(), "{report:?}");
-    }
-
-    #[test]
-    fn a_nested_path_matches_by_rust_name_and_reports_the_wire_name() {
-        // `details` is `info` on the wire, and `color` is `colour`.
-        let release = |with_color: bool, reads: &[&str], writes: &[&str]| {
-            let mut bundle = nested_paths_release(with_color, reads, Some(writes));
-            for e in &mut bundle.endpoints {
-                for f in e
-                    .request
-                    .serialized
-                    .iter_mut()
-                    .chain(&mut e.request.deserialized)
-                    .chain(&mut e.response.serialized)
-                    .chain(&mut e.response.deserialized)
-                {
-                    if f.rust_name == "details" {
-                        f.wire_name = "info".to_owned();
-                    }
-                }
-            }
-            let shape = &mut bundle.types[0].shape;
-            for f in shape.serialized.iter_mut().chain(&mut shape.deserialized) {
-                if f.rust_name == "color" {
-                    f.wire_name = "colour".to_owned();
-                }
-            }
-            bundle
-        };
-        let deployed = release(
-            true,
-            &["details", "details.color"],
-            &["details", "details.color", "name"],
-        );
-        let current = release(false, &["details", "details.size"], &["details", "name"]);
-        let report = compare(&deployed, &current);
-        let found = kinds(&report.callee_first);
-        assert_eq!(found.len(), 2, "{report:?}");
-        assert!(found.contains(&BreakKind::ResponseFieldMissing("info.colour".to_owned())));
-        assert!(found.contains(&BreakKind::RequestFieldDropped("info.colour".to_owned())));
-    }
-
-    #[test]
-    fn a_nested_write_applies_only_to_the_field_it_names() {
-        // `billing` shares the `Details` type, and the call site does not set
-        // its `color`. A result kept per type pair only would hide one break.
-        let with_billing = |mut bundle: Bundle| {
-            let req = &mut ep(&mut bundle, "create_item").request;
-            let mut second = req.serialized.last().expect("details").clone();
-            second.rust_name = "billing".to_owned();
-            second.wire_name = "billing".to_owned();
-            req.serialized.push(second.clone());
-            req.deserialized.push(second);
-            bundle
-        };
-        let writes = [
-            "billing",
-            "billing.size",
-            "details",
-            "details.color",
-            "name",
-        ];
-        let deployed = with_billing(nested_paths_release(true, &["name"], Some(&writes)));
-        let current = with_billing(nested_paths_release(
-            false,
-            &["name"],
-            Some(&["billing", "billing.size", "details", "name"]),
-        ));
-        let report = compare(&deployed, &current);
-        assert_eq!(
-            kinds(&report.callee_first),
-            [BreakKind::RequestFieldDropped("details.color".to_owned())]
-        );
-    }
-
-    #[test]
-    fn a_new_nested_field_a_new_call_site_sets_needs_the_callee_first() {
-        let deployed = nested_paths_release(false, &["name"], Some(&["details", "name"]));
-        let current =
-            nested_paths_release(true, &["name"], Some(&["details", "details.color", "name"]));
-        let report = compare(&deployed, &current);
-        assert!(report.callee_first.is_empty(), "{report:?}");
-        assert_eq!(
-            kinds(&report.caller_first),
-            [BreakKind::RequestFieldDropped("details.color".to_owned())]
-        );
-        assert_eq!(report.verdict(), Verdict::CalleeFirst);
-    }
-
-    #[test]
-    fn a_nested_field_the_call_site_does_not_set_can_be_dropped() {
-        let writes = ["details", "details.size", "name"];
-        let deployed = nested_paths_release(true, &["name"], Some(&writes));
-        let current = nested_paths_release(false, &["name"], Some(&writes));
-        assert_eq!(compare(&deployed, &current), Report::default());
-    }
-
-    /// `nested_paths_release` with an event whose payload holds `details`,
-    /// and one consumer that reads `reads`.
-    fn nested_event_release(with_color: bool, reads: &[&str]) -> Bundle {
-        let mut bundle = nested_paths_release(with_color, &["name"], None);
-        let mut payload = contact_shape(&[("id", "i64", true)]);
-        let mut nested = field("details", "details", "Details", true);
-        nested.nested = vec!["mesh-catalog::Details".to_owned()];
-        payload.serialized.push(nested.clone());
-        payload.deserialized.push(nested);
-        bundle.events = vec![event(1, payload)];
-        bundle.listeners = vec![listener("on_contact", "contact.updated", reads)];
-        bundle
-    }
-
-    #[test]
-    fn a_new_consumer_of_a_new_optional_nested_event_field_needs_the_producer_first() {
-        let deployed = nested_event_release(false, &["details", "details.size"]);
-        let current = nested_event_release(true, &["details", "details.color"]);
-        let report = compare(&deployed, &current);
-        assert!(report.callee_first.is_empty(), "{report:?}");
-        assert_eq!(
-            kinds(&report.caller_first),
-            [BreakKind::EventFieldMissing("details.color".to_owned())]
-        );
-        assert_eq!(report.verdict(), Verdict::CalleeFirst);
-    }
-
-    #[test]
-    fn a_read_and_removed_required_nested_field_is_one_break() {
-        let mut deployed = nested_release();
-        deployed.callers = vec![call(
-            "show_item",
-            "get_item",
-            &["details", "details.color"],
-            None,
-        )];
-        let mut current = nested_release();
-        current.types = vec![details(vec![plain("size", true)])];
-        current.callers = vec![call(
-            "show_item",
-            "get_item",
-            &["details", "details.size"],
-            None,
-        )];
-        let report = compare(&deployed, &current);
-        assert_eq!(
-            kinds(&report.callee_first),
-            [BreakKind::ResponseFieldMissing("details.color".to_owned())]
-        );
-    }
-
-    #[test]
-    fn a_format_4_caller_has_top_level_reads_only() {
-        // A bundle older than format 5 records `details`, not `details.color`,
-        // so the removal of the optional `color` does not show.
-        let mut deployed = nested_paths_release(true, &["details"], Some(&["name"]));
-        deployed.format = crate::contracts::bundle::WIRE_TYPE_FORMAT;
-        let mut current = nested_paths_release(false, &["details"], Some(&["name"]));
-        current.format = crate::contracts::bundle::NESTED_PATHS_FORMAT;
-        assert_eq!(compare(&deployed, &current), Report::default());
-    }
-
-    #[test]
-    fn a_bare_parent_beside_its_dotted_paths_changes_nothing() {
-        // The macros keep `details` beside `details.color`, so an older CLI
-        // still sees the top-level read.
-        let with = nested_paths_release(true, &["details", "details.color"], None);
-        let without = nested_paths_release(true, &["details.color"], None);
-        let current = nested_paths_release(false, &["details.size"], None);
-        assert_eq!(compare(&with, &current), compare(&without, &current));
     }
 }

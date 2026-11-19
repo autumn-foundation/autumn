@@ -61,8 +61,7 @@ impl Entropy for RecordingEntropy {
     fn next_u64(&self) -> u64 {
         let drawn = self.inner.next_u64();
         if let Some(scope) = current_scope() {
-            // Recorded in the same little-endian spelling `next_u64` is
-            // reconstructed from on replay, so the round trip is exact.
+            // Little-endian, matching how replay rebuilds `next_u64`.
             scope.record_random(drawn.to_le_bytes().to_vec());
         }
         drawn
@@ -179,9 +178,8 @@ impl Entropy for ReplayEntropy {
     }
 
     fn fill_bytes(&self, dest: &mut [u8]) {
-        // A zero fill is the honest answer for an exhausted tape: it is
-        // deterministic, it is obviously not real randomness in a debugger,
-        // and the over-draw counter makes the verdict say so out loud.
+        // Zero-fill when there is no recorded draw or it is short: deterministic and visibly
+        // not real randomness. Over-draws and width mismatches are counted for the verdict.
         dest.fill(0);
         let Some(bytes) = self.next_draw(dest.len()) else {
             return;
@@ -265,9 +263,8 @@ mod tests {
 
     #[tokio::test]
     async fn draws_outside_the_replayed_request_do_not_consume_the_tape() {
-        // Symmetric with the clock: work the handler spawned carried no
-        // capture scope when the failure was recorded, so it must not eat
-        // draws the recorded handler is still owed.
+        // Spawned work had no capture scope at record time, so it must not consume draws owed to
+        // the recorded handler.
         let replay = ReplayEntropy::new(vec![vec![7u8; 16]]);
         let _ = replay.uuid_v4();
         assert_eq!(replay.unconsumed(), 1);

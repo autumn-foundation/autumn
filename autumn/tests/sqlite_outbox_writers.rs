@@ -309,11 +309,11 @@ async fn webhook_dispatch_from_the_outbox_survives_a_second_relay_send() {
 mod sql_webhook_store {
     use std::collections::HashMap;
 
+    use autumn_web::time::Timestamp;
     use autumn_web::webhook_outbound::{
         OutboundWebhookHandler as _, SqlOutboundWebhookStore, WebhookDeliveryLog,
         WebhookSubscription, WebhookSubscriptionStatus,
     };
-    use chrono::TimeZone as _;
 
     use super::substrate;
 
@@ -342,7 +342,7 @@ mod sql_webhook_store {
             max_attempts: 5,
             is_dlq: false,
             last_error: error.map(str::to_owned),
-            timestamp: chrono::Utc.timestamp_millis_opt(1_700_000_000_123).unwrap(),
+            timestamp: Timestamp::from_millisecond(1_700_000_000_123).unwrap(),
         }
     }
 
@@ -533,7 +533,7 @@ mod sql_webhook_store {
         let mut dead = log("dead", Some(500), Some("500"));
         dead.is_dlq = true;
         let mut fresh = log("fresh", Some(200), None);
-        fresh.timestamp = chrono::Utc.timestamp_millis_opt(1_800_000_000_000).unwrap();
+        fresh.timestamp = Timestamp::from_millisecond(1_800_000_000_000).unwrap();
         for entry in [
             log("delivered", Some(204), None),
             log("pending", None, None),
@@ -545,7 +545,7 @@ mod sql_webhook_store {
             store.replace_delivery_log(entry).await.unwrap();
         }
 
-        let cutoff = chrono::Utc.timestamp_millis_opt(1_750_000_000_000).unwrap();
+        let cutoff = Timestamp::from_millisecond(1_750_000_000_000).unwrap();
         assert_eq!(store.purge_deliveries_before(cutoff).await.unwrap(), 1);
         assert_eq!(store.get_delivery_log("delivered").await.unwrap(), None);
         for kept in ["pending", "retrying", "timed-out", "dead", "fresh"] {

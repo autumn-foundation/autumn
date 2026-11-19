@@ -1,0 +1,6 @@
+ calls | temp_blks_written |                                                                          left                                                                          
+-------+-------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+    27 |              2871 | SELECT c."id" AS id, c."parent_id" AS parent_id, c."author_id" AS author_id, c."body" AS body, c."created_at" AS created_at, __autumn_cmt_author."user
+     5 |             70178 | SELECT "post_id" AS agg_key, CAST(SUM("value") AS bigint) AS agg_val FROM "votes" WHERE "post_id" IS NOT NULL AND ($1 IS NULL OR "post_id" = $1) AND (
+(2 rows)
+

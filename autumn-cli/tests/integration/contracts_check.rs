@@ -159,15 +159,18 @@ fn a_required_field_removed_from_a_nested_type_is_a_break() {
 
 #[test]
 fn an_optional_nested_field_a_caller_reads_removed_is_a_break() {
-    // `item.details.color` with `color: Option<String>`. Its decode does not
-    // fail, so only the read-set shows the break.
+    // The deployed caller reads `item.details.color`.
     let report = golden_descriptors("nested_optional_read_field_removed", 3);
+    let (old_callers, new_callers) = report
+        .split_once("If the callers ship first")
+        .expect("both windows");
     assert!(
-        report.contains("reads response field `details.color`, which the new callee"),
+        old_callers.contains("reads response field `details.color`"),
         "{report}"
     );
+    assert!(new_callers.contains("ok"), "{report}");
     assert!(
-        report.contains("Deploy mesh-storefront before catalog"),
+        report.contains("safe only if the callers ship first"),
         "{report}"
     );
 }
@@ -175,22 +178,44 @@ fn an_optional_nested_field_a_caller_reads_removed_is_a_break() {
 #[test]
 fn a_new_optional_nested_field_a_new_caller_reads_names_the_deploy_order() {
     let report = golden_descriptors("nested_optional_field_read_by_new_caller", 3);
+    let (_, new_callers) = report
+        .split_once("If the callers ship first")
+        .expect("both windows");
     assert!(
-        report.contains("reads response field `details.color`, which the deployed callee"),
+        new_callers.contains("reads response field `details.color`"),
         "{report}"
     );
     assert!(
-        report.contains("Deploy catalog before mesh-storefront"),
+        report.contains("safe only if the callees ship first"),
         "{report}"
     );
 }
 
 #[test]
-fn a_nested_field_the_call_sets_and_the_callee_drops_is_a_break() {
-    // `NewItem { details: Details { color: Some(c), ..Default::default() }, ..Default::default() }`.
+fn a_nested_field_the_call_site_sets_and_the_callee_drops_is_a_break() {
+    // The deployed caller sets `details: Details { color: Some(..), .. }`.
     let report = golden_descriptors("nested_request_field_dropped", 3);
+    let (old_callers, _) = report
+        .split_once("If the callers ship first")
+        .expect("both windows");
     assert!(
-        report.contains("sets request field `details.color`, and the new callee ignores it"),
+        old_callers.contains("sets request field `details.color`"),
+        "{report}"
+    );
+    assert!(
+        report.contains("safe only if the callers ship first"),
+        "{report}"
+    );
+}
+
+#[test]
+fn an_optional_nested_event_field_a_consumer_reads_removed_is_a_break() {
+    let report = golden_descriptors("nested_event_field_removed", 3);
+    let (old_callers, _) = report
+        .split_once("If the callers ship first")
+        .expect("both windows");
+    assert!(
+        old_callers.contains("reads field `details.color`"),
         "{report}"
     );
 }
@@ -238,6 +263,13 @@ fn a_removed_response_field_that_a_caller_reads_fails() {
 #[test]
 fn a_removed_response_field_that_no_caller_reads_passes() {
     golden("removed_unread_response_field", 0);
+}
+
+#[test]
+fn a_type_change_of_a_response_field_fails_even_when_no_caller_reads_it() {
+    // The deployed caller decodes every field, also one it does not read.
+    let report = golden("response_field_type_changed", 1);
+    assert!(report.contains("`subtitle` is `Option<i64>`"), "{report}");
 }
 
 #[test]

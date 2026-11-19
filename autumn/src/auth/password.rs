@@ -123,8 +123,7 @@ impl PasswordPolicy {
     }
 }
 
-// Manual `Debug`: `http_client::Client` is not `Debug`, so we summarize the
-// breach-client presence instead of the client itself.
+// Manual `Debug`: `http_client::Client` is not `Debug`, so show only whether one is set.
 impl std::fmt::Debug for PasswordPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("PasswordPolicy");
@@ -300,10 +299,8 @@ async fn check_breach(password: &str, policy: &PasswordPolicy) -> BreachOutcome 
         _ => return BreachOutcome::Unreachable,
     };
 
-    // Body is `SUFFIX:COUNT` per line (uppercase hex suffixes). We look for our
-    // suffix anchored to the `:` count separator so a partial hex overlap can't
-    // false-positive. Matching by substring (rather than strict line parsing)
-    // keeps this robust to CRLF vs LF line endings.
+    // Body is `SUFFIX:COUNT` per line. Anchoring on `:` stops a partial hex overlap from
+    // matching; a substring search tolerates both CRLF and LF line endings.
     let body = resp.text().to_uppercase();
     let needle = format!("{suffix}:");
     if body.contains(&needle) {
@@ -337,7 +334,6 @@ pub async fn validate_password(
 ) -> PasswordValidation {
     let mut failures = Vec::new();
 
-    // 1. Length (Unicode-safe).
     let actual = password.chars().count();
     if actual < policy.min_length {
         failures.push(PasswordFailure::TooShort {
@@ -346,29 +342,20 @@ pub async fn validate_password(
         });
     }
 
-    // Lowercased once and shared: the common-corpus check below and
-    // `is_similar_to_context` both need it, and it's always needed (context
-    // similarity runs unconditionally), so hoisting it here costs nothing
-    // extra when `reject_common` is off and saves one allocation when it's on.
+    // Shared by the common-corpus and context-similarity checks.
     let lower = password.to_lowercase();
 
-    // 2. Common/weak corpus.
     if policy.reject_common && common_passwords().contains(lower.as_str()) {
         failures.push(PasswordFailure::TooCommon);
     }
 
-    // 3. Context similarity.
     if is_similar_to_context(&lower, context) {
         failures.push(PasswordFailure::SimilarToContext);
     }
-    // Drop explicitly rather than let scope do it: `validate_password` is
-    // async and `lower` would otherwise live in the generated future's state
-    // across the `.await` below, holding the allocation for as long as the
-    // breach-check request is in flight instead of releasing it once the two
-    // synchronous checks above are done with it.
+    // Drop before the `.await` so the future does not hold the allocation while the breach
+    // request is in flight.
     drop(lower);
 
-    // 4. Breach check.
     if policy.breach_check != BreachCheck::Off {
         match check_breach(password, policy).await {
             BreachOutcome::Breached => failures.push(PasswordFailure::Breached),
@@ -458,9 +445,8 @@ mod tests {
 
     #[tokio::test]
     async fn length_counts_unicode_scalar_values() {
-        // 4 multibyte chars — byte length would be 8+ but char count is 4.
+        // "héllo" is 6 bytes but 5 chars; `actual: 5` proves chars are counted.
         let v = validate_password("héllo", &policy(8, false, BreachCheck::Off), &[]).await;
-        // "héllo" is 5 chars < 8.
         assert!(
             v.failures
                 .iter()
@@ -521,10 +507,7 @@ mod tests {
 
     #[test]
     fn similarity_helper_ignores_unrelated_and_empty() {
-        // `is_similar_to_context` now takes an already-lowercased password
-        // (callers, i.e. `validate_password`, lowercase once and share it) —
-        // lowercase these inline so the assertions still exercise the same
-        // real-world (mixed-case) inputs as before.
+        // `is_similar_to_context` expects an already-lowercased password.
         assert!(!is_similar_to_context(
             &"Tr0ub4dour&3-Staple-Horse".to_lowercase(),
             &["john@example.com"]

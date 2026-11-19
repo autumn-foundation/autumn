@@ -150,7 +150,7 @@ async fn metrics_record_the_client_visible_status_not_the_pre_filter_one() {
 ///
 /// `router.rs`: "inner to `RequestIdLayer` (so the request id is available when
 /// a handler panics) and outer to the timeout, user layers, and handler".
-#[cfg(feature = "reporting")]
+#[cfg(feature = "error-reporting")]
 #[tokio::test]
 async fn handler_panic_becomes_a_500_that_still_carries_the_request_id() {
     let client = TestApp::new().routes(routes![panic_handler]).build();

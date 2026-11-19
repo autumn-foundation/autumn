@@ -85,9 +85,8 @@ pub const ALLOWED_TAGS: &[&str] = &[
     "sub", "sup", "abbr", "cite", "q", "time", "address", "wbr",
     // Lists
     "ul", "ol", "li", "dl", "dt", "dd",
-    // Links and media. `img` is allowed (unlike the rich-text path, which
-    // drops it): a generated UI is chrome the app is rendering on purpose, and
-    // its image sources are scheme-checked below.
+    // Links and media. Unlike the rich-text path, `img` is allowed: the app
+    // renders this UI on purpose, and image sources are scheme-checked below.
     "a", "img", "picture", "source", "audio", "video", "track",
     // Tables
     "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption",
@@ -107,10 +106,8 @@ pub const ALLOWED_ATTRS: &[&str] = &[
     "translate", "slot", "part",
     // Links
     "target", "rel", "download", "hreflang", "type", "referrerpolicy",
-    // Media
-    // `srcset` is absent on purpose: it holds a comma-separated *list* of URLs
-    // with descriptors, so a single-value scheme check does not cover it and a
-    // list parser here would be a second URL grammar to get wrong. Use `src`.
+    // Media. `srcset` is absent on purpose: it holds a list of URLs, which the
+    // single-value scheme check does not cover. Use `src`.
     "alt", "width", "height", "loading", "decoding",
     "controls", "autoplay", "loop", "muted", "playsinline", "preload",
     "kind", "srclang", "label", "default",
@@ -296,11 +293,9 @@ pub fn is_allowed_url(url: &str) -> bool {
         .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
         .collect();
 
-    // Read the characters up to the scheme delimiter. A `/`, `?` or `#` before
-    // any `:` means the URL is relative and there is no scheme to check —
-    // `/a:b` is a path, not a scheme. Accumulated char by char rather than
-    // sliced at the delimiter so no byte index is ever taken on a string whose
-    // contents came from a document.
+    // A `/`, `?` or `#` before any `:` means a relative URL: `/a:b` is a path,
+    // not a scheme. Built char by char so no byte index is taken on document
+    // text.
     let mut scheme = String::new();
     let mut delimited = false;
     for c in stripped.chars() {

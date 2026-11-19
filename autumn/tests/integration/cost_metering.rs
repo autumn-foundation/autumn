@@ -27,6 +27,7 @@ fn metered_config() -> AutumnConfig {
     config.actuator.sensitive = true;
     config.tenancy.enabled = true;
     "header".clone_into(&mut config.tenancy.source);
+    config.tenancy.header_trust = Some(autumn_web::config::TenantHeaderTrust::AnyClient);
     "x-tenant-id".clone_into(&mut config.tenancy.header_name);
     config
 }
@@ -207,6 +208,7 @@ async fn an_inserted_accountant_does_not_report_metering_as_on() {
 
 /// AC: the signal is live. An operator changes the runtime-config key and the
 /// running app follows it, with no redeploy.
+#[cfg(feature = "runtime-config")]
 #[tokio::test]
 async fn signal_follows_runtime_config_without_redeploy() {
     use autumn_web::runtime_config::{

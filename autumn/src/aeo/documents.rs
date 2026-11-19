@@ -2180,8 +2180,8 @@ mod tests {
             assert_eq!(card["version"], "2.1.0");
             assert_eq!(card["remotes"][0]["type"], "streamable-http");
             assert_eq!(card["remotes"][0]["url"], "https://shop.example.com/mcp");
-            // Codex review (P2): the modern protocol is advertised too; the
-            // `initialize` default stays the newest legacy version.
+            // The modern protocol is advertised too; the `initialize` default
+            // stays the newest legacy version.
             assert_eq!(
                 card["remotes"][0]["supportedProtocolVersions"][0],
                 "2026-07-28"
@@ -2213,7 +2213,7 @@ mod tests {
             let doc = render(&facts, &origin(), path).unwrap();
             for want in [
                 ("access-control-allow-origin", "*"),
-                // Codex review (P2): a `HEAD` revalidation preflights too.
+                // A `HEAD` revalidation preflights too.
                 ("access-control-allow-methods", "GET, HEAD"),
                 (
                     "access-control-allow-headers",
@@ -2683,7 +2683,7 @@ mod tests {
             "{localized}"
         );
 
-        // Codex review (P2): an app below a `base_url` prefix links there.
+        // An app below a `base_url` prefix links there.
         let shop = homepage_link_header(&api_site(), "/", "/shop");
         for want in [
             "</shop/.well-known/api-catalog>; rel=\"api-catalog\"",

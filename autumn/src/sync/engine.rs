@@ -171,41 +171,20 @@ impl SyncEngine {
     pub async fn sync_once(&self) -> Result<SyncReport, SyncError> {
         let _pass = self.sync_lock.lock().await;
         let mut report = SyncReport::default();
-        // Crash-state healing: synced rows alongside a cursor of 0 mean a
-        // previous pass persisted rows without the cursor (impossible via
-        // today's atomic `apply_remote_page`, but reachable through stores
-        // written by older builds — or, routinely, a device whose first
-        // sync pushed fine and then lost the radio before the pull). A
-        // from-0 session is exempt from the server's tombstone-horizon
-        // check (it looks like a fresh device), so deletions GC'd since
-        // those rows were written would never arrive and stale rows would
-        // stay visible forever while the cursor advances past them.
-        //
-        // The heal is reconcile-shaped, NOT clear-first: the full from-zero
-        // snapshot is fetched before anything local is touched, and one
-        // store transaction then applies it, drops synced rows absent from
-        // it, and lands the cursor. Clearing up front would delete
-        // acknowledged-but-never-pulled local rows while still offline —
-        // transport failures must leave local state untouched, and the
-        // push-ok-pull-failed first sync is exactly a transport failure.
+        // Synced rows with a cursor of 0 mean rows were stored without the cursor (an older
+        // store, or a first sync whose push succeeded and whose pull failed). A from-0 session
+        // is exempt from the server's tombstone-horizon check, so deletions GC'd since then
+        // would never arrive. Heal with a snapshot reconcile, not by clearing first: clearing
+        // would drop acknowledged local rows while offline, and a transport failure must leave
+        // local state untouched.
         if self.store.cursor()? == 0 && self.store.has_synced_rows()? {
             self.resync_from_snapshot(&mut report).await?;
         }
         self.push_pending(&mut report).await?;
         if self.pull_updates(&mut report).await? {
-            // Stale cursor: the server demands a full resync. Same
-            // clear-after-success shape as the zero-cursor heal above —
-            // the complete from-zero snapshot is fetched BEFORE anything
-            // local is touched, then one store transaction reconciles and
-            // lands the cursor (pending writes survive and replay). A
-            // failure mid-snapshot leaves the pre-resync state — including
-            // rows just acked by the push above — fully intact, and the
-            // still-stale cursor makes the server demand the resync again
-            // on the next pass; the snapshot runs with session=0, which the
-            // server never asks to resync, so multi-page snapshots cannot
-            // trip the horizon check mid-pagination (a GC racing the
-            // snapshot is instead detected CLIENT-side via the per-page
-            // horizon and restarts the snapshot — see resync_from_snapshot).
+            // Stale cursor: the server demands a full resync. Pending writes survive the
+            // reconcile and are pushed again. A failure mid-snapshot leaves local state intact,
+            // and the still-stale cursor makes the server demand the resync on the next pass.
             self.resync_from_snapshot(&mut report).await?;
             self.push_pending(&mut report).await?;
         }
@@ -243,8 +222,7 @@ impl SyncEngine {
         let limit = self.config.pull_batch_size.clamp(1, MAX_PULL_LIMIT);
         let mut snapshot: Vec<RemoteRow> = Vec::new();
         let mut cursor: Version = 0;
-        // The horizon observed on the CURRENT attempt's first page (None
-        // until that page arrives).
+        // Horizon from the current attempt's first page.
         let mut attempt_horizon: Option<Version> = None;
         let mut restarts: usize = 0;
         let (final_cursor, tombstone_horizon) = loop {
@@ -274,9 +252,8 @@ impl SyncEngine {
                 } => {
                     match attempt_horizon {
                         None => attempt_horizon = Some(tombstone_horizon),
-                        // The horizon moved mid-snapshot: a GC may have
-                        // dropped tombstones for rows already buffered.
-                        // Restart from scratch (see the doc comment).
+                        // The horizon moved mid-snapshot: a GC may have dropped tombstones for
+                        // rows already buffered, so restart from scratch.
                         Some(start) if tombstone_horizon != start => {
                             restarts = restarts.saturating_add(1);
                             if restarts > MAX_SNAPSHOT_RESTARTS {
@@ -372,8 +349,7 @@ impl SyncEngine {
     async fn pull_updates(&self, report: &mut SyncReport) -> Result<bool, SyncError> {
         let session_start = self.store.cursor()?;
         let limit = self.config.pull_batch_size.clamp(1, MAX_PULL_LIMIT);
-        // Horizon observed on the first page — only consulted for from-zero
-        // sessions, which the server exempts from its own horizon check.
+        // Only consulted for from-zero sessions, which the server exempts from its horizon check.
         let mut first_page_horizon: Option<Version> = None;
         loop {
             let cursor = self.store.cursor()?;
@@ -397,18 +373,10 @@ impl SyncEngine {
                     next_cursor,
                     tombstone_horizon,
                 } => {
-                    // A from-zero session (fresh device paging its first
-                    // sync) is exempt from the server's horizon check, so a
-                    // GC between its pages must be detected here — exactly
-                    // the race `resync_from_snapshot` guards against: an
-                    // early page applied a live row whose delete was GC'd
-                    // before a later page, so the tombstone never arrives
-                    // while the final cursor lands past the new horizon.
-                    // Treat it like a server-demanded resync: the snapshot
-                    // path re-fetches from scratch and carries its own
-                    // bounded restart guard. Sessions with a non-zero start
-                    // need nothing — the server itself answers
-                    // FullResyncRequired once the horizon passes them.
+                    // A from-zero session is exempt from the server's horizon check, so a GC
+                    // between its pages must be caught here: an early page may hold a live row
+                    // whose tombstone was GC'd before a later page. Treat it as a server-demanded
+                    // resync. Non-zero sessions get `FullResyncRequired` from the server instead.
                     if session_start == 0 {
                         match first_page_horizon {
                             None => first_page_horizon = Some(tombstone_horizon),
@@ -419,16 +387,11 @@ impl SyncEngine {
                     let page_len = rows.len();
                     let caught_up =
                         rows.is_empty() || i64::try_from(page_len).unwrap_or(i64::MAX) < limit;
-                    // End of pagination lands at/above the horizon so a
-                    // horizon left above the newest surviving row (GC right
-                    // after a delete) cannot strand the cursor in a
-                    // perpetual full-resync loop. Rows and cursor persist
-                    // in ONE store transaction: a crash between them would
-                    // leave synced rows with a stale cursor — at cursor 0
-                    // that state pulls with session=0, which the server
-                    // exempts from the horizon check, so GC'd deletions
-                    // would never reach this device (see
-                    // `SyncStore::apply_remote_page`).
+                    // The last page lands the cursor at or above the horizon: a horizon above the
+                    // newest surviving row (GC right after a delete) would otherwise loop full
+                    // resyncs forever. Rows and cursor persist in one transaction: a crash between
+                    // them could leave synced rows at cursor 0, which pull with session=0 and never
+                    // see GC'd deletions.
                     let new_cursor = if caught_up {
                         next_cursor.max(tombstone_horizon)
                     } else {

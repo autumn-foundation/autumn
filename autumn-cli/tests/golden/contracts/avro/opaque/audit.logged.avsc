@@ -1,0 +1,5 @@
+{
+  "type": "bytes",
+  "doc": "topic: audit.logged, version 1. Opaque event: the contract has no field list, so the data is the JSON text as bytes",
+  "autumn.topic": "audit.logged"
+}

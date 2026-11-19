@@ -1,0 +1,7 @@
+# 100k vote inserts (ON CONFLICT DO NOTHING), CHECKPOINT before each, pg_current_wal_lsn() delta
+WITH index    rows=99999 WAL=253063352 secs=2.62
+WITH index    rows=99998 WAL=248905576 secs=2.83
+WITHOUT index rows=99997 WAL=235537040 secs=2.50
+WITHOUT index rows=99996 WAL=235529248 secs=2.51
+mean WAL 250,984,464 vs 235,533,144 = +6.6%; mean insert time 2.73s vs 2.50s (noisy, not gated)
+migration: up.sql 2.1s (CREATE INDEX CONCURRENTLY), down.sql 0.11s; index valid, 90 MB

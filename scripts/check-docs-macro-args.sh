@@ -273,12 +273,18 @@ ROOT = pathlib.Path(sys.argv[2])
 # ── Truth set ────────────────────────────────────────────────────────────────
 
 # The macro crate split (#2809) moved `model.rs`, `repository.rs` and
-# `service.rs` into sibling proc-macro crates. File names stay unique across
-# the roots, so `OWNERS` below still names a bare file.
+# `service.rs` into sibling proc-macro crates. `OWNERS` below still names a
+# bare file, and `macro_src` resolves it to the first root that holds it.
+#
+# Order matters: the support library has its own `parse.rs`, `graph.rs` and
+# `wire/` files, so its root stays last. Listed earlier, it would hand the
+# route verbs its `parse.rs` in place of the route argument parser.
 MACRO_SRCS = (
     ROOT / "autumn-macros" / "src",
     ROOT / "autumn-macros-model" / "src",
     ROOT / "autumn-macros-repository" / "src",
+    # `query_budget.rs` and `agent_authority.rs` live in the support library.
+    ROOT / "autumn-macros-support" / "src",
 )
 
 

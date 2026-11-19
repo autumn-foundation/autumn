@@ -1,13 +1,13 @@
 //! Saturating time / duration arithmetic for request-path modules.
 //!
-//! `std` and `chrono` both expose *panicking* operators for the everyday
+//! `std` and `jiff` both expose *panicking* operators for the everyday
 //! "deadline = now + ttl" shape:
 //!
 //! * `Instant + Duration` panics when the sum is not representable by the
 //!   platform clock (`Duration::MAX`, `Duration::from_secs(u64::MAX)`, …).
-//! * `DateTime<Utc> + TimeDelta` panics via `expect("`DateTime + TimeDelta`
-//!   overflowed")`.
-//! * `TimeDelta::seconds` panics above `i64::MAX / 1_000` seconds.
+//! * `Timestamp + SignedDuration` panics when the sum leaves
+//!   `[Timestamp::MIN, Timestamp::MAX]`.
+//! * A `u64` second count does not fit `SignedDuration::from_secs`'s `i64`.
 //!
 //! Every one of those inputs is routinely *configuration* (a TTL, a retry
 //! window, a poll interval), which means a bad config value crashes a worker
@@ -39,7 +39,7 @@
 
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 
 /// Clamp horizon (~10 years, `10 * 365 * 24 * 3600`) used when a
 /// caller-supplied TTL would overflow `Instant + Duration`. This constant is
@@ -73,10 +73,8 @@ pub fn saturating_deadline(now: Instant, ttl: Duration) -> Instant {
 /// free under a paused runtime), while `tokio::time::Instant` is a distinct type
 /// from `std::time::Instant` and cannot reuse the same function.
 #[must_use]
-// Currently reached only from the `redis` job worker's maintenance throttle, so
-// a default-feature build has no caller. Kept ungated (and not `#[cfg(feature =
-// "redis")]`) because it is a general helper: the moment any other tokio-timeline
-// deadline needs clamping it should reach for this, not re-derive the policy.
+// Only the `redis` job worker calls this today. It stays ungated so other tokio-timeline
+// deadlines reuse the clamp policy instead of re-deriving it.
 #[cfg_attr(not(feature = "redis"), allow(dead_code))]
 pub fn saturating_tokio_deadline(now: tokio::time::Instant, ttl: Duration) -> tokio::time::Instant {
     now.checked_add(ttl).unwrap_or_else(|| {
@@ -85,36 +83,31 @@ pub fn saturating_tokio_deadline(now: tokio::time::Instant, ttl: Duration) -> to
     })
 }
 
-/// Add `delta` to `now`, clamping to chrono's representable range instead of
-/// panicking.
+/// Add `delta` to `now`, clamping to [`Timestamp`]'s representable range
+/// instead of panicking.
 ///
-/// `DateTime<Utc> + TimeDelta` is `checked_add_signed(..).expect(..)`. When
-/// the sum leaves `[DateTime::MIN_UTC, DateTime::MAX_UTC]` we saturate *in the
-/// direction of the delta's sign*, so a huge positive TTL becomes "never
-/// expires" and a huge negative offset becomes "the beginning of time" —
-/// both of which preserve the comparison the caller was about to make.
-pub fn saturating_dt_add(now: DateTime<Utc>, delta: TimeDelta) -> DateTime<Utc> {
-    now.checked_add_signed(delta).unwrap_or_else(|| {
-        if delta < TimeDelta::zero() {
-            DateTime::<Utc>::MIN_UTC
+/// `Timestamp + SignedDuration` panics on overflow. When the sum leaves
+/// `[Timestamp::MIN, Timestamp::MAX]` we saturate *in the direction of the
+/// delta's sign*, so a huge positive TTL becomes "never expires" and a huge
+/// negative offset becomes "the beginning of time" — both of which preserve
+/// the comparison the caller was about to make.
+pub fn saturating_ts_add(now: Timestamp, delta: SignedDuration) -> Timestamp {
+    now.checked_add(delta).unwrap_or_else(|_| {
+        if delta.is_negative() {
+            Timestamp::MIN
         } else {
-            DateTime::<Utc>::MAX_UTC
+            Timestamp::MAX
         }
     })
 }
 
-/// Build a [`TimeDelta`] from a `u64` second count, clamping to
-/// [`TimeDelta::MAX`] instead of panicking.
+/// Build a [`SignedDuration`] from a `u64` second count, clamping to
+/// [`SignedDuration::MAX`] instead of wrapping.
 ///
-/// `TimeDelta::seconds` panics above `i64::MAX / 1_000` seconds, so the
-/// common `TimeDelta::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX))`
-/// idiom panics *precisely* on the saturating branch it was written to
-/// protect. Pair this with [`saturating_dt_add`] at the addition site.
-pub fn saturating_time_delta_secs(secs: u64) -> TimeDelta {
-    i64::try_from(secs)
-        .ok()
-        .and_then(TimeDelta::try_seconds)
-        .unwrap_or(TimeDelta::MAX)
+/// Counts above `i64::MAX` do not fit a `SignedDuration`'s seconds. Pair
+/// this with [`saturating_ts_add`] at the addition site.
+pub fn saturating_duration_secs(secs: u64) -> SignedDuration {
+    i64::try_from(secs).map_or(SignedDuration::MAX, SignedDuration::from_secs)
 }
 
 /// Kani proofs over the saturating time helpers. Run with
@@ -123,17 +116,18 @@ pub fn saturating_time_delta_secs(secs: u64) -> TimeDelta {
 mod kani_proofs {
     use super::*;
 
-    /// Any second count gives a `TimeDelta`, never a panic. Counts that fit
-    /// are exact; the rest clamp to `TimeDelta::MAX`.
+    /// Any second count gives a `SignedDuration`, never a panic. Counts that
+    /// fit an `i64` are exact; the rest clamp to `SignedDuration::MAX`.
     #[kani::proof]
-    fn time_delta_secs_never_panics() {
+    fn duration_secs_never_panics() {
         let secs: u64 = kani::any();
-        let delta = saturating_time_delta_secs(secs);
-        assert!(delta >= TimeDelta::zero());
-        if let Some(exact) = i64::try_from(secs).ok().and_then(TimeDelta::try_seconds) {
-            assert_eq!(delta, exact);
+        let delta = saturating_duration_secs(secs);
+        assert!(!delta.is_negative());
+        if let Ok(exact) = i64::try_from(secs) {
+            assert_eq!(delta.as_secs(), exact);
+            assert_eq!(delta.subsec_nanos(), 0);
         } else {
-            assert_eq!(delta, TimeDelta::MAX);
+            assert_eq!(delta, SignedDuration::MAX);
         }
     }
 }
@@ -154,11 +148,8 @@ mod tests {
 
     #[test]
     fn saturating_tokio_deadline_matches_the_std_clamp_policy() {
-        // The tokio-timeline twin must behave identically: exact for ordinary
-        // TTLs, clamped (never panicking) for a pathological one. The redis
-        // maintenance throttle derives its interval from app config, so an
-        // absurd value must make the sweep one-shot rather than crash the
-        // worker (issue #1611's regression, now on tokio's timeline).
+        // Exact for ordinary TTLs, clamped for a pathological one: the redis maintenance
+        // interval comes from app config, and an absurd value must not crash the worker (#1611).
         let now = tokio::time::Instant::now();
         assert_eq!(
             saturating_tokio_deadline(now, Duration::from_secs(60)),
@@ -187,65 +178,50 @@ mod tests {
     }
 
     #[test]
-    fn saturating_dt_add_is_exact_for_ordinary_deltas() {
-        let now = DateTime::<Utc>::UNIX_EPOCH;
+    fn saturating_ts_add_is_exact_for_ordinary_deltas() {
+        let now = Timestamp::UNIX_EPOCH;
         assert_eq!(
-            saturating_dt_add(now, TimeDelta::seconds(86_400)),
-            now + TimeDelta::seconds(86_400)
+            saturating_ts_add(now, SignedDuration::from_secs(86_400)),
+            now + SignedDuration::from_secs(86_400)
         );
         assert_eq!(
-            saturating_dt_add(now, TimeDelta::seconds(-86_400)),
-            now - TimeDelta::seconds(86_400)
-        );
-    }
-
-    #[test]
-    fn saturating_dt_add_clamps_in_the_direction_of_the_delta() {
-        let now = DateTime::<Utc>::UNIX_EPOCH;
-        assert_eq!(
-            saturating_dt_add(now, TimeDelta::MAX),
-            DateTime::<Utc>::MAX_UTC
-        );
-        assert_eq!(
-            saturating_dt_add(now, TimeDelta::MIN),
-            DateTime::<Utc>::MIN_UTC
-        );
-        assert_eq!(
-            saturating_dt_add(DateTime::<Utc>::MAX_UTC, TimeDelta::seconds(1)),
-            DateTime::<Utc>::MAX_UTC
-        );
-        assert_eq!(
-            saturating_dt_add(DateTime::<Utc>::MIN_UTC, TimeDelta::seconds(-1)),
-            DateTime::<Utc>::MIN_UTC
+            saturating_ts_add(now, SignedDuration::from_secs(-86_400)),
+            now - SignedDuration::from_secs(86_400)
         );
     }
 
     #[test]
-    fn saturating_time_delta_secs_is_exact_below_the_ceiling() {
-        assert_eq!(saturating_time_delta_secs(0), TimeDelta::zero());
+    fn saturating_ts_add_clamps_in_the_direction_of_the_delta() {
+        let now = Timestamp::UNIX_EPOCH;
+        assert_eq!(saturating_ts_add(now, SignedDuration::MAX), Timestamp::MAX);
+        assert_eq!(saturating_ts_add(now, SignedDuration::MIN), Timestamp::MIN);
         assert_eq!(
-            saturating_time_delta_secs(86_400),
-            TimeDelta::seconds(86_400)
+            saturating_ts_add(Timestamp::MAX, SignedDuration::from_secs(1)),
+            Timestamp::MAX
         );
-        // The largest exactly-representable second count.
-        let ceiling = i64::MAX / 1_000;
         assert_eq!(
-            saturating_time_delta_secs(
-                u64::try_from(ceiling).expect("the ceiling is a positive i64")
-            ),
-            TimeDelta::seconds(ceiling)
+            saturating_ts_add(Timestamp::MIN, SignedDuration::from_secs(-1)),
+            Timestamp::MIN
         );
     }
 
     #[test]
-    fn saturating_time_delta_secs_clamps_instead_of_panicking() {
-        for extreme in [
-            u64::MAX,
-            u64::try_from(i64::MAX).expect("i64::MAX fits in u64"),
-            // One second past the `i64::MAX / 1_000` ceiling.
-            u64::try_from(i64::MAX / 1_000).expect("positive") + 1,
-        ] {
-            assert_eq!(saturating_time_delta_secs(extreme), TimeDelta::MAX);
+    fn saturating_duration_secs_is_exact_below_the_ceiling() {
+        assert_eq!(saturating_duration_secs(0), SignedDuration::ZERO);
+        assert_eq!(
+            saturating_duration_secs(86_400),
+            SignedDuration::from_secs(86_400)
+        );
+        assert_eq!(
+            saturating_duration_secs(i64::MAX.cast_unsigned()),
+            SignedDuration::from_secs(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn saturating_duration_secs_clamps_instead_of_wrapping() {
+        for extreme in [u64::MAX, i64::MAX.cast_unsigned() + 1] {
+            assert_eq!(saturating_duration_secs(extreme), SignedDuration::MAX);
         }
     }
 }

@@ -236,7 +236,7 @@ impl EdgeArtifact {
     /// capsule's `EdgeCache::get` becomes a `kv_get` frame that this function
     /// answers before the capsule can continue.
     ///
-    /// Sensitive headers are stripped here, before the request frame is built.
+    /// Only [`crate::wire::ALLOWED_REQUEST_HEADERS`] go into the request frame.
     ///
     /// # Errors
     ///

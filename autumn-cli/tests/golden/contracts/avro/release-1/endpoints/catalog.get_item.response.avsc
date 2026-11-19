@@ -1,0 +1,13 @@
+{
+  "type": "record",
+  "name": "GetItemResponse",
+  "namespace": "autumn.catalog",
+  "doc": "endpoint: catalog.get_item, GET /items/{id}, response body",
+  "autumn.endpoint": "catalog.get_item",
+  "fields": [
+    { "name": "id", "type": "string" },
+    { "name": "name", "type": "string" },
+    { "name": "price_cents", "type": "long" },
+    { "name": "subtitle", "type": ["null", "string"], "default": null }
+  ]
+}

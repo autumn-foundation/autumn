@@ -1176,10 +1176,8 @@ pub(crate) async fn assemble_seo_bodies_with_policy(
                         && !loc.exclude_exact.iter().any(|p| p == path)
                         && !matches_locale_exclude_prefix(path, loc.exclude_prefixes) =>
                 {
-                    // Root-path special case: axum's `nest("/{locale}",
-                    // router)` matches bare `/{locale}` (no trailing slash)
-                    // against the inner router's own "/" route — `/{locale}/`
-                    // 404s — so `path == "/"` must not get a doubled slash.
+                    // axum's `nest("/{locale}", router)` serves bare `/{locale}` from the inner
+                    // "/" route and 404s `/{locale}/`, so the root gets no trailing slash.
                     for locale_code in loc.supported_locales {
                         let entry = if *path == "/" {
                             format!("{bu}/{locale_code}")
@@ -1507,11 +1505,9 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_seo_bodies_does_not_filter_registered_source_entries() {
-        // A registered `SitemapSource` is the application's explicit URL list.
-        // Route-level `robots = "noindex"` filters the paths Autumn derives on
-        // its own (done before this call), never a source's entries — dropping
-        // those silently would make `seo_source` lossy. Pinned so the boundary
-        // stays a decision rather than an accident.
+        // A `SitemapSource` is the app's explicit URL list. Route-level `robots = "noindex"`
+        // filters only the paths Autumn derives itself (before this call), never a source's
+        // entries.
         let source = Arc::new(SimpleSitemapSource {
             entries: vec![SitemapEntry::new("https://example.com/posts/hello")],
         }) as Arc<dyn SitemapSource>;
@@ -1537,9 +1533,8 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_seo_bodies_skips_parameterized_templates() {
-        // The other half of the same story: a parameterized static route
-        // contributes nothing on its own, so a noindex one cannot leak in
-        // through the template path either.
+        // A parameterized static route contributes nothing, so a noindex one cannot leak in
+        // through the template path.
         let (_, sitemap) = assemble_seo_bodies(
             "prod",
             Some("https://example.com"),
@@ -1788,10 +1783,8 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_seo_bodies_root_exclude_prefix_excludes_exactly_the_root() {
-        // Codex review (P1): a bare "/" exclude entry (as
-        // exclude_static_routes_from_locale_prefix adds for a
-        // #[static_get("/")] route) must exclude exactly the root path, not
-        // be normalized away to an empty, always-non-matching prefix.
+        // A bare "/" exclude entry (added for a `#[static_get("/")]` route) must exclude exactly
+        // the root, not normalize to an empty prefix that matches nothing.
         let supported = vec!["en".to_owned(), "es".to_owned()];
         let exclude = vec!["/".to_owned()];
         let (_, sitemap) = assemble_seo_bodies(
@@ -1819,9 +1812,8 @@ mod tests {
 
     #[tokio::test]
     async fn assemble_seo_bodies_does_not_exclude_path_sharing_a_string_prefix() {
-        // "/apikeys" merely starts with the same characters as the excluded
-        // "/api" prefix — it is not a sub-path of it and must still be
-        // localized like any other eligible static path.
+        // "/apikeys" shares characters with the excluded "/api" but is not under it, so it is
+        // still localized.
         let supported = vec!["en".to_owned(), "es".to_owned()];
         let exclude = vec!["/api".to_owned()];
         let (_, sitemap) = assemble_seo_bodies(

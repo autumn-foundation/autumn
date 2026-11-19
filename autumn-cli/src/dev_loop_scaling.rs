@@ -140,23 +140,13 @@ pub struct ScalingReport {
 /// in `handler_0` whose value can be changed by [`apply_handler_edit`] to
 /// force a warm incremental recompile of exactly one file.
 pub fn generate_synthetic_app(n: usize) -> GeneratedApp {
-    // `autumn-web = "*"`: the live driver always appends a `[patch.crates-io]`
-    // pointing this dependency at the workspace's local `autumn-web` source, so
-    // the resolved version is whatever the repo currently is. A wildcard avoids
-    // a hardcoded version that would silently break `[patch]` resolution after a
-    // workspace version bump; `publish = false` makes the wildcard valid.
+    // `autumn-web = "*"`: the live driver appends a `[patch.crates-io]` pointing it at the
+    // workspace source, so a pinned version would break `[patch]` resolution after a version
+    // bump. `publish = false` makes the wildcard valid.
     //
-    // `diesel`, `serde`, and `serde_json` are also DIRECT dependencies here even
-    // though `autumn-web` re-exports all three (`autumn_web::reexports::diesel`
-    // etc.) and pulls them in transitively: `diesel::table!` and the
-    // `#[autumn_web::model]`/`#[autumn_web::repository]` derives expand to code
-    // that references the bare `diesel`/`serde`/`serde_json` crate paths (not
-    // `$crate`-hygienic re-export paths), which only resolve when those crates
-    // are direct dependencies of the compiling crate — a transitive dependency
-    // is invisible at that path. Omitting them fails every generated model and
-    // repository with "no external crate `diesel`" / "could not find `serde`"
-    // before a single size point can even compile, mirroring the same class of
-    // gap `benchmarks/runtime/autumn` had (issue: diesel-async version skew).
+    // `diesel`, `serde` and `serde_json` must be direct dependencies: `diesel::table!` and the
+    // `#[model]`/`#[repository]` macros expand to bare `diesel`/`serde`/`serde_json` paths,
+    // which a transitive dependency through `autumn-web` does not satisfy.
     let cargo_toml = "[package]\n\
          name = \"scaling_bench_app\"\n\
          version = \"0.1.0\"\n\
@@ -239,8 +229,6 @@ fn generate_repositories(n: usize) -> String {
 /// exactly this one file. All other handlers are static strings.
 fn generate_handlers(n: usize, revision: u32) -> String {
     let mut out = String::from("use autumn_web::prelude::*;\n\n");
-    // handler_0 — the editable handler whose BENCH_EDIT_SENTINEL is bumped
-    // each time the live driver wants to trigger a warm incremental rebuild.
     writeln!(
         out,
         "const BENCH_EDIT_SENTINEL: &str = \"bench_edit_rev_{revision}\";\n\n\
@@ -290,9 +278,8 @@ fn generate_main(n: usize) -> String {
 /// recompile only `handlers.rs` — a genuine warm incremental rebuild that
 /// exercises macro re-expansion without touching any other module.
 pub fn apply_handler_edit(handlers_src: &str, revision: u32) -> String {
-    // Use split('\n') instead of lines() so trailing newlines are preserved
-    // when the result is rejoined: lines() silently drops trailing \n, which
-    // would cause the output to have a different line count than the input.
+    // `split('\n')`, not `lines()`: `lines()` drops a trailing newline, which the rejoin
+    // would lose.
     handlers_src
         .split('\n')
         .map(|line| {
@@ -366,10 +353,8 @@ pub fn build_scaling_report(
     let mut points = Vec::new();
     for (n, samples) in measurements {
         let stats = compute_stats(samples);
-        // An empty sample vector means the measurement for this size failed:
-        // `compute_stats` yields p95 = 0, which would otherwise sail under the
-        // absolute ceiling and silently report a missing measurement as a pass.
-        // Treat a sample-less point as a hard fail.
+        // No samples means the measurement failed. `compute_stats` gives p95 = 0 for it, which
+        // would pass the ceiling, so fail it explicitly.
         let abs_passed = !samples.is_empty() && stats.p95_ms <= SCALING_ABS_P95_MS;
         points.push(ScalingPoint {
             n: *n,
@@ -378,10 +363,8 @@ pub fn build_scaling_report(
         });
     }
 
-    // Compute the slope from the smallest-N to the largest-N point, ordered by
-    // N rather than by input position. `parse_sizes` preserves caller order, so
-    // a sweep passed out of order (e.g. `--sizes 100,50,1`) must not invert the
-    // ratio and let a real regression pass the gate.
+    // Slope runs from the smallest N to the largest N, not first to last: `parse_sizes` keeps
+    // caller order, and `--sizes 100,50,1` must not invert the ratio.
     let min_n_p95 = points
         .iter()
         .min_by_key(|p| p.n)
@@ -770,12 +753,9 @@ mod tests {
 
     #[test]
     fn generate_app_schema_uses_reexport_path() {
-        // Schema declarations go through autumn_web::reexports::diesel::table!
-        // (mirroring the compile-pass test pattern) even though the generated
-        // Cargo.toml also carries a *direct* diesel dependency — diesel's own
-        // table! macro expands to code that references the bare `diesel` path,
-        // which only resolves when diesel is a direct dependency of the
-        // compiling crate (see generate_app_cargo_toml_has_direct_macro_deps).
+        // The schema uses the re-export path, as the compile-pass tests do. The manifest still
+        // needs a direct diesel dependency because `table!` expands to bare `diesel` paths (see
+        // generate_app_cargo_toml_has_direct_macro_deps).
         let app = generate_synthetic_app(1);
         let schema = file_content(&app, "src/schema.rs");
         assert!(
@@ -786,19 +766,10 @@ mod tests {
 
     #[test]
     fn generate_app_cargo_toml_has_direct_macro_deps() {
-        // Regression: `diesel::table!` and the `#[model]`/`#[repository]`
-        // derives expand to code referencing the bare `diesel`/`serde`/
-        // `serde_json` crate paths, not `autumn_web::reexports::...` — these
-        // only resolve when the crates are DIRECT dependencies of the
-        // compiling crate, since a transitive dependency (pulled in only via
-        // autumn-web) is invisible at that path. Omitting them fails the
-        // scaffolded app with "no external crate `diesel`" / "could not find
-        // `serde`" before a single size point can compile.
+        // `diesel::table!` and `#[model]`/`#[repository]` expand to bare `diesel`/`serde`/
+        // `serde_json` paths, which only resolve for direct dependencies.
         let app = generate_synthetic_app(1);
-        // Match complete manifest keys, not bare substrings: "serde" is a
-        // substring of "serde_json", so a `.contains("serde")` check alone
-        // would still pass even if the direct `serde =` entry were removed
-        // and only `serde_json` remained.
+        // Match `key =`, not the bare name: "serde" is a substring of "serde_json".
         assert!(
             app.cargo_toml.contains("diesel ="),
             "Cargo.toml must declare a direct diesel dependency"
@@ -815,13 +786,8 @@ mod tests {
 
     #[test]
     fn generate_app_repository_table_attr_matches_model_table_attr() {
-        // Regression: the repository macro has no way to see the model's own
-        // #[model(table = "...")] override — each macro independently infers
-        // (or is told) its table name. Since these generated models use an
-        // explicit non-default table name (entity_{k}, not the default
-        // pluralized entity{k}s), the repository attribute must carry the
-        // SAME explicit table = "entity_{k}" override, or diesel resolves it
-        // against a schema module that was never declared.
+        // The repository macro cannot see the model's `#[model(table = ...)]` override, so it
+        // must repeat `table = "entity_{k}"` or it infers the undeclared `entity{k}s`.
         let n = 3;
         let app = generate_synthetic_app(n);
         let repos = file_content(&app, "src/repositories.rs");
@@ -857,7 +823,6 @@ mod tests {
         let app = generate_synthetic_app(3);
         let handlers = file_content(&app, "src/handlers.rs");
         let edited = apply_handler_edit(handlers, 5);
-        // Lines other than the sentinel line are unchanged.
         let orig_lines: Vec<&str> = handlers.lines().collect();
         let edit_lines: Vec<&str> = edited.lines().collect();
         assert_eq!(
@@ -939,7 +904,6 @@ mod tests {
 
     #[test]
     fn parse_sizes_rejects_negative() {
-        // usize parse rejects leading "-" so this is an Err.
         assert!(
             parse_sizes("1,-5,100").is_err(),
             "negative must be rejected"
@@ -1027,8 +991,7 @@ mod tests {
 
     #[test]
     fn build_report_baseline_not_established_always_passes() {
-        // slope = 5.0 (violates 2× budget, but baseline not established → reg check skipped)
-        // The 2× slope gate still applies regardless of baseline.
+        // slope = 3.0: the regression check is skipped, but the 2× slope gate still applies.
         let m = make_measurements(&[1, 100], &[1000, 3000]);
         let baseline = ScalingBaseline {
             established: false,
@@ -1040,7 +1003,6 @@ mod tests {
             r.baseline_regression_passed,
             "non-established baseline must always pass regression"
         );
-        // slope = 3.0 still > 2× so all_passed should be false due to slope gate
         assert!(!r.all_passed, "slope 3× still fails 2× absolute slope gate");
     }
 
@@ -1083,7 +1045,7 @@ mod tests {
 
     #[test]
     fn build_report_single_size_slope_is_one() {
-        // Single size → no meaningful slope → defaults to 1.0 (flat).
+        // A single size has no slope; it defaults to 1.0.
         let m = make_measurements(&[50], &[4000]);
         let r = build_scaling_report(&m, None);
         assert!(
@@ -1112,9 +1074,7 @@ mod tests {
 
     #[test]
     fn build_report_slope_is_size_ordered_not_input_ordered() {
-        // Same data, ascending vs. reversed input order. The slope must be
-        // p95@N_max / p95@N_min (5000/1000 = 5.0) regardless of input order —
-        // a reversed sweep must not invert the ratio and pass the gate.
+        // Slope is p95@N_max / p95@N_min (5000/1000 = 5.0) whatever the input order.
         let ascending = make_measurements(&[1, 100], &[1000, 5000]);
         let reversed = make_measurements(&[100, 1], &[5000, 1000]);
         let ra = build_scaling_report(&ascending, None);
@@ -1136,8 +1096,7 @@ mod tests {
 
     #[test]
     fn build_report_empty_samples_point_fails() {
-        // A size whose measurement produced no samples (build failure) must not
-        // be reported as a pass via compute_stats' zero p95.
+        // A size with no samples (build failure) must not pass via compute_stats' zero p95.
         let m: Vec<(usize, Vec<u64>)> = vec![(1, vec![2000]), (100, vec![])];
         let r = build_scaling_report(&m, None);
         assert!(r.points[0].abs_passed, "the measured size still passes");

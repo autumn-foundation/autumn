@@ -1,0 +1,42 @@
+rows: 1000444, heap blocks: 23799
+CREATE UNIQUE INDEX autumn_repository_commit_hooks_pkey ON public.autumn_repository_commit_hooks USING btree (id)
+CREATE INDEX idx_autumn_commit_hooks_finished ON public.autumn_repository_commit_hooks USING btree (finished_at) WHERE (status = ANY (ARRAY['completed'::text, 'failed'::text, 'after_hook_failed'::text]))
+CREATE INDEX idx_autumn_repository_commit_hooks_after_hook_recovery ON public.autumn_repository_commit_hooks USING btree (claimed_at) WHERE (status = ANY (ARRAY['pending_after_hook'::text, 'after_hook_succeeded'::text]))
+CREATE INDEX idx_autumn_repository_commit_hooks_handler_ready ON public.autumn_repository_commit_hooks USING btree (handler_key, run_at) WHERE (status = 'enqueued'::text)
+CREATE INDEX idx_autumn_repository_commit_hooks_pending_recovery ON public.autumn_repository_commit_hooks USING btree (claimed_at) WHERE (status = 'pending_after_hook'::text)
+CREATE INDEX idx_autumn_repository_commit_hooks_ready ON public.autumn_repository_commit_hooks USING btree (run_at, enqueued_at) WHERE (status = 'enqueued'::text)
+CREATE INDEX idx_autumn_repository_commit_hooks_stale_recovery ON public.autumn_repository_commit_hooks USING btree (claimed_at) WHERE (status = 'running'::text)
+=== recover_pending
+                                                                                                                                                                                                                                                                                                                                                                QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.autumn_repository_commit_hooks  (cost=0.13..8.17 rows=0 width=0) (actual time=0.012..0.012 rows=0 loops=1)
+   Buffers: shared hit=1
+   ->  Index Scan using idx_autumn_repository_commit_hooks_after_hook_recovery on public.autumn_repository_commit_hooks  (cost=0.13..8.17 rows=1 width=206) (actual time=0.010..0.010 rows=0 loops=1)
+         Output: CASE WHEN (status = 'pending_after_hook'::text) THEN '{}'::jsonb ELSE context END, CASE WHEN (status = 'pending_after_hook'::text) THEN '{}'::jsonb ELSE record END, CASE WHEN (status = 'after_hook_succeeded'::text) THEN 'enqueued'::text ELSE 'after_hook_failed'::text END, CASE WHEN (status = 'after_hook_succeeded'::text) THEN COALESCE(enqueued_at, now()) ELSE enqueued_at END, NULL::timestamp with time zone, CASE WHEN (status = 'pending_after_hook'::text) THEN now() ELSE finished_at END, NULL::text, NULL::timestamp with time zone, COALESCE(last_error, 'stale pending after hook recovered by worker-1'::text), CASE WHEN (status = 'after_hook_succeeded'::text) THEN now() ELSE run_at END, ctid
+         Index Cond: (autumn_repository_commit_hooks.claimed_at < (now() - '00:01:00'::interval))
+         Filter: (autumn_repository_commit_hooks.status = ANY ('{pending_after_hook,after_hook_succeeded}'::text[]))
+         Buffers: shared hit=1
+ Query Identifier: 8550179770115314356
+ Planning:
+   Buffers: shared hit=231
+ Planning Time: 0.575 ms
+ Execution Time: 0.118 ms
+(12 rows)
+
+=== recover_running
+                                                                                                                                                                                                                          QUERY PLAN                                                                                                                                                                                                                          
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.autumn_repository_commit_hooks  (cost=0.13..8.17 rows=0 width=0) (actual time=0.010..0.011 rows=0 loops=1)
+   Buffers: shared hit=1
+   ->  Index Scan using idx_autumn_repository_commit_hooks_stale_recovery on public.autumn_repository_commit_hooks  (cost=0.13..8.17 rows=1 width=138) (actual time=0.008..0.008 rows=0 loops=1)
+         Output: CASE WHEN (attempt < max_attempts) THEN 'enqueued'::text ELSE 'failed'::text END, CASE WHEN (attempt < max_attempts) THEN (attempt + 1) ELSE attempt END, NULL::timestamp with time zone, CASE WHEN (attempt >= max_attempts) THEN now() ELSE NULL::timestamp with time zone END, NULL::text, NULL::timestamp with time zone, 'stale claim recovered by worker-1'::text, CASE WHEN (attempt < max_attempts) THEN now() ELSE run_at END, ctid
+         Index Cond: (autumn_repository_commit_hooks.claimed_at < (now() - '00:01:00'::interval))
+         Filter: (autumn_repository_commit_hooks.status = 'running'::text)
+         Buffers: shared hit=1
+ Query Identifier: 4469403482195222258
+ Planning:
+   Buffers: shared hit=173
+ Planning Time: 0.512 ms
+ Execution Time: 0.065 ms
+(12 rows)
+

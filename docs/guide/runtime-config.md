@@ -10,6 +10,10 @@ a restart) and the credentials store (which holds encrypted secrets).  Runtime
 config is for **non-secret operational tunables** that need to change at 2 am
 without waiting for CI.
 
+> **Cargo feature.** The `runtime-config` feature compiles this subsystem. It
+> is in `default`. An app with `default-features = false` adds
+> `"runtime-config"` to use it.
+
 ---
 
 ## Quick start

@@ -56,3 +56,4 @@ autumn/tests/fixtures/axe-core/axe.min.js -diff linguist-vendored
 # hash and size budget as Linux.
 autumn/vendor/*.js text eol=lf
 autumn/src/ui/**/*.css text eol=lf
+examples/mesh-catalog/tests/proto_consumer/** text eol=lf

@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "ContactRenamed",
+  "namespace": "autumn.core",
+  "doc": "topic: contact.renamed, version 1",
+  "autumn.topic": "contact.renamed",
+  "fields": [
+    { "name": "id", "type": "long" },
+    { "name": "email_address", "type": "string", "aliases": ["email", "mail"] }
+  ]
+}

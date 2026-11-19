@@ -117,7 +117,7 @@ pub struct LedgerDdComment {
     #[default]
     pub author: Option<String>,
     #[default]
-    pub edited_at: Option<chrono::NaiveDateTime>,
+    pub edited_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 // A plain leaf: no hooks, not soft-delete, not versioned, no counter cache,

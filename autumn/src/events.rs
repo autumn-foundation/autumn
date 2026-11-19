@@ -365,7 +365,7 @@ async fn dispatch(
     event_name: &'static str,
     payload: Value,
 ) -> AutumnResult<()> {
-    // 1. Record first so tests observe the event even without a job runner.
+    // Record first so tests observe the event even without a job runner.
     if let Some(recorder) = recorder {
         recorder.record(event_name, payload.clone());
     }
@@ -375,13 +375,9 @@ async fn dispatch(
         return Ok(());
     }
 
-    // 2. Durable listeners: enqueue onto the job queue (at-least-once).
-    //
-    // Prefer this app's own `JobClient` (installed onto `AppState` by the job
-    // runtime) over the process-global client, so durable dispatch is scoped to
-    // the publishing app rather than whichever app last started a runtime. This
-    // keeps parallel in-process apps (notably tests) from contending. We fall
-    // back to the global client only if no app-local one is present.
+    // Durable listeners are enqueued as jobs (at-least-once). Prefer this app's own `JobClient`
+    // over the process-global one, so parallel in-process apps (notably tests) do not dispatch
+    // through whichever app last started a job runtime.
     let app_client = state.extension::<crate::job::JobClient>();
     let mut durable_error = None;
     for listener in listeners
@@ -392,19 +388,16 @@ async fn dispatch(
             .job_name
             .as_deref()
             .expect("durable listener must carry a job_name");
-        // Enqueue *after commit* so publishing inside a `Db::tx` defers the
-        // durable reaction until the transaction commits — a rolled-back event
-        // never fires its listeners, and (on Postgres) the job is not claimed on
-        // another connection before the event's data is visible. Outside a
+        // After commit: a rolled-back event never fires its listeners, and (on Postgres) the job
+        // cannot be claimed on another connection before the event's data is visible. Outside a
         // transaction this enqueues immediately.
         let enqueued = if let Some(client) = &app_client {
             client.enqueue_after_commit(job_name, payload.clone()).await
         } else {
             crate::job::enqueue_after_commit(job_name, payload.clone()).await
         };
-        // Don't let one durable enqueue failure skip the in-request sync
-        // listeners (or the remaining durable enqueues); remember the first
-        // error and surface it after sync listeners have run.
+        // A failed enqueue must not skip the remaining enqueues or the sync listeners. Keep the
+        // first error and return it at the end.
         if let Err(error) = enqueued
             && durable_error.is_none()
         {
@@ -412,8 +405,6 @@ async fn dispatch(
         }
     }
 
-    // 3. Sync listeners: run independently, isolated from each other — these run
-    // even if a durable enqueue above failed.
     run_sync_listeners(state, listeners, &payload).await;
 
     durable_error.map_or(Ok(()), Err)
@@ -606,7 +597,8 @@ where
 pub async fn publish<E: Event>(event: E) -> AutumnResult<()> {
     let payload = serialize_event(&event)?;
 
-    // Prefer the ambient app context (set per request and per job) for isolation.
+    // Prefer the ambient app context (set per request and per job) over the global bus, so the
+    // event reaches this app's listeners.
     if let Some(state) = current_event_app() {
         let registry = state.extension::<EventRegistry>();
         let empty = EventRegistry::default();
@@ -722,8 +714,6 @@ mod tests {
         ]);
         let state = AppState::for_test();
 
-        // No recorder, no durable listeners: a panicking/erroring sibling must
-        // not stop the third listener from running, and publish still succeeds.
         let result = dispatch(
             &registry,
             None,
@@ -738,9 +728,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_listeners_run_even_when_a_durable_enqueue_fails() {
-        // With no app-local client and no global job runtime, the durable
-        // enqueue fails — but the sync listener must still run (and the error
-        // is surfaced afterwards rather than short-circuiting dispatch).
+        // No app-local client and no global job runtime, so the durable enqueue fails.
         static RAN: AtomicU32 = AtomicU32::new(0);
         crate::job::clear_global_job_client();
         RAN.store(0, Ordering::SeqCst);
@@ -763,7 +751,6 @@ mod tests {
             serde_json::json!({"n": 1}),
         )
         .await;
-        // The key guarantee: the durable failure did not skip the sync listener.
         assert_eq!(RAN.load(Ordering::SeqCst), 1, "sync listener ran anyway");
     }
 

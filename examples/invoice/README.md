@@ -11,7 +11,7 @@ dependency-free as `hello`.
 |---------|-------|---------------|
 | `autumn_web::pdf::Pdf` | `src/lib.rs` | Renders a `maud::Markup` view to a downloadable PDF |
 | One view, two responses | `src/lib.rs` | `invoice_view` backs both the HTML detail page and the PDF export |
-| `Clock` extractor | `src/lib.rs` | The "Generated at" timestamp comes from the injected clock, not `Utc::now()`, so tests can pin it |
+| `Clock` extractor | `src/lib.rs` | The "Generated at" timestamp comes from the injected clock, not `Timestamp::now()`, so tests can pin it |
 | `TestResponse::assert_pdf_contains` | `tests/invoice.rs` | Asserts on rendered PDF text via the in-process test client, no headless browser |
 | `#[lifecycle]` | `src/lib.rs` | Declares the invoice lifecycle once; the macro proves it sound at compile time and generates a typestate where an illegal transition does not exist |
 

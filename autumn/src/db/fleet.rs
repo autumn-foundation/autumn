@@ -58,7 +58,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -182,7 +182,7 @@ mod replica {
         pub(super) async fn replace_from_replica(
             &self,
             key: &FleetDbKey,
-            _: Option<chrono::DateTime<chrono::Utc>>,
+            _: Option<crate::time::Timestamp>,
         ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
             if !matches!(self.inner.engine.ship_mode(), ShipMode::Rebuild) {
                 return Err(FleetError::NotReplicated { name: key.name() });
@@ -2627,10 +2627,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let removed = self
             .with_provision_turn(&key, async {
                 let lock = {
-                    // Before the lock: the lock then waits for one write
-                    // only. The connection stays out of the pool while the
-                    // lock is busy (at most the lock timeout). It goes back
-                    // at the end of this block.
+                    // Check out before the path lock, so the lock waits for one
+                    // write only. The connection stays out of the pool while the
+                    // lock is busy (at most the lock timeout).
                     let mut control = record.checkout().await?;
                     // The path lock first: the check, the row and the
                     // removal then see one state. A delete in another
@@ -2937,7 +2936,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     pub(crate) async fn restore_to_point(
         &self,
         key: &FleetDbKey,
-        target: Option<chrono::DateTime<chrono::Utc>>,
+        target: Option<crate::time::Timestamp>,
     ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
         self.check_key(key)?;
         let (fleet, key, name) = (self.clone(), key.clone(), key.name());
@@ -2956,7 +2955,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     async fn restore_owned(
         &self,
         key: &FleetDbKey,
-        target: Option<chrono::DateTime<chrono::Utc>>,
+        target: Option<crate::time::Timestamp>,
     ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
         self.with_exclusive(key, self.replace_from_replica(key, target))
             .await
@@ -3982,7 +3981,12 @@ mod tests {
         use crate::config::FleetMaxOpenPolicy::{Refuse, Wait};
         for policy in [Refuse, Wait] {
             let tmp = tempfile::tempdir().unwrap();
-            let fleet = capped(tmp.path(), 3, policy, Duration::from_millis(40), 30);
+            // A slow runner opens and closes SQLite files slowly, and `wait`
+            // does not serve its waiters in order. This test checks the cap,
+            // not the wait time, so `wait` gets a deadline no runner reaches.
+            // The deadline test is `the_wait_policy_answers_503_when_no_room_comes_in_time`.
+            let wait_secs = if policy == Wait { 600 } else { 30 };
+            let fleet = capped(tmp.path(), 3, policy, Duration::from_millis(40), wait_secs);
             let tasks: Vec<_> = (1..=24)
                 .map(|n| {
                     let fleet = fleet.clone();

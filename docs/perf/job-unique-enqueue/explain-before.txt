@@ -1,0 +1,84 @@
+=== ttl, key with no row in the window (acct:19999)
+                                                                                                                                                                                                                                                   QUERY PLAN                                                                                                                                                                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_jobs (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Conflict Arbiter Indexes: idx_autumn_jobs_unique_inflight
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=1342 read=109017 dirtied=4
+   ->  Subquery Scan on "*SELECT*" (actual rows=1 loops=1)
+         Output: "*SELECT*"."?column?", "*SELECT*"."?column?_1", "*SELECT*".jsonb, 'enqueued'::text, "*SELECT*"."?column?_4", "*SELECT*"."?column?_5", "*SELECT*"."?column?_6", "*SELECT*".now, NULL::timestamp with time zone, NULL::timestamp with time zone, NULL::text, NULL::timestamp with time zone, NULL::text, "*SELECT*"."coalesce", NULL::text, NULL::text, "*SELECT*"."?column?_7", "*SELECT*"."?column?_8", "*SELECT*"."?column?_9", "*SELECT*"."?column?_10", NULL::text, "*SELECT*"."?column?_2"
+         Buffers: shared hit=1323 read=109011
+         ->  Result (actual rows=1 loops=1)
+               Output: 'x1'::text, 'report.build'::text, 'default'::text, '{}'::jsonb, NULL::unknown, 1, 5, '250'::bigint, now(), COALESCE((clock_timestamp() + '00:00:00'::interval)), 'acct:19999'::text, 'ttl'::text, NULL::text, NULL::integer
+               One-Time Filter: (NOT $0)
+               Buffers: shared hit=1323 read=109011
+               InitPlan 1 (returns $0)
+                 ->  Seq Scan on public.autumn_jobs dup (actual rows=0 loops=1)
+                       Filter: ((dup.name = 'report.build'::text) AND (dup.unique_key = 'acct:19999'::text) AND (dup.enqueued_at > (now() - '01:00:00'::interval)))
+                       Rows Removed by Filter: 3024973
+                       Buffers: shared hit=1323 read=109011
+ Query Identifier: -8899422849180215467
+ Planning:
+   Buffers: shared hit=202 read=10
+ Planning Time: 0.934 ms
+ Execution Time: 460.383 ms
+(23 rows)
+
+=== ttl, key held in the window (acct:1)
+                                                                                                                                                                                                                                                   QUERY PLAN                                                                                                                                                                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_jobs (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Conflict Arbiter Indexes: idx_autumn_jobs_unique_inflight
+   Tuples Inserted: 0
+   Conflicting Tuples: 0
+   Buffers: shared hit=1132 read=108177
+   ->  Subquery Scan on "*SELECT*" (actual rows=0 loops=1)
+         Output: "*SELECT*"."?column?", "*SELECT*"."?column?_1", "*SELECT*".jsonb, 'enqueued'::text, "*SELECT*"."?column?_4", "*SELECT*"."?column?_5", "*SELECT*"."?column?_6", "*SELECT*".now, NULL::timestamp with time zone, NULL::timestamp with time zone, NULL::text, NULL::timestamp with time zone, NULL::text, "*SELECT*"."coalesce", NULL::text, NULL::text, "*SELECT*"."?column?_7", "*SELECT*"."?column?_8", "*SELECT*"."?column?_9", "*SELECT*"."?column?_10", NULL::text, "*SELECT*"."?column?_2"
+         Buffers: shared hit=1132 read=108177
+         ->  Result (actual rows=0 loops=1)
+               Output: 'x2'::text, 'report.build'::text, 'default'::text, '{}'::jsonb, NULL::unknown, 1, 5, '250'::bigint, now(), COALESCE((clock_timestamp() + '00:00:00'::interval)), 'acct:1'::text, 'ttl'::text, NULL::text, NULL::integer
+               One-Time Filter: (NOT $0)
+               Buffers: shared hit=1132 read=108177
+               InitPlan 1 (returns $0)
+                 ->  Seq Scan on public.autumn_jobs dup (actual rows=1 loops=1)
+                       Filter: ((dup.name = 'report.build'::text) AND (dup.unique_key = 'acct:1'::text) AND (dup.enqueued_at > (now() - '01:00:00'::interval)))
+                       Rows Removed by Filter: 2983915
+                       Buffers: shared hit=1132 read=108177
+ Query Identifier: -8899422849180215467
+ Planning:
+   Buffers: shared hit=212
+ Planning Time: 0.579 ms
+ Execution Time: 409.647 ms
+(23 rows)
+
+=== running window, key with no in-flight row (user:19999)
+                                                                                                                                                                                                                                                   QUERY PLAN                                                                                                                                                                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_jobs (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Conflict Arbiter Indexes: idx_autumn_jobs_unique_inflight
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=25 read=2 dirtied=2
+   ->  Subquery Scan on "*SELECT*" (actual rows=1 loops=1)
+         Output: "*SELECT*"."?column?", "*SELECT*"."?column?_1", "*SELECT*".jsonb, 'enqueued'::text, "*SELECT*"."?column?_4", "*SELECT*"."?column?_5", "*SELECT*"."?column?_6", "*SELECT*".now, NULL::timestamp with time zone, NULL::timestamp with time zone, NULL::text, NULL::timestamp with time zone, NULL::text, "*SELECT*"."coalesce", NULL::text, NULL::text, "*SELECT*"."?column?_7", "*SELECT*"."?column?_8", "*SELECT*"."?column?_9", "*SELECT*"."?column?_10", NULL::text, "*SELECT*"."?column?_2"
+         Buffers: shared hit=1 read=1
+         ->  Result (actual rows=1 loops=1)
+               Output: 'x3'::text, 'digest.send'::text, 'default'::text, '{}'::jsonb, NULL::unknown, 1, 5, '250'::bigint, now(), COALESCE((clock_timestamp() + '00:00:00'::interval)), 'user:19999'::text, 'running'::text, NULL::text, NULL::integer
+               One-Time Filter: (NOT $0)
+               Buffers: shared hit=1 read=1
+               InitPlan 1 (returns $0)
+                 ->  Index Only Scan using idx_autumn_jobs_unique_inflight on public.autumn_jobs dup (actual rows=0 loops=1)
+                       Index Cond: ((dup.name = 'digest.send'::text) AND (dup.unique_key = 'user:19999'::text))
+                       Heap Fetches: 0
+                       Buffers: shared hit=1 read=1
+ Query Identifier: -8899422849180215467
+ Planning:
+   Buffers: shared hit=255
+ Planning Time: 0.892 ms
+ Execution Time: 0.223 ms
+(23 rows)
+

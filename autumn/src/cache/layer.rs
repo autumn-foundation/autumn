@@ -173,15 +173,12 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        // Only cache GET requests
         if req.method() != Method::GET {
             return Box::pin(self.inner.call(req));
         }
 
-        // ⚡ Bolt Optimization:
-        // Format the key into a stack-allocated buffer to avoid a heap allocation
-        // on every cache check. Fall back to allocating a String only if the URI
-        // is exceptionally long.
+        // Format the key into a stack buffer to skip a heap allocation per request. An empty key
+        // means the URI did not fit, and the code below falls back to an allocated String.
         let mut buf = [0u8; 512];
         let cache_key_str = {
             let mut cursor = &mut buf[..];
@@ -196,20 +193,17 @@ where
         let store = self.store.clone();
 
         let cache_hit = if cache_key_str.is_empty() {
-            // Fallback for very long URIs
             super::get_cached::<CachedResponse>(store.as_ref(), &format!("http:{}", req.uri()))
         } else {
             super::get_cached::<CachedResponse>(store.as_ref(), cache_key_str)
         };
 
-        // Check for a cache hit
         if let Some(cached) = cache_hit
             && let Some(resp) = cached_response_into_response(cached)
         {
             return Box::pin(async move { Ok(resp) });
         }
 
-        // Cache miss — call the inner service
         let mut inner = self.inner.clone();
         let cache_key = if cache_key_str.is_empty() {
             format!("http:{}", req.uri())
@@ -220,14 +214,12 @@ where
         Box::pin(async move {
             let response = inner.call(req).await?;
 
-            // Only cache 200 OK responses
             if response.status() != StatusCode::OK {
                 return Ok(response);
             }
 
             let (parts, body) = response.into_parts();
 
-            // Buffer the body
             let Ok(collected) = body.collect().await else {
                 let resp = axum::response::Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -237,11 +229,9 @@ where
             };
             let body_bytes = collected.to_bytes();
 
-            // Store in cache
             let cached = cached_response_from_parts(&parts, &body_bytes);
             super::insert_cached(store.as_ref(), &cache_key, cached, None);
 
-            // Reconstruct the response
             let response = axum::response::Response::from_parts(parts, Body::from(body_bytes));
             Ok(response)
         })
@@ -570,7 +560,6 @@ mod tests {
             "different URIs should miss"
         );
 
-        // But repeating /a should hit
         let req = Request::get("/a")
             .body(Body::empty())
             .expect("infallible response builder");
@@ -587,7 +576,6 @@ mod tests {
     #[test]
     fn from_shared_accepts_arc() {
         let store = Arc::new(super::super::MokaCache::new(100, None));
-        // Just verify from_shared compiles and the layer can be used
         let _layer = CacheResponseLayer::from_shared(store);
     }
 

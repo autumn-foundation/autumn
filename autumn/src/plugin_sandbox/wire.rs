@@ -166,34 +166,16 @@ fn redirect_target_allowed(
     requested: &str,
     status: u16,
 ) -> bool {
-    // A backslash is a path separator to some clients but not to this check,
-    // so a target carrying one is refused rather than guessed at.
+    // Some clients treat a backslash as a path separator; refuse rather than guess.
     if target.contains('\\') {
         return false;
     }
-    // A client *deletes* every ASCII tab and newline from a URL before it
-    // parses it — the URL Standard says so in as many words ("Remove all ASCII
-    // tab or newline from input") — so a target carrying one does not say here
-    // what it will say there. `/hello/<TAB>../admin` walks below as the
-    // ordinary segment `<TAB>..`, which climbs nothing; the client removes the
-    // tab, resolves `/hello/../admin`, and arrives at `/admin`. HTTP permits a
-    // tab in a field value, so the header validator does not stop it either,
-    // and a 307/308 then carries the client's credentials to a path this
-    // plugin was never mounted on.
-    //
-    // Refused rather than stripped and re-checked: two normalisations that have
-    // to agree is the shape of the next bypass, and no legitimate redirect
-    // needs a control character. The whole C0 range goes, not just the three
-    // that are deleted — the parser also trims leading and trailing controls,
-    // so none of them mean here what they mean at the client.
-    //
-    // And the space with them, which the C0 range does not cover and the parser
-    // trims for the same reason: `Location: /hello/.. ` walks below as the
-    // segment `.. `, which climbs nothing, and reaches the client as
-    // `/hello/..`, which resolves to `/`. A legitimate target percent-encodes a
-    // space, so refusing the raw byte costs nothing a redirect actually needs —
-    // and refusing it anywhere rather than only at the ends keeps this one rule
-    // instead of a second normalisation that has to agree with the client's.
+    // The URL Standard has the client delete every ASCII tab and newline and trim leading and
+    // trailing C0 controls and spaces before parsing. `/hello/<TAB>../admin` walks below as the
+    // harmless segment `<TAB>..` but reaches the client as `/hello/../admin`; `/hello/.. ` reaches
+    // it as `/hello/..`. HTTP allows a tab in a header value, so nothing upstream stops it.
+    // Refuse every control and space rather than strip and re-check: two normalisations that must
+    // agree invite a bypass, and a legitimate target percent-encodes them.
     if target.chars().any(|ch| ch.is_ascii_control() || ch == ' ') {
         return false;
     }
@@ -204,14 +186,10 @@ fn redirect_target_allowed(
     {
         return false;
     }
-    // No segment may climb out of the prefix. The query and fragment are not
-    // path, so stop before them.
-    //
-    // A single-dot segment climbs nothing, but the client removes it:
-    // `/hello/%2e/transfer` arrives as `/hello/transfer`, a route the plugin
-    // does not own (#2463). So every dot segment is refused, in the spellings
-    // `dot_segment_len` knows. An encoded `/` or `\` is refused too: a proxy
-    // that decodes it gives `%2e%2e%2f` a climb.
+    // No dot segment, in any spelling `dot_segment_len` knows, before the query or fragment. A
+    // single dot climbs nothing, but the client removes it: `/hello/%2e/transfer` arrives as
+    // `/hello/transfer`, which the plugin may not own (#2463). An encoded `/` or `\` is refused
+    // too: a proxy that decodes it gives `%2e%2e%2f` a climb.
     let path = rest.split(['?', '#']).next().unwrap_or_default();
     if path
         .split('/')
@@ -222,9 +200,8 @@ fn redirect_target_allowed(
     if percent_escapes(path).any(|(byte, _)| matches!(byte, b'/' | b'\\')) {
         return false;
     }
-    // And the target must be a route this plugin actually serves, for every
-    // method the client might replay. Staying under the prefix is not the same
-    // as being the plugin's to name — see [`OwnedRoutes`].
+    // The target must be a route this plugin serves for every method the client might replay.
+    // The prefix is not an ownership boundary: see [`OwnedRoutes`].
     let full = target.split(['?', '#']).next().unwrap_or_default();
     redirect_lands_on_the_plugin(status, requested, full, owned)
 }
@@ -604,17 +581,14 @@ mod body_b64 {
     use serde::{Deserialize as _, Deserializer, Serializer};
 
     pub(super) fn serialize<S: Serializer>(bytes: &[u8], ser: S) -> Result<S::Ok, S::Error> {
-        // Streamed, not encoded to a `String` first: that copy is 4/3 of the
-        // body and lives as long as the output line does.
+        // Streamed: a `String` copy would be 4/3 of the body and live as long as the line.
         ser.collect_str(&base64::display::Base64Display::new(bytes, &BASE64))
     }
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
-        // `Cow`, not `String`: base64's alphabet contains nothing JSON escapes,
-        // so an honest frame borrows straight out of the line the guest wrote
-        // and the decode is the only allocation. A guest that writes `\u0041`
-        // forces the owned copy — which is why the footprint still budgets for
-        // it — but it cannot make that the ordinary case.
+        // `Cow`: base64 needs no JSON escapes, so an honest frame borrows from the line and the
+        // decode is the only allocation. A guest writing `\u0041` forces an owned copy, which the
+        // footprint budgets for.
         let raw = std::borrow::Cow::<'de, str>::deserialize(de)?;
         BASE64
             .decode(raw.as_ref())
@@ -684,9 +658,7 @@ mod bounded_headers {
             where
                 A: SeqAccess<'de>,
             {
-                // Deliberately not `size_hint`-driven: the hint is computed from
-                // the guest's own framing, so reserving against it hands the
-                // allocation straight back to the thing this cap refuses.
+                // Not `size_hint`-driven: the guest controls the hint.
                 let mut headers = Vec::new();
                 while let Some(pair) = seq.next_element::<(String, String)>()? {
                     if headers.len() >= super::MAX_RESPONSE_HEADERS {
@@ -734,29 +706,17 @@ impl SandboxResponse {
         requested: &str,
     ) -> (Self, Vec<String>) {
         let mut denied = Vec::new();
-        // Read before the retain borrows `self.headers`, and because the status
-        // is what decides which methods a redirect may be replayed with.
         let status = self.status;
         self.headers.retain(|(name, value)| {
-            // Matched against the borrowed name. Lower-casing first copied every
-            // name to answer a question the allowlist can answer without one,
-            // and the copy of a *refused* name was then kept until it was
-            // logged — so the longer the name a guest chose, the more the host
-            // held to throw it away.
+            // Matched on the borrowed name, so a refused name of the guest's chosen length is
+            // never copied in full.
             if !response_header_allowed(name) {
                 denied.push(denied_excerpt(name));
                 return false;
             }
-            // `Location` is the one allowed header that makes the *client* act,
-            // and a client acts with the user's credentials. A guest answering
-            // `307` or `308` with `Location: /admin/...` has a conforming
-            // browser re-issue the request to the host's own origin with the
-            // method, the body and the cookies intact — so a plugin holding no
-            // session capability induces an authenticated request outside its
-            // mount. Confining the target to the plugin's own prefix keeps the
-            // redirect a plugin genuinely needs (its own routes) and takes away
-            // the one it must not have. An absolute URL is refused by the same
-            // rule, which closes the open-redirect half as well.
+            // `Location` makes the client act with the user's credentials: a 307/308 to
+            // `/admin/...` replays the method, body and cookies there. Confine it to the plugin's
+            // own routes, which also refuses an absolute URL (open redirect).
             if name.eq_ignore_ascii_case("location")
                 && !redirect_target_allowed(value, prefix, owned, requested, status)
             {
@@ -803,16 +763,9 @@ impl SandboxResponse {
     /// Returns the offending type so the caller can record a denial naming it.
     #[must_use]
     pub fn refused_content_type(&self) -> Option<String> {
-        // *Every* declared type, not the first. Header values are appended to
-        // the response, so a second `content-type` reaches the client too, and
-        // a proxy or client that takes the last one sees whatever it says. A
-        // check that read only the first would enforce the allowlist against
-        // the value a guest least wanted to smuggle anything through.
-        // The essence is borrowed, not lower-cased. With no `;` it is the whole
-        // header value, which the guest sizes, and copying it was how the
-        // allowlist was consulted — a third live copy beside the parsed
-        // response and the clone `run` holds, to decide the type is not one
-        // this slice serves.
+        // Every declared type, not the first: header values are appended, so a second
+        // `content-type` reaches the client too, and a client or proxy may honour the last one.
+        // The essence is borrowed, not lower-cased, because the guest sizes it.
         let mut declared = self
             .headers
             .iter()
@@ -821,11 +774,8 @@ impl SandboxResponse {
 
         let first = declared.next()?;
 
-        // Two content-types is not a response any client agrees on the meaning
-        // of, so it is refused whether or not both are allowed: "the allowlist
-        // passed one of them" is not a property worth having. The refused type
-        // reported is whichever one is actually off the list, so the denial
-        // names the interesting header rather than the first one.
+        // Clients disagree on two content-types, so refuse even if both are allowed. Report the one
+        // off the list, if any.
         if let Some(extra) = declared.next() {
             return Some(if content_type_allowed(extra) {
                 denied_excerpt(first)
@@ -868,12 +818,7 @@ impl SandboxResponse {
 /// the guest side it is a *protocol*, documented in this module and in
 /// `docs/guide/sandboxed-plugins.md`, that a guest implements from the prose —
 /// a `wasm32-wasip1` guest cannot link `autumn-web` at all.
-// `Eq` is deliberately absent: a frame can carry a
-// [`PluginValue::Float`](super::capability::PluginValue), and `f64` is not
-// `Eq`. Nothing in this crate needs total equality on a frame — tests compare
-// them, which `PartialEq` does — and the alternative was dropping floating
-// point from the plugin value vocabulary, which would have made a price
-// unrepresentable.
+// No `Eq`: a frame can carry a [`PluginValue::Float`](super::capability::PluginValue).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
@@ -1004,18 +949,8 @@ pub(crate) enum GuestFrame {
 /// changed.
 #[must_use]
 pub(crate) fn canonicalize_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
-    // Filtered before anything is allocated, not after. Cloning first and
-    // discarding on the next step duplicated every byte of headers that never
-    // reach the guest — and once the metadata ceiling stopped charging for
-    // those headers (rightly, since they are dropped) nothing else stood
-    // between a direct `SandboxHost::run` caller and an arbitrarily large
-    // credential being copied in full before being thrown away.
-    //
-    // The *name* is the same trap one step smaller: lower-casing it to look it
-    // up allocates a copy of a string the caller chose the length of, in order
-    // to decide it is not wanted. `request_header_allowed` compares the
-    // borrowed name case-insensitively, so nothing is allocated until a header
-    // has earned it.
+    // Filter on the borrowed name before allocating: the metadata ceiling does not charge for
+    // dropped headers' contents, so a large credential must not be copied just to be discarded.
     let mut out: Vec<(String, String)> = headers
         .iter()
         .filter(|(name, _)| request_header_allowed(name))
@@ -1064,9 +999,8 @@ mod tests {
     /// request's method, 303 rewrites to GET, and 301 and 302 may do either.
     #[test]
     fn a_redirect_must_land_on_the_plugin_under_the_method_it_replays() {
-        // The plugin serves this path for GET only. The application may hold
-        // POST on it, and a 307 preserves the method — so a POST redirected
-        // here reaches the application, carrying the user's body and cookies.
+        // The plugin serves this path for GET only. The application may hold POST on it, and a
+        // 307 preserves the method.
         let owned = OwnedRoutes::from_routes([("GET", "/hello"), ("GET", "/hello/transfer")]);
         let preserved = SandboxResponse {
             status: 307,
@@ -1094,8 +1028,7 @@ mod tests {
         );
         assert!(denied.is_empty());
 
-        // A 303 rewrites the method to GET whatever was requested, so the same
-        // POST is fine here — it is a GET that arrives.
+        // A 303 rewrites any method to GET, so the same POST is fine.
         let rewritten = SandboxResponse {
             status: 303,
             headers: vec![("location".to_owned(), "/hello/transfer".to_owned())],
@@ -1109,7 +1042,7 @@ mod tests {
         );
         assert!(denied.is_empty());
 
-        // 302 is the pair that may do either, so both must be the plugin's.
+        // A 302 may do either, so both methods must be the plugin's.
         let ambiguous = SandboxResponse {
             status: 302,
             headers: vec![("location".to_owned(), "/hello/transfer".to_owned())],
@@ -1121,7 +1054,7 @@ mod tests {
             "a 302 may be replayed as either method, so a POST it might preserve must be owned",
         );
 
-        // And a declared GET answers HEAD, because the mount does.
+        // A declared GET answers HEAD, because the mount does.
         let head = SandboxResponse {
             status: 307,
             headers: vec![("location".to_owned(), "/hello/transfer".to_owned())],
@@ -1159,8 +1092,7 @@ mod tests {
         );
         assert_eq!(denied, vec!["location".to_owned()], "and recorded");
 
-        // The declared literal beside it is unaffected, so this narrows what a
-        // template confers rather than what a plugin declared.
+        // A declared literal beside it is unaffected.
         let declared = SandboxResponse {
             status: 307,
             headers: vec![("location".to_owned(), "/hello/greet".to_owned())],
@@ -1173,17 +1105,9 @@ mod tests {
 
     #[test]
     fn a_redirect_may_only_name_a_route_the_plugin_serves() {
-        // Staying under the prefix is not the same as being the plugin's to
-        // name. The router deliberately lets an application route sit under a
-        // plugin's prefix — disjoint siblings mount cleanly, and
-        // `try_build_router_allows_declared_plugin_routes_that_do_not_collide`
-        // pins exactly that — so `/hello/other` can belong to the application
-        // while `/hello` is the plugin's prefix.
-        //
-        // A 307 replays the user's method, body and cookies at whatever it
-        // names. A guest that could name an application route would have the
-        // browser re-issue an authenticated request against a trusted handler
-        // of the guest's choosing, holding no session capability itself.
+        // The router lets an application route sit under a plugin's prefix, so `/hello/other`
+        // can be the application's. A 307 there would replay the user's method, body and cookies
+        // against a handler of the guest's choosing.
         let application_owned = SandboxResponse {
             status: 307,
             headers: vec![("location".to_owned(), "/hello/other".to_owned())],
@@ -1196,8 +1120,7 @@ mod tests {
         );
         assert_eq!(denied, vec!["location".to_owned()], "and recorded");
 
-        // Its own routes stay: a plugin redirecting within what it serves is
-        // the case this rule exists to keep working.
+        // Redirects to the plugin's own routes stay.
         for target in ["/hello", "/hello/greet", "/hello/greet?x=1"] {
             let own = SandboxResponse {
                 status: 307,
@@ -1213,9 +1136,7 @@ mod tests {
             assert!(denied.is_empty(), "{target} was denied");
         }
 
-        // And the rules this one sits behind still hold on their own: outside
-        // the prefix, and climbing out of it, are refused before ownership is
-        // ever consulted.
+        // Leaving or climbing out of the prefix is refused before ownership is consulted.
         for target in ["/admin", "/hello/../admin", "/hello/%2e%2e/admin"] {
             let escaping = SandboxResponse {
                 status: 307,
@@ -1229,17 +1150,8 @@ mod tests {
 
     #[test]
     fn a_denied_header_name_is_not_copied_whole_to_be_thrown_away() {
-        // `sanitize` lower-cased every name before deciding anything, so a name
-        // the allowlist refuses was copied in full on the way to being dropped.
-        // The guest chooses that length — it is bounded only by the stdout line
-        // ceiling — and the copy is then *kept* in `denied` until the caller
-        // logs it, beside the parsed response and the clone `run` holds. The
-        // request side already answers this: `request_header_allowed` compares
-        // the borrowed name case-insensitively and copies nothing.
-        //
-        // The name is still recorded, because a plugin reaching for
-        // `Set-Cookie` is exactly what an operator wants to see — just as an
-        // excerpt rather than as however many megabytes the guest chose.
+        // The guest chooses the name's length, bounded only by the stdout line ceiling, and
+        // `denied` keeps it until it is logged. It is recorded as an excerpt, not in full.
         let huge = format!("set-cookie{}", "x".repeat(64 * 1024));
         let response = SandboxResponse {
             status: 200,
@@ -1264,9 +1176,7 @@ mod tests {
             denied[0].get(..40),
         );
 
-        // Case-insensitive without allocating to find out: the allowlist is
-        // matched against the borrowed name now, so a shouted name is refused
-        // exactly as a quiet one is.
+        // Matching is case-insensitive.
         let shouted = SandboxResponse {
             status: 200,
             headers: vec![("SET-COOKIE".to_owned(), "v".to_owned())],
@@ -1283,8 +1193,7 @@ mod tests {
             "recorded lower-cased"
         );
 
-        // And an allowed header still survives, whatever case it arrives in —
-        // the bound must not become a filter.
+        // An allowed header survives in any case.
         let fine = SandboxResponse {
             status: 200,
             headers: vec![("Content-Type".to_owned(), "text/plain".to_owned())],
@@ -1297,15 +1206,9 @@ mod tests {
 
     #[test]
     fn a_redirect_cannot_hide_its_climb_behind_a_space_the_client_trims() {
-        // The control-character refusal did not cover U+0020, and the URL
-        // parser trims leading and trailing spaces for the same reason it
-        // deletes tabs: `/hello/.. ` walks here as the segment `.. `, which
-        // climbs nothing, and reaches the client as `/hello/..`, which resolves
-        // to `/` — outside the prefix entirely, with a 307/308 replaying the
-        // method and body there.
-        //
-        // Asserted as an equivalence, like the deleted-character cases: the
-        // trimmed form and the plain form are the same redirect.
+        // The URL parser trims leading and trailing spaces: `/hello/.. ` walks here as the
+        // harmless segment `.. ` but reaches the client as `/hello/..`, which resolves to `/`.
+        // The equivalence assert shows the trimmed and plain forms are the same redirect.
         for smuggled in ["/hello/.. ", "/hello/.. \t", " /hello/.. "] {
             let as_the_client_sees_it: String = smuggled
                 .chars()
@@ -1322,8 +1225,7 @@ mod tests {
             );
         }
 
-        // The plain form was already refused, so the assertions above cannot
-        // pass vacuously.
+        // The plain form is refused, so the assertions above do not pass vacuously.
         assert!(!redirect_target_allowed(
             "/hello/..",
             "/hello",
@@ -1332,9 +1234,8 @@ mod tests {
             307,
         ));
 
-        // A space is refused anywhere rather than only at the ends, so there is
-        // one rule here instead of a second normalisation that has to agree
-        // with the client's. A legitimate target percent-encodes it.
+        // A space is refused anywhere, not only at the ends. A legitimate target
+        // percent-encodes it.
         assert!(!redirect_target_allowed(
             "/hello/a b",
             "/hello",
@@ -1353,20 +1254,9 @@ mod tests {
 
     #[test]
     fn a_redirect_cannot_hide_its_climb_behind_characters_the_client_deletes() {
-        // The cases above are refused because of what they say. This one is
-        // refused because of what it will say *later*: the URL Standard has the
-        // client remove every ASCII tab and newline from the input before
-        // parsing it, so the target the guest sends and the target the client
-        // resolves are not the same string.
-        //
-        // `<TAB>..` walks as an ordinary segment name — it climbs nothing, and
-        // a check reading the bytes as sent has no reason to object. Delete the
-        // tab, as every browser does, and it is `..`. HTTP allows a tab in a
-        // field value, so nothing upstream objects either, and a 307/308
-        // preserves the method, body and cookies on the way to `/admin`.
-        //
-        // Asserted as an equivalence rather than a bare refusal, so the test
-        // says why: the smuggled form and the plain form are the same redirect.
+        // The URL Standard has the client remove every ASCII tab and newline before parsing, so
+        // `<TAB>..` walks here as a harmless segment but is `..` at the client. The equivalence
+        // assert shows the smuggled and plain forms are the same redirect.
         let plain = "/hello/../admin";
         for smuggled in [
             "/hello/\t../admin",
@@ -1389,9 +1279,7 @@ mod tests {
             );
         }
 
-        // The plain form was already refused; this is the floor the above is
-        // measured against, so a change that stopped refusing it cannot make
-        // the assertions above pass vacuously.
+        // The plain form is refused, so the assertions above do not pass vacuously.
         assert!(!redirect_target_allowed(
             plain,
             "/hello",
@@ -1455,10 +1343,8 @@ mod tests {
 
     #[test]
     fn a_redirect_may_not_leave_the_plugin_s_own_prefix() {
-        // `Location` is the one allowed header that makes the *client* act, and
-        // it acts with the user's credentials. A 307/308 preserves the method,
-        // the body and the cookies, so a guest with no session capability could
-        // induce an authenticated request to the host's own admin surface.
+        // A 307/308 replays the method, body and cookies, so a guest with no session capability
+        // could send an authenticated request to the host's admin surface.
         for target in [
             "/admin",                     // elsewhere in the host's origin
             "https://evil.example/admin", // another origin entirely
@@ -1496,8 +1382,7 @@ mod tests {
             );
         }
 
-        // And a redirect to its own routes still works — the plugin needs that,
-        // and it can already serve whatever it points at.
+        // A redirect to its own routes still works.
         for target in [
             "/hello",
             "/hello/greet",
@@ -1571,9 +1456,7 @@ mod tests {
         let json = to_line(&frame).expect("serializes");
         assert!(!json.contains("session=secret"), "{json}");
         assert!(!json.contains("Bearer secret"), "{json}");
-        // The list is closed, so an unrecognised header does not cross either —
-        // which is the property that survives the next proxy vendor inventing
-        // an identity header nobody has heard of.
+        // The list is closed, so an unrecognised header does not cross either.
         assert!(!json.contains("x-trace"), "{json}");
         let HostFrame::Request { headers, .. } = frame else {
             panic!("`HostFrame::request` builds a request frame")
@@ -1726,9 +1609,7 @@ mod tests {
 
     #[test]
     fn an_unknown_field_on_a_response_frame_is_refused() {
-        // The response is the one frame a guest controls, so it is the one that
-        // most needs to refuse what it does not understand: a v2 guest sending
-        // a field this version drops would be answered as if it had not.
+        // A newer guest's field that this version drops would be silently ignored.
         let line = r#"{"op":"response","status":200,"headers":[],"body_b64":"","stream":true}"#;
         let err = from_line::<GuestFrame>(line).expect_err("an unknown field must be refused");
         assert!(err.to_string().contains("stream"), "{err}");
@@ -1748,8 +1629,7 @@ mod tests {
 
     #[test]
     fn a_status_outside_http_range_is_refused() {
-        // 1xx is refused too: an informational response is the HTTP stack's to
-        // send, and hyper treats one coming back from a service as an error.
+        // 1xx is refused: hyper treats an informational response from a service as an error.
         for status in [0u16, 99, 100, 101, 199, 600, 1000] {
             let response = SandboxResponse {
                 status,
@@ -1818,10 +1698,8 @@ mod tests {
 
     #[test]
     fn a_proxy_injected_identity_header_never_reaches_the_guest() {
-        // A denylist of credential headers is a losing game: an authenticating
-        // proxy injects names nobody standardised — `cf-access-jwt-assertion`,
-        // `x-forwarded-user`, `x-amzn-oidc-data`, `x-ms-client-principal` — and
-        // each one is a credential the sandbox promised would not cross.
+        // Authenticating proxies inject unstandardised credential headers, so a denylist cannot
+        // cover them; the allowlist does.
         let mut req = request();
         req.headers = vec![
             ("Accept".to_owned(), "text/plain".to_owned()),
@@ -1865,11 +1743,7 @@ mod tests {
 
     #[test]
     fn a_second_content_type_cannot_smuggle_a_document_past_the_allowlist() {
-        // The allowlist exists because a response is served from the host's
-        // own origin, so this slice serves data and not documents. Checking
-        // only the *first* content-type does not enforce that: header values
-        // are appended, so both reach the client, and a proxy or client that
-        // takes the last one sees the document.
+        // Both content-types reach the client, and one that takes the last sees the document.
         let response = SandboxResponse {
             status: 200,
             headers: vec![
@@ -1883,7 +1757,7 @@ mod tests {
             "a second content-type crossed the boundary unchecked"
         );
 
-        // And the reverse order, so this is not passing by luck of ordering.
+        // And in the reverse order.
         let response = SandboxResponse {
             status: 200,
             headers: vec![
@@ -1905,10 +1779,8 @@ mod tests {
 
     #[test]
     fn a_plugin_cannot_reach_a_reverse_proxy_through_an_x_header() {
-        // `X-Accel-Redirect` (nginx) and `X-Sendfile` (Apache) make the proxy
-        // serve an internal URI or a local file. An allowlist that ends in "and
-        // anything starting with x-" would hand a filesystem-free plugin the
-        // filesystem, one hop upstream.
+        // `X-Accel-Redirect` (nginx) and `X-Sendfile` (Apache) make the proxy serve an internal
+        // URI or a local file, so `x-` headers are not allowed wholesale.
         for name in [
             "x-accel-redirect",
             "x-sendfile",
@@ -1950,11 +1822,8 @@ mod tests {
 
     #[test]
     fn a_response_frame_carrying_more_headers_than_the_cap_is_refused_while_parsing() {
-        // The refusal has to happen *during* deserialization: after it, the
-        // vector this guards against already exists. `["",""]` is eight bytes
-        // on the wire and a 48-byte `(String, String)` in memory, so a frame at
-        // the stdout budget expands roughly sixfold — and `sanitize` then
-        // strips these, so `check_size` never charges for a byte of it.
+        // Refused during deserialization, before the vector exists: `["",""]` is 8 bytes on the
+        // wire and 48 in memory, and `sanitize` strips these before `check_size` charges them.
         let headers = std::iter::repeat_n(r#"["",""]"#, MAX_RESPONSE_HEADERS + 1)
             .collect::<Vec<_>>()
             .join(",");
@@ -1966,8 +1835,7 @@ mod tests {
             "a frame past the header cap must not deserialize"
         );
 
-        // And one at the cap still parses: the bound is a ceiling, not a
-        // narrowing of what a working plugin may answer with.
+        // One at the cap still parses.
         let headers = std::iter::repeat_n(r#"["x","y"]"#, MAX_RESPONSE_HEADERS)
             .collect::<Vec<_>>()
             .join(",");
@@ -1991,8 +1859,8 @@ mod tests {
 
     #[test]
     fn a_body_is_encoded_into_the_line_without_a_whole_body_temporary() {
-        // A base64 `String` of the whole body handed to serde reaches the
-        // writer as one piece. Streaming the encoding never does.
+        // A whole-body base64 `String` would reach the writer as one piece; a streamed encoding
+        // never does.
         const BODY: usize = 1 << 20;
         let mut big = request();
         big.body = vec![0xA5; BODY];
@@ -2006,7 +1874,7 @@ mod tests {
             "one write carried {} bytes of a {BODY}-byte body",
             widest.0
         );
-        // And the output is unchanged: the same line decodes to the same body.
+        // The line decodes to the same body.
         let line = to_line(&frame).expect("serializes");
         let HostFrame::Request { body, .. } = from_line(line.trim_end()).expect("parses") else {
             panic!("a request frame must parse back as a request");
@@ -2016,9 +1884,8 @@ mod tests {
 
     #[test]
     fn a_line_holds_no_spare_capacity() {
-        // The line stays resident for the whole request. A buffer that grew by
-        // doubling would keep up to twice its length, which the footprint does
-        // not count.
+        // The line stays resident for the whole request, and the footprint does not count spare
+        // capacity from a doubling buffer.
         let mut big = request();
         big.body = vec![0x5A; (1 << 20) + 17];
         let line = to_exact_line(&HostFrame::request(&big, &[])).expect("serializes");

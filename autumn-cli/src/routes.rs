@@ -113,6 +113,40 @@ pub fn clear_other_dump_modes(command: &mut Command, own: &str) {
     }
 }
 
+/// Every one-shot, no-boot env `AppBuilder::run` checks before it falls
+/// through to normal server startup: [`ALL_DUMP_MODE_ENVS`] plus the task
+/// runner and every later mutating one-shot mode (migrate, retention,
+/// the GDPR data capsule, replay), in dispatch order.
+///
+/// A call site dispatched later than all 8 [`ALL_DUMP_MODE_ENVS`] entries —
+/// `autumn task`, `autumn data capsule`, `autumn replay`, `autumn retention`,
+/// `autumn search reindex` — needs this wider set cleared via
+/// [`clear_other_one_shot_envs`], not just the dump modes: an inherited
+/// `AUTUMN_MIGRATE=1` or `AUTUMN_DB_RETENTION=purge` is dispatched before all
+/// of them too and would just as silently hijack the run (#2370's class, one
+/// dispatch tier later than [`ALL_DUMP_MODE_ENVS`] covers).
+pub fn all_one_shot_envs() -> impl Iterator<Item = &'static str> {
+    ALL_DUMP_MODE_ENVS.iter().copied().chain([
+        "AUTUMN_LIST_TASKS",
+        "AUTUMN_RUN_TASK",
+        "AUTUMN_MIGRATE",
+        "AUTUMN_RETENTION_DRY_RUN",
+        "AUTUMN_DB_RETENTION",
+        "AUTUMN_DATA_CAPSULE",
+        crate::replay::REPLAY_CAPSULE_ENV,
+    ])
+}
+
+/// Clear every [`all_one_shot_envs`] entry except `own` from `command`'s
+/// environment, so an unrelated ambient export can't silently win (#2370).
+pub fn clear_other_one_shot_envs(command: &mut Command, own: &str) {
+    for mode in all_one_shot_envs() {
+        if mode != own {
+            command.env_remove(mode);
+        }
+    }
+}
+
 /// Run `autumn routes`.
 pub fn run(opts: &RoutesOptions<'_>) {
     eprintln!("\u{1F342} autumn routes\n");
@@ -146,7 +180,6 @@ pub fn run(opts: &RoutesOptions<'_>) {
         std::process::exit(1);
     });
 
-    // Apply filters and sort
     routes = apply_filters(routes, opts.filter, opts.methods, opts.user_only);
     sort_routes(&mut routes);
 
@@ -209,19 +242,16 @@ pub fn format_table(routes: &[RouteInfo]) -> String {
         "Middleware",
     ];
 
-    // Compute column widths
     let widths = compute_column_widths(routes, &HEADERS);
 
     let mut out = String::new();
 
-    // Header row
     out.push_str(&format_row(
         &HEADERS.map(std::borrow::ToOwned::to_owned),
         &widths,
     ));
     out.push('\n');
 
-    // Separator row
     for (i, &w) in widths.iter().enumerate() {
         if i > 0 {
             out.push_str("  ");
@@ -230,7 +260,6 @@ pub fn format_table(routes: &[RouteInfo]) -> String {
     }
     out.push('\n');
 
-    // Data rows
     for route in routes {
         let middleware = if route.middleware.is_empty() {
             String::new()
@@ -491,9 +520,8 @@ fn resolve_binary_target(
         },
     );
 
-    // Collect (package-name, binary-name) pairs for every matching package
-    // that has at least one `bin` target.  When --bin is given, pick that
-    // specific target; otherwise error if a package exposes more than one.
+    // One (package, bin, manifest dir) per matching package with a `bin` target. Without --bin,
+    // a package with several bins is an error.
     let mut candidates: Vec<(String, String, Option<PathBuf>)> = Vec::new();
     for pkg in &matching_packages {
         let pkg_name = match pkg["name"].as_str() {
@@ -548,8 +576,6 @@ fn resolve_binary_target(
         }
     }
 
-    // When no explicit --package was given and multiple workspace members each
-    // have a binary, we can't pick one safely — ask the user to be explicit.
     if package.is_none() && candidates.len() > 1 {
         let names: Vec<&str> = candidates.iter().map(|(n, _, _)| n.as_str()).collect();
         return Err(format!(
@@ -737,9 +763,7 @@ mod tests {
 
     #[test]
     fn all_dump_mode_envs_has_no_duplicate_entries() {
-        // A repeated entry would mean a mode is checked twice at different
-        // priorities, or (more likely) a copy-paste mistake that silently
-        // drops a distinct mode from the clearable set.
+        // A duplicate is usually a copy-paste slip that dropped a distinct mode from the set.
         let mut seen = std::collections::HashSet::new();
         for mode in ALL_DUMP_MODE_ENVS {
             assert!(seen.insert(*mode), "{mode} appears more than once");
@@ -757,6 +781,57 @@ mod tests {
             clear_other_dump_modes(&mut command, own);
 
             for &mode in ALL_DUMP_MODE_ENVS {
+                let value = command
+                    .get_envs()
+                    .find(|(key, _)| *key == std::ffi::OsStr::new(mode));
+                if mode == own {
+                    assert_eq!(
+                        value,
+                        Some((std::ffi::OsStr::new(mode), Some(std::ffi::OsStr::new("1")))),
+                        "own mode {mode} must survive clearing: {value:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        value,
+                        Some((std::ffi::OsStr::new(mode), None)),
+                        "{mode} must be cleared when own is {own}: {value:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn all_one_shot_envs_has_no_duplicate_entries() {
+        let mut seen = std::collections::HashSet::new();
+        for mode in all_one_shot_envs() {
+            assert!(seen.insert(mode), "{mode} appears more than once");
+        }
+    }
+
+    #[test]
+    fn all_one_shot_envs_is_a_superset_of_all_dump_mode_envs() {
+        let wider: std::collections::HashSet<_> = all_one_shot_envs().collect();
+        for mode in ALL_DUMP_MODE_ENVS {
+            assert!(
+                wider.contains(mode),
+                "{mode} missing from all_one_shot_envs"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_other_one_shot_envs_preserves_own_and_clears_every_other_entry() {
+        let all: Vec<&str> = all_one_shot_envs().collect();
+        for &own in &all {
+            let mut command = Command::new("true");
+            for &mode in &all {
+                command.env(mode, "1");
+            }
+
+            clear_other_one_shot_envs(&mut command, own);
+
+            for &mode in &all {
                 let value = command
                     .get_envs()
                     .find(|(key, _)| *key == std::ffi::OsStr::new(mode));
@@ -1044,7 +1119,6 @@ mod tests {
         assert!(mermaid.contains("subgraph src2[\"plugin:harvest\"]"));
         assert!(mermaid.contains("subgraph src3[\"user\"]"));
 
-        // Check for specific routes
         assert!(mermaid.contains("\"<b>GET</b> /about\""));
         assert!(mermaid.contains("\"<b>GET</b> /api/posts\""));
         assert!(mermaid.contains("\"<b>GET</b> /actuator/health\""));
@@ -1099,12 +1173,9 @@ mod tests {
 
     #[test]
     fn resolve_binary_honors_the_requested_profile() {
-        // #1654 review round 3: a command that builds and then runs the binary
-        // must look in the profile it just compiled. Resolving `target/debug`
-        // after a `--release` build ran the wrong binary (or none), so
-        // `autumn data-flow --check` could certify a manifest that omitted
-        // every `#[cfg(not(debug_assertions))]` classified column and
-        // declassification boundary in the binary that actually ships.
+        // A command that builds and then runs the binary must look in the profile it just
+        // compiled; `target/debug` after a `--release` build would audit the wrong binary
+        // (#1654).
         let metadata = serde_json::json!({
             "target_directory": "/tmp/target",
             "packages": [{

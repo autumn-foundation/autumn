@@ -295,9 +295,8 @@ where
                 .into_response();
         }
 
-        // `Download` owns the `Content-Disposition` encoding: it strips control
-        // characters, reduces the name to its basename, and quotes/escapes it,
-        // so a caller-supplied filename cannot inject header directives.
+        // `Download` sanitizes and quotes the filename, so a caller-supplied one cannot
+        // inject `Content-Disposition` directives.
         crate::download::Download::from_bytes(out)
             .filename(self.0)
             .content_type("text/csv; charset=utf-8")
@@ -334,8 +333,7 @@ where
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
         .from_reader(reader);
-    // `byte_records` avoids the UTF-8 validation `records` performs: this pass
-    // only counts, and a row that is not valid UTF-8 is still a row.
+    // `byte_records` skips UTF-8 validation: a row that is not valid UTF-8 is still a row.
     rdr.byte_records().count() as u64
 }
 
@@ -509,39 +507,21 @@ where
         }
     };
 
-    // Calibrate the reported line numbers against the header, whose true span
-    // we know: it is line 1, so a reader that has just consumed it sits at line
-    // 2. The underlying `csv` parser's own counter does NOT agree with that on
-    // every dialect — on a CRLF file (what Excel and most Windows tools write)
-    // it runs exactly one behind the LF reading of the same rows, so a row a
-    // spreadsheet shows on line 7 would be reported as line 6, and a
-    // byte-identical LF copy of the same file would report 7. A row number that
-    // depends on the line endings is worse than useless in an error report
-    // someone is meant to act on, so measure the parser's convention once here
-    // and shift every position below by the same amount. On a dialect the
-    // parser does not count lines for at all (bare-CR, the classic-Mac
-    // dialect), the shift still puts the first data row at 2 — the rows after
-    // it share that number rather than climbing, which is the parser's limit,
-    // not this offset's.
+    // The `csv` parser's line counter runs one behind on CRLF files compared with LF, so
+    // calibrate it against the header, whose true span is known, and shift every reported
+    // line by that offset. The offset is measured once: a file that mixes terminators drifts
+    // by one after the switch. On bare-CR files the parser counts no lines, so every row
+    // reports the first data row's line.
     //
-    // The shift is measured ONCE, so it assumes the file's terminators are
-    // internally consistent. The one input it cannot serve is a file that MIXES
-    // them — an editor that appended an LF row to a CRLF export, or two exports
-    // concatenated — where the rows after the switch drift by one. That is rare
-    // next to "the file came out of Excel", and the alternative (trusting a
-    // counter that disagrees with itself across dialects) is wrong on the common
-    // case instead of the exotic one.
-    // The header's true span, so the shift is the dialect's alone. Count the
-    // blank lines before the header and the line breaks inside its fields.
-    // Assuming one line would move every row number.
+    // The header's span counts the blank lines before it and the line breaks inside its
+    // fields.
     let header_lines: u64 = 1
         + rdr.get_ref().leading_breaks
         + headers
             .iter()
             .map(|field| newline_count(field.as_bytes()))
             .sum::<u64>();
-    // The first data row therefore starts at `header_lines + 1`; whatever the
-    // parser calls that row is the convention to correct for.
+    // The first data row starts at `header_lines + 1`; the parser's number for it sets the offset.
     let line_offset: i64 = i64::try_from(header_lines.saturating_add(1)).unwrap_or(2)
         - i64::try_from(rdr.position().line()).unwrap_or(2);
     let absolute_line = move |raw: u64| -> u64 {
@@ -549,10 +529,8 @@ where
         u64::try_from(raw.saturating_add(line_offset)).unwrap_or(0)
     };
 
-    // The parser sets the start line of a record before it skips blank lines,
-    // so that line is too small by the number of blank lines. The end line is
-    // exact. Subtract the line breaks of the record to get its true start.
-    // Never report a line before the parser start.
+    // The parser records a start line before skipping blank lines, so it is too small. The end
+    // line is exact: subtract the record's line breaks from it, never going below the parser's.
     let lf_file = line_offset == 0;
     let start_line = |rdr_end: u64, raw: &csv::ByteRecord, parser: u64, open: bool| -> u64 {
         let end_break = u64::from(!(open && lf_file));
@@ -860,9 +838,7 @@ mod tests {
         assert_eq!(report.inserted, 2);
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].message, "title must not be 'Bad row'");
-        // "Bad row" is the THIRD line of the file (the header is line 1), and
-        // that is the number an operator has to be able to find in their
-        // spreadsheet.
+        // "Bad row" is the third line of the file: the header is line 1.
         assert_eq!(report.errors[0].line, 3);
     }
 
@@ -1268,12 +1244,11 @@ mod tests {
 
     #[test]
     fn import_csv_reports_error_at_exact_row_for_large_file() {
-        // Simulates a large file where row 27143 has a validation error
         let target_line: usize = 27143;
         let mut csv = String::from("value\n");
         for i in 1..=target_line {
             if i == target_line - 1 {
-                // this is the "bad" row (line 27143 in CSV = data row 27142)
+                // Data row 27142, which is file line 27143.
                 csv.push_str("BAD\n");
             } else {
                 csv.push_str("good\n");
@@ -1294,10 +1269,6 @@ mod tests {
         assert_eq!(report.errors.len(), 1, "exactly one error expected");
         assert!(!report.errors.is_empty());
         assert_eq!(report.errors[0].message, "value is BAD");
-        // The test's name promises an EXACT row; assert it, so this 27k-row
-        // fixture buys something the small ones above do not. The bad row is
-        // written at `i == target_line - 1`, which — with the header on line 1 —
-        // is file line 27143.
         assert_eq!(report.errors[0].line, 27_143);
     }
 

@@ -50,8 +50,11 @@ struct CountRow {
 
 #[derive(diesel::QueryableByName)]
 struct TimestampRow {
-    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-    value: chrono::DateTime<chrono::Utc>,
+    #[diesel(
+        sql_type = diesel::sql_types::Timestamptz,
+        deserialize_as = autumn_web::db::SqlTimestamp
+    )]
+    value: autumn_web::time::Timestamp,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -562,7 +565,7 @@ async fn every_sweep_emits_an_audit_record_with_dataset_cutoff_and_rows() {
     );
     let cutoff = event.metadata.get("cutoff").expect("cutoff recorded");
     assert!(
-        chrono::DateTime::parse_from_rfc3339(cutoff).is_ok(),
+        cutoff.parse::<autumn_web::time::Timestamp>().is_ok(),
         "the cutoff must be a real RFC-3339 timestamp: {cutoff}"
     );
 }
@@ -898,7 +901,9 @@ async fn the_cutoff_comes_from_the_database_clock() {
     .expect("dry run");
 
     let reported = reports[0].cutoff.as_deref().expect("a cutoff is reported");
-    let reported = chrono::DateTime::parse_from_rfc3339(reported).expect("an RFC-3339 cutoff");
+    let reported = reported
+        .parse::<autumn_web::time::Timestamp>()
+        .expect("an RFC-3339 cutoff");
 
     let mut conn = pool.get().await.expect("conn");
     let expected = diesel::sql_query("SELECT NOW() - INTERVAL '30 days' AS value")
@@ -907,9 +912,7 @@ async fn the_cutoff_comes_from_the_database_clock() {
         .expect("db cutoff")
         .value;
 
-    let drift = (expected - reported.with_timezone(&chrono::Utc))
-        .num_seconds()
-        .abs();
+    let drift = expected.duration_since(reported).as_secs().abs();
     assert!(
         drift < 60,
         "the reported cutoff must be the database's NOW() minus the window \

@@ -126,8 +126,8 @@ pub(super) fn perform(
         payload: payload.clone(),
     };
     match sink.enqueue(job) {
-        // The job is queued. The guest cannot hold the id, so the host answers
-        // `ResultRejected`. The audit ledger counts it as an enqueue.
+        // The job is queued, but the guest cannot hold the id, so answer `ResultRejected`.
+        // The audit ledger still counts it as an enqueue.
         Ok(job_id) if job_id.is_empty() || job_id.len() > super::MAX_JOB_ID_BYTES => {
             CallResult::denied(
                 id,
@@ -282,16 +282,10 @@ impl JobSink for MemoryJobSink {
                 self.depth
             ));
         }
-        // And by the size of the whole record, not just its payload. Depth
-        // alone bounds the queue in jobs rather than in the memory they hold,
-        // and a job retains a tenant id, a plugin name and a job type beside
-        // its arguments — a tenant arrives in a header with no length bound of
-        // its own, so an empty-payload job charged nothing while holding one.
-        // The running total, not a fresh scan. Re-weighing the whole queue on
-        // every enqueue made a *full* queue the expensive case: each refusal
-        // walked every payload while holding this lock, so a plugin that had
-        // filled the queue could spend the host's CPU indefinitely at no cost
-        // to its own quota. A refusal now costs the same as an acceptance.
+        // Bounded by the whole record's size, not just the payload: the tenant id comes from
+        // a header with no length bound. Checked against the running total; rescanning the
+        // queue under this lock on each refusal would let a plugin with a full queue spend
+        // host CPU at no cost to its quota.
         let incoming = Self::job_weight(&job);
         if queued.bytes.saturating_add(incoming) > self.byte_capacity {
             return Err(format!(

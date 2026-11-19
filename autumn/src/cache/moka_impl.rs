@@ -100,12 +100,9 @@ impl Cache for MokaCache {
     }
 
     fn invalidate_namespace(&self, namespace: &str) -> bool {
-        // Iterate rather than `invalidate_entries_if`: moka's predicate API
-        // requires the cache to be built with `support_invalidation_closures()`,
-        // which taxes every ordinary get/insert, and applies lazily on the next
-        // read. Namespace invalidation is rare and must take effect
-        // immediately, so paying O(entries) here — and nothing on the hot path
-        // — is the right trade.
+        // Not `invalidate_entries_if`: it needs `support_invalidation_closures()`, which slows
+        // every get/insert, and applies lazily on the next read. Namespace invalidation is rare
+        // and must take effect at once, so it pays O(entries) here instead of on the hot path.
         let prefix = format!("{namespace}:");
         let doomed: Vec<String> = self
             .inner
@@ -161,12 +158,11 @@ mod tests {
 
     #[test]
     fn max_capacity_evicts() {
-        // Moka eviction is async; insert many more entries than capacity
-        // and verify the cache eventually stabilises below the limit.
+        // Moka evicts asynchronously, so insert far more than capacity and check the count settles.
         let c = MokaCache::new(10, None);
         for i in 0..100 {
             cache::insert(&c, &format!("k{i}"), i);
-            // Periodically flush to give moka a chance to evict.
+            // Let moka run its pending evictions.
             if i % 20 == 0 {
                 c.inner.run_pending_tasks();
             }
@@ -175,8 +171,7 @@ mod tests {
         let count = (0..100)
             .filter(|i| cache::get::<i32>(&c, &format!("k{i}")).is_some())
             .count();
-        // Moka may temporarily overshoot, but should be in the right
-        // ballpark. Allow some slack.
+        // Moka can overshoot its capacity briefly; allow slack.
         assert!(
             count <= 20,
             "expected roughly <=10 entries (with slack), got {count}"

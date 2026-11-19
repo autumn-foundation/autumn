@@ -15,10 +15,12 @@
 //! - **The node forwards requests exactly.** It does not follow redirects.
 //!   It does not use `HTTP(S)_PROXY`. It removes hop-by-hop headers in both
 //!   directions. It refuses a path with a dot segment (400).
-//! - **Both lanes get the same forwarded headers.** [`EdgeNode`] sets them
-//!   before the capsule runs. It keeps them only from a [`TrustedProxy`];
-//!   for any other peer it is the first proxy. It removes `forwarded`.
-//!   `host` is the origin's host.
+//! - **The node sets the forwarded headers.** [`EdgeNode`] sets them before
+//!   the gateway runs, so a fallthrough and an origin-only request get the
+//!   same headers. It keeps them only from a [`TrustedProxy`]; for any other
+//!   peer it is the first proxy. It removes `forwarded`. `host` is the
+//!   origin's host. The capsule does not get these headers: they are not in
+//!   [`ALLOWED_REQUEST_HEADERS`](crate::wire::ALLOWED_REQUEST_HEADERS).
 //! - **Upgrades tunnel.** A WebSocket (or other `upgrade`) request goes to
 //!   the origin. On a 101, the node copies bytes both ways.
 //! - **Origin bodies stream.** The node does not hold a request or origin

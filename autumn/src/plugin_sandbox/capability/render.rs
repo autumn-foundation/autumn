@@ -250,10 +250,9 @@ fn write_node(
         return Err(RenderError::TooDeep);
     }
     *budget = budget.checked_sub(1).ok_or(RenderError::TooManyNodes)?;
-    // Checked as the string grows rather than only at the end: a tree within
-    // every structural bound can still render to megabytes (512 nodes each
-    // carrying 8 KiB of text is 4 MiB), and the point of the ceiling is not to
-    // *report* that but to stop building it.
+    // Checked as the string grows, not only at the end: a tree within every structural bound
+    // can still render megabytes (512 nodes x 8 KiB of text is 4 MiB), and the ceiling exists
+    // to stop building it.
     if out.len() > max_bytes {
         return Err(RenderError::TooLarge {
             found: out.len(),
@@ -272,14 +271,9 @@ fn write_node(
             attributes,
             children,
         } => {
-            // Matched without folding the guest's string first. The allow-list
-            // is a handful of short names, and `eq_ignore_ascii_case` compares
-            // lengths before bytes, so an overlong tag loses against `p` in
-            // constant time. Folding first copied whatever arrived — up to the
-            // stdout-frame ceiling, per concurrent render, outside the Wasm
-            // memory limiter — before anything decided it was a tag at all.
-            // The same shape as the outbound method a few commits back; this is
-            // the sibling that pass did not look for.
+            // Matched without lowercasing the guest's string: `eq_ignore_ascii_case` compares
+            // lengths first, so an overlong tag is refused without being copied outside the
+            // Wasm memory limiter.
             let Some(tag) = ALLOWED_TAGS
                 .iter()
                 .find(|known| known.eq_ignore_ascii_case(tag))
@@ -296,12 +290,8 @@ fn write_node(
             out.push_str(&tag);
             for (name, value) in attributes {
                 write_attribute(out, &tag, name, value)?;
-                // Re-checked per attribute, not once per node. Escaping expands
-                // a value severalfold — `&` becomes `&amp;` — so an element
-                // inside every structural bound can still render megabytes
-                // before the check at the top of the next node runs, and the
-                // point of the ceiling is to stop the string being built rather
-                // than to report its size afterwards.
+                // Re-checked per attribute: escaping expands a value severalfold (`&` becomes
+                // `&amp;`), so one element can render megabytes before the next node's check.
                 if out.len() > max_bytes {
                     return Err(RenderError::TooLarge {
                         found: out.len(),
@@ -310,8 +300,7 @@ fn write_node(
                 }
             }
             if VOID_TAGS.contains(&tag.as_str()) {
-                // Rendered `<br />` rather than `<br>`: the fragment is spliced
-                // into a host page whose author may be serving XHTML, and the
+                // `<br />` rather than `<br>`: the host page may be served as XHTML, and the
                 // self-closing form parses the same in HTML5.
                 out.push_str(" />");
                 return Ok(());
@@ -334,8 +323,7 @@ fn write_attribute(
     name: &str,
     value: &str,
 ) -> Result<(), RenderError> {
-    // As for the tag above: compared without allocating, so an overlong
-    // attribute name is refused on its length rather than after a full copy.
+    // Compared without allocating, so an overlong name is refused without a copy.
     let Some((_, known)) = ALLOWED_ATTRIBUTES
         .iter()
         .find(|(on, known)| known.eq_ignore_ascii_case(name) && (*on == "*" || *on == tag))
@@ -352,10 +340,8 @@ fn write_attribute(
     match name.as_str() {
         "href" => check_href(value)?,
         "class" | "lang" | "dir" | "datetime" => {
-            // A closed charset rather than escaping: these values end up in
-            // selectors, in `lang` matching and in date parsing, and a value
-            // that needs escaping to be safe here is a value that was never
-            // going to work anyway.
+            // A closed charset rather than escaping: these values feed selectors, `lang`
+            // matching and date parsing, where a value needing escaping would never work.
             if !value.bytes().all(|byte| {
                 byte.is_ascii_alphanumeric()
                     || matches!(byte, b' ' | b'-' | b'_' | b':' | b'.' | b'+')
@@ -366,10 +352,6 @@ fn write_attribute(
                 });
             }
         }
-        // The condition is a guard rather than an `if` inside the arm: an arm
-        // whose whole body is one `if` is an arm clippy asks to be written this
-        // way, and the `_ => {}` below already accepts everything that falls
-        // through, so the guard failing lands there rather than anywhere new.
         "colspan" | "rowspan"
             if value.is_empty()
                 || value.len() > 3
@@ -408,9 +390,8 @@ fn write_attribute(
 /// the value are the same class of bug one variation along, so the character is
 /// refused wherever it appears rather than pattern-matched at the front.
 fn check_href(value: &str) -> Result<(), RenderError> {
-    // Before the shape test, and unconditionally: `/\evil` passes every
-    // prefix check a reader would write, because the byte that makes it an
-    // authority is the *second* one.
+    // Before the shape test: `/\evil` passes the prefix checks, because the byte that makes it
+    // an authority is the second one.
     if value.contains('\\') {
         return Err(RenderError::InvalidAttributeValue {
             name: "href".to_owned(),
@@ -427,8 +408,7 @@ fn check_href(value: &str) -> Result<(), RenderError> {
             reason: "expected a same-origin link: `/path`, `?query` or `#fragment`",
         });
     }
-    // Control characters are how `java\tscript:` gets past a scheme check in a
-    // browser that strips them. Nothing here needs one.
+    // Browsers strip control characters, which is how `java\tscript:` evades scheme checks.
     if value.chars().any(char::is_control) {
         return Err(RenderError::InvalidAttributeValue {
             name: "href".to_owned(),
@@ -554,8 +534,7 @@ mod tests {
             "vbscript:msgbox",
             "https://attacker.test/",
             "//attacker.test/",
-            // A browser reads `\` as a path separator for http(s), so each of
-            // these is `//attacker.test` by another spelling and navigates
+            // Browsers read `\` as a path separator for http(s), so each of these navigates
             // off-origin. `/\` is the one a `!starts_with("//")` guard misses.
             "/\\attacker.test/login",
             "\\/attacker.test/login",
@@ -610,12 +589,6 @@ mod tests {
 
     #[test]
     fn an_overlong_tag_or_attribute_name_is_refused_without_being_copied() {
-        // The outbound method got this treatment a few rounds back and the pass
-        // stopped there. These are the siblings: a tag and an attribute name
-        // were both `to_ascii_lowercase`d before anything decided they were
-        // names at all, so a megabyte of either was copied once for the fold
-        // and again for the denial -- per concurrent render, outside the Wasm
-        // memory limiter.
         let huge = "p".repeat(512 * 1024);
         assert!(matches!(
             render(
@@ -640,8 +613,7 @@ mod tests {
             Err(RenderError::ForbiddenAttribute { .. })
         ));
 
-        // And the case-insensitivity the fold existed for still holds, so the
-        // allocation-free match did not quietly become a case-sensitive one.
+        // Matching stays case-insensitive.
         assert_eq!(
             render(
                 &[FragmentNode::Element {
@@ -701,14 +673,8 @@ mod tests {
 
     #[test]
     fn one_element_may_not_carry_unbounded_attributes() {
-        // The allow-list bounds *which* attributes appear and says nothing
-        // about how many. An element repeating `title` is inside every other
-        // ceiling — depth, node count, per-value length — and still renders
-        // megabytes, because escaping expands each value severalfold and the
-        // byte check used to run once per node rather than per attribute.
-        // `a`, because `title` is the one free-form value the allow-list
-        // permits and it permits it there. On any other tag this would be
-        // refused for the attribute's *name* and prove nothing about its size.
+        // The allow-list bounds which attributes appear, not how many. `a` because it is the
+        // only tag allowing `title`; any other tag would refuse the name and prove nothing.
         let wide = FragmentNode::Element {
             tag: "a".to_owned(),
             attributes: (0..=MAX_ATTRIBUTES)
@@ -721,8 +687,7 @@ mod tests {
             Err(RenderError::TooManyAttributes(_))
         ));
 
-        // And the byte ceiling stops the string being *built*, not merely
-        // reports its size: every value here escapes to five bytes.
+        // The byte ceiling stops the string mid-element: every value escapes to five bytes.
         let heavy = FragmentNode::Element {
             tag: "a".to_owned(),
             attributes: (0..MAX_ATTRIBUTES)

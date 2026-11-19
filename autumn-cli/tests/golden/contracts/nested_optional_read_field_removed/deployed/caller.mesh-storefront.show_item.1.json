@@ -7,7 +7,8 @@
       "method": "get_item",
       "reads": [
         "details",
-        "details.color"
+        "details.color",
+        "id"
       ],
       "writes": null
     }

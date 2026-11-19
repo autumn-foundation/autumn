@@ -215,41 +215,18 @@ pub fn resolve_retention_descriptors(
 ) -> AutumnResult<Vec<&'static RetentionSweepDescriptor>> {
     let all: Vec<&RetentionSweepDescriptor> =
         inventory::iter::<RetentionSweepDescriptor>().collect();
-    // Resolving descriptors alone does not validate them: the `every`, `after`, and
-    // `purge_deleted_after` duration parsing, the model-dependents boot assert, and the
-    // backend-bind-limit assert all live inside `task_info()`, which this function never
-    // called. A policy with a bad `every` — "bogus" — used to pass a dry run silently
-    // even though it panics the moment real boot calls `collect_retention_tasks()`, which
-    // does call `task_info()` on every descriptor. Run the exact validation boot relies
-    // on: it is pure and DB-independent, so calling it here does not cost the
-    // resolve-before-connecting property this function exists for.
-    //
-    // Also apply the duplicate-task-name check `collect_retention_tasks` applies. Calling
-    // `task_info()` alone catches a bad duration, dependents list, or bind limit on any
-    // one descriptor, but not two different repositories that legitimately target the same
-    // table (see `live_broadcast.rs`) both declaring `retention(...)`.
-    //
-    // Validated against `all`, not the `--model`-narrowed `matches` below: a filtered dry
-    // run used to validate only the selected descriptor, so a duplicate-name collision
-    // between two other, unselected policies went undetected — and real boot's
-    // `collect_retention_tasks()` has no filter concept, walking every registered
-    // descriptor, so it would still panic on that collision whatever `--model` narrowed
-    // to. Validate the complete registry up front, before narrowing (#1342).
+    // Run the same checks boot runs in `collect_retention_tasks()`: the duration, dependents
+    // and bind-limit asserts inside `task_info()`, plus the duplicate-task-name check. They
+    // are pure, so this still resolves before connecting. Validate `all`, not the
+    // `--model`-narrowed matches: boot has no filter and panics on any bad policy (#1342).
     validate_resolved_descriptors(&all);
 
     let matches: Vec<&RetentionSweepDescriptor> = match model_filter {
         None => all,
         Some(filter) => {
-            // The ambiguity error below tells the operator to pass the table name
-            // instead of the model name to disambiguate — but if a different
-            // policy's `table_name` equals this filter, as when one repository uses
-            // model `Session` while another targets a table literally named
-            // `Session`, the combined `model_name == filter || table_name == filter`
-            // filter below still collects both, making the suggested table-name
-            // filter just as ambiguous. Resolve an exact, unique `table_name` match
-            // first — schema table names are unique, so that can never be ambiguous —
-            // and fall back to the model-or-table filter, whose ambiguity is expected
-            // and reported, only when no single table matches (#1342).
+            // A unique `table_name` match wins first. The ambiguity error tells the operator
+            // to pass the table name, and the model-or-table filter alone could match it
+            // twice (model `Session` in one policy, a table named `Session` in another).
             let table_matches: Vec<&RetentionSweepDescriptor> = all
                 .iter()
                 .copied()
@@ -384,13 +361,9 @@ mod tests {
         }
     }
 
-    // `RetentionSweepDescriptor::task_info` is a plain `fn() -> TaskInfo`
-    // (no captures), so each `inventory::submit!` fixture below needs its
-    // own named function rather than a closure over `task_info_named` — and
-    // each must return a distinct name, now that `collect_retention_tasks`
-    // rejects duplicates (#1342 review round 7). Sharing `sample_task_info`
-    // across fixtures, as earlier versions of these tests did, is exactly
-    // the collision that check now catches.
+    // `RetentionSweepDescriptor::task_info` is a plain `fn() -> TaskInfo`, so each
+    // `inventory::submit!` fixture needs its own named function, and each must return a
+    // distinct name: `collect_retention_tasks` rejects duplicates.
     fn by_model_name_task_info() -> TaskInfo {
         task_info_named("retention-sweep-__retention_runtime_test_widgets")
     }
@@ -435,9 +408,8 @@ mod tests {
 
     #[test]
     fn collect_retention_tasks_calls_every_registered_descriptor() {
-        // The consolidated integration test binary links every macro-expanded
-        // fixture, so descriptors from other test modules may already be
-        // registered; assert on containment rather than an exact count.
+        // Descriptors from other test modules may be registered too, so do not assert an
+        // exact count.
         let tasks = collect_retention_tasks();
         assert!(
             tasks.iter().all(|t| !t.name.is_empty()),
@@ -447,14 +419,9 @@ mod tests {
 
     #[test]
     fn duplicate_retention_task_name_detects_a_collision() {
-        // Regression (#1342 review round 7): two different repositories can
-        // legitimately target the same table (see live_broadcast.rs); if
-        // both declare retention(...), the table-qualified task name alone
-        // doesn't disambiguate them. Tested against the pure helper, not
-        // collect_retention_tasks() itself — inventory::submit! is
-        // process-global and can't be un-registered, so submitting a
-        // colliding pair here would break every other test in the binary
-        // that also calls collect_retention_tasks().
+        // Two repositories can target the same table, and both may declare retention(...).
+        // This tests the pure helper: a colliding pair submitted to the process-global
+        // inventory would break every other test that calls collect_retention_tasks().
         let tasks = vec![sample_task_info(), sample_task_info()];
         let message = duplicate_retention_task_name(&tasks)
             .expect("two tasks with the same name must be flagged as a collision");
@@ -558,14 +525,8 @@ mod tests {
 
     #[test]
     fn resolve_retention_descriptors_prefers_exact_table_match_over_ambiguous_model_match() {
-        // Regression (#1342 review round 24): the ambiguity error tells the
-        // operator to pass the table name instead of the model name to
-        // disambiguate, but the combined `model_name == filter ||
-        // table_name == filter` filter treats a *different* policy's
-        // table_name equaling this policy's model_name as an ambiguous
-        // match too — making the suggested table-name filter just as
-        // ambiguous as the model-name filter it was meant to fix. An exact
-        // table_name match must resolve unambiguously regardless.
+        // One policy's table_name equals another's model_name. The table-name filter the
+        // ambiguity error suggests must still resolve to exactly one policy.
         struct FixtureA;
         struct FixtureB;
         inventory::submit! {
@@ -613,19 +574,9 @@ mod tests {
         assert!(error.to_string().contains("__NoSuchRetentionModel"));
     }
 
-    // `resolve_retention_descriptors` used to return matched descriptors without ever
-    // calling their `task_info()`, the one place the `every`, `after`, and
-    // `purge_deleted_after` duration parsing, the model-dependents assert, and the
-    // bind-limit assert all live. A policy with a bad `every` therefore passed a dry run
-    // silently even though real boot — `collect_retention_tasks()`, which does call
-    // `task_info()` on every descriptor — would panic on it (#1342).
-    //
-    // This cannot be tested with a genuinely panicking fixture: `inventory`'s registry is
-    // process-global, and every other test in this binary that calls
-    // `collect_retention_tasks()` also invokes every registered descriptor's
-    // `task_info()`, so a permanently panicking fixture would break those too. Count calls
-    // instead: proving `resolve_retention_descriptors` invokes `task_info()` is exactly
-    // what proves it would propagate a real panic.
+    // A dry run must run the `task_info()` validation boot runs (#1342). A panicking fixture
+    // would break every other test that calls `collect_retention_tasks()`, since the
+    // `inventory` registry is process-global, so count `task_info()` calls instead.
     static COUNTING_TASK_INFO_CALLS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
@@ -661,16 +612,8 @@ mod tests {
         );
     }
 
-    // Regression (#1342 review round 19): a `--model`-filtered
-    // resolve_retention_descriptors call used to validate only the
-    // narrowed-down match, so a bad `every`/duplicate-name on some OTHER,
-    // unselected policy went undetected — real boot's
-    // collect_retention_tasks() has no filter concept and validates every
-    // registered descriptor, so it would still panic on that other
-    // policy's problem regardless of what any dry run's --model narrowed
-    // to. A separate counting fixture (not selected by the filter used
-    // below) proves the fix: filtering to one policy must still invoke
-    // task_info() on every OTHER registered descriptor too.
+    // Boot has no `--model` filter, so a filtered dry run must still call `task_info()` on
+    // policies the filter does not select. This fixture is never selected.
     static UNSELECTED_TASK_INFO_CALLS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
@@ -725,20 +668,9 @@ mod tests {
 
     #[test]
     fn validate_resolved_descriptors_panics_on_duplicate_task_names() {
-        // Regression (#1342 review round 15): resolve_retention_descriptors
-        // used to run task_info() validation without also checking the
-        // resulting names for a collision, unlike collect_retention_tasks().
-        // Two different repositories can legitimately target the same table
-        // (see live_broadcast.rs); if both declare retention(...), an
-        // unfiltered dry run without this check would run both policies and
-        // report success, potentially double-counting the same rows, right
-        // up until real boot panics on the identical collision.
-        //
-        // Synthetic descriptors, not inventory::submit! (matching the
-        // constraint duplicate_retention_task_name's own doc comment
-        // explains): a genuinely colliding pair registered in the
-        // process-global registry would also break every other test in this
-        // binary that calls collect_retention_tasks().
+        // A dry run must reject the duplicate task names boot rejects. Synthetic descriptors,
+        // not inventory::submit!: a colliding pair in the process-global registry would break
+        // every other test that calls collect_retention_tasks().
         let a = RetentionSweepDescriptor {
             model_name: "__ValidateResolvedDescriptorsA",
             table_name: "__validate_resolved_descriptors_dup",
@@ -784,7 +716,6 @@ mod tests {
         };
         let matches: Vec<&RetentionSweepDescriptor> = vec![&a, &b];
 
-        // Must not panic.
         validate_resolved_descriptors(&matches);
     }
 }

@@ -122,7 +122,9 @@ sim.run_to_idle().await; // drain everything the advance released
   itself again), `run_to_idle` panics with a `sim drain stall` message and the
   seed. `Sim::try_run_to_idle` returns the `SimStall` instead.
 - [`Sim::advance_to`] / [`Sim::advance_to_local`] jump to a specific
-  (optionally timezone-zoned, DST-aware) instant instead of a raw duration —
+  instant (`advance_to` takes anything `Into<Timestamp>`) or a
+  `civil::DateTime` read in a `jiff::tz::TimeZone` (`advance_to_local`,
+  DST-aware) instead of a raw duration —
   useful for business-calendar / SLA tests that must cross a spring-forward or
   fall-back boundary deterministically.
 
@@ -571,7 +573,7 @@ rate, plus an offset.
 | `Replica::named("b").clock_ahead(d)` / `.clock_behind(d)` | a fixed offset |
 | `.clock_drift_ppm(ppm)` | the clock runs `ppm` parts per million fast (negative: slow), from the mount |
 | `.seeded_clock(max_offset, max_drift_ppm)` | offset and drift drawn from the seed and the name |
-| `sim.step_replica_clock("b", TimeDelta::seconds(5))` | an NTP step: the wall clock jumps, the monotonic clock does not |
+| `sim.step_replica_clock("b", SignedDuration::from_secs(5))` | an NTP step: the wall clock jumps, the monotonic clock does not |
 | `sim.replica_clock("b")` | the offset (with steps) and drift in use |
 
 The drift changes what the replica's clock reads, not its tokio timers: a
@@ -816,7 +818,7 @@ rank update for all posts. `calculate_hot_rank` and its SQL now keep the age at
 
 | Source | Sim treatment |
 |---|---|
-| Wall-clock time (`Utc::now()` via the `Clock` extractor) | Virtual, driven by `Sim::advance` |
+| Wall-clock time (`clock.now()` via the `Clock` extractor) | Virtual, driven by `Sim::advance` |
 | Async timers (`tokio::time::sleep`, job backoff, scheduler ticks) | Virtual, via a paused current-thread Tokio runtime |
 | Elapsed / monotonic time (`state.monotonic()`, the `Clock` extractor's `.monotonic()`) | Virtual, driven by `Sim::advance` — but a raw `std::time::Instant` is **not** (see below) |
 | Scheduling of autumn's own background work (jobs, scheduler, commit hooks) | Deterministic, drained by `Sim::run_to_idle` |
@@ -840,7 +842,7 @@ seams instead:
 
 | Instead of | Use |
 |---|---|
-| `chrono::Utc::now()` | `state.clock().now()`, or the `Clock` extractor in a handler |
+| `jiff::Timestamp::now()` | `state.clock().now()`, or the `Clock` extractor in a handler |
 | `std::time::Instant::now()` (measuring elapsed) | `clock.monotonic()` for the start (the extractor snapshots at request start) and `state.monotonic()` for the closing read, then `MonotonicInstant::saturating_duration_since` |
 | `std::time::Instant::now()` (a deadline whose counterparty is `tokio::time::sleep`) | `tokio::time::Instant::now()` — already virtual under the paused runtime |
 | `std::time::SystemTime::now()` | `autumn_web::time::clock_unix_secs(clock)` / `clock_unix_duration(clock)` |

@@ -78,13 +78,15 @@
 //! Everything here is designed to grow additively (builder-style) without
 //! breaking the frozen surface — hence the `#[non_exhaustive]` markers.
 
-// Several thin accessors here could be `const fn`; they stay non-const so the
-// frozen public surface can grow a non-const body later without a break.
+// Some accessors could be `const fn`; they stay non-const so a later non-const body is
+// not a breaking change.
 #![allow(clippy::missing_const_for_fn)]
 
 use std::sync::Arc;
 
-use chrono::{DateTime, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
+use jiff::Timestamp;
+use jiff::civil::DateTime as CivilDateTime;
+use jiff::tz::{Disambiguation, TimeZone};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use uuid::Uuid;
@@ -92,34 +94,22 @@ use uuid::Uuid;
 use crate::entropy::{Entropy, SeededEntropy, uuid_v4_from_bytes, uuid_v7_from_parts};
 use crate::time::TickingClock;
 
-// The per-sim SQLite DB lane (W4, issue #1797): a fresh, migrated, in-process
-// SQLite substrate the sim builds its app on. Self-contained and additive — W2
-// consumes its pool when it mounts the app on `SimApp`. Only meaningful under the
-// `sqlite` feature (the sim's DB substrate is SQLite by design).
-//
-// Exposed as `#[doc(hidden)] pub` — unstable test/sim plumbing, not the stable
-// surface — mirroring this module's `__seed_from_env` / `__replay_line` hidden
-// hooks. It is `pub` (not `pub(crate)`) purely so the W4 DoD consolidated
-// integration test, which is an external crate, can drive the end-to-end drain;
-// the stable mount API remains W2's `Sim::build`.
+// The per-sim migrated, in-process SQLite database the sim builds its app on (#1797).
+// Hidden `pub`, not `pub(crate)`, only so integration tests can drive it; the stable
+// mount API is `Sim::build`.
 #[cfg(feature = "sqlite")]
 #[doc(hidden)]
 pub mod substrate;
 
-// The chaos lane (W5, issue #1797): deterministic fault injection wired into
-// `Sim::build`. Additive and opt-in — a default (empty) `Chaos` installs
-// nothing. See the module docs for the determinism contract.
+// Seeded probabilistic fault injection wired into `Sim::build` (#1797).
 pub mod chaos;
 
 #[cfg(feature = "mail")]
 pub use chaos::MailFault;
 pub use chaos::{Chaos, ChaosEvent, ChaosHook};
 
-// The authored fault lane (issue #1680): `FaultPlan`, an ordinal-targeted,
-// seed-deterministic fault schedule installed through `TestApp::with_fault_plan`
-// (not through `Sim::chaos`), plus the serializable `FaultOutcome` a scenario
-// asserts on. Additive and opt-in — a `TestApp` with no plan is untouched. See
-// the module docs for the determinism contract and how it differs from `Chaos`.
+// Ordinal-targeted faults installed through `TestApp::with_fault_plan`, not
+// `Sim::chaos` (#1680).
 pub mod fault;
 
 pub use fault::{
@@ -127,25 +117,15 @@ pub use fault::{
     ReportedError,
 };
 
-// The seeded LLM stub (W5.b, item 6, issue #1797): a deterministic fake
-// completion client — canned responses + a seeded fault/latency schedule — for
-// exercising agent retry/fallback paths under the virtual clock. Standalone and
-// additive; it does not route through the `Chaos` builder. See the module docs
-// for the determinism contract.
+// A seeded fake LLM client for agent retry/fallback paths (#1797).
 pub mod llm;
 
 pub use llm::{LlmCall, LlmClient, LlmError, LlmRequest, LlmResponse, SeededLlm, SeededLlmBuilder};
 
-// The crash lane (W5.c item 7, issue #1797): a seed-derived crash schedule plus
-// the `Sim` kill/restart primitive for durable crash-recovery tests. Additive —
-// the schedule is a pure function of the seed and installs nothing at build.
+// Seed-derived crash schedules for crash-recovery tests (#1797).
 pub mod crash;
 
-// The W6 semantic core (issue #1797): the `always!` / `sometimes!` assertion
-// macros and the thread-local non-vacuity registry. Public (documented) module —
-// the macros are `#[macro_export]`ed at the crate root (`autumn_web::always` /
-// `autumn_web::sometimes`), and their hidden plumbing plus the sweep-facing
-// registry API live here.
+// Plumbing and registry for the crate-root `always!` / `sometimes!` macros (#1797).
 pub mod assert;
 
 // The simulated network (issue #2967): seeded latency, drops and partitions
@@ -156,9 +136,7 @@ pub mod net;
 #[cfg(feature = "http-client")]
 pub use net::{NetEvent, NetFault, SimNet};
 
-// The shared demo scenario (issue #2967): one `Op` vocabulary for the
-// `sim-sweep` proptest sweep and the `sim_ops` cargo-fuzz target. Hidden,
-// unstable harness plumbing.
+// One `Op` vocabulary for the `sim-sweep` sweep and the `sim_ops` fuzz target (#2967).
 #[doc(hidden)]
 pub mod scenario;
 
@@ -199,23 +177,13 @@ pub use assert::{
 };
 pub use crash::{CrashOutcome, CrashPoint, CrashSchedule, crash_at};
 
-// The W6 op-driver (PR2, issue #1797): `Sim::gen_ops`/`Sim::gen_ops_with` (deterministic,
-// non-shrinking generation) and `Sim::run_proptest` (the shrink-capable
-// runner-owning entrypoint). Behind the `sim-testing` feature because it needs
-// `proptest` as a library (not just dev) dependency — see `autumn/Cargo.toml`.
+// Op generation and `Sim::run_proptest` (#1797). Feature-gated because it needs
+// `proptest` as a library dependency, not only a dev one.
 #[cfg(feature = "sim-testing")]
 pub mod op;
 
-// The W6 seed-sweep runner (PR3, issue #1797): `sweep_proptest` runs
-// `Sim::run_proptest` sequentially across a batch of seeds, reporting the
-// first failing seed (if any), and folds `sometimes!` reachability — across
-// every proptest case in every seed — across the whole swept range so a
-// green sweep is provably non-vacuous. Sequential, not parallel: see
-// `sim::sweep`'s module docs for why a `body` that mounts a real app makes
-// OS-thread parallelism unsafe here. The `sim-sweep` `[[bin]]`
-// (`autumn/src/bin/sim_sweep.rs`) is its CI-facing driver. Same
-// `sim-testing` feature gate as `op` — it builds directly on
-// `Sim::run_proptest_with_case_hook`.
+// The seed-sweep runner behind the `sim-sweep` binary (#1797). It runs seeds
+// sequentially; `sim::sweep`'s module docs explain why.
 #[cfg(feature = "sim-testing")]
 pub mod sweep;
 
@@ -354,9 +322,7 @@ impl Sim {
     /// it; `#[sim_test]` does this for you.
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
-        // Each seed run starts with a clean reachability registry, so the sweep
-        // can attribute observed/satisfied `sometimes!` labels to exactly one
-        // seed before folding them into its cross-seed aggregate (W6, #1797).
+        // A clean registry per seed lets the sweep attribute `sometimes!` labels to one seed.
         assert::reset_sometimes_registry();
         let clock = SimClock::new(TickingClock::starting_at(sim_epoch()));
         let ambient_clock = Arc::new(AmbientSimClock {
@@ -523,12 +489,11 @@ impl Sim {
     /// path. When chaos is active this re-derives the chaos decision state from
     /// the seed, so a restart's fault schedule replays deterministically.
     fn mount(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
-        // Seed the app's entropy unless the test injected its own source, so
-        // framework-minted ids replay from the seed with no extra call.
+        // Unless the test injected its own entropy, framework-minted ids replay from the seed.
         let mount_seed = mount_entropy_seed(self.seed, self.mounts);
         let app = app.with_default_entropy(SeededEntropy::shared(mount_seed));
         self.mounts += 1;
-        // Install the simulated network, with a stream fresh for this mount.
+        // A fresh network stream for each mount.
         #[cfg(feature = "http-client")]
         let app = match &self.net {
             Some(net) => {
@@ -537,10 +502,8 @@ impl Sim {
             }
             None => app,
         };
-        // When chaos is active, install its deterministic hooks (which also own
-        // the clock so a skew wrapper can be applied); otherwise the build is
-        // byte-for-byte the pre-W5 path — just the virtual clock.
-        // The ambient wall clock matches the app clock, skewed or not.
+        // The ambient wall clock matches the app clock, skewed or not. Active chaos owns
+        // the app clock so it can apply its skew.
         *self
             .ambient
             .wall
@@ -584,15 +547,13 @@ impl Sim {
     /// the in-memory job queue's by-design loss is documented, never pretended
     /// durable. See the [`crash`] module docs.
     pub fn kill(&mut self) {
-        // Stop the app's tasks, as a process death does. Dropping the client
-        // then runs `TestJobRuntime::drop` (shutdown.cancel() +
-        // clear_global_job_client()).
+        // Dropping the client runs `TestJobRuntime::drop`, which cancels shutdown and
+        // clears the global job client.
         if let Some(client) = self.app.client.take() {
             abort_app_tasks(&client);
             drop(client);
         }
-        // A fresh process has no in-memory chaos decision log; a restart
-        // re-derives it deterministically from the seed.
+        // A restart re-derives the chaos decision log from the seed.
         self.chaos_state = None;
     }
 
@@ -765,7 +726,7 @@ impl Sim {
     /// # Panics
     ///
     /// Panics if no replica with this name was mounted.
-    pub fn step_replica_clock(&self, name: &str, by: chrono::TimeDelta) {
+    pub fn step_replica_clock(&self, name: &str, by: jiff::SignedDuration) {
         let index = self.expect_replica_index(name);
         self.replicas[index].clock.step(by);
     }
@@ -975,7 +936,7 @@ impl Sim {
     /// wall-clock time leaking into a step that should have taken virtually none.
     ///
     /// It is **not** off-seam-read detection. It cannot tell you that some code
-    /// read `Utc::now()` / `Instant::now()` directly instead of through the
+    /// read `Timestamp::now()` / `Instant::now()` directly instead of through the
     /// injected clock — a free-function `now()` call has no runtime interception
     /// point in safe Rust, so its *absence* is not observable at runtime. Finding
     /// those reads is a static-analysis (deny-lint) job; this guard is the
@@ -1069,7 +1030,7 @@ impl Sim {
     /// The framework [`crate::time::Clock`] extractor (backed by the
     /// simulation's virtual clock) and tokio's virtual timer (`tokio::time::sleep`,
     /// job backoff delays, delayed enqueues) move by exactly the same amount, so
-    /// `Utc::now()`-via-extractor and a sleeping task stay in lockstep — a job
+    /// the extractor's `now()` and a sleeping task stay in lockstep — a job
     /// whose retry backs off 24 hours fires the instant this advances 24 hours,
     /// with zero wall-clock delay. Timers that come due within the window fire
     /// and their tasks are polled before this returns.
@@ -1077,54 +1038,42 @@ impl Sim {
     /// Pair with [`run_to_idle`](Sim::run_to_idle) to then drain the work the
     /// fired timers enqueued.
     pub async fn advance(&self, duration: std::time::Duration) {
-        // Real-time leak guard (no-op unless `strict_wall_clock` is enabled):
-        // sample a REAL instant (not tokio's paused time) at entry and check the
-        // real elapsed against the budget before returning. `advance_to` routes
-        // through here, so it inherits the guard for free.
+        // Real-time leak guard (no-op unless `strict_wall_clock` is set): a real instant,
+        // not tokio's paused time. `advance_to` routes through here.
         let guard_start = self.wall_clock_guard_start();
-        // `advance` yields and never parks, so database work runs without the
-        // gate's turns, as before the gate (#3067).
+        // `advance` yields and never parks, so database work runs outside the gate's
+        // turns (#3067).
         let _open = gate::Open::new();
-        // Let every ready task take one step at the current instant before time
-        // moves. A task spawned since the last yield (a `#[scheduled]` loop that
-        // `build` started, a job worker) then registers its first timer at the
-        // instant it was started, not at the end of this advance.
+        // Let ready tasks step before time moves, so a task spawned since the last yield
+        // (a `#[scheduled]` loop, a job worker) registers its first timer at the instant it
+        // started, not at the end of this advance.
         tokio::task::yield_now().await;
-        // Step the framework clock first so any task woken by the tokio timer
-        // that reads the clock observes the already-advanced instant.
+        // Framework clock first, so a task woken by the tokio timer reads the new instant.
         self.clock.advance(duration);
-        // Advance tokio's paused timer wheel; this fires due timers and yields
-        // so their tasks are polled before returning.
-        // `tokio::time::advance` moves the clock in its first poll, the same
-        // poll as this note, and only then yields.
+        // `tokio::time::advance` moves the clock in its first poll, the same poll as this
+        // note, and only then yields.
         note_own_advance(&self.ambient, duration);
         tokio::time::advance(duration).await;
         self.enforce_wall_clock_budget(guard_start);
     }
 
-    /// Advance virtual time **to** a specific zoned instant, resolving the
-    /// timezone (including any DST transition) to the correct UTC instant and
-    /// then stepping forward by the delta from the current sim instant.
+    /// Advance virtual time **to** a specific instant, then step forward by the
+    /// delta from the current sim instant.
     ///
-    /// This is the timezone/DST-aware companion to [`advance`](Sim::advance):
-    /// where `advance` takes a raw [`std::time::Duration`], `advance_to` takes a
-    /// *wall-clock target in any timezone* and computes the real (UTC) delta for
-    /// you. It is generic over any [`chrono::TimeZone`] — pass a
-    /// `chrono::DateTime<Utc>`, a `chrono::DateTime<chrono::FixedOffset>`, or a
-    /// `chrono::DateTime<chrono_tz::Tz>` from the `chrono-tz` crate — so a caller
-    /// can express a zoned target without this crate hard-depending on any
-    /// particular timezone database.
+    /// This is the instant-based companion to [`advance`](Sim::advance): where
+    /// `advance` takes a raw [`std::time::Duration`], `advance_to` takes a target
+    /// instant and computes the real delta for you. It accepts anything that
+    /// converts into a [`jiff::Timestamp`]: a `Timestamp` itself, or a
+    /// [`jiff::ZonedDateTime`] (`&ZonedDateTime` too) in any time zone, which
+    /// already names a single instant.
     ///
-    /// The target is converted to UTC via [`chrono::DateTime::with_timezone`],
-    /// which is unambiguous (every zoned `DateTime` already names a single
-    /// instant), and the sim then reuses [`advance`](Sim::advance) internally so
-    /// the injected wall clock and tokio's paused timer wheel stay in **exact
-    /// lockstep** — any `tokio::time::sleep` / job-backoff timer whose deadline
-    /// falls inside the crossed wall-clock window (a DST "spring-forward" gap
-    /// included) fires during the advance, then its task is polled before this
-    /// returns. Because the injected clock is UTC and monotonic, a spring-forward
-    /// boundary is just a shorter real interval — the timers inside it still fire
-    /// correctly.
+    /// The sim reuses [`advance`](Sim::advance) internally so the injected wall
+    /// clock and tokio's paused timer wheel stay in **exact lockstep**: any
+    /// `tokio::time::sleep` / job-backoff timer whose deadline falls inside the
+    /// crossed window (a DST "spring-forward" gap included) fires during the
+    /// advance, then its task is polled before this returns. Because the
+    /// injected clock is UTC and monotonic, a spring-forward boundary is just a
+    /// shorter real interval, and the timers inside it still fire correctly.
     ///
     /// # Forward-only semantics
     ///
@@ -1142,86 +1091,72 @@ impl Sim {
     ///
     /// # Panics
     ///
-    /// Panics if `target` resolves to a UTC instant strictly before the current
-    /// sim instant (see *Forward-only semantics*).
+    /// Panics if `target` is strictly before the current sim instant (see
+    /// *Forward-only semantics*).
     ///
     /// ```rust,ignore
-    /// use chrono::{TimeZone, Utc};
+    /// use autumn_web::time::Timestamp;
     /// // Advance the sim clock to a specific UTC instant.
-    /// let target = Utc.with_ymd_and_hms(2020, 3, 8, 12, 0, 0).unwrap();
-    /// sim.advance_to(&target).await;
+    /// let target: Timestamp = "2020-03-08T12:00:00Z".parse().unwrap();
+    /// sim.advance_to(target).await;
     /// sim.run_to_idle().await;
     /// ```
     ///
-    /// Written as a non-`async fn` returning a future so the generic zoned
-    /// `target` is resolved to UTC **synchronously** and never captured across an
-    /// `.await` — the returned future holds only `&self` and the resolved
-    /// `DateTime<Utc>`, so it stays `Send` for any `Tz` (a borrowed or non-`Sync`
-    /// `Tz` would otherwise poison the future).
-    pub fn advance_to<Tz>(
-        &self,
-        target: &DateTime<Tz>,
-    ) -> impl std::future::Future<Output = ()> + '_
+    /// Written as a non-`async fn` returning a future so `target` is converted
+    /// **synchronously** and never captured across an `.await`: the returned
+    /// future holds only `&self` and the resolved [`Timestamp`], so it stays
+    /// `Send` whatever `T` is.
+    pub fn advance_to<T>(&self, target: T) -> impl std::future::Future<Output = ()> + '_
     where
-        Tz: TimeZone,
+        T: Into<Timestamp>,
     {
-        let target_utc = target.with_timezone(&Utc);
-        self.advance_to_utc(target_utc)
+        self.advance_to_utc(target.into())
     }
 
-    /// Advance virtual time to a **naive local wall-clock time** interpreted in
-    /// timezone `tz`, resolving DST edge cases explicitly (no `.unwrap()` on a
-    /// [`chrono::LocalResult`]).
+    /// Advance virtual time to a **civil local wall-clock time** interpreted in
+    /// time zone `tz`, resolving DST edge cases deterministically.
     ///
     /// Convenience wrapper over [`advance_to`](Sim::advance_to) for the common
-    /// "advance to 2:30 AM local on this date" shape, where the naive local time
-    /// must be mapped to a single UTC instant. `tz` is any
-    /// [`chrono::TimeZone`] (e.g. a `chrono_tz::Tz`); the forward-only /
-    /// panic-on-past semantics of [`advance_to`](Sim::advance_to) apply once the
-    /// instant is resolved.
+    /// "advance to 2:30 AM local on this date" shape, where the civil local time
+    /// must be mapped to a single instant. The forward-only / panic-on-past
+    /// semantics of [`advance_to`](Sim::advance_to) apply once the instant is
+    /// resolved.
     ///
     /// # DST resolution (deterministic)
     ///
-    /// A naive local time need not correspond to exactly one UTC instant:
+    /// A civil local time need not correspond to exactly one instant. It is
+    /// resolved with [`Disambiguation::Compatible`]:
     ///
-    /// - **Unambiguous** ([`LocalResult::Single`])
-    ///   → that instant.
-    /// - **Fall-back / ambiguous** ([`LocalResult::Ambiguous`],
-    ///   the wall time occurs twice as the clock rolls back) → the **earlier**
-    ///   of the two UTC instants.
-    /// - **Spring-forward gap** ([`LocalResult::None`],
-    ///   the wall time never occurs because the clock jumps forward) → the
-    ///   nonexistent wall time is carried **forward across** the gap to a single
-    ///   deterministic post-transition instant (it is resolved by looking up the
-    ///   zone's offset at the matching UTC-clock reading and applying it, which
-    ///   shifts the requested time past the boundary rather than erroring). For
-    ///   example a request for the nonexistent `02:30` on a US spring-forward
-    ///   day resolves to `03:30` local (the same instant, one gap-length later).
+    /// - **Unambiguous** → that instant.
+    /// - **Fall-back / ambiguous** (the wall time occurs twice as the clock
+    ///   rolls back) → the **earlier** of the two instants.
+    /// - **Spring-forward gap** (the wall time never occurs because the clock
+    ///   jumps forward) → the wall time is read with the offset in effect before
+    ///   the gap, which carries it **forward across** the gap. For example a
+    ///   request for the nonexistent `02:30` on a US spring-forward day resolves
+    ///   to `03:30` local.
     ///
     /// # Panics
     ///
     /// Panics if the resolved instant is strictly before the current sim instant
-    /// (see [`advance_to`](Sim::advance_to)).
+    /// (see [`advance_to`](Sim::advance_to)), or if the local time is outside
+    /// the range a [`Timestamp`] can represent.
     ///
     /// ```rust,ignore
-    /// use chrono::NaiveDate;
-    /// let local = NaiveDate::from_ymd_opt(2020, 3, 8).unwrap()
-    ///     .and_hms_opt(3, 30, 0).unwrap();
-    /// sim.advance_to_local(local, &chrono_tz::America::New_York).await;
+    /// use autumn_web::time::{civil, tz::TimeZone};
+    /// let local = civil::date(2020, 3, 8).at(3, 30, 0, 0);
+    /// let new_york = TimeZone::get("America/New_York").unwrap();
+    /// sim.advance_to_local(local, &new_york).await;
     /// ```
     ///
     /// Like [`advance_to`](Sim::advance_to), this is a non-`async fn` returning a
     /// future: the `&tz` reference is used only while resolving the instant
-    /// synchronously and is **not** captured by the returned future, so the
-    /// future stays `Send` even though `Tz` need not be `Sync`.
-    pub fn advance_to_local<Tz>(
+    /// synchronously and is **not** captured by the returned future.
+    pub fn advance_to_local(
         &self,
-        local: NaiveDateTime,
-        tz: &Tz,
-    ) -> impl std::future::Future<Output = ()> + '_
-    where
-        Tz: TimeZone,
-    {
+        local: CivilDateTime,
+        tz: &TimeZone,
+    ) -> impl std::future::Future<Output = ()> + '_ {
         self.advance_to_utc(resolve_local_to_utc(local, tz))
     }
 
@@ -1229,7 +1164,7 @@ impl Sim {
     /// [`advance_to_local`](Sim::advance_to_local): plan the step against the
     /// current sim instant, then reuse [`advance`](Sim::advance) so the clock and
     /// timer wheel stay in lockstep.
-    async fn advance_to_utc(&self, target: DateTime<Utc>) {
+    async fn advance_to_utc(&self, target: Timestamp) {
         match plan_advance_to(self.clock.now(), target) {
             AdvancePlan::NoOp => {}
             AdvancePlan::Advance(delta) => self.advance(delta).await,
@@ -1276,27 +1211,23 @@ impl Sim {
     /// A single long-running job, or a task that loops without spawning,
     /// does not count as work.
     pub async fn try_run_to_idle(&self) -> Result<(), SimStall> {
-        // Real-time leak guard (no-op unless `strict_wall_clock` is enabled):
-        // sample a REAL instant at entry and enforce the budget before
-        // returning, catching a real blocking sleep in a drained task.
+        // Real-time leak guard (no-op unless `strict_wall_clock` is set): catches a real
+        // blocking sleep in a drained task.
         let guard_start = self.wall_clock_guard_start();
-        // The drain yields and never parks, so database work runs without the
-        // gate's turns, as before the gate (#3067).
+        // The drain yields and never parks, so database work runs outside the gate's
+        // turns (#3067).
         let _open = gate::Open::new();
 
-        // Resolve the mounted app's DB pool once (a cheap, cloned Arc-backed
-        // handle). Durable repository commit hooks are rows, so there is
-        // nothing to drain when the app was built without a database (e.g. the
-        // in-memory job DoD path) — the lane is skipped entirely then.
+        // Commit hooks are rows, so an app built without a database has none to drain.
         #[cfg(feature = "db")]
         let commit_hook_pools: Vec<_> = self
             .live_clients()
             .filter_map(|client| crate::db::DbState::pool(client.state()).cloned())
             .collect();
 
-        // Run the full `MAX_DRAIN_STEPS`. Then stop at the first
-        // `STALL_WINDOW` quiet rounds in a row; work that ends late still
-        // settles. Work that never goes quiet is a stall.
+        // Run the full `MAX_DRAIN_STEPS`, then stop at the first `STALL_WINDOW` quiet rounds
+        // in a row, so work that ends late still settles. Work not quiet by twice
+        // `MAX_DRAIN_STEPS` is a stall.
         let mut quiet_rounds = 0;
         let mut rounds = 0;
         while rounds < MAX_DRAIN_STEPS
@@ -1304,22 +1235,13 @@ impl Sim {
         {
             rounds += 1;
             let before = drain_fingerprint();
-            // One yield lets each currently-ready spawned task take a step; a
-            // zero-duration timer advance flushes any timers registered for the
-            // current instant and yields again, so a chain of ready timer/task
-            // wakeups settles without advancing the clock. This quiesces the
-            // in-process job runtime (TestJobRuntime / JobAdminMemoryBackend)
-            // and any tasks woken by already-due scheduler ticks.
+            // The yield lets each ready task step; the zero-duration advance fires timers due
+            // at the current instant, so chained wakeups settle without moving the clock.
             tokio::task::yield_now().await;
             tokio::time::advance(std::time::Duration::ZERO).await;
 
-            // Third ready-work source: durable repository commit hooks. Drain
-            // the ready set through the public test-harness wrapper
-            // (`crate::test::drain_ready_repository_commit_hooks`), which runs
-            // the same claim → run → ack wiring the background commit-hook
-            // worker uses, but deterministically and worker-free. A hook may
-            // itself enqueue a job, so draining inside the settle loop lets a
-            // subsequent iteration pick that job up.
+            // Durable commit hooks, through the same claim → run → ack path as the background
+            // worker. A hook may enqueue a job, which a later round picks up.
             #[cfg(feature = "db")]
             for pool in &commit_hook_pools {
                 let hooks_drained =
@@ -1329,8 +1251,8 @@ impl Sim {
                 }
             }
 
-            // Fourth source: the transactional outbox (issue #3062). The same
-            // claim → handle → mark path the relay worker runs, worker-free.
+            // The transactional outbox, through the relay worker's claim → handle → mark
+            // path (#3062).
             #[cfg(feature = "db")]
             for state in self
                 .live_clients()
@@ -1364,8 +1286,7 @@ impl Sim {
 
 impl Drop for Sim {
     fn drop(&mut self) {
-        // A replica is a host of the sim network, and its app holds the
-        // network: a cycle. Remove the hosts, so the replica apps drop.
+        // A replica is a network host and its app holds the network: break the cycle.
         #[cfg(feature = "http-client")]
         for slot in &mut self.replicas {
             if let Some(net) = slot.net.take() {
@@ -1426,11 +1347,9 @@ fn drain_fingerprint() -> (u64, usize) {
     (DRAIN_PROGRESS.with(std::cell::Cell::get), tasks)
 }
 
-/// The fixed sim epoch as a `DateTime`.
-fn sim_epoch() -> DateTime<Utc> {
-    Utc.timestamp_opt(SIM_EPOCH_UNIX_SECS, 0)
-        .single()
-        .unwrap_or_else(|| Utc.timestamp_nanos(0))
+/// The fixed sim epoch as a [`Timestamp`].
+fn sim_epoch() -> Timestamp {
+    Timestamp::from_second(SIM_EPOCH_UNIX_SECS).unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
 /// A `u64` derived from `seed` and `purpose`.
@@ -1652,48 +1571,42 @@ enum AdvancePlan {
 /// Panics when `target` is strictly before `now`: virtual time is forward-only,
 /// and a past target signals a test-arithmetic bug that silent no-op behavior
 /// would hide.
-fn plan_advance_to(now: DateTime<Utc>, target: DateTime<Utc>) -> AdvancePlan {
-    let delta = target - now;
-    match delta.cmp(&chrono::Duration::zero()) {
+fn plan_advance_to(now: Timestamp, target: Timestamp) -> AdvancePlan {
+    match target.cmp(&now) {
         std::cmp::Ordering::Equal => AdvancePlan::NoOp,
         std::cmp::Ordering::Less => panic!(
             "Sim::advance_to target {target} is strictly before the current sim instant {now}; \
              virtual time is forward-only (advancing to a past instant is a test bug)"
         ),
-        std::cmp::Ordering::Greater => AdvancePlan::Advance(
-            delta
-                .to_std()
-                .expect("a strictly-positive chrono delta always converts to std::time::Duration"),
-        ),
+        std::cmp::Ordering::Greater => {
+            let delta = target.duration_since(now);
+            AdvancePlan::Advance(
+                std::time::Duration::try_from(delta)
+                    .expect("a strictly-positive delta always converts to std::time::Duration"),
+            )
+        }
     }
 }
 
-/// Resolve a naive local wall-clock time in timezone `tz` to a single UTC
+/// Resolve a civil local wall-clock time in time zone `tz` to a single
 /// instant, handling DST edges deterministically (see
 /// [`Sim::advance_to_local`] for the documented policy).
 ///
-/// Ambiguous (fall-back) local times resolve to the **earlier** instant; a
-/// nonexistent (spring-forward gap) local time is carried across the gap using
-/// the post-transition UTC offset. Never `.unwrap()`s a
-/// [`chrono::LocalResult`].
-fn resolve_local_to_utc<Tz>(local: NaiveDateTime, tz: &Tz) -> DateTime<Utc>
-where
-    Tz: TimeZone,
-{
-    match tz.from_local_datetime(&local) {
-        LocalResult::Single(dt) => dt.with_timezone(&Utc),
-        LocalResult::Ambiguous(earlier, _later) => earlier.with_timezone(&Utc),
-        LocalResult::None => {
-            // Spring-forward gap: the wall time never occurs. Resolve it by
-            // looking up the zone's offset at the UTC-clock reading numerically
-            // equal to the wall time and applying it — a total, deterministic
-            // mapping that carries the nonexistent time forward across the gap to
-            // a single post-transition instant.
-            let offset_secs =
-                i64::from(tz.offset_from_utc_datetime(&local).fix().local_minus_utc());
-            (local - chrono::Duration::seconds(offset_secs)).and_utc()
-        }
-    }
+/// Uses [`Disambiguation::Compatible`]: an ambiguous (fall-back) local time
+/// resolves to the **earlier** instant, and a nonexistent (spring-forward gap)
+/// local time is read with the pre-transition offset, which carries it past
+/// the gap.
+///
+/// # Panics
+///
+/// Panics if the local time is outside the range a [`Timestamp`] can
+/// represent in `tz`.
+fn resolve_local_to_utc(local: CivilDateTime, tz: &TimeZone) -> Timestamp {
+    tz.to_ambiguous_timestamp(local)
+        .disambiguate(Disambiguation::Compatible)
+        .unwrap_or_else(|err| {
+            panic!("Sim::advance_to_local: {local} in {tz:?} is not a valid instant: {err}")
+        })
 }
 
 /// A seeded, deterministic random number generator handle.
@@ -1777,7 +1690,7 @@ impl SimRng {
 /// Wraps a [`TickingClock`] started at the fixed sim epoch. [`Sim::advance`]
 /// steps this clock (the wall-clock time a [`crate::time::Clock`] extractor
 /// reports) in lockstep with tokio's paused virtual timer, so
-/// `Utc::now()`-via-extractor and `tokio::time::sleep` never drift apart.
+/// the extractor's `now()` and `tokio::time::sleep` never drift apart.
 pub(crate) struct SimClock {
     inner: TickingClock,
 }
@@ -1809,7 +1722,7 @@ impl SimClock {
     ///
     /// Read by [`Sim::advance_to`] to compute the forward delta to a zoned
     /// target.
-    pub(crate) fn now(&self) -> DateTime<Utc> {
+    pub(crate) fn now(&self) -> Timestamp {
         crate::time::ClockSource::now(&self.inner)
     }
 }
@@ -2011,7 +1924,7 @@ fn note_own_advance(sim: &AmbientSimClock, duration: std::time::Duration) {
 }
 
 impl crate::time::ClockSource for AmbientSimClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> crate::time::Timestamp {
         self.wall
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2109,8 +2022,18 @@ mod tests {
         mount_entropy_seed, parse_liveness_budget, parse_seed, parse_strict_budget_ms,
         plan_advance_to, resolve_local_to_utc, strict_budget_from_env_or,
     };
-    use chrono::{NaiveDate, TimeZone, Utc};
+    use jiff::Timestamp;
+    use jiff::civil::date;
+    use jiff::tz::TimeZone;
     use rand::Rng;
+
+    fn utc(y: i16, mo: i8, d: i8, h: i8) -> Timestamp {
+        date(y, mo, d)
+            .at(h, 0, 0, 0)
+            .to_zoned_datetime(TimeZone::UTC)
+            .unwrap()
+            .timestamp()
+    }
 
     #[tokio::test(start_paused = true)]
     async fn blocking_work_reads_auto_advanced_sim_time() {
@@ -2228,14 +2151,14 @@ mod tests {
 
     #[test]
     fn plan_advance_to_equal_target_is_noop() {
-        let now = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let now = utc(2020, 1, 1, 0);
         assert_eq!(plan_advance_to(now, now), AdvancePlan::NoOp);
     }
 
     #[test]
     fn plan_advance_to_future_target_is_exact_delta() {
-        let now = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let target = Utc.with_ymd_and_hms(2020, 1, 1, 1, 0, 0).unwrap();
+        let now = utc(2020, 1, 1, 0);
+        let target = utc(2020, 1, 1, 1);
         assert_eq!(
             plan_advance_to(now, target),
             AdvancePlan::Advance(std::time::Duration::from_secs(3600))
@@ -2245,8 +2168,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "forward-only")]
     fn plan_advance_to_past_target_panics() {
-        let now = Utc.with_ymd_and_hms(2020, 1, 1, 1, 0, 0).unwrap();
-        let target = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let now = utc(2020, 1, 1, 1);
+        let target = utc(2020, 1, 1, 0);
         let _ = plan_advance_to(now, target);
     }
 
@@ -2271,9 +2194,7 @@ mod tests {
 
     #[test]
     fn strict_budget_from_env_falls_back_to_default_when_unset() {
-        // The env var is not set in this unit-test process, so the default is
-        // returned verbatim (the override path is exercised via the public
-        // integration tests, which never set the var).
+        // The env var is not set in this unit-test process.
         let default = std::time::Duration::from_millis(7);
         assert_eq!(strict_budget_from_env_or(default), default);
         assert_eq!(
@@ -2300,12 +2221,20 @@ mod tests {
     #[test]
     fn resolve_local_unambiguous_maps_to_single_instant() {
         // A plain UTC-offset zone: 12:00 at +00:00 is exactly 12:00Z.
-        let local = NaiveDate::from_ymd_opt(2020, 6, 1)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap();
-        let got = resolve_local_to_utc(local, &Utc);
-        assert_eq!(got, Utc.with_ymd_and_hms(2020, 6, 1, 12, 0, 0).unwrap());
+        let local = date(2020, 6, 1).at(12, 0, 0, 0);
+        let got = resolve_local_to_utc(local, &TimeZone::UTC);
+        assert_eq!(got, utc(2020, 6, 1, 12));
+    }
+
+    #[test]
+    fn resolve_local_gap_moves_forward_and_fold_takes_the_earlier_instant() {
+        let new_york = TimeZone::get("America/New_York").unwrap();
+        // 02:30 does not exist on 2020-03-08: read at -05:00, it is 07:30Z (03:30 EDT).
+        let gap = resolve_local_to_utc(date(2020, 3, 8).at(2, 30, 0, 0), &new_york);
+        assert_eq!(gap, "2020-03-08T07:30:00Z".parse::<Timestamp>().unwrap());
+        // 01:30 occurs twice on 2020-11-01: the first one, in EDT, is 05:30Z.
+        let fold = resolve_local_to_utc(date(2020, 11, 1).at(1, 30, 0, 0), &new_york);
+        assert_eq!(fold, "2020-11-01T05:30:00Z".parse::<Timestamp>().unwrap());
     }
 
     /// A replica on the sim network is a host of that network, and its app

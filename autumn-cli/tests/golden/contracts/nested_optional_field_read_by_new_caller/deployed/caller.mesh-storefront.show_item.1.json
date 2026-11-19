@@ -7,7 +7,7 @@
       "method": "get_item",
       "reads": [
         "details",
-        "details.size"
+        "id"
       ],
       "writes": null
     }

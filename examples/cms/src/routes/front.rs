@@ -49,7 +49,11 @@ use super::site::{Csrf, Repos, permalink_from, render};
 /// That leaves exactly the two aliases a site gets by switching structure —
 /// which is the point of the fallback, so that changing the permalink setting
 /// does not 404 every link anyone has already shared.
-fn is_dated_permalink_for(path: &[String], post: &Post, zone: chrono_tz::Tz) -> bool {
+fn is_dated_permalink_for(
+    path: &[String],
+    post: &Post,
+    zone: &autumn_web::time::tz::TimeZone,
+) -> bool {
     let Some((_, prefix)) = path.split_last() else {
         return false;
     };
@@ -58,15 +62,12 @@ fn is_dated_permalink_for(path: &[String], post: &Post, zone: chrono_tz::Tz) -> 
     // read in the same zone, for the same reason. A UTC reading here would
     // 404 the very URL `post_permalink` had just published for a post whose
     // local and UTC days differ.
-    use chrono::TimeZone as _;
-    let date = zone
-        .from_utc_datetime(&post.published_at.unwrap_or(post.created_at))
-        .date_naive();
+    let date =
+        crate::settings::utc_to_local(zone, post.published_at.unwrap_or(post.created_at)).date();
     // Compared as the strings the generator writes — `%Y/%m/%d`, so a
     // four-digit year and zero-padded two-digit month and day. Parsing instead
     // would make `/2026/9/hello` and `/2026/009/hello` aliases of
     // `/2026/09/hello`, which is the same defect one layer down.
-    use chrono::Datelike as _;
     let expected: [String; 3] = [
         format!("{:04}", date.year()),
         format!("{:02}", date.month()),
@@ -426,7 +427,7 @@ pub async fn dispatch(
                 return not_found(&repos, &session, &csrf).await;
             };
             match find_visible(&repos, "post", last).await? {
-                Some(post) if is_dated_permalink_for(&path, &post, settings.zone()) => {
+                Some(post) if is_dated_permalink_for(&path, &post, &settings.zone()) => {
                     single_post(&repos, &session, &csrf, post, thread_view).await
                 }
                 _ => not_found(&repos, &session, &csrf).await,
@@ -632,7 +633,7 @@ async fn date_archive(
 ) -> AutumnResult<Response> {
     // Half-open bounds, so the filter is a pair of index-usable comparisons on
     // `published_at` rather than a per-row date decomposition.
-    let Some((from, until)) = archive_bounds(year, month, day, settings.zone()) else {
+    let Some((from, until)) = archive_bounds(year, month, day, &settings.zone()) else {
         return not_found(repos, session, csrf).await;
     };
     let per_page = usize::try_from(settings.posts_per_page.max(1)).unwrap_or(10);
@@ -734,7 +735,7 @@ async fn single_post(
                 h1 class="text-3xl font-bold tracking-tight mb-2" { (title) }
                 p class="text-sm text-gray-500 flex flex-wrap gap-2" {
                     @if let Some(published) = post.published_at {
-                        time datetime=(published.and_utc().to_rfc3339()) {
+                        time datetime=(autumn_web::time::compat::rfc3339(crate::settings::utc_instant(published))) {
                             (settings.format_date(published))
                         }
                     }
@@ -985,15 +986,23 @@ fn archive_bounds(
     year: i32,
     month: Option<u32>,
     day: Option<u32>,
-    zone: chrono_tz::Tz,
-) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
-    use chrono::{Days, Months, NaiveDate, TimeZone as _};
+    zone: &autumn_web::time::tz::TimeZone,
+) -> Option<(
+    autumn_web::time::civil::DateTime,
+    autumn_web::time::civil::DateTime,
+)> {
+    use autumn_web::time::civil::Date;
 
-    let start = NaiveDate::from_ymd_opt(year, month.unwrap_or(1), day.unwrap_or(1))?;
+    let start = Date::new(
+        i16::try_from(year).ok()?,
+        i8::try_from(month.unwrap_or(1)).ok()?,
+        i8::try_from(day.unwrap_or(1)).ok()?,
+    )
+    .ok()?;
     let end = match (month, day) {
-        (Some(_), Some(_)) => start.checked_add_days(Days::new(1))?,
-        (Some(_), None) => start.checked_add_months(Months::new(1))?,
-        _ => NaiveDate::from_ymd_opt(year.checked_add(1)?, 1, 1)?,
+        (Some(_), Some(_)) => start.tomorrow().ok()?,
+        (Some(_), None) => start.last_of_month().tomorrow().ok()?,
+        _ => start.last_of_year().tomorrow().ok()?,
     };
     // Local midnight, expressed as the UTC instant it names — `published_at` is
     // stored in UTC, and a `/2026/09/09/` archive means the ninth *here*. Taken
@@ -1021,21 +1030,22 @@ fn archive_bounds(
     // made the 29th return `None` too. (Which is how this was found — the first
     // version of the Apia test failed on the *neighbour*, not on the missing
     // day.)
-    let first_local_instant =
-        |from: chrono::NaiveDateTime, limit: i64| -> Option<chrono::NaiveDateTime> {
-            (0..limit).find_map(|minutes| {
-                let local = from.checked_add_signed(chrono::Duration::minutes(minutes))?;
-                zone.from_local_datetime(&local)
-                    .earliest()
-                    .map(|resolved| resolved.naive_utc())
-            })
-        };
+    let first_local_instant = |from: autumn_web::time::civil::DateTime,
+                               limit: i64|
+     -> Option<autumn_web::time::civil::DateTime> {
+        (0..limit).find_map(|minutes| {
+            let local = from
+                .checked_add(autumn_web::time::SignedDuration::from_mins(minutes))
+                .ok()?;
+            crate::settings::local_to_utc(zone, local)
+        })
+    };
 
     const MINUTES_IN_A_DAY: i64 = 24 * 60;
-    let from = first_local_instant(start.and_hms_opt(0, 0, 0)?, MINUTES_IN_A_DAY)?;
+    let from = first_local_instant(start.at(0, 0, 0, 0), MINUTES_IN_A_DAY)?;
     // Three days of slack: the longest gap any zone has ever had is Apia's one
     // day, and a bound keeps a corrupt zone database from spinning.
-    let until = first_local_instant(end.and_hms_opt(0, 0, 0)?, 3 * MINUTES_IN_A_DAY)?;
+    let until = first_local_instant(end.at(0, 0, 0, 0), 3 * MINUTES_IN_A_DAY)?;
     Some((from, until))
 }
 
@@ -1147,13 +1157,11 @@ mod tests {
     /// `/2026/04/24/` permalinks and appeared in neither day's archive.
     #[test]
     fn a_skipped_local_midnight_starts_the_archive_at_the_transition() {
-        let cairo: chrono_tz::Tz = "Africa/Cairo".parse().expect("a known zone");
-        let (from, until) = archive_bounds(2026, Some(4), Some(24), cairo).expect("a real date");
+        let cairo = autumn_web::time::tz::TimeZone::get("Africa/Cairo").expect("a known zone");
+        let (from, until) = archive_bounds(2026, Some(4), Some(24), &cairo).expect("a real date");
 
         // The naive-midnight reading; the value this must not be.
-        let naive = chrono::NaiveDate::from_ymd_opt(2026, 4, 24)
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .expect("a real date");
+        let naive = autumn_web::time::civil::date(2026, 4, 24).at(0, 0, 0, 0);
         assert_ne!(
             from, naive,
             "the day does not begin at 00:00 UTC — it begins when the local date does"
@@ -1162,17 +1170,13 @@ mod tests {
         // 01:00 Cairo on the 24th is 22:00 UTC on the 23rd.
         assert_eq!(
             from,
-            chrono::NaiveDate::from_ymd_opt(2026, 4, 23)
-                .and_then(|d| d.and_hms_opt(22, 0, 0))
-                .expect("a real date")
+            autumn_web::time::civil::date(2026, 4, 23).at(22, 0, 0, 0)
         );
         // The range is half-open and the following midnight is ordinary:
         // 00:00 on the 25th at UTC+3 is 21:00 UTC on the 24th.
         assert_eq!(
             until,
-            chrono::NaiveDate::from_ymd_opt(2026, 4, 24)
-                .and_then(|d| d.and_hms_opt(21, 0, 0))
-                .expect("a real date")
+            autumn_web::time::civil::date(2026, 4, 24).at(21, 0, 0, 0)
         );
         assert!(from < until);
     }
@@ -1186,15 +1190,15 @@ mod tests {
     /// before it.
     #[test]
     fn a_date_that_never_happened_locally_has_no_archive() {
-        let apia: chrono_tz::Tz = "Pacific/Apia".parse().expect("a known zone");
-        assert!(archive_bounds(2011, Some(12), Some(30), apia).is_none());
+        let apia = autumn_web::time::tz::TimeZone::get("Pacific/Apia").expect("a known zone");
+        assert!(archive_bounds(2011, Some(12), Some(30), &apia).is_none());
         // Its neighbours keep theirs. December 29 is the one that matters:
         // its range ends when the 31st begins, because the 30th never did.
         let (from, until) =
-            archive_bounds(2011, Some(12), Some(29), apia).expect("a day that happened");
+            archive_bounds(2011, Some(12), Some(29), &apia).expect("a day that happened");
         assert!(from < until);
         let (next_from, _) =
-            archive_bounds(2011, Some(12), Some(31), apia).expect("a day that happened");
+            archive_bounds(2011, Some(12), Some(31), &apia).expect("a day that happened");
         assert_eq!(
             until, next_from,
             "consecutive real days have to tile the timeline, missing day or not"
@@ -1204,20 +1208,16 @@ mod tests {
     /// The ordinary case, and the one every other day of the year takes.
     #[test]
     fn a_normal_day_is_local_midnight_to_local_midnight() {
-        let la: chrono_tz::Tz = "America/Los_Angeles".parse().expect("a known zone");
-        let (from, until) = archive_bounds(2026, Some(9), Some(9), la).expect("a real date");
+        let la = autumn_web::time::tz::TimeZone::get("America/Los_Angeles").expect("a known zone");
+        let (from, until) = archive_bounds(2026, Some(9), Some(9), &la).expect("a real date");
         assert_eq!(
             from,
-            chrono::NaiveDate::from_ymd_opt(2026, 9, 9)
-                .and_then(|d| d.and_hms_opt(7, 0, 0))
-                .expect("a real date"),
+            autumn_web::time::civil::date(2026, 9, 9).at(7, 0, 0, 0),
             "midnight at UTC-7"
         );
         assert_eq!(
             until,
-            chrono::NaiveDate::from_ymd_opt(2026, 9, 10)
-                .and_then(|d| d.and_hms_opt(7, 0, 0))
-                .expect("a real date")
+            autumn_web::time::civil::date(2026, 9, 10).at(7, 0, 0, 0)
         );
     }
 }

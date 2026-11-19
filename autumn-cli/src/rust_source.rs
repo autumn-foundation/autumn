@@ -178,8 +178,6 @@ fn step_raw_string(bytes: &[u8], i: usize, hashes: usize, out: &mut [u8]) -> (Sc
 /// offset just past its opening quote and the prefix length (`r` is 1,
 /// `br`/`cr` are 2).
 fn raw_string_start(bytes: &[u8], i: usize) -> Option<(usize, usize)> {
-    // A `b`/`c` immediately before the `r` makes a raw byte string (`br"…"`)
-    // or a raw C string (`cr"…"`).
     let prefix = if bytes[i] == b'r' {
         1
     } else if (bytes[i] == b'b' || bytes[i] == b'c') && bytes.get(i + 1) == Some(&b'r') {

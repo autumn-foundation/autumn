@@ -34,8 +34,7 @@ impl<T> FairBucket<T> {
     }
 
     pub fn push(&mut self, tenant: Option<String>, item: T) {
-        // Probe by borrow: a tenant that already has jobs here needs no
-        // second copy of its id.
+        // Probe by borrow so a tenant already queued here does not clone its id.
         #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
         let queue = match self.jobs.get_mut(&tenant) {
             Some(queue) => queue,
@@ -142,8 +141,7 @@ impl TenantJobIsolation {
         let Some(tenant) = tenant else {
             return Some(JobAdmit { permit: None });
         };
-        // Runs per tenant on every pop attempt, so ask about one lane rather
-        // than building the tenant's whole lane list.
+        // Runs on every pop attempt, so test one lane rather than build the tenant's lane list.
         if let Some(lane) = lane
             && !shuffle_shard_contains(tenant, self.lanes, self.lanes_per_tenant, lane)
         {

@@ -166,7 +166,6 @@ pub fn framework_prefixes(config: &crate::config::AutumnConfig) -> Vec<String> {
             config.health.startup_path.clone(),
         ]);
     }
-    // The inspector runs in the dev profile only.
     if crate::config::profile_is_dev(config.profile.as_deref()) {
         reserved.push(config.dev.inspector_path.clone());
     }

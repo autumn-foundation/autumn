@@ -8,7 +8,7 @@
 //!   measures a request. The job and task runtimes measure background runs.
 //! - [`CostSignal`] holds a live value (carbon g/kWh or price per unit) and a
 //!   threshold. Set it from code, or from the runtime-config key
-//!   [`COST_SIGNAL_KEY`](crate::runtime_config::COST_SIGNAL_KEY).
+//!   `runtime_config::COST_SIGNAL_KEY` (feature `runtime-config`).
 //! - Deferral. Work marked `deferrable` (`#[job(deferrable)]`,
 //!   `#[scheduled(..., deferrable)]`) waits while the signal is above the
 //!   threshold. The work runs when the signal falls. The runtime never drops
@@ -35,7 +35,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -819,6 +819,7 @@ impl CostSignal {
 
     /// Hold work until the first value arrives: a store can already hold a
     /// high value when the app starts.
+    #[cfg(any(test, feature = "runtime-config"))]
     fn mark_pending(&self) {
         self.inner.pending.store(true, Ordering::Release);
     }
@@ -883,6 +884,7 @@ impl CostSignal {
     ///
     /// [`RuntimeConfigService::get`]: crate::runtime_config::RuntimeConfigService::get
     /// [`ConfigError::TypeMismatch`]: crate::runtime_config::ConfigError::TypeMismatch
+    #[cfg(feature = "runtime-config")]
     pub fn sync_from(
         &self,
         config: &crate::runtime_config::RuntimeConfigService,
@@ -1014,8 +1016,6 @@ pub(crate) fn cpu_since(mark: CpuMark) -> Duration {
     }
 }
 
-// Real wall time, not the injected clock: this measures how long a poll ran on
-// the CPU. The sim clock does not move during a poll, so it would read zero.
 #[allow(
     clippy::disallowed_methods,
     reason = "measures on-CPU poll time; the injected clock does not move during a poll"
@@ -1432,8 +1432,9 @@ pub(crate) fn measure_poll(
 ///   `Arc<dyn AllocationProbe>` extension when the app inserted one. Its
 ///   metrics show tenant labels only when `[actuator] sensitive` is on.
 /// - With an `Arc<RuntimeConfigService>` extension that declares
-///   [`COST_SIGNAL_KEY`](crate::runtime_config::COST_SIGNAL_KEY), a task
-///   copies the key into the signal every `signal_refresh_secs`.
+///   `runtime_config::COST_SIGNAL_KEY`, a task copies the key into the
+///   signal every `signal_refresh_secs`. This needs the `runtime-config`
+///   feature.
 pub(crate) fn install(state: &crate::AppState, config: &crate::config::AutumnConfig) {
     let cost = &config.cost;
     let signal = state.extension_or_insert_with(|| CostSignal::new(cost.defer_threshold));
@@ -1466,6 +1467,7 @@ pub(crate) fn install(state: &crate::AppState, config: &crate::config::AutumnCon
         }
     }
 
+    #[cfg(feature = "runtime-config")]
     if let Some(service) = state.extension::<Arc<crate::runtime_config::RuntimeConfigService>>()
         && service
             .registry()
@@ -1484,6 +1486,7 @@ pub(crate) fn install(state: &crate::AppState, config: &crate::config::AutumnCon
 ///
 /// The first read is in the task too: a Postgres store can block, and boot
 /// must not wait for it.
+#[cfg(feature = "runtime-config")]
 fn spawn_signal_refresh(
     signal: &CostSignal,
     service: Arc<crate::runtime_config::RuntimeConfigService>,
@@ -1751,6 +1754,7 @@ mod tests {
         assert!(!snapshot.high);
     }
 
+    #[cfg(feature = "runtime-config")]
     #[test]
     fn signal_syncs_from_runtime_config() {
         use crate::runtime_config::{
@@ -1780,7 +1784,7 @@ mod tests {
         assert!(!is_deferrable(WorkKind::Job, "cost_unit_test_other"));
     }
 
-    // ── Background work (slice 2) ───────────────────────────────────
+    // ── Background work ─────────────────────────────────────────────
 
     fn us(micros: u64) -> Duration {
         Duration::from_micros(micros)

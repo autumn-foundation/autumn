@@ -24,7 +24,7 @@ no extra imports are needed beyond the usual `use autumn_web::prelude::*;`.
 | `truncate(text, 30)` | `The quick brown fox jumps ov…` |
 | `truncate_words(text, 5)` | `The quick brown fox jumps…` |
 | `time_ago_in_words(dt, clock.now())` | `3 minutes ago` / `in 2 days` |
-| `format_datetime(dt, "%Y-%m-%d")` | `2026-06-07` |
+| `format_datetime(dt, "%Y-%m-%d")` | `2026-06-07` (UTC; a pattern `jiff` cannot format gives `2026-06-07T14:32:01Z`) |
 
 `number_to_currency` takes a [`rust_decimal::Decimal`](https://docs.rs/rust_decimal)
 — the same exact-precision type used by decimal model fields — so money never
@@ -40,7 +40,7 @@ struct Order {
     id: i64,
     total: Decimal,
     item_count: i64,
-    placed_at: chrono::DateTime<chrono::Utc>,
+    placed_at: autumn_web::time::Timestamp,
 }
 
 #[get("/orders")]
@@ -101,17 +101,16 @@ custom marker (e.g. `" [read more]"`).
 
 ## Deterministic relative time in tests
 
-`time_ago_in_words` takes `now` as a plain `DateTime<Utc>` — pass
+`time_ago_in_words` takes `now` as a plain `Timestamp` — pass
 `clock.now()` from the `Clock` extractor in handlers, or from any
 `ClockSource` (like `FixedClock`) in tests for exact, non-flaky output:
 
 ```rust
 use autumn_web::prelude::*;
-use autumn_web::time::{ClockSource, FixedClock};
-use chrono::{TimeZone, Utc};
+use autumn_web::time::{ClockSource, FixedClock, Timestamp};
 
-let posted_at = Utc.with_ymd_and_hms(2026, 1, 1, 11, 58, 0).unwrap();
-let now = FixedClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap()).now();
+let posted_at: Timestamp = "2026-01-01T11:58:00Z".parse().unwrap();
+let now = FixedClock::at("2026-01-01T12:00:00Z".parse().unwrap()).now();
 assert_eq!(time_ago_in_words(posted_at, now).into_string(), "2 minutes ago");
 ```
 

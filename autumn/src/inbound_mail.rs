@@ -50,7 +50,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -89,17 +89,258 @@ use serde::Deserialize;
 mod sns_verify {
     use super::*;
 
-    /// Validate that a `SigningCertURL` comes from the AWS SNS service.
+    /// Largest certificate body to read, in bytes. A real SNS certificate is approximately 2 KiB.
+    pub(super) const MAX_CERT_BYTES: u64 = 16 * 1024;
+
+    /// Total time limit for one SNS fetch.
+    const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A `SigningCertURL` that [`SnsCertUrl::parse`] accepted.
+    #[derive(Debug, Clone)]
+    pub(super) struct SnsCertUrl(url::Url);
+
+    impl SnsCertUrl {
+        /// Accept only `https://sns.<region>.amazonaws.com[.cn]/<name>.pem`.
+        ///
+        /// The text must be in canonical form. Then the fetch connects to the host that
+        /// this check reads.
+        pub(super) fn parse(raw: &str) -> Option<Self> {
+            let url = parse_sns_url(raw)?;
+            let name = url.path().strip_prefix('/')?.strip_suffix(".pem")?;
+            let name_ok = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            let exact = url.query().is_none() && url.fragment().is_none() && url.as_str() == raw;
+            (name_ok && exact).then_some(Self(url))
+        }
+
+        /// Wrap a URL without the SNS checks. Use this only in tests.
+        #[cfg(test)]
+        pub(super) const fn unchecked(url: url::Url) -> Self {
+            Self(url)
+        }
+    }
+
+    /// A `SubscribeURL` that [`SnsSubscribeUrl::parse`] accepted.
+    #[derive(Debug, Clone)]
+    pub(super) struct SnsSubscribeUrl(url::Url);
+
+    impl SnsSubscribeUrl {
+        /// Accept only `https://sns.<region>.amazonaws.com[.cn]/?Action=ConfirmSubscription`
+        /// with `TopicArn` equal to `expected_topic_arn`.
+        pub(super) fn parse(raw: &str, expected_topic_arn: &str) -> Option<Self> {
+            let url = parse_sns_url(raw)?;
+            if url.path() != "/" || url.fragment().is_some() {
+                return None;
+            }
+            let mut action = None;
+            let mut topic = None;
+            for (key, value) in url.query_pairs() {
+                let slot = if key.eq_ignore_ascii_case("Action") {
+                    &mut action
+                } else if key.eq_ignore_ascii_case("TopicArn") {
+                    &mut topic
+                } else {
+                    continue;
+                };
+                // Reject a key that occurs more than one time, in any letter case.
+                if slot.replace(value).is_some() {
+                    return None;
+                }
+            }
+            let ok = action.as_deref() == Some("ConfirmSubscription")
+                && topic.as_deref() == Some(expected_topic_arn);
+            ok.then_some(Self(url))
+        }
+
+        /// Wrap a URL without the SNS checks. Use this only in tests.
+        #[cfg(test)]
+        pub(super) const fn unchecked(url: url::Url) -> Self {
+            Self(url)
+        }
+    }
+
+    /// Parse `raw`. Keep it only when its origin is an SNS endpoint.
     ///
-    /// Accepted form: `https://sns.<region>.amazonaws.com/…` (or `.cn`).
-    pub(super) fn is_valid_sns_cert_url(url: &str) -> bool {
-        let Some(host) = url.strip_prefix("https://") else {
+    /// Refuse user info, a port, an IP address and any authority text that is not
+    /// the same as the parsed host.
+    fn parse_sns_url(raw: &str) -> Option<url::Url> {
+        let url = url::Url::parse(raw).ok()?;
+        let ok = match url.host() {
+            Some(url::Host::Domain(host)) => {
+                url.scheme() == "https"
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.port().is_none()
+                    && is_sns_host(host)
+                    && raw
+                        .strip_prefix("https://")
+                        .and_then(|rest| rest.strip_prefix(host))
+                        .is_some_and(|rest| rest.starts_with(['/', '?']))
+            }
+            _ => false,
+        };
+        ok.then_some(url)
+    }
+
+    /// Return `true` for `sns.<region>.amazonaws.com`, or `sns.cn-<…>.amazonaws.com.cn`.
+    fn is_sns_host(host: &str) -> bool {
+        let Some(rest) = host.strip_prefix("sns.") else {
             return false;
         };
-        let host = host.split('/').next().unwrap_or("");
-        // Must be sns.<anything>.amazonaws.com or sns.<anything>.amazonaws.com.cn
-        let base = host.strip_suffix(".cn").unwrap_or(host);
-        base.ends_with(".amazonaws.com") && base.starts_with("sns.") && !host.contains("..")
+        let (region, china) = if let Some(region) = rest.strip_suffix(".amazonaws.com.cn") {
+            (region, true)
+        } else if let Some(region) = rest.strip_suffix(".amazonaws.com") {
+            (region, false)
+        } else {
+            return false;
+        };
+        is_region(region) && region.starts_with("cn-") == china
+    }
+
+    /// Return `true` for an AWS region name, for example `us-east-1` or `us-gov-west-1`.
+    fn is_region(label: &str) -> bool {
+        let Some((words, number)) = label.rsplit_once('-') else {
+            return false;
+        };
+        words.contains('-')
+            && words
+                .split('-')
+                .all(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_lowercase()))
+            && !number.is_empty()
+            && number.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    /// Build the client for SNS fetches. It does not follow redirects or decompress.
+    pub(super) fn http_client() -> reqwest::Result<reqwest::Client> {
+        http_client_builder().build()
+    }
+
+    /// Make the builder that [`http_client`] uses.
+    ///
+    /// Decompression stays off, also when the app enables a reqwest compression
+    /// feature. Otherwise `content_length()` is `None` and every fetch fails.
+    pub(super) fn http_client_builder() -> reqwest::ClientBuilder {
+        crate::reqwest_tls::client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(FETCH_TIMEOUT)
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+    }
+
+    /// Check the request with the capsule egress guard (#2351).
+    ///
+    /// This client does not use the capsule HTTP recorder, so the check occurs here.
+    #[cfg_attr(not(feature = "reporting"), allow(clippy::unnecessary_wraps))]
+    fn guard_egress(url: &url::Url) -> Result<(), StatusCode> {
+        #[cfg(feature = "reporting")]
+        crate::capsule::guard_egress("inbound mail", "GET", url.as_str())
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        #[cfg(not(feature = "reporting"))]
+        let _ = url;
+        Ok(())
+    }
+
+    /// Fetch the signing certificate PEM.
+    ///
+    /// Refuse a redirect, a body without `Content-Length` and a body larger than
+    /// [`MAX_CERT_BYTES`].
+    pub(super) async fn fetch_cert_pem(
+        client: &reqwest::Client,
+        url: &SnsCertUrl,
+    ) -> Result<String, StatusCode> {
+        guard_egress(&url.0)?;
+        let mut response = client.get(url.0.clone()).send().await.map_err(|e| {
+            tracing::error!(error = %e, "inbound_mail.ses: failed to fetch SNS cert");
+            StatusCode::BAD_GATEWAY
+        })?;
+        let status = response.status();
+        if status.is_redirection() {
+            tracing::warn!(%status, "inbound_mail.ses: SNS cert redirect refused");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        if !status.is_success() {
+            tracing::error!(
+                %status,
+                "inbound_mail.ses: SNS cert endpoint returned an error status; \
+                 treating as transient so SNS will retry"
+            );
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        if response
+            .content_length()
+            .is_none_or(|len| len > MAX_CERT_BYTES)
+        {
+            tracing::warn!(
+                content_length = ?response.content_length(),
+                "inbound_mail.ses: SNS cert has no Content-Length or is too large"
+            );
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| StatusCode::BAD_GATEWAY)?
+        {
+            let len = body.len().saturating_add(chunk.len());
+            if u64::try_from(len).map_or(true, |len| len > MAX_CERT_BYTES) {
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        String::from_utf8(body).map_err(|_| StatusCode::UNAUTHORIZED)
+    }
+
+    /// Answer a `SubscriptionConfirmation` with the `SubscribeURL` `raw`.
+    ///
+    /// A URL that is not an SNS confirmation URL for `topic_arn` gets `400` and no
+    /// fetch. Any other URL can cause a blind SSRF.
+    pub(super) async fn handle_subscription(
+        client: &reqwest::Client,
+        raw: &str,
+        topic_arn: &str,
+    ) -> StatusCode {
+        let Some(url) = SnsSubscribeUrl::parse(raw, topic_arn) else {
+            tracing::warn!(
+                subscribe_url = raw,
+                "inbound_mail.ses: SubscribeURL is not an SNS confirmation URL"
+            );
+            return StatusCode::BAD_REQUEST;
+        };
+        confirm_subscription(client, &url).await
+    }
+
+    /// GET the `SubscribeURL` to confirm the subscription.
+    ///
+    /// A failed request returns `500`, so SNS sends the confirmation again.
+    pub(super) async fn confirm_subscription(
+        client: &reqwest::Client,
+        url: &SnsSubscribeUrl,
+    ) -> StatusCode {
+        if let Err(status) = guard_egress(&url.0) {
+            return status;
+        }
+        match client.get(url.0.clone()).send().await {
+            Ok(response) if response.status().is_success() => StatusCode::OK,
+            Ok(response) => {
+                tracing::error!(
+                    status = %response.status(),
+                    "inbound_mail.ses: SNS subscription confirmation failed"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "inbound_mail.ses: SNS subscription confirmation fetch failed"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
     }
 
     /// Build the canonical string SNS uses for signing.
@@ -265,17 +506,17 @@ mod sns_verify {
         }
     }
 
-    /// Verify the SNS notification signature and optional `TopicArn` binding.
+    /// Verify the SNS notification signature and the `TopicArn` binding.
     ///
-    /// `expected_topic_arn` — when `Some`, the notification's `TopicArn` must
-    /// match exactly; this prevents any other AWS account's SNS topic from
-    /// posting forged (but validly-signed) messages to this endpoint.
+    /// This function checks the certificate URL and the `TopicArn` before it fetches
+    /// the certificate. The `TopicArn` check stops a message with a correct signature
+    /// from a topic in a different AWS account.
     ///
     /// Set `AUTUMN_SES_SKIP_SNS_VERIFICATION=1` to disable in tests/local dev.
     pub(super) async fn verify(
         json: &serde_json::Value,
         http_client: &reqwest::Client,
-        expected_topic_arn: Option<&str>,
+        expected_topic_arn: &str,
     ) -> Result<(), StatusCode> {
         if super::SKIP_SNS_VERIFICATION.load(std::sync::atomic::Ordering::Relaxed)
             || std::env::var("AUTUMN_SES_SKIP_SNS_VERIFICATION")
@@ -296,8 +537,17 @@ mod sns_verify {
             .and_then(|v| v.as_str())
             .unwrap_or("1");
 
-        if !is_valid_sns_cert_url(cert_url) {
+        let Some(cert_url) = SnsCertUrl::parse(cert_url) else {
             tracing::warn!(cert_url, "inbound_mail.ses: invalid SNS SigningCertURL");
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let actual_topic_arn = json.get("TopicArn").and_then(|v| v.as_str()).unwrap_or("");
+        if actual_topic_arn != expected_topic_arn {
+            tracing::warn!(
+                expected_topic_arn,
+                actual_topic_arn,
+                "inbound_mail.ses: TopicArn mismatch — request rejected"
+            );
             return Err(StatusCode::UNAUTHORIZED);
         }
         let sig_bytes = base64::engine::general_purpose::STANDARD
@@ -305,31 +555,7 @@ mod sns_verify {
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
         let canonical = canonical_string(json, msg_type).ok_or(StatusCode::BAD_REQUEST)?;
 
-        // This client is not the recorded outbound seam (#2351 item 1).
-        #[cfg(feature = "reporting")]
-        crate::capsule::guard_egress("inbound mail", "GET", cert_url)
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let cert_pem = http_client
-            .get(cert_url)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "inbound_mail.ses: failed to fetch SNS cert");
-                StatusCode::BAD_GATEWAY
-            })?
-            .error_for_status()
-            .map_err(|e| {
-                tracing::error!(
-                    error = %e,
-                    "inbound_mail.ses: SNS cert endpoint returned an error status; \
-                     treating as transient so SNS will retry"
-                );
-                StatusCode::SERVICE_UNAVAILABLE
-            })?
-            .text()
-            .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
-
+        let cert_pem = fetch_cert_pem(http_client, &cert_url).await?;
         let cert_der = pem_to_der(&cert_pem).ok_or_else(|| {
             tracing::error!("inbound_mail.ses: could not parse SNS signing cert PEM");
             StatusCode::UNAUTHORIZED
@@ -338,27 +564,10 @@ mod sns_verify {
             tracing::error!("inbound_mail.ses: could not extract public key from SNS cert");
             StatusCode::UNAUTHORIZED
         })?;
-        verify_rsa_signature(&spki, canonical.as_bytes(), &sig_bytes, sig_version).map_err(
-            |()| {
-                tracing::warn!("inbound_mail.ses: SNS signature verification failed");
-                StatusCode::UNAUTHORIZED
-            },
-        )?;
-
-        // Bind to the expected SNS topic so that signed messages from any other
-        // topic are also rejected (prevents cross-account/cross-topic forgery).
-        if let Some(expected) = expected_topic_arn {
-            let actual = json.get("TopicArn").and_then(|v| v.as_str()).unwrap_or("");
-            if actual != expected {
-                tracing::warn!(
-                    expected_topic_arn = expected,
-                    actual_topic_arn = actual,
-                    "inbound_mail.ses: TopicArn mismatch — request rejected"
-                );
-                return Err(StatusCode::UNAUTHORIZED);
-            }
-        }
-        Ok(())
+        verify_rsa_signature(&spki, canonical.as_bytes(), &sig_bytes, sig_version).map_err(|()| {
+            tracing::warn!("inbound_mail.ses: SNS signature verification failed");
+            StatusCode::UNAUTHORIZED
+        })
     }
 }
 
@@ -837,14 +1046,14 @@ impl InboundMailRouter {
     /// 4. Fallback handler, if registered.
     /// 5. Log + drop with a `WARN` trace.
     pub(crate) async fn dispatch(&self, mut email: InboundEmail) -> crate::AutumnResult<()> {
-        // Bounce detection via provider-set flag (never derived from forwarded headers).
+        // `is_bounce` comes from the provider's webhook field, never from forwardable headers.
         if email.is_bounce
             && let Some(handler) = self.bounce_handler
         {
             return handler(email).await;
         }
 
-        // Spam dispatch: provider-side spam verdict (e.g. X-Mailgun-Sflag: Yes).
+        // Provider-side spam verdict, e.g. `X-Mailgun-Sflag: Yes`.
         if email
             .spam_report
             .as_ref()
@@ -908,11 +1117,8 @@ fn subtle_eq(a: &[u8], b: &[u8]) -> bool {
 /// `"<support@company.com>"` → `"support@company.com"`
 /// `"support@company.com"` → `"support@company.com"` (unchanged)
 fn extract_addr_spec(addr: &str) -> String {
-    // The `>` is searched for *after* the first `<`, so
-    // `"Support <support@company.com>"` yields `support@company.com`. A stray
-    // `>` *before* the first `<` is not stripped: `>bogus< <a@b.com>` anchors
-    // on the first `<` (after `bogus`) and yields `<a@b.com` — matching the
-    // pre-#1611 `find('<')`/relative-`find('>')` behavior exactly.
+    // The `>` is searched for only after the first `<`, so a stray `>` before it is not
+    // stripped: `>bogus< <a@b.com>` yields `<a@b.com`.
     if let Some((_, after_angle)) = addr.split_once('<')
         && let Some((inner, _)) = after_angle.split_once('>')
     {
@@ -940,7 +1146,7 @@ pub(crate) fn parse_mailgun(
     signing_key: &str,
     file_parts: Vec<Attachment>,
 ) -> Result<InboundEmail, StatusCode> {
-    // Refuse all requests when no signing key is configured to prevent trivial forgery.
+    // With an empty key anyone can compute a valid signature.
     if signing_key.is_empty() {
         tracing::error!("inbound_mail.mailgun: signing key is empty; rejecting request");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -956,8 +1162,7 @@ pub(crate) fn parse_mailgun(
         StatusCode::UNAUTHORIZED
     })?;
     let now = crate::time::clock_unix_secs(&crate::time::AmbientClock).cast_signed();
-    // Use abs_diff to avoid signed overflow when `ts` is an extreme value
-    // (e.g. i64::MIN), which would panic in debug builds before the rejection runs.
+    // `abs_diff` cannot overflow; `(now - ts).abs()` panics in debug builds for `ts = i64::MIN`.
     if now.abs_diff(ts) > 300 {
         tracing::warn!("inbound_mail.mailgun: timestamp outside 5-minute window");
         return Err(StatusCode::UNAUTHORIZED);
@@ -970,7 +1175,7 @@ pub(crate) fn parse_mailgun(
     }
 
     let from = form.get("from").cloned().unwrap_or_default();
-    // Collect all recipients: RFC `To` header + Mailgun's envelope `recipient` field.
+    // Recipients are the `To` header plus Mailgun's envelope `recipient` field.
     let mut to = parse_address_list(form.get("to").map_or("", String::as_str));
     for addr in parse_address_list(form.get("recipient").map_or("", String::as_str)) {
         if !to.contains(&addr) {
@@ -988,8 +1193,8 @@ pub(crate) fn parse_mailgun(
 
     let headers = parse_mailgun_headers(form.get("message-headers").map_or("", String::as_str));
 
-    // Bounce detection: only trust the provider's top-level webhook field, never
-    // forwarded message headers (which a sender could forge).
+    // Trust only the provider's top-level webhook field, never message headers, which a
+    // sender can forge.
     let bounced_address = form
         .get("X-Mailgun-Bounced-Address")
         .or_else(|| form.get("x-mailgun-bounced-address"))
@@ -997,9 +1202,8 @@ pub(crate) fn parse_mailgun(
         .filter(|s| !s.is_empty());
     let is_bounce = bounced_address.is_some();
 
-    // Use actual file parts when available (multipart/form-data delivery); fall back
-    // to metadata-only attachment stubs for URL-encoded deliveries where Mailgun
-    // includes only attachment-count / attachment-{n} fields.
+    // URL-encoded deliveries carry no file parts, only `attachment-count` /
+    // `attachment-{n}` metadata.
     let attachments = if file_parts.is_empty() {
         mailgun_attachment_stubs(form)
     } else {
@@ -1023,10 +1227,8 @@ pub(crate) fn parse_mailgun(
         plus_token: None,
         is_bounce,
         bounced_address,
-        // Mailgun's inbound/spam-verdict payload carries no genuine outbound
-        // complainant address (`X-Mailgun-Sflag` is an inbound spam score, not
-        // an FBL complaint), so this stays `None`. A provider-specific
-        // complaint parser would populate it.
+        // Mailgun's inbound payload has no complainant address: `X-Mailgun-Sflag` is an
+        // inbound spam score, not a feedback-loop complaint.
         complained_address: None,
     })
 }
@@ -1145,9 +1347,8 @@ pub(crate) fn parse_ses(body: &Bytes) -> Result<SnsParseResult, StatusCode> {
                 }
             };
             let mut email = parse_rfc5322(Bytes::from(raw));
-            // Merge envelope recipients not already in the RFC 5322 To header.
-            // Compare case-insensitively to avoid duplicates while preserving original
-            // casing (needed for plus-address token extraction).
+            // Merge envelope recipients missing from `To`. Compare case-insensitively but keep
+            // the original casing, which plus-address token extraction needs.
             for addr in envelope_to {
                 let addr_lower = addr.to_ascii_lowercase();
                 if !email
@@ -1202,9 +1403,7 @@ pub(crate) fn parse_generic(
 }
 
 // ── Fuzzing seams ───────────────────────────────────────────────────────────
-// `#[cfg(fuzzing)]` wrappers exposing the inbound-mail parsing surface to the
-// `fuzz/` crate: SNS/SES JSON parsing, the RFC 5322 / MIME body parser (via the
-// unsigned `parse_generic` path), and address-list parsing. Compiled out of all
+// `#[cfg(fuzzing)]` wrappers exposing the parsers to the `fuzz/` crate. Compiled out of
 // normal builds. See `fuzz/fuzz_targets/body.rs`.
 
 /// Fuzzing seam: parse an SES-via-SNS notification body.
@@ -1259,9 +1458,8 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
         .get("content-transfer-encoding")
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
-    // Normalise the MIME type/subtype for matching (RFC 2045 §5 — case-insensitive),
-    // but pass the original `content_type` value to boundary extraction so that
-    // case-sensitive boundary parameter values are preserved.
+    // The MIME type matches case-insensitively (RFC 2045 §5), but boundary extraction gets
+    // the original value: the boundary parameter is case-sensitive.
     let ct_lower = content_type.to_ascii_lowercase();
     let (text_body, html_body, attachments) = if body_bytes.iter().all(u8::is_ascii_whitespace) {
         (None, None, Vec::new())
@@ -1477,15 +1675,13 @@ fn decode_quoted_printable(input: &str) -> String {
 /// correctly handling quoted strings so that a semicolon inside a quoted
 /// filename (e.g. `filename="Q1;final.pdf"`) is not treated as a separator.
 fn mime_param(header_val: &str, name: &str) -> Option<String> {
-    // Scan `char`s rather than bytes: a byte-wise `b as char` cast Latin-1-decodes
-    // UTF-8 input, so `filename="café.pdf"` came back as `cafÃ©.pdf` (issue #1611).
+    // Scan `char`s, not bytes: a byte-wise `b as char` cast Latin-1-decodes UTF-8 input,
+    // turning `café.pdf` into `cafÃ©.pdf` (#1611).
     let mut chars = header_val.chars().peekable();
     loop {
-        // Skip the separator and any whitespace between parameters.
         while chars.next_if(|&c| matches!(c, ';' | ' ' | '\t')).is_some() {}
         chars.peek()?; // end of input — no such parameter
 
-        // Read the key, stopping at `=` (value follows) or `;` (valueless).
         let mut key = String::new();
         let mut has_value = false;
         for c in chars.by_ref() {
@@ -1502,7 +1698,6 @@ fn mime_param(header_val: &str, name: &str) -> Option<String> {
             continue; // valueless parameter, or end of input
         }
 
-        // Skip whitespace between `=` and the value.
         while chars.next_if(|&c| matches!(c, ' ' | '\t')).is_some() {}
         let &lead = chars.peek()?; // a trailing `=` at end of input yields nothing
 
@@ -1610,10 +1805,8 @@ fn extract_multipart_bodies_at(
     let mut text_body: Option<String> = None;
     let mut html_body: Option<String> = None;
     let mut attachments: Vec<Attachment> = Vec::new();
-    // Latch the depth-cap warning so a body with many sibling `multipart/*`
-    // parts at the cap emits one WARN per level, not one per part — otherwise a
-    // crafted body turns the unauthenticated inbound path into a log-flood
-    // amplifier (issue #1611).
+    // Warn once per level, not once per part: a crafted body with many sibling `multipart/*`
+    // parts at the cap would otherwise flood the log from an unauthenticated endpoint (#1611).
     let mut depth_cap_warned = false;
 
     // The first segment is the preamble (everything before the opening boundary).
@@ -1636,8 +1829,8 @@ fn extract_multipart_bodies_at(
             .or_else(|| part.strip_suffix(b"\n"))
             .unwrap_or(part);
 
-        // If no blank-line separator exists, the part has no headers — treat the
-        // entire content as the body with empty headers (RFC 2045 §5.2 defaults apply).
+        // Without a blank-line separator the part has no headers: all of it is the body, and
+        // the RFC 2045 §5.2 defaults apply.
         let (part_header_bytes, part_body_bytes) = split_mime_headers(part).unwrap_or((&[], part));
         let part_headers = unfold_mime_headers(&String::from_utf8_lossy(part_header_bytes));
 
@@ -1647,16 +1840,14 @@ fn extract_multipart_bodies_at(
         let part_cte = header_line_value(&part_headers, "content-transfer-encoding")
             .unwrap_or_default()
             .to_ascii_lowercase();
-        // Keep original case for value extraction; only compare names case-insensitively.
+        // Keep the original case: parameter values such as `filename` are case-sensitive.
         let disposition = header_line_value(&part_headers, "content-disposition").unwrap_or("");
         let is_attachment = disposition.to_ascii_lowercase().starts_with("attachment")
             || mime_param(disposition, "filename").is_some();
 
-        // A nested `multipart/*` past the depth cap is *not* parsed further and
-        // *not* dropped: it falls through to the attachment arm below and is kept
-        // verbatim as an opaque part.
+        // A nested `multipart/*` past the depth cap is not dropped: it falls through to the
+        // attachment arm below and is kept verbatim.
         if part_ct_lower.starts_with("multipart/") && depth < MAX_MIME_DEPTH {
-            // Recurse into nested multipart parts (e.g. multipart/alternative).
             let (nested_text, nested_html, nested_atts) =
                 extract_multipart_bodies_at(part_body_bytes, part_ct_orig, depth.saturating_add(1));
             if text_body.is_none() {
@@ -1681,7 +1872,6 @@ fn extract_multipart_bodies_at(
                      keeping the remaining subtree(s) at this level as opaque attachments"
                 );
             }
-            // Collect attachment parts; use raw bytes to avoid UTF-8 corruption.
             attachments.push(Attachment {
                 filename: mime_param(disposition, "filename"),
                 content_type: mime_type_only(&part_ct_lower, "application/octet-stream"),
@@ -1703,9 +1893,8 @@ fn decode_rfc2047(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
     let mut rest = value;
     let mut last_was_encoded = false;
-    // Each iteration consumes one `=?charset?encoding?text?=` word. A word that
-    // is truncated at any of its three `?` separators is emitted verbatim and
-    // ends the scan — exactly as the original cursor-based parser did.
+    // Each iteration consumes one `=?charset?encoding?text?=` word. A word truncated at any
+    // of its three `?` separators is emitted verbatim and ends the scan.
     while let Some((before, after_intro)) = rest.split_once("=?") {
         // If the gap between encoded words is only whitespace, swallow it.
         if !(last_was_encoded && before.chars().all(|c| c == ' ' || c == '\t')) {
@@ -1929,10 +2118,8 @@ fn parse_mailgun_form_data(
     content_type: &str,
 ) -> (HashMap<String, String>, Vec<Attachment>) {
     let Some(boundary) = extract_boundary(content_type) else {
-        // Without a usable boundary the form cannot be parsed at all; the
-        // caller then fails signature verification on the empty field map and
-        // answers 401. Name the real cause here so that outcome is diagnosable
-        // as a boundary problem, not a signing-key problem.
+        // The caller then fails signature verification on the empty field map and answers
+        // 401. Log the real cause so it does not look like a signing-key problem.
         tracing::warn!(
             %content_type,
             "inbound_mail.mailgun: multipart/form-data boundary is missing, empty, or over 70 \
@@ -1948,7 +2135,6 @@ fn parse_mailgun_form_data(
     let mut file_parts: Vec<Attachment> = Vec::new();
     let mut search_from = 0_usize;
 
-    // Locate each "--{boundary}" in the raw byte buffer.
     while let Some(rel) = find_subslice(body.get(search_from..).unwrap_or_default(), &delim_bytes) {
         let abs = search_from.saturating_add(rel);
         let after_delim = abs.saturating_add(delim_bytes.len());
@@ -1969,7 +2155,6 @@ fn parse_mailgun_form_data(
             break;
         }
 
-        // Skip the CRLF/LF that follows the opening boundary line.
         let part_start = if after.starts_with(b"\r\n") {
             after_delim.saturating_add(2)
         } else if after.starts_with(b"\n") {
@@ -1978,9 +2163,8 @@ fn parse_mailgun_form_data(
             after_delim
         };
 
-        // The part body ends just before the next "\r\n--{boundary}" or "\n--{boundary}".
-        // `find_part_end` validates the terminator byte to avoid false matches on
-        // boundary-prefix strings (e.g. "\r\n--abc" inside "\r\n--abc123").
+        // `find_part_end` checks the terminator byte, so "\r\n--abc123" does not end a part
+        // whose boundary is "abc".
         let part_end = find_part_end(
             body.get(part_start..).unwrap_or_default(),
             &crlf_delim_bytes,
@@ -2015,28 +2199,24 @@ enum MailgunFormPart {
 /// Decode one `multipart/form-data` part. `None` when the part carries no
 /// `name` parameter, which every Mailgun form field and file part has.
 fn mailgun_form_part(headers_bytes: &[u8], body_bytes: &[u8]) -> Option<MailgunFormPart> {
-    // Headers are ASCII; lossy conversion is safe here.  Unfold before parsing
-    // so a folded Content-Disposition reads as one logical line.
+    // Headers are ASCII, so lossy conversion is safe. Unfold so a folded
+    // Content-Disposition reads as one line.
     let headers_str = unfold_mime_headers(&String::from_utf8_lossy(headers_bytes));
 
-    // Preserve the original disposition value so that filename casing is not
-    // corrupted — parameter values are case-sensitive (RFC 2183 §2).
-    // Key matching (name=, filename=) is done case-insensitively, and the
-    // quote-aware parser keeps `filename="Q1;final.pdf"` intact.
+    // Not lowercased: parameter values are case-sensitive (RFC 2183 §2). `mime_param`
+    // matches keys case-insensitively.
     let disposition = header_line_value(&headers_str, "content-disposition").unwrap_or("");
     let name = mime_param(disposition, "name")?;
 
     let Some(filename) = mime_param(disposition, "filename") else {
-        // Text field: lossy conversion is acceptable.
-        // Do not trim trailing newlines — the boundary separator is already excluded
-        // by the line-anchored boundary split, so trailing content is intentional.
+        // Do not trim trailing newlines: the boundary split already excludes the line ending
+        // before the delimiter, so what remains is field content.
         return Some(MailgunFormPart::Field {
             name,
             value: String::from_utf8_lossy(body_bytes).into_owned(),
         });
     };
 
-    // File part: use raw bytes from the original buffer to avoid lossy UTF-8 corruption.
     let content_type = header_line_value(&headers_str, "content-type").map_or_else(
         || "application/octet-stream".to_string(),
         |v| mime_type_only(v, "application/octet-stream").to_ascii_lowercase(),
@@ -2044,8 +2224,8 @@ fn mailgun_form_part(headers_bytes: &[u8], body_bytes: &[u8]) -> Option<MailgunF
     let cte = header_line_value(&headers_str, "content-transfer-encoding")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    // Only base64 is decoded here; anything else (including 8-bit binary) is
-    // copied through byte-for-byte, unchanged from the original parser.
+    // Only base64 is decoded; any other encoding, including 8-bit binary, is copied
+    // byte-for-byte.
     let data = if cte == "base64" {
         decode_part_bytes(body_bytes, "base64")
     } else {
@@ -2147,10 +2327,8 @@ fn build_ses_route(
     use axum::extract::DefaultBodyLimit;
     use axum::routing::post;
 
-    // Fail closed: without a topic ARN every SNS-signed notification from any
-    // AWS account passes signature verification.  A third party could subscribe
-    // this endpoint to their own topic and deliver arbitrary payloads.  Emit an
-    // error at startup so the misconfiguration is visible immediately.
+    // Without a topic ARN, any AWS account could subscribe this endpoint to its own topic and
+    // pass signature verification, so the route rejects every request. Say so at startup.
     if topic_arn.is_none() {
         tracing::error!(
             path = %path,
@@ -2159,10 +2337,10 @@ fn build_ses_route(
         );
     }
 
-    // One shared client per route for SNS cert fetching.
-    // If it cannot be built, the route fails closed with 503.
+    // One client per route for SNS cert fetches. If it cannot be built, the route fails
+    // closed with 503.
     #[cfg(feature = "inbound-ses")]
-    let http_client = match crate::reqwest_tls::client_builder().build() {
+    let http_client = match sns_verify::http_client() {
         Ok(client) => Some(client),
         Err(error) => {
             tracing::error!(
@@ -2179,20 +2357,19 @@ fn build_ses_route(
         let http_client = http_client.clone();
         let topic_arn = topic_arn.clone();
         async move {
-            // Fail closed: reject every request if no topic ARN was configured.
-            if topic_arn.is_none() {
+            let Some(topic_arn) = topic_arn else {
                 return StatusCode::SERVICE_UNAVAILABLE;
-            }
+            };
             #[cfg(feature = "inbound-ses")]
             let Some(http_client) = http_client else {
                 return StatusCode::SERVICE_UNAVAILABLE;
             };
 
-            // Reject SES notifications when the `inbound-ses` feature is off: the
-            // signature verifier is not compiled in, so accepting requests would
-            // bypass SNS authentication entirely.
+            // Without `inbound-ses` the signature verifier is not compiled in, so accepting
+            // requests would bypass SNS authentication.
             #[cfg(not(feature = "inbound-ses"))]
             {
+                let _ = topic_arn;
                 tracing::error!(
                     "inbound_mail.ses: SES endpoint configured but the `inbound-ses` \
                      Cargo feature is not enabled; all requests are rejected. \
@@ -2201,11 +2378,11 @@ fn build_ses_route(
                 return StatusCode::SERVICE_UNAVAILABLE;
             }
 
-            // Verify SNS signature (and optional TopicArn binding) before parsing.
+            // Verify before parsing. A body that is not JSON skips this, and `parse_ses` rejects
+            // it with 400.
             #[cfg(feature = "inbound-ses")]
             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body)
-                && let Err(status) =
-                    sns_verify::verify(&json, &http_client, topic_arn.as_deref()).await
+                && let Err(status) = sns_verify::verify(&json, &http_client, &topic_arn).await
             {
                 return status;
             }
@@ -2213,29 +2390,7 @@ fn build_ses_route(
             match parse_ses(&body) {
                 #[cfg(feature = "inbound-ses")]
                 Ok(SnsParseResult::SubscriptionConfirmation { url }) => {
-                    // This client is not the recorded outbound seam (#2351
-                    // item 1).
-                    #[cfg(feature = "reporting")]
-                    if crate::capsule::guard_egress("inbound mail", "GET", &url).is_err() {
-                        return StatusCode::SERVICE_UNAVAILABLE;
-                    }
-                    match http_client
-                        .get(&url)
-                        .send()
-                        .await
-                        .and_then(reqwest::Response::error_for_status)
-                    {
-                        Ok(_) => StatusCode::OK,
-                        Err(e) => {
-                            // Return 5xx so SNS retries the SubscriptionConfirmation delivery,
-                            // giving us another chance to GET the SubscribeURL.
-                            tracing::error!(
-                                error = %e,
-                                "inbound_mail.ses: SNS subscription confirmation fetch failed"
-                            );
-                            StatusCode::INTERNAL_SERVER_ERROR
-                        }
-                    }
+                    sns_verify::handle_subscription(&http_client, &url, &topic_arn).await
                 }
                 #[cfg(not(feature = "inbound-ses"))]
                 Ok(SnsParseResult::SubscriptionConfirmation { .. }) => StatusCode::OK,
@@ -2269,8 +2424,8 @@ fn build_generic_route(
         let router = Arc::clone(&router);
         let key = signing_key.clone();
         async move {
-            // Fail closed: if a signing key was configured but could not be resolved
-            // (e.g. missing env var), reject instead of silently skipping verification.
+            // A key that was configured but did not resolve (e.g. a missing env var) must
+            // not silently disable verification.
             if key_configured && key.is_none() {
                 tracing::error!(
                     "inbound_mail.generic: signing key env var not resolved; rejecting request"
@@ -2504,8 +2659,7 @@ mod tests {
 
     #[test]
     fn mailgun_parse_extreme_timestamp_returns_401_not_panic() {
-        // i64::MIN as a timestamp would overflow `(now - ts).abs()` in debug
-        // builds before the stale-window check rejects it.  Ensure we get 401.
+        // `i64::MIN` would overflow a naive `(now - ts).abs()` in debug builds.
         for ts_str in &[
             i64::MIN.to_string(),
             i64::MAX.to_string(),
@@ -2521,7 +2675,6 @@ mod tests {
             .into_iter()
             .collect();
             let result = parse_mailgun(&form, "key", Vec::new());
-            // Either a parse error (non-i64) or a 401 — must never panic.
             assert!(
                 result.is_err(),
                 "extreme timestamp {ts_str} must be rejected, not panic"
@@ -2600,8 +2753,6 @@ mod tests {
 
         let email = parse_mailgun(&form, key, Vec::new()).unwrap();
         assert!(email.is_bounce, "top-level bounce field must set is_bounce");
-        // The injected header must NOT appear in email.headers — bounce state is
-        // tracked only via is_bounce to prevent spoofing via message-headers.
         assert!(
             !email.headers.contains_key("x-mailgun-bounced-address"),
             "bounce header must not bleed into forwarded headers map"
@@ -2610,8 +2761,6 @@ mod tests {
 
     #[test]
     fn mailgun_bounce_not_triggered_by_injected_message_header() {
-        // A sender that embeds X-Mailgun-Bounced-Address in their own email headers
-        // must not have those headers treated as a provider bounce signal.
         let ts = now_ts();
         let tok = "regtoken";
         let key = "spoof-key";
@@ -2803,21 +2952,19 @@ mod tests {
 
     #[test]
     fn decode_rfc2047_q_encoding() {
-        // =?UTF-8?Q?Hello_World?= → "Hello World"
         let encoded = "=?UTF-8?Q?Hello_World?=";
         assert_eq!(decode_rfc2047(encoded), "Hello World");
     }
 
     #[test]
     fn decode_rfc2047_q_hex_sequence() {
-        // =?UTF-8?Q?caf=C3=A9?= → "café"
         let encoded = "=?UTF-8?Q?caf=C3=A9?=";
         assert_eq!(decode_rfc2047(encoded), "café");
     }
 
     #[test]
     fn decode_rfc2047_adjacent_words_no_space() {
-        // Two adjacent encoded words should be joined without whitespace.
+        // The space between the words is dropped; the one in " World" is encoded text.
         use base64::Engine as _;
         let w1 = base64::engine::general_purpose::STANDARD.encode("Hello");
         let w2 = base64::engine::general_purpose::STANDARD.encode(" World");
@@ -3002,7 +3149,6 @@ mod tests {
 
     #[test]
     fn parse_mailgun_form_data_binary_file_preserved() {
-        // Verify that non-UTF-8 binary bytes are not corrupted by the parser.
         let b = "formbnd";
         let binary_payload: &[u8] = &[0x80u8, 0xFFu8, 0x00u8, 0x42u8];
         let mut body: Vec<u8> = Vec::new();
@@ -3080,39 +3226,493 @@ mod tests {
         assert_eq!(result.unwrap_err(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    /// The SNS origin policy for `SigningCertURL` and `SubscribeURL`.
     #[cfg(feature = "inbound-ses")]
-    #[test]
-    fn is_valid_sns_cert_url_accepts_aws_https() {
-        assert!(sns_verify::is_valid_sns_cert_url(
-            "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc.pem"
-        ));
-        assert!(sns_verify::is_valid_sns_cert_url(
-            "https://sns.ap-southeast-2.amazonaws.com/cert.pem"
-        ));
-        assert!(sns_verify::is_valid_sns_cert_url(
-            "https://sns.cn-north-1.amazonaws.com.cn/cert.pem"
-        ));
+    mod sns_url_policy {
+        use super::super::sns_verify;
+
+        fn cert_ok(raw: &str) -> bool {
+            sns_verify::SnsCertUrl::parse(raw).is_some()
+        }
+
+        #[test]
+        fn accepts_documented_sns_cert_urls() {
+            for raw in [
+                "https://sns.us-east-1.amazonaws.com/SimpleNotificationService-9c6465fa7f48f5cacd23014631ec1136.pem",
+                "https://sns.ap-southeast-2.amazonaws.com/cert.pem",
+                "https://sns.us-gov-west-1.amazonaws.com/SimpleNotificationService-abc.pem",
+                "https://sns.cn-north-1.amazonaws.com.cn/cert.pem",
+                "https://sns.cn-northwest-1.amazonaws.com.cn/cert.pem",
+            ] {
+                assert!(cert_ok(raw), "must accept {raw}");
+            }
+        }
+
+        #[test]
+        fn rejects_userinfo_in_cert_url() {
+            for raw in [
+                "https://sns.us-east-1.amazonaws.com@attacker.s3.amazonaws.com/cert.pem",
+                "https://sns.us-east-1.amazonaws.com:x@attacker.s3.amazonaws.com/cert.pem",
+                "https://user@sns.us-east-1.amazonaws.com/cert.pem",
+                "https://:pw@sns.us-east-1.amazonaws.com/cert.pem",
+            ] {
+                assert!(!cert_ok(raw), "must reject {raw}");
+            }
+        }
+
+        #[test]
+        fn rejects_encoded_or_alternate_delimiters_in_cert_url() {
+            for raw in [
+                "https://sns.us-east-1.amazonaws.com%40attacker.s3.amazonaws.com/cert.pem",
+                "https://sns.us-east-1.amazonaws.com\\@attacker.s3.amazonaws.com/cert.pem",
+                "https://sns.us-east-1.amazonaws.com\\.attacker.s3.amazonaws.com/cert.pem",
+                "https://sns.us-east-1.amazon\taws.com/cert.pem",
+                "https://sns.us-east-1.amazonaws.com/%2e%2e/cert.pem",
+                "https://sns.us-east-1.amazonaws.com/a%2Fb.pem",
+                "https://sns.us-east-1.amazonaws.com/x/../cert.pem",
+                "https://SNS.us-east-1.amazonaws.com/cert.pem",
+                " https://sns.us-east-1.amazonaws.com/cert.pem",
+            ] {
+                assert!(!cert_ok(raw), "must reject {raw:?}");
+            }
+        }
+
+        #[test]
+        fn rejects_explicit_port_in_cert_url() {
+            for raw in [
+                "https://sns.us-east-1.amazonaws.com:443/cert.pem",
+                "https://sns.us-east-1.amazonaws.com:8443/cert.pem",
+            ] {
+                assert!(!cert_ok(raw), "must reject {raw}");
+            }
+        }
+
+        #[test]
+        fn rejects_non_sns_hosts_in_cert_url() {
+            for raw in [
+                "http://sns.us-east-1.amazonaws.com/cert.pem",
+                "https://evil.com/cert.pem",
+                "https://s3.amazonaws.com/cert.pem",
+                "https://sns..amazonaws.com/cert.pem",
+                "https://sns.amazonaws.com/cert.pem",
+                // An S3 bucket named `sns.us-east-1`.
+                "https://sns.us-east-1.s3.amazonaws.com/cert.pem",
+                "https://sns.attacker.us-east-1.amazonaws.com/cert.pem",
+                "https://sns.us-east-1.amazonaws.com.attacker.com/cert.pem",
+                "https://sns.us-east-1.amazonaws.com./cert.pem",
+                "https://xsns.us-east-1.amazonaws.com/cert.pem",
+                "https://sns.-.amazonaws.com/cert.pem",
+                "https://sns.us_east_1.amazonaws.com/cert.pem",
+                // The region and the partition domain must agree.
+                "https://sns.us-east-1.amazonaws.com.cn/cert.pem",
+                "https://sns.cn-north-1.amazonaws.com/cert.pem",
+                "https://127.0.0.1/cert.pem",
+                "https://[::1]/cert.pem",
+            ] {
+                assert!(!cert_ok(raw), "must reject {raw}");
+            }
+        }
+
+        const TOPIC: &str = "arn:aws:sns:us-west-2:123456789012:MyTopic";
+
+        fn subscribe_ok(raw: &str) -> bool {
+            sns_verify::SnsSubscribeUrl::parse(raw, TOPIC).is_some()
+        }
+
+        #[test]
+        fn accepts_documented_subscribe_urls() {
+            for raw in [
+                "https://sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&TopicArn=arn:aws:sns:us-west-2:123456789012:MyTopic&Token=2336412f37",
+                "https://sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&TopicArn=arn%3Aaws%3Asns%3Aus-west-2%3A123456789012%3AMyTopic&Token=t",
+                "https://sns.cn-north-1.amazonaws.com.cn/?Action=ConfirmSubscription&TopicArn=arn:aws:sns:us-west-2:123456789012:MyTopic&Token=t",
+            ] {
+                assert!(subscribe_ok(raw), "must accept {raw}");
+            }
+        }
+
+        #[test]
+        fn rejects_subscribe_urls_outside_sns() {
+            let q = format!("?Action=ConfirmSubscription&TopicArn={TOPIC}&Token=t");
+            for raw in [
+                format!("https://sns.example.com/{q}"),
+                format!("https://sns.us-west-2.amazonaws.com@attacker.example/{q}"),
+                format!("https://x@sns.us-west-2.amazonaws.com/{q}"),
+                format!("https://sns.us-west-2.amazonaws.com:443/{q}"),
+                format!("https://sns.us-west-2.amazonaws.com\\@attacker.example/{q}"),
+                format!("https://sns.us-west-2.amazonaws.com%40attacker.example/{q}"),
+                format!("http://sns.us-west-2.amazonaws.com/{q}"),
+                format!("https://169.254.169.254/{q}"),
+                format!("https://sns.us-west-2.s3.amazonaws.com/{q}"),
+                format!("https://sns.us-west-2.amazonaws.com/other{q}"),
+                format!("https://sns.us-west-2.amazonaws.com/{q}#x"),
+            ] {
+                assert!(!subscribe_ok(&raw), "must reject {raw}");
+            }
+        }
+
+        #[test]
+        fn rejects_subscribe_urls_with_a_wrong_action_or_topic() {
+            for raw in [
+                "https://sns.us-west-2.amazonaws.com/?Action=Publish&TopicArn=arn:aws:sns:us-west-2:123456789012:MyTopic",
+                "https://sns.us-west-2.amazonaws.com/?TopicArn=arn:aws:sns:us-west-2:123456789012:MyTopic&Token=t",
+                "https://sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&Token=t",
+                "https://sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&TopicArn=arn:aws:sns:us-west-2:999999999999:MyTopic",
+                "https://sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&Action=Publish&TopicArn=arn:aws:sns:us-west-2:123456789012:MyTopic",
+                "https://sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&TopicArn=arn:aws:sns:us-west-2:123456789012:MyTopic&TopicArn=x",
+                "https://sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&TopicArn=arn:aws:sns:us-west-2:123456789012:MyTopic&action=DeleteTopic",
+            ] {
+                assert!(!subscribe_ok(raw), "must reject {raw}");
+            }
+        }
+
+        proptest::proptest! {
+            /// User info before an SNS host never passes, for all values.
+            #[test]
+            fn userinfo_before_an_sns_host_never_passes(user in "[!-~]{0,40}") {
+                let raw = format!("https://{user}@sns.us-east-1.amazonaws.com/cert.pem");
+                proptest::prop_assert!(!cert_ok(&raw));
+                let raw = format!(
+                    "https://{user}@sns.us-west-2.amazonaws.com/?Action=ConfirmSubscription&TopicArn={TOPIC}"
+                );
+                proptest::prop_assert!(!subscribe_ok(&raw));
+            }
+
+            /// An accepted URL starts with `https://<sns host>/`.
+            #[test]
+            fn an_accepted_cert_url_connects_to_the_host_it_names(
+                prefix in proptest::prop_oneof![
+                    3 => proptest::strategy::Just("sns.".to_string()),
+                    1 => "[a-z0-9.@:%\\\\-]{0,30}",
+                ],
+                region in "[a-z]{2}(-[a-z]{2,8}){1,2}-[0-9]",
+                suffix in proptest::prop_oneof![
+                    2 => proptest::strategy::Just(".amazonaws.com".to_string()),
+                    2 => proptest::strategy::Just(".amazonaws.com.cn".to_string()),
+                    1 => "[a-z0-9.@:%-]{0,20}",
+                ],
+                name in "[A-Za-z0-9_-]{1,12}",
+            ) {
+                let raw = format!("https://{prefix}{region}{suffix}/{name}.pem");
+                if cert_ok(&raw) {
+                    let url = url::Url::parse(&raw).unwrap();
+                    let host = url.host_str().unwrap();
+                    proptest::prop_assert!(host.starts_with("sns."));
+                    proptest::prop_assert!(
+                        host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn")
+                    );
+                    proptest::prop_assert!(url.username().is_empty() && url.password().is_none());
+                    proptest::prop_assert_eq!(url.port(), None);
+                    let origin = format!("https://{host}/");
+                    proptest::prop_assert!(raw.starts_with(&origin));
+                }
+            }
+        }
+
+        #[test]
+        fn rejects_cert_urls_that_are_not_one_pem_file() {
+            for raw in [
+                "https://sns.us-east-1.amazonaws.com/",
+                "https://sns.us-east-1.amazonaws.com/cert.txt",
+                "https://sns.us-east-1.amazonaws.com/a/cert.pem",
+                "https://sns.us-east-1.amazonaws.com/cert.pem?x=1",
+                "https://sns.us-east-1.amazonaws.com/cert.pem#x",
+                "https://sns.us-east-1.amazonaws.com/.pem",
+            ] {
+                assert!(!cert_ok(raw), "must reject {raw}");
+            }
+        }
     }
 
+    /// `verify` must refuse a bad key source before it opens a connection.
     #[cfg(feature = "inbound-ses")]
-    #[test]
-    fn is_valid_sns_cert_url_rejects_invalid() {
-        // http (not https)
-        assert!(!sns_verify::is_valid_sns_cert_url(
-            "http://sns.us-east-1.amazonaws.com/cert.pem"
-        ));
-        // non-AWS domain
-        assert!(!sns_verify::is_valid_sns_cert_url(
-            "https://evil.com/cert.pem"
-        ));
-        // not starting with sns.
-        assert!(!sns_verify::is_valid_sns_cert_url(
-            "https://s3.amazonaws.com/cert.pem"
-        ));
-        // double-dot (path traversal attempt)
-        assert!(!sns_verify::is_valid_sns_cert_url(
-            "https://sns..amazonaws.com/cert.pem"
-        ));
+    mod sns_verify_key_source {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use http::StatusCode;
+
+        const TOPIC: &str = "arn:aws:sns:us-east-1:123456789012:inbound";
+
+        /// A TCP listener that counts connections and closes each one immediately.
+        async fn counting_listener() -> (SocketAddr, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&hits);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+            (addr, hits)
+        }
+
+        /// A client that sends every named host to `addr`, with no proxy.
+        fn client_to(addr: SocketAddr, hosts: &[&str]) -> reqwest::Client {
+            hosts
+                .iter()
+                .fold(
+                    crate::reqwest_tls::client_builder().no_proxy(),
+                    |b, host| b.resolve(host, addr),
+                )
+                .build()
+                .unwrap()
+        }
+
+        fn notification(cert_url: &str, topic: &str) -> serde_json::Value {
+            serde_json::json!({
+                "Type": "Notification",
+                "MessageId": "m-1",
+                "Message": "forged",
+                "Timestamp": "2026-11-14T00:00:00.000Z",
+                "TopicArn": topic,
+                "SignatureVersion": "2",
+                "Signature": "AAAA",
+                "SigningCertURL": cert_url,
+            })
+        }
+
+        /// `verify` skips every check when this variable is `1`.
+        fn assert_verification_on() {
+            assert_ne!(
+                std::env::var("AUTUMN_SES_SKIP_SNS_VERIFICATION").as_deref(),
+                Ok("1"),
+                "unset AUTUMN_SES_SKIP_SNS_VERIFICATION to run this test"
+            );
+        }
+
+        /// Positive control: the harness sees a fetch when the checks pass.
+        #[tokio::test]
+        async fn valid_cert_url_and_topic_reach_the_fetch() {
+            assert_verification_on();
+            let (addr, hits) = counting_listener().await;
+            let client = client_to(addr, &["sns.us-east-1.amazonaws.com"]);
+            let json = notification("https://sns.us-east-1.amazonaws.com/cert.pem", TOPIC);
+            let status = super::super::sns_verify::verify(&json, &client, TOPIC).await;
+            assert_eq!(status, Err(StatusCode::BAD_GATEWAY));
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "one certificate fetch");
+        }
+
+        #[tokio::test]
+        async fn a_valid_subscribe_url_reaches_the_fetch() {
+            let (addr, hits) = counting_listener().await;
+            let client = client_to(addr, &["sns.us-east-1.amazonaws.com"]);
+            let raw = format!(
+                "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&TopicArn={TOPIC}&Token=t"
+            );
+            let status = super::super::sns_verify::handle_subscription(&client, &raw, TOPIC).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "one confirmation fetch");
+        }
+
+        #[tokio::test]
+        async fn a_userinfo_subscribe_url_is_rejected_without_a_fetch() {
+            let (addr, hits) = counting_listener().await;
+            let client = client_to(
+                addr,
+                &["attacker.s3.amazonaws.com", "sns.us-east-1.amazonaws.com"],
+            );
+            let raw = format!(
+                "https://sns.us-east-1.amazonaws.com@attacker.s3.amazonaws.com/\
+                 ?Action=ConfirmSubscription&TopicArn={TOPIC}&Token=t"
+            );
+            let status = super::super::sns_verify::handle_subscription(&client, &raw, TOPIC).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "no confirmation fetch");
+        }
+
+        #[tokio::test]
+        async fn userinfo_cert_url_is_rejected_without_a_fetch() {
+            assert_verification_on();
+            let (addr, hits) = counting_listener().await;
+            let client = client_to(
+                addr,
+                &["attacker.s3.amazonaws.com", "sns.us-east-1.amazonaws.com"],
+            );
+            let json = notification(
+                "https://sns.us-east-1.amazonaws.com@attacker.s3.amazonaws.com/cert.pem",
+                TOPIC,
+            );
+            let status = super::super::sns_verify::verify(&json, &client, TOPIC).await;
+            assert_eq!(status, Err(StatusCode::UNAUTHORIZED));
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "no certificate fetch");
+        }
+
+        #[tokio::test]
+        async fn wrong_topic_is_rejected_without_a_fetch() {
+            assert_verification_on();
+            let (addr, hits) = counting_listener().await;
+            let client = client_to(addr, &["sns.us-east-1.amazonaws.com"]);
+            let json = notification(
+                "https://sns.us-east-1.amazonaws.com/cert.pem",
+                "arn:aws:sns:us-east-1:999999999999:other",
+            );
+            let status = super::super::sns_verify::verify(&json, &client, TOPIC).await;
+            assert_eq!(status, Err(StatusCode::UNAUTHORIZED));
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "no certificate fetch");
+        }
+    }
+
+    /// Fetch limits, against a local plain-HTTP server.
+    #[cfg(feature = "inbound-ses")]
+    mod sns_fetch {
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex};
+
+        use http::StatusCode;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        use super::super::sns_verify::{self, SnsCertUrl, SnsSubscribeUrl};
+
+        const PEM: &str = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+
+        /// Serve one raw HTTP response per request. Record each request path.
+        async fn raw_server(reply: fn(&str) -> String) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let paths = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&paths);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head);
+                    let path = head.split(' ').nth(1).unwrap_or("").to_string();
+                    let response = reply(&path);
+                    seen.lock().unwrap().push(path);
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+            (addr, paths)
+        }
+
+        fn ok(body: &str) -> String {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        }
+
+        fn redirect(_: &str) -> String {
+            "HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+                .to_string()
+        }
+
+        fn client() -> reqwest::Client {
+            sns_verify::http_client_builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+        }
+
+        fn cert_url(addr: SocketAddr, path: &str) -> SnsCertUrl {
+            SnsCertUrl::unchecked(url::Url::parse(&format!("http://{addr}{path}")).unwrap())
+        }
+
+        #[tokio::test]
+        async fn reads_a_small_pem() {
+            let (addr, _) = raw_server(|_| ok(PEM)).await;
+            let pem = sns_verify::fetch_cert_pem(&client(), &cert_url(addr, "/cert.pem")).await;
+            assert_eq!(pem.as_deref(), Ok(PEM));
+        }
+
+        #[tokio::test]
+        async fn refuses_a_redirect_and_does_not_follow_it() {
+            let (addr, paths) = raw_server(redirect).await;
+            let pem = sns_verify::fetch_cert_pem(&client(), &cert_url(addr, "/cert.pem")).await;
+            assert_eq!(pem, Err(StatusCode::BAD_GATEWAY));
+            assert_eq!(*paths.lock().unwrap(), ["/cert.pem"]);
+        }
+
+        #[tokio::test]
+        async fn refuses_an_oversized_body() {
+            let (addr, _) = raw_server(|_| {
+                let max = usize::try_from(sns_verify::MAX_CERT_BYTES).unwrap();
+                ok(&"A".repeat(max + 1))
+            })
+            .await;
+            let pem = sns_verify::fetch_cert_pem(&client(), &cert_url(addr, "/cert.pem")).await;
+            assert_eq!(pem, Err(StatusCode::BAD_GATEWAY));
+        }
+
+        #[tokio::test]
+        async fn accepts_a_body_at_the_size_limit() {
+            let (addr, _) = raw_server(|_| {
+                let max = usize::try_from(sns_verify::MAX_CERT_BYTES).unwrap();
+                ok(&"A".repeat(max))
+            })
+            .await;
+            let pem = sns_verify::fetch_cert_pem(&client(), &cert_url(addr, "/cert.pem")).await;
+            let max = usize::try_from(sns_verify::MAX_CERT_BYTES).unwrap();
+            assert_eq!(pem.map(|p| p.len()), Ok(max));
+        }
+
+        #[tokio::test]
+        async fn refuses_a_chunked_body() {
+            let (addr, _) = raw_server(|_| {
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+                 4\r\nAAAA\r\n0\r\n\r\n"
+                    .to_string()
+            })
+            .await;
+            let pem = sns_verify::fetch_cert_pem(&client(), &cert_url(addr, "/cert.pem")).await;
+            assert_eq!(pem, Err(StatusCode::BAD_GATEWAY));
+        }
+
+        #[tokio::test]
+        async fn an_error_status_is_transient() {
+            let (addr, _) = raw_server(|_| {
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+                    .to_string()
+            })
+            .await;
+            let pem = sns_verify::fetch_cert_pem(&client(), &cert_url(addr, "/cert.pem")).await;
+            assert_eq!(pem, Err(StatusCode::SERVICE_UNAVAILABLE));
+        }
+
+        fn subscribe_url(addr: SocketAddr) -> SnsSubscribeUrl {
+            SnsSubscribeUrl::unchecked(url::Url::parse(&format!("http://{addr}/confirm")).unwrap())
+        }
+
+        #[tokio::test]
+        async fn confirm_subscription_returns_ok_on_success() {
+            let (addr, _) = raw_server(|_| ok("<ConfirmSubscriptionResponse/>")).await;
+            let status = sns_verify::confirm_subscription(&client(), &subscribe_url(addr)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn confirm_subscription_does_not_follow_a_redirect() {
+            let (addr, paths) = raw_server(redirect).await;
+            let status = sns_verify::confirm_subscription(&client(), &subscribe_url(addr)).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(*paths.lock().unwrap(), ["/confirm"]);
+        }
+
+        #[tokio::test]
+        async fn confirm_subscription_fetch_failure_returns_500() {
+            // The server closes each connection with no response.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    drop(stream);
+                }
+            });
+            let status = sns_verify::confirm_subscription(&client(), &subscribe_url(addr)).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        }
     }
 
     #[cfg(feature = "inbound-ses")]
@@ -3162,8 +3762,6 @@ mod tests {
 
     #[test]
     fn extract_multipart_bodies_headerless_part_treated_as_text_plain() {
-        // A part with no headers at all (no blank-line separator after boundary)
-        // must still yield a text_body, defaulting to text/plain per RFC 2045 §5.2.
         let b = "bnd";
         let body = format!("--{b}\r\nHello headerless\r\n--{b}--\r\n");
         let ct = format!("multipart/mixed; boundary={b}");
@@ -3179,8 +3777,6 @@ mod tests {
 
     #[test]
     fn extract_multipart_bodies_boundary_inside_content_not_split() {
-        // A boundary token that appears in the middle of a line (not at line-start)
-        // must NOT be treated as a MIME boundary delimiter.
         let b = "abc";
         let body = format!(
             "--{b}\r\nContent-Type: text/plain\r\n\r\nsee --{b} here, not a split\r\n--{b}--\r\n"
@@ -3196,8 +3792,6 @@ mod tests {
 
     #[test]
     fn extract_multipart_bodies_boundary_prefix_not_split() {
-        // If the boundary is "abc" but the line starts with "--abc123" (extended token),
-        // the RFC 2046 terminator check must reject it as a non-boundary.
         let b = "abc";
         let body = format!(
             "--{b}\r\nContent-Type: text/plain\r\n\r\nhello\r\n--{b}123\r\nmore content\r\n--{b}--\r\n"
@@ -3214,7 +3808,6 @@ mod tests {
     #[test]
     fn extract_multipart_bodies_attachment_quoted_printable_decoded() {
         let b = "bndqp";
-        // QP-encoded attachment: "Hello=20World" decodes to "Hello World"
         let body = format!(
             "--{b}\r\n\
              Content-Type: application/octet-stream\r\n\
@@ -3227,7 +3820,7 @@ mod tests {
         let ct = format!("multipart/mixed; boundary={b}");
         let (_text, _html, atts) = extract_multipart_bodies(body.as_bytes(), &ct);
         assert_eq!(atts.len(), 1);
-        // The CRLF before the boundary delimiter is stripped by MIME before QP decode.
+        // The CRLF before the delimiter belongs to the boundary, so it is not in the data.
         assert_eq!(atts[0].data.as_ref(), b"Hello World");
     }
 
@@ -3289,8 +3882,6 @@ mod tests {
 
     #[test]
     fn parse_mailgun_form_data_boundary_prefix_not_split() {
-        // A line that starts with "--{boundary}" followed by non-terminator bytes
-        // (e.g. "--abc123") must NOT be treated as a valid MIME part boundary.
         let b = "abc";
         let body = format!(
             "--{b}\r\nContent-Disposition: form-data; name=\"field1\"\r\n\r\nvalue1\r\n\
@@ -3308,10 +3899,7 @@ mod tests {
 
     #[test]
     fn parse_mailgun_form_data_boundary_must_start_at_line() {
-        // A boundary string that appears mid-line (not at position 0 or immediately
-        // after a newline) must NOT be treated as a valid MIME part boundary.
         let b = "sep";
-        // Embed the delimiter string mid-line inside the value of field1.
         let body = format!(
             "--{b}\r\nContent-Disposition: form-data; name=\"field1\"\r\n\r\nvalue with --{b} inside\r\n\
              --{b}\r\nContent-Disposition: form-data; name=\"field2\"\r\n\r\nvalue2\r\n\
@@ -3329,8 +3917,6 @@ mod tests {
 
     #[test]
     fn rfc5322_single_part_pdf_collected_as_attachment() {
-        // A non-multipart message whose Content-Type is application/pdf must have
-        // its body collected as an Attachment rather than placed in text_body.
         let pdf_b64 = "JVBERi0xLjA="; // minimal %PDF-1.0 stub, base64-encoded
         let raw = format!(
             "From: sender@example.com\r\nTo: inbox@example.com\r\n\
@@ -3357,14 +3943,11 @@ mod tests {
         let att = &email.attachments[0];
         assert_eq!(att.content_type, "application/pdf");
         assert_eq!(att.filename.as_deref(), Some("doc.pdf"));
-        // The decoded bytes should match the original PDF stub.
         assert_eq!(att.data.as_ref(), b"%PDF-1.0");
     }
 
     #[test]
     fn rfc5322_attachment_filename_with_semicolon() {
-        // A filename that contains a semicolon must not be truncated when the
-        // Content-Disposition parameter is parsed.
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"data");
         let raw = format!(
             "From: s@example.com\r\nTo: r@example.com\r\n\
@@ -3385,8 +3968,6 @@ mod tests {
 
     #[test]
     fn rfc5322_attachment_qp_binary_not_corrupted() {
-        // A QP-encoded attachment with non-UTF-8 bytes (=FF) must not have those
-        // bytes replaced by U+FFFD when decoded.
         let raw = "From: s@example.com\r\nTo: r@example.com\r\n\
                    Content-Type: application/octet-stream\r\n\
                    Content-Transfer-Encoding: quoted-printable\r\n\
@@ -3405,8 +3986,6 @@ mod tests {
 
     #[test]
     fn rfc5322_single_part_attachment_qp_decoded() {
-        // A single-part attachment with Content-Transfer-Encoding: quoted-printable
-        // must have its body decoded; handlers must not receive raw QP bytes.
         let raw = "From: s@example.com\r\nTo: r@example.com\r\n\
                    Content-Type: application/octet-stream\r\n\
                    Content-Transfer-Encoding: quoted-printable\r\n\
@@ -3430,8 +4009,7 @@ mod tests {
 
     #[test]
     fn parse_mailgun_form_data_preserves_filename_casing() {
-        // RFC 2183 §2: parameter values are case-sensitive.
-        // A filename like "Q1-Report.PDF" must not be lowercased to "q1-report.pdf".
+        // Parameter values are case-sensitive (RFC 2183 §2).
         let b = "bound";
         let body = format!(
             "--{b}\r\n\
@@ -3453,8 +4031,7 @@ mod tests {
 
     #[test]
     fn parse_ses_notification_preserves_envelope_recipient_casing() {
-        // Bcc recipients in mail.destination must retain original case so that
-        // extract_token can recover the exact token from a plus-address.
+        // `extract_token` needs the original casing to recover the plus-address token.
         let msg_json = serde_json::json!({
             "content": "From: sender@example.com\r\nTo: support@example.com\r\nSubject: hi\r\n\r\nbody",
             "mail": {
@@ -3507,9 +4084,8 @@ mod tests {
 
     #[test]
     fn deeply_nested_multipart_does_not_overflow_the_stack() {
-        // D1: unbounded MIME recursion is an unauthenticated process-abort.
-        // 256 KiB is a deliberately small stack; the parser must be depth-capped
-        // rather than recursing once per nesting level.
+        // Unbounded recursion would let an unauthenticated request abort the process. The
+        // small stack proves the parser is depth-capped.
         let raw = nested_multipart_bomb(5_000);
         let handle = std::thread::Builder::new()
             .stack_size(256 * 1024)
@@ -3528,8 +4104,8 @@ mod tests {
 
     #[test]
     fn extract_boundary_rejects_over_length_boundary() {
-        // D2: RFC 2046 §5.1.1 caps a boundary at 70 characters. A longer value
-        // is not a boundary — fall back to the single-part path.
+        // RFC 2046 §5.1.1 caps a boundary at 70 characters; a longer value falls back to the
+        // single-part path.
         let long = "a".repeat(71);
         let ct = format!("multipart/mixed; boundary=\"{long}\"");
         assert_eq!(extract_boundary(&ct), None);
@@ -3554,7 +4130,7 @@ mod tests {
 
     #[test]
     fn extract_boundary_rejects_empty_boundary() {
-        // D2: an empty boundary makes every position a match.
+        // An empty boundary would match at every position.
         assert_eq!(extract_boundary("multipart/mixed; boundary=\"\""), None);
         assert_eq!(extract_boundary("multipart/mixed; boundary="), None);
         assert_eq!(extract_boundary("multipart/mixed; boundary=  "), None);
@@ -3567,9 +4143,8 @@ mod tests {
 
     #[test]
     fn extract_boundary_rejects_whitespace_only_and_trailing_space_boundary() {
-        // F6: RFC 2046 §5.1.1 requires the final boundary byte to be
-        // `bcharsnospace`, so an all-whitespace or trailing-whitespace boundary
-        // is not permitted even though it is non-empty.
+        // RFC 2046 §5.1.1: the last boundary character must be `bcharsnospace`, so an
+        // all-whitespace or trailing-whitespace boundary is invalid.
         assert_eq!(extract_boundary("multipart/mixed; boundary=\" \""), None);
         assert_eq!(extract_boundary("multipart/mixed; boundary=\"ab \""), None);
         assert_eq!(extract_boundary("multipart/mixed; boundary=\"ab\t\""), None);
@@ -3582,10 +4157,9 @@ mod tests {
 
     #[test]
     fn extract_boundary_validates_the_first_parameter_not_a_later_fallback() {
-        // F5: every conformant parser takes the FIRST `boundary` parameter. A
-        // rejected first boundary must NOT fall through to a later acceptable
-        // one — otherwise Autumn and an upstream scanner split the same message
-        // on different delimiters (content smuggling).
+        // Conformant parsers take the first `boundary` parameter. Falling through to a later
+        // one would split the message on a different delimiter than an upstream scanner
+        // does (content smuggling).
         let over_len = "A".repeat(MAX_BOUNDARY_LEN + 1);
         assert_eq!(
             extract_boundary(&format!(
@@ -3594,7 +4168,6 @@ mod tests {
             None,
             "must reject on the first (invalid) boundary, not adopt the later 'ok'"
         );
-        // First boundary valid → used, later one ignored.
         assert_eq!(
             extract_boundary("multipart/mixed; boundary=first; boundary=second").as_deref(),
             Some("first")
@@ -3603,8 +4176,7 @@ mod tests {
 
     #[test]
     fn mime_param_preserves_utf8_in_quoted_value() {
-        // D3: the byte→char cast Latin-1-decoded UTF-8 input, so `café.pdf`
-        // came back as `cafÃ©.pdf`.
+        // A byte-wise cast would Latin-1-decode UTF-8, turning `café.pdf` into `cafÃ©.pdf`.
         assert_eq!(
             mime_param("attachment; filename=\"café.pdf\"", "filename").as_deref(),
             Some("café.pdf")
@@ -3613,7 +4185,6 @@ mod tests {
             mime_param("attachment; filename=\"🚀 launch.png\"", "filename").as_deref(),
             Some("🚀 launch.png")
         );
-        // Unquoted values were already sliced from the &str and stayed correct.
         assert_eq!(
             mime_param("attachment; filename=café.pdf", "filename").as_deref(),
             Some("café.pdf")
@@ -3636,7 +4207,6 @@ mod tests {
 
     #[test]
     fn decode_quoted_printable_bytes_edge_cases() {
-        // Pins the exact semantics the index-free rewrite must preserve.
         let cases: &[(&str, &[u8], &[u8])] = &[
             ("lone `=` at EOF", b"=", b"="),
             ("`=` + one hex digit at EOF", b"=4", b"=4"),
@@ -3690,7 +4260,6 @@ mod tests {
 
     #[test]
     fn decode_rfc2047_truncated_words_pass_through_verbatim() {
-        // Every truncation point emits the partial word unchanged and stops.
         for input in ["=?", "=?utf-8?", "=?utf-8?B?", "=?utf-8?B?QQ"] {
             assert_eq!(decode_rfc2047(input), input, "truncated word: {input}");
         }
@@ -3794,7 +4363,6 @@ mod tests {
 
         for (name, raw) in cases {
             let email = parse_rfc5322(Bytes::from_static(raw));
-            // Touch every field so nothing is lazily skipped.
             let _ = (
                 email.from.len(),
                 email.to.len(),

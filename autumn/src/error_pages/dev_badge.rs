@@ -283,7 +283,7 @@ pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
         div #autumn-dev-error-badge {
             input #autumn-dev-badge-toggle type="checkbox" class="autumn-dev-toggle";
 
-            // Collapsed badge (always visible)
+            // Always visible.
             label #autumn-dev-badge-collapsed
                 for="autumn-dev-badge-toggle"
                 tabindex="0"
@@ -293,7 +293,6 @@ pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
                 span class="autumn-dev-badge-label" { (reason) }
             }
 
-            // Expanded overlay
             div #autumn-dev-badge-expanded style="display:none" {
                 div class="autumn-dev-overlay-header" {
                     div class="autumn-dev-overlay-title" {
@@ -648,15 +647,12 @@ mod tests {
         let ctx = test_ctx();
         let html = dev_error_badge_html(&ctx);
         let s = html.into_string();
-        // The label ">Source<" in the HTML body must not appear when no source_location is set.
-        // CSS class names containing "source" (lowercase) are always present.
+        // CSS class names always contain "source", so check for the label itself.
         assert!(
             !s.contains(">Source<"),
             "no source section label without location"
         );
     }
-
-    // ── RED-phase tests: new fields and types ───────────────────────
 
     #[test]
     fn badge_renders_stack_frames_when_present() {
