@@ -1,0 +1,8 @@
+before fpw=off  records=14433  fpi=0  bytes=1705657  bytes/request=1665.6806640625000000
+after  fpw=off  records=12977  fpi=0  bytes=1577560  bytes/request=1540.5859375000000000
+before fpw=off  records=14122  fpi=0  bytes=1543349  bytes/request=1507.1767578125000000
+after  fpw=off  records=12987  fpi=0  bytes=1450548  bytes/request=1416.5507812500000000
+before fpw=on  records=14168  fpi=990  bytes=7842840  bytes/request=7659.0234375000000000
+after  fpw=on  records=13019  fpi=1065  bytes=8268352  bytes/request=8074.5625000000000000
+before fpw=on  records=14165  fpi=990  bytes=8045390  bytes/request=7856.8261718750000000
+after  fpw=on  records=13030  fpi=1037  bytes=8261945  bytes/request=8068.3056640625000000
