@@ -209,8 +209,11 @@ impl<K: Eq + Hash> HotKeys<K> {
     pub fn decay(&self) {
         let mut table = self.lock();
         table.slots.retain(|_, slot| {
+            // Halve the bound on each side: the guaranteed count rounds
+            // down, so an uncertain count never becomes a certain one.
+            let guaranteed = (slot.count - slot.error) / 2;
             slot.count /= 2;
-            slot.error /= 2;
+            slot.error = slot.count - guaranteed;
             slot.count > 0
         });
         table.total = table
@@ -240,7 +243,7 @@ impl<K: Eq + Hash + Clone + Ord> HotKeys<K> {
     /// smaller error, then the smaller key.
     #[must_use]
     pub fn top(&self, n: usize) -> Vec<HotKey<K>> {
-        let mut all = self.ranked();
+        let (_, mut all) = self.snapshot();
         all.truncate(n);
         all
     }
@@ -253,9 +256,10 @@ impl<K: Eq + Hash + Clone + Ord> HotKeys<K> {
     /// No key is missed when `share_ppm` is at least `1_000_000 / capacity`.
     #[must_use]
     pub fn heavy_hitters(&self, share_ppm: u32) -> Vec<HeavyHitter<K>> {
-        let total = u128::from(self.total());
+        let (total, ranked) = self.snapshot();
+        let total = u128::from(total);
         let over = |count: u64| u128::from(count) * PPM > total * u128::from(share_ppm);
-        self.ranked()
+        ranked
             .into_iter()
             .filter(|hot| over(hot.count))
             .map(|hot| HeavyHitter {
@@ -267,24 +271,29 @@ impl<K: Eq + Hash + Clone + Ord> HotKeys<K> {
             .collect()
     }
 
-    fn ranked(&self) -> Vec<HotKey<K>> {
-        let mut all: Vec<HotKey<K>> = self
-            .lock()
-            .slots
-            .iter()
-            .map(|(k, slot)| HotKey {
-                key: k.clone(),
-                count: slot.count,
-                error: slot.error,
-            })
-            .collect();
+    /// The total and every tracked key, ranked, read under one lock so the
+    /// two agree. Sorting happens after the lock is released.
+    fn snapshot(&self) -> (u64, Vec<HotKey<K>>) {
+        let (total, mut all) = {
+            let table = self.lock();
+            let all: Vec<HotKey<K>> = table
+                .slots
+                .iter()
+                .map(|(k, slot)| HotKey {
+                    key: k.clone(),
+                    count: slot.count,
+                    error: slot.error,
+                })
+                .collect();
+            (table.total, all)
+        };
         all.sort_by(|a, b| {
             b.count
                 .cmp(&a.count)
                 .then(a.error.cmp(&b.error))
                 .then_with(|| a.key.cmp(&b.key))
         });
-        all
+        (total, all)
     }
 }
 
@@ -416,6 +425,32 @@ mod tests {
         }
         hot.record_weighted("today", 100);
         assert_eq!(keys(&hot.top(1)), vec!["today"]);
+    }
+
+    #[test]
+    fn decay_never_raises_the_guaranteed_count_above_the_decayed_true_count() {
+        // "a" (3) is evicted by "b" (1): b = (4, error 3), true weight 1.
+        let hot = HotKeys::new(1);
+        hot.record_weighted("a", 3);
+        hot.record("b");
+        hot.decay();
+        // Decayed, b's true weight is 0.5, so nothing is guaranteed.
+        let b = hot.estimate(&"b").unwrap();
+        assert_eq!((b.count, b.guaranteed()), (2, 0));
+        let hh = hot.heavy_hitters(400_000);
+        assert_eq!(hh.iter().map(|h| h.key).collect::<Vec<_>>(), vec!["b"]);
+        assert!(!hh[0].certain);
+    }
+
+    #[test]
+    fn heavy_hitters_reads_total_and_counts_from_one_snapshot() {
+        let hot = HotKeys::new(4);
+        let (total, ranked) = hot.snapshot();
+        assert_eq!((total, ranked.len()), (0, 0));
+        hot.record_weighted("a", 3);
+        let (total, ranked) = hot.snapshot();
+        assert_eq!(total, 3);
+        assert_eq!(ranked[0].key, "a");
     }
 
     #[test]
