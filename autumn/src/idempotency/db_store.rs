@@ -835,11 +835,13 @@ impl IdempotencyTx {
             // is final; after a crash, the lock TTL frees it. Until then a
             // retry gets `409`, not this record.
             let ttl = ms(claim.ttl);
-            let expires = now_ms().saturating_add(ttl);
+            let now = now_ms();
+            let expires = now.saturating_add(ttl);
+            // `unlock` sets the expiry back to `now + ttl` on a normal release.
             let written = diesel::update(owned_key(&claim))
                 .set((
                     keys::record.eq(Some(encoded)),
-                    keys::expires_at_ms.eq(expires),
+                    keys::expires_at_ms.eq(held_expiry(now, ttl)),
                     keys::ttl_ms.eq(ttl),
                     keys::record_owner.eq(Some(claim.owner.clone())),
                 ))
@@ -848,17 +850,15 @@ impl IdempotencyTx {
             if written != 1 {
                 return Err(claim_error(conn, &claim).await);
             }
-            // `unlock` sets the expiry back to `now + ttl` on a normal release.
-            keep_past_crash_lock(conn, &claim).await?;
             // The session already changed, so this record has no final
             // `Set-Cookie`. Keep it hidden until the session rewrite ends.
             if let Some(session) = &session
                 && session.has_pending_changes().await
             {
                 extend_lock_to_expiry(conn, &claim.storage_key, &claim.owner).await?;
-                // The lock now ends at the record expiry, which
-                // `keep_past_crash_lock` may have moved to the old deadline
-                // plus the TTL. Keep an upper bound on both.
+                // The lock now ends at the record expiry, which the write
+                // above may have set to the old deadline plus the TTL. Keep
+                // an upper bound on both.
                 let held_until = AtomicI64::load(&claim.lock_deadline_ms, Ordering::Relaxed)
                     .saturating_add(ttl)
                     .max(expires);
@@ -898,9 +898,8 @@ impl IdempotencyTx {
                 .set((
                     keys::recovery_point.eq(Some(point)),
                     keys::recovery_body_hash.eq(Some(claim.body_hash.clone())),
-                    // The layer's TTL, not the store default the lock set:
-                    // `keep_past_crash_lock` below only moves it later.
-                    keys::expires_at_ms.eq(now_ms().saturating_add(ttl)),
+                    // The layer's TTL, not the store default the lock set.
+                    keys::expires_at_ms.eq(held_expiry(now_ms(), ttl)),
                     // The layer's TTL, for a later owner that takes the row over.
                     keys::ttl_ms.eq(ttl),
                 ))
@@ -909,7 +908,6 @@ impl IdempotencyTx {
             if written != 1 {
                 return Err(claim_error(conn, &claim).await);
             }
-            keep_past_crash_lock(conn, &claim).await?;
             Ok(())
         }
     }
@@ -954,28 +952,33 @@ fn owned_key(claim: &TxClaim) -> HeldKey<'_> {
         .filter(keys::locked_by.eq(claim.owner.as_str()))
 }
 
-/// Keep the held row for one TTL after its lock frees.
+/// The type of [`held_expiry`].
+type HeldExpiry = diesel::dsl::Otherwise<
+    diesel::dsl::case_when<
+        diesel::dsl::Gt<keys::locked_until_ms, i64>,
+        diesel::dsl::Add<keys::locked_until_ms, i64>,
+    >,
+    i64,
+>;
+
+/// The expiry of a held row written at `now` with `ttl` (ms): one TTL after
+/// its lock frees while the lock is live, else one TTL from `now`.
 ///
 /// After a crash, a retry can take the key only when the lock frees. The row
 /// (a record or a recovery point) must still be there, or the retry runs the
-/// committed work again. The expiry only moves later.
-async fn keep_past_crash_lock(
-    conn: &mut RuntimeConnection,
-    claim: &TxClaim,
-) -> diesel::QueryResult<()> {
-    #[allow(
-        clippy::arithmetic_side_effects,
-        reason = "a SQL expression, evaluated by the database"
-    )]
-    let crash_expiry = keys::locked_until_ms + ms(claim.ttl);
-    let live = owned_key(claim)
-        .filter(keys::locked_until_ms.gt(now_ms()))
-        .filter(keys::expires_at_ms.lt(crash_expiry));
-    diesel::update(live)
-        .set(keys::expires_at_ms.eq(crash_expiry))
-        .execute(conn)
-        .await
-        .map(drop)
+/// committed work again. A live lock ends after `now`, so this is never
+/// earlier than `now + ttl`.
+///
+/// It is part of the write that stores the row, not a second `UPDATE`: that
+/// would write a second version of the row in the same transaction, and,
+/// since `expires_at_ms` is indexed, new index entries with it.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "a SQL expression, evaluated by the database"
+)]
+fn held_expiry(now: i64, ttl: i64) -> HeldExpiry {
+    diesel::dsl::case_when(keys::locked_until_ms.gt(now), keys::locked_until_ms + ttl)
+        .otherwise(now.saturating_add(ttl))
 }
 
 /// The recovery point of the row this request holds.
