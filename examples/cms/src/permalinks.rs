@@ -94,7 +94,7 @@ impl PermalinkStructure {
         self,
         post: &crate::models::Post,
         ancestry: &[String],
-        zone: chrono_tz::Tz,
+        zone: &autumn_web::time::tz::TimeZone,
     ) -> String {
         match post.post_type.as_str() {
             "page" => {
@@ -109,7 +109,11 @@ impl PermalinkStructure {
         }
     }
 
-    fn post_permalink(self, post: &crate::models::Post, zone: chrono_tz::Tz) -> String {
+    fn post_permalink(
+        self,
+        post: &crate::models::Post,
+        zone: &autumn_web::time::tz::TimeZone,
+    ) -> String {
         // Dated structures need a date. A post that has never been published
         // has no `published_at`, so fall back to its creation date rather than
         // rendering `//sample-post`.
@@ -118,19 +122,17 @@ impl PermalinkStructure {
         // the post was published on — the same day `Settings::format_date`
         // renders. `resolve` turns that URL back into a local-day range through
         // the same zone, so the two halves stay each other's inverse.
-        use chrono::TimeZone as _;
-        let date = zone
-            .from_utc_datetime(&post.published_at.unwrap_or(post.created_at))
-            .naive_local();
+        let date =
+            crate::settings::utc_to_local(zone, post.published_at.unwrap_or(post.created_at));
         match self {
             Self::Plain => format!("/?p={}", post.id),
             Self::Numeric => format!("/archives/{}", post.id),
             Self::PostName => format!("/{}", post.slug),
             Self::MonthAndName => {
-                format!("/{}/{}", date.format("%Y/%m"), post.slug)
+                format!("/{}/{}", date.strftime("%Y/%m"), post.slug)
             }
             Self::DayAndName => {
-                format!("/{}/{}", date.format("%Y/%m/%d"), post.slug)
+                format!("/{}/{}", date.strftime("%Y/%m/%d"), post.slug)
             }
         }
     }
@@ -391,10 +393,7 @@ pub(crate) mod tests_support {
 
     /// A published post dated 2026-09-07, id 123, slug `sample-post`.
     pub(crate) fn sample_post() -> Post {
-        let published = chrono::NaiveDate::from_ymd_opt(2026, 9, 7)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap();
+        let published = autumn_web::time::civil::date(2026, 9, 7).at(12, 0, 0, 0);
         Post {
             id: 123,
             post_type: "post".to_owned(),
@@ -428,23 +427,35 @@ mod tests {
     fn every_structure_renders_wordpresss_example_url() {
         let post = sample_post();
         assert_eq!(
-            PermalinkStructure::Plain.permalink(&post, &[], chrono_tz::UTC),
+            PermalinkStructure::Plain.permalink(&post, &[], &autumn_web::time::tz::TimeZone::UTC),
             "/?p=123"
         );
         assert_eq!(
-            PermalinkStructure::Numeric.permalink(&post, &[], chrono_tz::UTC),
+            PermalinkStructure::Numeric.permalink(&post, &[], &autumn_web::time::tz::TimeZone::UTC),
             "/archives/123"
         );
         assert_eq!(
-            PermalinkStructure::PostName.permalink(&post, &[], chrono_tz::UTC),
+            PermalinkStructure::PostName.permalink(
+                &post,
+                &[],
+                &autumn_web::time::tz::TimeZone::UTC
+            ),
             "/sample-post"
         );
         assert_eq!(
-            PermalinkStructure::MonthAndName.permalink(&post, &[], chrono_tz::UTC),
+            PermalinkStructure::MonthAndName.permalink(
+                &post,
+                &[],
+                &autumn_web::time::tz::TimeZone::UTC
+            ),
             "/2026/09/sample-post"
         );
         assert_eq!(
-            PermalinkStructure::DayAndName.permalink(&post, &[], chrono_tz::UTC),
+            PermalinkStructure::DayAndName.permalink(
+                &post,
+                &[],
+                &autumn_web::time::tz::TimeZone::UTC
+            ),
             "/2026/09/07/sample-post"
         );
     }
@@ -473,7 +484,7 @@ mod tests {
         let post = sample_post();
         for structure in PermalinkStructure::all() {
             let url = with_query(
-                &structure.permalink(&post, &[], chrono_tz::UTC),
+                &structure.permalink(&post, &[], &autumn_web::time::tz::TimeZone::UTC),
                 "comments",
                 "2",
             );
@@ -532,7 +543,7 @@ mod tests {
     fn every_generated_permalink_resolves_back_to_its_post() {
         let post = sample_post();
         for structure in PermalinkStructure::all() {
-            let url = structure.permalink(&post, &[], chrono_tz::UTC);
+            let url = structure.permalink(&post, &[], &autumn_web::time::tz::TimeZone::UTC);
             // `Plain` is a query string, not a path — it is resolved by the
             // `?p=` handler, not the path router.
             if *structure == PermalinkStructure::Plain {
@@ -557,7 +568,11 @@ mod tests {
         page.slug = "team".to_owned();
         let ancestry = vec!["about".to_owned()];
         assert_eq!(
-            PermalinkStructure::DayAndName.permalink(&page, &ancestry, chrono_tz::UTC),
+            PermalinkStructure::DayAndName.permalink(
+                &page,
+                &ancestry,
+                &autumn_web::time::tz::TimeZone::UTC
+            ),
             "/about/team",
             "a page must never take a dated URL"
         );

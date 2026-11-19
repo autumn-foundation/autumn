@@ -58,9 +58,10 @@ async fn stamp_step_up_mcp(session: Session) -> &'static str {
 /// *present but stale*, not merely absent.
 #[post("/stamp-stale-step-up-mcp")]
 async fn stamp_stale_step_up_mcp(session: Session) -> &'static str {
-    let stale_ts = (chrono::Utc::now() - chrono::Duration::seconds(600))
-        .timestamp()
-        .to_string();
+    let stale_ts = (autumn_web::time::Timestamp::now()
+        - autumn_web::time::SignedDuration::from_secs(600))
+    .as_second()
+    .to_string();
     session
         .insert(autumn_web::step_up::STEP_UP_SESSION_KEY, stale_ts)
         .await;

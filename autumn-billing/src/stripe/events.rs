@@ -12,7 +12,7 @@
 //!
 //! The new path wins when both are present.
 
-use chrono::{DateTime, Utc};
+use autumn_web::time::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -206,8 +206,8 @@ fn position(error: &serde_json::Error) -> String {
     format!("line {}, column {}", error.line(), error.column())
 }
 
-const fn unix(secs: i64) -> Option<DateTime<Utc>> {
-    DateTime::from_timestamp(secs, 0)
+fn unix(secs: i64) -> Option<Timestamp> {
+    Timestamp::from_second(secs).ok()
 }
 
 fn checkout(

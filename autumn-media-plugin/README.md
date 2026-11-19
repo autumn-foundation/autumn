@@ -28,8 +28,8 @@ builder chain and printed these lines for you):
 
 ```toml
 [dependencies]
-autumn-web = "0.10"
-autumn-media-plugin = "0.10"
+autumn-web = "0.11"
+autumn-media-plugin = "0.11"
 ```
 
 ## `[media]` configuration

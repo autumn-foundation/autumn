@@ -88,9 +88,9 @@ impl MutationHooks for PostHooks {
         // rather than expecting every subsystem to write a timestamp here.
         //
         // `ctx.now` is the framework's injected mutation timestamp, so this
-        // stays deterministic under `#[sim_test]`; `chrono::Utc::now()` would
+        // stays deterministic under `#[sim_test]`; `Timestamp::now()` would
         // not (see the determinism seam gate in `clippy.toml`).
-        draft.after.updated_at = ctx.now.naive_utc();
+        draft.after.updated_at = autumn_web::time::tz::Offset::UTC.to_datetime(ctx.now);
 
         Ok(())
     }
@@ -132,16 +132,13 @@ impl MutationHooks for SubredditHooks {
 #[cfg(test)]
 mod tests {
     use autumn_web::hooks::MutationOp;
-    use chrono::TimeZone as _;
+    use autumn_web::time::{civil, tz};
 
     use super::*;
 
     /// A post created a year ago and never touched since.
     fn stale_post() -> Post {
-        let created = chrono::NaiveDate::from_ymd_opt(2025, 5, 1)
-            .expect("valid date")
-            .and_hms_opt(12, 0, 0)
-            .expect("valid time");
+        let created = civil::date(2025, 5, 1).at(12, 0, 0, 0);
         Post {
             id: 1,
             title: "Original title".to_owned(),
@@ -159,11 +156,10 @@ mod tests {
     }
 
     /// A context whose `now` is fixed, so the assertion below is exact.
-    fn context_at(year: i32, month: u32, day: u32) -> MutationContext {
+    fn context_at(year: i16, month: i8, day: i8) -> MutationContext {
         let mut ctx = MutationContext::new(MutationOp::Update);
-        ctx.now = chrono::Utc
-            .with_ymd_and_hms(year, month, day, 9, 30, 0)
-            .single()
+        ctx.now = tz::Offset::UTC
+            .to_timestamp(civil::date(year, month, day).at(9, 30, 0, 0))
             .expect("valid timestamp");
         ctx
     }
@@ -271,7 +267,7 @@ mod tests {
             creator_id: 1,
             subscriber_count: 0,
             comment_count: 0,
-            created_at: chrono::NaiveDateTime::default(),
+            created_at: civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
         });
         draft.after.name = "🎉🔥💯".to_owned();
 
@@ -316,7 +312,7 @@ mod tests {
 
         assert_eq!(
             draft.after.updated_at,
-            ctx.now.naive_utc(),
+            tz::Offset::UTC.to_datetime(ctx.now),
             "an edit must advance posts.updated_at -- /sitemap.xml publishes it as <lastmod>",
         );
         assert_ne!(
@@ -347,7 +343,7 @@ mod tests {
             .await
             .expect("hook succeeds");
 
-        assert_eq!(draft.after.updated_at, ctx.now.naive_utc());
+        assert_eq!(draft.after.updated_at, tz::Offset::UTC.to_datetime(ctx.now));
     }
 
     #[tokio::test]

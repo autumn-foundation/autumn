@@ -44,7 +44,7 @@ autumn-web = { path = "autumn" }
 [workspace.package]
 edition = "2024"
 rust-version = "1.97.0"
-version = "0.10.0"
+version = "0.11.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/autumn-foundation/autumn"
 
@@ -129,14 +129,17 @@ opentelemetry-otlp = { version = "0.33.1", default-features = false, features = 
 # `redis::Client::open` otherwise errors immediately on that scheme with no
 # TLS feature compiled in.
 redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
-chrono-tz = "0.10"
 validator = { version = "0.21", features = ["card", "derive"] }
 bcrypt = "0.19"
 futures = "0.3"
 indexmap = "2"
 inventory = "0.3"
 moka = { version = "0.12", features = ["sync"] }
-chrono = { version = "0.4", features = ["serde"] }
+# Default features off: `tzdb-bundle-always` embeds the IANA database, and
+# leaving out `tzdb-zoneinfo` means no host /usr/share/zoneinfo is read, so
+# zone data is identical on every host (slim containers, WASI, sims).
+# `tz-system` still detects the host's own zone for `TimeZone::system()`.
+jiff = { version = "1.0.0", default-features = false, features = ["std", "serde", "tz-system", "tz-fat", "tzdb-bundle-always", "perf-inline"] }
 # Held at 0.27: 0.28 exists, but testcontainers-modules 0.15 (the newest)
 # needs `^0.27`.
 testcontainers = "0.27"

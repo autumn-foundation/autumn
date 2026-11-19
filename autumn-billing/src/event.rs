@@ -3,7 +3,7 @@
 //! A provider parses its raw webhook body into one [`BillingEvent`]. The
 //! reconciler never sees provider types.
 
-use chrono::{DateTime, Utc};
+use autumn_web::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{InvoiceStatus, ProviderId, SubscriptionStatus};
@@ -16,7 +16,8 @@ pub struct BillingEvent {
     /// Provider event id. The idempotency key of the ledger.
     pub id: String,
     /// Provider time the event was created. The ordering key.
-    pub occurred_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub occurred_at: Timestamp,
     /// What happened.
     pub kind: BillingEventKind,
 }
@@ -24,7 +25,7 @@ pub struct BillingEvent {
 impl BillingEvent {
     /// Build an event.
     #[must_use]
-    pub fn new(id: impl Into<String>, occurred_at: DateTime<Utc>, kind: BillingEventKind) -> Self {
+    pub fn new(id: impl Into<String>, occurred_at: Timestamp, kind: BillingEventKind) -> Self {
         Self {
             id: id.into(),
             occurred_at,
@@ -99,7 +100,8 @@ pub struct SubscriptionSnapshot {
     /// Seat quantity.
     pub quantity: i64,
     /// End of the current period.
-    pub current_period_end: Option<DateTime<Utc>>,
+    #[serde(default, with = "autumn_web::time::compat::serde_autosi_option")]
+    pub current_period_end: Option<Timestamp>,
     /// Cancels at period end.
     pub cancel_at_period_end: bool,
 }
@@ -132,7 +134,7 @@ impl SubscriptionSnapshot {
 
     /// Set the period end.
     #[must_use]
-    pub const fn with_period_end(mut self, end: DateTime<Utc>) -> Self {
+    pub const fn with_period_end(mut self, end: Timestamp) -> Self {
         self.current_period_end = Some(end);
         self
     }
@@ -171,7 +173,8 @@ pub struct InvoiceSnapshot {
     /// Provider payment attempts so far.
     pub attempt_count: i64,
     /// Provider's own next attempt time, when reported.
-    pub next_payment_attempt: Option<DateTime<Utc>>,
+    #[serde(default, with = "autumn_web::time::compat::serde_autosi_option")]
+    pub next_payment_attempt: Option<Timestamp>,
 }
 
 impl InvoiceSnapshot {
@@ -218,7 +221,7 @@ impl InvoiceSnapshot {
 
     /// Set the provider's next attempt time.
     #[must_use]
-    pub const fn with_next_payment_attempt(mut self, at: DateTime<Utc>) -> Self {
+    pub const fn with_next_payment_attempt(mut self, at: Timestamp) -> Self {
         self.next_payment_attempt = Some(at);
         self
     }

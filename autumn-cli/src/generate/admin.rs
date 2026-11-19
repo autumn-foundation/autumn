@@ -581,7 +581,7 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         // `Enum` never emits `Text`: `render_fields_vec` replaces it with a `Select` (#1030).
         // `Decimal` is text, not `Float`: the admin coerces `Float` input through `f64`, which
         // rounds. Text keeps the string exact for `rust_decimal`.
-        // `Time` (#3405) is text too: the admin has no time kind, and `NaiveTime` parses
+        // `Time` (#3405) is text too: the admin has no time kind, and `civil::Time` parses
         // `HH:MM[:SS]`.
         FieldKind::String
         | FieldKind::Uuid
@@ -597,6 +597,7 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         FieldKind::Bool => "AdminFieldKind::Boolean",
         FieldKind::F32 | FieldKind::F64 => "AdminFieldKind::Float",
         FieldKind::NaiveDateTime | FieldKind::DateTime => "AdminFieldKind::DateTime",
+        FieldKind::Date => "AdminFieldKind::Date",
         // Binary blobs and file metadata are not editable inline. `Position` (#1358) and
         // `Commentable` (#1367) are framework-maintained and absent from `New*`/`Update*`.
         FieldKind::Bytea | FieldKind::Attachment | FieldKind::Position | FieldKind::Commentable => {

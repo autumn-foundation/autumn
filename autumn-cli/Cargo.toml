@@ -64,7 +64,7 @@ acme = ["tls", "autumn-web/acme"]
 sqlite = ["autumn-web/sqlite", "diesel_migrations/sqlite"]
 
 [dependencies]
-autumn-web = { version = "0.10.0", path = "../autumn", default-features = false, features = [
+autumn-web = { version = "0.11.0", path = "../autumn", default-features = false, features = [
     # Enable `postgres` with `db`. All CLI builds, including `sqlite`, call the
     # Postgres migrate API (#2605).
     "db", "postgres", "htmx", "maud", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting",
@@ -93,12 +93,12 @@ autumn-web = { version = "0.10.0", path = "../autumn", default-features = false,
     # `serde-saphyr`.
     "openapi"
 ] }
-autumn-schema-core = { version = "0.10.0", path = "../autumn-schema-core" }
+autumn-schema-core = { version = "0.11.0", path = "../autumn-schema-core" }
 # The wire descriptor types the macros write. `autumn contracts` reads them.
-autumn-macros-support = { version = "0.10.0", path = "../autumn-macros-support" }
+autumn-macros-support = { version = "0.11.0", path = "../autumn-macros-support" }
 # `autumn edge serve` / `autumn edge ttfb` (#1790). `node` is the native edge
 # node: the wasmi host, an HTTP server and the origin client.
-autumn-edge = { version = "0.10.0", path = "../autumn-edge", features = ["node"] }
+autumn-edge = { version = "0.11.0", path = "../autumn-edge", features = ["node"] }
 base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
 # The workspace pin has no `postgres` (#2605). The CLI uses `diesel::pg`.
@@ -119,7 +119,7 @@ notify = "8"
 notify-debouncer-mini = "0.7"
 ratatui = "0.30"
 reqwest = { version = "0.13", features = ["blocking", "json", "rustls", "multipart", "cookies"], default-features = false }
-chrono = { workspace = true }
+jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11"
@@ -182,7 +182,7 @@ serde-saphyr = "2"
 # Parses each schema `autumn contracts export --avro` writes, and checks Avro
 # schema resolution against `autumn contracts check`. Test-only: the export
 # writes text and needs no Avro library.
-apache-avro = { version = "0.21", default-features = false }
+apache-avro = { version = "0.22", default-features = false }
 
 [lints]
 workspace = true

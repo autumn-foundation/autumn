@@ -18,7 +18,7 @@ use autumn_web::app::AppBuilder;
 use autumn_web::config::AutumnConfig;
 use autumn_web::error::AutumnError;
 use autumn_web::plugin::Plugin;
-use chrono::{NaiveDateTime, Utc};
+use autumn_web::time::civil;
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
@@ -65,7 +65,8 @@ struct LiveFeedEventRow {
     id: i64,
     subreddit_slug: String,
     event: Value,
-    created_at: NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    created_at: civil::DateTime,
 }
 
 #[derive(diesel::Insertable)]
@@ -295,19 +296,22 @@ impl LiveFeedRelayHealth {
         };
     }
 
-    fn record_replay(&self, cursor: i64, replayed: usize, last_created_at: Option<NaiveDateTime>) {
+    fn record_replay(
+        &self,
+        cursor: i64,
+        replayed: usize,
+        last_created_at: Option<civil::DateTime>,
+    ) {
         if replayed > 0 {
             self.inner
                 .replayed_events
                 .fetch_add(replayed as u64, Ordering::Relaxed);
             self.inner.last_seen_id.store(cursor, Ordering::Relaxed);
             if let Some(created_at) = last_created_at
+                && let Ok(created_at) = autumn_web::time::tz::TimeZone::UTC.to_timestamp(created_at)
                 && let Ok(mut last_replayed_at) = self.inner.last_replayed_at.write()
             {
-                *last_replayed_at = Some(
-                    chrono::DateTime::<Utc>::from_naive_utc_and_offset(created_at, Utc)
-                        .to_rfc3339(),
-                );
+                *last_replayed_at = Some(autumn_web::time::compat::rfc3339(created_at));
             }
         }
     }
@@ -1105,7 +1109,7 @@ async fn notify_live_event_stored(
 struct RebroadcastProgress {
     cursor: i64,
     replayed: usize,
-    last_created_at: Option<NaiveDateTime>,
+    last_created_at: Option<civil::DateTime>,
 }
 
 async fn rebroadcast_pending_live_events(

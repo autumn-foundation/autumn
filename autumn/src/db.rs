@@ -29,7 +29,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -143,6 +143,12 @@ pub mod prelude {
 /// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]
 pub mod sqlite_types;
+
+pub mod sql_time;
+pub use sql_time::{
+    AsSqlTime, SqlDate, SqlDateTime, SqlNullableDate, SqlNullableDateTime, SqlNullableTime,
+    SqlNullableTimestamp, SqlTime, SqlTimestamp,
+};
 
 // ── After-commit callback infrastructure ─────────────────────────────────────
 
@@ -4702,7 +4708,7 @@ mod tests {
         })
         .expect("sqlite pool builds")
         .expect("url configured");
-        let clock = crate::time::TickingClock::starting_at(chrono::DateTime::UNIX_EPOCH);
+        let clock = crate::time::TickingClock::starting_at(jiff::Timestamp::UNIX_EPOCH);
         let logs = LogBuffer::new(16, ParameterFilter::default());
         let subscriber = tracing_subscriber::registry().with(LogCaptureLayer::new(logs.clone()));
         let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));

@@ -5,16 +5,19 @@
 
 use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
-use autumn_web::time::FixedClock;
+use autumn_web::time::{FixedClock, Timestamp};
 use autumn_web::time_zone::{TimeZone, local_datetime};
-use chrono::{TimeZone as ChrTz, Utc};
+
+fn utc(text: &str) -> Timestamp {
+    text.parse().unwrap()
+}
 
 // ── Handler under test ────────────────────────────────────────────────────────
 
 /// Renders a fixed UTC timestamp as local time in the request's zone.
 #[get("/local")]
 async fn show_local(clock: Clock, tz: TimeZone) -> Markup {
-    html! { p { (local_datetime(clock.now(), *tz)) } }
+    html! { p { (local_datetime(clock.now(), &tz)) } }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -22,7 +25,7 @@ async fn show_local(clock: Clock, tz: TimeZone) -> Markup {
 /// Three zones → three distinct, correctly formatted bodies from one handler.
 #[tokio::test]
 async fn three_zones_produce_distinct_local_times() {
-    let pinned = Utc.with_ymd_and_hms(2025, 6, 14, 12, 0, 0).unwrap();
+    let pinned = utc("2025-06-14T12:00:00Z");
     let client = TestApp::new()
         .routes(routes![show_local])
         .with_clock(FixedClock::at(pinned))
@@ -58,7 +61,7 @@ async fn three_zones_produce_distinct_local_times() {
 /// `Clock` and `TimeZone` compose: both are deterministic and independent.
 #[tokio::test]
 async fn clock_and_time_zone_compose_deterministically() {
-    let pinned = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    let pinned = utc("2025-01-01T00:00:00Z");
     let client = TestApp::new()
         .routes(routes![show_local])
         .with_clock(FixedClock::at(pinned))
@@ -79,7 +82,7 @@ async fn clock_and_time_zone_compose_deterministically() {
 /// Without any zone override, the extractor falls back to UTC (default config).
 #[tokio::test]
 async fn falls_back_to_utc_when_no_zone_provided() {
-    let pinned = Utc.with_ymd_and_hms(2025, 6, 14, 15, 30, 0).unwrap();
+    let pinned = utc("2025-06-14T15:30:00Z");
     let client = TestApp::new()
         .routes(routes![show_local])
         .with_clock(FixedClock::at(pinned))

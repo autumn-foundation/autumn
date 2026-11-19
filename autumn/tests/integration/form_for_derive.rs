@@ -158,30 +158,36 @@ diesel::table! {
 pub struct Event {
     pub id: i32,
     pub title: String,
-    pub published_at: chrono::DateTime<chrono::Utc>,
-    pub starts_at: chrono::NaiveDateTime,
-    pub ends_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub published_at: autumn_web::time::Timestamp,
+    pub starts_at: autumn_web::time::civil::DateTime,
+    pub ends_at: Option<autumn_web::time::Timestamp>,
+}
+
+fn utc(raw: &str) -> autumn_web::time::Timestamp {
+    raw.parse().expect("a valid RFC 3339 timestamp")
 }
 
 #[test]
 fn derived_new_struct_decodes_datetime_local_submission() {
-    // Regression test (Codex P2 on #1587): `form_for` renders
-    // `DateTime<Utc>`/`NaiveDateTime` columns as `<input
-    // type="datetime-local">`, whose value has no timezone offset — chrono's
-    // default `Deserialize` for `DateTime<Utc>` demands an RFC 3339 offset,
-    // so without the generated `deserialize_with` wiring even an *untouched*
-    // pre-filled value would be rejected as a 400 before validation.
-    use chrono::TimeZone as _;
-    let published = chrono::Utc
-        .with_ymd_and_hms(2024, 3, 15, 10, 30, 56)
-        .unwrap();
+    // Regression test (Codex P2 on #1587): `form_for` renders `Timestamp` and
+    // `civil::DateTime` columns as `<input type="datetime-local">`, whose
+    // value has no timezone offset — the default `Deserialize` for
+    // `Timestamp` demands an RFC 3339 offset, so without the generated
+    // `deserialize_with` wiring even an *untouched* pre-filled value would be
+    // rejected as a 400 before validation.
+    let published = utc("2024-03-15T10:30:56Z");
+    let wall_clock = autumn_web::time::civil::date(2024, 3, 15).at(10, 30, 56, 0);
     let changeset = Changeset::new(Event {
         id: 1,
         title: "Launch".into(),
         published_at: published,
-        starts_at: published.naive_utc(),
+        starts_at: wall_clock,
         ends_at: None,
     });
+    let fields = Event::form_fields();
+    assert!(matches!(fields[1].control, FieldControl::DateTime));
+    assert!(matches!(fields[2].control, FieldControl::DateTime));
+    assert!(matches!(fields[3].control, FieldControl::DateTime));
     let html = form_for(&changeset, "/events", "post")
         .csrf("tok")
         .render()
@@ -203,7 +209,7 @@ fn derived_new_struct_decodes_datetime_local_submission() {
     let new_event: NewEvent = serde_urlencoded::from_str(body)
         .expect("untouched datetime-local submission must decode, not 400");
     assert_eq!(new_event.published_at, published);
-    assert_eq!(new_event.starts_at, published.naive_utc());
+    assert_eq!(new_event.starts_at, wall_clock);
     // Empty nullable datetime decodes as None, not a parse error.
     assert_eq!(new_event.ends_at, None);
 
@@ -215,27 +221,20 @@ fn derived_new_struct_decodes_datetime_local_submission() {
                 &ends_at=2024-03-15T11%3A00";
     let new_event: NewEvent = serde_urlencoded::from_str(body)
         .expect("minute-granularity datetime-local submission must decode");
+    assert_eq!(new_event.published_at, utc("2024-03-15T10:30:00Z"));
     assert_eq!(
-        new_event.published_at,
-        chrono::Utc
-            .with_ymd_and_hms(2024, 3, 15, 10, 30, 0)
-            .unwrap()
+        new_event.starts_at,
+        autumn_web::time::civil::date(2024, 3, 15).at(10, 30, 0, 0)
     );
-    assert_eq!(
-        new_event.ends_at,
-        Some(chrono::Utc.with_ymd_and_hms(2024, 3, 15, 11, 0, 0).unwrap())
-    );
+    assert_eq!(new_event.ends_at, Some(utc("2024-03-15T11:00:00Z")));
 }
 
 #[test]
 fn derived_new_struct_still_decodes_rfc3339_json_bodies() {
     // The generated `NewX` also serves JSON API create bodies — attaching the
     // datetime-local deserializer must not break RFC 3339 input. An explicit
-    // offset is honored and normalized to UTC.
-    use chrono::TimeZone as _;
-    let expected = chrono::Utc
-        .with_ymd_and_hms(2024, 3, 15, 10, 30, 56)
-        .unwrap();
+    // offset is honored.
+    let expected = utc("2024-03-15T10:30:56Z");
 
     let json = r#"{
         "title": "Launch",
@@ -246,7 +245,10 @@ fn derived_new_struct_still_decodes_rfc3339_json_bodies() {
     let new_event: NewEvent =
         serde_json::from_str(json).expect("RFC 3339 JSON create body must keep decoding");
     assert_eq!(new_event.published_at, expected);
-    assert_eq!(new_event.starts_at, expected.naive_utc());
+    assert_eq!(
+        new_event.starts_at,
+        autumn_web::time::civil::date(2024, 3, 15).at(10, 30, 56, 0)
+    );
     assert_eq!(new_event.ends_at, Some(expected));
 
     // A JSON body may still omit the nullable column entirely
@@ -262,123 +264,35 @@ fn derived_new_struct_still_decodes_rfc3339_json_bodies() {
     assert_eq!(new_event.ends_at, None);
 }
 
-diesel::table! {
-    meetings (id) {
-        id -> Integer,
-        title -> Text,
-        scheduled_at -> Timestamptz,
-        reminder_at -> Nullable<Timestamptz>,
-    }
-}
-
-// `DateTime<Local>` is the other zone parameter diesel's chrono support can
-// round-trip for `Timestamptz` (it has no `FromSql` for `DateTime<FixedOffset>`
-// or chrono-tz zones, so those can't appear on a compilable `#[model]` struct
-// — their text-input fallback is asserted at the token level in
-// autumn-macros' `form_control_tokens_gates_datetime_picker_on_zone_param`).
-#[autumn_web::model(table = "meetings")]
-pub struct Meeting {
-    pub id: i32,
-    pub title: String,
-    pub scheduled_at: chrono::DateTime<chrono::Local>,
-    pub reminder_at: Option<chrono::DateTime<chrono::Local>>,
-}
-
 #[test]
-fn derived_new_struct_decodes_datetime_local_submission_for_local_zone() {
-    // Regression test (Codex P2 on #1587): `form_for` renders a
-    // `DateTime<Local>` column as `<input type="datetime-local">` too, but
-    // `datetime_local_serde_attr` used to wire a tolerant deserializer only
-    // for `DateTime<Utc>` — the generated `NewMeeting` kept chrono's default
-    // `Deserialize` for `DateTime<Local>`, which demands an RFC 3339 offset,
-    // so posting the rendered form back 400'd even with the value untouched.
-    //
-    // All wall clocks below sit at midday, which no real timezone's DST
-    // transition touches, so the test is deterministic without pinning `TZ`.
-    use chrono::TimeZone as _;
-    let scheduled = chrono::Local
-        .with_ymd_and_hms(2024, 3, 15, 12, 30, 56)
-        .earliest()
-        .expect("midday local wall clock must exist");
-    let changeset = Changeset::new(Meeting {
-        id: 1,
-        title: "Standup".into(),
-        scheduled_at: scheduled,
-        reminder_at: None,
-    });
+fn a_time_column_is_written_and_read_through_its_wrapper() {
+    // The model, `NewEvent` and the changeset bind their time columns through
+    // `autumn_web::db`'s wrappers, so the generated structs build the same
+    // Diesel expressions a hand-written query would.
+    use diesel::{QueryDsl as _, debug_query, pg::Pg};
 
-    // The derived control for a Local column is still the datetime picker…
-    let fields = Meeting::form_fields();
-    assert!(matches!(fields[1].control, FieldControl::DateTime));
-    assert!(matches!(fields[2].control, FieldControl::DateTime));
+    let new_event = NewEvent {
+        title: "Launch".into(),
+        published_at: utc("2024-03-15T10:30:56Z"),
+        starts_at: autumn_web::time::civil::date(2024, 3, 15).at(10, 30, 56, 0),
+        ends_at: None,
+    };
+    let insert = diesel::insert_into(events::table).values(new_event);
+    let sql = debug_query::<Pg, _>(&insert).to_string();
+    assert!(sql.contains("\"published_at\""), "{sql}");
+    assert!(sql.contains("\"ends_at\""), "{sql}");
 
-    // …whose pre-filled value is the offsetless local wall clock (chrono
-    // serializes `DateTime<Local>` as RFC 3339 with the local offset;
-    // `datetime_input` strips it, keeping the wall clock).
-    let html = form_for(&changeset, "/meetings", "post")
-        .csrf("tok")
-        .render()
-        .into_string();
-    assert!(html.contains(r#"value="2024-03-15T12:30:56""#), "{html}");
-
-    // A browser that round-trips the form untouched posts back exactly that
-    // offsetless value; it must decode to the same instant, not 400.
-    let body = "title=Standup&scheduled_at=2024-03-15T12%3A30%3A56&reminder_at=";
-    let new_meeting: NewMeeting = serde_urlencoded::from_str(body)
-        .expect("untouched datetime-local submission must decode, not 400");
-    assert_eq!(new_meeting.scheduled_at, scheduled);
-    // Empty nullable datetime decodes as None, not a parse error.
-    assert_eq!(new_meeting.reminder_at, None);
-
-    // A value edited through the browser's native picker may drop seconds.
-    let body = "title=Standup&scheduled_at=2024-03-15T12%3A30&reminder_at=2024-03-15T13%3A00";
-    let new_meeting: NewMeeting = serde_urlencoded::from_str(body)
-        .expect("minute-granularity datetime-local submission must decode");
-    assert_eq!(
-        new_meeting.scheduled_at,
-        chrono::Local
-            .with_ymd_and_hms(2024, 3, 15, 12, 30, 0)
-            .earliest()
-            .unwrap()
-    );
-    assert_eq!(
-        new_meeting.reminder_at,
-        Some(
-            chrono::Local
-                .with_ymd_and_hms(2024, 3, 15, 13, 0, 0)
-                .earliest()
-                .unwrap()
-        )
-    );
-}
-
-#[test]
-fn derived_new_struct_still_decodes_rfc3339_json_bodies_for_local_zone() {
-    // The generated `NewMeeting` also serves JSON API create bodies — the
-    // datetime-local deserializer must keep accepting RFC 3339, honoring the
-    // explicit offset and converting the instant to the local zone.
-    let expected = chrono::DateTime::parse_from_rfc3339("2024-03-15T10:30:56Z")
-        .unwrap()
-        .with_timezone(&chrono::Local);
-
-    let json = r#"{
-        "title": "Standup",
-        "scheduled_at": "2024-03-15T10:30:56Z",
-        "reminder_at": "2024-03-15T19:30:56+09:00"
-    }"#;
-    let new_meeting: NewMeeting =
-        serde_json::from_str(json).expect("RFC 3339 JSON create body must keep decoding");
-    assert_eq!(new_meeting.scheduled_at, expected);
-    assert_eq!(new_meeting.reminder_at, Some(expected));
-
-    // A JSON body may still omit the nullable column entirely.
-    let json = r#"{
-        "title": "Standup",
-        "scheduled_at": "2024-03-15T10:30:56Z"
-    }"#;
-    let new_meeting: NewMeeting =
-        serde_json::from_str(json).expect("omitted nullable datetime must decode as None");
-    assert_eq!(new_meeting.reminder_at, None);
+    let changes = __EventChangeset {
+        title: None,
+        published_at: Some(utc("2024-03-16T00:00:00Z")),
+        starts_at: None,
+        ends_at: Some(None),
+    };
+    let update = diesel::update(events::table.find(1)).set(changes);
+    let sql = debug_query::<Pg, _>(&update).to_string();
+    assert!(sql.contains("\"published_at\" = $1"), "{sql}");
+    assert!(sql.contains("\"ends_at\" = $2"), "{sql}");
+    assert!(!sql.contains("\"starts_at\""), "{sql}");
 }
 
 diesel::table! {
@@ -509,13 +423,13 @@ diesel::table! {
 pub struct Alarm {
     pub id: i32,
     pub label: String,
-    pub rings_at: chrono::NaiveTime,
-    pub snooze_until: Option<chrono::NaiveTime>,
+    pub rings_at: autumn_web::time::civil::Time,
+    pub snooze_until: Option<autumn_web::time::civil::Time>,
 }
 
 #[test]
-fn derived_naive_time_renders_a_time_input_that_round_trips() {
-    // Issue #3405: a `NaiveTime` column renders `<input type="time">`.
+fn derived_civil_time_renders_a_time_input_that_round_trips() {
+    // Issue #3405: a `civil::Time` column renders `<input type="time">`.
     let fields = Alarm::form_fields();
     assert!(matches!(fields[1].control, FieldControl::Time));
     assert!(fields[1].required);
@@ -525,7 +439,7 @@ fn derived_naive_time_renders_a_time_input_that_round_trips() {
     let changeset = Changeset::new(Alarm {
         id: 1,
         label: "Wake".into(),
-        rings_at: chrono::NaiveTime::from_hms_opt(7, 15, 0).unwrap(),
+        rings_at: autumn_web::time::civil::time(7, 15, 0, 0),
         snooze_until: None,
     });
     let html = form_for(&changeset, "/alarms", "post")
@@ -542,7 +456,7 @@ fn derived_naive_time_renders_a_time_input_that_round_trips() {
         autumn_web::form::from_urlencoded(b"label=Wake&rings_at=07%3A15&snooze_until=").unwrap();
     assert_eq!(
         new_alarm.rings_at,
-        chrono::NaiveTime::from_hms_opt(7, 15, 0).unwrap()
+        autumn_web::time::civil::time(7, 15, 0, 0)
     );
     assert_eq!(new_alarm.snooze_until, None);
 }

@@ -149,8 +149,8 @@ async fn build(
         }
         if let Some(published) = post.published_at {
             entry = entry
-                .published(published.and_utc())
-                .updated(post.updated_at.max(published).and_utc());
+                .published(crate::settings::utc_instant(published))
+                .updated(crate::settings::utc_instant(post.updated_at.max(published)));
         }
         feed = feed.entry(entry);
     }

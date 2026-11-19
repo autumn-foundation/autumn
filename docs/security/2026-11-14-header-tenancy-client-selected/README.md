@@ -57,4 +57,4 @@ tenant B.
 - `ShardedDb` keeps the `403`. The fleet router still returns `400` for it.
 
 See [Tenant sources](../../guide/tenant-cells.md#tenant-sources) and the
-[migration guide](../../migrations/next.md#tenancy-the-tenant-header-needs-header_trust).
+[migration guide](../../migrations/0.11.0.md#tenancy-the-tenant-header-needs-header_trust).

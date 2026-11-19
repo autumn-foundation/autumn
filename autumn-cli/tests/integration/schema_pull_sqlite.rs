@@ -102,7 +102,7 @@ pub struct Metric {
     pub big: i64,
     pub ratio32: f32,
     pub ratio64: f64,
-    pub scheduled_at: chrono::NaiveDateTime,
+    pub scheduled_at: autumn_web::time::civil::DateTime,
 }
 ";
 

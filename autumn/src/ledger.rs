@@ -126,7 +126,7 @@
 //!   columns are covered there too. Only a column whose key is gone entirely
 //!   drops out of that comparison.
 
-use chrono::{DateTime, SubsecRound, Utc};
+use jiff::{RoundMode, SignedDuration, Timestamp, TimestampRound, Unit, civil};
 use serde::{Deserialize, Serialize};
 
 use crate::version_history::{ColumnChange, VersionOp};
@@ -188,9 +188,11 @@ pub struct LedgerRevision {
     /// Full column values of the record *after* the mutation.
     pub snapshot: serde_json::Value,
     /// Valid time: when the fact became true in the business domain.
-    pub valid_from: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub valid_from: Timestamp,
     /// Transaction time: when the database learned the fact.
-    pub recorded_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub recorded_at: Timestamp,
     /// Hash of the previous revision of this record; `None` for `seq == 1`.
     pub prev_hash: Option<String>,
     /// This revision's hash, over its own fields and `prev_hash`.
@@ -246,9 +248,9 @@ pub struct RevisionHashInput<'a> {
     /// Full column values after the mutation.
     pub snapshot: &'a serde_json::Value,
     /// Valid time.
-    pub valid_from: DateTime<Utc>,
+    pub valid_from: Timestamp,
     /// Transaction time.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
 }
 
 // ── Canonicalization & hashing ───────────────────────────────────────
@@ -310,9 +312,18 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) {
 /// as microseconds would make every freshly written revision fail
 /// [`verify_chain`], so the write path truncates before it both binds and
 /// hashes.
+///
+/// The fraction is floored, so an instant before 1970 moves earlier, never
+/// later.
 #[must_use]
-pub fn truncate_to_micros(at: DateTime<Utc>) -> DateTime<Utc> {
-    at.trunc_subsecs(6)
+pub fn truncate_to_micros(at: Timestamp) -> Timestamp {
+    at.round(
+        TimestampRound::new()
+            .smallest(Unit::Microsecond)
+            .mode(RoundMode::Floor),
+    )
+    // Flooring a value inside the range stays inside it.
+    .unwrap_or(at)
 }
 
 /// Compute a revision's hash.
@@ -353,9 +364,15 @@ pub fn revision_hash(input: &RevisionHashInput<'_>) -> String {
     hex::encode(hasher.finalize_reset())
 }
 
-/// Render an instant in the fixed encoding the hash preimage uses.
-fn format_instant(at: DateTime<Utc>) -> String {
-    truncate_to_micros(at).to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+/// Render an instant in the fixed encoding the hash preimage uses:
+/// RFC 3339 with six fraction digits and `Z`, e.g.
+/// `2026-09-01T18:08:53.000000Z`.
+fn format_instant(at: Timestamp) -> String {
+    crate::time::compat::rfc3339_opts(
+        truncate_to_micros(at),
+        crate::time::compat::Digits::Micros,
+        true,
+    )
 }
 
 // ── Verification ─────────────────────────────────────────────────────
@@ -516,7 +533,8 @@ pub struct LedgerHead {
     /// Hash of the newest revision.
     pub hash: String,
     /// Transaction time of the newest revision.
-    pub recorded_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub recorded_at: Timestamp,
 }
 
 /// A record's high-water mark: the highest sequence number its chain has ever
@@ -558,7 +576,8 @@ pub struct LedgerHighWater {
     pub hash: String,
     /// Transaction time of the revision that was written at
     /// [`seq`](Self::seq).
-    pub recorded_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub recorded_at: Timestamp,
 }
 
 /// A record's chain head and high-water mark, read together (issue #2323).
@@ -750,7 +769,7 @@ struct ChainTip {
     id: i64,
     seq: i64,
     hash: String,
-    recorded_at: DateTime<Utc>,
+    recorded_at: Timestamp,
 }
 
 impl ChainTip {
@@ -1006,7 +1025,7 @@ fn live_state_break(head: Option<&ChainTip>, live: LedgerLiveState) -> Option<Le
 ///
 /// Reported **last**, after the structural, high-water and live-state checks,
 /// and that ordering is deliberate. A chain written by a pre-#2323 writer — from
-/// the host's own `Utc::now()`, unclamped — can carry a legitimate regression
+/// the host's own wall clock, unclamped — can carry a legitimate regression
 /// across ordinary NTP skew between two application nodes, and those rows are
 /// immutable, so the report never goes away. Ranked any earlier it would
 /// permanently *mask* a truncation or a live-row divergence on the same record,
@@ -1116,7 +1135,7 @@ fn link_break(revision: &LedgerRevision, prev: Option<&ChainTip>) -> Option<Ledg
 /// The transaction time a revision must carry, given the database's own clock
 /// read and the chain's current floor (issue #2323).
 ///
-/// `recorded_at` used to be `Utc::now()` on the writing node. Across a
+/// `recorded_at` used to be the wall clock of the writing node. Across a
 /// multi-node deployment with clock skew, or after a host clock adjustment, a
 /// later sequence could carry an earlier instant — and `snapshot_as_of` filters
 /// on `recorded_at` before taking the greatest surviving `seq`, so an as-of
@@ -1173,15 +1192,15 @@ fn link_break(revision: &LedgerRevision, prev: Option<&ChainTip>) -> Option<Ledg
 /// carries. Closing that would need a commit timestamp, which cannot be read
 /// before the insert that has to hash it.
 #[must_use]
-pub fn monotonic_recorded_at(
-    db_now: DateTime<Utc>,
-    floor: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+pub fn monotonic_recorded_at(db_now: Timestamp, floor: Option<Timestamp>) -> Option<Timestamp> {
     let now = truncate_to_micros(db_now);
     let Some(floor) = floor.map(truncate_to_micros) else {
         return Some(now);
     };
-    if floor > now + chrono::TimeDelta::seconds(LEDGER_MAX_CLOCK_SKEW_SECS) {
+    let ceiling = now
+        .checked_add(SignedDuration::from_secs(LEDGER_MAX_CLOCK_SKEW_SECS))
+        .unwrap_or(Timestamp::MAX);
+    if floor > ceiling {
         return None;
     }
     Some(now.max(floor))
@@ -1209,10 +1228,10 @@ pub fn monotonic_recorded_at(
 /// accordingly — the same convention as [`LedgerValidTimeValue`].
 #[doc(hidden)]
 #[must_use]
-pub fn parse_sqlite_instant(raw: &str) -> Option<DateTime<Utc>> {
-    chrono::NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M:%S%.f")
+pub fn parse_sqlite_instant(raw: &str) -> Option<Timestamp> {
+    civil::DateTime::strptime("%Y-%m-%d %H:%M:%S%.f", raw.trim())
         .ok()
-        .map(|naive| naive.and_utc())
+        .and_then(|dt| jiff::tz::Offset::UTC.to_timestamp(dt).ok())
 }
 
 // ── As-of reconstruction ─────────────────────────────────────────────
@@ -1226,16 +1245,16 @@ pub fn parse_sqlite_instant(raw: &str) -> Option<DateTime<Utc>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LedgerAsOf {
     /// Transaction-time bound: ignore revisions recorded after this instant.
-    pub transaction: Option<DateTime<Utc>>,
+    pub transaction: Option<Timestamp>,
     /// Valid-time bound: ignore revisions that became true after this instant.
-    pub valid: Option<DateTime<Utc>>,
+    pub valid: Option<Timestamp>,
 }
 
 impl LedgerAsOf {
     /// An as-of query on transaction time alone — "what did the database hold
     /// at this instant".
     #[must_use]
-    pub const fn transaction(at: DateTime<Utc>) -> Self {
+    pub const fn transaction(at: Timestamp) -> Self {
         Self {
             transaction: Some(at),
             valid: None,
@@ -1245,7 +1264,7 @@ impl LedgerAsOf {
     /// An as-of query on valid time alone — "what was true at this instant,
     /// according to everything the database knows now".
     #[must_use]
-    pub const fn valid(at: DateTime<Utc>) -> Self {
+    pub const fn valid(at: Timestamp) -> Self {
         Self {
             transaction: None,
             valid: Some(at),
@@ -1254,7 +1273,7 @@ impl LedgerAsOf {
 
     /// A fully bitemporal as-of query.
     #[must_use]
-    pub const fn bitemporal(transaction: DateTime<Utc>, valid: DateTime<Utc>) -> Self {
+    pub const fn bitemporal(transaction: Timestamp, valid: Timestamp) -> Self {
         Self {
             transaction: Some(transaction),
             valid: Some(valid),
@@ -1591,10 +1610,10 @@ pub async fn read_revisions_page(
         request_id: Option<String>,
         #[diesel(sql_type = Text)]
         snapshot: String,
-        #[diesel(sql_type = Instant)]
-        valid_from: DateTime<Utc>,
-        #[diesel(sql_type = Instant)]
-        recorded_at: DateTime<Utc>,
+        #[diesel(sql_type = Instant, deserialize_as = crate::db::SqlTimestamp)]
+        valid_from: Timestamp,
+        #[diesel(sql_type = Instant, deserialize_as = crate::db::SqlTimestamp)]
+        recorded_at: Timestamp,
         #[diesel(sql_type = Nullable<Text>)]
         prev_hash: Option<String>,
         #[diesel(sql_type = Text)]
@@ -1827,7 +1846,7 @@ pub trait LedgeredRecord: crate::version_history::VersionedRecord {
     /// so the write path falls back to the revision's transaction time. Declare
     /// `ledgered(valid_time = "effective_at")` on the repository to read the
     /// instant from a column instead.
-    fn ledger_valid_from(&self) -> Option<DateTime<Utc>> {
+    fn ledger_valid_from(&self) -> Option<Timestamp> {
         None
     }
 
@@ -1912,36 +1931,48 @@ pub fn refuse_tenant_change(
 /// Extract a valid-time instant from the column shapes a model may use.
 ///
 /// Generated `LedgeredRecord` impls go through this so a `valid_time` column may
-/// be `DateTime<Utc>`, `NaiveDateTime`, or an `Option` of either without the
-/// macro having to know which.
+/// be a `Timestamp`, a UTC `civil::DateTime`, or an `Option` of either without
+/// the macro having to know which.
 #[doc(hidden)]
 pub trait LedgerValidTimeValue {
     /// This value as a UTC instant, or `None` when it carries none.
-    fn ledger_valid_from(&self) -> Option<DateTime<Utc>>;
+    fn ledger_valid_from(&self) -> Option<Timestamp>;
 }
 
-impl LedgerValidTimeValue for DateTime<Utc> {
-    fn ledger_valid_from(&self) -> Option<DateTime<Utc>> {
+impl LedgerValidTimeValue for Timestamp {
+    fn ledger_valid_from(&self) -> Option<Timestamp> {
         Some(*self)
     }
 }
 
-impl LedgerValidTimeValue for Option<DateTime<Utc>> {
-    fn ledger_valid_from(&self) -> Option<DateTime<Utc>> {
+impl LedgerValidTimeValue for Option<Timestamp> {
+    fn ledger_valid_from(&self) -> Option<Timestamp> {
         *self
     }
 }
 
-impl LedgerValidTimeValue for chrono::NaiveDateTime {
-    fn ledger_valid_from(&self) -> Option<DateTime<Utc>> {
-        Some(self.and_utc())
+impl LedgerValidTimeValue for civil::DateTime {
+    fn ledger_valid_from(&self) -> Option<Timestamp> {
+        Some(utc_instant(*self))
     }
 }
 
-impl LedgerValidTimeValue for Option<chrono::NaiveDateTime> {
-    fn ledger_valid_from(&self) -> Option<DateTime<Utc>> {
-        self.as_ref().map(chrono::NaiveDateTime::and_utc)
+impl LedgerValidTimeValue for Option<civil::DateTime> {
+    fn ledger_valid_from(&self) -> Option<Timestamp> {
+        self.map(utc_instant)
     }
+}
+
+/// A UTC wall-clock value as an instant. A civil value past either end of
+/// [`Timestamp`]'s range saturates to [`Timestamp::MAX`] / [`Timestamp::MIN`].
+fn utc_instant(dt: civil::DateTime) -> Timestamp {
+    jiff::tz::Offset::UTC.to_timestamp(dt).unwrap_or_else(|_| {
+        if dt.year() < 0 {
+            Timestamp::MIN
+        } else {
+            Timestamp::MAX
+        }
+    })
 }
 
 // ── Snapshot fidelity (#2326) ────────────────────────────────────────
@@ -2345,13 +2376,13 @@ pub fn ensure_snapshot_recoverable(
 #[cfg(feature = "db")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChainState {
-    db_now: DateTime<Utc>,
+    db_now: Timestamp,
     head_seq: Option<i64>,
     head_hash: Option<String>,
-    head_recorded_at: Option<DateTime<Utc>>,
+    head_recorded_at: Option<Timestamp>,
     mark_seq: Option<i64>,
     mark_hash: Option<String>,
-    mark_recorded_at: Option<DateTime<Utc>>,
+    mark_recorded_at: Option<Timestamp>,
 }
 
 /// One ledger revision, as the generated repository has computed it.
@@ -2378,7 +2409,7 @@ pub struct LedgerAppend<'a> {
     pub snapshot: serde_json::Value,
     /// The model's own valid-time instant, when it declares one. `None` falls
     /// back to the revision's transaction time.
-    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_from: Option<Timestamp>,
 }
 
 /// Read the record's chain head, its out-of-band high-water mark and the
@@ -2431,20 +2462,20 @@ async fn read_chain_state(
 
         #[derive(diesel::QueryableByName)]
         struct Row {
-            #[diesel(sql_type = Timestamptz)]
-            db_now: DateTime<Utc>,
+            #[diesel(sql_type = Timestamptz, deserialize_as = crate::db::SqlTimestamp)]
+            db_now: Timestamp,
             #[diesel(sql_type = Nullable<BigInt>)]
             head_seq: Option<i64>,
             #[diesel(sql_type = Nullable<Text>)]
             head_hash: Option<String>,
-            #[diesel(sql_type = Nullable<Timestamptz>)]
-            head_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<Timestamptz>, deserialize_as = crate::db::SqlNullableTimestamp)]
+            head_recorded_at: Option<Timestamp>,
             #[diesel(sql_type = Nullable<BigInt>)]
             mark_seq: Option<i64>,
             #[diesel(sql_type = Nullable<Text>)]
             mark_hash: Option<String>,
-            #[diesel(sql_type = Nullable<Timestamptz>)]
-            mark_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<Timestamptz>, deserialize_as = crate::db::SqlNullableTimestamp)]
+            mark_recorded_at: Option<Timestamp>,
         }
 
         let row: Row = diesel::sql_query(
@@ -2501,14 +2532,14 @@ async fn read_chain_state(
             head_seq: Option<i64>,
             #[diesel(sql_type = Nullable<Text>)]
             head_hash: Option<String>,
-            #[diesel(sql_type = Nullable<TimestamptzSqlite>)]
-            head_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<TimestamptzSqlite>, deserialize_as = crate::db::SqlNullableTimestamp)]
+            head_recorded_at: Option<Timestamp>,
             #[diesel(sql_type = Nullable<BigInt>)]
             mark_seq: Option<i64>,
             #[diesel(sql_type = Nullable<Text>)]
             mark_hash: Option<String>,
-            #[diesel(sql_type = Nullable<TimestamptzSqlite>)]
-            mark_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<TimestamptzSqlite>, deserialize_as = crate::db::SqlNullableTimestamp)]
+            mark_recorded_at: Option<Timestamp>,
         }
 
         let row: Row = diesel::sql_query(
@@ -2625,8 +2656,8 @@ type Instant = diesel::sql_types::TimestamptzSqlite;
 struct PlannedRevision {
     seq: i64,
     prev_hash: Option<String>,
-    recorded_at: DateTime<Utc>,
-    valid_from: DateTime<Utc>,
+    recorded_at: Timestamp,
+    valid_from: Timestamp,
     hash: String,
     /// The canonical snapshot text that `hash` covers.
     snapshot: String,
@@ -2861,8 +2892,8 @@ pub async fn append_revision(
         .bind::<Text, _>(append.actor)
         .bind::<Nullable<Text>, _>(append.request_id)
         .bind::<Text, _>(planned.snapshot.as_str())
-        .bind::<Instant, _>(planned.valid_from)
-        .bind::<Instant, _>(planned.recorded_at)
+        .bind::<Instant, _>(crate::db::SqlTimestamp(planned.valid_from))
+        .bind::<Instant, _>(crate::db::SqlTimestamp(planned.recorded_at))
         .bind::<Nullable<Text>, _>(planned.prev_hash.as_deref())
         .bind::<Text, _>(planned.hash.as_str())
         .execute(&mut *conn)
@@ -2875,7 +2906,7 @@ pub async fn append_revision(
         .bind::<BigInt, _>(append.record_id)
         .bind::<BigInt, _>(planned.seq)
         .bind::<Text, _>(planned.hash.as_str())
-        .bind::<Instant, _>(planned.recorded_at)
+        .bind::<Instant, _>(crate::db::SqlTimestamp(planned.recorded_at))
         .execute(conn)
         .await
         .map_err(crate::AutumnError::from)?;
@@ -2938,20 +2969,20 @@ async fn read_chain_states(
         struct Row {
             #[diesel(sql_type = BigInt)]
             ord: i64,
-            #[diesel(sql_type = Timestamptz)]
-            db_now: DateTime<Utc>,
+            #[diesel(sql_type = Timestamptz, deserialize_as = crate::db::SqlTimestamp)]
+            db_now: Timestamp,
             #[diesel(sql_type = Nullable<BigInt>)]
             head_seq: Option<i64>,
             #[diesel(sql_type = Nullable<Text>)]
             head_hash: Option<String>,
-            #[diesel(sql_type = Nullable<Timestamptz>)]
-            head_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<Timestamptz>, deserialize_as = crate::db::SqlNullableTimestamp)]
+            head_recorded_at: Option<Timestamp>,
             #[diesel(sql_type = Nullable<BigInt>)]
             mark_seq: Option<i64>,
             #[diesel(sql_type = Nullable<Text>)]
             mark_hash: Option<String>,
-            #[diesel(sql_type = Nullable<Timestamptz>)]
-            mark_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<Timestamptz>, deserialize_as = crate::db::SqlNullableTimestamp)]
+            mark_recorded_at: Option<Timestamp>,
         }
 
         let rows: Vec<Row> = diesel::sql_query(CHAIN_STATES_SQL)
@@ -3000,14 +3031,14 @@ async fn read_chain_states(
             head_seq: Option<i64>,
             #[diesel(sql_type = Nullable<Text>)]
             head_hash: Option<String>,
-            #[diesel(sql_type = Nullable<TimestamptzSqlite>)]
-            head_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<TimestamptzSqlite>, deserialize_as = crate::db::SqlNullableTimestamp)]
+            head_recorded_at: Option<Timestamp>,
             #[diesel(sql_type = Nullable<BigInt>)]
             mark_seq: Option<i64>,
             #[diesel(sql_type = Nullable<Text>)]
             mark_hash: Option<String>,
-            #[diesel(sql_type = Nullable<TimestamptzSqlite>)]
-            mark_recorded_at: Option<DateTime<Utc>>,
+            #[diesel(sql_type = Nullable<TimestamptzSqlite>, deserialize_as = crate::db::SqlNullableTimestamp)]
+            mark_recorded_at: Option<Timestamp>,
         }
 
         // Three binds for each key, then three for the table name.
@@ -3283,9 +3314,17 @@ async fn write_revisions(
                     .map(|p| p.snapshot.as_str())
                     .collect::<Vec<_>>(),
             )
-            .bind::<Array<Timestamptz>, _>(planned.iter().map(|p| p.valid_from).collect::<Vec<_>>())
             .bind::<Array<Timestamptz>, _>(
-                planned.iter().map(|p| p.recorded_at).collect::<Vec<_>>(),
+                planned
+                    .iter()
+                    .map(|p| crate::db::SqlTimestamp(p.valid_from))
+                    .collect::<Vec<_>>(),
+            )
+            .bind::<Array<Timestamptz>, _>(
+                planned
+                    .iter()
+                    .map(|p| crate::db::SqlTimestamp(p.recorded_at))
+                    .collect::<Vec<_>>(),
             )
             .bind::<Array<Nullable<Text>>, _>(
                 planned
@@ -3322,7 +3361,7 @@ async fn write_revisions(
             .bind::<Array<Timestamptz>, _>(
                 marks
                     .iter()
-                    .map(|&i| planned[i].recorded_at)
+                    .map(|&i| crate::db::SqlTimestamp(planned[i].recorded_at))
                     .collect::<Vec<_>>(),
             )
             .execute(conn)
@@ -3371,8 +3410,8 @@ async fn insert_revisions_sqlite(
                 .bind::<Text, _>(append.actor)
                 .bind::<Nullable<Text>, _>(append.request_id)
                 .bind::<Text, _>(plan.snapshot.as_str())
-                .bind::<Instant, _>(plan.valid_from)
-                .bind::<Instant, _>(plan.recorded_at)
+                .bind::<Instant, _>(crate::db::SqlTimestamp(plan.valid_from))
+                .bind::<Instant, _>(crate::db::SqlTimestamp(plan.recorded_at))
                 .bind::<Nullable<Text>, _>(plan.prev_hash.as_deref())
                 .bind::<Text, _>(plan.hash.as_str());
         }
@@ -3417,7 +3456,7 @@ async fn raise_marks_sqlite(
                 .bind::<BigInt, _>(appends[i].record_id)
                 .bind::<BigInt, _>(planned[i].seq)
                 .bind::<Text, _>(planned[i].hash.as_str())
-                .bind::<Instant, _>(planned[i].recorded_at);
+                .bind::<Instant, _>(crate::db::SqlTimestamp(planned[i].recorded_at));
         }
         query
             .execute(&mut *conn)
@@ -3513,7 +3552,6 @@ mod tests {
             "the mark must refuse to move backwards: {HIGH_WATER_UPSERT_SQL}"
         );
     }
-    use chrono::TimeZone as _;
     use serde_json::json;
 
     /// The Postgres batch statements keep the contract of the single-row ones
@@ -3548,10 +3586,8 @@ mod tests {
         );
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_800_000_000 + secs, 0)
-            .single()
-            .expect("valid instant")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(1_800_000_000 + secs).expect("valid instant")
     }
 
     /// Build a well-formed chain of `n` revisions whose snapshots carry an
@@ -3776,10 +3812,47 @@ mod tests {
     }
 
     #[test]
+    fn truncate_to_micros_floors_and_the_preimage_keeps_six_digits() {
+        let after = Timestamp::new(1_800_000_000, 123_456_789).expect("valid instant");
+        assert_eq!(
+            truncate_to_micros(after),
+            Timestamp::new(1_800_000_000, 123_456_000).expect("valid instant")
+        );
+        // Before 1970 the fraction still floors, to the earlier microsecond.
+        let before = Timestamp::new(-1, 999_998_500).expect("valid instant");
+        assert_eq!(
+            truncate_to_micros(before),
+            Timestamp::new(-1, 999_998_000).expect("valid instant")
+        );
+        assert_eq!(
+            format_instant(at(0)),
+            "2027-01-15T08:00:00.000000Z",
+            "the hash preimage keeps six digits and `Z` for whole seconds"
+        );
+        assert_eq!(format_instant(before), "1969-12-31T23:59:59.999998Z");
+    }
+
+    /// The hash of a fixed revision, computed from the documented preimage
+    /// outside Rust. Chains already stored keep verifying only while this
+    /// value holds, so a change to the instant encoding fails here first.
+    #[test]
+    fn revision_hash_matches_the_stored_chain_encoding() {
+        let snapshot = json!({ "id": 7, "title": "hello" });
+        let input = RevisionHashInput {
+            recorded_at: Timestamp::new(1_800_000_000, 123_456_789).expect("valid instant"),
+            ..base_input(&snapshot)
+        };
+        assert_eq!(
+            revision_hash(&input),
+            "e2c478eff72f890b8cdb0d454d814ca8bb6593d47ba92976895649f1c98045c3"
+        );
+    }
+
+    #[test]
     fn revision_hash_truncates_sub_microsecond_precision() {
         let snapshot = json!({});
-        let micros = Utc.timestamp_nanos(1_800_000_000_000_123_000);
-        let nanos = Utc.timestamp_nanos(1_800_000_000_000_123_456);
+        let micros = Timestamp::from_nanosecond(1_800_000_000_000_123_000).expect("valid instant");
+        let nanos = Timestamp::from_nanosecond(1_800_000_000_000_123_456).expect("valid instant");
         let a = RevisionHashInput {
             recorded_at: micros,
             ..base_input(&snapshot)
@@ -4504,7 +4577,7 @@ mod tests {
         // The writer clamps `recorded_at` to its predecessor, so a regression in stored data is
         // a forgery or an old writer's clock step.
         let mut revisions = chain(3);
-        revisions[2].recorded_at = revisions[1].recorded_at - chrono::Duration::seconds(1);
+        revisions[2].recorded_at = revisions[1].recorded_at - SignedDuration::from_secs(1);
         revisions[2].hash = revisions[2].compute_hash();
 
         let broken = verify_chain(7, &revisions)
@@ -4522,7 +4595,7 @@ mod tests {
         let full = chain(4);
         let mark = mark_for(&full);
         let mut truncated = full[..3].to_vec();
-        truncated[2].recorded_at = truncated[1].recorded_at - chrono::Duration::seconds(1);
+        truncated[2].recorded_at = truncated[1].recorded_at - SignedDuration::from_secs(1);
         truncated[2].hash = truncated[2].compute_hash();
         // Re-link so only the regression and the truncation remain.
         let mut fixed = truncated.clone();
@@ -4568,7 +4641,7 @@ mod tests {
         // Valid time is a business claim: a back-dated correction is the whole
         // point of the second axis.
         let mut revisions = chain(3);
-        revisions[2].valid_from = revisions[0].valid_from - chrono::Duration::days(30);
+        revisions[2].valid_from = revisions[0].valid_from - SignedDuration::from_hours(30 * 24);
         revisions[2].hash = revisions[2].compute_hash();
 
         assert!(verify_chain(7, &revisions).is_intact());
@@ -4587,15 +4660,15 @@ mod tests {
     fn monotonic_recorded_at_truncates_both_sides_to_micros() {
         // The value that is hashed has to be the value the database stores, and
         // both tiers keep microseconds.
-        let now = at(100) + chrono::Duration::nanoseconds(1_500);
+        let now = at(100) + SignedDuration::from_nanos(1_500);
         assert_eq!(
             monotonic_recorded_at(now, None),
-            Some(at(100) + chrono::Duration::microseconds(1))
+            Some(at(100) + SignedDuration::from_micros(1))
         );
-        let floor = at(200) + chrono::Duration::nanoseconds(1_500);
+        let floor = at(200) + SignedDuration::from_nanos(1_500);
         assert_eq!(
             monotonic_recorded_at(at(100), Some(floor)),
-            Some(at(200) + chrono::Duration::microseconds(1))
+            Some(at(200) + SignedDuration::from_micros(1))
         );
     }
 
@@ -4605,17 +4678,17 @@ mod tests {
         // time forward: later revisions would hash a future instant and `snapshot_as_of` would
         // stop returning them.
         let now = at(0);
-        let inside = now + chrono::Duration::seconds(LEDGER_MAX_CLOCK_SKEW_SECS);
+        let inside = now + SignedDuration::from_secs(LEDGER_MAX_CLOCK_SKEW_SECS);
         assert_eq!(monotonic_recorded_at(now, Some(inside)), Some(inside));
 
-        let outside = inside + chrono::Duration::microseconds(1);
+        let outside = inside + SignedDuration::from_micros(1);
         assert_eq!(
             monotonic_recorded_at(now, Some(outside)),
             None,
             "a floor past the tolerated skew must refuse the write, not honour it"
         );
         assert_eq!(
-            monotonic_recorded_at(now, Some(now + chrono::Duration::days(365_000))),
+            monotonic_recorded_at(now, Some(now + SignedDuration::from_hours(365_000 * 24))),
             None
         );
     }
@@ -4626,16 +4699,13 @@ mod tests {
         // write path reads, to millisecond precision.
         let parsed = parse_sqlite_instant("2026-09-01 18:08:53.597")
             .expect("the documented SQLite clock encoding parses");
-        assert_eq!(
-            parsed.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-            "2026-09-01T18:08:53.597000Z"
-        );
+        assert_eq!(format_instant(parsed), "2026-09-01T18:08:53.597000Z");
 
         // Whole seconds carry no fractional part at all.
         assert_eq!(
-            parse_sqlite_instant("2026-09-01 18:08:53")
-                .expect("a fractionless instant parses")
-                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            format_instant(
+                parse_sqlite_instant("2026-09-01 18:08:53").expect("a fractionless instant parses")
+            ),
             "2026-09-01T18:08:53.000000Z"
         );
 
@@ -4810,16 +4880,16 @@ mod tests {
             Some(instant)
         );
         assert_eq!(
-            LedgerValidTimeValue::ledger_valid_from(&None::<DateTime<Utc>>),
+            LedgerValidTimeValue::ledger_valid_from(&None::<Timestamp>),
             None
         );
-        let naive = instant.naive_utc();
+        let naive = jiff::tz::Offset::UTC.to_datetime(instant);
         assert_eq!(
             LedgerValidTimeValue::ledger_valid_from(&naive),
             Some(instant)
         );
         assert_eq!(
-            LedgerValidTimeValue::ledger_valid_from(&None::<chrono::NaiveDateTime>),
+            LedgerValidTimeValue::ledger_valid_from(&None::<civil::DateTime>),
             None
         );
     }
@@ -4931,7 +5001,7 @@ mod tests {
         cases.push(duplicate);
 
         let mut regression = chain(5);
-        regression[3].recorded_at = regression[2].recorded_at - chrono::Duration::seconds(1);
+        regression[3].recorded_at = regression[2].recorded_at - SignedDuration::from_secs(1);
         regression[3].hash = regression[3].compute_hash();
         regression[4].prev_hash = Some(regression[3].hash.clone());
         regression[4].hash = regression[4].compute_hash();
@@ -5384,7 +5454,7 @@ mod tests {
     // ── Batched appends (#3345) ──────────────────────────────────────
 
     #[cfg(feature = "db")]
-    fn empty_state(db_now: DateTime<Utc>) -> ChainState {
+    fn empty_state(db_now: Timestamp) -> ChainState {
         ChainState {
             db_now,
             head_seq: None,
@@ -5486,7 +5556,7 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn every_guard_refuses_the_batch_with_the_single_row_text() {
-        let head = |seq: i64, hash: &str, recorded_at: DateTime<Utc>| ChainState {
+        let head = |seq: i64, hash: &str, recorded_at: Timestamp| ChainState {
             head_seq: Some(seq),
             head_hash: Some(hash.to_owned()),
             head_recorded_at: Some(recorded_at),

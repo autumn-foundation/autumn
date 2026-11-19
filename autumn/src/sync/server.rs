@@ -18,7 +18,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -49,7 +49,6 @@ use axum::extract::{FromRequestParts, OptionalFromRequestParts, Query};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use chrono::{DateTime, Utc};
 #[cfg(feature = "postgres")]
 use diesel::prelude::*;
 #[cfg(feature = "postgres")]
@@ -63,6 +62,9 @@ use super::protocol::{
     PushRequest, PushResponse, RemoteRow, Version,
 };
 use super::resolver::{ConflictResolver, Resolution};
+#[cfg(feature = "postgres")]
+use crate::db::SqlTimestamp;
+use crate::time::Timestamp;
 
 #[cfg(feature = "postgres")]
 fn backend_err(err: impl std::fmt::Display) -> SyncError {
@@ -585,7 +587,7 @@ pub trait SyncBackend: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns [`SyncError::Backend`] on storage failure.
-    fn gc_applied(&self, older_than: DateTime<Utc>) -> Result<u64, SyncError>;
+    fn gc_applied(&self, older_than: Timestamp) -> Result<u64, SyncError>;
 
     /// `scope`'s current tombstone GC horizon (`0` if no tombstone of that
     /// scope was ever dropped).
@@ -618,7 +620,7 @@ pub trait SyncBackend: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 struct AppliedRecord {
     version: Version,
-    applied_at: DateTime<Utc>,
+    applied_at: Timestamp,
     /// `Some` when the original outcome was `Resolved { row }`.
     resolved_row: Option<RemoteRow>,
 }
@@ -798,7 +800,7 @@ impl SyncBackend for MemorySyncBackend {
         Ok(removed)
     }
 
-    fn gc_applied(&self, older_than: DateTime<Utc>) -> Result<u64, SyncError> {
+    fn gc_applied(&self, older_than: Timestamp) -> Result<u64, SyncError> {
         let mut state = self.lock()?;
         let before = state.applied.len();
         state
@@ -921,7 +923,7 @@ struct PgRowRecord {
     #[diesel(sql_type = Bool)]
     deleted: bool,
     #[diesel(sql_type = Timestamptz)]
-    updated_at: DateTime<Utc>,
+    updated_at: SqlTimestamp,
     #[diesel(sql_type = Text)]
     device_id: String,
     #[diesel(sql_type = BigInt)]
@@ -938,7 +940,7 @@ impl PgRowRecord {
                 payload: self.payload,
                 version: self.version,
                 deleted: self.deleted,
-                updated_at: self.updated_at,
+                updated_at: self.updated_at.into(),
                 device_id: self.device_id,
             },
             created_version: self.created_version,
@@ -1015,7 +1017,10 @@ where
         stored.iter().map(|s| s.row.payload.clone()).collect();
     let versions: Vec<i64> = stored.iter().map(|s| s.row.version).collect();
     let deleteds: Vec<bool> = stored.iter().map(|s| s.row.deleted).collect();
-    let updated_ats: Vec<DateTime<Utc>> = stored.iter().map(|s| s.row.updated_at).collect();
+    let updated_ats: Vec<SqlTimestamp> = stored
+        .iter()
+        .map(|s| SqlTimestamp::from(s.row.updated_at))
+        .collect();
     let device_ids: Vec<&str> = stored.iter().map(|s| s.row.device_id.as_str()).collect();
     let created_versions: Vec<i64> = stored.iter().map(|s| s.created_version).collect();
 
@@ -1570,10 +1575,10 @@ impl SyncBackend for PgSyncBackend {
         })
     }
 
-    fn gc_applied(&self, older_than: DateTime<Utc>) -> Result<u64, SyncError> {
+    fn gc_applied(&self, older_than: Timestamp) -> Result<u64, SyncError> {
         with_sync_pg_connection!(&self.database_url, |conn| {
             let removed = sql_query("DELETE FROM autumn_sync_applied WHERE applied_at < $1")
-                .bind::<Timestamptz, _>(older_than)
+                .bind::<Timestamptz, _>(SqlTimestamp::from(older_than))
                 .execute(conn)
                 .map_err(backend_err)?;
             Ok(removed as u64)

@@ -28,7 +28,7 @@
 #![cfg(feature = "sqlite")]
 
 use autumn_web::config::DatabaseConfig;
-use autumn_web::db::{RuntimeConnection, create_pool};
+use autumn_web::db::{AsSqlTime as _, RuntimeConnection, create_pool};
 use autumn_web::reexports::{diesel, diesel_async};
 
 // The named (non-glob) import shadows `diesel::prelude`'s sync `RunQueryDsl`,
@@ -88,9 +88,11 @@ struct UserSession {
     #[allow(dead_code)]
     ua_device: String,
     label: Option<String>,
-    last_seen_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    last_seen_at: autumn_web::time::civil::DateTime,
     #[allow(dead_code)]
-    created_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    created_at: autumn_web::time::civil::DateTime,
 }
 
 /// The insert shape: `id`, `label`, `last_seen_at` and `created_at` are left to
@@ -329,10 +331,10 @@ async fn tracked_sessions_store_runs_on_sqlite() {
     // then stamped from Rust, so both encodings must read back as a timestamp.
     let stamped = tracked
         .last_seen_at
-        .checked_add_signed(chrono::Duration::seconds(90))
+        .checked_add(autumn_web::time::SignedDuration::from_secs(90))
         .expect("in-range timestamp");
     diesel::update(user_sessions::table.find(tracked.id))
-        .set(user_sessions::last_seen_at.eq(stamped))
+        .set(user_sessions::last_seen_at.eq(stamped.as_sql_time()))
         .execute(&mut *conn)
         .await
         .expect("refresh last_seen_at");
@@ -440,14 +442,14 @@ async fn retention_sweep_and_cascade_run_on_sqlite() {
     // `fresh_default` keeps the CURRENT_TIMESTAMP default (no fraction).
     record_login_session(&mut conn, &new_session(owner, "fresh-default", "Firefox")).await;
     // The other two are stamped from Rust, so they carry a fractional suffix.
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::tz::Offset::UTC.to_datetime(autumn_web::time::Timestamp::now());
     for (digest, age_days) in [("fresh-stamped", 1), ("stale-stamped", 200)] {
         record_login_session(&mut conn, &new_session(owner, digest, "Safari")).await;
         let at = now
-            .checked_sub_signed(chrono::Duration::days(age_days))
+            .checked_sub(autumn_web::time::SignedDuration::from_hours(age_days * 24))
             .expect("in-range timestamp");
         diesel::update(user_sessions::table.filter(user_sessions::token_digest.eq(digest)))
-            .set(user_sessions::last_seen_at.eq(at))
+            .set(user_sessions::last_seen_at.eq(at.as_sql_time()))
             .execute(&mut *conn)
             .await
             .expect("stamp last_seen_at");

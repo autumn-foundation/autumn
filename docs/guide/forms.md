@@ -195,7 +195,7 @@ passthrough above.
 | `checkbox_group(…, choices)` | boxes in a `<fieldset>` | `#[serde(default)] Vec<String>` | no |
 | `segmented_control(…, choices)` | radios that look like buttons | a `String` or an enum | yes |
 | `email_input`, `tel_input`, `url_input` | `type="email"`, `"tel"`, `"url"` | `String` | yes |
-| `time_input` | `type="time"` | `chrono::NaiveTime` | yes |
+| `time_input` | `type="time"` | `autumn_web::time::civil::Time` | yes |
 | `month_input` | `type="month"` | `String` (`YYYY-MM`) | yes |
 | `color_input` | `type="color"` | `String` (`#rrggbb`) | no |
 | `hidden_input(changeset, field)` | `type="hidden"` | any | no |
@@ -233,7 +233,7 @@ use autumn_web::form::{FieldOptions, checkbox_group_with, radio_group, switch_in
 `form_for` takes the same controls: `FieldControl::Switch`, `Range { step }`,
 `Radio { options }`, `CheckboxGroup { options }`, `Segmented { options }`,
 `Email`, `Tel`, `Url`, `Time`, `Month`, `Color` and `Hidden`. A `#[model]`
-`NaiveTime` column gets `Time`. A non-null column does not make a switch, a
+`civil::Time` column gets `Time`. A non-null column does not make a switch, a
 slider, a color, a hidden input or a checkbox group required.
 
 The "Native inputs" and "Choice controls" stories show each control.

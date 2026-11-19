@@ -195,14 +195,15 @@ async fn echo_cookie(headers: axum::http::HeaderMap) -> String {
 #[tokio::test]
 async fn cookie_jar_expires_check_uses_virtual_clock_future() {
     use autumn_web::time::FixedClock;
-    use chrono::{TimeZone, Utc};
 
     // Pin the clock *before* the cookie's `Expires` (2022): the jar must keep
     // the cookie. Under real time (2026+) it would be dropped, so a retained
     // cookie proves the jar consulted the virtual clock, not `Utc::now()`.
     let client = TestApp::new()
         .with_clock(FixedClock::at(
-            Utc.with_ymd_and_hms(2021, 6, 1, 0, 0, 0).unwrap(),
+            "2021-06-01T00:00:00Z"
+                .parse::<autumn_web::time::Timestamp>()
+                .unwrap(),
         ))
         .routes(routes![emit_expiring_cookie, echo_cookie])
         .build();
@@ -218,12 +219,13 @@ async fn cookie_jar_expires_check_uses_virtual_clock_future() {
 #[tokio::test]
 async fn cookie_jar_expires_check_uses_virtual_clock_past() {
     use autumn_web::time::FixedClock;
-    use chrono::{TimeZone, Utc};
 
     // Pin the clock *after* the cookie's `Expires` (2022): the jar must drop it.
     let client = TestApp::new()
         .with_clock(FixedClock::at(
-            Utc.with_ymd_and_hms(2023, 6, 1, 0, 0, 0).unwrap(),
+            "2023-06-01T00:00:00Z"
+                .parse::<autumn_web::time::Timestamp>()
+                .unwrap(),
         ))
         .routes(routes![emit_expiring_cookie, echo_cookie])
         .build();
@@ -257,12 +259,13 @@ async fn emit_live_cookie() -> impl IntoResponse {
 #[tokio::test]
 async fn live_cookie_max_age_expires_against_virtual_clock() {
     use autumn_web::time::TickingClock;
-    use chrono::{TimeZone, Utc};
     use std::time::Duration;
 
     let client = TestApp::new()
         .with_clock(TickingClock::starting_at(
-            Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap(),
+            "2025-01-01T00:00:00Z"
+                .parse::<autumn_web::time::Timestamp>()
+                .unwrap(),
         ))
         .routes(routes![emit_live_cookie, echo_cookie])
         .build();

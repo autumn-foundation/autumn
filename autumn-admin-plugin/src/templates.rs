@@ -10,6 +10,7 @@ use autumn_web::job::{
 };
 use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
+use autumn_web::time::civil;
 use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
 use autumn_web::widgets::{
     CardConfig, ConfirmActionConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem, card,
@@ -1909,11 +1910,10 @@ pub fn config_history_page(
 }
 
 fn format_timestamp(ts: u64) -> String {
-    use chrono::{DateTime, Utc};
     let secs = i64::try_from(ts).unwrap_or(i64::MAX);
-    DateTime::from_timestamp(secs, 0).map_or_else(
-        || ts.to_string(),
-        |dt: DateTime<Utc>| dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+    autumn_web::time::Timestamp::from_second(secs).map_or_else(
+        |_| ts.to_string(),
+        |at| at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
     )
 }
 
@@ -2015,18 +2015,29 @@ fn normalize_date_input(s: &str) -> String {
         return String::new();
     }
     // Fast path: already in the right shape.
-    if chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok() {
+    if civil::Date::strptime("%Y-%m-%d", s).is_ok() {
         return s.to_owned();
     }
     // Fall back to full RFC 3339 (which includes the `T` + time).
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return dt.format("%Y-%m-%d").to_string();
+    if let Some(dt) = rfc3339_wall_clock(s) {
+        return dt.strftime("%Y-%m-%d").to_string();
     }
     // Finally try a naive datetime.
-    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        return ndt.format("%Y-%m-%d").to_string();
+    if let Ok(ndt) = civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", s) {
+        return ndt.strftime("%Y-%m-%d").to_string();
     }
     s.to_owned()
+}
+
+/// The wall-clock date and time of an RFC 3339 value, in its own offset.
+///
+/// `2024-01-02T12:34:56+05:30` gives `2024-01-02T12:34:56`: the offset is
+/// dropped, not applied. Returns `None` unless `s` has a date, a time and an
+/// offset (`Z` or numeric).
+fn rfc3339_wall_clock(s: &str) -> Option<civil::DateTime> {
+    let pieces = jiff::fmt::temporal::Pieces::parse(s).ok()?;
+    pieces.offset()?;
+    Some(pieces.date().to_datetime(pieces.time()?))
 }
 
 /// Normalize a stored datetime string into `YYYY-MM-DDTHH:MM`, the only
@@ -2035,8 +2046,8 @@ fn normalize_date_input(s: &str) -> String {
 /// backend representations onto the local-time shape the input expects.
 ///
 /// **Wall-time preserved.** For RFC 3339 inputs with an explicit offset,
-/// the offset is dropped but the local clock components are kept as-is
-/// (we use `naive_local()`, not `naive_utc()`). That way an unchanged
+/// the offset is dropped but the local clock components are kept as-is,
+/// not converted to UTC. That way an unchanged
 /// edit-save round trip doesn't shift the timestamp — `12:34+05:30`
 /// renders as `12:34`, posts back unchanged as `12:34`, and the model can
 /// re-attach whatever offset it wants.
@@ -2048,17 +2059,17 @@ fn normalize_datetime_local_input(s: &str) -> String {
         return String::new();
     }
     // Already local-shaped.
-    if chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").is_ok() {
+    if civil::DateTime::strptime("%Y-%m-%dT%H:%M", s).is_ok() {
         return s.to_owned();
     }
-    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        return ndt.format("%Y-%m-%dT%H:%M").to_string();
+    if let Ok(ndt) = civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", s) {
+        return ndt.strftime("%Y-%m-%dT%H:%M").to_string();
     }
     // RFC 3339 with timezone — keep the local wall-clock components and
     // drop the offset (don't shift to UTC; that would mutate the value
     // on a no-op save).
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return dt.naive_local().format("%Y-%m-%dT%H:%M").to_string();
+    if let Some(dt) = rfc3339_wall_clock(s) {
+        return dt.strftime("%Y-%m-%dT%H:%M").to_string();
     }
     s.to_owned()
 }
@@ -2516,8 +2527,8 @@ pub fn model_history_page(
                                         }
                                     }
                                     td {
-                                        time datetime=(entry.recorded_at.to_rfc3339()) {
-                                            (entry.recorded_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                                        time datetime=(autumn_web::time::compat::rfc3339(entry.recorded_at)) {
+                                            (entry.recorded_at.strftime("%Y-%m-%d %H:%M:%S UTC"))
                                         }
                                     }
                                 }
@@ -3237,7 +3248,7 @@ mod tests {
                 op: "insert".to_owned(),
                 request_id: None,
                 changes: vec![],
-                recorded_at: chrono::Utc::now(),
+                recorded_at: autumn_web::time::ambient_now(),
             }],
             total: 250,
             page: 2,

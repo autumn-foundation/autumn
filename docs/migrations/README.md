@@ -19,6 +19,7 @@ request and in the publish gate. See
 - [`0.8.0.md`](0.8.0.md) — `autumn-web 0.7.x → 0.8.0`
 - [`0.9.0.md`](0.9.0.md) — `autumn-web 0.8.x → 0.9.0`
 - [`0.10.0.md`](0.10.0.md) — `autumn-web 0.9.x → 0.10.0`
+- [`0.11.0.md`](0.11.0.md) — `autumn-web 0.10.x → 0.11.0`
 - [`next.md`](next.md) — rolling draft for everything not released yet,
   renamed to `<version>.md` at release time
 

@@ -4,7 +4,7 @@
 // as-of / diff / verify / head query surface.
 //
 // The `ledgered(valid_time = "...")` variant is exercised too, since it emits a
-// different `LedgeredRecord` body reading a `NaiveDateTime` column through
+// different `LedgeredRecord` body reading a civil `DateTime` column through
 // `LedgerValidTimeValue`.
 
 mod schema {
@@ -34,7 +34,7 @@ pub struct LedgerNote {
     pub id: i64,
     pub content: String,
     #[default]
-    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(LedgerNote, table = "ledger_notes", soft_delete, ledgered = true)]
@@ -46,9 +46,9 @@ pub struct LedgerValidTimeNote {
     pub id: i64,
     pub content: String,
     #[default]
-    pub effective_at: autumn_web::reexports::chrono::NaiveDateTime,
+    pub effective_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -63,12 +63,12 @@ pub trait LedgerValidTimeNoteRepository {}
 fn _assert_query_surface(repo: &PgLedgerNoteRepository) {
     let _ = repo.ledger_revisions(1);
     let _ = repo.ledger_revisions_page(1, autumn_web::ledger::LedgerPageRequest::default());
-    let _ = repo.ledger_as_of(1, autumn_web::reexports::chrono::Utc::now());
+    let _ = repo.ledger_as_of(1, autumn_web::time::ambient_now());
     let _ = repo.ledger_as_of_at(1, autumn_web::ledger::LedgerAsOf::default());
     let _ = repo.ledger_diff(
         1,
-        autumn_web::reexports::chrono::Utc::now(),
-        autumn_web::reexports::chrono::Utc::now(),
+        autumn_web::time::ambient_now(),
+        autumn_web::time::ambient_now(),
     );
     let _ = repo.ledger_verify(1);
     let _ = repo.ledger_head(1);

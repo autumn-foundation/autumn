@@ -67,7 +67,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -379,8 +379,8 @@ pub struct Comment {
     #[diesel(sql_type = Text)]
     pub body: String,
     /// When the comment was created.
-    #[diesel(sql_type = Timestamp)]
-    pub created_at: chrono::NaiveDateTime,
+    #[diesel(sql_type = Timestamp, deserialize_as = crate::db::SqlDateTime)]
+    pub created_at: crate::time::civil::DateTime,
     /// The author's display name, when the model declared
     /// `#[commentable(author_name = <column>)]`. `None` otherwise — the
     /// framework does not guess a column.
@@ -2144,7 +2144,9 @@ async fn delete_subtree(
              WHERE {pk} IN ({id_list}) AND {deleted_at} IS NULL",
             ph(1),
         ))
-        .bind::<Timestamp, _>(crate::time::ambient_now().naive_utc())
+        .bind::<Timestamp, _>(crate::db::SqlDateTime::from(
+            crate::time::ambient_civil_utc(),
+        ))
         .execute(conn)
         .await
         .map_err(AutumnError::from)?;
@@ -2205,7 +2207,7 @@ mod tests {
             parent_id,
             author_id: 1,
             body: body.to_owned(),
-            created_at: chrono::NaiveDateTime::default(),
+            created_at: crate::time::civil::DateTime::default(),
             author_name: None,
         }
     }
@@ -2516,7 +2518,7 @@ mod tests {
                     parent_id: None,
                     author_id: 1,
                     body: String::new(),
-                    created_at: chrono::NaiveDateTime::default(),
+                    created_at: crate::time::civil::DateTime::default(),
                     author_name: None,
                 },
                 depth,

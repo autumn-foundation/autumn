@@ -52,7 +52,7 @@ Doctor results (exit <N>):
 
 If the command is not found, tell the user to install:
 ```bash
-cargo install autumn-cli --version 0.5.0
+cargo install autumn-cli --version 0.11.0
 ```
 
 ## Common FAIL remedies
@@ -66,7 +66,7 @@ These names match what `autumn doctor --json` actually emits in the `name` field
 | `db_connectivity` | Verify `AUTUMN_DATABASE__PRIMARY_URL` and that Postgres is reachable |
 | `trusted_hosts` | Set explicit `[security] trusted_hosts` in `autumn.toml` for production |
 | `rate_limit_key_strategy` | Set `rate_limit.key_strategy` to `"ip"`, `"api_token"`, or `"authenticated_principal"` |
-| `version_compat` | Upgrade `autumn-cli` to match the framework version: `cargo install autumn-cli --version 0.5.0` |
+| `version_compat` | Upgrade `autumn-cli` to the same minor version as the project's `autumn-web` (for 0.11: `cargo install autumn-cli --version 0.11.0`) |
 | `dotenv` | Copy `.env.example` to `.env` and fill in local values, or add every present secret dotenv file (`.env`, `.env.local`, and any `.env.<profile>.local`) to `.gitignore` if it is not already ignored — committable `.env.<profile>` files are left alone (warns only; never fails) |
 | `jobs_queue_coverage` **(trunk-dev)** | Add the uncovered queue(s) to a tier's `jobs.pin` in `[jobs.fleet].tiers`, or run an unpinned tier that drains everything (fails once `[jobs.fleet]` is declared and a needed queue is uncovered; informational when `[jobs.fleet]` is absent) |
 | `offsite_backup` **(trunk-dev)** | Set `backup.offsite.s3.bucket`, or set `backup.offsite.allow_shared_bucket = true` if intentionally reusing the app `[storage.s3]` bucket |

@@ -624,9 +624,9 @@ impl Plugin for MediaPlugin {
             let room_urls = transport::MediaUrls::from_config(&config.mediamtx);
             let room_namespace = config.room_namespace.clone().unwrap_or_default();
             let room_token_ttl =
-                chrono::Duration::seconds(i64::from(config.room_token_ttl_seconds));
+                jiff::SignedDuration::from_secs(i64::from(config.room_token_ttl_seconds));
             let room_max_session =
-                chrono::Duration::seconds(i64::from(config.room_session_max_seconds));
+                jiff::SignedDuration::from_secs(i64::from(config.room_session_max_seconds));
             let room_rate_limit = config.room_rate_limit_per_minute;
 
             // The `memory` store lives in the process that serves the room
@@ -1418,7 +1418,7 @@ mod primitive_surface_tests {
             (rooms.rate_limit_per_minute(), rooms.session_max())
         });
         assert_eq!(rate, 30);
-        assert_eq!(session, chrono::Duration::hours(1));
+        assert_eq!(session, jiff::SignedDuration::from_hours(1));
     }
 
     /// The extensions `plugin` installs.

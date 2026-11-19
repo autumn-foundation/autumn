@@ -21,7 +21,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use chrono::{DateTime, Utc};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_query;
@@ -32,6 +31,7 @@ use serde::de::DeserializeOwned;
 
 use super::SyncError;
 use super::protocol::{Change, ChangeOutcome, Op, RemoteRow, Version};
+use crate::time::Timestamp;
 
 const SCHEMA_DDL: &str = "
 CREATE TABLE IF NOT EXISTS autumn_sync_rows (
@@ -129,10 +129,8 @@ struct PendingRecord {
     updated_at: String,
 }
 
-fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, SyncError> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(store_err)
+fn parse_timestamp(value: &str) -> Result<Timestamp, SyncError> {
+    value.parse::<Timestamp>().map_err(store_err)
 }
 
 fn get_state(conn: &mut SqliteConnection, key: &str) -> Result<Option<String>, SyncError> {
@@ -214,7 +212,7 @@ fn replace_pending(
     .bind::<Nullable<Text>, _>(payload)
     .bind::<BigInt, _>(base_version)
     .bind::<Text, _>(updated_at)
-    .bind::<Text, _>(crate::time::ambient_now().to_rfc3339())
+    .bind::<Text, _>(crate::time::compat::rfc3339(crate::time::ambient_now()))
     .execute(conn)
     .map(|_| ())
 }
@@ -261,7 +259,7 @@ fn upsert_remote_row(
         payload.as_deref(),
         row.version,
         row.deleted,
-        &row.updated_at.to_rfc3339(),
+        &crate::time::compat::rfc3339(row.updated_at),
     )
 }
 
@@ -543,7 +541,7 @@ impl SyncStore {
         op: Op,
         payload: Option<&str>,
     ) -> Result<(), SyncError> {
-        let now = crate::time::ambient_now().to_rfc3339();
+        let now = crate::time::compat::rfc3339(crate::time::ambient_now());
         let op_name = match op {
             Op::Upsert => "upsert",
             Op::Delete => "delete",
@@ -920,7 +918,6 @@ impl SyncStore {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
     use serde_json::json;
 
     use super::*;
@@ -938,7 +935,7 @@ mod tests {
             payload: (!deleted).then(|| json!({"title": format!("server v{version}")})),
             version,
             deleted,
-            updated_at: Utc::now(),
+            updated_at: crate::time::ambient_now(),
             device_id: "server-device".to_owned(),
         }
     }

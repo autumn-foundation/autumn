@@ -329,7 +329,7 @@ no one-container-per-test overhead.
 ```toml
 # Cargo.toml  — use the same version as your [dependencies] entry
 [dev-dependencies]
-autumn-web = { version = "0.10", features = ["test-support"] }
+autumn-web = { version = "0.11", features = ["test-support"] }
 serde_json = "1"
 ```
 
@@ -624,7 +624,7 @@ let comment = Comment::factory().post_id(post.id).body("Nice!").create(&pool).aw
 ## Testing time-sensitive logic
 
 Autumn ships a first-class `Clock` extractor so that handlers read wall-clock
-time through a swappable interface rather than calling `chrono::Utc::now()`
+time through a swappable interface rather than calling `jiff::Timestamp::now()`
 directly. In tests you pin or advance time with
 `TestApp::with_clock` and `TestClient::advance_clock` — no `sleep`, no Tokio
 timer games, no third-party crates.
@@ -643,7 +643,7 @@ async fn token_age(clock: Clock) -> String {
 }
 ```
 
-If no custom clock is configured, `Clock` delegates to `chrono::Utc::now()`
+If no custom clock is configured, `Clock` reads the system clock
 with zero overhead — existing handlers that don't take `Clock` keep working
 unchanged.
 
@@ -654,12 +654,11 @@ advance it between requests:
 
 ```rust
 use autumn_web::test::TestApp;
-use autumn_web::time::FixedClock;
-use chrono::{TimeZone, Utc};
+use autumn_web::time::{FixedClock, Timestamp};
 
 #[tokio::test]
 async fn token_is_fresh_at_issue_time() {
-    let issued_at = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    let issued_at: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
     let client = TestApp::new()
         .routes(routes![token_age])
         .with_clock(FixedClock::at(issued_at))
@@ -676,14 +675,13 @@ Use [`TickingClock`] when the test needs to step time forward. Pass it to
 
 ```rust
 use autumn_web::test::TestApp;
-use autumn_web::time::{Clock, TickingClock};
-use chrono::{TimeZone, Utc};
+use autumn_web::time::{Clock, SignedDuration, TickingClock, Timestamp};
 use std::time::Duration;
 
 #[get("/token")]
 async fn check_token(clock: Clock) -> axum::http::StatusCode {
-    let issued = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
-    if clock.now() < issued + chrono::Duration::days(30) {
+    let issued: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
+    if clock.now() < issued + SignedDuration::from_hours(30 * 24) {
         axum::http::StatusCode::OK
     } else {
         axum::http::StatusCode::UNAUTHORIZED
@@ -692,7 +690,7 @@ async fn check_token(clock: Clock) -> axum::http::StatusCode {
 
 #[tokio::test]
 async fn token_expires_after_30_days() {
-    let issued = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    let issued: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
     let client = TestApp::new()
         .routes(routes![check_token])
         .with_clock(TickingClock::starting_at(issued))
@@ -719,7 +717,8 @@ that doesn't match production).
 keep a handle in the test and still wire the same clock into the app:
 
 ```rust
-let clock = TickingClock::starting_at(Utc::now());
+let start: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
+let clock = TickingClock::starting_at(start);
 let client = TestApp::new()
     .with_clock(clock.clone())  // shares state with `clock`
     .build();
@@ -737,10 +736,11 @@ framework internals. The signing half lives behind the non-default `storage`
 feature (`features = ["storage"]`) — see [File Storage](./storage.md):
 
 ```rust
-use autumn_web::time::{TickingClock, clock_unix_secs};
+use autumn_web::time::{TickingClock, Timestamp, clock_unix_secs};
 use autumn_web::storage::local::{SigningKey, sign, verify_with_now};
 
-let clock = TickingClock::starting_at(Utc::now());
+let start: Timestamp = "2025-01-01T00:00:00Z".parse().unwrap();
+let clock = TickingClock::starting_at(start);
 let key = SigningKey::new(b"my-signing-key".to_vec());
 let blob_key = "uploads/file.png";
 

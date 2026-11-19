@@ -45,7 +45,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -683,8 +683,8 @@ mod tests {
     struct CountingClock(Arc<std::sync::atomic::AtomicUsize>);
 
     impl crate::time::ClockSource for CountingClock {
-        fn now(&self) -> chrono::DateTime<chrono::Utc> {
-            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+        fn now(&self) -> crate::time::Timestamp {
+            crate::time::Timestamp::UNIX_EPOCH
         }
 
         fn monotonic(&self) -> crate::time::MonotonicInstant {

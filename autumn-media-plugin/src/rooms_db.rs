@@ -15,8 +15,8 @@
 //! Every query is written against autumn-web's `RuntimeConnection` /
 //! `RuntimeBackend` aliases (Postgres by default, `SQLite` under
 //! `autumn-web/sqlite`) using only backend-portable diesel query-builder
-//! fragments and `Timestamp`/`NaiveDateTime` columns — no Postgres-only SQL — so
-//! **both lanes compile**. This crate never enables the `sqlite` runtime lane
+//! fragments and `Timestamp` columns (a UTC `civil::DateTime`) — no
+//! Postgres-only SQL — so **both lanes compile**. This crate never enables the `sqlite` runtime lane
 //! itself (that would trip the feature-unification hazard in `autumn/src/db.rs`);
 //! the active backend is chosen by the end application.
 //!
@@ -52,24 +52,28 @@
 //! pair, so reaping **never crosses namespaces** (tenant isolation), exactly
 //! like the in-memory sweep.
 
-use chrono::{DateTime, Duration, SubsecRound, Utc};
 use diesel::prelude::*;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection as _, RunQueryDsl};
 use uuid::Uuid;
 
 use autumn_web::RuntimeConnection;
+use autumn_web::db::SqlDateTime;
+use autumn_web::time::ambient_now;
+use jiff::tz::Offset;
+use jiff::{RoundMode, SignedDuration, Timestamp, TimestampRound, Unit};
 
 use crate::config::DEFAULT_ROOM_MAX_PARTICIPANTS;
 use crate::rooms::{
     JoinRecord, MAX_ROOMS, ParticipantView, ReapFuture, ReapStats, RoomError, RoomSnapshot,
-    RoomStore, RoomStoreFuture, SessionToken, renewed_expiry, validate_room_segment,
+    RoomStore, RoomStoreFuture, SessionToken, renewed_expiry, saturating_add,
+    validate_room_segment,
 };
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 //
 // Two tables with composite primary keys. Timestamps are `Timestamp`
-// (`NaiveDateTime`), never Postgres-only `Timestamptz`, so the schema compiles
+// (a UTC `civil::DateTime`), never Postgres-only `Timestamptz`, so the schema compiles
 // and runs on both the Postgres and SQLite lanes. The app ships the matching
 // migration (see `migrations/` in this crate); the testcontainer suite creates
 // the same shape from raw SQL.
@@ -104,7 +108,7 @@ struct RoomRow {
     namespace: String,
     room_id: String,
     max_participants: i32,
-    created_at: chrono::NaiveDateTime,
+    created_at: SqlDateTime,
 }
 
 #[derive(Queryable, Selectable, Insertable)]
@@ -115,9 +119,9 @@ struct ParticipantRow {
     participant_id: String,
     display_name: Option<String>,
     token: String,
-    joined_at: chrono::NaiveDateTime,
-    token_expires_at: chrono::NaiveDateTime,
-    last_seen_at: chrono::NaiveDateTime,
+    joined_at: SqlDateTime,
+    token_expires_at: SqlDateTime,
+    last_seen_at: SqlDateTime,
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -319,7 +323,7 @@ fn snapshot_from(room: &RoomRow, rows: &[ParticipantRow]) -> RoomSnapshot {
         .map(|row| ParticipantView {
             id: row.participant_id.clone(),
             display_name: row.display_name.clone(),
-            joined_at: row.joined_at.and_utc(),
+            joined_at: from_column(row.joined_at),
         })
         .collect();
     participants.sort_by(|a, b| a.joined_at.cmp(&b.joined_at).then_with(|| a.id.cmp(&b.id)));
@@ -327,9 +331,37 @@ fn snapshot_from(room: &RoomRow, rows: &[ParticipantRow]) -> RoomSnapshot {
         id: room.room_id.clone(),
         namespace: room.namespace.clone(),
         max_participants: usize::try_from(room.max_participants).unwrap_or(0),
-        created_at: room.created_at.and_utc(),
+        created_at: from_column(room.created_at),
         participants,
     }
+}
+
+/// The UTC wall-clock value a `Timestamp` column stores for `ts`.
+fn to_column(ts: Timestamp) -> SqlDateTime {
+    SqlDateTime(Offset::UTC.to_datetime(ts))
+}
+
+/// A stored UTC wall-clock value as an instant. A value past either end of
+/// [`Timestamp`]'s range saturates to [`Timestamp::MAX`] / [`Timestamp::MIN`].
+fn from_column(value: SqlDateTime) -> Timestamp {
+    Offset::UTC.to_timestamp(value.0).unwrap_or_else(|_| {
+        if value.0.year() < 0 {
+            Timestamp::MIN
+        } else {
+            Timestamp::MAX
+        }
+    })
+}
+
+/// `ts` truncated to whole microseconds, the resolution of a `Timestamp`
+/// column.
+fn truncate_to_micros(ts: Timestamp) -> Timestamp {
+    ts.round(
+        TimestampRound::new()
+            .smallest(Unit::Microsecond)
+            .mode(RoundMode::Trunc),
+    )
+    .unwrap_or(ts)
 }
 
 #[allow(clippy::needless_lifetimes)] // boxed futures borrow the args across `.await`; see the trait.
@@ -370,12 +402,12 @@ impl RoomStore for DbRoomStore {
             }
 
             let id = Uuid::new_v4().to_string();
-            let now = Utc::now();
+            let now = ambient_now();
             let row = RoomRow {
                 namespace: namespace.to_owned(),
                 room_id: id.clone(),
                 max_participants: i32::try_from(max_participants).unwrap_or(i32::MAX),
-                created_at: now.naive_utc(),
+                created_at: to_column(now),
             };
             diesel::insert_into(media_rooms::table)
                 .values(&row)
@@ -398,7 +430,7 @@ impl RoomStore for DbRoomStore {
         namespace: &'a str,
         room_id: &'a str,
         display_name: Option<String>,
-        token_ttl: Duration,
+        token_ttl: SignedDuration,
     ) -> RoomStoreFuture<'a, JoinRecord> {
         let pool = self.pool.clone();
         let (namespace, room_id) = (namespace.to_owned(), room_id.to_owned());
@@ -442,19 +474,19 @@ impl RoomStore for DbRoomStore {
                     return Err(RoomError::Store.into());
                 }
 
-                let now = Utc::now();
+                let now = ambient_now();
                 let participant_id = Uuid::new_v4().to_string();
                 let token = SessionToken::generate();
-                let token_expires_at = now + token_ttl;
+                let token_expires_at = saturating_add(now, token_ttl);
                 let new = ParticipantRow {
                     namespace: namespace.to_owned(),
                     room_id: room_id.to_owned(),
                     participant_id: participant_id.clone(),
                     display_name,
                     token: token.expose().to_owned(),
-                    joined_at: now.naive_utc(),
-                    token_expires_at: token_expires_at.naive_utc(),
-                    last_seen_at: now.naive_utc(),
+                    joined_at: to_column(now),
+                    token_expires_at: to_column(token_expires_at),
+                    last_seen_at: to_column(now),
                 };
                 diesel::insert_into(media_room_participants::table)
                     .values(&new)
@@ -555,7 +587,7 @@ impl RoomStore for DbRoomStore {
         namespace: &'a str,
         room_id: &'a str,
         auth_token: &'a str,
-        session_max: Duration,
+        session_max: SignedDuration,
     ) -> RoomStoreFuture<'a, RoomSnapshot> {
         Box::pin(async move {
             let mut conn = self.pool.get().await.map_err(map_db_err)?;
@@ -589,13 +621,13 @@ impl RoomStore for DbRoomStore {
             // membership oracle). On a match, refresh that member's liveness
             // clock so the reaper never reclaims an actively-polling participant.
             // A member past `joined_at + session_max` is refused the same way.
-            let now = Utc::now();
+            let now = ambient_now();
             let member_id = rows
                 .iter()
                 .find(|row| {
                     autumn_web::auth::constant_time_eq(auth_token.as_bytes(), row.token.as_bytes())
                 })
-                .filter(|row| now < row.joined_at.and_utc() + session_max)
+                .filter(|row| now < saturating_add(from_column(row.joined_at), session_max))
                 .map(|row| row.participant_id.clone())
                 .ok_or(RoomError::RoomNotFound)?;
 
@@ -607,7 +639,7 @@ impl RoomStore for DbRoomStore {
                         .and(media_room_participants::participant_id.eq(&member_id)),
                 ),
             )
-            .set(media_room_participants::last_seen_at.eq(now.naive_utc()))
+            .set(media_room_participants::last_seen_at.eq(to_column(now)))
             .execute(&mut conn)
             .await
             .map_err(map_db_err)?;
@@ -622,44 +654,43 @@ impl RoomStore for DbRoomStore {
         room_id: &'a str,
         participant_id: &'a str,
         token: &'a str,
-        token_ttl: Duration,
-        session_max: Duration,
-    ) -> RoomStoreFuture<'a, DateTime<Utc>> {
+        token_ttl: SignedDuration,
+        session_max: SignedDuration,
+    ) -> RoomStoreFuture<'a, Timestamp> {
         Box::pin(async move {
             let mut conn = self.pool.get().await.map_err(map_db_err)?;
 
             // Fail-closed: an absent row and a token mismatch are the same
             // `RoomNotFound`, so a heartbeat is no membership oracle. The room
             // row is not probed separately for the same reason.
-            let (stored, joined_at): (String, chrono::NaiveDateTime) =
-                media_room_participants::table
-                    .filter(
-                        media_room_participants::namespace
-                            .eq(namespace)
-                            .and(media_room_participants::room_id.eq(room_id))
-                            .and(media_room_participants::participant_id.eq(participant_id)),
-                    )
-                    .select((
-                        media_room_participants::token,
-                        media_room_participants::joined_at,
-                    ))
-                    .first(&mut conn)
-                    .await
-                    .optional()
-                    .map_err(map_db_err)?
-                    .ok_or(RoomError::RoomNotFound)?;
+            let (stored, joined_at): (String, SqlDateTime) = media_room_participants::table
+                .filter(
+                    media_room_participants::namespace
+                        .eq(namespace)
+                        .and(media_room_participants::room_id.eq(room_id))
+                        .and(media_room_participants::participant_id.eq(participant_id)),
+                )
+                .select((
+                    media_room_participants::token,
+                    media_room_participants::joined_at,
+                ))
+                .first(&mut conn)
+                .await
+                .optional()
+                .map_err(map_db_err)?
+                .ok_or(RoomError::RoomNotFound)?;
             if !autumn_web::auth::constant_time_eq(token.as_bytes(), stored.as_bytes()) {
                 return Err(RoomError::RoomNotFound);
             }
 
-            let now = Utc::now();
-            let renewed = renewed_expiry(joined_at.and_utc(), now, token_ttl, session_max)
+            let now = ambient_now();
+            let renewed = renewed_expiry(from_column(joined_at), now, token_ttl, session_max)
                 .ok_or(RoomError::RoomNotFound)?;
             // Truncate to microseconds — the `Timestamp` column's resolution —
             // so the expiry this call returns is exactly the one another process
             // reads back, instead of a nanosecond-precise value the row cannot
             // hold.
-            let renewed = renewed.trunc_subsecs(6);
+            let renewed = truncate_to_micros(renewed);
             let updated = diesel::update(
                 media_room_participants::table.filter(
                     media_room_participants::namespace
@@ -669,8 +700,8 @@ impl RoomStore for DbRoomStore {
                 ),
             )
             .set((
-                media_room_participants::last_seen_at.eq(now.naive_utc()),
-                media_room_participants::token_expires_at.eq(renewed.naive_utc()),
+                media_room_participants::last_seen_at.eq(to_column(now)),
+                media_room_participants::token_expires_at.eq(to_column(renewed)),
             ))
             .execute(&mut conn)
             .await
@@ -684,12 +715,18 @@ impl RoomStore for DbRoomStore {
         })
     }
 
-    fn reap_stale(&self, now: DateTime<Utc>, idle_ttl: Duration) -> ReapFuture<'_> {
+    fn reap_stale(&self, now: Timestamp, idle_ttl: SignedDuration) -> ReapFuture<'_> {
         Box::pin(async move {
             // Best-effort, exactly like the reaper loop expects: a backend error
             // reaps nothing this tick (logged, zero stats) rather than failing.
             let mut stats = ReapStats::default();
-            let cutoff = (now - idle_ttl).naive_utc();
+            let cutoff = to_column(now.checked_sub(idle_ttl).unwrap_or_else(|_| {
+                if idle_ttl.is_negative() {
+                    Timestamp::MAX
+                } else {
+                    Timestamp::MIN
+                }
+            }));
             let mut conn = match self.pool.get().await {
                 Ok(conn) => conn,
                 Err(err) => {

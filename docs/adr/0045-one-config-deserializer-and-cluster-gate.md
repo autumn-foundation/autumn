@@ -109,7 +109,7 @@ Tests:
   IR lines give a smaller time gain.
 - The schema from `get_schema_keys()` is the same as before (111 tables).
 - An app with `default-features = false` that uses the cluster adds
-  `"cluster"`. See `docs/migrations/next.md`.
+  `"cluster"`. See `docs/migrations/0.11.0.md`.
 - A program that parsed the `TOML parse error at line` text of a config
   type error must read the key path instead.
 - Small differences from `toml::from_str` remain. Map keys are always

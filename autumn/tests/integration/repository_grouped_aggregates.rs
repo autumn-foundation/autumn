@@ -39,7 +39,7 @@ pub struct AggEvent {
     pub id: i64,
     pub post_id: i64,
     pub score: i32,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[autumn_web::repository(AggEvent, table = "test_agg_events")]
@@ -55,7 +55,7 @@ pub trait AggEventRepository {
     /// MAX(score) GROUP BY post_id.
     fn max_score_grouped_by_post_id() -> Vec<(i64, Option<i32>)>;
     /// COUNT(*) GROUP BY created_at — used for `DateBucket` time series.
-    fn count_grouped_by_created_at() -> Vec<(chrono::NaiveDateTime, i64)>;
+    fn count_grouped_by_created_at() -> Vec<(autumn_web::time::civil::DateTime, i64)>;
 }
 
 // ── Tenant-scoped model ───────────────────────────────────────────────────────
@@ -105,7 +105,7 @@ pub struct AggSoftEvent {
     pub bucket: String,
     pub value: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(AggSoftEvent, table = "test_agg_soft_events", soft_delete)]
@@ -243,10 +243,9 @@ fn build_nullable_repo(pool: Pool<AsyncPgConnection>) -> PgAggNullableEventRepos
     }
 }
 
-fn ts(secs: i64) -> chrono::NaiveDateTime {
-    chrono::DateTime::from_timestamp(secs, 0)
-        .expect("valid timestamp")
-        .naive_utc()
+fn ts(secs: i64) -> autumn_web::time::civil::DateTime {
+    autumn_web::time::tz::Offset::UTC
+        .to_datetime(autumn_web::time::Timestamp::from_second(secs).expect("valid timestamp"))
 }
 
 // ── Non-ignored: the generated surface exists without a live database ──────────

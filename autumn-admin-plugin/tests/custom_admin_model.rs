@@ -21,7 +21,7 @@
 //!    `SQLite` has none of the three. Use `CAST(x AS TEXT)`, an `IN` list, and
 //!    separate statements in a transaction.
 //! 4. **`NOW()` is `CURRENT_TIMESTAMP`**, and a timestamp column reads as
-//!    `Timestamp`/`NaiveDateTime`, never `Timestamptz`.
+//!    `Timestamp`/`civil::DateTime`, never `Timestamptz`.
 //!
 //! `autumn_web::backend_select!` picks the pool URL and the DDL, so one test
 //! body runs on Postgres and on `SQLite`.

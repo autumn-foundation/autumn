@@ -2,8 +2,8 @@
 
 use autumn_web::obligation;
 use autumn_web::sla::{BusinessDuration, Obligation};
-use chrono::{DateTime, TimeZone, Utc};
-use chrono_tz::Tz;
+use autumn_web::time::Timestamp;
+use autumn_web::time::tz::TimeZone;
 
 #[obligation(
     name = first_response,
@@ -17,20 +17,20 @@ use chrono_tz::Tz;
 #[derive(Debug, Clone)]
 pub struct Ticket {
     pub id: i64,
-    pub opened_at: DateTime<Utc>,
-    pub responded_at: Option<DateTime<Utc>>,
+    pub opened_at: Timestamp,
+    pub responded_at: Option<Timestamp>,
     pub customer_zone: String,
 }
 
 #[obligation(name = refund_window, within = "30 business minutes", starts = placed_at, subject = number, zone = zone)]
 pub struct Order {
     pub number: String,
-    pub placed_at: DateTime<Utc>,
-    pub zone: Option<Tz>,
+    pub placed_at: Timestamp,
+    pub zone: Option<TimeZone>,
 }
 
-fn opened() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2024, 1, 5, 15, 0, 0).unwrap()
+fn opened() -> Timestamp {
+    "2024-01-05T15:00:00Z".parse().unwrap()
 }
 
 fn ticket() -> Ticket {
@@ -44,7 +44,7 @@ fn ticket() -> Ticket {
 
 #[test]
 fn obligation_macro_builds_the_declared_obligation() {
-    let ny: Tz = "America/New_York".parse().unwrap();
+    let ny = TimeZone::get("America/New_York").unwrap();
     let want = Obligation::new("first_response", "ticket:42")
         .within(BusinessDuration::days(2))
         .calendar("support")
@@ -61,7 +61,7 @@ fn obligation_macro_builds_the_declared_obligation() {
 #[test]
 fn obligation_macro_reads_the_met_field() {
     let mut t = ticket();
-    let at = Utc.with_ymd_and_hms(2024, 1, 8, 10, 0, 0).unwrap();
+    let at: Timestamp = "2024-01-08T10:00:00Z".parse().unwrap();
     t.responded_at = Some(at);
     assert_eq!(t.first_response_obligation().met(), Some(at));
 }
@@ -101,7 +101,7 @@ macro_rules! parity {
             #[allow(dead_code)]
             struct $ty {
                 id: u8,
-                at: DateTime<Utc>,
+                at: Timestamp,
             }
         )*
 
@@ -130,7 +130,7 @@ parity! {
 #[obligation(name = r#type, within = "1 business day", starts = opened_at)]
 pub struct Raw {
     pub id: i64,
-    pub opened_at: DateTime<Utc>,
+    pub opened_at: Timestamp,
 }
 
 #[test]

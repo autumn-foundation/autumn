@@ -14,7 +14,7 @@ pub struct Article {
     #[id]
     pub id: i64,
     pub title: String,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 ```
 

@@ -563,8 +563,8 @@ mod tests {
             alt_text: String::new(),
             caption: String::new(),
             uploader_id: None,
-            created_at: chrono::NaiveDateTime::default(),
-            updated_at: chrono::NaiveDateTime::default(),
+            created_at: autumn_web::time::civil::date(1970, 1, 1).at(0, 0, 0, 0),
+            updated_at: autumn_web::time::civil::date(1970, 1, 1).at(0, 0, 0, 0),
         }
     }
 

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use autumn_web::time::{SignedDuration, Timestamp};
 
 use super::{
     BillingStore, CustomerUpsert, EventClaim, Guard, InvoiceUpsert, StoreFuture,
@@ -20,8 +20,8 @@ use crate::model::{
 struct LedgerRow {
     #[allow(dead_code, reason = "diagnostic; read by the db store")]
     kind: String,
-    claimed_at: DateTime<Utc>,
-    applied_at: Option<DateTime<Utc>>,
+    claimed_at: Timestamp,
+    applied_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Default)]
@@ -68,15 +68,14 @@ impl BillingStore for MemoryBillingStore {
         &'a self,
         event_id: &'a str,
         kind: &'a str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         stale_after: Duration,
     ) -> StoreFuture<'a, EventClaim> {
         ready(self.lock().map(|mut inner| {
-            let stale_after =
-                chrono::Duration::from_std(stale_after).unwrap_or(chrono::Duration::MAX);
+            let stale_after = SignedDuration::try_from(stale_after).unwrap_or(SignedDuration::MAX);
             match inner.events.get_mut(event_id) {
                 Some(row) if row.applied_at.is_some() => EventClaim::Applied,
-                Some(row) if now.signed_duration_since(row.claimed_at) < stale_after => {
+                Some(row) if now.duration_since(row.claimed_at) < stale_after => {
                     EventClaim::InFlight
                 }
                 Some(row) => {
@@ -98,7 +97,7 @@ impl BillingStore for MemoryBillingStore {
         }))
     }
 
-    fn finish_event<'a>(&'a self, event_id: &'a str, now: DateTime<Utc>) -> StoreFuture<'a, ()> {
+    fn finish_event<'a>(&'a self, event_id: &'a str, now: Timestamp) -> StoreFuture<'a, ()> {
         ready(self.lock().map(|mut inner| {
             if let Some(row) = inner.events.get_mut(event_id) {
                 row.applied_at = Some(now);
@@ -214,7 +213,7 @@ impl BillingStore for MemoryBillingStore {
         &'a self,
         id: &'a str,
         user_id: String,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, Option<Customer>> {
         ready(self.lock().and_then(|mut inner| {
             // Existence first, matching the DB backend: a missing `id` is
@@ -343,7 +342,7 @@ impl BillingStore for MemoryBillingStore {
         &'a self,
         id: &'a str,
         status: SubscriptionStatus,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, Option<Subscription>> {
         ready(self.lock().map(|mut inner| {
             let row = inner.subscriptions.get_mut(id)?;
@@ -416,7 +415,7 @@ impl BillingStore for MemoryBillingStore {
         &'a self,
         provider_subscription_id: &'a ProviderId,
         subscription_id: &'a str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, ()> {
         ready(self.lock().map(|mut inner| {
             // Invoices already linked here are candidates too: their dunning
@@ -483,7 +482,7 @@ impl BillingStore for MemoryBillingStore {
         &'a self,
         invoice_id: &'a str,
         attempt: i64,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, bool> {
         ready(self.lock().map(|mut inner| {
             let Some(row) = inner.dunning.get_mut(invoice_id) else {
@@ -554,7 +553,7 @@ impl BillingStore for MemoryBillingStore {
         }))
     }
 
-    fn prune_events(&self, before: DateTime<Utc>) -> StoreFuture<'_, u64> {
+    fn prune_events(&self, before: Timestamp) -> StoreFuture<'_, u64> {
         ready(self.lock().map(|mut inner| {
             let len_before = inner.events.len();
             inner
@@ -570,10 +569,9 @@ mod tests {
     use super::*;
     use crate::model::{DunningState, SubscriptionStatus};
     use crate::plan::PlanId;
-    use chrono::TimeZone;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + secs, 0).single().unwrap()
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(1_700_000_000 + secs).unwrap()
     }
 
     fn upsert(status: SubscriptionStatus, occurred: i64) -> SubscriptionUpsert {

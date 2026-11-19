@@ -484,6 +484,7 @@ fn field_tokens(fields: &[WireFieldDescriptor]) -> Vec<TokenStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autumn_macros_support::wire::format;
 
     fn shape(src: &str) -> WireTypeDescriptor {
         let input: DeriveInput = syn::parse_str(src).expect("fixture parses");
@@ -770,6 +771,13 @@ mod tests {
             naive_date: chrono::NaiveDate,
             naive_date_time: NaiveDateTime,
             naive_time: NaiveTime,
+            timestamp: jiff::Timestamp,
+            timestamp_bare: Timestamp,
+            timestamp_reexport: autumn_web::time::Timestamp,
+            civil_date_time: civil::DateTime,
+            civil_date: jiff::civil::Date,
+            civil_time: autumn_web::time::civil::Time,
+            zoned: jiff::ZonedDateTime,
             offset_date_time: time::OffsetDateTime,
             primitive_date_time: time::PrimitiveDateTime,
             time_date: time::Date,
@@ -813,15 +821,15 @@ mod tests {
             status: Status,
             #[wire(opaque)]
             maybe_status: Option<Status>,
-            #[serde(with = "chrono::serde::ts_seconds")]
-            with_no_override: chrono::DateTime<chrono::Utc>,
+            #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
+            with_no_override: jiff::Timestamp,
             #[serde(serialize_with = "as_text")]
             serialize_with: u32,
             #[serde(deserialize_with = "from_text")]
             deserialize_with: u32,
-            #[serde(with = "chrono::serde::ts_seconds")]
+            #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
             #[wire(type = "integer", format = "unix-seconds")]
-            stamp: chrono::DateTime<chrono::Utc>,
+            stamp: jiff::Timestamp,
             #[wire(type = "string", nullable)]
             nickname: MaybeName,
             #[wire(type = "number")]
@@ -1023,6 +1031,37 @@ mod tests {
         let s = shape("struct T { a: sea_orm::prelude::DateTime, b: bson::DateTime }");
         assert_eq!(wire(&s.serialized, "a"), WireType::Any);
         assert_eq!(wire(&s.serialized, "b"), WireType::Any);
+    }
+
+    #[test]
+    fn jiff_civil_types_need_the_civil_qualifier() {
+        let s = shape(
+            "struct T { a: civil::DateTime, b: civil::Date, c: civil::Time, d: time::Date, e: Date }",
+        );
+        assert_eq!(
+            wire(&s.serialized, "a"),
+            WireType::string_in(format::LOCAL_DATE_TIME)
+        );
+        assert_eq!(wire(&s.serialized, "b"), WireType::string_in(format::DATE));
+        assert_eq!(
+            wire(&s.serialized, "c"),
+            WireType::string_in(format::LOCAL_TIME)
+        );
+        assert_eq!(wire(&s.serialized, "d"), WireType::Any);
+        assert_eq!(wire(&s.serialized, "e"), WireType::Any);
+    }
+
+    #[test]
+    fn a_jiff_timestamp_is_a_date_time_and_a_foreign_one_is_any() {
+        let s = shape(
+            "struct T { a: Timestamp, b: jiff::Timestamp, c: autumn_web::time::Timestamp, d: prost_types::Timestamp }",
+        );
+        let date_time = WireType::string_in(format::DATE_TIME);
+        assert_eq!(wire(&s.serialized, "a"), date_time);
+        assert_eq!(wire(&s.serialized, "b"), date_time);
+        assert_eq!(wire(&s.serialized, "c"), date_time);
+        // A `Timestamp` from another crate has no known form.
+        assert_eq!(wire(&s.serialized, "d"), WireType::Any);
     }
 
     #[test]

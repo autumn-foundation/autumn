@@ -3,11 +3,17 @@
 Autumn ships a `TimeZone` extractor that resolves the requesting user's IANA
 time zone and makes it available in handlers as a first-class parameter. Pair
 it with the `Clock` extractor for fully deterministic, test-injectable date/time
-rendering — no globals, no `Utc::now()` calls in templates.
+rendering — no globals, no `Timestamp::now()` calls in templates.
 
-> **Status:** ships in `v0.5.x` always-on (no Cargo feature needed). `chrono`
-> and `chrono-tz` are unconditional dependencies, so the extractor adds zero
-> overhead to apps that don't use it.
+> **Status:** ships in `v0.5.x` always-on (no Cargo feature needed). `jiff`,
+> with the IANA database bundled into the binary, is an unconditional
+> dependency, so the extractor adds zero overhead to apps that don't use it.
+> Zones are `jiff::tz::TimeZone` values (re-exported as
+> `autumn_web::time::tz::TimeZone`). They are `Clone`, not `Copy`, so the
+> helpers borrow them: pass `&tz`.
+>
+> Upgrading from an Autumn release built on `chrono` and `chrono-tz`? See
+> [Dates and times: chrono is replaced by jiff](../migrations/0.11.0.md#dates-and-times-chrono-is-replaced-by-jiff).
 
 ---
 
@@ -33,7 +39,7 @@ use autumn_web::time_zone::local_datetime;
 async fn events_index(clock: Clock, tz: TimeZone) -> Markup {
     let now = clock.now();
     html! {
-        p { "Current time: " (local_datetime(now, *tz)) }
+        p { "Current time: " (local_datetime(now, &tz)) }
     }
 }
 ```
@@ -79,6 +85,9 @@ If none of the above yields a valid zone, the configured `default_locale`
 
 The order is stable. Applications can rely on it.
 
+A zone name matches without regard to case: `america/new_york` finds
+`America/New_York`. Read the canonical name back with `tz.iana()`.
+
 ### Implementing a zone switcher
 
 ```rust,ignore
@@ -104,7 +113,7 @@ Renders a `<time datetime="<rfc3339-utc>">YYYY-MM-DD HH:MM TZ</time>` element.
 The `datetime` attribute is always UTC for machine readers.
 
 ```rust,ignore
-(local_datetime(clock.now(), *tz))
+(local_datetime(clock.now(), &tz))
 ```
 
 ### `local_date(dt, tz)`
@@ -118,7 +127,7 @@ Renders a relative string ("3 minutes ago", "in 2 hours"). Pass `clock.now()`
 as `now` so tests can freeze it.
 
 ```rust,ignore
-(time_ago(post.created_at, clock.now(), *tz))
+(time_ago(post.created_at, clock.now(), &tz))
 ```
 
 ---
@@ -130,13 +139,15 @@ interpreted as local time in the user's zone. Autumn provides two helpers for a
 lossless round-trip:
 
 ```rust,ignore
-use autumn_web::time_zone::{parse_local_datetime, to_local_input_value};
+use autumn_web::time::Timestamp;
+use autumn_web::time_zone::{parse_iana, parse_local_datetime, to_local_input_value};
 
 // Incoming form POST: parse "2025-06-14T15:30" as Tokyo time → UTC
-let utc: DateTime<Utc> = parse_local_datetime(&form.starts_at, Tz::Asia__Tokyo)?;
+let tokyo = parse_iana("Asia/Tokyo").expect("bundled IANA zone");
+let utc: Timestamp = parse_local_datetime(&form.starts_at, &tokyo)?;
 
-// Repopulating the form: UTC → Tokyo local string
-let input_value = to_local_input_value(stored_utc, *tz);
+// Repopulating the form: UTC → the user's local string
+let input_value = to_local_input_value(stored_utc, &tz);
 ```
 
 Round-trip is lossless to minute granularity (the resolution of
@@ -177,12 +188,13 @@ job::send_report(user.id, tz.iana()).enqueue(&state).await?;
 // In the job handler — re-enter the zone:
 #[job]
 async fn send_report(user_id: i64, tz_name: String, state: AppState) {
-    let tz = autumn_web::time_zone::parse_iana(&tz_name).unwrap_or(Tz::UTC);
-    with_request_time_zone(tz, async move {
+    let tz = autumn_web::time_zone::parse_iana(&tz_name)
+        .unwrap_or(autumn_web::time::tz::TimeZone::UTC);
+    with_request_time_zone(tz.clone(), async move {
         // Pass the captured zone to the view helpers explicitly; the ambient
         // zone set above is available via `ambient_time_zone()` if you'd rather
         // read it inside a deeply-nested renderer.
-        let body = render_report(user_id, &state, tz).await;
+        let body = render_report(user_id, &state, &tz).await;
         // ...
     }).await;
 }
@@ -196,12 +208,11 @@ Pin both clock and zone for fully deterministic tests:
 
 ```rust,ignore
 use autumn_web::test::TestApp;
-use autumn_web::time::FixedClock;
-use chrono::{TimeZone as _, Utc};
+use autumn_web::time::{FixedClock, Timestamp};
 
 #[tokio::test]
 async fn report_shows_tokyo_time() {
-    let pinned = Utc.with_ymd_and_hms(2025, 6, 14, 12, 0, 0).unwrap();
+    let pinned: Timestamp = "2025-06-14T12:00:00Z".parse().unwrap();
     let client = TestApp::new()
         .routes(routes![my_handler])
         .with_clock(FixedClock::at(pinned))
@@ -248,4 +259,4 @@ error: time_zone identifier `Mars/Phobos` is not a valid IANA time zone
 - [`autumn_web::time_zone`](https://docs.rs/autumn-web/latest/autumn_web/time_zone/index.html) — full API reference.
 - [`autumn_web::time::Clock`](https://docs.rs/autumn-web/latest/autumn_web/time/struct.Clock.html) — injectable clock, compose with `TimeZone`.
 - [docs/guide/i18n.md](./i18n.md) — locale-aware text rendering.
-- [Project chrono-tz](https://docs.rs/chrono-tz) — the IANA database backing `parse_iana`.
+- [`jiff::tz`](https://docs.rs/jiff/latest/jiff/tz/index.html) — the time zone type and the bundled IANA database backing `parse_iana`.

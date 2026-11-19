@@ -75,7 +75,7 @@
 //!   [`FiredFault::at`] and [`FiredFault::elapsed_ms`] come from the clock
 //!   [`TestApp::build`](crate::test::TestApp::build) resolved, which under a
 //!   [`Sim`](crate::sim::Sim) is the virtual clock. Nothing here reads
-//!   `Utc::now()` or `Instant::now()`.
+//!   `Timestamp::now()` or `Instant::now()`.
 //! * **The outcome record is canonical.** [`FaultOutcome`] contains only
 //!   integers, strings, RFC 3339 timestamps, structs and `Vec`s — no maps, no
 //!   floats, no request ids (those are entropy-minted) — so
@@ -109,7 +109,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -120,7 +120,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::entropy::{Entropy, SeededEntropy};
@@ -519,8 +519,10 @@ pub struct FiredFault {
     /// The **per-target** 1-based ordinal this fault fired at.
     pub target_ordinal: u32,
     /// Wall-clock reading from the app's injected
-    /// [`ClockSource`] when the fault fired.
-    pub at: DateTime<Utc>,
+    /// [`ClockSource`] when the fault fired. Serialized as RFC 3339 with `Z`
+    /// and a 0/3/6/9-digit fraction.
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub at: Timestamp,
     /// Milliseconds since app start, on the injected monotonic clock.
     pub elapsed_ms: u64,
 }
@@ -1160,6 +1162,7 @@ mod tests {
         sample_distinct,
     };
     use crate::time::{ClockSource as _, TickingClock};
+    use jiff::{SignedDuration, Timestamp};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1167,8 +1170,8 @@ mod tests {
 
     /// The sim epoch (`2020-01-01T00:00:00Z`), so the timings a windowed test
     /// asserts on read like the ones a `#[sim_test]` produces.
-    fn epoch() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::from_timestamp(1_577_836_800, 0).expect("valid timestamp")
+    fn epoch() -> Timestamp {
+        Timestamp::from_second(1_577_836_800).expect("valid timestamp")
     }
 
     /// A ledger state driven by a virtual clock the test still holds a handle
@@ -1358,7 +1361,7 @@ mod tests {
         let outcome = state.outcome();
         assert_eq!(outcome.fired.len(), 1, "{outcome:?}");
         assert_eq!(outcome.fired[0].elapsed_ms, 5_000);
-        assert_eq!(outcome.fired[0].at, epoch() + chrono::Duration::seconds(5));
+        assert_eq!(outcome.fired[0].at, epoch() + SignedDuration::from_secs(5));
 
         // t = 10s — the end is exclusive.
         clock.advance(Duration::from_secs(5));
@@ -1493,7 +1496,7 @@ mod tests {
                 target: "probe".to_owned(),
                 ordinal: 2,
                 target_ordinal: 2,
-                at: chrono::DateTime::from_timestamp(1_577_836_806, 0).expect("valid timestamp"),
+                at: Timestamp::from_second(1_577_836_806).expect("valid timestamp"),
                 elapsed_ms: 6_000,
             }],
             suppressed: Vec::new(),

@@ -15,6 +15,7 @@ use autumn_billing::provider::{
 use autumn_billing::{BillingEvent, ProviderId, StripeProvider};
 use autumn_web::config::AutumnConfig;
 use autumn_web::test::{TestApp, TestClient};
+use autumn_web::time::{SignedDuration, Timestamp};
 use autumn_web::webhook::{WebhookConfig, WebhookEndpointConfig, hmac_sha256_hex};
 
 /// Webhook signing secret used by every test app.
@@ -418,14 +419,13 @@ pub async fn post_webhook_signed_as(
 // ── WP-D1 helpers (reconcile / dunning) ───────────────────────────────────
 
 /// Fixed base instant for event times: 2026-01-01T00:00:00Z.
-pub fn base_time() -> chrono::DateTime<chrono::Utc> {
-    use chrono::TimeZone;
-    chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+pub fn base_time() -> Timestamp {
+    "2026-01-01T00:00:00Z".parse().unwrap()
 }
 
 /// `base_time()` plus `secs`.
-pub fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
-    base_time() + chrono::Duration::seconds(secs)
+pub fn at(secs: i64) -> Timestamp {
+    base_time() + SignedDuration::from_secs(secs)
 }
 
 /// Like [`harness`], but with a custom config and hooks.
@@ -455,7 +455,7 @@ pub fn harness_with_hooks(
 /// Build a `BillingEvent`.
 pub fn event(
     id: &str,
-    occurred_at: chrono::DateTime<chrono::Utc>,
+    occurred_at: Timestamp,
     kind: autumn_billing::BillingEventKind,
 ) -> BillingEvent {
     BillingEvent::new(id, occurred_at, kind)
@@ -624,7 +624,7 @@ impl BillingStore for FailingStore {
         &'a self,
         event_id: &'a str,
         kind: &'a str,
-        now: chrono::DateTime<chrono::Utc>,
+        now: Timestamp,
         stale_after: std::time::Duration,
     ) -> autumn_billing::store::StoreFuture<'a, autumn_billing::store::EventClaim> {
         delegate!(self, claim_event, event_id, kind, now, stale_after)
@@ -633,7 +633,7 @@ impl BillingStore for FailingStore {
     fn finish_event<'a>(
         &'a self,
         event_id: &'a str,
-        now: chrono::DateTime<chrono::Utc>,
+        now: Timestamp,
     ) -> autumn_billing::store::StoreFuture<'a, ()> {
         delegate!(self, finish_event, event_id, now)
     }
@@ -681,7 +681,7 @@ impl BillingStore for FailingStore {
         &'a self,
         id: &'a str,
         user_id: String,
-        now: chrono::DateTime<chrono::Utc>,
+        now: Timestamp,
     ) -> autumn_billing::store::StoreFuture<'a, Option<autumn_billing::Customer>> {
         delegate!(self, relink_customer, id, user_id, now)
     }
@@ -718,7 +718,7 @@ impl BillingStore for FailingStore {
         &'a self,
         id: &'a str,
         status: SubscriptionStatus,
-        now: chrono::DateTime<chrono::Utc>,
+        now: Timestamp,
     ) -> autumn_billing::store::StoreFuture<'a, Option<Subscription>> {
         delegate!(self, set_subscription_status, id, status, now)
     }
@@ -763,7 +763,7 @@ impl BillingStore for FailingStore {
         &'a self,
         invoice_id: &'a str,
         attempt: i64,
-        now: chrono::DateTime<chrono::Utc>,
+        now: Timestamp,
     ) -> autumn_billing::store::StoreFuture<'a, bool> {
         delegate!(self, claim_dunning_attempt, invoice_id, attempt, now)
     }
@@ -798,10 +798,7 @@ impl BillingStore for FailingStore {
         )
     }
 
-    fn prune_events(
-        &self,
-        before: chrono::DateTime<chrono::Utc>,
-    ) -> autumn_billing::store::StoreFuture<'_, u64> {
+    fn prune_events(&self, before: Timestamp) -> autumn_billing::store::StoreFuture<'_, u64> {
         delegate!(self, prune_events, before)
     }
 }

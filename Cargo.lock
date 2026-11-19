@@ -269,24 +269,24 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apache-avro"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36fa98bc79671c7981272d91a8753a928ff6a1cd8e4f20a44c45bd5d313840bf"
+checksum = "312c1ea69e5fe9966e0029fb95aca8790100b85aff4f0d3b00a9337c74069a9c"
 dependencies = [
  "bigdecimal",
  "bon",
- "digest 0.10.7",
+ "digest 0.11.3",
  "log",
- "miniz_oxide 0.8.9",
+ "miniz_oxide 0.9.1",
  "num-bigint 0.4.8",
+ "ouroboros",
  "quad-rand",
- "rand 0.9.5",
+ "rand 0.10.3",
  "regex-lite",
  "serde",
  "serde_bytes",
  "serde_json",
- "strum 0.27.2",
- "strum_macros 0.27.2",
+ "strum 0.28.0",
  "thiserror 2.0.21",
  "uuid",
 ]
@@ -610,17 +610,17 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "autumn-admin-plugin"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-web",
  "axum",
- "chrono",
  "csv",
  "diesel",
  "diesel-async",
  "form_urlencoded",
  "futures",
  "http",
+ "jiff 1.0.0",
  "maud",
  "serde",
  "serde_json",
@@ -634,12 +634,12 @@ dependencies = [
 
 [[package]]
 name = "autumn-billing"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
+ "jiff 1.0.0",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-cache-redis"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-web",
  "redis",
@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "apache-avro",
  "autumn-edge",
@@ -678,7 +678,6 @@ dependencies = [
  "autumn-schema-core",
  "autumn-web",
  "base64 0.23.1",
- "chrono",
  "clap",
  "crossterm",
  "ctrlc",
@@ -691,6 +690,7 @@ dependencies = [
  "hmac 0.13.0",
  "include_dir",
  "indicatif",
+ "jiff 1.0.0",
  "libc",
  "nix 0.31.3",
  "notify",
@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-edge"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-macros",
  "axum",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-macros-support",
  "proc-macro-crate",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-model"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-macros-support",
  "autumn-schema-core",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-repository"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-macros-support",
  "proc-macro-crate",
@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-macros-support"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -799,15 +799,15 @@ dependencies = [
 
 [[package]]
 name = "autumn-media-plugin"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-web",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
- "chrono",
  "diesel",
  "diesel-async",
+ "jiff 1.0.0",
  "percent-encoding",
  "reqwest",
  "serde",
@@ -825,7 +825,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-plugin-reference"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-web",
  "maud",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-schema-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-search"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-web",
  "diesel",
@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-storage-s3"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-web",
  "aws-config",
@@ -886,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-web"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "allocation-counter",
@@ -903,8 +903,6 @@ dependencies = [
  "brotli",
  "bytes",
  "chromiumoxide",
- "chrono",
- "chrono-tz",
  "criterion",
  "croner",
  "css-inline",
@@ -934,6 +932,7 @@ dependencies = [
  "infer",
  "instant-acme",
  "inventory",
+ "jiff 1.0.0",
  "jsonwebtoken",
  "lettre",
  "libsqlite3-sys",
@@ -1773,7 +1772,6 @@ version = "0.1.0"
 dependencies = [
  "autumn-admin-plugin",
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -1896,10 +1894,9 @@ dependencies = [
 
 [[package]]
 name = "bookmarks"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -1916,11 +1913,10 @@ dependencies = [
 
 [[package]]
 name = "bookmarks-distributed"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-cache-redis",
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -1941,10 +1937,9 @@ dependencies = [
 
 [[package]]
 name = "bookmarks-sharded"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -2272,21 +2267,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
-]
-
-[[package]]
-name = "chrono-tz"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
-dependencies = [
- "chrono",
- "phf 0.12.1",
 ]
 
 [[package]]
@@ -2399,11 +2382,9 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "cms"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-web",
- "chrono",
- "chrono-tz",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -2721,7 +2702,6 @@ version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0097e28936e948e8f759478e1b5ec2e5ca70ab62cf38aaa9bd3aa660023e3fca"
 dependencies = [
- "chrono",
  "derive_builder",
  "strum 0.27.2",
 ]
@@ -2900,9 +2880,9 @@ dependencies = [
 
 [[package]]
 name = "css-inline"
-version = "0.23.1"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c357d136b76b660cf6024f37871b9c39f4f31e63cc7e548c81579cae22bbd45b"
+checksum = "03ae4075c30a3fe73063e2d3130b4d491b9d467d0afc031d40a1374fa4e3b39f"
 dependencies = [
  "cssparser",
  "hashbrown 0.17.1",
@@ -3346,7 +3326,6 @@ checksum = "9824c36a57a17ece4c8883baed41dc3eb81b2b949364c174750acc462e19b5ec"
 dependencies = [
  "bitflags 2.13.2",
  "byteorder",
- "chrono",
  "diesel_derives",
  "downcast-rs 2.0.2",
  "itoa",
@@ -3460,7 +3439,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3695,9 +3674,9 @@ dependencies = [
 
 [[package]]
 name = "email-encoding"
-version = "0.4.2"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "420b9da095f052ea597503e39073b5b3c522f7db933fbac202d91d24492693fd"
+checksum = "9f690ae2169f2ceb3f45b28b6fcd8fa16839f2f5c8818546774b9425f5f71004"
 dependencies = [
  "base64 0.23.1",
  "memchr",
@@ -3771,7 +3750,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4959,7 +4938,6 @@ name = "invoice"
 version = "0.1.0"
 dependencies = [
  "autumn-web",
- "chrono",
  "example-e2e",
  "maud",
  "tokio",
@@ -5008,9 +4986,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ac703058abac89e5c39b0b879dce2b6b14a4ba36600c7e7e3d0c60a6883ef3c"
 dependencies = [
  "defmt",
- "jiff-core",
- "jiff-static",
+ "jiff-core 0.1.2",
+ "jiff-static 0.2.39",
  "jiff-tzdb-platform",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
+ "windows-link",
+]
+
+[[package]]
+name = "jiff"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cc767b5763de45e810109520123bb2829a653f3a7ed9be40b2bc4f81158f595"
+dependencies = [
+ "jiff-core 1.0.0",
+ "jiff-static 1.0.0",
+ "jiff-tzdb 1.0.0",
  "log",
  "portable-atomic",
  "portable-atomic-util",
@@ -5029,15 +5023,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "jiff-core"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "894f7ac42105f584100691b3bf6e6b92dd12fcfa225f6c397f95c8a94b47b68f"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "jiff-static"
 version = "0.2.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dc32470c67eb7d0e9ccb74303fa925313dc04cecb1aa048beaa6f391e36a93d"
 dependencies = [
- "jiff-core",
+ "jiff-core 0.1.2",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "jiff-static"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "955491488dc99b572ea6d67b172dcd98787d00744b1fb44a5689b4e6413695a6"
+dependencies = [
+ "jiff-core 1.0.0",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -5047,12 +5062,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fa8377070c6bae868759445e5a77f66d84f0b72f3a054bfb00e6d038b8282da7"
 
 [[package]]
+name = "jiff-tzdb"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12e71a1b68a875a44a33bb7a1dd84392cb77145a3367a552a3cfe6a4f5cf3afc"
+
+[[package]]
 name = "jiff-tzdb-platform"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "875a5a69ac2bab1a891711cf5eccbec1ce0341ea805560dcd90b7a2e925132e8"
 dependencies = [
- "jiff-tzdb",
+ "jiff-tzdb 0.1.9",
 ]
 
 [[package]]
@@ -5210,9 +5231,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "lettre"
-version = "0.11.23"
+version = "0.11.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2c646bd5cc763b1087b15493e29a64be6147ba8f19342004fa52048ee596eae"
+checksum = "f294f3d7cdb313e578acef7d7727d4e8d897e0fcd0d6d58c19959cec95073f19"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -5492,7 +5513,6 @@ version = "0.1.0"
 dependencies = [
  "autumn-media-plugin",
  "autumn-web",
- "chrono",
  "example-e2e",
  "maud",
  "serde",
@@ -5809,7 +5829,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6463,15 +6483,6 @@ dependencies = [
 
 [[package]]
 name = "phf"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
-dependencies = [
- "phf_shared 0.12.1",
-]
-
-[[package]]
-name = "phf"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
@@ -6562,15 +6573,6 @@ name = "phf_shared"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67eabc2ef2a60eb7faa00097bd1ffdb5bd28e62bf39990626a582201b7a754e5"
-dependencies = [
- "siphasher",
-]
-
-[[package]]
-name = "phf_shared"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
 dependencies = [
  "siphasher",
 ]
@@ -6941,9 +6943,9 @@ dependencies = [
 
 [[package]]
 name = "printpdf"
-version = "0.12.8"
+version = "0.12.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95d50369c5e18e18d4716bd855172db3a70f9e82c966687ae051ea58138f285c"
+checksum = "91e8829ac96180b3c07de6a880766f9e0bbcbccd1869744a9d347ba0d830ae94"
 dependencies = [
  "allsorts-azul",
  "base64 0.22.1",
@@ -7035,9 +7037,9 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.14.4"
+version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+checksum = "3ef0b569d1d907ab3a28596aee62cf1f61dacb0529a4bedcd8e7460e2d5228b4"
 dependencies = [
  "bytes",
  "prost-derive",
@@ -7045,9 +7047,9 @@ dependencies = [
 
 [[package]]
 name = "prost-derive"
-version = "0.14.4"
+version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+checksum = "1ad9c5423459fa2f729b8d9235fab810aa29628b171467744fc86d21460ad70d"
 dependencies = [
  "anyhow",
  "itertools 0.14.0",
@@ -7106,9 +7108,9 @@ dependencies = [
 
 [[package]]
 name = "psl"
-version = "2.1.249"
+version = "2.1.253"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5a4e068733aa4f2ef06083331e02678699f997128ad66e57a8adc7e3f654ba0"
+checksum = "82576eafaa94759a92a0cf047f34d227665811d5cdf70f4b11e25cd813f3de54"
 dependencies = [
  "psl-types",
 ]
@@ -7234,7 +7236,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7511,7 +7513,6 @@ dependencies = [
  "async-graphql",
  "autumn-web",
  "axum",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -7528,7 +7529,7 @@ dependencies = [
 
 [[package]]
 name = "reddit-clone"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "async-stream",
  "autumn-storage-s3",
@@ -7536,7 +7537,6 @@ dependencies = [
  "aws-sdk-s3",
  "axum",
  "bytes",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -7949,7 +7949,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7982,9 +7982,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-pki-types"
-version = "1.15.1"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
+checksum = "102f35f7de7b06d8c61f1cff6592f5253e0dea431c74867aad5dfd70f44663fb"
 dependencies = [
  "web-time",
  "zeroize",
@@ -8008,7 +8008,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8076,7 +8076,6 @@ name = "saas"
 version = "0.1.0"
 dependencies = [
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -8237,13 +8236,14 @@ dependencies = [
 
 [[package]]
 name = "selectors"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8322aebea94a6cc288ff884e8a49bdbceef60206c400c6c46d22e62fc4fd91a6"
+checksum = "284ac2879477575f13b22201f7e98aa33aacc765b790536808cf580fd79339f1"
 dependencies = [
  "bitflags 2.13.2",
  "cssparser",
  "derive_more",
+ "hashbrown 0.17.1",
  "log",
  "new_debug_unreachable",
  "precomputed-hash",
@@ -8275,7 +8275,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43fb82d550b07e6f929a58d7d0935182602f48ddead875f5ee313c41c8f07fe"
 dependencies = [
  "annotate-snippets",
- "base64 0.23.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "granit-parser",
  "nohash-hasher",
@@ -8406,7 +8406,7 @@ dependencies = [
  "hex",
  "indexmap 1.9.3",
  "indexmap 2.14.2",
- "jiff",
+ "jiff 0.2.39",
  "schemars 0.9.0",
  "schemars 1.2.3",
  "serde_core",
@@ -8439,9 +8439,9 @@ dependencies = [
 
 [[package]]
 name = "servo_arc"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4eceb519ec34d8290aaf6e46f435102f2bfa63f22b05a144fb16ab266d3b198"
+checksum = "9f121f129345b5201873a0e253f630413d750b9d799613e2873fb768e592c2a7"
 dependencies = [
  "stable_deref_trait",
 ]
@@ -9121,9 +9121,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.40.1"
+version = "0.40.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e8a3edbe0394ce115f3917a00349dd242be09eb5a091ed509eaf67b55cfb8a8"
+checksum = "a86bac2f7d06e6384984118ad727f5694110f0ec44d924d05c8fdec3d030bee6"
 dependencies = [
  "libc",
  "memchr",
@@ -9167,7 +9167,6 @@ name = "teams"
 version = "0.1.0"
 dependencies = [
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -9199,10 +9198,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -9500,7 +9499,6 @@ version = "0.1.0"
 dependencies = [
  "autumn-web",
  "base64 0.23.1",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -10611,9 +10609,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.11"
+version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -10726,11 +10724,10 @@ checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "wiki"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "autumn-search",
  "autumn-web",
- "chrono",
  "diesel",
  "diesel-async",
  "diesel_migrations",
@@ -10769,7 +10766,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

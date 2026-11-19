@@ -16,8 +16,7 @@ use autumn_web::auth::{
     ApiTokenStore, DbApiTokenStore, IssueTokenSpec, hash_api_token, issue_scoped_api_token,
     list_api_tokens, rotate_api_token,
 };
-use autumn_web::time::FixedClock;
-use chrono::{Duration as ChronoDuration, TimeZone as _, Utc};
+use autumn_web::time::{FixedClock, SignedDuration, Timestamp};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -119,7 +118,7 @@ async fn db_store_issue_list_revoke_rotate_round_trip() {
 #[ignore = "requires Docker"]
 async fn db_store_filters_expired_tokens_in_sql() {
     let (pool, _container) = setup_pool().await;
-    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let now: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
     let store = DbApiTokenStore::new(pool).with_clock(Arc::new(FixedClock::at(now)));
 
     let raw = store
@@ -127,7 +126,7 @@ async fn db_store_filters_expired_tokens_in_sql() {
             principal_id: "service:ci",
             name: "ci",
             scopes: &scopes(&["posts:read"]),
-            expires_at: Some(now - ChronoDuration::seconds(1)),
+            expires_at: Some(now - SignedDuration::from_secs(1)),
         })
         .await
         .unwrap();
@@ -140,7 +139,7 @@ async fn db_store_filters_expired_tokens_in_sql() {
 #[ignore = "requires Docker"]
 async fn db_store_records_last_used_at() {
     let (pool, _container) = setup_pool().await;
-    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let now: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
     let store = DbApiTokenStore::new(pool).with_clock(Arc::new(FixedClock::at(now)));
 
     let raw = store

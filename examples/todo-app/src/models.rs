@@ -16,7 +16,8 @@ pub struct Todo {
     pub id: i64,
     pub title: String,
     pub completed: bool,
-    pub created_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 impl Todo {

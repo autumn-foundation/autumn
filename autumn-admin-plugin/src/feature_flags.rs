@@ -678,8 +678,11 @@ struct FlagRow {
     actor_allowlist: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     group_allowlist: String,
-    #[diesel(sql_type = diesel::sql_types::Timestamp)]
-    updated_at: chrono::NaiveDateTime,
+    #[diesel(
+        sql_type = diesel::sql_types::Timestamp,
+        deserialize_as = autumn_web::db::SqlDateTime
+    )]
+    updated_at: autumn_web::time::civil::DateTime,
 }
 
 impl FlagRow {
@@ -692,7 +695,7 @@ impl FlagRow {
             "rollout_pct": self.rollout_pct,
             "actor_allowlist": self.actor_allowlist,
             "group_allowlist": self.group_allowlist,
-            "updated_at": self.updated_at.and_utc().to_rfc3339(),
+            "updated_at": crate::traits::utc_rfc3339(self.updated_at),
         })
     }
 }
@@ -701,7 +704,7 @@ impl FlagRow {
 // `history_row_to_entry` below are structurally identical to their namesakes
 // in `experiments.rs` — same columns, same `actor` default. They have
 // co-changed twice (commit 3d318b55: `changed_at` Timestamptz→Timestamp +
-// `.and_utc()`; commit 10e9538e: pool type), but the surrounding query is not
+// read as UTC; commit 10e9538e: pool type), but the surrounding query is not
 // a clone: this model's `get_history` walks a rename-ancestry recursive CTE
 // (`ancestor_cte` below) that `experiments.rs` has no equivalent for, so the
 // two `get_history` bodies are a real, documented divergence, not an
@@ -718,8 +721,11 @@ struct HistoryRow {
     op: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     actor: Option<String>,
-    #[diesel(sql_type = diesel::sql_types::Timestamp)]
-    changed_at: chrono::NaiveDateTime,
+    #[diesel(
+        sql_type = diesel::sql_types::Timestamp,
+        deserialize_as = autumn_web::db::SqlDateTime
+    )]
+    changed_at: autumn_web::time::civil::DateTime,
 }
 
 fn history_row_to_entry(r: HistoryRow) -> crate::AdminHistoryEntry {
@@ -729,7 +735,7 @@ fn history_row_to_entry(r: HistoryRow) -> crate::AdminHistoryEntry {
         op: r.op,
         request_id: None,
         changes: vec![],
-        recorded_at: r.changed_at.and_utc(),
+        recorded_at: crate::traits::utc_instant(r.changed_at),
     }
 }
 
@@ -757,7 +763,7 @@ mod tests {
             id: 1,
             op: "update".to_owned(),
             actor: None,
-            changed_at: chrono::Utc::now().naive_utc(),
+            changed_at: autumn_web::time::ambient_civil_utc(),
         };
         assert_eq!(history_row_to_entry(row).actor, "cli");
     }

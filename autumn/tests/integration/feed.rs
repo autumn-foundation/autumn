@@ -1,9 +1,16 @@
 use autumn_web::feed::{Feed, FeedEntry, FeedFormat};
+use autumn_web::time::Timestamp;
 use axum::body::to_bytes;
 use axum::response::IntoResponse;
-use chrono::{TimeZone, Utc};
 use http::header::{CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use http::{HeaderMap, StatusCode};
+
+/// `year-month-day hour:00:00Z`.
+fn utc(year: i16, month: i8, day: i8, hour: i8) -> Timestamp {
+    autumn_web::time::tz::Offset::UTC
+        .to_timestamp(autumn_web::time::civil::date(year, month, day).at(hour, 0, 0, 0))
+        .unwrap()
+}
 
 fn sample_feed(format: FeedFormat) -> Feed {
     let base = match format {
@@ -18,8 +25,8 @@ fn sample_feed(format: FeedFormat) -> Feed {
             "https://example.com/feed.xml",
         ),
     };
-    let entries = (0u32..10).map(|i| {
-        let ts = Utc.with_ymd_and_hms(2026, 5, 1 + i, 12, 0, 0).unwrap();
+    let entries = (0i8..10).map(|i| {
+        let ts = utc(2026, 5, 1 + i, 12);
         FeedEntry::new(
             format!("https://example.com/posts/post-{i}"),
             format!("Post {i}"),
@@ -60,7 +67,7 @@ fn atom_defaults_feed_author_to_title_when_unset() {
     .entry(
         FeedEntry::new("https://example.com/x", "Post", "https://example.com/x")
             .summary("body")
-            .published(Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()),
+            .published(utc(2026, 5, 1, 12)),
     );
     let xml = feed.render();
     assert!(xml.contains("<author>"));
@@ -96,7 +103,7 @@ fn escapes_special_characters_no_injection() {
             "https://example.com/x",
         )
         .summary("payload ]]> break-out & <b>bold</b>")
-        .published(Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()),
+        .published(utc(2026, 5, 1, 12)),
     );
     let xml = feed.render();
     // No raw markup from user input survives.
@@ -124,7 +131,7 @@ fn drops_xml_illegal_control_characters() {
             "https://example.com/x",
         )
         .summary("body\u{0}with\u{8}controls")
-        .published(Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()),
+        .published(utc(2026, 5, 1, 12)),
     );
     let xml = feed.render();
     // Illegal controls are gone...
@@ -150,7 +157,7 @@ fn keeps_legal_whitespace_in_text() {
             "Line\tone\nLine two",
             "https://example.com/x",
         )
-        .published(Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()),
+        .published(utc(2026, 5, 1, 12)),
     );
     let xml = feed.render();
     assert!(xml.contains("Line\tone\nLine two"));
@@ -234,7 +241,7 @@ fn feed_etag_is_weak() {
 
 #[test]
 fn etag_changes_when_content_changes_within_same_second() {
-    let ts = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+    let ts = utc(2026, 5, 1, 12);
     let mk = |title: &str| {
         Feed::atom(
             "Blog",
@@ -276,10 +283,10 @@ fn empty_feed_renders_deterministically() {
 }
 
 // Issue #3093: an out-of-range date must not panic. The feed clamps it to
-// the nearest limit: years 0000–9999 for Atom, 1900–9999 for RSS and HTTP.
+// the nearest limit: year 0000 for Atom, 1900 for RSS and HTTP, and
+// `Timestamp::MAX` (9999-12-30T22:00Z) at the top for every format.
 
-fn feed_with_date(format: FeedFormat, year: i32) -> Feed {
-    let date = Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap();
+fn feed_with_date(format: FeedFormat, date: Timestamp) -> Feed {
     let base = match format {
         FeedFormat::Atom => Feed::atom("t", "https://example.com/", "https://example.com/feed.xml"),
         FeedFormat::Rss => Feed::rss("t", "https://example.com/", "https://example.com/feed.xml"),
@@ -288,73 +295,76 @@ fn feed_with_date(format: FeedFormat, year: i32) -> Feed {
 }
 
 #[test]
-fn rss_clamps_out_of_range_years() {
-    for (year, expected) in [
-        (10_000, "Fri, 31 Dec 9999 23:59:59 +0000"),
-        (262_000, "Fri, 31 Dec 9999 23:59:59 +0000"),
-        (-1, "Mon, 1 Jan 1900 00:00:00 +0000"),
-        (1899, "Mon, 1 Jan 1900 00:00:00 +0000"),
+fn rss_clamps_out_of_range_dates() {
+    for (date, expected) in [
+        (Timestamp::MAX, "Thu, 30 Dec 9999 22:00:00 +0000"),
+        (Timestamp::MIN, "Mon, 1 Jan 1900 00:00:00 +0000"),
+        (utc(-1, 1, 1, 0), "Mon, 1 Jan 1900 00:00:00 +0000"),
+        (utc(1899, 1, 1, 0), "Mon, 1 Jan 1900 00:00:00 +0000"),
     ] {
-        let xml = feed_with_date(FeedFormat::Rss, year).render();
+        let xml = feed_with_date(FeedFormat::Rss, date).render();
         assert!(
             xml.contains(&format!("<pubDate>{expected}</pubDate>")),
-            "year {year}: {xml}"
+            "{date}: {xml}"
         );
         assert!(
             xml.contains(&format!("<lastBuildDate>{expected}</lastBuildDate>")),
-            "year {year}: {xml}"
+            "{date}: {xml}"
         );
     }
 }
 
 #[test]
-fn atom_clamps_out_of_range_years() {
-    for (year, expected) in [
-        (10_000, "9999-12-31T23:59:59Z"),
-        (262_000, "9999-12-31T23:59:59Z"),
-        (-1, "0000-01-01T00:00:00Z"),
+fn atom_clamps_out_of_range_dates() {
+    for (date, expected) in [
+        (Timestamp::MAX, "9999-12-30T22:00:00Z"),
+        (Timestamp::MIN, "0000-01-01T00:00:00Z"),
+        (utc(-1, 1, 1, 0), "0000-01-01T00:00:00Z"),
     ] {
-        let xml = feed_with_date(FeedFormat::Atom, year).render();
+        let xml = feed_with_date(FeedFormat::Atom, date).render();
         assert!(
             xml.contains(&format!("<published>{expected}</published>")),
-            "year {year}: {xml}"
+            "{date}: {xml}"
         );
         assert_eq!(
             xml.matches(&format!("<updated>{expected}</updated>"))
                 .count(),
             2,
-            "year {year}: feed and entry <updated> must clamp: {xml}"
+            "{date}: feed and entry <updated> must clamp: {xml}"
         );
     }
 }
 
 #[test]
 fn in_range_years_are_not_changed() {
-    let atom = feed_with_date(FeedFormat::Atom, 9999).render();
+    let atom = feed_with_date(FeedFormat::Atom, utc(9999, 1, 1, 0)).render();
     assert!(atom.contains("<published>9999-01-01T00:00:00Z</published>"));
-    let atom = feed_with_date(FeedFormat::Atom, 0).render();
+    let atom = feed_with_date(FeedFormat::Atom, utc(0, 1, 1, 0)).render();
     assert!(atom.contains("<published>0000-01-01T00:00:00Z</published>"));
-    let rss = feed_with_date(FeedFormat::Rss, 1900).render();
+    let rss = feed_with_date(FeedFormat::Rss, utc(1900, 1, 1, 0)).render();
     assert!(rss.contains("<pubDate>Mon, 1 Jan 1900 00:00:00 +0000</pubDate>"));
 }
 
 #[tokio::test]
-async fn out_of_range_year_does_not_panic_the_response_paths() {
+async fn out_of_range_dates_do_not_panic_the_response_paths() {
     for format in [FeedFormat::Atom, FeedFormat::Rss] {
-        let _ = feed_with_date(format, 10_000).etag();
-        let resp = feed_with_date(format, 10_000).into_response();
-        assert_eq!(resp.status(), StatusCode::OK);
+        for date in [Timestamp::MAX, Timestamp::MIN] {
+            let _ = feed_with_date(format, date).etag();
+            let resp = feed_with_date(format, date).into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
     }
 }
 
 #[tokio::test]
 async fn conditional_clamps_last_modified() {
-    for (year, expected) in [
-        (10_000, "Fri, 31 Dec 9999 23:59:59 GMT"),
-        (-1, "Mon, 01 Jan 1900 00:00:00 GMT"),
+    for (date, expected) in [
+        (Timestamp::MAX, "Thu, 30 Dec 9999 22:00:00 GMT"),
+        (Timestamp::MIN, "Mon, 01 Jan 1900 00:00:00 GMT"),
+        (utc(-1, 1, 1, 0), "Mon, 01 Jan 1900 00:00:00 GMT"),
     ] {
-        let resp = feed_with_date(FeedFormat::Rss, year).conditional(&HeaderMap::new());
+        let resp = feed_with_date(FeedFormat::Rss, date).conditional(&HeaderMap::new());
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers()[LAST_MODIFIED], expected, "year {year}");
+        assert_eq!(resp.headers()[LAST_MODIFIED], expected, "{date}");
     }
 }

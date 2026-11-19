@@ -96,6 +96,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/query_string.rs:default
   autumn/src/idempotency.rs:default
   autumn/src/time_math.rs:default
+  autumn/src/time/compat.rs:default
   autumn/src/mail.rs:mail
   autumn/src/inbound_mail.rs:inbound-mail
   autumn/src/channels.rs:ws

@@ -12,6 +12,8 @@ use async_graphql::{
 use autumn_web::reexports::diesel::prelude::*;
 use autumn_web::reexports::diesel_async::RunQueryDsl;
 use autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+use autumn_web::time::compat;
+use autumn_web::time::tz::TimeZone;
 use autumn_web::{AppState, AutumnError};
 
 use crate::models::{NewNote, Note};
@@ -41,8 +43,11 @@ impl Note {
         self.pinned
     }
     /// RFC 3339 UTC timestamp, so the client needs no date library.
-    async fn created_at(&self) -> String {
-        self.created_at.and_utc().to_rfc3339()
+    async fn created_at(&self) -> Result<String> {
+        let at = TimeZone::UTC
+            .to_timestamp(self.created_at)
+            .map_err(|err| async_graphql::Error::new(format!("created_at out of range: {err}")))?;
+        Ok(compat::rfc3339(at))
     }
 }
 

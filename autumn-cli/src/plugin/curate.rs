@@ -950,7 +950,7 @@ fn listing_in(src: &str, name: &str) -> Result<Listing, String> {
 /// Apply every report and exemption, then write the file once. Nothing is
 /// written when any step fails, or when the result breaks an admission rule.
 fn record(opts: &RecordOptions<'_>) -> Result<Vec<String>, String> {
-    if chrono::NaiveDate::parse_from_str(opts.date, "%Y-%m-%d").is_err() {
+    if jiff::civil::Date::strptime("%Y-%m-%d", opts.date).is_err() {
         return Err(format!("`--date {}` is not a YYYY-MM-DD date", opts.date));
     }
     if semver::Version::parse(opts.against).is_err() {

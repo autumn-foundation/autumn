@@ -811,7 +811,7 @@ autumn_web::app()
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-cache-redis = "0.10"
+autumn-cache-redis = "0.11"
 ```
 
 `CacheResponseLayer::from_app(&state)` returns `Some(layer)` wired to the
@@ -892,9 +892,9 @@ pub struct Article {
     #[lock_version]
     pub lock_version: i32,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub updated_at: chrono::NaiveDateTime,
+    pub updated_at: autumn_web::time::civil::DateTime,
 }
 ```
 

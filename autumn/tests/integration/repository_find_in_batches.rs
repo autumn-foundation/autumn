@@ -57,7 +57,7 @@ pub struct BatchSoftRecord {
     pub id: i64,
     pub name: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(BatchSoftRecord, table = "test_batch_soft_records", soft_delete)]

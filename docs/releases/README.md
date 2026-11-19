@@ -13,6 +13,12 @@ new in this one?" and does not want 145 changelog entries.
 
 ## Index
 
+- [`0.11.0.md`](0.11.0.md) — *Trust less, contract more*: the tenant
+  header and edge request headers are untrusted by default; events and
+  outbox messages are wire contracts, with protobuf and Avro exports and
+  outbox delivery to another service; a Postgres role and schema per
+  boundary; a fleet engine seam with memory budgets and generation shipping;
+  role-aware background tasks and one Kubernetes workload per role.
 - [`0.10.0.md`](0.10.0.md) — *Pay for what you use, run it in more shapes*:
   module and widget-family features, optional `jwt` and `push`; named role
   presets, capabilities and route groups mounted per role; design tokens v2

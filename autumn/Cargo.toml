@@ -138,7 +138,6 @@ db = [
     "dep:scoped-futures",
     # The fleet core takes OS file locks on its root (path and volume locks).
     "dep:fd-lock",
-    "diesel/chrono",
     "diesel/serde_json",
     # The repository layer records history, money and retention itself.
     "ledger",
@@ -379,7 +378,7 @@ edge = ["dep:autumn-edge"]
 plugin-sandbox = ["dep:wasmi"]
 
 [dependencies]
-autumn-edge = { version = "0.10.0", path = "../autumn-edge", optional = true }
+autumn-edge = { version = "0.11.0", path = "../autumn-edge", optional = true }
 # Pure-Rust WebAssembly interpreter behind the `plugin-sandbox` feature. Already
 # resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
 # new crate to the workspace graph. Licensed MIT OR Apache-2.0.
@@ -394,11 +393,11 @@ wasmi = { version = "0.40", optional = true }
 # could never reach those macros anyway (their re-exports are `#[cfg(feature =
 # "db")]` in `src/lib.rs`), and skipping them cuts macro compile time by ~90%
 # on the no-DB onboarding path (issue #2309).
-autumn-macros = { version = "0.10.0", path = "../autumn-macros", default-features = false }
+autumn-macros = { version = "0.11.0", path = "../autumn-macros", default-features = false }
 # Database-layer proc macros, split out of `autumn-macros` so a no-database
 # build never compiles their codegen. Optional: enabled by the `db` feature.
-autumn-macros-model = { version = "0.10.0", path = "../autumn-macros-model", optional = true }
-autumn-macros-repository = { version = "0.10.0", path = "../autumn-macros-repository", optional = true }
+autumn-macros-model = { version = "0.11.0", path = "../autumn-macros-model", optional = true }
+autumn-macros-repository = { version = "0.11.0", path = "../autumn-macros-repository", optional = true }
 axum.workspace = true
 # 1.9 for `Bytes::from_owner`, which is what lets a response buffer own the
 # sandbox concurrency permit and release it exactly when the last handle drops.
@@ -514,11 +513,10 @@ validator.workspace = true
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.10"
 rand_chacha = "0.10"
-chrono = { workspace = true }
-chrono-tz.workspace = true
+jiff.workspace = true
 # `serde` is a default feature, named here because `SqliteDecimal` depends on it.
 rust_decimal = { workspace = true, features = ["serde"] }
-croner = "4.0.2"
+croner = { version = "4.0.3", default-features = false }
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 proptest = { version = "1.4", optional = true }
@@ -593,7 +591,7 @@ lettre = { version = "0.11.21", default-features = false, features = ["builder",
 # optional network (`http`/reqwest) and local-file stylesheet fetchers — Autumn
 # only inlines embedded `<style>` blocks, never remote CSS — keeping the added
 # graph to the html5ever/selectors parsing stack. Gated behind the `mail` feature.
-css-inline = { version = "0.23", default-features = false, optional = true }
+css-inline = { version = "0.24", default-features = false, optional = true }
 chromiumoxide = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 
@@ -641,7 +639,7 @@ autumn-schema-core = { path = "../autumn-schema-core" }
 # Criterion benches (issue #3068, `benches/admission.rs`). No plots: only the
 # statistics and the `cargo bench` harness.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-diesel = { version = "2", features = ["chrono", "postgres"] }
+diesel = { version = "2", features = ["postgres"] }
 # `rust_decimal`'s diesel impls (`AsExpression<Numeric>`, `ToSql`/`FromSql` on
 # the Pg backend) back the `#[model]` Postgres-`Decimal` integration test
 # (issue #2597): generated apps get `db-diesel2-postgres` from the model

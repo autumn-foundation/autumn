@@ -63,9 +63,9 @@ impl ConflictResolver for LwwResolver {
 mod tests {
     use super::*;
     use crate::sync::protocol::Op;
-    use chrono::{Duration, Utc};
+    use crate::time::{SignedDuration, Timestamp};
 
-    fn client_change(updated_at: chrono::DateTime<Utc>) -> Change {
+    fn client_change(updated_at: Timestamp) -> Change {
         Change {
             change_id: "c1".into(),
             collection: "notes".into(),
@@ -77,7 +77,7 @@ mod tests {
         }
     }
 
-    fn server_row(updated_at: chrono::DateTime<Utc>, device_id: &str) -> RemoteRow {
+    fn server_row(updated_at: Timestamp, device_id: &str) -> RemoteRow {
         RemoteRow {
             collection: "notes".into(),
             pk: "n1".into(),
@@ -91,10 +91,10 @@ mod tests {
 
     #[test]
     fn newer_client_write_wins() {
-        let now = Utc::now();
+        let now = crate::time::ambient_now();
         let verdict = LwwResolver.resolve(
             "device-b",
-            &client_change(now + Duration::seconds(5)),
+            &client_change(now + SignedDuration::from_secs(5)),
             &server_row(now, "device-a"),
         );
         assert_eq!(verdict, Resolution::TakeClient);
@@ -102,10 +102,10 @@ mod tests {
 
     #[test]
     fn newer_server_write_wins() {
-        let now = Utc::now();
+        let now = crate::time::ambient_now();
         let verdict = LwwResolver.resolve(
             "device-b",
-            &client_change(now - Duration::seconds(5)),
+            &client_change(now - SignedDuration::from_secs(5)),
             &server_row(now, "device-a"),
         );
         assert_eq!(verdict, Resolution::KeepServer);
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn exact_tie_breaks_on_device_id_deterministically() {
-        let now = Utc::now();
+        let now = crate::time::ambient_now();
         let win = LwwResolver.resolve(
             "device-b",
             &client_change(now),
