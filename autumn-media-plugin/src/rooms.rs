@@ -93,7 +93,8 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
-use chrono::{DateTime, Duration, Utc};
+use autumn_web::time::ambient_now;
+use jiff::{SignedDuration, Timestamp};
 use serde::{Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
@@ -323,7 +324,7 @@ impl RoomError {
 struct RoomParticipant {
     id: String,
     display_name: Option<String>,
-    joined_at: DateTime<Utc>,
+    joined_at: Timestamp,
     token: SessionToken,
     /// Advisory metadata only, for a future media-auth slice.
     ///
@@ -332,7 +333,7 @@ struct RoomParticipant {
     /// `MediaMTX` does not verify these tokens yet — so it must never gate a
     /// lifecycle operation (leave, heartbeat, roster auth). Verification is
     /// value-only (see [`verify_token`](Self::verify_token)).
-    token_expires_at: DateTime<Utc>,
+    token_expires_at: Timestamp,
     /// Liveness clock for the idle-participant reaper (see [`reap_stale`]).
     ///
     /// Seeded to `joined_at` and refreshed to `now` by either explicit signal:
@@ -340,7 +341,7 @@ struct RoomParticipant {
     /// [`RoomStore::roster`]). A client doing either stays fresh; one that does
     /// neither ages out and is reclaimed. Liveness is client-driven, not
     /// media-derived — see the module-level *Known limitations* note.
-    last_seen_at: DateTime<Utc>,
+    last_seen_at: Timestamp,
 }
 
 impl RoomParticipant {
@@ -363,7 +364,8 @@ pub struct ParticipantView {
     /// The participant's optional display name.
     pub display_name: Option<String>,
     /// When the participant joined.
-    pub joined_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub joined_at: Timestamp,
 }
 
 /// A room's public snapshot (never carries a token).
@@ -377,7 +379,8 @@ pub struct RoomSnapshot {
     /// The room's participant cap.
     pub max_participants: usize,
     /// When the room was created.
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub created_at: Timestamp,
     /// The current roster (token-free), ordered by join time then id.
     pub participants: Vec<ParticipantView>,
 }
@@ -387,7 +390,7 @@ struct Room {
     id: String,
     namespace: String,
     max_participants: usize,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     participants: HashMap<String, RoomParticipant>,
 }
 
@@ -430,7 +433,7 @@ pub struct JoinRecord {
     /// The minted session token (returned to the joining participant).
     pub token: SessionToken,
     /// When the token expires.
-    pub token_expires_at: DateTime<Utc>,
+    pub token_expires_at: Timestamp,
     /// A snapshot of the room *after* the join (includes the new participant).
     pub room: RoomSnapshot,
 }
@@ -513,7 +516,7 @@ pub trait RoomStore: Send + Sync {
         namespace: &'a str,
         room_id: &'a str,
         display_name: Option<String>,
-        token_ttl: Duration,
+        token_ttl: SignedDuration,
     ) -> RoomStoreFuture<'a, JoinRecord>;
 
     /// Remove a participant from the room after verifying its token by value.
@@ -556,7 +559,7 @@ pub trait RoomStore: Send + Sync {
         namespace: &'a str,
         room_id: &'a str,
         auth_token: &'a str,
-        session_max: Duration,
+        session_max: SignedDuration,
     ) -> RoomStoreFuture<'a, RoomSnapshot>;
 
     /// Refresh a participant's liveness clock and renew its advisory token
@@ -587,9 +590,9 @@ pub trait RoomStore: Send + Sync {
         room_id: &'a str,
         participant_id: &'a str,
         token: &'a str,
-        token_ttl: Duration,
-        session_max: Duration,
-    ) -> RoomStoreFuture<'a, DateTime<Utc>>;
+        token_ttl: SignedDuration,
+        session_max: SignedDuration,
+    ) -> RoomStoreFuture<'a, Timestamp>;
 
     /// Reclaim stale participants and idle rooms, returning what was reaped.
     ///
@@ -608,7 +611,7 @@ pub trait RoomStore: Send + Sync {
     /// this a single atomic conditional delete so concurrent reapers across
     /// processes converge (last-write-wins) — see
     /// [`DbRoomStore::reap_stale`](crate::rooms_db::DbRoomStore).
-    fn reap_stale(&self, now: DateTime<Utc>, idle_ttl: Duration) -> ReapFuture<'_>;
+    fn reap_stale(&self, now: Timestamp, idle_ttl: SignedDuration) -> ReapFuture<'_>;
 }
 
 /// The token expiry a heartbeat at `now` renews to, or `None` when the session
@@ -619,13 +622,25 @@ pub trait RoomStore: Send + Sync {
 /// [`RoomStore`] applies this rule in [`RoomStore::heartbeat`].
 #[must_use]
 pub fn renewed_expiry(
-    joined_at: DateTime<Utc>,
-    now: DateTime<Utc>,
-    token_ttl: Duration,
-    session_max: Duration,
-) -> Option<DateTime<Utc>> {
-    let session_end = joined_at + session_max;
-    (now < session_end).then(|| (now + token_ttl).min(session_end))
+    joined_at: Timestamp,
+    now: Timestamp,
+    token_ttl: SignedDuration,
+    session_max: SignedDuration,
+) -> Option<Timestamp> {
+    let session_end = saturating_add(joined_at, session_max);
+    (now < session_end).then(|| saturating_add(now, token_ttl).min(session_end))
+}
+
+/// `ts + delta`, saturating at [`Timestamp::MAX`] / [`Timestamp::MIN`]
+/// instead of panicking when the sum leaves `Timestamp`'s range.
+pub(crate) fn saturating_add(ts: Timestamp, delta: SignedDuration) -> Timestamp {
+    ts.checked_add(delta).unwrap_or_else(|_| {
+        if delta.is_negative() {
+            Timestamp::MIN
+        } else {
+            Timestamp::MAX
+        }
+    })
 }
 
 /// Capacity backstop on the number of rooms an [`InMemoryRoomStore`] holds.
@@ -722,7 +737,7 @@ impl RoomStore for InMemoryRoomStore {
                 id: id.clone(),
                 namespace: namespace.to_owned(),
                 max_participants,
-                created_at: Utc::now(),
+                created_at: ambient_now(),
                 participants: HashMap::new(),
             };
             let snapshot = room.snapshot();
@@ -747,7 +762,7 @@ impl RoomStore for InMemoryRoomStore {
         namespace: &'a str,
         room_id: &'a str,
         display_name: Option<String>,
-        token_ttl: Duration,
+        token_ttl: SignedDuration,
     ) -> RoomStoreFuture<'a, JoinRecord> {
         Box::pin(async move {
             let mut rooms = self.rooms.write().expect("room store lock poisoned");
@@ -759,7 +774,7 @@ impl RoomStore for InMemoryRoomStore {
                     max: room.max_participants,
                 });
             }
-            let now = Utc::now();
+            let now = ambient_now();
             let participant_id = Uuid::new_v4().to_string();
             let token = SessionToken::generate();
             let participant = RoomParticipant {
@@ -767,7 +782,7 @@ impl RoomStore for InMemoryRoomStore {
                 display_name,
                 joined_at: now,
                 token: token.clone(),
-                token_expires_at: now + token_ttl,
+                token_expires_at: saturating_add(now, token_ttl),
                 last_seen_at: now,
             };
             // The stored record is the single source of truth for the advisory
@@ -820,7 +835,7 @@ impl RoomStore for InMemoryRoomStore {
         namespace: &'a str,
         room_id: &'a str,
         auth_token: &'a str,
-        session_max: Duration,
+        session_max: SignedDuration,
     ) -> RoomStoreFuture<'a, RoomSnapshot> {
         Box::pin(async move {
             // A write lock (not a shared read) because a successful member read
@@ -837,12 +852,12 @@ impl RoomStore for InMemoryRoomStore {
             // non-member cannot probe room existence or their own membership. On a
             // match, touch that member's liveness clock (see `reap_stale`).
             // A member past `joined_at + session_max` is refused the same way.
-            let now = Utc::now();
+            let now = ambient_now();
             let member = room
                 .participants
                 .values_mut()
                 .find(|participant| participant.verify_token(auth_token))
-                .filter(|participant| now < participant.joined_at + session_max)
+                .filter(|participant| now < saturating_add(participant.joined_at, session_max))
                 .ok_or(RoomError::RoomNotFound)?;
             member.last_seen_at = now;
             let snapshot = room.snapshot();
@@ -857,9 +872,9 @@ impl RoomStore for InMemoryRoomStore {
         room_id: &'a str,
         participant_id: &'a str,
         token: &'a str,
-        token_ttl: Duration,
-        session_max: Duration,
-    ) -> RoomStoreFuture<'a, DateTime<Utc>> {
+        token_ttl: SignedDuration,
+        session_max: SignedDuration,
+    ) -> RoomStoreFuture<'a, Timestamp> {
         Box::pin(async move {
             let mut rooms = self.rooms.write().expect("room store lock poisoned");
             // Every miss below collapses to `RoomNotFound`: no membership oracle.
@@ -873,7 +888,7 @@ impl RoomStore for InMemoryRoomStore {
             if !participant.verify_token(token) {
                 return Err(RoomError::RoomNotFound);
             }
-            let now = Utc::now();
+            let now = ambient_now();
             let renewed = renewed_expiry(participant.joined_at, now, token_ttl, session_max)
                 .ok_or(RoomError::RoomNotFound)?;
             participant.last_seen_at = now;
@@ -883,7 +898,7 @@ impl RoomStore for InMemoryRoomStore {
         })
     }
 
-    fn reap_stale(&self, now: DateTime<Utc>, idle_ttl: Duration) -> ReapFuture<'_> {
+    fn reap_stale(&self, now: Timestamp, idle_ttl: SignedDuration) -> ReapFuture<'_> {
         Box::pin(async move {
             let mut stats = ReapStats::default();
             let mut rooms = self.rooms.write().expect("room store lock poisoned");
@@ -895,7 +910,7 @@ impl RoomStore for InMemoryRoomStore {
                 // Evict any participant idle past the horizon (last observed —
                 // via join, heartbeat or roster poll — more than `idle_ttl` ago).
                 room.participants.retain(|_id, participant| {
-                    now.signed_duration_since(participant.last_seen_at) < idle_ttl
+                    now.duration_since(participant.last_seen_at) < idle_ttl
                 });
                 let reaped = before - room.participants.len();
                 stats.participants_reaped += reaped;
@@ -905,8 +920,7 @@ impl RoomStore for InMemoryRoomStore {
                     // TTL. Gating (b) on `created_at` age avoids reaping a room in
                     // the brief create→first-join window. Dropping an empty room can
                     // never harm a live participant.
-                    let drop_room =
-                        reaped > 0 || now.signed_duration_since(room.created_at) >= idle_ttl;
+                    let drop_room = reaped > 0 || now.duration_since(room.created_at) >= idle_ttl;
                     if drop_room {
                         stats.rooms_reaped += 1;
                         return false;
@@ -932,13 +946,6 @@ const ROOM_REAPER_INTERVAL_SECONDS: u64 = 60;
 /// minutes (crashed, abandoned, or never sent leave) ages out.
 const ROOM_IDLE_TTL_SECONDS: u64 = 900;
 
-/// Upper bound (10 years, in seconds) applied to the reaper idle-TTL before it
-/// is turned into a [`chrono::Duration`]. `chrono::Duration::seconds` panics on
-/// values that overflow its internal millisecond representation, so a hostile /
-/// fat-fingered `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS` is clamped here rather
-/// than crashing the reaper spawn.
-const MAX_REAPER_TTL_SECONDS: i64 = 315_360_000;
-
 /// Read a positive `u64` from `key`, falling back to `default` on
 /// unset / blank / unparseable / zero. Keeps the reaper tunable without
 /// threading a field through `MediaConfig` (a documented follow-up).
@@ -950,18 +957,14 @@ fn env_positive_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Clamp a raw idle-TTL seconds value into a chrono [`Duration`].
+/// Turn a raw idle-TTL seconds value into a [`SignedDuration`].
 ///
-/// `chrono::Duration::seconds` panics on values that overflow its internal
-/// higher-precision (millisecond) representation, so a hostile / fat-fingered
-/// `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS` (up to `u64::MAX`) is clamped to
-/// [`MAX_REAPER_TTL_SECONDS`] rather than crashing the reaper spawn.
-fn clamp_reaper_ttl(idle_ttl_secs: u64) -> Duration {
-    Duration::seconds(
-        i64::try_from(idle_ttl_secs)
-            .unwrap_or(MAX_REAPER_TTL_SECONDS)
-            .min(MAX_REAPER_TTL_SECONDS),
-    )
+/// `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS` can be up to `u64::MAX`, past
+/// `i64::MAX`, so a value that does not fit saturates at `i64::MAX` seconds
+/// rather than wrapping or crashing the reaper spawn. A TTL that long reaps
+/// nothing: every sweep saturates its cutoff instead of overflowing.
+fn clamp_reaper_ttl(idle_ttl_secs: u64) -> SignedDuration {
+    SignedDuration::from_secs(i64::try_from(idle_ttl_secs).unwrap_or(i64::MAX))
 }
 
 /// Reap the idle rooms and stale participants of `store` until `shutdown` is
@@ -999,7 +1002,7 @@ pub async fn run_room_reaper(store: Arc<dyn RoomStore>, shutdown: CancellationTo
 pub(crate) async fn run_room_reaper_every(
     store: Arc<dyn RoomStore>,
     interval: std::time::Duration,
-    idle_ttl: Duration,
+    idle_ttl: SignedDuration,
     shutdown: CancellationToken,
 ) {
     let mut ticker = tokio::time::interval(interval);
@@ -1011,7 +1014,7 @@ pub(crate) async fn run_room_reaper_every(
         }
         let stats = tokio::select! {
             () = shutdown.cancelled() => return,
-            stats = store.reap_stale(Utc::now(), idle_ttl) => stats,
+            stats = store.reap_stale(ambient_now(), idle_ttl) => stats,
         };
         if stats.rooms_reaped > 0 || stats.participants_reaped > 0 {
             tracing::info!(
@@ -1063,7 +1066,8 @@ pub struct JoinResponse {
     /// The minted session token (returned only to the joining participant).
     pub session_token: SessionToken,
     /// When the token expires.
-    pub token_expires_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub token_expires_at: Timestamp,
     /// The participant's own publish target.
     pub publish: PublishTarget,
     /// One subscribe target per *other* participant (the mesh).
@@ -1085,7 +1089,8 @@ pub struct RosterEntry {
     /// The participant's optional display name.
     pub display_name: Option<String>,
     /// When the participant joined.
-    pub joined_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub joined_at: Timestamp,
     /// The participant's `MediaMTX` path.
     pub path: String,
     /// The `WHEP` read (subscribe) URL for that path.
@@ -1104,7 +1109,8 @@ pub struct RoomRoster {
     /// The room's participant cap.
     pub max_participants: usize,
     /// When the room was created.
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub created_at: Timestamp,
     /// The current roster, each entry carrying a subscribe target.
     pub participants: Vec<RosterEntry>,
 }
@@ -1121,8 +1127,8 @@ pub struct RoomService {
     store: Arc<dyn RoomStore>,
     urls: MediaUrls,
     namespace: String,
-    token_ttl: Duration,
-    session_max: Duration,
+    token_ttl: SignedDuration,
+    session_max: SignedDuration,
     max_participants: usize,
     rate_limit_per_minute: u32,
 }
@@ -1134,7 +1140,7 @@ impl RoomService {
         store: Arc<dyn RoomStore>,
         urls: MediaUrls,
         namespace: impl Into<String>,
-        token_ttl: Duration,
+        token_ttl: SignedDuration,
         max_participants: usize,
     ) -> Self {
         Self {
@@ -1142,7 +1148,7 @@ impl RoomService {
             urls,
             namespace: namespace.into(),
             token_ttl,
-            session_max: Duration::seconds(i64::from(
+            session_max: SignedDuration::from_secs(i64::from(
                 crate::config::DEFAULT_ROOM_SESSION_MAX_SECONDS,
             )),
             max_participants,
@@ -1173,7 +1179,7 @@ impl RoomService {
     /// [`DEFAULT_ROOM_SESSION_MAX_SECONDS`](crate::config::DEFAULT_ROOM_SESSION_MAX_SECONDS).
     /// Keep it at least the token TTL; this builder does not check it.
     #[must_use]
-    pub const fn with_session_max(mut self, session_max: Duration) -> Self {
+    pub const fn with_session_max(mut self, session_max: SignedDuration) -> Self {
         self.session_max = session_max;
         self
     }
@@ -1186,7 +1192,7 @@ impl RoomService {
 
     /// The maximum session length, counted from the join.
     #[must_use]
-    pub const fn session_max(&self) -> Duration {
+    pub const fn session_max(&self) -> SignedDuration {
         self.session_max
     }
 
@@ -1423,7 +1429,8 @@ pub struct HeartbeatResponse {
     ///
     /// Advisory only: nothing verifies it yet (see [`RoomStore::heartbeat`]).
     /// Clients use it to pace the next heartbeat.
-    pub token_expires_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub token_expires_at: Timestamp,
 }
 
 /// Resolve the installed [`RoomService`] or fail with a `500`.
@@ -1659,11 +1666,11 @@ fn room_route(method: &str, path: String, handler: &str) -> RouteInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        HeartbeatRequest, InMemoryRoomStore, LeaveRequest, MAX_DISPLAY_NAME_CHARS,
-        MAX_REAPER_TTL_SECONDS, ReapStats, Room, RoomError, RoomParticipant, RoomRateGate,
-        RoomService, RoomStore, SessionToken, bearer_token, clamp_reaper_ttl, renewed_expiry,
-        room_participant_path, room_route_infos, room_router, room_service, rooms_heartbeat,
-        rooms_roster, run_room_reaper_every, validate_room_segment,
+        HeartbeatRequest, HeartbeatResponse, InMemoryRoomStore, LeaveRequest,
+        MAX_DISPLAY_NAME_CHARS, ParticipantView, ReapStats, Room, RoomError, RoomParticipant,
+        RoomRateGate, RoomService, RoomSnapshot, RoomStore, SessionToken, bearer_token,
+        clamp_reaper_ttl, renewed_expiry, room_participant_path, room_route_infos, room_router,
+        room_service, rooms_heartbeat, rooms_roster, run_room_reaper_every, validate_room_segment,
     };
     use crate::config::MediaMtxConfig;
     use crate::transport::MediaUrls;
@@ -1673,7 +1680,8 @@ mod tests {
     use autumn_web::reexports::axum::extract::{ConnectInfo, Path, State};
     use autumn_web::reexports::http::{HeaderMap, Request, StatusCode, header};
     use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-    use chrono::{DateTime, Duration, Utc};
+    use autumn_web::time::ambient_now;
+    use jiff::{SignedDuration, Timestamp};
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -1690,9 +1698,43 @@ mod tests {
             Arc::new(InMemoryRoomStore::new(6)),
             urls(),
             namespace,
-            Duration::seconds(300),
+            SignedDuration::from_secs(300),
             6,
         )
+    }
+
+    // ── Wire format ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn response_timestamps_keep_their_json_shape() {
+        // RFC 3339 with `Z` and a 0/3/6/9-digit fraction: a `.1` second is
+        // written `.100`, a whole second has no fraction.
+        let joined: Timestamp = "2026-05-14T10:00:00.1Z".parse().expect("timestamp");
+        let created: Timestamp = "2026-05-14T09:00:00Z".parse().expect("timestamp");
+        let snapshot = RoomSnapshot {
+            id: "room-1".to_owned(),
+            namespace: String::new(),
+            max_participants: 6,
+            created_at: created,
+            participants: vec![ParticipantView {
+                id: "p1".to_owned(),
+                display_name: None,
+                joined_at: joined,
+            }],
+        };
+        let json = serde_json::to_value(&snapshot).expect("serialize");
+        assert_eq!(json["created_at"], "2026-05-14T09:00:00Z");
+        assert_eq!(
+            json["participants"][0]["joined_at"],
+            "2026-05-14T10:00:00.100Z"
+        );
+
+        let heartbeat = HeartbeatResponse {
+            alive: true,
+            token_expires_at: "2026-05-14T10:05:00.123456Z".parse().expect("timestamp"),
+        };
+        let json = serde_json::to_value(&heartbeat).expect("serialize");
+        assert_eq!(json["token_expires_at"], "2026-05-14T10:05:00.123456Z");
     }
 
     // ── Reaper TTL clamp ─────────────────────────────────────────────────────
@@ -1700,13 +1742,12 @@ mod tests {
     #[test]
     fn reaper_ttl_clamps_overflowing_value_without_panicking() {
         // A sane operator value passes through unchanged.
-        assert_eq!(clamp_reaper_ttl(900), Duration::seconds(900));
-        // A hostile / fat-fingered value that would overflow
-        // `chrono::Duration::seconds`'s internal millisecond representation is
-        // clamped to the 10-year maximum instead of panicking.
+        assert_eq!(clamp_reaper_ttl(900), SignedDuration::from_secs(900));
+        // A hostile / fat-fingered value past `i64::MAX` saturates instead of
+        // wrapping or panicking.
         assert_eq!(
             clamp_reaper_ttl(u64::MAX),
-            Duration::seconds(MAX_REAPER_TTL_SECONDS)
+            SignedDuration::from_secs(i64::MAX)
         );
     }
 
@@ -1937,7 +1978,7 @@ mod tests {
             Arc::new(InMemoryRoomStore::new(6)),
             urls(),
             "",
-            Duration::seconds(300),
+            SignedDuration::from_secs(300),
             6,
         );
         let room = service.create().await.unwrap();
@@ -1956,8 +1997,14 @@ mod tests {
     #[tokio::test]
     async fn rooms_never_leak_across_namespaces() {
         let store = Arc::new(InMemoryRoomStore::new(6));
-        let ns_a = RoomService::new(store.clone(), urls(), "a", Duration::seconds(300), 6);
-        let ns_b = RoomService::new(store, urls(), "b", Duration::seconds(300), 6);
+        let ns_a = RoomService::new(
+            store.clone(),
+            urls(),
+            "a",
+            SignedDuration::from_secs(300),
+            6,
+        );
+        let ns_b = RoomService::new(store, urls(), "b", SignedDuration::from_secs(300), 6);
 
         let room = ns_a.create().await.unwrap();
         let member = ns_a.join(&room.id, None).await.unwrap();
@@ -1984,7 +2031,7 @@ mod tests {
     #[test]
     fn participant_verify_token_matches_by_value_only_ignoring_expiry() {
         use super::RoomParticipant;
-        let now = Utc::now();
+        let now = ambient_now();
         // An already-expired token: `verify_token` ignores expiry entirely, so
         // the value-correct token still verifies and a wrong value still fails.
         let participant = RoomParticipant {
@@ -1992,7 +2039,7 @@ mod tests {
             display_name: None,
             joined_at: now,
             token: SessionToken("secret-token-value".to_owned()),
-            token_expires_at: now - Duration::seconds(1),
+            token_expires_at: now - SignedDuration::from_secs(1),
             last_seen_at: now,
         };
         assert!(
@@ -2013,13 +2060,13 @@ mod tests {
             Arc::new(InMemoryRoomStore::new(6)),
             urls(),
             "",
-            Duration::seconds(-10),
+            SignedDuration::from_secs(-10),
             6,
         );
         let room = service.create().await.unwrap();
         let joined = service.join(&room.id, None).await.unwrap();
         assert!(
-            joined.token_expires_at < Utc::now(),
+            joined.token_expires_at < ambient_now(),
             "token is already expired (advisory only)"
         );
         // A wrong token value is still rejected.
@@ -2577,8 +2624,8 @@ mod tests {
         store: &InMemoryRoomStore,
         namespace: &str,
         room_id: &str,
-        created_at: DateTime<Utc>,
-        seats: &[(&str, &str, DateTime<Utc>)],
+        created_at: Timestamp,
+        seats: &[(&str, &str, Timestamp)],
     ) {
         let mut participants = HashMap::new();
         for (id, token, last_seen_at) in seats {
@@ -2621,16 +2668,16 @@ mod tests {
         // (a) + (b): a participant past the horizon is evicted while a fresh
         // co-tenant is kept, and the room (still non-empty) survives.
         let store = InMemoryRoomStore::new(6);
-        let now = Utc::now();
-        let ttl = Duration::minutes(30);
+        let now = ambient_now();
+        let ttl = SignedDuration::from_mins(30);
         seed_room(
             &store,
             "",
             "room-1",
-            now - Duration::hours(2),
+            now - SignedDuration::from_hours(2),
             &[
-                ("stale", "tok-stale", now - Duration::hours(1)),
-                ("fresh", "tok-fresh", now - Duration::minutes(5)),
+                ("stale", "tok-stale", now - SignedDuration::from_hours(1)),
+                ("fresh", "tok-fresh", now - SignedDuration::from_mins(5)),
             ],
         );
 
@@ -2642,13 +2689,13 @@ mod tests {
         // The kept seat is the fresh one.
         assert!(
             store
-                .roster("", "room-1", "tok-fresh", Duration::hours(12))
+                .roster("", "room-1", "tok-fresh", SignedDuration::from_hours(12))
                 .await
                 .is_ok()
         );
         assert!(matches!(
             store
-                .roster("", "room-1", "tok-stale", Duration::hours(12))
+                .roster("", "room-1", "tok-stale", SignedDuration::from_hours(12))
                 .await,
             Err(RoomError::RoomNotFound)
         ));
@@ -2658,16 +2705,16 @@ mod tests {
     async fn reap_drops_a_room_emptied_by_reaping() {
         // (c): a room whose only participant ages out is dropped.
         let store = InMemoryRoomStore::new(6);
-        let now = Utc::now();
+        let now = ambient_now();
         seed_room(
             &store,
             "",
             "room-1",
-            now - Duration::hours(2),
-            &[("stale", "tok", now - Duration::hours(1))],
+            now - SignedDuration::from_hours(2),
+            &[("stale", "tok", now - SignedDuration::from_hours(1))],
         );
 
-        let stats = store.reap_stale(now, Duration::minutes(30)).await;
+        let stats = store.reap_stale(now, SignedDuration::from_mins(30)).await;
 
         assert_eq!(stats.participants_reaped, 1);
         assert_eq!(stats.rooms_reaped, 1);
@@ -2685,10 +2732,22 @@ mod tests {
         // room in the create→first-join window is never reaped out from under a
         // joiner).
         let store = InMemoryRoomStore::new(6);
-        let now = Utc::now();
-        let ttl = Duration::minutes(30);
-        seed_room(&store, "", "old-empty", now - Duration::hours(1), &[]);
-        seed_room(&store, "", "new-empty", now - Duration::minutes(5), &[]);
+        let now = ambient_now();
+        let ttl = SignedDuration::from_mins(30);
+        seed_room(
+            &store,
+            "",
+            "old-empty",
+            now - SignedDuration::from_hours(1),
+            &[],
+        );
+        seed_room(
+            &store,
+            "",
+            "new-empty",
+            now - SignedDuration::from_mins(5),
+            &[],
+        );
 
         let stats = store.reap_stale(now, ttl).await;
 
@@ -2711,21 +2770,21 @@ mod tests {
         // (e): reaping a stale room in namespace "a" leaves an identically-named
         // fresh room in namespace "b" untouched — tenant isolation holds.
         let store = InMemoryRoomStore::new(6);
-        let now = Utc::now();
-        let ttl = Duration::minutes(30);
+        let now = ambient_now();
+        let ttl = SignedDuration::from_mins(30);
         seed_room(
             &store,
             "a",
             "shared-id",
-            now - Duration::hours(2),
-            &[("stale", "tok-a", now - Duration::hours(1))],
+            now - SignedDuration::from_hours(2),
+            &[("stale", "tok-a", now - SignedDuration::from_hours(1))],
         );
         seed_room(
             &store,
             "b",
             "shared-id",
-            now - Duration::minutes(1),
-            &[("fresh", "tok-b", now - Duration::minutes(1))],
+            now - SignedDuration::from_mins(1),
+            &[("fresh", "tok-b", now - SignedDuration::from_mins(1))],
         );
 
         let stats = store.reap_stale(now, ttl).await;
@@ -2748,16 +2807,16 @@ mod tests {
     async fn reap_on_a_clean_store_is_a_zero_count_no_op() {
         // (f): nothing to reap → default (all-zero) stats, no state change.
         let store = InMemoryRoomStore::new(6);
-        let now = Utc::now();
+        let now = ambient_now();
         seed_room(
             &store,
             "",
             "room-1",
-            now - Duration::minutes(1),
-            &[("fresh", "tok", now - Duration::minutes(1))],
+            now - SignedDuration::from_mins(1),
+            &[("fresh", "tok", now - SignedDuration::from_mins(1))],
         );
 
-        let stats = store.reap_stale(now, Duration::minutes(30)).await;
+        let stats = store.reap_stale(now, SignedDuration::from_mins(30)).await;
 
         assert_eq!(stats, ReapStats::default());
         assert_eq!(seat_count(&store, "", "room-1"), Some(1));
@@ -2765,7 +2824,9 @@ mod tests {
         // And a truly empty store is likewise a no-op.
         let empty = InMemoryRoomStore::new(6);
         assert_eq!(
-            empty.reap_stale(Utc::now(), Duration::minutes(30)).await,
+            empty
+                .reap_stale(ambient_now(), SignedDuration::from_mins(30))
+                .await,
             ReapStats::default()
         );
     }
@@ -2777,26 +2838,28 @@ mod tests {
         // (last_seen an hour ago); polling the roster with A's token refreshes
         // A's `last_seen_at` to *now*, so a reap at *now* keeps A and evicts B.
         let store = InMemoryRoomStore::new(6);
-        let stale = Utc::now() - Duration::hours(1);
+        let stale = ambient_now() - SignedDuration::from_hours(1);
         seed_room(
             &store,
             "",
             "room-1",
-            Utc::now() - Duration::hours(2),
+            ambient_now() - SignedDuration::from_hours(2),
             &[("active", "tok-a", stale), ("idle", "tok-b", stale)],
         );
 
         // A polls the roster — this is the liveness signal.
         assert!(
             store
-                .roster("", "room-1", "tok-a", Duration::hours(12))
+                .roster("", "room-1", "tok-a", SignedDuration::from_hours(12))
                 .await
                 .is_ok()
         );
 
         // Reap as of now with a 30-minute TTL: A was just touched (fresh), B is
         // still an hour idle (stale).
-        let stats = store.reap_stale(Utc::now(), Duration::minutes(30)).await;
+        let stats = store
+            .reap_stale(ambient_now(), SignedDuration::from_mins(30))
+            .await;
 
         assert_eq!(
             stats.participants_reaped, 1,
@@ -2805,14 +2868,14 @@ mod tests {
         assert_eq!(stats.rooms_reaped, 0);
         assert!(
             store
-                .roster("", "room-1", "tok-a", Duration::hours(12))
+                .roster("", "room-1", "tok-a", SignedDuration::from_hours(12))
                 .await
                 .is_ok(),
             "the actively-polling participant survived the sweep"
         );
         assert!(matches!(
             store
-                .roster("", "room-1", "tok-b", Duration::hours(12))
+                .roster("", "room-1", "tok-b", SignedDuration::from_hours(12))
                 .await,
             Err(RoomError::RoomNotFound)
         ));
@@ -2825,12 +2888,12 @@ mod tests {
         // A client that heartbeats but never polls the roster stays live: the
         // heartbeat is a first-class liveness signal, not a roster side effect.
         let store = InMemoryRoomStore::new(6);
-        let stale = Utc::now() - Duration::hours(1);
+        let stale = ambient_now() - SignedDuration::from_hours(1);
         seed_room(
             &store,
             "",
             "room-1",
-            Utc::now() - Duration::hours(2),
+            ambient_now() - SignedDuration::from_hours(2),
             &[("beating", "tok-a", stale), ("silent", "tok-b", stale)],
         );
 
@@ -2840,25 +2903,27 @@ mod tests {
                 "room-1",
                 "beating",
                 "tok-a",
-                Duration::seconds(300),
-                Duration::hours(12),
+                SignedDuration::from_secs(300),
+                SignedDuration::from_hours(12),
             )
             .await
             .expect("heartbeat");
 
-        let stats = store.reap_stale(Utc::now(), Duration::minutes(30)).await;
+        let stats = store
+            .reap_stale(ambient_now(), SignedDuration::from_mins(30))
+            .await;
 
         assert_eq!(stats.participants_reaped, 1, "only the silent seat reaped");
         assert_eq!(stats.rooms_reaped, 0);
         assert!(
             store
-                .roster("", "room-1", "tok-a", Duration::hours(12))
+                .roster("", "room-1", "tok-a", SignedDuration::from_hours(12))
                 .await
                 .is_ok()
         );
         assert!(matches!(
             store
-                .roster("", "room-1", "tok-b", Duration::hours(12))
+                .roster("", "room-1", "tok-b", SignedDuration::from_hours(12))
                 .await,
             Err(RoomError::RoomNotFound)
         ));
@@ -2869,18 +2934,18 @@ mod tests {
         // Renewal-on-activity: the surfaced expiry tracks the live session
         // instead of decaying to a lie while the client is still active.
         let store = InMemoryRoomStore::new(6);
-        let stale = Utc::now() - Duration::hours(1);
+        let stale = ambient_now() - SignedDuration::from_hours(1);
         seed_room(&store, "", "room-1", stale, &[("p1", "tok", stale)]);
 
-        let before = Utc::now();
+        let before = ambient_now();
         let renewed = store
             .heartbeat(
                 "",
                 "room-1",
                 "p1",
                 "tok",
-                Duration::seconds(300),
-                Duration::hours(12),
+                SignedDuration::from_secs(300),
+                SignedDuration::from_hours(12),
             )
             .await
             .expect("heartbeat");
@@ -2890,8 +2955,8 @@ mod tests {
             "expiry moved forward from the seeded value"
         );
         // Renewed to `now + the supplied TTL`, not to some other horizon.
-        assert!(renewed >= before + Duration::seconds(300));
-        assert!(renewed <= Utc::now() + Duration::seconds(300));
+        assert!(renewed >= before + SignedDuration::from_secs(300));
+        assert!(renewed <= ambient_now() + SignedDuration::from_secs(300));
         // The store record — not just the response — carries the new expiry.
         let stored = store
             .rooms
@@ -2906,19 +2971,24 @@ mod tests {
 
     #[test]
     fn renewed_expiry_holds_the_session_limit_at_its_edges() {
-        let joined = Utc::now();
-        let ttl = Duration::seconds(300);
-        let max = Duration::hours(1);
+        let joined = ambient_now();
+        let ttl = SignedDuration::from_secs(300);
+        let max = SignedDuration::from_hours(1);
 
         // Far from the limit: plain `now + ttl`.
         assert_eq!(renewed_expiry(joined, joined, ttl, max), Some(joined + ttl));
         // Near the limit: cut to the limit.
-        let near = joined + max - Duration::seconds(1);
+        let near = joined + max - SignedDuration::from_secs(1);
         assert_eq!(renewed_expiry(joined, near, ttl, max), Some(joined + max));
         // At the limit and after it: refused.
         assert_eq!(renewed_expiry(joined, joined + max, ttl, max), None);
         assert_eq!(
-            renewed_expiry(joined, joined + max + Duration::seconds(1), ttl, max),
+            renewed_expiry(
+                joined,
+                joined + max + SignedDuration::from_secs(1),
+                ttl,
+                max
+            ),
             None
         );
     }
@@ -2928,7 +2998,7 @@ mod tests {
         // Joined 11h59m ago with a 12h limit: one minute is left, so a 5-minute
         // TTL is cut to the end of the session.
         let store = InMemoryRoomStore::new(6);
-        let joined = Utc::now() - Duration::hours(12) + Duration::minutes(1);
+        let joined = ambient_now() - SignedDuration::from_hours(12) + SignedDuration::from_mins(1);
         seed_room(&store, "", "room-1", joined, &[("p1", "tok", joined)]);
 
         let renewed = store
@@ -2937,21 +3007,21 @@ mod tests {
                 "room-1",
                 "p1",
                 "tok",
-                Duration::seconds(300),
-                Duration::hours(12),
+                SignedDuration::from_secs(300),
+                SignedDuration::from_hours(12),
             )
             .await
             .expect("heartbeat inside the session limit");
 
-        assert_eq!(renewed, joined + Duration::hours(12));
+        assert_eq!(renewed, joined + SignedDuration::from_hours(12));
     }
 
     #[tokio::test]
     async fn heartbeat_after_the_session_limit_is_refused() {
         // A captured token cannot be kept alive by heartbeats forever.
         let store = InMemoryRoomStore::new(6);
-        let joined = Utc::now() - Duration::hours(13);
-        let last_seen = Utc::now() - Duration::minutes(1);
+        let joined = ambient_now() - SignedDuration::from_hours(13);
+        let last_seen = ambient_now() - SignedDuration::from_mins(1);
         seed_room(&store, "", "room-1", joined, &[("p1", "tok", joined)]);
         set_last_seen(&store, "room-1", "p1", last_seen);
 
@@ -2961,8 +3031,8 @@ mod tests {
                 "room-1",
                 "p1",
                 "tok",
-                Duration::seconds(300),
-                Duration::hours(12),
+                SignedDuration::from_secs(300),
+                SignedDuration::from_hours(12),
             )
             .await;
 
@@ -2976,12 +3046,14 @@ mod tests {
     async fn roster_after_the_session_limit_is_refused() {
         // A roster poll must not keep a captured token alive past the limit.
         let store = InMemoryRoomStore::new(6);
-        let joined = Utc::now() - Duration::hours(13);
-        let last_seen = Utc::now() - Duration::minutes(1);
+        let joined = ambient_now() - SignedDuration::from_hours(13);
+        let last_seen = ambient_now() - SignedDuration::from_mins(1);
         seed_room(&store, "", "room-1", joined, &[("p1", "tok", joined)]);
         set_last_seen(&store, "room-1", "p1", last_seen);
 
-        let result = store.roster("", "room-1", "tok", Duration::hours(12)).await;
+        let result = store
+            .roster("", "room-1", "tok", SignedDuration::from_hours(12))
+            .await;
 
         assert!(matches!(result, Err(RoomError::RoomNotFound)));
         let (seen, _) = seat_clocks(&store, "room-1", "p1");
@@ -2991,16 +3063,16 @@ mod tests {
     #[tokio::test]
     async fn room_service_roster_applies_its_session_limit() {
         let store = Arc::new(InMemoryRoomStore::new(6));
-        let joined = Utc::now() - Duration::hours(2);
+        let joined = ambient_now() - SignedDuration::from_hours(2);
         seed_room(&store, "", "room-1", joined, &[("p1", "tok", joined)]);
         let service = RoomService::new(
             store,
             MediaUrls::from_config(&MediaMtxConfig::default()),
             "",
-            Duration::seconds(300),
+            SignedDuration::from_secs(300),
             6,
         )
-        .with_session_max(Duration::hours(1));
+        .with_session_max(SignedDuration::from_hours(1));
 
         assert!(matches!(
             service.roster("room-1", "tok").await,
@@ -3014,21 +3086,21 @@ mod tests {
             Arc::new(InMemoryRoomStore::new(6)),
             MediaUrls::from_config(&MediaMtxConfig::default()),
             "",
-            Duration::hours(2),
+            SignedDuration::from_hours(2),
             6,
         )
-        .with_session_max(Duration::hours(1));
+        .with_session_max(SignedDuration::from_hours(1));
         let room = service.create().await.expect("create");
-        let before = Utc::now();
+        let before = ambient_now();
         let joined = service.join(&room.id, None).await.expect("join");
-        assert!(joined.token_expires_at <= Utc::now() + Duration::hours(1));
-        assert!(joined.token_expires_at >= before + Duration::hours(1));
+        assert!(joined.token_expires_at <= ambient_now() + SignedDuration::from_hours(1));
+        assert!(joined.token_expires_at >= before + SignedDuration::from_hours(1));
     }
 
     // ── Join display_name limit (#3104) ──────────────────────────────────────
 
     fn service_over(store: Arc<InMemoryRoomStore>) -> RoomService {
-        RoomService::new(store, urls(), "", Duration::seconds(300), 6)
+        RoomService::new(store, urls(), "", SignedDuration::from_secs(300), 6)
     }
 
     fn seats_in(store: &InMemoryRoomStore, room_id: &str) -> usize {
@@ -3125,16 +3197,16 @@ mod tests {
     #[tokio::test]
     async fn room_service_heartbeat_applies_its_session_limit() {
         let store = Arc::new(InMemoryRoomStore::new(6));
-        let joined = Utc::now() - Duration::hours(2);
+        let joined = ambient_now() - SignedDuration::from_hours(2);
         seed_room(&store, "", "room-1", joined, &[("p1", "tok", joined)]);
         let service = RoomService::new(
             store,
             MediaUrls::from_config(&MediaMtxConfig::default()),
             "",
-            Duration::seconds(300),
+            SignedDuration::from_secs(300),
             6,
         )
-        .with_session_max(Duration::hours(1));
+        .with_session_max(SignedDuration::from_hours(1));
 
         assert!(matches!(
             service.heartbeat("room-1", "p1", "tok").await,
@@ -3143,7 +3215,7 @@ mod tests {
     }
 
     /// Set one seat's `last_seen_at` apart from its `joined_at`.
-    fn set_last_seen(store: &InMemoryRoomStore, room_id: &str, id: &str, at: DateTime<Utc>) {
+    fn set_last_seen(store: &InMemoryRoomStore, room_id: &str, id: &str, at: Timestamp) {
         store
             .rooms
             .write()
@@ -3155,11 +3227,7 @@ mod tests {
     }
 
     /// One seat's `(last_seen_at, token_expires_at)`.
-    fn seat_clocks(
-        store: &InMemoryRoomStore,
-        room_id: &str,
-        id: &str,
-    ) -> (DateTime<Utc>, DateTime<Utc>) {
+    fn seat_clocks(store: &InMemoryRoomStore, room_id: &str, id: &str) -> (Timestamp, Timestamp) {
         store
             .rooms
             .read()
@@ -3175,7 +3243,7 @@ mod tests {
         // Renewal extends the expiry; it never rotates the value, so an
         // in-flight roster poll holding the same token keeps working.
         let store = InMemoryRoomStore::new(6);
-        let now = Utc::now();
+        let now = ambient_now();
         seed_room(&store, "", "room-1", now, &[("p1", "tok", now)]);
 
         store
@@ -3184,15 +3252,15 @@ mod tests {
                 "room-1",
                 "p1",
                 "tok",
-                Duration::seconds(300),
-                Duration::hours(12),
+                SignedDuration::from_secs(300),
+                SignedDuration::from_hours(12),
             )
             .await
             .expect("heartbeat");
 
         assert!(
             store
-                .roster("", "room-1", "tok", Duration::hours(12))
+                .roster("", "room-1", "tok", SignedDuration::from_hours(12))
                 .await
                 .is_ok(),
             "the original token still authenticates after a heartbeat"
@@ -3206,9 +3274,9 @@ mod tests {
         // membership. (Stricter than `leave`, which a departing client needs to
         // be able to tell apart.)
         let store = InMemoryRoomStore::new(6);
-        let now = Utc::now();
+        let now = ambient_now();
         seed_room(&store, "", "room-1", now, &[("p1", "tok", now)]);
-        let ttl = Duration::seconds(300);
+        let ttl = SignedDuration::from_secs(300);
 
         for (room, participant, token, case) in [
             ("nope", "p1", "tok", "unknown room"),
@@ -3218,7 +3286,14 @@ mod tests {
             assert!(
                 matches!(
                     store
-                        .heartbeat("", room, participant, token, ttl, Duration::hours(12))
+                        .heartbeat(
+                            "",
+                            room,
+                            participant,
+                            token,
+                            ttl,
+                            SignedDuration::from_hours(12)
+                        )
                         .await,
                     Err(RoomError::RoomNotFound)
                 ),
@@ -3232,7 +3307,7 @@ mod tests {
         // The token is verified against the named participant, not against any
         // member of the room.
         let store = InMemoryRoomStore::new(6);
-        let now = Utc::now();
+        let now = ambient_now();
         seed_room(
             &store,
             "",
@@ -3248,8 +3323,8 @@ mod tests {
                     "room-1",
                     "p2",
                     "tok-1",
-                    Duration::seconds(300),
-                    Duration::hours(12)
+                    SignedDuration::from_secs(300),
+                    SignedDuration::from_hours(12)
                 )
                 .await,
             Err(RoomError::RoomNotFound)
@@ -3261,7 +3336,7 @@ mod tests {
         // Tenant isolation: a value-correct token cannot touch another
         // namespace's identically-named room.
         let store = InMemoryRoomStore::new(6);
-        let stale = Utc::now() - Duration::hours(1);
+        let stale = ambient_now() - SignedDuration::from_hours(1);
         seed_room(&store, "tenant-a", "room-1", stale, &[("p1", "tok", stale)]);
 
         assert!(matches!(
@@ -3271,15 +3346,17 @@ mod tests {
                     "room-1",
                     "p1",
                     "tok",
-                    Duration::seconds(300),
-                    Duration::hours(12)
+                    SignedDuration::from_secs(300),
+                    SignedDuration::from_hours(12)
                 )
                 .await,
             Err(RoomError::RoomNotFound)
         ));
 
         // The real tenant's seat is untouched, so it still ages out.
-        let stats = store.reap_stale(Utc::now(), Duration::minutes(30)).await;
+        let stats = store
+            .reap_stale(ambient_now(), SignedDuration::from_mins(30))
+            .await;
         assert_eq!(stats.participants_reaped, 1);
     }
 
@@ -3328,13 +3405,13 @@ mod tests {
     #[tokio::test]
     async fn run_room_reaper_reaps_and_stops_on_shutdown() {
         let store = Arc::new(InMemoryRoomStore::new(6));
-        let now = Utc::now();
-        seed_room(&store, "", "idle", now - Duration::hours(2), &[]);
+        let now = ambient_now();
+        seed_room(&store, "", "idle", now - SignedDuration::from_hours(2), &[]);
         let shutdown = autumn_web::reexports::tokio_util::sync::CancellationToken::new();
         let reaper = tokio::spawn(run_room_reaper_every(
             Arc::clone(&store) as Arc<dyn RoomStore>,
             std::time::Duration::from_secs(3600),
-            Duration::minutes(30),
+            SignedDuration::from_mins(30),
             shutdown.clone(),
         ));
         // The first tick runs at once.

@@ -204,7 +204,7 @@ pub(crate) struct RepoConfig {
     pub(crate) policy_type: Option<Ident>,
     pub(crate) scope_type: Option<Ident>,
     pub(crate) cursor_key: Option<String>,
-    /// Rust type of the `cursor_key` field (e.g. `chrono::NaiveDateTime`).
+    /// Rust type of the `cursor_key` field (e.g. `autumn_web::time::Timestamp`).
     /// When provided the generated `cursor_page` emits a fully-typed two-part
     /// keyset filter.  When absent it falls back to an id-only cursor which is
     /// correct whenever `cursor_key` values are monotonically correlated with `id`.
@@ -1889,15 +1889,81 @@ fn type_is_option_of(ty: &syn::Type, inner_ident: &str) -> bool {
     option_inner_type(ty).is_some_and(|inner| type_is_bare_ident(inner, inner_ident))
 }
 
-/// True if `ty`'s final path segment identifier is `ident`, ignoring any
-/// generic arguments — so it matches both `DateTime` and `DateTime<Utc>`. Used
-/// to detect a `timestamptz` group key (`DateTime<Utc>`) so `.bucket()`
-/// truncation can be pinned to UTC (#1364).
-fn type_last_segment_is(ty: &syn::Type, ident: &str) -> bool {
+/// True if `ty` is a `timestamptz` group key, a `jiff` `Timestamp`. Used so
+/// `.bucket()` truncation can be pinned to UTC (#1364). A civil `DateTime`
+/// is a `timestamp` key and is not pinned.
+fn type_is_timestamptz_key(ty: &syn::Type) -> bool {
     let syn::Type::Path(p) = ty else {
         return false;
     };
-    p.path.segments.last().is_some_and(|s| s.ident == ident)
+    p.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "Timestamp")
+}
+
+/// A `jiff` date or time type that a generated Diesel query binds and loads
+/// through its `autumn_web::db` wrapper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JiffTimeKind {
+    Timestamp,
+    DateTime,
+    Date,
+    Time,
+}
+
+impl JiffTimeKind {
+    /// The kind of `ty`: `Timestamp`, a civil `DateTime` (written without
+    /// generic arguments), or `Date` / `Time` written bare or after `civil::`.
+    /// `None` for every other type, which binds as itself.
+    fn of(ty: &syn::Type) -> Option<Self> {
+        let syn::Type::Path(p) = ty else {
+            return None;
+        };
+        if p.qself.is_some() {
+            return None;
+        }
+        let seg = p.path.segments.last()?;
+        if !seg.arguments.is_empty() {
+            return None;
+        }
+        let qualifier = p
+            .path
+            .segments
+            .iter()
+            .rev()
+            .nth(1)
+            .map(|s| s.ident.to_string());
+        let civil_or_bare = matches!(qualifier.as_deref(), None | Some("civil"));
+        match seg.ident.to_string().as_str() {
+            "Timestamp" => Some(Self::Timestamp),
+            "DateTime" => Some(Self::DateTime),
+            "Date" if civil_or_bare => Some(Self::Date),
+            "Time" if civil_or_bare => Some(Self::Time),
+            _ => None,
+        }
+    }
+
+    /// The `autumn_web::db` wrapper type.
+    fn wrapper(self) -> TokenStream {
+        match self {
+            Self::Timestamp => quote! { ::autumn_web::db::SqlTimestamp },
+            Self::DateTime => quote! { ::autumn_web::db::SqlDateTime },
+            Self::Date => quote! { ::autumn_web::db::SqlDate },
+            Self::Time => quote! { ::autumn_web::db::SqlTime },
+        }
+    }
+
+    /// The Diesel SQL type the wrapper binds as on Postgres.
+    fn sql_type(self) -> TokenStream {
+        let d = quote! { ::autumn_web::reexports::diesel::sql_types };
+        match self {
+            Self::Timestamp => quote! { #d::Timestamptz },
+            Self::DateTime => quote! { #d::Timestamp },
+            Self::Date => quote! { #d::Date },
+            Self::Time => quote! { #d::Time },
+        }
+    }
 }
 
 /// Map a supported Rust type to its diesel `sql_types` path token, threading
@@ -1914,6 +1980,9 @@ fn diesel_sql_type_for(ty: &syn::Type) -> Option<TokenStream> {
                 let inner_st = diesel_sql_type_for(inner)?;
                 return Some(quote! { #d::Nullable<#inner_st> });
             }
+            if let Some(kind) = JiffTimeKind::of(ty) {
+                return Some(kind.sql_type());
+            }
             let st = match name.as_str() {
                 "i16" => quote! { #d::SmallInt },
                 "i32" => quote! { #d::Integer },
@@ -1923,10 +1992,6 @@ fn diesel_sql_type_for(ty: &syn::Type) -> Option<TokenStream> {
                 "bool" => quote! { #d::Bool },
                 "String" | "str" => quote! { #d::Text },
                 "Uuid" => quote! { #d::Uuid },
-                "NaiveDate" => quote! { #d::Date },
-                "NaiveDateTime" => quote! { #d::Timestamp },
-                "NaiveTime" => quote! { #d::Time },
-                "DateTime" => quote! { #d::Timestamptz },
                 _ => return None,
             };
             Some(st)
@@ -2167,7 +2232,7 @@ fn generate_derived_query_for_source(
                     // The derived soft-delete / timestamp write has no `AppState`
                     // in scope. The ambient clock follows a running `Sim` (autumn
                     // #2967), and is the system clock otherwise.
-                    let __now = ::autumn_web::time::ambient_now().naive_utc();
+                    let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::ambient_civil_utc());
                     let mut conn = self.__autumn_acquire_conn().await?;
                     ::autumn_web::reexports::diesel::update(
                         #query_source #(#filters)* .filter(#table_ident::deleted_at.is_null())
@@ -2841,13 +2906,13 @@ fn ledger_append_ts(
     let valid_from_stmt = if matches!(op, "delete" | "restore") {
         quote! {
             let __lg_valid_from: ::core::option::Option<
-                ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                ::autumn_web::time::Timestamp,
             > = ::core::option::Option::None;
         }
     } else {
         quote! {
             let __lg_valid_from: ::core::option::Option<
-                ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                ::autumn_web::time::Timestamp,
             > = {
                 use ::autumn_web::ledger::LedgeredRecord as _;
                 <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(&__lg_row)
@@ -4656,7 +4721,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let column_ident = format_ident!("{}", column);
             quote! {
                 fn ledger_valid_from(&self) -> ::core::option::Option<
-                    ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>
+                    ::autumn_web::time::Timestamp
                 > {
                     ::autumn_web::ledger::LedgerValidTimeValue::ledger_valid_from(&self.#column_ident)
                 }
@@ -5040,10 +5105,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     request_id: ::core::option::Option<::std::string::String>,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
                                     snapshot: ::std::string::String,
-                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
-                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
-                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                    valid_from: ::autumn_web::time::Timestamp,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                    recorded_at: ::autumn_web::time::Timestamp,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
                                     prev_hash: ::core::option::Option<::std::string::String>,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
@@ -5090,10 +5155,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     request_id: ::core::option::Option<::std::string::String>,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
                                     snapshot: ::std::string::String,
-                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
-                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
-                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                    valid_from: ::autumn_web::time::Timestamp,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                    recorded_at: ::autumn_web::time::Timestamp,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
                                     prev_hash: ::core::option::Option<::std::string::String>,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
@@ -5229,10 +5294,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     request_id: ::core::option::Option<::std::string::String>,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
                                     snapshot: ::std::string::String,
-                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
-                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
-                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                    valid_from: ::autumn_web::time::Timestamp,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                    recorded_at: ::autumn_web::time::Timestamp,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
                                     prev_hash: ::core::option::Option<::std::string::String>,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
@@ -5254,8 +5319,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_transaction_bound)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_valid_bound)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_transaction_bound))
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_valid_bound))
                                     .get_results::<__AutumnLedgerRow>(&mut conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -5285,10 +5350,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     request_id: ::core::option::Option<::std::string::String>,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
                                     snapshot: ::std::string::String,
-                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
-                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
-                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                    valid_from: ::autumn_web::time::Timestamp,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                    recorded_at: ::autumn_web::time::Timestamp,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
                                     prev_hash: ::core::option::Option<::std::string::String>,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
@@ -5310,8 +5375,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_transaction_bound)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_valid_bound)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_transaction_bound))
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_valid_bound))
                                     .get_results::<__AutumnLedgerRow>(&mut conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?
@@ -5403,10 +5468,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 request_id: ::core::option::Option<::std::string::String>,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
                                 snapshot: ::std::string::String,
-                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
-                                valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
-                                recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                valid_from: ::autumn_web::time::Timestamp,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                recorded_at: ::autumn_web::time::Timestamp,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
                                 prev_hash: ::core::option::Option<::std::string::String>,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
@@ -5440,10 +5505,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
                                 .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
                                 .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_from_transaction_bound)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_from_valid_bound)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_to_transaction_bound)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(__ledger_to_valid_bound)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_from_transaction_bound))
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_from_valid_bound))
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_to_transaction_bound))
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_to_valid_bound))
                                 .get_results::<__AutumnLedgerDiffRow>(&mut conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -5473,10 +5538,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 request_id: ::core::option::Option<::std::string::String>,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
                                 snapshot: ::std::string::String,
-                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
-                                valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
-                                recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                valid_from: ::autumn_web::time::Timestamp,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                recorded_at: ::autumn_web::time::Timestamp,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
                                 prev_hash: ::core::option::Option<::std::string::String>,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
@@ -5510,10 +5575,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
                                 .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
                                 .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_from_transaction_bound)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_from_valid_bound)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_to_transaction_bound)
-                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(__ledger_to_valid_bound)
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_from_transaction_bound))
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_from_valid_bound))
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_to_transaction_bound))
+                                .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(::autumn_web::db::SqlNullableTimestamp(__ledger_to_valid_bound))
                                 .get_results::<__AutumnLedgerDiffRow>(&mut conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)?;
@@ -5542,7 +5607,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 pub async fn ledger_as_of(
                     &self,
                     record_id: i64,
-                    at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                    at: ::autumn_web::time::Timestamp,
                 ) -> ::autumn_web::AutumnResult<::core::option::Option<#model_name>> {
                     self.ledger_as_of_at(record_id, ::autumn_web::ledger::LedgerAsOf::transaction(at)).await
                 }
@@ -5586,8 +5651,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 pub async fn ledger_diff(
                     &self,
                     record_id: i64,
-                    from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-                    to: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                    from: ::autumn_web::time::Timestamp,
+                    to: ::autumn_web::time::Timestamp,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerDiff> {
                     self.ledger_diff_at(
                         record_id,
@@ -5970,14 +6035,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 head_seq: ::core::option::Option<i64>,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
                                 head_hash: ::core::option::Option<::std::string::String>,
-                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>)]
-                                head_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, deserialize_as = ::autumn_web::db::SqlNullableTimestamp)]
+                                head_recorded_at: ::core::option::Option<::autumn_web::time::Timestamp>,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>)]
                                 mark_seq: ::core::option::Option<i64>,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
                                 mark_hash: ::core::option::Option<::std::string::String>,
-                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>)]
-                                mark_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, deserialize_as = ::autumn_web::db::SqlNullableTimestamp)]
+                                mark_recorded_at: ::core::option::Option<::autumn_web::time::Timestamp>,
                             }
                             ::autumn_web::reexports::diesel::sql_query(
                                 "SELECT __head.seq AS head_seq, \
@@ -6025,14 +6090,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 head_seq: ::core::option::Option<i64>,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
                                 head_hash: ::core::option::Option<::std::string::String>,
-                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>)]
-                                head_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, deserialize_as = ::autumn_web::db::SqlNullableTimestamp)]
+                                head_recorded_at: ::core::option::Option<::autumn_web::time::Timestamp>,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>)]
                                 mark_seq: ::core::option::Option<i64>,
                                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
                                 mark_hash: ::core::option::Option<::std::string::String>,
-                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>)]
-                                mark_recorded_at: ::core::option::Option<::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>>,
+                                #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, deserialize_as = ::autumn_web::db::SqlNullableTimestamp)]
+                                mark_recorded_at: ::core::option::Option<::autumn_web::time::Timestamp>,
                             }
                             ::autumn_web::reexports::diesel::sql_query(
                                 "SELECT __head.seq AS head_seq, \
@@ -6215,8 +6280,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     request_id: ::core::option::Option<::std::string::String>,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
                                     changes: ::std::string::String,
-                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
-                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                    recorded_at: ::autumn_web::time::Timestamp,
                                 }
                                 #vh_count_struct
 
@@ -6232,8 +6297,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(::autumn_web::db::SqlNullableTimestamp(filter.from))
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(::autumn_web::db::SqlNullableTimestamp(filter.to))
                                     .get_results::<__AutumnVersionHistoryCount>(&mut conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?;
@@ -6269,8 +6334,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.from)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(filter.to)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(::autumn_web::db::SqlNullableTimestamp(filter.from))
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Timestamptz>, _>(::autumn_web::db::SqlNullableTimestamp(filter.to))
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
                                     .get_results::<__AutumnVersionHistoryRow>(&mut conn)
@@ -6316,8 +6381,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     request_id: ::core::option::Option<::std::string::String>,
                                     #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
                                     changes: ::std::string::String,
-                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
-                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite, deserialize_as = ::autumn_web::db::SqlTimestamp)]
+                                    recorded_at: ::autumn_web::time::Timestamp,
                                 }
                                 #vh_count_struct
 
@@ -6333,8 +6398,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.from)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.to)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(::autumn_web::db::SqlNullableTimestamp(filter.from))
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(::autumn_web::db::SqlNullableTimestamp(filter.to))
                                     .get_results::<__AutumnVersionHistoryCount>(&mut conn)
                                     .await
                                     .map_err(::autumn_web::AutumnError::from)?;
@@ -6370,8 +6435,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(__table_name)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__version_history_tenant_id)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.from)
-                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(filter.to)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(::autumn_web::db::SqlNullableTimestamp(filter.from))
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite>, _>(::autumn_web::db::SqlNullableTimestamp(filter.to))
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(limit)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(offset)
                                     .get_results::<__AutumnVersionHistoryRow>(&mut conn)
@@ -8743,7 +8808,7 @@ fn emit_hooked_delete(config: &RepoConfig, inputs: &HookedDeleteInputs<'_>) -> H
     // Both paths still fire before_delete / after_delete_commit hooks.
     let hooked_delete_mutation_stmt = if config.soft_delete {
         quote! {
-            let __now = ::autumn_web::time::ambient_now().naive_utc();
+            let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::ambient_civil_utc());
             let __autumn_deleted = ::autumn_web::reexports::diesel::update(
                 #table_ident::table.find(id).filter(#table_ident::deleted_at.is_null())
             )
@@ -10946,7 +11011,7 @@ fn emit_hooked_mutate_many(
 
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let __now = ::autumn_web::time::ambient_now().naive_utc();
+                    let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::ambient_civil_utc());
 
                     #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
@@ -12443,7 +12508,7 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
                 #tenant_id_setup
-                let __now = ::autumn_web::time::ambient_now().naive_utc();
+                let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::ambient_civil_utc());
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
                     #cc_before_delete
@@ -12486,7 +12551,7 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 #tenant_id_setup
-                let __now = ::autumn_web::time::ambient_now().naive_utc();
+                let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::ambient_civil_utc());
                 let mut conn = self.__autumn_acquire_conn().await?;
                 #cc_delete_tenant_soft_wrap
             }
@@ -12568,7 +12633,7 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                let __now = ::autumn_web::time::ambient_now().naive_utc();
+                let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::ambient_civil_utc());
                 let mut conn = self.__autumn_acquire_conn().await?;
                 ::autumn_web::__private::scoped_immediate_transaction::<_, ::autumn_web::AutumnError, _>(&mut *conn, |conn| async move {
                     #cc_before_delete
@@ -12603,7 +12668,7 @@ fn emit_plain_delete(config: &RepoConfig, inputs: &PlainDeleteInputs<'_>) -> Pla
             quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let __now = ::autumn_web::time::ambient_now().naive_utc();
+                let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::ambient_civil_utc());
                 let mut conn = self.__autumn_acquire_conn().await?;
                 #cc_delete_soft_wrap
             }
@@ -13832,7 +13897,7 @@ fn emit_plain_mutate_many(
 
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let __now = ::autumn_web::time::ambient_now().naive_utc();
+                    let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::ambient_civil_utc());
 
                     #delete_many_tx_bind ::autumn_web::__private::scoped_transaction::<_, ::autumn_web::AutumnError, _, _>(&mut *conn, |conn| {
                         async move {
@@ -14588,7 +14653,7 @@ fn emit_dependent_cascade(
                             ),
                         );
                     }
-                    let __now = ::autumn_web::time::ambient_now().naive_utc();
+                    let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::ambient_civil_utc());
                     ::autumn_web::reexports::diesel::update(
                         #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
                     )
@@ -14601,7 +14666,7 @@ fn emit_dependent_cascade(
         } else if config.soft_delete {
             quote! {
                 #destroy_count_bind = if __parent_soft {
-                    let __now = ::autumn_web::time::ambient_now().naive_utc();
+                    let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::ambient_civil_utc());
                     ::autumn_web::reexports::diesel::update(
                         #table_ident::table.find(__cid).filter(#table_ident::deleted_at.is_null())
                     )
@@ -16579,12 +16644,12 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
             let query = #table_ident::table.find(id);
             let __count = if let ::core::option::Option::Some(ref t) = tenant_id {
                 ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
-                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::db::SqlDateTime>))
                     .execute(conn)
                     .await
             } else {
                 ::autumn_web::reexports::diesel::update(query)
-                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::db::SqlDateTime>))
                     .execute(conn)
                     .await
             }
@@ -16603,7 +16668,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
             #cc_before_restore
             let query = #table_ident::table.find(id);
             let __count = ::autumn_web::reexports::diesel::update(query)
-                .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::db::SqlDateTime>))
                 .execute(conn)
                 .await
                 .map_err(::autumn_web::AutumnError::from)?;
@@ -16711,12 +16776,12 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                             let update_query = #table_ident::table.find(id);
                             let __restored = if let ::core::option::Option::Some(ref t) = tenant_id {
                                 ::autumn_web::reexports::diesel::update(update_query.filter(#table_ident::tenant_id.eq(t)))
-                                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::db::SqlDateTime>))
                                     .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                             } else {
                                 ::autumn_web::reexports::diesel::update(update_query)
-                                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::db::SqlDateTime>))
                                     .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                     .await
                             }
@@ -16891,7 +16956,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
                                     format!("{} with id {} not found", stringify!(#model_name), id)
                                 ))?;
                             let __restored = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                                .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::reexports::chrono::NaiveDateTime>))
+                                .set(#table_ident::deleted_at.eq(::core::option::Option::None::<::autumn_web::db::SqlDateTime>))
                                 .returning(#model_name::as_select()).get_result::<#model_name>(conn)
                                 .await
                                 .optional()
@@ -19011,7 +19076,18 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
 
         let impl_method = if let Some(ref key_type) = config.cursor_key_type {
             // Full two-part keyset filter ΓÇö always correct regardless of whether
-            // cursor_key and id are monotonically correlated.
+            // cursor_key and id are monotonically correlated. A `jiff` key is
+            // compared through its `autumn_web::db` wrapper.
+            let key_ty: syn::Type = syn::parse_quote!(#key_type);
+            let wrap_key = |key: TokenStream| match JiffTimeKind::of(&key_ty) {
+                Some(kind) => {
+                    let wrapper = kind.wrapper();
+                    quote! { #wrapper::from(#key) }
+                }
+                None => key,
+            };
+            let after_k_lt = wrap_key(quote! { after_k.clone() });
+            let after_k_eq = wrap_key(quote! { after_k });
             quote! {
                 async fn cursor_page(
                     &self,
@@ -19028,9 +19104,9 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                         req.decode::<(#key_type, i64)>()
                     {
                         query = query.filter(
-                            #table_ident::#cursor_key_ident.lt(after_k.clone()).or(
+                            #table_ident::#cursor_key_ident.lt(#after_k_lt).or(
                                 #table_ident::#cursor_key_ident
-                                    .eq(after_k)
+                                    .eq(#after_k_eq)
                                     .and(#table_ident::id.lt(after_id)),
                             ),
                         );
@@ -19379,11 +19455,20 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                 }
                 quote! { #(#confidential_guards)* #(#checks)* }
             };
-            // #1364 timezone correctness: only a `timestamptz` (`DateTime<Utc>`)
+            // #1364 timezone correctness: only a `timestamptz` (`Timestamp`)
             // bucket key gets the UTC-pinning 3-arg `date_trunc` zone argument.
-            // A `NaiveDateTime` (`timestamp`) key keeps the plain 2-arg form
+            // A civil `DateTime` (`timestamp`) key keeps the plain 2-arg form
             // (deterministic field truncation, session-tz independent).
-            let bucket_zone_arg: &str = if type_last_segment_is(key_type, "DateTime") {
+            // A `jiff` key binds and loads through its `autumn_web::db` wrapper.
+            let (key_deserialize_as, key_bind_map) =
+                match JiffTimeKind::of(key_type).map(JiffTimeKind::wrapper) {
+                    Some(wrapper) => (
+                        quote! { , deserialize_as = #wrapper },
+                        quote! { .map(#wrapper::from) },
+                    ),
+                    None => (quote! {}, quote! {}),
+                };
+            let bucket_zone_arg: &str = if type_is_timestamptz_key(key_type) {
                 ", 'UTC'"
             } else {
                 ""
@@ -19414,20 +19499,20 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
 
                                 #[derive(::autumn_web::reexports::diesel::QueryableByName)]
                                 struct __AutumnAggRow {
-                                    #[diesel(sql_type = #key_sql_type)]
+                                    #[diesel(sql_type = #key_sql_type #key_deserialize_as)]
                                     agg_key: #key_type,
                                     #[diesel(sql_type = #value_sql_type)]
                                     agg_val: #value_type,
                                 }
 
                                 // Group expression: bucketed (date_trunc) or the raw
-                                // column. For a `timestamptz` (`DateTime<Utc>`) key,
+                                // column. For a `timestamptz` (`Timestamp`) key,
                                 // `#bucket_zone_arg` is `, 'UTC'`, so the 3-arg
                                 // `date_trunc('unit', col, 'UTC')` (Postgres 12+)
                                 // truncates in UTC; the 2-arg form would truncate in
                                 // the DB session `TimeZone` and drift bucket
                                 // boundaries across deployments (#1364). For a
-                                // `NaiveDateTime` key it is empty. SELECT and GROUP BY
+                                // civil `DateTime` key it is empty. SELECT and GROUP BY
                                 // reuse this string, so the expressions always match.
                                 let __group_expr: ::std::string::String = match __opts.bucket {
                                     ::core::option::Option::Some(__b) => format!(
@@ -19497,9 +19582,9 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                                 let __rows: ::std::vec::Vec<__AutumnAggRow> =
                                     ::autumn_web::reexports::diesel::sql_query(__sql)
                                         #tenant_bind
-                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__eq)
-                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__low)
-                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__high)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__eq #key_bind_map)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__low #key_bind_map)
+                                        .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<#key_sql_type>, _>(__high #key_bind_map)
                                         .load::<__AutumnAggRow>(&mut __conn)
                                         .await
                                         .map_err(::autumn_web::AutumnError::from)?;
@@ -20299,7 +20384,7 @@ fn emit_write_bodies(
                 }
             };
             quote! {
-                let __now = ::autumn_web::time::ambient_now().naive_utc();
+                let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::ambient_civil_utc());
                 #tenant_scoped_update
                 if __count == 0 {
                     return Err(::autumn_web::AutumnError::not_found_msg(
@@ -22678,7 +22763,7 @@ mod tests {
 
     #[test]
     fn repository_macro_grouped_bucket_timestamptz_key_truncates_in_utc() {
-        // §1364 timezone correctness: a `DateTime<Utc>` (Postgres `timestamptz`)
+        // §1364 timezone correctness: a `Timestamp` (Postgres `timestamptz`)
         // bucket key must truncate in an explicit UTC zone via the 3-arg
         // `date_trunc('unit', col, 'UTC')` form (Postgres 12+). The 2-arg form
         // would truncate in the DB session `TimeZone`, drifting bucket
@@ -22687,7 +22772,7 @@ mod tests {
             quote! { Event, table = "events" },
             quote! {
                 pub trait EventRepository {
-                    fn count_grouped_by_created_at() -> Vec<(::chrono::DateTime<::chrono::Utc>, i64)>;
+                    fn count_grouped_by_created_at() -> Vec<(::autumn_web::time::Timestamp, i64)>;
                 }
             },
         )
@@ -22707,18 +22792,28 @@ mod tests {
             "timestamptz bucket key must supply the UTC zone argument so \
              date_trunc truncates in UTC (#1364): {generated}"
         );
+        // The key loads and binds through its Diesel wrapper.
+        assert!(
+            generated.contains("deserialize_as = :: autumn_web :: db :: SqlTimestamp")
+                && generated.contains("__eq . map (:: autumn_web :: db :: SqlTimestamp :: from)"),
+            "a Timestamp key must load and bind through SqlTimestamp: {generated}"
+        );
+        assert!(
+            generated.contains("sql_types :: Timestamptz"),
+            "a Timestamp key is a timestamptz column: {generated}"
+        );
     }
 
     #[test]
     fn repository_macro_grouped_bucket_timestamp_key_has_no_zone() {
-        // A `NaiveDateTime` (Postgres `timestamp WITHOUT time zone`) bucket key
+        // A civil `DateTime` (Postgres `timestamp WITHOUT time zone`) bucket key
         // is a deterministic field truncation, so it keeps the plain 2-arg
         // `date_trunc('unit', col)` with an EMPTY zone argument — no `'UTC'`.
         let generated = repository_macro(
             quote! { Event, table = "events" },
             quote! {
                 pub trait EventRepository {
-                    fn count_grouped_by_created_at() -> Vec<(::chrono::NaiveDateTime, i64)>;
+                    fn count_grouped_by_created_at() -> Vec<(::autumn_web::time::civil::DateTime, i64)>;
                 }
             },
         )
@@ -22738,6 +22833,10 @@ mod tests {
             !generated.contains("'UTC'"),
             "timestamp bucket key must NOT pin truncation to UTC — it is a \
              deterministic field truncation (#1364): {generated}"
+        );
+        assert!(
+            generated.contains("deserialize_as = :: autumn_web :: db :: SqlDateTime"),
+            "a civil DateTime key must load through SqlDateTime: {generated}"
         );
     }
 
@@ -26545,7 +26644,7 @@ mod tests {
     #[test]
     fn parse_repo_args_with_cursor_key_and_type() {
         let tokens: proc_macro2::TokenStream =
-            "Post, cursor_key = created_at, cursor_key_type = chrono::NaiveDateTime"
+            "Post, cursor_key = created_at, cursor_key_type = autumn_web::time::civil::DateTime"
                 .parse()
                 .unwrap();
         let config = parse_repo_args(tokens).unwrap();
@@ -26561,7 +26660,7 @@ mod tests {
                 .map(|s| s.ident.to_string())
                 .collect::<Vec<_>>()
                 .join("::")),
-            Some("chrono::NaiveDateTime".to_string()),
+            Some("autumn_web::time::civil::DateTime".to_string()),
         );
     }
 
@@ -26629,7 +26728,7 @@ mod tests {
     #[test]
     fn repository_macro_generates_two_part_filter_when_cursor_key_type_set() {
         let generated = repository_macro(
-            quote! { Post, cursor_key = created_at, cursor_key_type = chrono::NaiveDateTime },
+            quote! { Post, cursor_key = created_at, cursor_key_type = autumn_web::time::Timestamp },
             quote! { pub trait PostRepository {} },
         )
         .to_string();
@@ -26645,8 +26744,14 @@ mod tests {
         );
         // Concrete type ΓÇö no inference placeholder.
         assert!(
-            generated.contains("NaiveDateTime"),
+            generated.contains("decode :: < (autumn_web :: time :: Timestamp , i64) >"),
             "cursor_key_type must appear in the decode call: {generated}"
+        );
+        // A `jiff` key is compared through its Diesel wrapper.
+        assert!(
+            generated
+                .contains("lt (:: autumn_web :: db :: SqlTimestamp :: from (after_k . clone ()))"),
+            "a Timestamp cursor key must bind through SqlTimestamp: {generated}"
         );
     }
 
@@ -29346,15 +29451,15 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_retention_validates_chrono_cutoff_range_at_boot() {
+    fn repository_macro_retention_validates_signed_duration_range_at_boot() {
         // Regression (#1342 review round 15): `parse_duration` only
         // validates that a duration string parses to a `std::time::Duration`
         // — a value that parses fine there (e.g. a huge second count like
-        // "18446744073709551615s") can still overflow `chrono::Duration`'s
+        // "18446744073709551615s") can still overflow `SignedDuration`'s
         // range, which the sweep loop converts to in order to compute the
         // cutoff. Before this fix, that class of error only panicked on the
         // sweep's first scheduled tick; the task_info builder must also run
-        // the `chrono::Duration::from_std` conversion up front.
+        // the `SignedDuration::try_from` conversion up front.
         let generated = repository_macro(
             quote! {
                 Post,
@@ -29373,19 +29478,19 @@ mod tests {
 
         assert!(
             task_info_region
-                .matches("chrono :: Duration :: from_std")
+                .matches("SignedDuration :: try_from")
                 .count()
                 >= 2,
             "task_info builder must validate both `after` and `purge_deleted_after` convert to \
-             a chrono::Duration up front (two from_std calls): {task_info_region}"
+             a SignedDuration up front (two try_from calls): {task_info_region}"
         );
     }
 
     #[test]
     fn repository_macro_retention_validates_cutoff_arithmetic_at_boot() {
-        // Regression (#1342 review round 16): fitting `chrono::Duration`'s
+        // Regression (#1342 review round 16): fitting `SignedDuration`'s
         // range (round 15's fix) doesn't mean subtracting it from a clock
-        // reading stays inside `NaiveDateTime`'s representable range — e.g.
+        // reading stays inside `civil::DateTime`'s representable range — e.g.
         // `after = "100000000d"` (~274,000 years) still panics the sweep's
         // first scheduled tick at `now - duration`. The task_info builder
         // must also perform the checked cutoff subtraction against the real
@@ -29407,7 +29512,7 @@ mod tests {
             &generated[task_info_start..(task_info_start + 5000).min(generated.len())];
 
         assert!(
-            task_info_region.matches("checked_sub_signed").count() >= 2,
+            task_info_region.matches("checked_sub (").count() >= 2,
             "task_info builder must validate checked cutoff arithmetic for both `after` and \
              `purge_deleted_after` up front: {task_info_region}"
         );
@@ -29424,7 +29529,7 @@ mod tests {
         // Regression (#1342 review round 16): the sweep loop computed the
         // cutoff with plain `-`, which panics on overflow. A boot-validated
         // duration doesn't guarantee this stays safe against every possible
-        // clock reading (e.g. a custom/test clock near NaiveDateTime::MIN),
+        // clock reading (e.g. a custom/test clock near civil::DateTime::MIN),
         // so the runtime computation must also use checked subtraction, not
         // just boot-time validation against the wall clock.
         let generated = repository_macro(
@@ -29439,13 +29544,12 @@ mod tests {
         let retention_run = generated_fn(&generated, "async fn __autumn_retention_run");
 
         assert!(
-            retention_run.matches("checked_sub_signed").count() >= 2,
+            retention_run.matches("checked_sub (").count() >= 2,
             "the age and purge branches must both compute their cutoff with checked \
              subtraction, not plain `-`: {retention_run}"
         );
         assert!(
-            !retention_run.contains(". naive_utc () - __age_chrono")
-                && !retention_run.contains(". naive_utc () - __purge_chrono"),
+            !retention_run.contains("- __age_span") && !retention_run.contains("- __purge_span"),
             "the runtime cutoff computation must not use plain `-`, which panics on overflow: \
              {retention_run}"
         );

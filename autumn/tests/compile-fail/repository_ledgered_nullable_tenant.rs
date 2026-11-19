@@ -24,7 +24,7 @@ pub struct LedgeredNullableTenantNote {
     pub tenant_id: Option<String>,
     pub content: String,
     #[default]
-    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(

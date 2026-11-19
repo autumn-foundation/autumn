@@ -8,6 +8,9 @@
 //! `posts_per_page` means when the row is missing or unparseable.
 
 use autumn_web::AutumnResult;
+use autumn_web::time::fmt::strtime;
+use autumn_web::time::tz::{AmbiguousOffset, TimeZone};
+use autumn_web::time::{Timestamp, civil};
 use serde::{Deserialize, Serialize};
 
 use crate::permalinks::PermalinkStructure;
@@ -94,18 +97,22 @@ pub mod keys {
 /// Public so the settings form can *refuse* a bad pattern rather than let
 /// `from_rows` quietly drop it — see [`is_known_timezone`].
 ///
-/// `NaiveDateTime::format` parses nothing eagerly — it hands back a
-/// `DelayedFormat` whose `Display` does the work and returns `Err` on a bad
-/// directive. `write!` surfaces that as a `Result`; `to_string()` panics on it.
-/// The probe date carries a value for every field a pattern might name.
+/// `strtime::format` returns `Err` on a directive it does not know, and
+/// `strftime(..).to_string()` panics on the same pattern. The probe date
+/// carries a value for every field a pattern might name.
 #[must_use]
 pub fn is_renderable_date_format(pattern: &str) -> bool {
-    use std::fmt::Write as _;
-    let probe = chrono::NaiveDate::from_ymd_opt(2026, 1, 31)
-        .and_then(|date| date.and_hms_opt(13, 45, 6))
-        .expect("the probe timestamp is a valid date and time");
-    let mut out = String::new();
-    write!(out, "{}", probe.format(pattern)).is_ok()
+    strtime::format(pattern, civil::date(2026, 1, 31).at(13, 45, 6, 0)).is_ok()
+}
+
+/// The canonical IANA name of the zone `name` resolves to.
+///
+/// Zone lookup ignores case, so `europe/london` resolves; storing the
+/// canonical `Europe/London` keeps one spelling per zone in the settings.
+#[must_use]
+pub fn canonical_timezone(name: &str) -> Option<String> {
+    let zone = TimeZone::get(name).ok()?;
+    zone.iana_name().map(str::to_owned)
 }
 
 /// Whether a string names a timezone the database knows.
@@ -120,7 +127,47 @@ pub fn is_renderable_date_format(pattern: &str) -> bool {
 /// the same code path used for two different questions.
 #[must_use]
 pub fn is_known_timezone(name: &str) -> bool {
-    name.parse::<chrono_tz::Tz>().is_ok()
+    canonical_timezone(name).is_some()
+}
+
+/// A stored UTC wall-clock value as `zone`'s wall clock reads it.
+///
+/// A value outside the range a timestamp can hold comes back unchanged.
+#[must_use]
+pub fn utc_to_local(zone: &TimeZone, utc: civil::DateTime) -> civil::DateTime {
+    TimeZone::UTC
+        .to_timestamp(utc)
+        .map_or(utc, |instant| zone.to_datetime(instant))
+}
+
+/// A stored UTC wall-clock value as the instant it names.
+///
+/// A value outside the range an instant can hold clamps to the nearer end.
+#[must_use]
+pub fn utc_instant(utc: civil::DateTime) -> Timestamp {
+    TimeZone::UTC.to_timestamp(utc).unwrap_or_else(|_| {
+        if utc.year() < 1970 {
+            Timestamp::MIN
+        } else {
+            Timestamp::MAX
+        }
+    })
+}
+
+/// A wall-clock time in `zone`, as the UTC wall-clock value to store.
+///
+/// `None` for a local time that does not exist — the hour a daylight-saving
+/// change skips. Ambiguous times (the hour that happens twice) resolve to the
+/// earlier instant, which is the one an editor who typed it almost certainly
+/// meant.
+#[must_use]
+pub fn local_to_utc(zone: &TimeZone, local: civil::DateTime) -> Option<civil::DateTime> {
+    let resolved = zone.to_ambiguous_timestamp(local);
+    if matches!(resolved.offset(), AmbiguousOffset::Gap { .. }) {
+        return None;
+    }
+    let instant = resolved.earlier().ok()?;
+    Some(TimeZone::UTC.to_datetime(instant))
 }
 
 impl Settings {
@@ -182,8 +229,10 @@ impl Settings {
                 // funnel every source goes through — the form, an import, a
                 // direct write — and a name nothing can resolve would leave
                 // every conversion below with no answer.
-                keys::TIMEZONE if value.parse::<chrono_tz::Tz>().is_ok() => {
-                    settings.timezone = value.to_owned();
+                keys::TIMEZONE => {
+                    if let Some(canonical) = canonical_timezone(value) {
+                        settings.timezone = canonical;
+                    }
                 }
                 _ => {}
             }
@@ -193,18 +242,17 @@ impl Settings {
 
     /// The configured zone, resolved.
     ///
-    /// `from_rows` only stores a name that parses, so the fallback is
+    /// `from_rows` only stores a name that resolves, so the fallback is
     /// unreachable through it — but a `Settings` can also be built by hand.
     #[must_use]
-    pub fn zone(&self) -> chrono_tz::Tz {
-        self.timezone.parse().unwrap_or(chrono_tz::UTC)
+    pub fn zone(&self) -> TimeZone {
+        TimeZone::get(&self.timezone).unwrap_or(TimeZone::UTC)
     }
 
     /// A stored UTC timestamp as the site's wall clock reads it.
     #[must_use]
-    pub fn to_local(&self, utc: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
-        use chrono::TimeZone as _;
-        self.zone().from_utc_datetime(&utc).naive_local()
+    pub fn to_local(&self, utc: civil::DateTime) -> civil::DateTime {
+        utc_to_local(&self.zone(), utc)
     }
 
     /// A wall-clock time an editor typed, as the UTC instant to store.
@@ -214,31 +262,23 @@ impl Settings {
     /// twice) resolve to the earlier instant, which is the one an editor who
     /// typed it almost certainly meant.
     #[must_use]
-    pub fn from_local(&self, local: chrono::NaiveDateTime) -> Option<chrono::NaiveDateTime> {
-        use chrono::TimeZone as _;
-        self.zone()
-            .from_local_datetime(&local)
-            .earliest()
-            .map(|resolved| resolved.naive_utc())
+    pub fn from_local(&self, local: civil::DateTime) -> Option<civil::DateTime> {
+        local_to_utc(&self.zone(), local)
     }
 
     /// Render a stored UTC timestamp with the configured pattern, in the
     /// configured zone, without the panic.
     ///
-    /// `format(..).to_string()` is the obvious spelling and it panics on a
+    /// `strftime(..).to_string()` is the obvious spelling and it panics on a
     /// malformed pattern. `from_rows` refuses to store one, so this should
     /// never see it — but the line is short enough to copy into new code, and
     /// this makes the copied version safe by construction.
     #[must_use]
-    pub fn format_date(&self, when: chrono::NaiveDateTime) -> String {
-        use std::fmt::Write as _;
+    pub fn format_date(&self, when: civil::DateTime) -> String {
         let local = self.to_local(when);
-        let mut out = String::new();
-        if write!(out, "{}", local.format(&self.date_format)).is_ok() {
-            return out;
-        }
-        // Unreachable via `from_rows`; ISO-8601 rather than an empty cell.
-        local.format("%Y-%m-%d").to_string()
+        // The fallback is unreachable via `from_rows`; ISO-8601 rather than
+        // an empty cell.
+        strtime::format(&self.date_format, local).unwrap_or_else(|_| local.date().to_string())
     }
 
     /// A stored UTC timestamp as a date *and* time in the site's zone.
@@ -247,14 +287,14 @@ impl Settings {
     /// spelling `%Y-%m-%d %H:%M` against the raw UTC value — which read as the
     /// editor's own wall clock and was not.
     #[must_use]
-    pub fn format_datetime(&self, when: chrono::NaiveDateTime) -> String {
-        self.to_local(when).format("%Y-%m-%d %H:%M").to_string()
+    pub fn format_datetime(&self, when: civil::DateTime) -> String {
+        self.to_local(when).strftime("%Y-%m-%d %H:%M").to_string()
     }
 
     /// The value a `datetime-local` input takes, in the site's zone.
     #[must_use]
-    pub fn format_datetime_local(&self, when: chrono::NaiveDateTime) -> String {
-        self.to_local(when).format("%Y-%m-%dT%H:%M").to_string()
+    pub fn format_datetime_local(&self, when: civil::DateTime) -> String {
+        self.to_local(when).strftime("%Y-%m-%dT%H:%M").to_string()
     }
 
     /// The `(name, value)` pairs that persist this struct.
@@ -400,5 +440,70 @@ mod tests {
             let rows = vec![("comment_moderation".to_owned(), falsy.to_owned())];
             assert!(!Settings::from_rows(&rows).comment_moderation, "{falsy}");
         }
+    }
+
+    #[test]
+    fn default_date_format_renders() {
+        assert!(is_renderable_date_format(&Settings::default().date_format));
+        let settings = Settings::default();
+        let when = civil::date(2026, 9, 7).at(12, 0, 0, 0);
+        assert_eq!(settings.format_date(when), "September 7, 2026");
+    }
+
+    #[test]
+    fn unknown_date_directive_is_refused() {
+        assert!(!is_renderable_date_format("%Y-%"));
+        assert!(!is_renderable_date_format("%Q"));
+        assert!(is_renderable_date_format("%Y-%m-%d"));
+    }
+
+    #[test]
+    fn timezone_names_are_stored_canonically() {
+        let rows = vec![("timezone".to_owned(), "america/new_york".to_owned())];
+        assert_eq!(Settings::from_rows(&rows).timezone, "America/New_York");
+        let rows = vec![("timezone".to_owned(), "Mars/Phobos".to_owned())];
+        assert_eq!(Settings::from_rows(&rows).timezone, "UTC");
+        assert!(is_known_timezone("Europe/London"));
+        assert!(!is_known_timezone(""));
+    }
+
+    #[test]
+    fn local_times_round_trip_through_the_zone() {
+        let settings = Settings {
+            timezone: "America/New_York".to_owned(),
+            ..Settings::default()
+        };
+        let local = civil::date(2026, 7, 1).at(9, 30, 0, 0);
+        let utc = settings.from_local(local).expect("an ordinary summer time");
+        assert_eq!(utc, civil::date(2026, 7, 1).at(13, 30, 0, 0));
+        assert_eq!(settings.to_local(utc), local);
+        assert_eq!(settings.format_datetime(utc), "2026-07-01 09:30");
+        assert_eq!(settings.format_datetime_local(utc), "2026-07-01T09:30");
+    }
+
+    #[test]
+    fn a_skipped_local_hour_has_no_instant() {
+        let settings = Settings {
+            timezone: "America/New_York".to_owned(),
+            ..Settings::default()
+        };
+        // 2026-03-08 02:30 never happens in New York: clocks jump 02:00 -> 03:00.
+        assert_eq!(
+            settings.from_local(civil::date(2026, 3, 8).at(2, 30, 0, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_repeated_local_hour_takes_the_earlier_instant() {
+        let settings = Settings {
+            timezone: "America/New_York".to_owned(),
+            ..Settings::default()
+        };
+        // 2026-11-01 01:30 happens twice in New York; the first is EDT (-04:00).
+        assert_eq!(
+            settings.from_local(civil::date(2026, 11, 1).at(1, 30, 0, 0)),
+            Some(civil::date(2026, 11, 1).at(5, 30, 0, 0))
+        );
     }
 }

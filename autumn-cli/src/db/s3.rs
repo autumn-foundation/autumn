@@ -450,7 +450,7 @@ pub struct S3Client {
     multipart_part_size: u64,
     /// Clock indirection so signing/tests are deterministic. Returns the `SigV4`
     /// `x-amz-date` (`YYYYMMDDTHHMMSSZ`).
-    now: fn() -> chrono::DateTime<chrono::Utc>,
+    now: fn() -> jiff::Timestamp,
 }
 
 /// The body of a request. Bodyless ops use [`RequestBody::Empty`]; the artifact
@@ -520,7 +520,7 @@ impl S3Client {
             http,
             multipart_threshold: MULTIPART_THRESHOLD,
             multipart_part_size: MULTIPART_PART_SIZE,
-            now: chrono::Utc::now,
+            now: jiff::Timestamp::now,
         })
     }
 
@@ -624,8 +624,8 @@ impl S3Client {
         body: RequestBody<'_>,
     ) -> Result<reqwest::blocking::Response, S3Error> {
         let now = (self.now)();
-        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-        let date = now.format("%Y%m%d").to_string();
+        let amz_date = now.strftime("%Y%m%dT%H%M%SZ").to_string();
+        let date = now.strftime("%Y%m%d").to_string();
         let payload_hash = match &body {
             RequestBody::Empty => EMPTY_PAYLOAD_SHA256.to_owned(),
             RequestBody::File { sha256_hex, .. } => (*sha256_hex).to_owned(),

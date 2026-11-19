@@ -66,13 +66,14 @@ use std::sync::Arc;
 
 use autumn_media_plugin::rooms::RoomStore;
 use autumn_media_plugin::rooms_db::DbRoomStore;
-use chrono::{DateTime, Duration, Utc};
 use diesel::connection::SimpleConnection;
 use diesel::sql_types::{BigInt, Text};
 use diesel::{Connection, PgConnection, QueryableByName, RunQueryDsl as _};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
+use jiff::tz::Offset;
+use jiff::{SignedDuration, Timestamp};
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -118,13 +119,16 @@ fn namespace_for(i: usize) -> String {
     }
 }
 
-fn fmt_ts(ts: DateTime<Utc>) -> String {
-    ts.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+fn fmt_ts(ts: Timestamp) -> String {
+    Offset::UTC
+        .to_datetime(ts)
+        .strftime("%Y-%m-%d %H:%M:%S%.6f")
+        .to_string()
 }
 
 struct Fixture {
-    now: DateTime<Utc>,
-    cutoff: DateTime<Utc>,
+    now: Timestamp,
+    cutoff: Timestamp,
     stale_candidate_rooms: i64,
     expected_reaped_rooms: i64,
     expected_surviving_rooms: i64,
@@ -134,18 +138,18 @@ struct Fixture {
 /// measured workload, so it's kept fast rather than round-trip-realistic).
 #[allow(clippy::too_many_lines)]
 fn seed_fixture(conn: &mut PgConnection) -> Fixture {
-    let now = DateTime::parse_from_rfc3339("2026-06-01T12:00:00Z")
-        .expect("fixed reference time")
-        .with_timezone(&Utc);
-    let cutoff = now - Duration::minutes(IDLE_TTL_MINUTES);
-    let stale = cutoff - Duration::minutes(5);
-    let fresh = cutoff + Duration::minutes(5);
+    let now: Timestamp = "2026-06-01T12:00:00Z"
+        .parse()
+        .expect("fixed reference time");
+    let cutoff = now - SignedDuration::from_mins(IDLE_TTL_MINUTES);
+    let stale = cutoff - SignedDuration::from_mins(5);
+    let fresh = cutoff + SignedDuration::from_mins(5);
 
     let mut room_rows: Vec<String> = Vec::new();
     let mut participant_rows: Vec<String> = Vec::new();
     let mut heartbeat_touch_ids: Vec<(String, String, String)> = Vec::new();
 
-    let mut push_room = |ns: &str, room_id: &str, created: DateTime<Utc>| {
+    let mut push_room = |ns: &str, room_id: &str, created: Timestamp| {
         room_rows.push(format!(
             "('{}', '{}', 6, '{}')",
             ns,
@@ -154,7 +158,7 @@ fn seed_fixture(conn: &mut PgConnection) -> Fixture {
         ));
     };
     let mut push_participant =
-        |ns: &str, room_id: &str, pid: &str, last_seen: DateTime<Utc>, display_name: bool| {
+        |ns: &str, room_id: &str, pid: &str, last_seen: Timestamp, display_name: bool| {
             let name = if display_name { "'guest'" } else { "NULL" };
             participant_rows.push(format!(
                 "('{}', '{}', '{}', {}, 'tok-{}-{}-{}', '{}', '{}', '{}')",
@@ -166,7 +170,7 @@ fn seed_fixture(conn: &mut PgConnection) -> Fixture {
                 room_id,
                 pid,
                 fmt_ts(last_seen),
-                fmt_ts(last_seen + Duration::hours(1)),
+                fmt_ts(last_seen + SignedDuration::from_hours(1)),
                 fmt_ts(last_seen)
             ));
         };
@@ -508,7 +512,7 @@ async fn room_reaper_batch_profile() {
 
     reset_stats(&mut conn);
     let stats = store
-        .reap_stale(fixture.now, Duration::minutes(IDLE_TTL_MINUTES))
+        .reap_stale(fixture.now, SignedDuration::from_mins(IDLE_TTL_MINUTES))
         .await;
     println!(
         "\n=== reap_stale result: rooms_reaped={} participants_reaped={} ===",

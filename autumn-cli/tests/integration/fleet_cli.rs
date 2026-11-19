@@ -786,7 +786,7 @@ mod sqlite {
                 .unwrap();
             // A restore plans by millisecond timestamps.
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let between = chrono::Utc::now();
+            let between = jiff::Timestamp::now();
             tokio::time::sleep(Duration::from_millis(100)).await;
             exec(db.path(), "INSERT INTO notes VALUES ('second')");
             drop(db);
@@ -808,7 +808,7 @@ mod sqlite {
         assert_eq!(count_notes(&path), 2);
 
         // Point in time.
-        let at = before_second.to_rfc3339();
+        let at = autumn_web::time::compat::rfc3339(before_second);
         run_ok(
             &app.dir,
             &[

@@ -717,7 +717,9 @@ pub struct Todo {
     pub id: i64,
     pub title: String,
     pub completed: bool,
-    pub created_at: chrono::NaiveDateTime,
+    // Diesel cannot load a `jiff` value directly; Autumn's wrapper converts it.
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[derive(Insertable, Deserialize)]
@@ -740,7 +742,7 @@ pub struct Todo {
     pub id: i64,
     pub title: String,
     pub completed: bool,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 ```
 
@@ -759,11 +761,13 @@ your code referred to Diesel's traits:
 ```toml
 [dependencies]
 autumn-web = "0.11"
-chrono = { version = "0.4", features = ["serde"] }
-diesel = { version = "2", features = ["postgres", "chrono"] }
+diesel = { version = "2", features = ["postgres"] }
 diesel-async = { version = "0.10", features = ["postgres"] }
 serde = { version = "1", features = ["derive"] }
 ```
+
+Dates and times come from `autumn_web::time`, which re-exports `jiff`, so
+there is no date crate to add.
 
 (`autumn generate scaffold` adds these for you — another reason to let the
 generator lay down the first resource.)

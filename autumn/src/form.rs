@@ -4083,45 +4083,40 @@ pub fn required_number_input<T: Serialize>(
     )
 }
 
+/// The wall-clock date and time written in `raw`, ignoring any offset: a
+/// bare date (midnight), an offsetless date-time, or one with a `Z` or
+/// `±HH:MM` offset. A space separator, as some database drivers print, is
+/// accepted too.
+#[cfg(feature = "maud")]
+fn stored_wall_clock(raw: &str) -> Option<jiff::civil::DateTime> {
+    let pieces = jiff::fmt::temporal::Pieces::parse(raw).ok()?;
+    let time = pieces.time().unwrap_or(jiff::civil::Time::midnight());
+    Some(pieces.date().to_datetime(time))
+}
+
 /// Normalize a stored date/datetime string into `YYYY-MM-DD`, the shape the
 /// HTML `<input type="date">` control requires.
 ///
 /// Accepts a bare date, a full RFC 3339 timestamp (with offset/`Z`), or a
-/// naive datetime, and keeps just the date component. Falls back to the
-/// input unchanged when none of those shapes match (e.g. an empty string).
+/// civil datetime, and keeps just the date component as written. Falls back
+/// to the input unchanged when none of those shapes match (e.g. an empty
+/// string).
 #[cfg(feature = "maud")]
 fn normalize_date_value(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    // `NaiveDateTime`'s `Display` (unlike its serde form) and some database drivers put a space
-    // between date and time; normalize it so those values parse instead of passing through raw.
-    let normalized = raw.replace(' ', "T");
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
-        return date.to_string();
-    }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
-        return dt.format("%Y-%m-%d").to_string();
-    }
-    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f") {
-        return ndt.format("%Y-%m-%d").to_string();
-    }
-    raw.to_owned()
+    stored_wall_clock(raw).map_or_else(|| raw.to_owned(), |dt| dt.date().to_string())
 }
 
 /// Normalize a stored datetime string into a shape the HTML `<input
-/// type="datetime-local">` control accepts (`YYYY-MM-DDTHH:MM[:SS[.fff]]`).
+/// type="datetime-local">` control accepts (`YYYY-MM-DDTHH:MM:SS[.fff]`).
 /// Browsers silently reject RFC 3339 timestamps carrying a `Z`/offset
 /// suffix.
 ///
-/// **Seconds/fractional-seconds preserved when present.** `chrono`'s default
-/// `serde::Deserialize` for `NaiveDateTime`/`DateTime<Utc>` requires the
-/// seconds component — truncating to `YYYY-MM-DDTHH:MM` here would make
-/// [`ChangesetForm`] fail to decode the *pre-filled* value on any
-/// submission where the user doesn't manually retype it (chrono's parser
-/// returns "premature end of input"). `%.f` omits the fractional part
-/// cleanly when it's zero, so whole-second values still render without a
-/// trailing dot.
+/// **Seconds always written.** The value is printed with its seconds, and its
+/// fraction when non-zero, so an untouched submission decodes back to the
+/// same value.
 ///
 /// **Wall-clock preserved.** For RFC 3339 input with an explicit offset, the
 /// offset is dropped but the local clock components are kept as-is (no
@@ -4132,117 +4127,104 @@ fn normalize_datetime_local_value(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    // See `normalize_date_value`'s comment on space-separated input.
-    let normalized = raw.replace(' ', "T");
-    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M:%S%.f") {
-        return ndt.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
-    }
-    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%dT%H:%M") {
-        return ndt.format("%Y-%m-%dT%H:%M:%S%.f").to_string();
-    }
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
-        return dt.naive_local().format("%Y-%m-%dT%H:%M:%S%.f").to_string();
-    }
-    raw.to_owned()
+    stored_wall_clock(raw).map_or_else(|| raw.to_owned(), |dt| dt.to_string())
 }
 
-/// Pad an HTML `datetime-local` submission (`YYYY-MM-DDTHH:MM`, seconds
-/// omitted by the browser at minute granularity) to `YYYY-MM-DDTHH:MM:00` so
-/// chrono's parser — which requires the seconds component — accepts it.
-fn pad_datetime_local_seconds(raw: &str) -> String {
-    if raw.chars().count() == 16 {
-        format!("{raw}:00")
-    } else {
-        raw.to_owned()
-    }
+/// Parse the offsetless HTML `datetime-local` shape
+/// `YYYY-MM-DDTHH:MM[:SS[.f]]`. Browsers omit the seconds at minute
+/// granularity, so both forms are read.
+fn parse_datetime_local(raw: &str) -> Result<jiff::civil::DateTime, jiff::Error> {
+    jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S%.f", raw)
+        .or_else(|_| jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M", raw))
 }
 
-/// Parse a submitted datetime string into `chrono::DateTime<Utc>`, accepting
+/// Parse a submitted datetime string into a [`jiff::Timestamp`], accepting
 /// both wire shapes the same struct has to serve:
 ///
 /// - RFC 3339 with an explicit offset (JSON API bodies) — the offset is
-///   honored and the instant converted to UTC;
+///   honored;
 /// - the offsetless HTML `datetime-local` shape `YYYY-MM-DDTHH:MM[:SS[.f]]`
 ///   (browser form posts) — interpreted as UTC wall-clock time.
-fn parse_datetime_local_or_rfc3339_utc(
-    raw: &str,
-) -> Result<chrono::DateTime<chrono::Utc>, chrono::ParseError> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
-        return Ok(dt.with_timezone(&chrono::Utc));
+fn parse_datetime_local_or_rfc3339_utc(raw: &str) -> Result<jiff::Timestamp, jiff::Error> {
+    if let Ok(ts) = raw.parse::<jiff::Timestamp>() {
+        return Ok(ts);
     }
-    chrono::NaiveDateTime::parse_from_str(&pad_datetime_local_seconds(raw), "%Y-%m-%dT%H:%M:%S%.f")
-        .map(|ndt| ndt.and_utc())
+    parse_datetime_local(raw).and_then(|dt| jiff::tz::TimeZone::UTC.to_timestamp(dt))
 }
 
-/// Parse a submitted datetime string into `chrono::DateTime<Local>`,
-/// accepting both wire shapes the same struct has to serve:
+/// The server's own time zone, which a `datetime-local` value submitted for a
+/// [`jiff::ZonedDateTime`] field is read in.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a ZonedDateTime form field is defined as the server's local wall clock"
+)]
+fn server_time_zone() -> jiff::tz::TimeZone {
+    jiff::tz::TimeZone::system()
+}
+
+/// Parse a submitted datetime string into a [`jiff::ZonedDateTime`] in the
+/// server's time zone, accepting both wire shapes the same struct has to
+/// serve:
 ///
 /// - RFC 3339 with an explicit offset (JSON API bodies) — the offset is
-///   honored and the instant converted to the server's local zone;
+///   honored and the instant converted to the server's zone;
 /// - the offsetless HTML `datetime-local` shape `YYYY-MM-DDTHH:MM[:SS[.f]]`
 ///   (browser form posts) — interpreted as wall-clock time in the server's
-///   local zone. A wall clock repeated by a DST fall-back transition maps to
-///   the **earlier** of the two instants (deterministic rather than
-///   rejected); a wall clock skipped by a spring-forward transition has no
-///   corresponding instant and errors.
-fn parse_datetime_local_or_rfc3339_local(
-    raw: &str,
-) -> Result<chrono::DateTime<chrono::Local>, String> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
-        return Ok(dt.with_timezone(&chrono::Local));
+///   zone. A wall clock repeated by a DST fall-back transition maps to the
+///   **earlier** of the two instants (deterministic rather than rejected); a
+///   wall clock skipped by a spring-forward transition has no corresponding
+///   instant and errors.
+fn parse_datetime_local_or_rfc3339_local(raw: &str) -> Result<jiff::ZonedDateTime, String> {
+    let zone = server_time_zone();
+    if let Ok(ts) = raw.parse::<jiff::Timestamp>() {
+        return Ok(ts.to_zoned_datetime(zone));
     }
-    let ndt = chrono::NaiveDateTime::parse_from_str(
-        &pad_datetime_local_seconds(raw),
-        "%Y-%m-%dT%H:%M:%S%.f",
-    )
-    .map_err(|e| e.to_string())?;
-    match ndt.and_local_timezone(chrono::Local) {
-        chrono::LocalResult::Single(dt) => Ok(dt),
-        chrono::LocalResult::Ambiguous(earliest, _) => Ok(earliest),
-        chrono::LocalResult::None => Err(format!(
-            "local time {ndt} does not exist in the server's timezone (skipped by a DST transition)"
-        )),
+    let dt = parse_datetime_local(raw).map_err(|e| e.to_string())?;
+    let ambiguous = zone.into_ambiguous_zoned_datetime(dt);
+    if matches!(ambiguous.offset(), jiff::tz::AmbiguousOffset::Gap { .. }) {
+        return Err(format!(
+            "local time {dt} does not exist in the server's timezone (skipped by a DST transition)"
+        ));
     }
+    ambiguous.earlier().map_err(|e| e.to_string())
 }
 
-/// Deserialize an HTML `datetime-local` submission into `chrono::DateTime<Utc>`,
-/// treating an offsetless submitted wall-clock value as UTC.
+/// Deserialize an HTML `datetime-local` submission into a
+/// [`jiff::Timestamp`], treating an offsetless submitted wall-clock value as
+/// UTC.
 ///
-/// RFC 3339 input with an explicit offset is also accepted (converted to
-/// UTC), so a struct that doubles as a JSON API body keeps decoding.
+/// RFC 3339 input with an explicit offset is also accepted, so a struct that
+/// doubles as a JSON API body keeps decoding.
 ///
 /// `<input type="datetime-local">` has no timezone concept, so [`datetime_input`]
-/// necessarily strips any offset when rendering a `DateTime<Utc>` field's
+/// necessarily strips any offset when rendering a `Timestamp` field's
 /// current value — the browser then posts back an offsetless string (e.g.
-/// `2024-03-15T10:30:56`). Chrono's *default* `Deserialize` for
-/// `DateTime<Utc>` requires an RFC 3339 offset and rejects that string with
-/// "premature end of input" on every submission. The `#[model]`-generated
-/// `NewX` insert struct attaches this deserializer to non-nullable
-/// `DateTime<Utc>` columns automatically (and
+/// `2024-03-15T10:30:56`). The *default* `Deserialize` for `Timestamp`
+/// requires an RFC 3339 offset and rejects that string on every submission.
+/// The `#[model]`-generated `NewX` insert struct attaches this deserializer
+/// to non-nullable `Timestamp` columns automatically (and
 /// [`deserialize_datetime_local_utc_option`] to nullable ones); attach it
-/// yourself on any hand-written form struct with a `DateTime<Utc>` field
+/// yourself on any hand-written form struct with a `Timestamp` field
 /// rendered via `datetime_input`:
 ///
 /// ```rust,ignore
 /// #[derive(serde::Deserialize)]
 /// struct EventForm {
 ///     #[serde(deserialize_with = "autumn_web::form::deserialize_datetime_local_utc")]
-///     starts_at: chrono::DateTime<chrono::Utc>,
+///     starts_at: autumn_web::time::Timestamp,
 /// }
 /// ```
 ///
-/// `chrono::NaiveDateTime` fields don't need an offset, but still benefit
-/// from [`deserialize_naive_datetime_local`] as a defensive measure — see
-/// its doc comment.
+/// `civil::DateTime` fields don't need an offset, but still benefit from
+/// [`deserialize_naive_datetime_local`] as a defensive measure — see its doc
+/// comment.
 ///
 /// # Errors
 ///
 /// Returns a deserializer error when the submitted value is neither a valid
 /// `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string nor a valid RFC 3339
 /// timestamp.
-pub fn deserialize_datetime_local_utc<'de, D>(
-    deserializer: D,
-) -> Result<chrono::DateTime<chrono::Utc>, D::Error>
+pub fn deserialize_datetime_local_utc<'de, D>(deserializer: D) -> Result<jiff::Timestamp, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -4250,12 +4232,12 @@ where
     parse_datetime_local_or_rfc3339_utc(&raw).map_err(serde::de::Error::custom)
 }
 
-/// `Option<chrono::DateTime<Utc>>` counterpart to
-/// [`deserialize_datetime_local_utc`], for a nullable field — an absent,
-/// `null`, or empty submitted value decodes as `None`.
+/// `Option<Timestamp>` counterpart to [`deserialize_datetime_local_utc`], for
+/// a nullable field — an absent, `null`, or empty submitted value decodes as
+/// `None`.
 ///
 /// Like the required variant, both the offsetless `datetime-local` shape
-/// (interpreted as UTC) and RFC 3339 (offset converted to UTC) are accepted.
+/// (interpreted as UTC) and RFC 3339 (offset honored) are accepted.
 ///
 /// Pair it with `#[serde(default)]`: `deserialize_with` disables serde's
 /// implicit missing-`Option`-field-is-`None` handling, and `default` restores
@@ -4268,7 +4250,7 @@ where
 /// RFC 3339 timestamp.
 pub fn deserialize_datetime_local_utc_option<'de, D>(
     deserializer: D,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, D::Error>
+) -> Result<Option<jiff::Timestamp>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -4281,39 +4263,39 @@ where
     }
 }
 
-/// Deserialize an HTML `datetime-local` submission into
-/// `chrono::DateTime<Local>`, treating an offsetless submitted wall-clock
-/// value as the server's local time.
+/// Deserialize an HTML `datetime-local` submission into a
+/// [`jiff::ZonedDateTime`] in the server's time zone, treating an offsetless
+/// submitted wall-clock value as the server's local time.
 ///
 /// RFC 3339 input with an explicit offset is also accepted (the instant is
-/// converted to the local zone), so a struct that doubles as a JSON API body
-/// keeps decoding.
+/// converted to the server's zone), so a struct that doubles as a JSON API
+/// body keeps decoding.
 ///
-/// This is the `DateTime<chrono::Local>` counterpart to
+/// This is the `ZonedDateTime` counterpart to
 /// [`deserialize_datetime_local_utc`] — see its doc comment for why derived
 /// forms need a datetime-local-tolerant deserializer at all. The
 /// `#[model]`-generated `NewX` insert struct attaches this deserializer to
-/// non-nullable `DateTime<Local>` columns automatically (and
+/// non-nullable `ZonedDateTime` fields automatically (and
 /// [`deserialize_datetime_local_local_option`] to nullable ones); attach it
-/// yourself on any hand-written form struct with a `DateTime<Local>` field
+/// yourself on any hand-written form struct with a `ZonedDateTime` field
 /// rendered via [`datetime_input`].
 ///
-/// **DST edge cases** (the submitted wall clock has no offset, so the local
-/// zone decides which instant it names): a wall clock that occurs twice
-/// because of a fall-back transition maps to the **earlier** of the two
-/// instants — deterministic, rather than rejecting the submission; a wall
-/// clock skipped by a spring-forward transition names no instant at all and
-/// is rejected as a decode error.
+/// **DST edge cases** (the submitted wall clock has no offset, so the zone
+/// decides which instant it names): a wall clock that occurs twice because
+/// of a fall-back transition maps to the **earlier** of the two instants —
+/// deterministic, rather than rejecting the submission; a wall clock skipped
+/// by a spring-forward transition names no instant at all and is rejected as
+/// a decode error.
 ///
 /// # Errors
 ///
 /// Returns a deserializer error when the submitted value is neither a valid
 /// `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string nor a valid RFC 3339
 /// timestamp, or when the offsetless wall clock falls in a DST gap of the
-/// server's local zone.
+/// server's zone.
 pub fn deserialize_datetime_local_local<'de, D>(
     deserializer: D,
-) -> Result<chrono::DateTime<chrono::Local>, D::Error>
+) -> Result<jiff::ZonedDateTime, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -4321,14 +4303,14 @@ where
     parse_datetime_local_or_rfc3339_local(&raw).map_err(serde::de::Error::custom)
 }
 
-/// `Option<chrono::DateTime<Local>>` counterpart to
+/// `Option<ZonedDateTime>` counterpart to
 /// [`deserialize_datetime_local_local`], for a nullable field — an absent,
 /// `null`, or empty submitted value decodes as `None`.
 ///
 /// Like the required variant, both the offsetless `datetime-local` shape
 /// (interpreted as the server's local wall clock; DST-ambiguous values map
-/// to the earlier instant, DST-skipped values error) and RFC 3339 (offset
-/// converted to the local zone) are accepted.
+/// to the earlier instant, DST-skipped values error) and RFC 3339 (converted
+/// to the server's zone) are accepted.
 ///
 /// Pair it with `#[serde(default)]`: `deserialize_with` disables serde's
 /// implicit missing-`Option`-field-is-`None` handling, and `default` restores
@@ -4339,10 +4321,10 @@ where
 /// Returns a deserializer error when a non-empty submitted value is neither
 /// a valid `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string nor a valid
 /// RFC 3339 timestamp, or when the offsetless wall clock falls in a DST gap
-/// of the server's local zone.
+/// of the server's zone.
 pub fn deserialize_datetime_local_local_option<'de, D>(
     deserializer: D,
-) -> Result<Option<chrono::DateTime<chrono::Local>>, D::Error>
+) -> Result<Option<jiff::ZonedDateTime>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -4355,26 +4337,25 @@ where
     }
 }
 
-/// Deserialize an HTML `datetime-local` submission into `chrono::NaiveDateTime`.
+/// Deserialize an HTML `datetime-local` submission into a
+/// [`jiff::civil::DateTime`].
 ///
 /// The *pre-filled* value [`datetime_input`] renders always includes seconds
-/// (see `normalize_datetime_local_value`), so chrono's default `Deserialize`
-/// — which requires the seconds component — decodes an untouched submission
-/// fine on its own. But a value the user actively edits through the
-/// browser's native picker isn't guaranteed to include seconds (`step="any"`
-/// only requests that the control *allow* seconds; it doesn't guarantee
-/// every browser's UI captures them), which would otherwise 400 with
-/// "premature end of input". The `#[model]`-generated `NewX` insert struct
-/// attaches this deserializer to non-nullable `NaiveDateTime` columns
-/// automatically (and [`deserialize_naive_datetime_local_option`] to nullable
-/// ones); attach it yourself on hand-written form structs to defend against
-/// that:
+/// (see `normalize_datetime_local_value`). But a value the user actively
+/// edits through the browser's native picker isn't guaranteed to include
+/// them (`step="any"` only requests that the control *allow* seconds; it
+/// doesn't guarantee every browser's UI captures them). This deserializer
+/// reads both forms and nothing looser: no offset, no bare date. The
+/// `#[model]`-generated `NewX` insert struct attaches it to non-nullable
+/// `civil::DateTime` columns automatically (and
+/// [`deserialize_naive_datetime_local_option`] to nullable ones); attach it
+/// yourself on hand-written form structs:
 ///
 /// ```rust,ignore
 /// #[derive(serde::Deserialize)]
 /// struct EventForm {
 ///     #[serde(deserialize_with = "autumn_web::form::deserialize_naive_datetime_local")]
-///     starts_at: chrono::NaiveDateTime,
+///     starts_at: autumn_web::time::civil::DateTime,
 /// }
 /// ```
 ///
@@ -4384,16 +4365,15 @@ where
 /// `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
 pub fn deserialize_naive_datetime_local<'de, D>(
     deserializer: D,
-) -> Result<chrono::NaiveDateTime, D::Error>
+) -> Result<jiff::civil::DateTime, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = <String as serde::Deserialize>::deserialize(deserializer)?;
-    chrono::NaiveDateTime::parse_from_str(&pad_datetime_local_seconds(&raw), "%Y-%m-%dT%H:%M:%S%.f")
-        .map_err(serde::de::Error::custom)
+    parse_datetime_local(&raw).map_err(serde::de::Error::custom)
 }
 
-/// `Option<chrono::NaiveDateTime>` counterpart to
+/// `Option<civil::DateTime>` counterpart to
 /// [`deserialize_naive_datetime_local`], for a nullable field — an absent,
 /// `null`, or empty submitted value decodes as `None`.
 ///
@@ -4407,18 +4387,15 @@ where
 /// valid `YYYY-MM-DDTHH:MM[:SS[.f]]` local datetime string.
 pub fn deserialize_naive_datetime_local_option<'de, D>(
     deserializer: D,
-) -> Result<Option<chrono::NaiveDateTime>, D::Error>
+) -> Result<Option<jiff::civil::DateTime>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
     match raw {
-        Some(s) if !s.is_empty() => chrono::NaiveDateTime::parse_from_str(
-            &pad_datetime_local_seconds(&s),
-            "%Y-%m-%dT%H:%M:%S%.f",
-        )
-        .map(Some)
-        .map_err(serde::de::Error::custom),
+        Some(s) if !s.is_empty() => parse_datetime_local(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         _ => Ok(None),
     }
 }
@@ -4473,41 +4450,36 @@ pub fn required_date_input<T: Serialize>(
 }
 
 /// Render a labeled `<input type="datetime-local">` tied to a changeset
-/// field (`NaiveDateTime` or `DateTime`).
+/// field (`civil::DateTime`, `Timestamp` or `ZonedDateTime`).
 ///
 /// The current value is normalized via `normalize_datetime_local_value` to
-/// the shape HTML5 datetime pickers require, preserving seconds/fractional
-/// seconds when present — `chrono`'s default `Deserialize` requires the
-/// seconds component, so truncating to minutes would break decoding the
-/// pre-filled value on any untouched submission. Renders `step="any"` so a
+/// the shape HTML5 datetime pickers require, always with its seconds and
+/// keeping a fraction when present, so an untouched submission decodes back
+/// to the same value. Renders `step="any"` so a
 /// value carrying seconds doesn't fail the browser's step-mismatch
 /// constraint validation (the default step is minute-granularity). Wraps in
 /// `<div id="{field}-field">` for stable htmx targeting. ARIA annotations
 /// behave identically to [`text_input`].
 ///
-/// # Attach a `deserialize_with` matching the field's chrono type
+/// # Attach a `deserialize_with` matching the field's type
 ///
 /// `<input type="datetime-local">` has no timezone concept, so the value
-/// this renders for a `DateTime<Utc>` field never carries an offset —
-/// chrono's default `Deserialize` for `DateTime<Utc>` requires one and
-/// rejects the submission. Attach [`deserialize_datetime_local_utc`] (or
-/// [`deserialize_datetime_local_utc_option`] for `Option<DateTime<Utc>>`)
-/// via `#[serde(deserialize_with = "...")]` on that field. `DateTime<Local>`
+/// this renders for a `Timestamp` field never carries an offset — the
+/// default `Deserialize` for `Timestamp` requires one and rejects the
+/// submission. Attach [`deserialize_datetime_local_utc`] (or
+/// [`deserialize_datetime_local_utc_option`] for `Option<Timestamp>`) via
+/// `#[serde(deserialize_with = "...")]` on that field. `ZonedDateTime`
 /// fields have the same problem and take
 /// [`deserialize_datetime_local_local`] (or its `_option` variant), which
-/// interprets the offsetless wall clock in the server's local zone. Other
-/// zone parameters (e.g. `DateTime<FixedOffset>`) have **no** sound
-/// interpretation of an offsetless value — don't render them through this
-/// control; use a text input carrying the RFC 3339 string instead (which is
-/// what a derived `form_for` does).
+/// interprets the offsetless wall clock in the server's zone.
 ///
-/// `NaiveDateTime` fields don't hit that offset problem, but a value the
+/// `civil::DateTime` fields don't hit that offset problem, but a value the
 /// user actively edits through the browser's native picker isn't guaranteed
 /// to include seconds (unlike the always-seconds-inclusive pre-filled
-/// value), which chrono's default `Deserialize` also rejects. Attach
-/// [`deserialize_naive_datetime_local`] (or
-/// [`deserialize_naive_datetime_local_option`] for `Option<NaiveDateTime>`)
-/// as a defensive measure.
+/// value). Attach [`deserialize_naive_datetime_local`] (or
+/// [`deserialize_naive_datetime_local_option`] for
+/// `Option<civil::DateTime>`), which reads exactly the two shapes the
+/// control posts.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn datetime_input<T: Serialize>(
@@ -5043,7 +5015,7 @@ native_input_helpers! {
 /// seconds are not zero, or `HH:MM:SS.sss` when there is a fraction. With
 /// seconds the input gets `step="1"`, and with a fraction `step="0.001"`, so
 /// the browser accepts the value. The browser posts `HH:MM` (or `HH:MM:SS`
-/// when the input shows seconds). A `chrono::NaiveTime` field reads both.
+/// when the input shows seconds). A `civil::Time` field reads both.
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn time_input<T: Serialize>(
@@ -5543,7 +5515,7 @@ pub enum FieldControl {
     /// `<input type="url">`.
     Url,
     /// `<input type="time">`. The `#[model]` derive gives it to a
-    /// `NaiveTime` column.
+    /// `civil::Time` column.
     Time,
     /// `<input type="month">`, for a `YYYY-MM` `String`.
     Month,
@@ -5785,32 +5757,30 @@ pub trait FormModel {
 /// A [`FieldControl::DateTime`] field renders via [`datetime_input`], whose
 /// `<input type="datetime-local">` has no timezone concept: the pre-filled
 /// value is offsetless (`YYYY-MM-DDTHH:MM:SS`) and the browser posts back an
-/// offsetless string — not always with seconds. Chrono's default
-/// `Deserialize` for `DateTime<Utc>` demands an RFC 3339 offset, so a plain
-/// field would reject even an *untouched* submission as a 400 before
-/// validation. The `#[model]`-generated `NewX` insert struct therefore
-/// attaches [`deserialize_datetime_local_utc`] (or the `_option` variant) to
-/// `DateTime<Utc>` columns, [`deserialize_datetime_local_local`] (or its
-/// `_option` variant) to `DateTime<Local>` columns, and
+/// offsetless string — not always with seconds. The default `Deserialize`
+/// for `Timestamp` demands an RFC 3339 offset, so a plain field would reject
+/// even an *untouched* submission as a 400 before validation. The
+/// `#[model]`-generated `NewX` insert struct therefore attaches
+/// [`deserialize_datetime_local_utc`] (or the `_option` variant) to
+/// `Timestamp` columns, [`deserialize_datetime_local_local`] (or its
+/// `_option` variant) to `ZonedDateTime` fields, and
 /// [`deserialize_naive_datetime_local`] (or its `_option` variant) to
-/// `NaiveDateTime` columns: the offsetless value is interpreted as UTC or
-/// the server's local zone respectively (see
-/// [`deserialize_datetime_local_local`] for the DST edge cases), and
-/// RFC 3339 JSON API bodies posted to the same struct keep decoding (an
-/// explicit offset is converted to the field's zone).
+/// `civil::DateTime` columns: the offsetless value is read as UTC, in the
+/// server's zone, or as written respectively (see
+/// [`deserialize_datetime_local_local`] for the DST edge cases), and RFC 3339
+/// JSON API bodies posted to the first two keep decoding.
 ///
-/// A `DateTime` column with any **other** zone parameter (e.g.
-/// `DateTime<FixedOffset>`, or a bare `DateTime` alias whose zone the derive
-/// can't see) does *not* get the `datetime-local` picker: an offsetless
-/// wall clock is genuinely ambiguous for such a zone, so inventing an
-/// interpretation would silently shift instants. The derived [`FormModel`]
+/// A date-time type the derive does not know does *not* get the
+/// `datetime-local` picker: the derive cannot tell which zone an offsetless
+/// wall clock would mean, so inventing an interpretation would silently shift
+/// instants. The derived [`FormModel`]
 /// falls back to [`FieldControl::Text`] for those columns — the pre-filled
-/// value is the field's serialized RFC 3339 string, which chrono's default
+/// value is the field's serialized RFC 3339 string, which the type's own
 /// `Deserialize` round-trips as-is.
 ///
 /// A required [`FieldControl::Date`] needs no such treatment — the browser's
-/// `YYYY-MM-DD` wire shape is exactly what chrono's `NaiveDate`
-/// `Deserialize` accepts. Hand-written form targets must attach the
+/// `YYYY-MM-DD` wire shape is exactly what `civil::Date`'s `Deserialize`
+/// accepts. Hand-written form targets must attach the
 /// deserializers themselves — see each helper's documentation.
 ///
 /// # Serde-renamed fields
@@ -9323,7 +9293,7 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn date_input_normalizes_space_separated_datetime_to_date_only() {
-        // `NaiveDateTime`'s `Display` and some database drivers put a space between date and time.
+        // Some database drivers and older stored values put a space between date and time.
         #[derive(serde::Serialize)]
         struct F {
             born_on: String,
@@ -9368,8 +9338,7 @@ mod tests {
         });
         let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
         assert!(html.contains(r#"type="datetime-local""#), "{html}");
-        // Seconds are kept: chrono's default `Deserialize` requires them, so a minute-only value
-        // would fail to decode on an untouched submission.
+        // Seconds are always written, so an untouched submission decodes to the same value.
         assert!(html.contains(r#"value="2024-03-15T10:30:00""#), "{html}");
         // The default step is one minute, so a value with seconds would fail step validation.
         assert!(html.contains(r#"step="any""#), "{html}");
@@ -9394,7 +9363,7 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn datetime_input_normalizes_space_separated_datetime() {
-        // `NaiveDateTime`'s `Display` and some database drivers use a space, which
+        // Some database drivers and older stored values use a space, which
         // `<input type="datetime-local">` rejects: it requires `T`.
         #[derive(serde::Serialize)]
         struct F {
@@ -9429,31 +9398,33 @@ mod tests {
     }
 
     #[cfg(feature = "maud")]
+    fn rendered_value(html: &str) -> &str {
+        html.split("value=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("value attribute present")
+    }
+
+    #[cfg(feature = "maud")]
     #[test]
-    fn datetime_input_value_round_trips_through_chronos_default_deserialize() {
-        // chrono's default `Deserialize` for `NaiveDateTime` requires seconds. The pre-filled
-        // value, submitted untouched, must decode into a plain `NaiveDateTime` field.
+    fn datetime_input_value_round_trips_through_the_civil_default_deserialize() {
+        // The pre-filled value, submitted untouched, must decode into a plain
+        // `civil::DateTime` field.
         #[derive(serde::Serialize)]
         struct F {
-            starts_at: chrono::NaiveDateTime,
+            starts_at: jiff::civil::DateTime,
         }
         #[derive(serde::Deserialize)]
         struct Decoded {
-            starts_at: chrono::NaiveDateTime,
+            starts_at: jiff::civil::DateTime,
         }
-        let stored = chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-            .unwrap()
-            .and_hms_opt(10, 30, 56)
-            .unwrap();
+        let stored = jiff::civil::date(2024, 3, 15).at(10, 30, 56, 0);
         let cs = Changeset::new(F { starts_at: stored });
         let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
 
         // Submit the rendered value as a browser would on a no-op edit.
-        let value = html
-            .split("value=\"")
-            .nth(1)
-            .and_then(|s| s.split('"').next())
-            .expect("value attribute present");
+        let value = rendered_value(&html);
+        assert_eq!(value, "2024-03-15T10:30:56");
         let body = format!("starts_at={value}");
         let decoded: Decoded =
             serde_urlencoded::from_str(&body).expect("pre-filled value must decode");
@@ -9462,32 +9433,41 @@ mod tests {
 
     #[cfg(feature = "maud")]
     #[test]
-    fn datetime_input_value_round_trips_for_utc_datetime_with_deserialize_helper() {
-        // The rendered value has no offset, which chrono's default `Deserialize` for
-        // `DateTime<Utc>` rejects; `deserialize_datetime_local_utc` accepts it.
+    fn datetime_input_keeps_a_fraction_and_writes_zero_seconds() {
         #[derive(serde::Serialize)]
         struct F {
-            starts_at: chrono::DateTime<chrono::Utc>,
+            starts_at: jiff::civil::DateTime,
+        }
+        let cs = Changeset::new(F {
+            starts_at: jiff::civil::date(2024, 3, 15).at(10, 30, 0, 0),
+        });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        assert_eq!(rendered_value(&html), "2024-03-15T10:30:00");
+        let cs = Changeset::new(F {
+            starts_at: jiff::civil::date(2024, 3, 15).at(10, 30, 56, 123_000_000),
+        });
+        let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
+        assert_eq!(rendered_value(&html), "2024-03-15T10:30:56.123");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn datetime_input_value_round_trips_for_a_timestamp_with_deserialize_helper() {
+        // The rendered value has no offset, which the default `Deserialize` for
+        // `Timestamp` rejects; `deserialize_datetime_local_utc` accepts it.
+        #[derive(serde::Serialize)]
+        struct F {
+            starts_at: jiff::Timestamp,
         }
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(deserialize_with = "deserialize_datetime_local_utc")]
-            starts_at: chrono::DateTime<chrono::Utc>,
+            starts_at: jiff::Timestamp,
         }
-        let stored = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-                .unwrap()
-                .and_hms_opt(10, 30, 56)
-                .unwrap(),
-            chrono::Utc,
-        );
+        let stored: jiff::Timestamp = "2024-03-15T10:30:56Z".parse().unwrap();
         let cs = Changeset::new(F { starts_at: stored });
         let html = datetime_input(&cs, "starts_at", "Starts at").into_string();
-        let value = html
-            .split("value=\"")
-            .nth(1)
-            .and_then(|s| s.split('"').next())
-            .expect("value attribute present");
+        let value = rendered_value(&html);
         // `datetime-local` takes no offset.
         assert!(!value.contains('Z') && !value.contains('+'), "{value}");
 
@@ -9499,41 +9479,28 @@ mod tests {
 
     #[cfg(feature = "maud")]
     #[test]
-    fn deserialize_datetime_local_utc_pads_missing_seconds() {
+    fn deserialize_datetime_local_utc_reads_a_value_without_seconds() {
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(deserialize_with = "deserialize_datetime_local_utc")]
-            starts_at: chrono::DateTime<chrono::Utc>,
+            starts_at: jiff::Timestamp,
         }
         let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30").unwrap();
         assert_eq!(
             decoded.starts_at,
-            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-                    .unwrap()
-                    .and_hms_opt(10, 30, 0)
-                    .unwrap(),
-                chrono::Utc,
-            )
+            "2024-03-15T10:30:00Z".parse::<jiff::Timestamp>().unwrap()
         );
     }
 
     #[test]
     fn deserialize_datetime_local_utc_accepts_rfc3339_with_offset() {
-        // The same struct often serves JSON API bodies, so RFC 3339 with an offset still decodes,
-        // converted to UTC.
+        // The same struct often serves JSON API bodies, so RFC 3339 with an offset still decodes.
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(deserialize_with = "deserialize_datetime_local_utc")]
-            starts_at: chrono::DateTime<chrono::Utc>,
+            starts_at: jiff::Timestamp,
         }
-        let expected = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-                .unwrap()
-                .and_hms_opt(10, 30, 56)
-                .unwrap(),
-            chrono::Utc,
-        );
+        let expected: jiff::Timestamp = "2024-03-15T10:30:56Z".parse().unwrap();
         let decoded: Decoded =
             serde_json::from_str(r#"{"starts_at":"2024-03-15T10:30:56Z"}"#).unwrap();
         assert_eq!(decoded.starts_at, expected);
@@ -9543,13 +9510,36 @@ mod tests {
         assert_eq!(decoded.starts_at, expected);
     }
 
+    #[test]
+    fn deserialize_datetime_local_utc_rejects_garbage() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Decoded {
+            #[serde(deserialize_with = "deserialize_datetime_local_utc")]
+            #[allow(dead_code)]
+            starts_at: jiff::Timestamp,
+        }
+        for bad in [
+            "",
+            "2024-03-15",
+            "2024-03-15T10",
+            "not a date",
+            "2024-13-01T10:30",
+        ] {
+            let body = serde_json::json!({ "starts_at": bad }).to_string();
+            assert!(
+                serde_json::from_str::<Decoded>(&body).is_err(),
+                "{bad:?} must not decode"
+            );
+        }
+    }
+
     #[cfg(feature = "maud")]
     #[test]
     fn deserialize_datetime_local_utc_option_absent_key_is_none() {
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(default, deserialize_with = "deserialize_datetime_local_utc_option")]
-            starts_at: Option<chrono::DateTime<chrono::Utc>>,
+            starts_at: Option<jiff::Timestamp>,
         }
         let decoded: Decoded = serde_urlencoded::from_str("").unwrap();
         assert_eq!(decoded.starts_at, None);
@@ -9561,68 +9551,58 @@ mod tests {
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(default, deserialize_with = "deserialize_datetime_local_utc_option")]
-            starts_at: Option<chrono::DateTime<chrono::Utc>>,
+            starts_at: Option<jiff::Timestamp>,
         }
         let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30:56").unwrap();
         assert_eq!(
             decoded.starts_at,
-            Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-                    .unwrap()
-                    .and_hms_opt(10, 30, 56)
-                    .unwrap(),
-                chrono::Utc,
-            ))
+            Some("2024-03-15T10:30:56Z".parse::<jiff::Timestamp>().unwrap())
         );
     }
 
     #[test]
     fn deserialize_datetime_local_local_interprets_offsetless_as_local_wall_clock() {
-        // An offsetless value is a wall clock in the server's local zone. Midday is outside every
+        // An offsetless value is a wall clock in the server's zone. Midday is outside every
         // real zone's DST transition, so this holds in any host `TZ`.
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(deserialize_with = "deserialize_datetime_local_local")]
-            starts_at: chrono::DateTime<chrono::Local>,
+            starts_at: jiff::ZonedDateTime,
         }
-        let expected_wall_clock = chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-            .unwrap()
-            .and_hms_opt(12, 30, 56)
-            .unwrap();
         let decoded: Decoded =
             serde_json::from_str(r#"{"starts_at":"2024-03-15T12:30:56"}"#).unwrap();
-        assert_eq!(decoded.starts_at.naive_local(), expected_wall_clock);
+        assert_eq!(
+            decoded.starts_at.datetime(),
+            jiff::civil::date(2024, 3, 15).at(12, 30, 56, 0)
+        );
+        assert_eq!(decoded.starts_at.time_zone(), &server_time_zone());
 
-        // Seconds dropped by a minute-granularity picker are padded.
+        // A minute-granularity picker drops the seconds.
         let decoded: Decoded = serde_json::from_str(r#"{"starts_at":"2024-03-15T12:30"}"#).unwrap();
         assert_eq!(
-            decoded.starts_at.naive_local(),
-            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-                .unwrap()
-                .and_hms_opt(12, 30, 0)
-                .unwrap()
+            decoded.starts_at.datetime(),
+            jiff::civil::date(2024, 3, 15).at(12, 30, 0, 0)
         );
     }
 
     #[test]
     fn deserialize_datetime_local_local_accepts_rfc3339_with_offset() {
         // The same struct often serves JSON API bodies, so RFC 3339 with an offset still decodes,
-        // converted to the local zone.
+        // converted to the server's zone.
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(deserialize_with = "deserialize_datetime_local_local")]
-            starts_at: chrono::DateTime<chrono::Local>,
+            starts_at: jiff::ZonedDateTime,
         }
-        let expected = chrono::DateTime::parse_from_rfc3339("2024-03-15T10:30:56Z")
-            .unwrap()
-            .with_timezone(&chrono::Local);
+        let expected: jiff::Timestamp = "2024-03-15T10:30:56Z".parse().unwrap();
         let decoded: Decoded =
             serde_json::from_str(r#"{"starts_at":"2024-03-15T10:30:56Z"}"#).unwrap();
-        assert_eq!(decoded.starts_at, expected);
+        assert_eq!(decoded.starts_at.timestamp(), expected);
+        assert_eq!(decoded.starts_at.time_zone(), &server_time_zone());
         // +09:00 wall clock 19:30:56 is the same instant.
         let decoded: Decoded =
             serde_json::from_str(r#"{"starts_at":"2024-03-15T19:30:56+09:00"}"#).unwrap();
-        assert_eq!(decoded.starts_at, expected);
+        assert_eq!(decoded.starts_at.timestamp(), expected);
     }
 
     #[cfg(feature = "maud")]
@@ -9631,7 +9611,7 @@ mod tests {
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(default, deserialize_with = "deserialize_datetime_local_local_option")]
-            starts_at: Option<chrono::DateTime<chrono::Local>>,
+            starts_at: Option<jiff::ZonedDateTime>,
         }
         let decoded: Decoded = serde_urlencoded::from_str("").unwrap();
         assert_eq!(decoded.starts_at, None);
@@ -9639,32 +9619,24 @@ mod tests {
         assert_eq!(decoded.starts_at, None);
         let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T12:30:56").unwrap();
         assert_eq!(
-            decoded.starts_at.map(|dt| dt.naive_local()),
-            Some(
-                chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-                    .unwrap()
-                    .and_hms_opt(12, 30, 56)
-                    .unwrap()
-            )
+            decoded.starts_at.map(|zdt| zdt.datetime()),
+            Some(jiff::civil::date(2024, 3, 15).at(12, 30, 56, 0))
         );
     }
 
     #[cfg(feature = "maud")]
     #[test]
-    fn deserialize_naive_datetime_local_pads_missing_seconds() {
+    fn deserialize_naive_datetime_local_reads_a_value_without_seconds() {
         // A value edited in the native picker can lack seconds, unlike the pre-filled one.
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(deserialize_with = "deserialize_naive_datetime_local")]
-            starts_at: chrono::NaiveDateTime,
+            starts_at: jiff::civil::DateTime,
         }
         let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30").unwrap();
         assert_eq!(
             decoded.starts_at,
-            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-                .unwrap()
-                .and_hms_opt(10, 30, 0)
-                .unwrap()
+            jiff::civil::date(2024, 3, 15).at(10, 30, 0, 0)
         );
     }
 
@@ -9674,16 +9646,41 @@ mod tests {
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(deserialize_with = "deserialize_naive_datetime_local")]
-            starts_at: chrono::NaiveDateTime,
+            starts_at: jiff::civil::DateTime,
         }
         let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30:56").unwrap();
         assert_eq!(
             decoded.starts_at,
-            chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-                .unwrap()
-                .and_hms_opt(10, 30, 56)
-                .unwrap()
+            jiff::civil::date(2024, 3, 15).at(10, 30, 56, 0)
         );
+        let decoded: Decoded =
+            serde_urlencoded::from_str("starts_at=2024-03-15T10:30:56.250").unwrap();
+        assert_eq!(
+            decoded.starts_at,
+            jiff::civil::date(2024, 3, 15).at(10, 30, 56, 250_000_000)
+        );
+    }
+
+    #[test]
+    fn deserialize_naive_datetime_local_rejects_an_offset_or_a_bare_date() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Decoded {
+            #[serde(deserialize_with = "deserialize_naive_datetime_local")]
+            #[allow(dead_code)]
+            starts_at: jiff::civil::DateTime,
+        }
+        for bad in [
+            "2024-03-15",
+            "2024-03-15T10:30:56Z",
+            "2024-03-15T10:30:56+02:00",
+            "x",
+        ] {
+            let body = serde_json::json!({ "starts_at": bad }).to_string();
+            assert!(
+                serde_json::from_str::<Decoded>(&body).is_err(),
+                "{bad:?} must not decode"
+            );
+        }
     }
 
     #[cfg(feature = "maud")]
@@ -9692,9 +9689,21 @@ mod tests {
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(default, deserialize_with = "deserialize_naive_datetime_local_option")]
-            starts_at: Option<chrono::NaiveDateTime>,
+            starts_at: Option<jiff::civil::DateTime>,
         }
         let decoded: Decoded = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(decoded.starts_at, None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_naive_datetime_local_option_empty_value_is_none() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default, deserialize_with = "deserialize_naive_datetime_local_option")]
+            starts_at: Option<jiff::civil::DateTime>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=").unwrap();
         assert_eq!(decoded.starts_at, None);
     }
 
@@ -9704,17 +9713,12 @@ mod tests {
         #[derive(serde::Deserialize)]
         struct Decoded {
             #[serde(default, deserialize_with = "deserialize_naive_datetime_local_option")]
-            starts_at: Option<chrono::NaiveDateTime>,
+            starts_at: Option<jiff::civil::DateTime>,
         }
         let decoded: Decoded = serde_urlencoded::from_str("starts_at=2024-03-15T10:30").unwrap();
         assert_eq!(
             decoded.starts_at,
-            Some(
-                chrono::NaiveDate::from_ymd_opt(2024, 3, 15)
-                    .unwrap()
-                    .and_hms_opt(10, 30, 0)
-                    .unwrap()
-            )
+            Some(jiff::civil::date(2024, 3, 15).at(10, 30, 0, 0))
         );
     }
 

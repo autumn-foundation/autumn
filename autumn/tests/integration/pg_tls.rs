@@ -427,7 +427,7 @@ fn offline_sync_pg_backend_push_negotiates_tls_for_sslmode_require() {
             op: autumn_web::sync::Op::Upsert,
             payload: Some(serde_json::json!({"title": "over tls"})),
             base_version: 0,
-            updated_at: chrono::Utc::now(),
+            updated_at: autumn_web::time::ambient_now(),
         }],
     };
     let result = backend.apply_push(

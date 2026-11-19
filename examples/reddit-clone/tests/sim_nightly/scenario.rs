@@ -33,11 +33,10 @@ use autumn_web::sim::{
 };
 use autumn_web::test::{TestApp, TestClient};
 use autumn_web::time::{
-    AmbientClock, ambient_instant, ambient_monotonic, ambient_now, ambient_system_time,
-    clock_unix_duration, clock_unix_secs,
+    AmbientClock, SignedDuration, ambient_civil_utc, ambient_instant, ambient_monotonic,
+    ambient_now, ambient_system_time, civil, clock_unix_duration, clock_unix_secs,
 };
 use autumn_web::{always, sometimes};
-use chrono::{NaiveDate, TimeDelta, TimeZone as _, Utc};
 use futures::FutureExt as _;
 use proptest::strategy::Strategy;
 
@@ -527,7 +526,7 @@ async fn age_posts(sim: &Sim) {
         let system = ambient_system_time();
         let unix = clock_unix_duration(&AmbientClock);
         sim.advance(SWEEP_EVERY).await;
-        always!(ambient_now() - now == TimeDelta::from_std(SWEEP_EVERY).expect("small"));
+        always!(ambient_now() - now == SignedDuration::try_from(SWEEP_EVERY).expect("small"));
         always!(ambient_monotonic().saturating_duration_since(mono) == SWEEP_EVERY);
         always!(ambient_instant().duration_since(instant) == SWEEP_EVERY);
         always!(ambient_system_time().duration_since(system).ok() == Some(SWEEP_EVERY));
@@ -551,15 +550,16 @@ async fn age_posts(sim: &Sim) {
         }
         previous = current;
     }
-    let tomorrow = NaiveDate::from_ymd_opt(2020, 1, 2).expect("a date");
-    sim.advance_to(&Utc.from_utc_datetime(&tomorrow.and_hms_opt(9, 0, 0).expect("a time")))
-        .await;
-    let new_york_winter = chrono::FixedOffset::west_opt(5 * 3600).expect("an offset");
-    sim.advance_to_local(
-        tomorrow.and_hms_opt(18, 0, 0).expect("a time"),
-        &new_york_winter,
+    let tomorrow = autumn_web::time::civil::date(2020, 1, 2);
+    sim.advance_to(
+        autumn_web::time::tz::TimeZone::UTC
+            .to_timestamp(tomorrow.at(9, 0, 0, 0))
+            .expect("a time in range"),
     )
     .await;
+    let new_york_winter = autumn_web::time::tz::TimeZone::fixed(autumn_web::time::tz::offset(-5));
+    sim.advance_to_local(tomorrow.at(18, 0, 0, 0), &new_york_winter)
+        .await;
     if let Err(stall) = sim.try_run_to_idle().await {
         panic!(
             "the app did not settle: seed {}, {} drain steps: {stall}",
@@ -740,7 +740,10 @@ async fn replicas(sim: &mut Sim, shared: &Arc<Shared>, posts: &[i64], plan: &Pla
         .clone();
     check_publish_order(&worker_log, shared, "the vote worker", false);
 
-    sim.step_replica_clock("web-b", TimeDelta::seconds(plan.step_b_secs));
+    sim.step_replica_clock(
+        "web-b",
+        autumn_web::time::SignedDuration::from_secs(plan.step_b_secs),
+    );
     sim.run_for(Duration::from_secs(30)).await;
     hot(sim.replica("web-b"), "web-b").await;
     for actor in &plan.actors {
@@ -845,9 +848,9 @@ fn check_end_state(sim: &Sim, shared: &Shared, net: &SimNet) {
 pub async fn rank_bands(sim: &mut Sim) {
     let hot_score = 400 + i64::try_from(sim.rng().next_u64() % 500).expect("small");
     let cold_score = 10 + i64::try_from(sim.rng().next_u64() % 190).expect("small");
-    let created = ambient_now().naive_utc();
+    let created = ambient_civil_utc();
     sim.advance(Duration::from_secs(24 * 3600)).await;
-    let now = ambient_now().naive_utc();
+    let now = ambient_civil_utc();
     for score in [hot_score, cold_score] {
         let rank = calculate_hot_rank(score, created, now);
         sometimes!(
@@ -868,16 +871,17 @@ pub fn rank_case_strategy() -> impl Strategy<Value = Vec<(i64, u32)>> {
 
 /// Check the real rank formula on generated posts.
 pub fn check_rank_cases(_sim: &mut Sim, cases: &[(i64, u32)]) {
-    let now = chrono::NaiveDateTime::default() + TimeDelta::days(60);
+    let now =
+        civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0) + SignedDuration::from_hours(60 * 24);
     for &(score, age) in cases {
-        let created = now - TimeDelta::minutes(i64::from(age));
+        let created = now - SignedDuration::from_mins(i64::from(age));
         let rank = calculate_hot_rank(score, created, now);
         always!(
             rank.is_finite(),
             "rank of score {score} at age {age} min is {rank}"
         );
         always!(rank.signum() == (score as f64).signum() || score == 0);
-        let older = calculate_hot_rank(score, created - TimeDelta::hours(1), now);
+        let older = calculate_hot_rank(score, created - SignedDuration::from_hours(1), now);
         if score > 0 {
             always!(
                 older < rank,

@@ -54,9 +54,9 @@ pub struct User {
     pub bio: String,
     pub website: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub updated_at: chrono::NaiveDateTime,
+    pub updated_at: autumn_web::time::civil::DateTime,
 }
 
 // `#[model]` already implements `Preloadable` for `User`, so the explicit
@@ -100,7 +100,7 @@ pub struct SiteOption {
     pub value: String,
     pub autoload: bool,
     #[default]
-    pub updated_at: chrono::NaiveDateTime,
+    pub updated_at: autumn_web::time::civil::DateTime,
 }
 
 // ── Media library ───────────────────────────────────────────────────────────
@@ -135,9 +135,9 @@ pub struct Attachment {
     pub caption: String,
     pub uploader_id: Option<i64>,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub updated_at: chrono::NaiveDateTime,
+    pub updated_at: autumn_web::time::civil::DateTime,
 }
 
 impl Attachment {
@@ -239,15 +239,15 @@ pub struct Post {
     pub comment_count: i64,
     /// When the post went live, or (for `future`) when it is due to. `None`
     /// until the first publish.
-    pub published_at: Option<chrono::NaiveDateTime>,
+    pub published_at: Option<autumn_web::time::civil::DateTime>,
     /// Optimistic locking, so two editors on the same post cannot silently
     /// overwrite each other — the second save is rejected rather than lost.
     #[lock_version]
     pub lock_version: i32,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub updated_at: chrono::NaiveDateTime,
+    pub updated_at: autumn_web::time::civil::DateTime,
 }
 
 impl Post {
@@ -357,7 +357,7 @@ pub struct PostMeta {
     pub meta_key: String,
     pub meta_value: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // ── Taxonomies ──────────────────────────────────────────────────────────────
@@ -385,7 +385,7 @@ pub struct Term {
     #[default]
     pub post_count: i64,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 /// Remove `[shortcode ...]` tags, leaving surrounding prose intact.
@@ -469,7 +469,8 @@ pub struct Revision {
     pub status: String,
     pub author_id: Option<i64>,
     pub summary: String,
-    pub created_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[derive(Debug, Clone, diesel::Insertable)]
@@ -520,7 +521,7 @@ pub struct Comment {
     /// `approved` | `pending` | `spam` | `trash`.
     pub status: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 impl Comment {
@@ -550,7 +551,7 @@ pub struct Menu {
     /// for an unassigned menu.
     pub location: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 /// One entry in a navigation menu.
@@ -596,7 +597,7 @@ mod tests {
     use super::*;
 
     fn sample_user() -> User {
-        let now = chrono::Utc::now().naive_utc();
+        let now = autumn_web::time::ambient_civil_utc();
         User {
             id: 1,
             username: "jane".to_owned(),

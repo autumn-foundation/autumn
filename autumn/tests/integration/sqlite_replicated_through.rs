@@ -14,8 +14,7 @@ use autumn_web::replication::{
     FileDestination, ReplicaDestination, ReplicationError, ReplicationSettings, ReplicationStatus,
     Replicator, restore, segment,
 };
-use autumn_web::time::ClockSource;
-use chrono::{DateTime, TimeZone as _, Utc};
+use autumn_web::time::{ClockSource, SignedDuration, Timestamp};
 use diesel::connection::SimpleConnection as _;
 use diesel::sql_types::Text;
 use diesel::{Connection as _, QueryableByName, RunQueryDsl as _, SqliteConnection, sql_query};
@@ -26,10 +25,8 @@ struct Row {
     v: String,
 }
 
-fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_700_000_000 + secs, 0)
-        .single()
-        .expect("timestamp")
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_second(1_700_000_000 + secs).expect("timestamp")
 }
 
 /// Open the database as the pool does with replication on.
@@ -51,12 +48,12 @@ fn insert(conn: &mut SqliteConnection, value: &str) {
         .expect("insert");
 }
 
-type Hook = Box<dyn FnOnce(DateTime<Utc>) + Send>;
+type Hook = Box<dyn FnOnce(Timestamp) + Send>;
 
 /// A clock that moves one second on each read. It can run a hook inside
 /// read number `n`, before that read returns.
 struct HookClock {
-    now: Mutex<DateTime<Utc>>,
+    now: Mutex<Timestamp>,
     reads: AtomicUsize,
     hook: Mutex<Option<(usize, Hook)>>,
 }
@@ -71,11 +68,11 @@ impl HookClock {
     }
 
     /// The current instant, without a read.
-    fn peek(&self) -> DateTime<Utc> {
+    fn peek(&self) -> Timestamp {
         *self.now.lock().expect("clock")
     }
 
-    fn set(&self, now: DateTime<Utc>) {
+    fn set(&self, now: Timestamp) {
         *self.now.lock().expect("clock") = now;
     }
 
@@ -87,10 +84,10 @@ impl HookClock {
 }
 
 impl ClockSource for HookClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> autumn_web::time::Timestamp {
         let value = {
             let mut now = self.now.lock().expect("clock");
-            *now += chrono::Duration::seconds(1);
+            *now += SignedDuration::from_secs(1);
             *now
         };
         let read = self.reads.fetch_add(1, Ordering::SeqCst);
@@ -166,7 +163,7 @@ impl Harness {
         }
     }
 
-    fn through(&self) -> Option<DateTime<Utc>> {
+    fn through(&self) -> Option<Timestamp> {
         self.status.snapshot().replicated_through
     }
 
@@ -211,7 +208,7 @@ fn commit_inside_read(n: usize) -> Step {
         "a caught-up tick covers what was committed before it: {before:?} vs {pre_at:?}"
     );
 
-    let late: Arc<Mutex<Option<DateTime<Utc>>>> = Arc::new(Mutex::new(None));
+    let late: Arc<Mutex<Option<Timestamp>>> = Arc::new(Mutex::new(None));
     let db = h.db.clone();
     let seen = Arc::clone(&late);
     h.clock.arm(
@@ -383,7 +380,7 @@ fn a_fenced_replicator_has_no_bound() {
     h.destination
         .put(&segment::epoch_marker_key(&h.root, 2), b"{}")
         .expect("marker");
-    h.clock.set(h.clock.peek() + chrono::Duration::hours(1));
+    h.clock.set(h.clock.peek() + SignedDuration::from_hours(1));
     let fenced = h.replicator.tick();
     assert!(
         matches!(fenced, Err(ReplicationError::Fenced { .. })),
@@ -444,7 +441,7 @@ mod props {
     use proptest::prelude::*;
 
     /// Each committed row and the time the app read after its commit.
-    type Committed = Arc<Mutex<Vec<(String, DateTime<Utc>)>>>;
+    type Committed = Arc<Mutex<Vec<(String, Timestamp)>>>;
 
     #[derive(Debug, Clone)]
     enum Op {

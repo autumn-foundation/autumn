@@ -194,14 +194,11 @@ fn optional_id(raw: Option<&String>) -> Option<i64> {
 /// seconds round-trips back a minute earlier. Comparing at the *form's*
 /// precision is what tells "the editor did not touch this" apart from "the
 /// editor moved it", and keeps the stored seconds in the first case.
-fn same_minute(stored: Option<chrono::NaiveDateTime>, submitted: chrono::NaiveDateTime) -> bool {
-    use chrono::Timelike as _;
-    stored.is_some_and(|stored| {
-        stored
-            .with_second(0)
-            .and_then(|truncated| truncated.with_nanosecond(0))
-            == Some(submitted)
-    })
+fn same_minute(
+    stored: Option<autumn_web::time::civil::DateTime>,
+    submitted: autumn_web::time::civil::DateTime,
+) -> bool {
+    stored.is_some_and(|stored| stored.date().at(stored.hour(), stored.minute(), 0, 0) == submitted)
 }
 
 /// Resolve a submitted featured-media id, refusing anything that is not an
@@ -240,13 +237,15 @@ async fn resolve_featured_media(
 fn scheduled_at(
     form: &PostForm,
     settings: &crate::settings::Settings,
-) -> Result<Option<chrono::NaiveDateTime>, &'static str> {
+) -> Result<Option<autumn_web::time::civil::DateTime>, &'static str> {
     let Some(local) = form
         .publish_at
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .and_then(|value| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M").ok())
+        .and_then(|value| {
+            autumn_web::time::civil::DateTime::strptime("%Y-%m-%dT%H:%M", value).ok()
+        })
     else {
         return Ok(None);
     };
@@ -298,7 +297,10 @@ fn validate_submission(
     form: &PostForm,
     status: &str,
     settings: &crate::settings::Settings,
-) -> (Option<chrono::NaiveDateTime>, Vec<(&'static str, String)>) {
+) -> (
+    Option<autumn_web::time::civil::DateTime>,
+    Vec<(&'static str, String)>,
+) {
     let mut errors = Vec::new();
 
     let scheduled_for = match scheduled_at(form, settings) {

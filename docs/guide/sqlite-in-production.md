@@ -801,8 +801,9 @@ as output that compiles on Postgres but breaks on SQLite.
 | `f32` | ✅ | `REAL` | |
 | `f64` | ✅ | `REAL` | |
 | `Bytea` | ✅ | `BLOB` | |
-| `NaiveDateTime` | ✅ | `Timestamp` (TEXT) | Core, ungated `diesel::sql_types::Timestamp`. |
-| `DateTime<Utc>` | ✅ | `TimestamptzSqlite` (TEXT) | RFC 3339 UTC text, so the column sorts chronologically. |
+| `CivilDateTime` (`NaiveDateTime`) | ✅ | `Timestamp` (TEXT) | Core, ungated `diesel::sql_types::Timestamp`, through `autumn_web::db::SqlDateTime`. |
+| `Timestamp` (`DateTime`) | ✅ | `TimestamptzSqlite` (TEXT) | UTC text with a `+00:00` offset (`2024-01-02 03:04:05.100+00:00`), so the column sorts chronologically. Through `autumn_web::db::SqlTimestamp`. |
+| `Date` / `time` | ✅ | `Date` / `Time` (TEXT) | `2024-01-02` / `03:04:05.100`, through `SqlDate` / `SqlTime`. |
 | `json` / `jsonb` | ✅ | `Json` (TEXT) | diesel's own `serde_json::Value` conversion. |
 | `Attachment` / `Blob` | ✅ | `TEXT` | The blob metadata JSON. `Blob` is an `autumn-web` type, so it carries its own `Text`/`Sqlite` conversion. |
 | `Enum` | ✅ | `TEXT` | The generated enum is local to your app, so `autumn generate` emits its `ToSql`/`FromSql<Text, Sqlite>` impls directly. |

@@ -22,7 +22,7 @@ use autumn_billing::{
     SubscriptionStatus,
 };
 use autumn_web::test::{TestApp, TestClient};
-use autumn_web::time::TickingClock;
+use autumn_web::time::{SignedDuration, TickingClock};
 
 use super::support::{
     self, DynHarness, FailingStore, FakeCall, FakeParser, FakeProvider, Harness, PRO_PRICE,
@@ -522,7 +522,7 @@ async fn transport_error_reschedules_the_same_attempt() {
     assert_eq!(pending.state, DunningState::Pending);
     assert_eq!(
         pending.next_attempt_at,
-        at(3601) + chrono::Duration::from_std(TRANSPORT_RETRY_DELAY).unwrap()
+        at(3601) + SignedDuration::try_from(TRANSPORT_RETRY_DELAY).unwrap()
     );
     h.client.assert_job_enqueued(RETRY_JOB_NAME);
     assert_eq!(
@@ -593,10 +593,10 @@ async fn stale_running_row_is_reclaimed() {
     h.client.advance_clock(Duration::from_secs(3601));
     let invoice_id = invoice(&h).await.id;
     // A run claimed the attempt and died more than RUNNING_STALE_AFTER ago.
-    let stale_since = at(3601) - chrono::Duration::from_std(RUNNING_STALE_AFTER).unwrap();
+    let stale_since = at(3601) - SignedDuration::try_from(RUNNING_STALE_AFTER).unwrap();
     assert!(
         h.store
-            .claim_dunning_attempt(&invoice_id, 1, stale_since - chrono::Duration::seconds(1))
+            .claim_dunning_attempt(&invoice_id, 1, stale_since - SignedDuration::from_secs(1))
             .await
             .unwrap()
     );
@@ -709,7 +709,7 @@ async fn restart_reclaims_an_abandoned_running_row_and_runs_it() {
     let invoice_id = invoice(&app_a).await.id;
     // A due retry was claimed and the process died mid-flight, long enough
     // ago that the new process's clock is past `updated_at + RUNNING_STALE_AFTER`.
-    let stale = chrono::Duration::from_std(RUNNING_STALE_AFTER).unwrap();
+    let stale = SignedDuration::try_from(RUNNING_STALE_AFTER).unwrap();
     let mut abandoned = store
         .dunning_by_invoice(&invoice_id)
         .await
@@ -717,7 +717,7 @@ async fn restart_reclaims_an_abandoned_running_row_and_runs_it() {
         .unwrap();
     abandoned.state = DunningState::Running;
     abandoned.next_attempt_at = at(-3600);
-    abandoned.updated_at = at(0) - stale - chrono::Duration::seconds(1);
+    abandoned.updated_at = at(0) - stale - SignedDuration::from_secs(1);
     store.upsert_dunning(abandoned).await.unwrap();
     drop(app_a);
 

@@ -52,7 +52,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use jiff::SignedDuration;
 
 use crate::entropy::{Entropy, SeededEntropy};
 use crate::time::{ClockSource, TickingClock};
@@ -407,12 +407,15 @@ impl ChaosState {
 /// still reflected (they share the same instant); only a constant skew is added.
 struct SkewClock {
     inner: TickingClock,
-    offset: ChronoDuration,
+    offset: SignedDuration,
 }
 
 impl ClockSource for SkewClock {
-    fn now(&self) -> DateTime<Utc> {
-        self.inner.now() + self.offset
+    fn now(&self) -> crate::time::Timestamp {
+        self.inner
+            .now()
+            .checked_add(self.offset)
+            .unwrap_or(crate::time::Timestamp::MAX)
     }
 
     /// Forwarded to the wrapped clock **unskewed**.
@@ -432,19 +435,19 @@ impl ClockSource for SkewClock {
 
 /// Draw the one-shot, deterministic clock-skew offset in `[0, dur]` from the
 /// skew sub-stream. Saturates a pathologically large `dur` at `i64::MAX`
-/// nanoseconds (≈292 years) so the chrono conversion never overflows.
-fn deterministic_skew(seed: u64, dur: std::time::Duration) -> ChronoDuration {
+/// nanoseconds (≈292 years) so the conversion never overflows.
+fn deterministic_skew(seed: u64, dur: std::time::Duration) -> SignedDuration {
     let max_nanos = dur.as_nanos();
     if max_nanos == 0 {
-        return ChronoDuration::zero();
+        return SignedDuration::ZERO;
     }
     let stream = SeededEntropy::shared(seed ^ CHAOS_SKEW_SALT);
     let draw = u128::from(stream.next_u64());
     // Inclusive of `dur`: pick uniformly in [0, max_nanos].
     let picked = draw % (max_nanos.saturating_add(1));
-    // `nanoseconds` takes an i64; saturate rather than wrap for an absurd `dur`.
+    // `from_nanos` takes an i64; saturate rather than wrap for an absurd `dur`.
     let nanos = i64::try_from(picked).unwrap_or(i64::MAX);
-    ChronoDuration::nanoseconds(nanos)
+    SignedDuration::from_nanos(nanos)
 }
 
 /// Install the active chaos hooks onto `app` and return it, ready to
@@ -738,14 +741,14 @@ mod tests {
         let a = deterministic_skew(99, dur);
         let b = deterministic_skew(99, dur);
         assert_eq!(a, b, "same seed ⇒ same skew offset");
-        assert!(a >= chrono::Duration::zero());
+        assert!(a >= jiff::SignedDuration::ZERO);
         assert!(
-            a <= chrono::Duration::from_std(dur).unwrap(),
+            a <= jiff::SignedDuration::try_from(dur).unwrap(),
             "offset stays within [0, dur]"
         );
         assert_eq!(
             deterministic_skew(99, std::time::Duration::ZERO),
-            chrono::Duration::zero()
+            jiff::SignedDuration::ZERO
         );
     }
 

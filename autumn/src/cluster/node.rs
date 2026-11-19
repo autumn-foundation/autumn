@@ -24,7 +24,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -985,10 +985,8 @@ mod tests {
     /// helper) is a one-line change that nothing else in the suite can see.
     #[test]
     fn incarnation_is_seeded_from_unix_milliseconds() {
-        let clock = FixedClock::at(
-            chrono::DateTime::<chrono::Utc>::from_timestamp(1_765_430_000, 250_000_000)
-                .unwrap_or_default(),
-        );
+        let clock =
+            FixedClock::at(jiff::Timestamp::new(1_765_430_000, 250_000_000).unwrap_or_default());
 
         assert_eq!(
             seed_incarnation(&clock),
@@ -998,10 +996,8 @@ mod tests {
              boots inside one second mint byte-identical self-records"
         );
 
-        let one_ms_later = FixedClock::at(
-            chrono::DateTime::<chrono::Utc>::from_timestamp(1_765_430_000, 251_000_000)
-                .unwrap_or_default(),
-        );
+        let one_ms_later =
+            FixedClock::at(jiff::Timestamp::new(1_765_430_000, 251_000_000).unwrap_or_default());
         assert!(
             seed_incarnation(&one_ms_later) > seed_incarnation(&clock),
             "a boot one millisecond later must come back strictly higher"
@@ -1009,9 +1005,7 @@ mod tests {
 
         // A pre-epoch clock saturates at 0 rather than wrapping. Two boots on such
         // a clock do collide; see `seed_incarnation`.
-        let pre_epoch = FixedClock::at(
-            chrono::DateTime::<chrono::Utc>::from_timestamp(-10, 0).unwrap_or_default(),
-        );
+        let pre_epoch = FixedClock::at(jiff::Timestamp::new(-10, 0).unwrap_or_default());
         assert_eq!(
             seed_incarnation(&pre_epoch),
             0,

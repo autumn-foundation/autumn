@@ -83,7 +83,7 @@ pub struct LedgerExportOrder {
     pub status: String,
     pub total_cents: i64,
     pub notes: Option<String>,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[autumn_web::repository(LedgerExportOrder, table = "ledger_export_orders")]

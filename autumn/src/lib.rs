@@ -2043,8 +2043,8 @@ pub use autumn_macros::lifecycle;
 /// )]
 /// pub struct Ticket {
 ///     pub id: i64,
-///     pub opened_at: chrono::DateTime<chrono::Utc>,
-///     pub responded_at: Option<chrono::DateTime<chrono::Utc>>,
+///     pub opened_at: autumn_web::time::Timestamp,
+///     pub responded_at: Option<autumn_web::time::Timestamp>,
 ///     pub customer_zone: String,
 /// }
 ///
@@ -2326,12 +2326,12 @@ pub use axum::extract::State;
 /// | `axum` | `autumn_web::reexports::axum` | Custom routers, middleware, extractors |
 /// | `diesel` | `autumn_web::reexports::diesel` | Raw Diesel queries, schema types |
 /// | `http` | `autumn_web::reexports::http` | HTTP types (`StatusCode`, `Method`, headers) |
+/// | `jiff` | `autumn_web::reexports::jiff` | Dates, times, zones (the common types are also in [`time`]) |
 /// | `redis` | `autumn_web::reexports::redis` | Naming the `redis::Client` [`redis_tls::open_client`] returns (`redis` feature) |
 /// | `serde_json` | `autumn_web::reexports::serde_json` | JSON values and conversion helpers |
 /// | `tokio` | `autumn_web::reexports::tokio` | Async runtime, spawn, timers |
 pub mod reexports {
     pub use axum;
-    pub use chrono;
     #[cfg(feature = "db")]
     pub use diesel;
     #[cfg(feature = "db")]
@@ -2346,6 +2346,7 @@ pub mod reexports {
     pub use diesel_migrations;
     pub use http;
     pub use inventory;
+    pub use jiff;
     #[cfg(feature = "mail")]
     pub use lettre;
     /// Re-exported because [`crate::redis_tls::open_client`] returns a

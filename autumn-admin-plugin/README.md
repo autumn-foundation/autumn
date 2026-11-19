@@ -144,7 +144,8 @@ Your own models choose their own SQL. Four rules keep it portable.
    SQLite has none of the three. Use `CAST(x AS TEXT)`, an `IN` list, and
    separate statements in one transaction.
 4. **Use `CURRENT_TIMESTAMP`, not `NOW()`.** Read a timestamp column as
-   `Timestamp` into a `NaiveDateTime`. The `Timestamptz` SQL type is
+   `Timestamp` into a `civil::DateTime` (through
+   `autumn_web::db::SqlDateTime`). The `Timestamptz` SQL type is
    Postgres-only.
 
 `tests/custom_admin_model.rs` is a worked example. The same test body runs on

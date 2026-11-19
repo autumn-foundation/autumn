@@ -33,13 +33,12 @@ Diesel/`diesel-async` (Postgres), and Maud for HTML.
   # Relative path from runs/<id>/app/ to <repo-root>/autumn (five levels up).
   # Or use an absolute path from `git rev-parse --show-toplevel`, or `autumn-web = "0.11"`.
   autumn-web = { path = "../../../../../autumn", features = ["seed"] }
-  diesel = { version = "2", features = ["postgres", "chrono"] }
+  diesel = { version = "2", features = ["postgres"] }
   diesel-async = { version = "0.10", features = ["postgres"] }
   diesel_migrations = "2"
   maud = { version = "0.27", features = ["axum"] }
   serde = { version = "1", features = ["derive"] }
   serde_json = "1"
-  chrono = { version = "0.4", features = ["serde"] }
   tokio = { version = "1", features = ["full"] }
   validator = { version = "0.21", features = ["derive"] }
 
@@ -115,7 +114,15 @@ Diesel/`diesel-async` (Postgres), and Maud for HTML.
 
 - **Validation.** Use the `validator` crate derives (`#[validate(length(min = 1))]`
   on `name`) and return **422** on failure. Parse dates with
-  `chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")`; a parse error → 422/400.
+  `autumn_web::time::civil::Date::strptime("%Y-%m-%d", s)`; a parse error → 422/400.
+
+- **Dates and times.** Autumn uses `jiff` through `autumn_web::time`: a `DATE`
+  column is `autumn_web::time::civil::Date`, a `TIMESTAMP` is
+  `civil::DateTime` and a `TIMESTAMPTZ` is `autumn_web::time::Timestamp`.
+  `#[model]` maps these on its own. A hand-written Diesel struct reads one with
+  `#[diesel(deserialize_as = autumn_web::db::SqlDate)]` (or `SqlDateTime`,
+  `SqlTimestamp`), and a query binds one with
+  `use autumn_web::db::AsSqlTime as _;` and `value.as_sql_time()`.
 
 - **Tests.** `autumn_web::prelude` exposes `TestApp` and `TestDb` (needs the
   `test-support` feature). `TestDb` spins up a throwaway Postgres; `TestApp`

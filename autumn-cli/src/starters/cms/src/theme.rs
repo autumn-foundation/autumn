@@ -375,7 +375,7 @@ impl Theme for MinimalTheme {
                     (render_title(&post.title))
                 }
                 @if let Some(published) = post.published_at {
-                    time datetime=(published.and_utc().to_rfc3339())
+                    time datetime=(autumn_web::time::compat::rfc3339(crate::settings::utc_instant(published)))
                          class="text-xs text-gray-400 shrink-0" {
                         (settings.format_date(published))
                     }
@@ -414,7 +414,7 @@ fn default_post_card(post: &Post, url: &str, settings: &Settings) -> Markup {
             }
             p class="text-xs text-gray-500 mb-2" {
                 @if let Some(published) = post.published_at {
-                    time datetime=(published.and_utc().to_rfc3339()) {
+                    time datetime=(autumn_web::time::compat::rfc3339(crate::settings::utc_instant(published))) {
                         (settings.format_date(published))
                     }
                 }
@@ -539,7 +539,7 @@ fn default_layout(chrome: &Chrome, page_title: &str, content: Markup) -> Markup 
                     }
                     div class="max-w-5xl mx-auto px-4 py-6 text-xs text-gray-500 flex \
                                flex-wrap gap-3 justify-between" {
-                        span { "© " (chrono::Utc::now().format("%Y").to_string()) " " (settings.site_title) }
+                        span { "© " (autumn_web::time::ambient_civil_utc().year().to_string()) " " (settings.site_title) }
                         span {
                             a href="/feed" class="hover:underline" { "Atom" }
                             " · "

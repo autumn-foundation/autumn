@@ -63,6 +63,8 @@ use std::io::Write as _;
 
 use serde::{Deserialize, Serialize};
 
+use crate::time::Timestamp;
+
 /// Version of the object layout and payload framing. Bumped only by a
 /// breaking change; restore refuses a version it does not understand.
 pub const LAYOUT_VERSION: u32 = 1;
@@ -224,6 +226,22 @@ pub struct SegmentRef {
 pub fn generation_id(created_ms: i64, nonce: u64) -> String {
     let ms = created_ms.max(0);
     format!("{ms:013}-{nonce:016x}")
+}
+
+/// The instant `ms` milliseconds after the Unix epoch, clamped to
+/// [`Timestamp::MIN`]..=[`Timestamp::MAX`].
+///
+/// `Timestamp::from_millisecond` refuses the millisecond count of
+/// `Timestamp::MAX` itself (its last whole millisecond is past the last whole
+/// second the constructor accepts), so a stored `MAX` must clamp back to it
+/// rather than fail.
+#[must_use]
+pub(crate) fn timestamp_from_ms(ms: i64) -> Timestamp {
+    Timestamp::from_millisecond(ms).unwrap_or(if ms < 0 {
+        Timestamp::MIN
+    } else {
+        Timestamp::MAX
+    })
 }
 
 /// Parse a generation id produced by [`generation_id`].

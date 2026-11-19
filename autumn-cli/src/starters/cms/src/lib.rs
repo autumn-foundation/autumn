@@ -134,7 +134,9 @@ pub fn bootstrap() {
     });
 
     // The current year, so a footer or a post can say `[year]` and stay right.
-    shortcodes::add_shortcode("year", |_| chrono::Utc::now().format("%Y").to_string());
+    shortcodes::add_shortcode("year", |_| {
+        autumn_web::time::ambient_civil_utc().year().to_string()
+    });
 
     // A filter, demonstrating the `the_content` hook: turn a bare `--` into an
     // em dash, the way a typographic plugin would.

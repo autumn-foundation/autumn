@@ -214,7 +214,7 @@ use aged_schema::after_commit_aged;
 pub struct AfterCommitAged {
     #[id]
     pub id: i64,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 /// How many aged rows exist. Cached, keyed by `scope` only.

@@ -31,7 +31,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Command;
 
-use chrono::{Duration, NaiveDateTime, Utc};
+use jiff::SignedDuration;
+use jiff::civil::DateTime;
+use jiff::tz::TimeZone;
 
 use super::DEFAULT_MIGRATIONS_DIR;
 
@@ -49,12 +51,25 @@ fn version_prefix(dir_name: &str) -> Option<String> {
         .then(|| prefix.to_string())
 }
 
-fn parse_version(version: &str) -> Option<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(version, VERSION_FMT).ok()
+fn parse_version(version: &str) -> Option<DateTime> {
+    DateTime::strptime(VERSION_FMT, version).ok()
 }
 
-fn format_version(dt: NaiveDateTime) -> String {
-    dt.format(VERSION_FMT).to_string()
+fn format_version(dt: DateTime) -> String {
+    dt.strftime(VERSION_FMT).to_string()
+}
+
+/// `dt` plus `secs` seconds, or a message naming the version that cannot be
+/// moved past the end of the calendar.
+fn add_seconds(dt: DateTime, secs: i64) -> Result<DateTime, String> {
+    dt.checked_add(SignedDuration::from_secs(secs))
+        .map_err(|_| {
+            format!(
+                "migration version {} is at the end of the calendar; there is no later \
+                 version to give a new migration",
+                format_version(dt),
+            )
+        })
 }
 
 /// Migration directory names (not just versions) present in the working
@@ -280,7 +295,7 @@ fn framework_migration_names() -> Vec<String> {
 /// `20261301000000` -- month 13 -- satisfies `version_prefix` but can't be
 /// arithmetic'd on) -- or when no free second exists in the two minutes
 /// after the starting point.
-fn resolve_free_version(taken: &BTreeSet<String>, now: NaiveDateTime) -> Result<String, String> {
+fn resolve_free_version(taken: &BTreeSet<String>, now: DateTime) -> Result<String, String> {
     // Compare as strings, not via `parse_version`: fixed-width digit strings sort
     // chronologically even when not a valid date, so a garbage 14-digit version still
     // counts as ahead of `now`. Only the arithmetic below needs it to parse, and that
@@ -301,8 +316,11 @@ fn resolve_free_version(taken: &BTreeSet<String>, now: NaiveDateTime) -> Result<
                  was a typo) before generating another migration.",
             ));
         };
-        let horizon = version + Duration::days(7);
-        if max_taken > horizon {
+        // A `now` within a week of the calendar's end has no horizon to exceed.
+        let beyond_horizon = version
+            .checked_add(SignedDuration::from_hours(7 * 24))
+            .is_ok_and(|horizon| max_taken > horizon);
+        if beyond_horizon {
             return Err(format!(
                 "the latest existing migration version is {}, which is more than a week ahead \
                  of this machine's UTC clock ({}).\n\
@@ -316,7 +334,7 @@ fn resolve_free_version(taken: &BTreeSet<String>, now: NaiveDateTime) -> Result<
                 format_version(max_taken),
             ));
         }
-        version = max_taken + Duration::seconds(1);
+        version = add_seconds(max_taken, 1)?;
         eprintln!(
             "note: this machine's UTC clock ({}) is behind the latest existing migration ({}); \
              using {} so this one still sorts -- and therefore runs -- after it",
@@ -328,7 +346,7 @@ fn resolve_free_version(taken: &BTreeSet<String>, now: NaiveDateTime) -> Result<
 
     let mut bumped = 0u32;
     while taken.contains(&format_version(version)) {
-        version += Duration::seconds(1);
+        version = add_seconds(version, 1)?;
         bumped += 1;
         if bumped > 120 {
             return Err(format!(
@@ -445,7 +463,7 @@ fn run_new_locked(migrations_dir: &Path, name: &str) -> Result<std::path::PathBu
         }
     }
 
-    let version = resolve_free_version(&taken, Utc::now().naive_utc())?;
+    let version = resolve_free_version(&taken, TimeZone::UTC.to_datetime(jiff::Timestamp::now()))?;
 
     let dir_name = format!("{version}_{name}");
     let dir = migrations_dir.join(&dir_name);
@@ -819,7 +837,7 @@ pub fn run_check_collisions() {
 mod tests {
     use super::*;
 
-    fn dt(s: &str) -> NaiveDateTime {
+    fn dt(s: &str) -> DateTime {
         parse_version(s).unwrap()
     }
 
@@ -900,6 +918,20 @@ mod tests {
         let now = dt("20260812120000");
         let err = resolve_free_version(&taken, now).unwrap_err();
         assert!(err.contains("more than a week ahead"), "{err}");
+    }
+
+    #[test]
+    fn resolve_free_version_errors_at_the_end_of_the_calendar() {
+        let mut taken = BTreeSet::new();
+        taken.insert("99991231235959".to_owned());
+        let err = resolve_free_version(&taken, dt("99991231235959")).unwrap_err();
+        assert!(err.contains("end of the calendar"), "{err}");
+    }
+
+    #[test]
+    fn parse_version_round_trips_the_diesel_stamp() {
+        assert_eq!(format_version(dt("20260812120005")), "20260812120005");
+        assert_eq!(parse_version("20261301000000"), None);
     }
 
     #[test]

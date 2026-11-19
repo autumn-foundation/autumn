@@ -36,7 +36,7 @@ const ADVANCE: Duration = Duration::from_hours(24);
 /// Reads the injected (skewed) wall clock.
 #[get("/now")]
 async fn now_route(clock: Clock) -> String {
-    clock.now().to_rfc3339()
+    autumn_web::time::compat::rfc3339(clock.now())
 }
 
 #[sim_test]

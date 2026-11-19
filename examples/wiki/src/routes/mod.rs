@@ -85,8 +85,8 @@ mod tests {
             title: "Test Title 1".into(),
             body: "Test Body".into(),
             status: "published".into(),
-            created_at: chrono::Utc::now().naive_utc(),
-            updated_at: chrono::Utc::now().naive_utc(),
+            created_at: autumn_web::time::ambient_civil_utc(),
+            updated_at: autumn_web::time::ambient_civil_utc(),
             lock_version: 1,
         };
         let p2 = Page {
@@ -95,8 +95,8 @@ mod tests {
             title: "Test Title 2".into(),
             body: "Test Body".into(),
             status: "draft".into(),
-            created_at: chrono::Utc::now().naive_utc(),
-            updated_at: chrono::Utc::now().naive_utc(),
+            created_at: autumn_web::time::ambient_civil_utc(),
+            updated_at: autumn_web::time::ambient_civil_utc(),
             lock_version: 1,
         };
         let pages = vec![p1, p2];

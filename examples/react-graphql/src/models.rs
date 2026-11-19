@@ -25,5 +25,5 @@ pub struct Note {
     #[indexed]
     pub pinned: bool,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }

@@ -20,7 +20,6 @@
 use std::sync::Arc;
 
 use axum::response::IntoResponse as _;
-use chrono::{DateTime, Utc};
 use scoped_futures::ScopedFutureExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -51,7 +50,8 @@ struct Envelope {
     id: String,
     topic: String,
     aggregate: String,
-    created_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    created_at: crate::time::Timestamp,
     payload: Value,
 }
 
@@ -176,7 +176,7 @@ async fn deliver(
     .map_err(|error| AutumnError::internal_server_error_msg(error.to_string()))?;
     // The receiver checks `t=` against its own clock: real time outside a
     // `Sim`, the sim clock inside one.
-    let timestamp = crate::time::ambient_now().timestamp();
+    let timestamp = crate::time::ambient_now().as_second();
     let signature = inbox_signature(&destination.secret, timestamp, &body);
     // Named by its URL, as webhook delivery is: a test mocks the destination
     // with `TestApp::http_mock(url)`.
@@ -425,7 +425,7 @@ mod endpoint_tests {
     }
 
     fn now() -> i64 {
-        crate::time::ambient_now().timestamp()
+        crate::time::ambient_now().as_second()
     }
 
     async fn post(
@@ -521,7 +521,7 @@ mod tests {
             "deal:1",
             "deal.won",
             serde_json::json!({ "deal_id": 1 }),
-            chrono::Utc::now(),
+            crate::time::ambient_now(),
         );
         let result = deliver(client.state().clone(), destination, message).await;
         mock.expect_called(1);

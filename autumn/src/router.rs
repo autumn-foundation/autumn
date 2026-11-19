@@ -7,7 +7,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -16716,7 +16716,7 @@ async fn api_versioning_middleware(
         ));
         let mut response = err.into_response();
         if let Some(sunset) = version.sunset_at {
-            let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            let http_date = crate::time::compat::http_date(sunset);
             if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
                 response.headers_mut().insert("Sunset", val);
             }
@@ -16726,7 +16726,7 @@ async fn api_versioning_middleware(
             (d, s) => d.or(s),
         };
         if let Some(date) = deprecation_date {
-            let timestamp = date.timestamp();
+            let timestamp = date.as_second();
             if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
                 response.headers_mut().insert("Deprecation", val);
             }
@@ -16742,14 +16742,14 @@ async fn api_versioning_middleware(
             (d, s) => d.or(s),
         };
         if let Some(date) = deprecation_date {
-            let timestamp = date.timestamp();
+            let timestamp = date.as_second();
             if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
                 response.headers_mut().insert("Deprecation", val);
             }
         }
     }
     if let Some(sunset) = version.sunset_at.filter(|_| is_deprecated || is_sunset) {
-        let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        let http_date = crate::time::compat::http_date(sunset);
         if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
             response.headers_mut().insert("Sunset", val);
         }
@@ -16783,7 +16783,7 @@ pub fn check_sunset(
         ));
         let mut response = axum::response::IntoResponse::into_response(err);
         if let Some(sunset) = version.sunset_at {
-            let http_date = sunset.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            let http_date = crate::time::compat::http_date(sunset);
             if let Ok(val) = axum::http::HeaderValue::from_str(&http_date) {
                 response.headers_mut().insert("Sunset", val);
             }
@@ -16793,7 +16793,7 @@ pub fn check_sunset(
             (d, s) => d.or(s),
         };
         if let Some(date) = deprecation_date {
-            let timestamp = date.timestamp();
+            let timestamp = date.as_second();
             if let Ok(val) = axum::http::HeaderValue::from_str(&format!("@{timestamp}")) {
                 response.headers_mut().insert("Deprecation", val);
             }

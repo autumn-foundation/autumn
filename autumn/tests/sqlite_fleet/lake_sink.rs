@@ -422,7 +422,7 @@ async fn a_tenant_deleted_since_the_last_load_leaves_the_kept_lake() {
     assert_eq!(host.reads.restored().len(), 3);
 
     // A tombstone marker newer than globex's generation.
-    let now = chrono::Utc::now().timestamp_millis() + 1;
+    let now = autumn_web::time::ambient_now().as_millisecond() + 1;
     let marker = Marker {
         deleted_at_ms: now,
         purge_after_ms: now + 3_600_000,

@@ -1027,7 +1027,16 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         rewrite: Rewrite::GuideOnly,
     },
     // 0.11.0 ships no codemod: no break below (one per section of the guide's *Breaking changes*)
-    // is rename-level, so each is `GuideOnly`.
+    // is rename-level, so each is `GuideOnly`. The chrono-to-jiff move changes types, not
+    // names: every site needs a type chosen by a person (an instant or a wall-clock value).
+    AppMigration {
+        id: "0.11.0-chrono-to-jiff",
+        version: "0.11.0",
+        title: "Dates and times: chrono is replaced by jiff",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.11.0.md#dates-and-times-chrono-is-replaced-by-jiff",
+        rewrite: Rewrite::GuideOnly,
+    },
     AppMigration {
         id: "0.11.0-diesel-async-0-10",
         version: "0.11.0",

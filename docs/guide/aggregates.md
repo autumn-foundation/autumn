@@ -57,7 +57,7 @@ pub trait BookmarkRepository {
     fn count_grouped_by_tag() -> Vec<(String, i64)>;
     /// `COUNT(*) GROUP BY created_at` → raw per-timestamp counts, later
     /// rolled into a daily series with `.bucket(DateBucket::Day)`.
-    fn count_grouped_by_created_at() -> Vec<(chrono::NaiveDateTime, i64)>;
+    fn count_grouped_by_created_at() -> Vec<(autumn_web::time::civil::DateTime, i64)>;
 }
 ```
 
@@ -114,7 +114,7 @@ are bound as query parameters (never string-interpolated):
 
 ```rust,ignore
 // Only bookmarks created in a window feed the counts.
-let recent: Vec<(chrono::NaiveDateTime, i64)> = repo
+let recent: Vec<(autumn_web::time::civil::DateTime, i64)> = repo
     .count_grouped_by_created_at()
     .filter_range(window_start, window_end)
     .load()
@@ -133,12 +133,13 @@ groups by `date_trunc('<unit>', <col>)` instead, collapsing the timestamps into
 
 ```rust,ignore
 use autumn_web::aggregate::DateBucket;
+use autumn_web::time::SignedDuration;
 
-let window_end = chrono::Utc::now().naive_utc();
-let window_start = window_end - chrono::Duration::days(30);
+let window_end = autumn_web::time::ambient_civil_utc();
+let window_start = window_end.saturating_sub(SignedDuration::from_hours(24 * 30));
 
 // Bookmarks added per day over the trailing 30 days.
-let mut per_day: Vec<(chrono::NaiveDateTime, i64)> = repo
+let mut per_day: Vec<(autumn_web::time::civil::DateTime, i64)> = repo
     .count_grouped_by_created_at()
     .bucket(DateBucket::Day)
     .filter_range(window_start, window_end)
@@ -150,7 +151,7 @@ per_day.sort_by_key(|(day, _)| *day);
 ```
 
 `.bucket()` is **type-gated**: it exists only when the group key is a timestamp
-type (`NaiveDateTime` for `timestamp`, `DateTime<Utc>` for `timestamptz`). A
+type (`civil::DateTime` for `timestamp`, `Timestamp` for `timestamptz`). A
 non-temporal key — like the `String` tag from `count_grouped_by_tag` — has no
 `.bucket()` method at all, so an invalid `date_trunc` on a non-timestamp column is
 a compile error rather than a runtime failure. As shown above, `filter_range`

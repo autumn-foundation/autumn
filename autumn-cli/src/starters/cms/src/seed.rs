@@ -104,7 +104,7 @@ pub async fn seed_site(
     }
 
     // Content.
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
     seed_posts(conn, author_id, now).await?;
 
     // A primary menu pointing at the About page.
@@ -228,7 +228,7 @@ pub async fn seed_site(
 pub async fn seed_posts(
     conn: &mut autumn_web::reexports::diesel_async::AsyncPgConnection,
     author_id: i64,
-    now: chrono::NaiveDateTime,
+    now: autumn_web::time::civil::DateTime,
 ) -> AutumnResult<()> {
     let content = [
         (
@@ -291,7 +291,7 @@ pub async fn seed_posts(
             continue;
         }
         diesel::insert_into(posts::table)
-            .values(&NewPost {
+            .values(NewPost {
                 post_type: post_type.to_owned(),
                 title: title.to_owned(),
                 slug: slug.to_owned(),

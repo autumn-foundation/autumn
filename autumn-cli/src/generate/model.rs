@@ -33,7 +33,7 @@ pub struct ModelOptions {
     pub validations: Vec<String>,
     /// Default specs in `field=value` form.
     pub defaults: Vec<String>,
-    /// Emit a `deleted_at: Option<NaiveDateTime>` field and a nullable
+    /// Emit a `deleted_at: Option<civil::DateTime>` field and a nullable
     /// `deleted_at TIMESTAMP NULL` column for soft-delete support.
     pub soft_delete: bool,
     /// Generate shard-aware handlers (`ShardedDb` instead of `Db`).
@@ -490,7 +490,8 @@ fn plan_model_with_options_impl(
     });
 
     // (d) `Cargo.toml` deps: `#[autumn_web::model]` expands to code naming `diesel`, `serde`,
-    // `serde_json`, `chrono` and field crates such as `uuid`.
+    // `serde_json` and field crates such as `uuid`. Date and time fields name
+    // `autumn_web::time`, so the app needs no direct `jiff` dependency.
     let mut deps: Vec<(&str, &str)> = model_deps(backend).to_vec();
     if metadata.has_validator_rules() {
         deps.push((
@@ -1005,10 +1006,9 @@ pub(super) fn augment_fields_for_soft_delete(
 /// Direct dependencies the *model* generator's Postgres output requires at
 /// compile time. See [`model_deps`] for the backend-aware accessor.
 pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
-    ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
     (
         "diesel",
-        "{ version = \"2\", features = [\"postgres\", \"chrono\", \"uuid\"] }",
+        "{ version = \"2\", features = [\"postgres\", \"uuid\"] }",
     ),
     (
         "diesel-async",
@@ -1034,10 +1034,9 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
 /// trims the app's direct dependency list, not its link line; see #2605.) `returning_clauses_for_sqlite_3_35`
 /// matches `autumn-web`, so the two never disagree about `RETURNING` support.
 pub(super) const MODEL_DEPS_SQLITE: &[(&str, &str)] = &[
-    ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
     (
         "diesel",
-        "{ version = \"2\", features = [\"sqlite\", \"chrono\", \"serde_json\", \
+        "{ version = \"2\", features = [\"sqlite\", \"serde_json\", \
          \"returning_clauses_for_sqlite_3_35\"] }",
     ),
     (
@@ -2509,6 +2508,7 @@ fn sql_default_literal(
         FieldKind::Uuid
         | FieldKind::NaiveDateTime
         | FieldKind::DateTime
+        | FieldKind::Date
         | FieldKind::Time
         | FieldKind::Bytea
         | FieldKind::Attachment
@@ -2879,10 +2879,10 @@ fn render_model_file(
         // Diesel `CompatibleType` error. `#[default]` keeps it out of `NewX`/`UpdateX`: the column
         // is NULL on insert and set only by the destroy handler.
         out.push_str("    #[default]\n");
-        out.push_str("    pub deleted_at: Option<chrono::NaiveDateTime>,\n");
+        out.push_str("    pub deleted_at: Option<autumn_web::time::civil::DateTime>,\n");
     }
     out.push_str("    #[default]\n");
-    out.push_str("    pub created_at: chrono::NaiveDateTime,\n");
+    out.push_str("    pub created_at: autumn_web::time::civil::DateTime,\n");
     out.push_str("}\n");
     out
 }
@@ -4084,7 +4084,7 @@ mod tests {
             // This model declares only a `NaiveDateTime` field, so no
             // timestamptz sql-type of any spelling (the Postgres-only
             // `Timestamptz` or the SQLite `TimestamptzSqlite` that a
-            // `DateTime<Utc>` field would emit, #1924) may appear here.
+            // `DateTime` (`Timestamp`) field would emit, #1924) may appear here.
             assert!(
                 !schema.contains("Timestamptz"),
                 "SQLite schema.rs leaked a timestamptz sql-type: {schema}"
@@ -4605,8 +4605,8 @@ mod tests {
         });
     }
 
-    /// A `SQLite` app now ACCEPTS `DateTime<Utc>` and `Attachment` fields at
-    /// generate time (issue #1924): `DateTime<Utc>` maps to diesel's
+    /// A `SQLite` app now ACCEPTS `DateTime` (`Timestamp`) and `Attachment` fields at
+    /// generate time (issue #1924): `DateTime` maps to diesel's
     /// `TimestamptzSqlite` sql-type and `Attachment` (`Blob`) rides
     /// `autumn-web`'s local `Text`/`Sqlite` conversion. This is the un-rejection
     /// half of the contract — these tokens must plan cleanly (no `Config`
@@ -5458,7 +5458,7 @@ mod tests {
         assert!(model.contains("pub published: bool,"));
         assert!(model.contains("#[id]"));
         assert!(model.contains("pub id: i64,"));
-        assert!(model.contains("created_at: chrono::NaiveDateTime"));
+        assert!(model.contains("created_at: autumn_web::time::civil::DateTime"));
 
         let up = fs::read_to_string(
             tmp.path()
@@ -5880,7 +5880,7 @@ autumn-web = \"0.3\"\n";
     }
 
     #[test]
-    fn execute_adds_chrono_and_diesel_to_cargo_toml() {
+    fn execute_adds_diesel_but_not_chrono_to_cargo_toml() {
         let tmp = TempDir::new().unwrap();
         // Realistic `autumn new` Cargo.toml.
         fs::write(
@@ -5899,7 +5899,6 @@ autumn-web = \"0.3\"\n";
         plan.execute(Flags::default()).unwrap();
         let cargo_toml = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
         for dep in [
-            "chrono",
             "diesel",
             "diesel-async",
             "serde",
@@ -5911,6 +5910,9 @@ autumn-web = \"0.3\"\n";
                 "missing '{dep}' in Cargo.toml after `generate model`:\n{cargo_toml}"
             );
         }
+        // Date and time fields name `autumn_web::time`; neither chrono nor diesel's chrono
+        // feature may come back.
+        assert!(!cargo_toml.contains("chrono"), "{cargo_toml}");
     }
 
     #[test]
@@ -5938,9 +5940,8 @@ autumn-web = \"0.3\"\n";
             "uuid::Uuid fields need a direct uuid dependency with serde support:\n{cargo_toml}"
         );
         assert!(
-            cargo_toml.contains(
-                "diesel = { version = \"2\", features = [\"postgres\", \"chrono\", \"uuid\"] }"
-            ),
+            cargo_toml
+                .contains("diesel = { version = \"2\", features = [\"postgres\", \"uuid\"] }"),
             "Diesel schema Uuid fields need diesel's uuid feature:\n{cargo_toml}"
         );
     }

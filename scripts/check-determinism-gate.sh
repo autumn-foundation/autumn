@@ -4,7 +4,8 @@
 #
 # THE DIVISION OF LABOUR (same as the #1611 panic gate)
 #   clippy does the DETECTION. `clippy.toml`'s `disallowed-methods` array bans
-#   `Instant::now` / `Utc::now` / `SystemTime::now` / `Uuid::new_v4`, and each
+#   `Instant::now` / `Timestamp::now` / `ZonedDateTime::now` /
+#   `TimeZone::system` / `SystemTime::now` / `Uuid::new_v4`, and each
 #   gated module re-denies the lint for its production code path via
 #   `#![cfg_attr(not(test), deny(clippy::disallowed_methods))]`. That runs in the
 #   same `lint` CI job.
@@ -14,8 +15,8 @@
 #   off-seam time read ship while `cargo clippy -- -D warnings` stays green.
 #   It never greps for the banned calls themselves: clippy resolves `use ... as`
 #   aliases and macro expansions that a grep cannot, and — decisively — clippy
-#   does NOT see string literals, whereas a grep would flag the ~30 templated
-#   `Utc::now()` occurrences inside `autumn-cli`'s code generators and the
+#   does NOT see string literals, whereas a grep would flag the templated
+#   wall-clock reads inside `autumn-cli`'s code generators and the
 #   `include_dir!`-embedded starter apps, which are generated-app text, not code.
 #
 # POLARITY (deliberately inverted from the panic gate)
@@ -131,7 +132,7 @@ GATED_MODULES=(
   autumn/src/middleware/request_id.rs:default
   # The authored fault lane (#1680). Every fault timestamp and every window
   # decision is read from the app's INJECTED clock — that is the whole point of
-  # `FaultPlan::only_between`, and a single `Utc::now()` here would make a
+  # `FaultPlan::only_between`, and a single `Timestamp::now()` here would make a
   # replayed scenario's outcome record differ run to run.
   autumn/src/sim/fault.rs:default
   # The embedded cluster control plane (#1762). Every node id comes from the
@@ -244,7 +245,9 @@ REQUIRED_GATE_LINTS=(
 # Every method path `clippy.toml` must ban.
 REQUIRED_CONFIG_PATHS=(
   "std::time::Instant::now"
-  "chrono::Utc::now"
+  "jiff::Timestamp::now"
+  "jiff::ZonedDateTime::now"
+  "jiff::tz::TimeZone::system"
   "std::time::SystemTime::now"
   "uuid::Uuid::new_v4"
 )
@@ -699,7 +702,9 @@ make_fixture() {
 msrv = "1.88.0"
 disallowed-methods = [
   { path = "std::time::Instant::now", reason = "use the injected clock" },
-  { path = "chrono::Utc::now", reason = "use the injected clock" },
+  { path = "jiff::Timestamp::now", reason = "use the injected clock" },
+  { path = "jiff::ZonedDateTime::now", reason = "use the injected clock" },
+  { path = "jiff::tz::TimeZone::system", reason = "name the zone explicitly" },
   { path = "std::time::SystemTime::now", reason = "use the injected clock" },
   { path = "uuid::Uuid::new_v4", reason = "use the injected entropy source" },
 ]
@@ -751,12 +756,21 @@ self_test_tail() {
 
   # clippy.toml emptied of a required path.
   make_fixture "$tmp/noconfig"
-  sed -i '/chrono::Utc::now/d' "$tmp/noconfig/clippy.toml"
-  expect_fail "$tmp/noconfig" "no longer bans" "config missing a required path"
+  sed -i '/jiff::Timestamp::now/d' "$tmp/noconfig/clippy.toml"
+  expect_fail "$tmp/noconfig" "no longer bans 'jiff::Timestamp::now'" "config missing a required path"
+
+  # The zone-reading bans are required too, not only the instant one.
+  make_fixture "$tmp/nozonedconfig"
+  sed -i '/jiff::ZonedDateTime::now/d' "$tmp/nozonedconfig/clippy.toml"
+  expect_fail "$tmp/nozonedconfig" "no longer bans 'jiff::ZonedDateTime::now'" "config missing the zoned now ban"
+
+  make_fixture "$tmp/nosystemtz"
+  sed -i '/jiff::tz::TimeZone::system/d' "$tmp/nosystemtz/clippy.toml"
+  expect_fail "$tmp/nosystemtz" "no longer bans 'jiff::tz::TimeZone::system'" "config missing the system zone ban"
 
   # clippy.toml entry stripped of its reason.
   make_fixture "$tmp/noconfreason"
-  sed -i 's/{ path = "chrono::Utc::now".*/{ path = "chrono::Utc::now" },/' "$tmp/noconfreason/clippy.toml"
+  sed -i 's/{ path = "jiff::Timestamp::now".*/{ path = "jiff::Timestamp::now" },/' "$tmp/noconfreason/clippy.toml"
   expect_fail "$tmp/noconfreason" "no non-empty reason" "config entry without a reason"
 
   # msrv pin dropped.

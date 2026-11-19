@@ -153,7 +153,7 @@ impl Repos {
         };
         Ok(settings
             .permalink_structure
-            .permalink(post, &ancestry, settings.zone()))
+            .permalink(post, &ancestry, &settings.zone()))
     }
 
     /// The slugs of a page's ancestors, outermost first.
@@ -551,8 +551,8 @@ impl Repos {
     pub async fn posts_in_period(
         &self,
         post_type: &str,
-        from: chrono::NaiveDateTime,
-        until: chrono::NaiveDateTime,
+        from: autumn_web::time::civil::DateTime,
+        until: autumn_web::time::civil::DateTime,
         offset: usize,
         limit: usize,
     ) -> AutumnResult<(Vec<Post>, usize)> {
@@ -699,7 +699,7 @@ pub fn permalink_from(
     };
     settings
         .permalink_structure
-        .permalink(post, &ancestry, settings.zone())
+        .permalink(post, &ancestry, &settings.zone())
 }
 
 /// A menu item's target: its post, its term, or its raw URL — in that order,

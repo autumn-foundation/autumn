@@ -884,8 +884,8 @@ pub struct DatedRow {
     #[id]
     pub id: i64,
     pub title: String,
-    pub occurred_at: chrono::DateTime<chrono::Utc>,
-    pub maybe_occurred_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub occurred_at: autumn_web::time::Timestamp,
+    pub maybe_occurred_at: Option<autumn_web::time::Timestamp>,
 }
 
 /// `#[model]` injects its own datetime-local-tolerant deserializer on every

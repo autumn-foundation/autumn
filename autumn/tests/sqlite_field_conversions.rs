@@ -5,15 +5,16 @@
 //! `SQLite` `FromSql`/`ToSql`. #1924 wires the conversions that reach Postgres
 //! parity for two of those kinds and un-rejects them at generate time:
 //!
-//! - **`DateTime<Utc>`** → diesel's `TimestamptzSqlite` sql-type. Its
-//!   `sqlite`+`chrono` conversion stores the value as an RFC 3339 UTC string
-//!   (`SQLite` `TEXT` affinity), which sorts and compares chronologically.
+//! - **`Timestamp`** → diesel's `TimestamptzSqlite` sql-type. Its `SQLite`
+//!   conversion (`autumn_web::db::SqlTimestamp`) stores the value as UTC text
+//!   with a `+00:00` offset (`SQLite` `TEXT` affinity), which sorts and
+//!   compares chronologically.
 //! - **`Attachment`** (`autumn_web::storage::Blob`) → a `TEXT` column holding
 //!   the metadata JSON. `Blob` is a local type, so `autumn-web` supplies
 //!   `FromSql`/`ToSql<Text, Sqlite>` directly (orphan-rule-legal).
 //!
-//! `NaiveDateTime` (core, ungated `Timestamp`) was already supported and is
-//! exercised here for good measure.
+//! `civil::DateTime` (core, ungated `Timestamp` sql-type) was already
+//! supported and is exercised here for good measure.
 //!
 //! `Uuid` (`uuid::Uuid`) and `Decimal` (`rust_decimal::Decimal`) remain rejected
 //! at generate time: their Rust types are foreign to `autumn-web`, so the orphan
@@ -23,10 +24,10 @@
 //! (including nullable columns), tracked as follow-up work under #1924 — so they
 //! are deliberately NOT declared as model fields here (they would not compile).
 //!
-//! This test declares a model carrying a `DateTime<Utc>`, a `NaiveDateTime`, and
+//! This test declares a model carrying a `Timestamp`, a `civil::DateTime`, and
 //! an `Option<Blob>` (attachment), boots an in-memory `SQLite` pool through the
 //! real [`autumn_web::db::create_pool`] path, and round-trips every field
-//! (insert → read back → assert equality), plus asserts that `DateTime<Utc>`
+//! (insert → read back → assert equality), plus asserts that `Timestamp`
 //! values order chronologically on the `TEXT`-backed column.
 //!
 //! Only meaningful under `--features sqlite`; the file is
@@ -36,11 +37,11 @@
 #![cfg(feature = "sqlite")]
 
 use autumn_web::config::DatabaseConfig;
-use autumn_web::db::{RuntimeConnection, create_pool};
-use autumn_web::reexports::{chrono, diesel, diesel_async};
+use autumn_web::db::{RuntimeConnection, SqlTimestamp, create_pool};
+use autumn_web::reexports::{diesel, diesel_async};
 use autumn_web::storage::Blob;
+use autumn_web::time::{Timestamp, civil, tz::Offset};
 
-use chrono::{DateTime, NaiveDateTime, Utc};
 use diesel::{ExpressionMethods as _, QueryDsl as _};
 use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -52,9 +53,9 @@ mod schema {
         conversion_rows (id) {
             id -> Int8,
             label -> Text,
-            // `DateTime<Utc>` -> diesel's SQLite `TimestamptzSqlite` (#1924).
+            // `Timestamp` -> diesel's SQLite `TimestamptzSqlite` (#1924).
             happened_at -> TimestamptzSqlite,
-            // `NaiveDateTime` -> core, ungated `Timestamp`.
+            // `civil::DateTime` -> core, ungated `Timestamp`.
             naive_at -> Timestamp,
             // `Attachment` (`Blob`) -> nullable `TEXT` metadata JSON (#1924).
             avatar -> Nullable<Text>,
@@ -69,8 +70,8 @@ pub struct ConversionRow {
     #[id]
     pub id: i64,
     pub label: String,
-    pub happened_at: DateTime<Utc>,
-    pub naive_at: NaiveDateTime,
+    pub happened_at: Timestamp,
+    pub naive_at: civil::DateTime,
     pub avatar: Option<Blob>,
 }
 
@@ -117,11 +118,10 @@ async fn field_conversions_round_trip_on_sqlite() {
 
     // A timestamp with sub-second (microsecond) precision to prove fractional
     // seconds survive the RFC 3339 text round-trip, not just whole seconds.
-    let happened_at = DateTime::<Utc>::from_timestamp(1_700_000_000, 123_456_000)
+    let happened_at = Timestamp::new(1_700_000_000, 123_456_000)
         .expect("valid timestamp with microsecond precision");
-    let naive_at = DateTime::<Utc>::from_timestamp(1_699_999_000, 0)
-        .expect("valid timestamp")
-        .naive_utc();
+    let naive_at =
+        Offset::UTC.to_datetime(Timestamp::from_second(1_699_999_000).expect("valid timestamp"));
     let avatar = Blob::new("local", "avatars/42.png", "image/png", 2048).with_etag("deadbeef");
 
     // insert with a present attachment
@@ -145,11 +145,11 @@ async fn field_conversions_round_trip_on_sqlite() {
     assert_eq!(found.label, "with-avatar");
     assert_eq!(
         found.happened_at, happened_at,
-        "DateTime<Utc> round-trips exactly (incl. microseconds) via TimestamptzSqlite"
+        "Timestamp round-trips exactly (incl. microseconds) via TimestamptzSqlite"
     );
     assert_eq!(
         found.naive_at, naive_at,
-        "NaiveDateTime round-trips via the core Timestamp sql-type"
+        "civil::DateTime round-trips via the core Timestamp sql-type"
     );
     assert_eq!(
         found.avatar,
@@ -183,10 +183,10 @@ async fn datetime_column_orders_chronologically_on_sqlite() {
     let repo = PgConversionRowRepository::with_pool_untracked(pool.clone());
 
     // Insert three rows out of chronological order.
-    let earliest = DateTime::<Utc>::from_timestamp(1_600_000_000, 0).unwrap();
-    let middle = DateTime::<Utc>::from_timestamp(1_700_000_000, 500_000_000).unwrap();
-    let latest = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
-    let naive = earliest.naive_utc();
+    let earliest = Timestamp::new(1_600_000_000, 0).unwrap();
+    let middle = Timestamp::new(1_700_000_000, 500_000_000).unwrap();
+    let latest = Timestamp::new(1_800_000_000, 0).unwrap();
+    let naive = Offset::UTC.to_datetime(earliest);
 
     for (label, ts) in [
         ("b-middle", middle),
@@ -203,10 +203,10 @@ async fn datetime_column_orders_chronologically_on_sqlite() {
         .expect("save row");
     }
 
-    // Order by the DateTime column directly in SQL — proves the RFC 3339 UTC
+    // Order by the timestamp column directly in SQL — proves the UTC
     // text representation sorts chronologically (not lexically-wrong).
     let mut conn = pool.get().await.expect("checkout");
-    let ordered: Vec<(i64, String, DateTime<Utc>)> = t::conversion_rows
+    let ordered: Vec<(i64, String, SqlTimestamp)> = t::conversion_rows
         .select((t::id, t::label, t::happened_at))
         .order(t::happened_at.asc())
         .load(&mut *conn)
@@ -217,10 +217,10 @@ async fn datetime_column_orders_chronologically_on_sqlite() {
     assert_eq!(
         labels,
         ["a-earliest", "b-middle", "c-latest"],
-        "DateTime<Utc> values sort chronologically on the TEXT-backed column"
+        "Timestamp values sort chronologically on the TEXT-backed column"
     );
     // And the values themselves survive the round-trip.
-    assert_eq!(ordered[0].2, earliest);
-    assert_eq!(ordered[1].2, middle);
-    assert_eq!(ordered[2].2, latest);
+    assert_eq!(Timestamp::from(ordered[0].2), earliest);
+    assert_eq!(Timestamp::from(ordered[1].2), middle);
+    assert_eq!(Timestamp::from(ordered[2].2), latest);
 }

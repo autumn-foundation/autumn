@@ -431,8 +431,8 @@ fn a_list_valued_meta_does_not_hide_a_later_rename_all() {
 #[derive(OpenApiSchema)]
 #[allow(dead_code)]
 struct Timestamped {
-    created_at: chrono::NaiveDateTime,
-    seen_on: chrono::NaiveDate,
+    created_at: autumn_web::time::civil::DateTime,
+    seen_on: autumn_web::time::civil::Date,
     id: uuid::Uuid,
 }
 
@@ -445,12 +445,12 @@ fn datetime_and_uuid_fields_are_inline_scalars_not_dangling_refs() {
     assert_eq!(props["seen_on"]["format"], "date");
     assert_eq!(props["id"]["format"], "uuid");
 
-    // A naive value carries NO RFC 3339 format: chrono writes it without a UTC
+    // A civil value carries NO RFC 3339 format: jiff writes it without a UTC
     // offset, so claiming `date-time` would describe a payload a strict
     // validator rejects and a generator would type as timezone-aware.
     assert!(
         props["created_at"].get("format").is_none(),
-        "NaiveDateTime must not claim an offset-bearing format: {schema}"
+        "civil::DateTime must not claim an offset-bearing format: {schema}"
     );
     assert!(
         props["created_at"]["description"]
