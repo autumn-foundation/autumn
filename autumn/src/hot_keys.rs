@@ -99,10 +99,11 @@ struct Slot {
 #[derive(Debug)]
 struct Table<K> {
     slots: HashMap<K, Slot>,
-    /// The total, rounded down after a decay.
-    total: u64,
+    /// The total, rounded down after a decay. Wider than a count, so weights
+    /// that saturate a count still add up here.
+    total: u128,
     /// The total, rounded up after a decay.
-    total_ceiling: u64,
+    total_ceiling: u128,
 }
 
 /// A thread-safe Space-Saving top-K tracker. See the [module docs](self).
@@ -149,8 +150,8 @@ impl<K: Eq + Hash> HotKeys<K> {
             return;
         }
         let mut table = self.lock();
-        table.total = table.total.saturating_add(weight);
-        table.total_ceiling = table.total_ceiling.saturating_add(weight);
+        table.total = table.total.saturating_add(u128::from(weight));
+        table.total_ceiling = table.total_ceiling.saturating_add(u128::from(weight));
         if let Some(slot) = table.slots.get_mut(&key) {
             slot.count = slot.count.saturating_add(weight);
             return;
@@ -193,7 +194,7 @@ impl<K: Eq + Hash> HotKeys<K> {
     /// it is rounded down.
     #[must_use]
     pub fn total(&self) -> u64 {
-        self.lock().total
+        u64::try_from(self.lock().total).unwrap_or(u64::MAX)
     }
 
     /// How many keys are tracked now.
@@ -269,8 +270,10 @@ impl<K: Eq + Hash + Clone + Ord> HotKeys<K> {
     #[must_use]
     pub fn heavy_hitters(&self, share_ppm: u32) -> Vec<HeavyHitter<K>> {
         let (total, ceiling, ranked) = self.snapshot();
-        let over = |count: u64, total: u64| {
-            u128::from(count) * PPM > u128::from(total) * u128::from(share_ppm)
+        // A u64 count times a million fits in a u128. The total side can
+        // only saturate past 2^128 events.
+        let over = |count: u64, total: u128| {
+            u128::from(count) * PPM > total.saturating_mul(u128::from(share_ppm))
         };
         ranked
             .into_iter()
@@ -286,7 +289,7 @@ impl<K: Eq + Hash + Clone + Ord> HotKeys<K> {
 
     /// The total, its ceiling and every tracked key, ranked, read under one
     /// lock so they agree. Sorting happens after the lock is released.
-    fn snapshot(&self) -> (u64, u64, Vec<HotKey<K>>) {
+    fn snapshot(&self) -> (u128, u128, Vec<HotKey<K>>) {
         let (total, ceiling, mut all) = {
             let table = self.lock();
             let all: Vec<HotKey<K>> = table
@@ -518,6 +521,16 @@ mod tests {
         hot.record_weighted("a", u64::MAX);
         hot.record("a");
         assert_eq!(hot.estimate(&"a").unwrap().count, u64::MAX);
+        assert_eq!(hot.total(), u64::MAX);
+    }
+
+    #[test]
+    fn a_total_past_u64_max_never_certifies_a_key() {
+        // Each key holds half the traffic, under 75%.
+        let hot = HotKeys::new(2);
+        hot.record_weighted("a", u64::MAX);
+        hot.record_weighted("b", u64::MAX);
+        assert!(hot.heavy_hitters(750_000).iter().all(|h| !h.certain));
         assert_eq!(hot.total(), u64::MAX);
     }
 
