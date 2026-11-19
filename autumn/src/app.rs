@@ -26,7 +26,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -7531,8 +7531,8 @@ impl AppBuilder {
     /// name feeds the `SessionAuth` security scheme.
     ///
     /// Like the served route this evaluates deprecation/sunset state against
-    /// the current instant ([`crate::openapi::generate_spec`] passes
-    /// `Utc::now()`), so an export is reproducible except across a declared
+    /// the current instant ([`crate::openapi::generate_spec`] passes the
+    /// ambient wall clock), so an export is reproducible except across a declared
     /// deprecation or sunset date — which is a real contract change a `--check`
     /// diff should surface, not noise to suppress.
     ///

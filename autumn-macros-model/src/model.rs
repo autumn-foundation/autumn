@@ -6899,22 +6899,6 @@ fn ty_last_ident(ty: &syn::Type) -> Option<String> {
     }
 }
 
-/// The identifier of the first generic type argument of a path type's last
-/// segment (e.g. `Utc` for `DateTime<Utc>`, `String` for `Vec<String>`).
-fn ty_last_generic_ident(ty: &syn::Type) -> Option<String> {
-    if let syn::Type::Path(tp) = ty {
-        let seg = tp.path.segments.last()?;
-        if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
-            for arg in &args.args {
-                if let syn::GenericArgument::Type(inner) = arg {
-                    return ty_last_ident(inner);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// A `jiff` date or time value, recognised by a field's type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JiffTime {
@@ -6964,7 +6948,7 @@ impl TimeColumn {
 /// - `Timestamp` and `ZonedDateTime`: bare, or after `jiff::` or `time::`
 ///   (`autumn_web::time::Timestamp`).
 /// - `DateTime` with no generic arguments, `Date` and `Time`: bare, or after
-///   `civil::`. A `DateTime<Tz>` is `chrono`'s.
+///   `civil::`. A generic `DateTime<Tz>` is another crate's type.
 ///
 /// Any other qualifier leaves the type alone, so an application type that
 /// shares one of these names opts out by being written with its path
@@ -7023,11 +7007,6 @@ fn time_column_diesel_attr(ty: &syn::Type, read: bool) -> Option<TokenStream> {
     })
 }
 
-/// Whether [`legacy_chrono_time_hint`] turns a `chrono` field type into a
-/// compile error. While it is `false`, a `chrono` column still compiles
-/// through Diesel's own `chrono` support.
-const REJECT_CHRONO_TIME_FIELDS: bool = false;
-
 /// For a field typed with a `chrono` date or time (optionally in an
 /// `Option`), the message naming the `jiff` type to use instead.
 fn legacy_chrono_time_hint(ty: &syn::Type) -> Option<String> {
@@ -7053,12 +7032,8 @@ fn legacy_chrono_time_hint(ty: &syn::Type) -> Option<String> {
     ))
 }
 
-/// Reject a `chrono` date or time field when [`REJECT_CHRONO_TIME_FIELDS`]
-/// is on.
+/// Reject a `chrono` date or time field, naming the `jiff` type to use.
 fn validate_time_field(field: &syn::Field) -> syn::Result<()> {
-    if !REJECT_CHRONO_TIME_FIELDS {
-        return Ok(());
-    }
     legacy_chrono_time_hint(&field.ty)
         .map_or(Ok(()), |hint| Err(syn::Error::new_spanned(&field.ty, hint)))
 }
@@ -7213,29 +7188,6 @@ fn fake_expr_core(
         )),
         "SqliteUuid" => Some(quote! { ::autumn_web::fake::uuid().into() }),
         _ if jiff_time_type(ty).is_some() => jiff_time_fake_expr(ty),
-        // `recent_datetime()` yields a `Timestamp`; a `chrono` field takes it
-        // converted. Only a `DateTime` whose timezone parameter is `Utc` is
-        // faked. Other zones (e.g. `Local`, `FixedOffset`) fall through to
-        // Default to avoid a type mismatch.
-        "DateTime" if ty_last_generic_ident(ty).as_deref() == Some("Utc") => Some(quote! {
-            ::autumn_web::time::bridge::ChronoBridge::to_chrono(
-                ::autumn_web::fake::recent_datetime(),
-            )
-        }),
-        "NaiveDateTime" => Some(quote! {
-            ::autumn_web::time::bridge::naive_utc(::autumn_web::fake::recent_datetime())
-        }),
-        "NaiveDate" => Some(quote! {
-            ::autumn_web::time::bridge::naive_utc(::autumn_web::fake::recent_datetime()).date()
-        }),
-        "NaiveTime" => Some(quote! {{
-            let __autumn_time = ::autumn_web::time::bridge::naive_utc(
-                ::autumn_web::fake::recent_datetime(),
-            )
-            .time();
-            ::autumn_web::reexports::chrono::Timelike::with_nanosecond(&__autumn_time, 0)
-                .unwrap_or(__autumn_time)
-        }}),
         _ => None,
     }
 }
@@ -7441,13 +7393,6 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
             }
             _ => quote! { ::autumn_web::form::FieldControl::DateTime },
         },
-        "NaiveDate" => quote! { ::autumn_web::form::FieldControl::Date },
-        "NaiveDateTime" => quote! { ::autumn_web::form::FieldControl::DateTime },
-        "NaiveTime" => quote! { ::autumn_web::form::FieldControl::Time },
-        // A `chrono` `DateTime<Tz>` falls back to a text input, pre-filled with the
-        // field's serialized RFC 3339 string, which its own `Deserialize` round-trips
-        // as-is. Plainer, but honest, rather than a picker whose offsetless
-        // submission 400s.
         // `String`/`str`/`Uuid` render as text, and so do unknown types
         // (user enums, JSON, custom newtypes) as a safe fallback; promote
         // via `.override_field(...)` where a richer control is known.
@@ -7479,10 +7424,9 @@ fn widen_decimals_tokens(body: &TokenStream) -> TokenStream {
 /// for `civil::DateTime` columns); the first two also accept RFC 3339, so
 /// JSON API create bodies posted to the same `NewX` keep decoding.
 ///
-/// Returns `None` for every other field, including a `chrono` `DateTime<Tz>`:
-/// that column does not render a `datetime-local` control in the first place
-/// (`form_control_tokens` falls back to a text input whose RFC 3339 value its
-/// own `Deserialize` round-trips), so it keeps that default.
+/// Returns `None` for every other field: such a column does not render a
+/// `datetime-local` control in the first place (`form_control_tokens` falls
+/// back to a text input), so it keeps its own `Deserialize`.
 fn datetime_local_serde_attr(ty: &syn::Type) -> Option<TokenStream> {
     let nullable = is_option_type(ty);
     let inner = if nullable {
@@ -13037,7 +12981,7 @@ mod tests {
     #[test]
     fn filter_over_an_unsupported_field_type_is_rejected() {
         let map = deriv_field_map(quote! {
-            struct C { pub id: i64, pub at: chrono::NaiveDateTime }
+            struct C { pub id: i64, pub at: civil::DateTime }
         });
         let model: syn::Ident = syn::parse_quote!(C);
         let err = lower_filter(&syn::parse_quote!(at == 1), &model, &map)
@@ -13977,7 +13921,7 @@ mod tests {
                 pub struct Doc {
                     #[id]
                     pub id: i64,
-                    pub deleted_at: Option<chrono::NaiveDateTime>,
+                    pub deleted_at: Option<civil::DateTime>,
                 }
             },
         )
@@ -14712,7 +14656,7 @@ mod tests {
     fn derivation_on_a_soft_delete_child_records_it() {
         let generated = derivation_model_output(
             &quote! { #[derivation(Post, column = "c")] },
-            &quote! { pub deleted_at: Option<chrono::NaiveDateTime>, },
+            &quote! { pub deleted_at: Option<civil::DateTime>, },
         );
         assert!(
             generated.contains("child_soft_delete : true"),
@@ -16296,7 +16240,7 @@ mod tests {
                     #[id]
                     pub id: i64,
                     pub score: i64,
-                    pub deleted_at: Option<chrono::NaiveDateTime>,
+                    pub deleted_at: Option<civil::DateTime>,
                 }
             },
         )
@@ -21071,9 +21015,8 @@ mod tests {
     // ── Datetime control/deserializer selection per type (#1135) ─────────
 
     /// Every `jiff` type the picker serves has a matching tolerant
-    /// deserializer. A `chrono` `DateTime<Tz>` has none, so it falls back to a
-    /// text control whose RFC 3339 value its own `Deserialize` round-trips;
-    /// giving it the picker would 400 every submission.
+    /// deserializer. Any other date-time type has none, so it falls back to a
+    /// text control; giving it the picker would 400 every submission.
     #[test]
     fn form_control_tokens_gives_the_picker_to_jiff_date_times_only() {
         let control = |ty: syn::Type| form_control_tokens(&ty, false).to_string();
@@ -21107,7 +21050,6 @@ mod tests {
         for ty in [
             syn::parse_quote!(autumn_web::time::civil::Time),
             syn::parse_quote!(civil::Time),
-            syn::parse_quote!(chrono::NaiveTime),
         ] {
             let control = form_control_tokens(&ty, false).to_string();
             assert!(control.contains("FieldControl :: Time"), "{control}");
@@ -21249,6 +21191,26 @@ mod tests {
         assert_eq!(hint(syn::parse_quote!(civil::DateTime)), None);
         assert_eq!(hint(syn::parse_quote!(Timestamp)), None);
         assert_eq!(hint(syn::parse_quote!(String)), None);
+    }
+
+    #[test]
+    fn a_model_with_a_chrono_time_field_fails_with_the_jiff_hint() {
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Event {
+                    #[id]
+                    pub id: i64,
+                    pub starts_at: chrono::NaiveDateTime,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("compile_error")
+                && generated.contains("autumn_web::time::civil::DateTime"),
+            "a chrono field must fail naming the jiff type: {generated}"
+        );
     }
 
     #[test]

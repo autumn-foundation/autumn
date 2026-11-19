@@ -25,7 +25,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -1018,7 +1018,7 @@ async fn apply_sweep(
 /// against it.
 ///
 /// The cutoff is `NOW() - <window>` evaluated by Postgres, not
-/// `Utc::now() - window` in the app. Every column these predicates compare
+/// `Timestamp::now() - window` in the app. Every column these predicates compare
 /// against is written with the database's `NOW()` (`finished_at`,
 /// `updated_at`, `assigned_at`), so using the app's clock would compare two
 /// different clocks: a worker replica running fast by δ would delete rows δ

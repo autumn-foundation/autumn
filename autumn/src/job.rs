@@ -1637,7 +1637,7 @@ impl JobAdminStoredRecord {
     /// carries, newest-first after the caller's `reverse()`.
     ///
     /// A record with no timestamp at all sorts as if it were the newest thing
-    /// in the list. That used to be spelled `unwrap_or_else(Utc::now)`, which
+    /// in the list. That used to be spelled `unwrap_or_else(Timestamp::now)`, which
     /// both read the clock off-seam and made an ordering depend on when the
     /// dashboard happened to be rendered; `Timestamp::MAX` expresses the same
     /// "sorts newest" intent as a constant, since every real recorded timestamp

@@ -1889,17 +1889,17 @@ fn type_is_option_of(ty: &syn::Type, inner_ident: &str) -> bool {
     option_inner_type(ty).is_some_and(|inner| type_is_bare_ident(inner, inner_ident))
 }
 
-/// True if `ty` is a `timestamptz` group key: a `jiff` `Timestamp`, or a
-/// `chrono` `DateTime<Utc>` (a `DateTime` with generic arguments). Used so
+/// True if `ty` is a `timestamptz` group key, a `jiff` `Timestamp`. Used so
 /// `.bucket()` truncation can be pinned to UTC (#1364). A civil `DateTime`
-/// (no generic arguments) is a `timestamp` key and is not pinned.
+/// is a `timestamp` key and is not pinned.
 fn type_is_timestamptz_key(ty: &syn::Type) -> bool {
     let syn::Type::Path(p) = ty else {
         return false;
     };
-    p.path.segments.last().is_some_and(|s| {
-        s.ident == "Timestamp" || (s.ident == "DateTime" && !s.arguments.is_empty())
-    })
+    p.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "Timestamp")
 }
 
 /// A `jiff` date or time type that a generated Diesel query binds and loads
@@ -1992,11 +1992,6 @@ fn diesel_sql_type_for(ty: &syn::Type) -> Option<TokenStream> {
                 "bool" => quote! { #d::Bool },
                 "String" | "str" => quote! { #d::Text },
                 "Uuid" => quote! { #d::Uuid },
-                // `chrono` spellings, bound through Diesel's own `chrono` support.
-                "NaiveDate" => quote! { #d::Date },
-                "NaiveDateTime" => quote! { #d::Timestamp },
-                "NaiveTime" => quote! { #d::Time },
-                "DateTime" => quote! { #d::Timestamptz },
                 _ => return None,
             };
             Some(st)

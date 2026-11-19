@@ -63,8 +63,6 @@ use std::time::Duration;
 
 pub use jiff::{SignedDuration, Span, Timestamp, Unit, ZonedDateTime, civil, fmt, tz};
 
-#[doc(hidden)]
-pub mod bridge;
 pub mod compat;
 pub(crate) mod cron;
 

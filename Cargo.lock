@@ -903,7 +903,6 @@ dependencies = [
  "brotli",
  "bytes",
  "chromiumoxide",
- "chrono",
  "criterion",
  "croner",
  "css-inline",
@@ -2268,10 +2267,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -3329,7 +3326,6 @@ checksum = "9824c36a57a17ece4c8883baed41dc3eb81b2b949364c174750acc462e19b5ec"
 dependencies = [
  "bitflags 2.13.2",
  "byteorder",
- "chrono",
  "diesel_derives",
  "downcast-rs 2.0.2",
  "itoa",

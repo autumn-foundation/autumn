@@ -316,26 +316,3 @@ impl<V> GroupedAggregate<'_, crate::time::Timestamp, V> {
         self
     }
 }
-
-/// `.bucket()` for repositories that still declare a `chrono` group key
-/// (`NaiveDateTime` is a `timestamp` key, `DateTime<Utc>` a `timestamptz`
-/// key), with the same SQL as the `civil::DateTime` and `Timestamp` impls.
-impl<V> GroupedAggregate<'_, ::chrono::NaiveDateTime, V> {
-    /// Group by `date_trunc('<unit>', <group_col>)` instead of the raw column.
-    /// See the `civil::DateTime` impl.
-    #[must_use]
-    pub const fn bucket(mut self, bucket: DateBucket) -> Self {
-        self.opts.bucket = Some(bucket);
-        self
-    }
-}
-
-impl<V> GroupedAggregate<'_, ::chrono::DateTime<::chrono::Utc>, V> {
-    /// Group by `date_trunc('<unit>', <group_col>, 'UTC')` instead of the raw
-    /// column. See the `Timestamp` impl.
-    #[must_use]
-    pub const fn bucket(mut self, bucket: DateBucket) -> Self {
-        self.opts.bucket = Some(bucket);
-        self
-    }
-}

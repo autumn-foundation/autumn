@@ -2332,7 +2332,6 @@ pub use axum::extract::State;
 /// | `tokio` | `autumn_web::reexports::tokio` | Async runtime, spawn, timers |
 pub mod reexports {
     pub use axum;
-    pub use chrono;
     #[cfg(feature = "db")]
     pub use diesel;
     #[cfg(feature = "db")]

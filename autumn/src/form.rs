@@ -5770,10 +5770,10 @@ pub trait FormModel {
 /// [`deserialize_datetime_local_local`] for the DST edge cases), and RFC 3339
 /// JSON API bodies posted to the first two keep decoding.
 ///
-/// A `chrono` `DateTime<Tz>` column, or any date-time type the derive does
-/// not know, does *not* get the `datetime-local` picker: the derive cannot
-/// tell which zone an offsetless wall clock would mean, so inventing an
-/// interpretation would silently shift instants. The derived [`FormModel`]
+/// A date-time type the derive does not know does *not* get the
+/// `datetime-local` picker: the derive cannot tell which zone an offsetless
+/// wall clock would mean, so inventing an interpretation would silently shift
+/// instants. The derived [`FormModel`]
 /// falls back to [`FieldControl::Text`] for those columns — the pre-filled
 /// value is the field's serialized RFC 3339 string, which the type's own
 /// `Deserialize` round-trips as-is.
@@ -9692,6 +9692,18 @@ mod tests {
             starts_at: Option<jiff::civil::DateTime>,
         }
         let decoded: Decoded = serde_urlencoded::from_str("").unwrap();
+        assert_eq!(decoded.starts_at, None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn deserialize_naive_datetime_local_option_empty_value_is_none() {
+        #[derive(serde::Deserialize)]
+        struct Decoded {
+            #[serde(default, deserialize_with = "deserialize_naive_datetime_local_option")]
+            starts_at: Option<jiff::civil::DateTime>,
+        }
+        let decoded: Decoded = serde_urlencoded::from_str("starts_at=").unwrap();
         assert_eq!(decoded.starts_at, None);
     }
 
