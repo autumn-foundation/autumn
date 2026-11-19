@@ -864,7 +864,7 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     // Without this they fall through to the `$ref` branch below and the spec
     // carries a dangling component nothing registers — which the back-fill then
     // resolves to the opaque object placeholder. `created_at` / `updated_at`
-    // columns make `NaiveDateTime` near-universal across `#[model]` types, so
+    // columns make a timestamp near-universal across `#[model]` types, so
     // this was one untyped field on almost every model on an API boundary
     // (issue #802). Each maps to the standard OpenAPI `format` for what serde
     // actually writes.
@@ -882,7 +882,8 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         );
     }
 
-    if let Some((json_type, format, description)) = scalar_json_schema(&name) {
+    let scalar_key = scalar_table_key(ty, &name);
+    if let Some((json_type, format, description)) = scalar_json_schema(scalar_key) {
         let format_insert = format.map(|f| {
             quote! { __scalar.insert("format".to_owned(), #f.into()); }
         });
@@ -890,8 +891,8 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
             quote! { __scalar.insert("description".to_owned(), #d.into()); }
         });
         // Matching is on the type's LAST PATH SEGMENT, because a proc macro sees
-        // only the tokens as written and `use chrono::NaiveDateTime;` is the
-        // normal spelling. Two runtime checks then establish that the type
+        // only the tokens as written and `use autumn_web::time::Timestamp;` is
+        // the normal spelling. Two runtime checks then establish that the type
         // really IS the external scalar before it is described as one:
         //
         //   1. The derived-schema inventory. A colliding application type
@@ -901,7 +902,7 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         //      advertised as a uuid/date-time string even though it serializes
         //      as an object — check (1) alone could not see it, because there
         //      was nothing registered to find. `type_name` gives the
-        //      fully-qualified path, so only the genuine `chrono::`/`uuid::`
+        //      fully-qualified path, so only the genuine `jiff::`/`uuid::`
         //      types take this branch; anything else falls through to the same
         //      `$ref` the fallback below emits, where it is either resolved or
         //      honestly reported as opaque.
@@ -912,10 +913,11 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         // that exact name.)
         // The predicate is derived from the REAL type through `autumn_web`'s
         // re-export (see `scalar_identity_predicate`), not from a hand-written
-        // prefix: `starts_with("chrono::")` accepted every type in a crate of
-        // that name, and a downstream crate named `chrono` with its own
-        // `DateTime` was inlined as a string even when serde writes an object.
-        let identity_predicate = scalar_identity_predicate(&name)
+        // prefix: a `starts_with("<crate>::")` check accepts every type in a
+        // crate of that name, so a downstream crate of the same name with its
+        // own `DateTime` was inlined as a string even when serde writes an
+        // object.
+        let identity_predicate = scalar_identity_predicate(scalar_key)
             .expect("scalar_json_schema and scalar_identity_predicate cover the same names");
         return emit_identity_guarded(
             ty,
@@ -980,15 +982,20 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
 /// `BigDecimal` is not in this table. Its wire type is not certain, and a wrong
 /// scalar is worse than an opaque placeholder.
 ///
-/// The **naive** chrono types deliberately carry NO `format`. `OpenAPI`'s
+/// The **civil** types deliberately carry NO `format`. `OpenAPI`'s
 /// `date-time` and `time` are RFC 3339 productions that *require* a UTC offset,
-/// but `NaiveDateTime` / `NaiveTime` serialize without one
+/// but `civil::DateTime` / `civil::Time` serialize without one
 /// (`2026-09-06T18:00:00`). Claiming the standard format would make a strict
 /// validator reject the server's real payload, and lead a generator to emit a
 /// timezone-aware client type that cannot parse it. A bare `string` plus a
-/// description is less specific but true. `NaiveDate` keeps `date`, whose RFC
-/// 3339 production (`full-date`) has no offset to begin with, and `DateTime<Tz>`
-/// keeps `date-time` because chrono does write an offset for it.
+/// description is less specific but true. `civil::Date` keeps `date`, whose RFC
+/// 3339 production (`full-date`) has no offset to begin with, and `Timestamp`
+/// keeps `date-time` because it always writes an offset (`Z`).
+/// `ZonedDateTime` appends a bracketed zone name (RFC 9557), which no
+/// `OpenAPI` format describes, so it is a described `string` too.
+///
+/// `name` is the key [`scalar_table_key`] returns: the last path segment,
+/// except that a `DateTime` with no generic arguments is `civil::DateTime`.
 /// Emit a runtime-guarded mapping for a type matched by its LAST PATH SEGMENT.
 ///
 /// Every table in this module matches on the last segment, because a proc macro
@@ -1106,6 +1113,25 @@ fn unconstrained_json_tokens(ty: &syn::Type) -> TokenStream {
     )
 }
 
+/// The key [`scalar_json_schema`] and [`scalar_identity_predicate`] look `ty`
+/// up by: its last path segment `name`, except that a `DateTime` written with
+/// no generic arguments is the civil date-time, keyed `civil::DateTime`, while
+/// `DateTime<Tz>` stays `DateTime`.
+fn scalar_table_key<'a>(ty: &syn::Type, name: &'a str) -> &'a str {
+    if name != "DateTime" {
+        return name;
+    }
+    let generic = match ty {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| !matches!(seg.arguments, syn::PathArguments::None)),
+        _ => false,
+    };
+    if generic { name } else { "civil::DateTime" }
+}
+
 /// Runtime predicate for `Decimal` and its `SQLite` wrapper, or `None` for any
 /// other name.
 ///
@@ -1128,18 +1154,27 @@ fn scalar_json_schema(
     name: &str,
 ) -> Option<(&'static str, Option<&'static str>, Option<&'static str>)> {
     Some(match name {
-        // `DateTime<Utc>` reaches here as its last path segment, `DateTime`.
-        "DateTime" => ("string", Some("date-time"), None),
-        "NaiveDate" => ("string", Some("date"), None),
-        "NaiveDateTime" => (
+        // The generic-less civil date-time arrives as `civil::DateTime`; a
+        // generic `DateTime<Tz>` is another crate's type and has no entry.
+        "Timestamp" => ("string", Some("date-time"), None),
+        "Date" => ("string", Some("date"), None),
+        "civil::DateTime" => (
             "string",
             None,
             Some("ISO 8601 date-time with no UTC offset, e.g. 2026-09-06T18:00:00"),
         ),
-        "NaiveTime" => (
+        "Time" => (
             "string",
             None,
             Some("ISO 8601 time with no UTC offset, e.g. 18:00:00"),
+        ),
+        "ZonedDateTime" => (
+            "string",
+            None,
+            Some(
+                "RFC 9557 date-time with a UTC offset and a bracketed time zone, \
+                 e.g. 2026-09-06T18:00:00-04:00[America/New_York]",
+            ),
         ),
         "Uuid" | "SqliteUuid" => ("string", Some("uuid"), None),
         // #1771: both confidential wrappers serialize as a string — `Sealed` as
@@ -1166,32 +1201,22 @@ fn scalar_json_schema(
 ///
 /// The identity is compared against `type_name` of the real type, reached
 /// through `autumn_web`'s own re-export — never against a hand-written string.
-/// Two things follow. It cannot drift from the dependency: if `chrono` moves
-/// `NaiveDateTime` between internal modules, both sides move together. And it
-/// is exact rather than namespace-wide: the previous `starts_with("chrono::")`
-/// accepted ANY type in a crate that happens to be named `chrono` — including a
-/// downstream crate of that name defining its own `DateTime` — and inlined it as
-/// a string even when serde writes an object, with no opaque component for
+/// Two things follow. It cannot drift from the dependency: if `jiff` moves
+/// `Timestamp` between internal modules, both sides move together. And it
+/// is exact rather than namespace-wide: a `starts_with("jiff::")` check would
+/// accept ANY type in a crate that happens to be named `jiff` — including a
+/// downstream crate of that name defining its own `Timestamp` — and inline it
+/// as a string even when serde writes an object, with no opaque component for
 /// `--strict` to catch.
 ///
-/// `DateTime<Tz>` is compared on the part before `<`, because the zone is a
-/// parameter: `DateTime<Utc>`, `DateTime<Local>` and `DateTime<Tz>` are all
-/// genuinely chrono's. Everything else is compared whole.
 fn scalar_identity_predicate(name: &str) -> Option<TokenStream> {
-    let chrono = quote! { ::autumn_web::reexports::chrono };
+    let time = quote! { ::autumn_web::time };
     let real: TokenStream = match name {
-        "DateTime" => {
-            // Generic: match the path up to the `<`, so any zone qualifies while
-            // an unrelated `DateTime` still does not.
-            return Some(quote! {{
-                let __real = ::core::any::type_name::<#chrono::DateTime<#chrono::Utc>>();
-                let __head = |__s: &'static str| __s.split('<').next().unwrap_or(__s);
-                __head(__identity) == __head(__real)
-            }});
-        }
-        "NaiveDate" => quote! { #chrono::NaiveDate },
-        "NaiveDateTime" => quote! { #chrono::NaiveDateTime },
-        "NaiveTime" => quote! { #chrono::NaiveTime },
+        "Timestamp" => quote! { #time::Timestamp },
+        "civil::DateTime" => quote! { #time::civil::DateTime },
+        "Date" => quote! { #time::civil::Date },
+        "Time" => quote! { #time::civil::Time },
+        "ZonedDateTime" => quote! { #time::ZonedDateTime },
         "Uuid" => quote! { ::autumn_web::reexports::uuid::Uuid },
         // Match as text. The type exists only with the `sqlite` feature.
         "SqliteUuid" => {
@@ -1672,6 +1697,56 @@ fn sqlite_uuid_is_a_uuid_string_matched_by_text() {
         .to_string();
     assert!(predicate.contains("autumn_web::db::sqlite_types::SqliteUuid"));
     assert_eq!(scalar_json_schema("Decimal"), None);
+}
+
+#[test]
+fn jiff_scalars_map_to_their_wire_formats() {
+    assert_eq!(
+        scalar_json_schema("Timestamp"),
+        Some(("string", Some("date-time"), None))
+    );
+    assert_eq!(
+        scalar_json_schema("Date"),
+        Some(("string", Some("date"), None))
+    );
+    let (ty, format, description) =
+        scalar_json_schema("civil::DateTime").expect("civil date-time is a scalar");
+    assert_eq!((ty, format), ("string", None));
+    assert!(description.is_some_and(|d| d.contains("no UTC offset")));
+    let (_, format, _) = scalar_json_schema("Time").expect("civil time is a scalar");
+    assert_eq!(format, None);
+    let (_, format, _) = scalar_json_schema("ZonedDateTime").expect("zoned is a scalar");
+    assert_eq!(format, None);
+    for key in [
+        "Timestamp",
+        "civil::DateTime",
+        "Date",
+        "Time",
+        "ZonedDateTime",
+    ] {
+        let predicate = scalar_identity_predicate(key)
+            .unwrap_or_else(|| panic!("{key} has an identity predicate"))
+            .to_string();
+        assert!(
+            predicate.contains("autumn_web :: time"),
+            "{key}: {predicate}"
+        );
+    }
+}
+
+#[test]
+fn scalar_table_key_separates_civil_from_zoned_date_time() {
+    let key = |ty: syn::Type| scalar_table_key(&ty, &type_name_str(&ty)).to_owned();
+    assert_eq!(key(syn::parse_quote!(civil::DateTime)), "civil::DateTime");
+    assert_eq!(
+        key(syn::parse_quote!(autumn_web::time::civil::DateTime)),
+        "civil::DateTime"
+    );
+    assert_eq!(key(syn::parse_quote!(DateTime<Utc>)), "DateTime");
+    assert_eq!(key(syn::parse_quote!(jiff::Timestamp)), "Timestamp");
+    // A generic `DateTime<Tz>` is another crate's type: no scalar entry.
+    assert_eq!(scalar_json_schema("DateTime"), None);
+    assert!(scalar_identity_predicate("DateTime").is_none());
 }
 
 #[test]

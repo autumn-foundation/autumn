@@ -329,8 +329,9 @@ fn walk(dir: &FsPath) -> Vec<PathBuf> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_generations_engine_survives_a_takeover_with_no_volume_on_the_new_host() {
     let tmp = tempfile::tempdir().unwrap();
-    let clock =
-        TickingClock::starting_at(chrono::DateTime::from_timestamp_millis(1_000_000).unwrap());
+    let clock = TickingClock::starting_at(
+        autumn_web::time::Timestamp::from_millisecond(1_000_000).unwrap(),
+    );
 
     // Host A serves the tenant and ships a generation.
     let a = host(tmp.path(), "vol-a", "host-a", &clock).await;

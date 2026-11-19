@@ -24,8 +24,7 @@ use autumn_web::replication::s3::{S3Credentials, S3Destination, S3Settings};
 use autumn_web::replication::{
     ReplicationSettings, ReplicationStatus, Replicator, restore, segment,
 };
-use autumn_web::time::ClockSource;
-use chrono::{DateTime, TimeZone as _, Utc};
+use autumn_web::time::{ClockSource, Timestamp, ambient_now};
 use diesel::connection::SimpleConnection as _;
 use diesel::sql_types::Text;
 use diesel::{Connection as _, QueryableByName, RunQueryDsl as _, SqliteConnection, sql_query};
@@ -184,29 +183,27 @@ async fn replicates_to_and_restores_from_a_real_s3_endpoint() {
 
 /// A fixture instant, deliberately in the past, so the point-in-time leg of this
 /// test does not depend on how long `MinIO` took to answer.
-fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_700_000_000 + secs, 0)
-        .single()
-        .expect("timestamp")
+fn at(secs: i64) -> Timestamp {
+    Timestamp::from_second(1_700_000_000 + secs).expect("timestamp")
 }
 
 /// A clock this test steps by hand. The replicator stamps each artifact from its
 /// own clock at the moment that artifact's contents are fenced, so the instants a
 /// point-in-time restore selects on come from here.
-struct StepClock(std::sync::Mutex<DateTime<Utc>>);
+struct StepClock(std::sync::Mutex<Timestamp>);
 
 impl StepClock {
     fn new() -> Arc<Self> {
         Arc::new(Self(std::sync::Mutex::new(at(0))))
     }
 
-    fn set(&self, now: DateTime<Utc>) {
+    fn set(&self, now: Timestamp) {
         *self.0.lock().expect("clock") = now;
     }
 }
 
 impl ClockSource for StepClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> autumn_web::time::Timestamp {
         *self.0.lock().expect("clock")
     }
 }
@@ -217,9 +214,9 @@ impl ClockSource for StepClock {
 fn create_bucket_via_http(endpoint: &str, bucket: &str) {
     use autumn_web::sigv4;
 
-    let now = Utc::now();
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date = now.format("%Y%m%d").to_string();
+    let now = ambient_now();
+    let amz_date = now.strftime("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.strftime("%Y%m%d").to_string();
     let host = endpoint
         .trim_start_matches("http://")
         .trim_start_matches("https://")

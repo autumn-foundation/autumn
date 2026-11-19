@@ -25,7 +25,7 @@ pub struct LedgeredPurgeNote {
     pub id: i64,
     pub content: String,
     #[default]
-    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(

@@ -33,7 +33,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -158,7 +158,7 @@ pub struct S3Destination {
     credentials: S3Credentials,
     http: reqwest::blocking::Client,
     /// Clock indirection so signing is deterministic under test.
-    now: fn() -> chrono::DateTime<chrono::Utc>,
+    now: fn() -> crate::time::Timestamp,
 }
 
 impl fmt::Debug for S3Destination {
@@ -206,7 +206,7 @@ impl S3Destination {
             clippy::disallowed_methods,
             reason = "SigV4 signs with the real date that the S3 server checks"
         )]
-        let now: fn() -> chrono::DateTime<chrono::Utc> = chrono::Utc::now;
+        let now: fn() -> crate::time::Timestamp = crate::time::Timestamp::now;
         Ok(Self {
             settings,
             credentials,
@@ -279,8 +279,8 @@ impl S3Destination {
         body: RequestBody<'_>,
     ) -> Result<reqwest::blocking::Response, DestinationError> {
         let now = (self.now)();
-        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-        let date = now.format("%Y%m%d").to_string();
+        let amz_date = now.strftime("%Y%m%dT%H%M%SZ").to_string();
+        let date = now.strftime("%Y%m%d").to_string();
         let payload_hash = match &body {
             // Both send no body, so both sign the empty-payload hash; they
             // differ only in the timeout applied to the response.

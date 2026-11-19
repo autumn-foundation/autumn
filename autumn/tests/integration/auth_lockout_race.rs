@@ -80,8 +80,11 @@ struct AttemptsRow {
 struct StateRow {
     #[diesel(sql_type = Int4)]
     failed_attempts: i32,
-    #[diesel(sql_type = Nullable<Timestamp>)]
-    locked_at: Option<chrono::NaiveDateTime>,
+    #[diesel(
+        sql_type = Nullable<Timestamp>,
+        deserialize_as = autumn_web::db::SqlNullableDateTime
+    )]
+    locked_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 /// Seeds one account row one attempt below the lockout threshold, unlocked —

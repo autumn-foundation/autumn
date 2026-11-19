@@ -66,7 +66,8 @@ struct MovableBookmark {
     url: String,
     title: String,
     tag: String,
-    created_at: chrono::NaiveDateTime,
+    /// Copied through unchanged, so it stays in Diesel's wrapper type.
+    created_at: autumn_web::db::SqlDateTime,
 }
 
 #[derive(QueryableByName)]

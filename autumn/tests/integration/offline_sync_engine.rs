@@ -11,7 +11,7 @@ use autumn_web::sync::{
     PullResponse, PushRequest, PushResponse, RemoteRow, Resolution, SyncBackend, SyncConfig,
     SyncEngine, SyncError, SyncScope, SyncStore, Version, server,
 };
-use chrono::Utc;
+use autumn_web::time::{Timestamp, ambient_now};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -112,7 +112,7 @@ async fn push_retry_is_idempotent() {
             op: Op::Upsert,
             payload: Some(json!({"title": "hello"})),
             base_version: 0,
-            updated_at: Utc::now(),
+            updated_at: ambient_now(),
         }],
     };
 
@@ -771,7 +771,7 @@ async fn heal_never_drops_acked_rows_while_pull_keeps_failing() {
             op: Op::Upsert,
             payload: Some(json!({"title": "from a"})),
             base_version: 0,
-            updated_at: Utc::now(),
+            updated_at: ambient_now(),
         }],
     };
     backend
@@ -1099,7 +1099,7 @@ impl GcInjectingBackend {
                 op: Op::Delete,
                 payload: None,
                 base_version: row.version,
-                updated_at: Utc::now(),
+                updated_at: ambient_now(),
             },
         );
         let latest = self.inner.latest_version().expect("latest");
@@ -1121,7 +1121,7 @@ impl GcInjectingBackend {
                 op: Op::Upsert,
                 payload: Some(json!({"churn": n})),
                 base_version: 0,
-                updated_at: Utc::now(),
+                updated_at: ambient_now(),
             },
         );
         self.push_one(
@@ -1133,7 +1133,7 @@ impl GcInjectingBackend {
                 op: Op::Delete,
                 payload: None,
                 base_version: version,
-                updated_at: Utc::now(),
+                updated_at: ambient_now(),
             },
         );
         let latest = self.inner.latest_version().expect("latest");
@@ -1170,7 +1170,7 @@ impl SyncBackend for GcInjectingBackend {
     fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
         self.inner.gc_tombstones(up_to)
     }
-    fn gc_applied(&self, older_than: chrono::DateTime<Utc>) -> Result<u64, SyncError> {
+    fn gc_applied(&self, older_than: Timestamp) -> Result<u64, SyncError> {
         self.inner.gc_applied(older_than)
     }
     fn tombstone_horizon(&self, scope: &str) -> Result<Version, SyncError> {
@@ -1196,7 +1196,7 @@ async fn gc_race_fixture(
                 op: Op::Upsert,
                 payload: Some(json!({"title": format!("note {i}")})),
                 base_version: 0,
-                updated_at: Utc::now(),
+                updated_at: ambient_now(),
             },
         );
     }
@@ -1395,7 +1395,7 @@ async fn other_scope_gc_churn_never_restarts_a_scoped_sync() {
                 op: Op::Upsert,
                 payload: Some(json!({"title": format!("note {i}")})),
                 base_version: 0,
-                updated_at: Utc::now(),
+                updated_at: ambient_now(),
             },
         );
     }
@@ -1573,7 +1573,7 @@ async fn server_bounds_push_batch_size_and_pull_limit() {
                 op: Op::Delete,
                 payload: None,
                 base_version: 0,
-                updated_at: Utc::now(),
+                updated_at: ambient_now(),
             })
             .collect(),
     };
@@ -1623,7 +1623,7 @@ async fn server_rejects_payloadless_upsert_with_422() {
                 op: Op::Upsert,
                 payload: Some(json!({"title": "valid sibling"})),
                 base_version: 0,
-                updated_at: Utc::now(),
+                updated_at: ambient_now(),
             },
             Change {
                 change_id: "00000000-0000-4000-8000-000000000002".to_owned(),
@@ -1632,7 +1632,7 @@ async fn server_rejects_payloadless_upsert_with_422() {
                 op: Op::Upsert,
                 payload: None,
                 base_version: 0,
-                updated_at: Utc::now(),
+                updated_at: ambient_now(),
             },
         ],
     };
@@ -1667,7 +1667,7 @@ async fn server_rejects_payloadless_upsert_with_422() {
             op: Op::Delete,
             payload: None,
             base_version: 0,
-            updated_at: Utc::now(),
+            updated_at: ambient_now(),
         }],
     };
     let response = client
@@ -1704,7 +1704,7 @@ async fn server_rejects_duplicate_change_ids_with_422() {
         op: Op::Upsert,
         payload: Some(json!({ "title": title })),
         base_version: 0,
-        updated_at: Utc::now(),
+        updated_at: ambient_now(),
     };
     let bad = PushRequest {
         device_id: "device-a".to_owned(),
@@ -1977,7 +1977,7 @@ async fn scoped_router_fails_closed_without_scope_extension() {
             op: Op::Upsert,
             payload: Some(json!({"title": "rejected"})),
             base_version: 0,
-            updated_at: Utc::now(),
+            updated_at: ambient_now(),
         }],
     };
     let response = client
@@ -2070,7 +2070,7 @@ async fn spawn_background_backs_off_then_recovers() {
         fn gc_tombstones(&self, up_to: Version) -> Result<u64, SyncError> {
             self.inner.gc_tombstones(up_to)
         }
-        fn gc_applied(&self, older_than: chrono::DateTime<Utc>) -> Result<u64, SyncError> {
+        fn gc_applied(&self, older_than: Timestamp) -> Result<u64, SyncError> {
             self.inner.gc_applied(older_than)
         }
         fn tombstone_horizon(&self, scope: &str) -> Result<Version, SyncError> {
@@ -2101,7 +2101,7 @@ async fn spawn_background_backs_off_then_recovers() {
                     op: Op::Upsert,
                     payload: Some(json!({"title": "recovered"})),
                     base_version: 0,
-                    updated_at: Utc::now(),
+                    updated_at: ambient_now(),
                 }],
             },
             &LwwResolver,

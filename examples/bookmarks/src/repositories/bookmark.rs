@@ -22,5 +22,5 @@ pub trait BookmarkRepository {
     fn count_grouped_by_tag() -> Vec<(String, i64)>;
     /// `COUNT(*) GROUP BY created_at` → the raw per-timestamp counts, bucketed
     /// into a daily time series by the `/stats` route via `.bucket(DateBucket::Day)`.
-    fn count_grouped_by_created_at() -> Vec<(chrono::NaiveDateTime, i64)>;
+    fn count_grouped_by_created_at() -> Vec<(autumn_web::time::civil::DateTime, i64)>;
 }

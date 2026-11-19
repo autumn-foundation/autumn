@@ -439,7 +439,7 @@ pub struct DepSoftPost {
     #[id]
     pub id: i64,
     pub title: String,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -465,7 +465,7 @@ pub struct DepSoftComment {
     pub id: i64,
     pub post_id: i64,
     pub body: String,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(DepSoftComment, table = "dep_soft_comments", soft_delete)]
@@ -514,7 +514,7 @@ pub struct DepHardSoftComment {
     pub id: i64,
     pub post_id: i64,
     pub body: String,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(DepHardSoftComment, table = "dep_hard_soft_comments", soft_delete)]
@@ -992,7 +992,7 @@ pub struct BsdNode {
     pub id: i64,
     pub parent_id: Option<i64>,
     pub name: String,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -1074,7 +1074,7 @@ pub struct DiaRoot {
     #[id]
     pub id: i64,
     pub title: String,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 // The soft child is declared BEFORE the hard child, so the cascade processes the
@@ -1101,7 +1101,7 @@ pub struct DiaSoft {
     #[id]
     pub id: i64,
     pub root_id: i64,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -1148,7 +1148,7 @@ pub struct DiaLeaf {
     pub id: i64,
     pub soft_id: i64,
     pub hard_id: i64,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(DiaLeaf, table = "dia_leaves", soft_delete)]
@@ -1216,7 +1216,7 @@ pub struct DhrRoot {
     #[id]
     pub id: i64,
     pub title: String,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 // Soft child declared BEFORE the hard child, so the cascade soft-deletes the leaf
@@ -1243,7 +1243,7 @@ pub struct DhrSoft {
     #[id]
     pub id: i64,
     pub root_id: i64,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -1290,7 +1290,7 @@ pub struct DhrLeaf {
     pub id: i64,
     pub soft_id: i64,
     pub hard_id: i64,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 // The leaf both fires a `before_delete` hook AND restrict-depends on `dhr_guards`.
@@ -1318,7 +1318,7 @@ pub struct DhrGuard {
     pub id: i64,
     pub leaf_id: i64,
     pub name: String,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(DhrGuard, table = "dhr_guards", soft_delete)]

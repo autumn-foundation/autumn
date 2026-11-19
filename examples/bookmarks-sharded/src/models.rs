@@ -11,7 +11,8 @@ pub struct Bookmark {
     pub url: String,
     pub title: String,
     pub tag: String,
-    pub created_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[derive(Debug, Clone, Insertable)]

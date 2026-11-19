@@ -103,7 +103,7 @@ pub struct Revision {
     pub id: i64,
     pub post_id: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[model]

@@ -52,7 +52,7 @@ use autumn_idempotency_keys::dsl as keys;
 const SWEEP_EVERY: u64 = 128;
 
 fn now_ms() -> i64 {
-    crate::time::ambient_now().timestamp_millis()
+    crate::time::ambient_now().as_millisecond()
 }
 
 /// The longest span the store writes, in milliseconds: about 18 million

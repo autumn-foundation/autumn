@@ -97,12 +97,16 @@ pub async fn post_publication(state: AppState, args: PostPublicationArgs) -> Aut
         .ok_or_else(|| AutumnError::service_unavailable_msg("No database pool"))?;
     let mut conn = pool.get().await.map_err(AutumnError::from)?;
 
-    let (score, created_at): (i64, chrono::NaiveDateTime) = posts::table
+    let (score, created_at): (i64, autumn_web::db::SqlDateTime) = posts::table
         .find(args.post_id)
         .select((posts::score, posts::created_at))
         .first(&mut conn)
         .await?;
-    let hot_rank = calculate_hot_rank(score, created_at, chrono::Utc::now().naive_utc());
+    let hot_rank = calculate_hot_rank(
+        score,
+        created_at.into(),
+        autumn_web::time::ambient_civil_utc(),
+    );
 
     diesel::update(posts::table.find(args.post_id))
         .set(posts::hot_rank.eq(hot_rank))
@@ -147,7 +151,7 @@ mod tests {
             password_hash: "hashed".to_string(),
             karma: 0,
             role: "user".to_string(),
-            created_at: chrono::DateTime::UNIX_EPOCH.naive_utc(),
+            created_at: autumn_web::time::civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
             avatar: None,
         };
 

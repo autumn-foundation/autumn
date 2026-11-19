@@ -150,7 +150,7 @@ pub(crate) fn emit_retention(
                         use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
                         #[allow(unused_imports)]
                         use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
-                        let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
+                        let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::tz::Offset::UTC.to_datetime(::autumn_web::time::ClockSource::now(state.clock())));
                         ::autumn_web::__private::scoped_immediate_transaction::<u64, ::autumn_web::AutumnError, _>(
                             &mut *conn,
                             |conn| async move {
@@ -193,7 +193,7 @@ pub(crate) fn emit_retention(
                         )
                         .await?
                     } else {
-                        let __now = ::autumn_web::time::ClockSource::now(state.clock()).naive_utc();
+                        let __now = ::autumn_web::db::SqlDateTime::from(::autumn_web::time::tz::Offset::UTC.to_datetime(::autumn_web::time::ClockSource::now(state.clock())));
                         ::autumn_web::reexports::diesel::update(
                             #table_ident::table
                                 .filter(#table_ident::id.eq_any(ids))
@@ -287,20 +287,21 @@ pub(crate) fn emit_retention(
                         #after,
                         "\"))]"
                     ));
-                let __age_chrono =
-                    ::autumn_web::reexports::chrono::Duration::from_std(__age_duration)
+                let __age_span =
+                    ::autumn_web::time::SignedDuration::try_from(__age_duration)
                         .expect("retention `after` duration out of range");
                 // Checked, not `-` (#1342): `after` fitting in
-                // `chrono::Duration`'s range does not mean subtracting it
-                // from this clock reading stays inside `NaiveDateTime`'s
-                // range. A custom clock near `NaiveDateTime::MIN` — a test
+                // `SignedDuration`'s range does not mean subtracting it
+                // from this clock reading stays inside `civil::DateTime`'s
+                // range. A custom clock near `civil::DateTime::MIN` — a test
                 // clock, or a misconfigured system clock — can underflow
                 // even for a boot-validated `after`. `-` panics on overflow;
                 // this fails with the same actionable message boot validation
                 // uses for the config-level check.
-                let __age_cutoff = ::autumn_web::time::ClockSource::now(state.clock())
-                    .naive_utc()
-                    .checked_sub_signed(__age_chrono)
+                let __age_cutoff = ::autumn_web::time::tz::Offset::UTC
+                    .to_datetime(::autumn_web::time::ClockSource::now(state.clock()))
+                    .checked_sub(__age_span)
+                    .map(::autumn_web::db::SqlDateTime::from)
                     .expect(concat!(
                         "retention `after` duration is too large to compute a valid cutoff \
                          from the current time in #[repository(..., retention(after = \"",
@@ -431,16 +432,17 @@ pub(crate) fn emit_retention(
                                     #purge_after,
                                     "\"))]"
                                 ));
-                            let __purge_chrono =
-                                ::autumn_web::reexports::chrono::Duration::from_std(__purge_duration)
+                            let __purge_span =
+                                ::autumn_web::time::SignedDuration::try_from(__purge_duration)
                                     .expect("retention `purge_deleted_after` duration out of range");
                             // Checked, not `-` (#1342 review round 16): see
                             // the age branch's identical cutoff computation
                             // for why a boot-validated duration can still
                             // underflow against a particular clock reading.
-                            let __cutoff = ::autumn_web::time::ClockSource::now(state.clock())
-                                .naive_utc()
-                                .checked_sub_signed(__purge_chrono)
+                            let __cutoff = ::autumn_web::time::tz::Offset::UTC
+                                .to_datetime(::autumn_web::time::ClockSource::now(state.clock()))
+                                .checked_sub(__purge_span)
+                                .map(::autumn_web::db::SqlDateTime::from)
                                 .expect(concat!(
                                     "retention `purge_deleted_after` duration is too large to \
                                      compute a valid cutoff from the current time in \
@@ -575,15 +577,15 @@ pub(crate) fn emit_retention(
     // and boots cleanly and panics only on the sweep's first scheduled tick,
     // well after anyone was watching the deploy.
     //
-    // This also validates the `chrono::Duration` conversion, not just
+    // This also validates the `SignedDuration` conversion, not just
     // `parse_duration`'s `std::time::Duration` (#1342): a value that parses as
     // a `std::time::Duration` — a huge second count like
-    // `"18446744073709551615s"` — can still overflow `chrono::Duration`, which
+    // `"18446744073709551615s"` — can still overflow `SignedDuration`, which
     // the sweep loop converts to when computing the cutoff.
     //
-    // `chrono::Duration::from_std` checks that a duration fits chrono's range,
-    // but a value that fits — `after = "100000000d"`, about 274,000 years — can
-    // still place the cutoff outside `NaiveDateTime`'s range once subtracted
+    // `SignedDuration::try_from` checks that a duration fits its range, but a
+    // value that fits — `after = "100000000d"`, about 274,000 years — can
+    // still place the cutoff outside `civil::DateTime`'s range once subtracted
     // from a clock reading. That is checked against the ambient clock
     // (`time::ambient_now`, issue #2967), not the app's `ClockSource`, which
     // `task_info()` — a plain `fn() -> TaskInfo` with no `state` parameter —
@@ -600,17 +602,17 @@ pub(crate) fn emit_retention(
                             #after,
                             "\"))]"
                         ));
-                    let __chrono_duration =
-                        ::autumn_web::reexports::chrono::Duration::from_std(__duration)
+                    let __span =
+                        ::autumn_web::time::SignedDuration::try_from(__duration)
                             .expect(concat!(
                                 "retention `after` duration out of range in \
                                  #[repository(..., retention(after = \"",
                                 #after,
                                 "\"))]"
                             ));
-                    ::autumn_web::time::ambient_now()
-                        .naive_utc()
-                        .checked_sub_signed(__chrono_duration)
+                    ::autumn_web::time::tz::Offset::UTC
+                        .to_datetime(::autumn_web::time::ambient_now())
+                        .checked_sub(__span)
                         .expect(concat!(
                             "retention `after` duration is too large to compute a valid \
                              cutoff (overflows the representable date range) in \
@@ -633,17 +635,17 @@ pub(crate) fn emit_retention(
                                 #purge_after,
                                 "\"))]"
                             ));
-                        let __chrono_duration =
-                            ::autumn_web::reexports::chrono::Duration::from_std(__duration)
+                        let __span =
+                            ::autumn_web::time::SignedDuration::try_from(__duration)
                                 .expect(concat!(
                                     "retention `purge_deleted_after` duration out of range in \
                                      #[repository(..., retention(purge_deleted_after = \"",
                                     #purge_after,
                                     "\"))]"
                                 ));
-                        ::autumn_web::time::ambient_now()
-                            .naive_utc()
-                            .checked_sub_signed(__chrono_duration)
+                        ::autumn_web::time::tz::Offset::UTC
+                            .to_datetime(::autumn_web::time::ambient_now())
+                            .checked_sub(__span)
                             .expect(concat!(
                                 "retention `purge_deleted_after` duration is too large to \
                                  compute a valid cutoff (overflows the representable date \

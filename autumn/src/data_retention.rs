@@ -25,7 +25,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -33,7 +33,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::AutumnResult;
@@ -629,8 +629,12 @@ async fn run_one_dataset(
     // replaces it with the instant the database resolved.
     let cutoff = effective
         .window
-        .and_then(|window| chrono::Duration::from_std(window).ok())
-        .map(|window| crate::time::ambient_now() - window);
+        .and_then(|window| jiff::SignedDuration::try_from(window).ok())
+        .map(|window| {
+            crate::time::ambient_now()
+                .checked_sub(window)
+                .unwrap_or(Timestamp::MIN)
+        });
 
     let mut report = RetentionDatasetReport {
         dataset: dataset.key().to_owned(),
@@ -638,7 +642,7 @@ async fn run_one_dataset(
         enforcement: dataset.enforcement_for(config).to_string(),
         window_secs: effective.window.map(|w| w.as_secs()),
         source: effective.source.to_string(),
-        cutoff: cutoff.map(|c| c.to_rfc3339()),
+        cutoff: cutoff.map(crate::time::compat::rfc3339),
         eligible_rows: None,
         rows_removed: 0,
         truncated: false,
@@ -807,7 +811,7 @@ fn elapsed_ms(started: crate::time::MonotonicInstant) -> u64 {
 #[allow(clippy::unused_async)]
 async fn apply_custom_domain_prune(
     _state: &AppState,
-    _cutoff: DateTime<Utc>,
+    _cutoff: Timestamp,
     _dry_run: bool,
     report: &mut RetentionDatasetReport,
 ) {
@@ -818,7 +822,7 @@ async fn apply_custom_domain_prune(
 #[cfg(feature = "custom-domains")]
 async fn apply_custom_domain_prune(
     state: &AppState,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     dry_run: bool,
     report: &mut RetentionDatasetReport,
 ) {
@@ -829,7 +833,7 @@ async fn apply_custom_domain_prune(
             Some("custom domains are not enabled ([server.tls.acme.custom_domains])".to_owned());
         return;
     };
-    match pruner.prune(cutoff.timestamp(), dry_run).await {
+    match pruner.prune(cutoff.as_second(), dry_run).await {
         Ok(removed) => report.rows_removed = removed,
         Err(e) => report.error = Some(e),
     }
@@ -838,7 +842,7 @@ async fn apply_custom_domain_prune(
 /// Purge stale audit-archive entries through the installed [`AuditLogger`].
 async fn apply_archive_purge(
     state: &AppState,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     dry_run: bool,
     report: &mut RetentionDatasetReport,
 ) {
@@ -1017,7 +1021,7 @@ async fn apply_sweep(
     match outcome {
         Ok(swept) => {
             // The cutoff the database applied replaces the provisional app-clock one.
-            report.cutoff = Some(swept.cutoff.to_rfc3339());
+            report.cutoff = Some(crate::time::compat::rfc3339(swept.cutoff));
             report.eligible_rows = Some(swept.eligible);
             report.rows_removed = swept.removed;
             report.truncated = swept.truncated;
@@ -1027,7 +1031,7 @@ async fn apply_sweep(
             // and the database's cutoff they used, alongside the failure, and mark the pass
             // truncated.
             if let Some(cutoff) = failure.cutoff {
-                report.cutoff = Some(cutoff.to_rfc3339());
+                report.cutoff = Some(crate::time::compat::rfc3339(cutoff));
             }
             report.eligible_rows = failure.eligible;
             report.rows_removed = failure.removed;
@@ -1055,7 +1059,7 @@ async fn apply_sweep(
 /// against it.
 ///
 /// The cutoff is `NOW() - <window>` evaluated by Postgres, not
-/// `Utc::now() - window` in the app. Every column these predicates compare
+/// `Timestamp::now() - window` in the app. Every column these predicates compare
 /// against is written with the database's `NOW()` (`finished_at`,
 /// `updated_at`, `assigned_at`), so using the app's clock would compare two
 /// different clocks: a worker replica running fast by δ would delete rows δ
@@ -1123,7 +1127,7 @@ async fn sweep_postgres(
             "DELETE FROM {table} WHERE {predicate} AND {key} IN \
              (SELECT {key} FROM {table} WHERE {predicate}{order} LIMIT $2)"
         ))
-        .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+        .bind::<diesel::sql_types::Timestamptz, _>(crate::db::SqlTimestamp(cutoff))
         .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
         .execute(&mut *conn)
         .await
@@ -1179,7 +1183,7 @@ fn sweep_failed(removed: u64, message: String) -> SweepFailure {
 /// the one actually applied.
 #[cfg(feature = "db")]
 fn sweep_failed_at(
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     removed: u64,
     eligible: Option<u64>,
     message: String,
@@ -1197,7 +1201,7 @@ fn sweep_failed_at(
 /// autocommit batches already deleted, and the error itself.
 #[cfg(feature = "db")]
 struct SweepFailure {
-    cutoff: Option<DateTime<Utc>>,
+    cutoff: Option<Timestamp>,
     removed: u64,
     /// Rows counted before the batches ran. `None` when the failure came first.
     eligible: Option<u64>,
@@ -1219,13 +1223,16 @@ async fn resolve_cutoff(
     conn: &mut diesel_async::AsyncPgConnection,
     table: &str,
     window: Duration,
-) -> Result<DateTime<Utc>, SweepFailure> {
+) -> Result<Timestamp, SweepFailure> {
     use diesel_async::RunQueryDsl as _;
 
     #[derive(diesel::QueryableByName)]
     struct CutoffRow {
-        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
-        cutoff: DateTime<Utc>,
+        #[diesel(
+            sql_type = diesel::sql_types::Timestamptz,
+            deserialize_as = crate::db::SqlTimestamp
+        )]
+        cutoff: Timestamp,
     }
 
     let Ok(window_secs) = u32::try_from(window.as_secs()) else {
@@ -1262,7 +1269,7 @@ async fn count_stale(
     conn: &mut diesel_async::AsyncPgConnection,
     table: &str,
     predicate: &str,
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     removed_so_far: u64,
     eligible: Option<u64>,
 ) -> Result<u64, SweepFailure> {
@@ -1277,7 +1284,7 @@ async fn count_stale(
     diesel::sql_query(format!(
         "SELECT COUNT(*) AS count FROM {table} WHERE {predicate}"
     ))
-    .bind::<diesel::sql_types::Timestamptz, _>(cutoff)
+    .bind::<diesel::sql_types::Timestamptz, _>(crate::db::SqlTimestamp(cutoff))
     .get_result::<CountRow>(conn)
     .await
     .map(|row| u64::try_from(row.count).unwrap_or(0))
@@ -1295,7 +1302,7 @@ async fn count_stale(
 #[cfg(feature = "db")]
 struct SweptDataset {
     /// The instant the database itself resolved for the window.
-    cutoff: DateTime<Utc>,
+    cutoff: Timestamp,
     /// Rows matching the predicate before the pass ran.
     eligible: u64,
     /// Rows actually deleted.
@@ -1591,7 +1598,7 @@ async fn resolve_sqlite_cutoff(
     table: &str,
     window: Duration,
     clock: SqliteClock,
-) -> Result<(DateTime<Utc>, SqliteCutoff), SweepFailure> {
+) -> Result<(Timestamp, SqliteCutoff), SweepFailure> {
     use diesel_async::RunQueryDsl as _;
 
     #[derive(diesel::QueryableByName)]
@@ -1624,13 +1631,18 @@ async fn resolve_sqlite_cutoff(
     let ms = row.cutoff_ms.ok_or_else(too_wide)?;
     // A text column holds whole seconds. Report the instant that is applied.
     let at = match clock {
-        SqliteClock::Millis => DateTime::<Utc>::from_timestamp_millis(ms),
-        SqliteClock::Text => DateTime::<Utc>::from_timestamp(ms.div_euclid(1000), 0),
+        SqliteClock::Millis => Timestamp::from_millisecond(ms),
+        SqliteClock::Text => Timestamp::from_second(ms.div_euclid(1000)),
     }
-    .ok_or_else(too_wide)?;
+    .map_err(|_| too_wide())?;
     let cutoff = match clock {
         SqliteClock::Millis => SqliteCutoff::Millis(ms),
-        SqliteClock::Text => SqliteCutoff::Text(at.format("%Y-%m-%d %H:%M:%S").to_string()),
+        SqliteClock::Text => SqliteCutoff::Text(
+            jiff::tz::Offset::UTC
+                .to_datetime(at)
+                .strftime("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        ),
     };
     Ok((at, cutoff))
 }
@@ -1643,7 +1655,7 @@ async fn count_stale_sqlite(
     cutoff: &SqliteCutoff,
     removed_so_far: u64,
     eligible: Option<u64>,
-    cutoff_at: DateTime<Utc>,
+    cutoff_at: Timestamp,
 ) -> Result<u64, SweepFailure> {
     use diesel_async::RunQueryDsl as _;
 
@@ -2273,7 +2285,12 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn a_failure_after_the_count_keeps_the_eligible_count() {
-        let failure = sweep_failed_at(Utc::now(), 500, Some(5_000_000), "timeout".to_owned());
+        let failure = sweep_failed_at(
+            Timestamp::UNIX_EPOCH,
+            500,
+            Some(5_000_000),
+            "timeout".to_owned(),
+        );
         assert_eq!(failure.eligible, Some(5_000_000));
         assert_eq!(failure.removed, 500);
         assert_eq!(sweep_failed(0, "no pool".to_owned()).eligible, None);

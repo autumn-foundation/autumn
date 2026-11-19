@@ -18,7 +18,7 @@ fn sample_sequence() -> Vec<String> {
         out.push(fake::int_range(1, 10).to_string());
         out.push(fake::decimal().to_string());
         out.push(fake::decimal_f64().to_string());
-        out.push(fake::recent_datetime().to_rfc3339());
+        out.push(autumn_web::time::compat::rfc3339(fake::recent_datetime()));
         out.push(fake::uuid().to_string());
     }
     out

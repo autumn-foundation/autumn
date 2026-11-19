@@ -84,7 +84,7 @@ use autumn_billing::{
 };
 use autumn_web::reexports::diesel_migrations::MigrationHarness;
 use autumn_web::test::TestApp;
-use chrono::{TimeZone, Utc};
+use autumn_web::time::{SignedDuration, Timestamp};
 use diesel::connection::SimpleConnection;
 use diesel::sql_types::{BigInt, Text};
 use diesel::{Connection, PgConnection, QueryableByName};
@@ -468,7 +468,7 @@ async fn dunning_close_scan_profile() {
     let client = TestApp::new().build();
     let state = client.state();
 
-    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let base: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
 
     reset_stats(&mut conn);
 
@@ -480,7 +480,7 @@ async fn dunning_close_scan_profile() {
     {
         let event = BillingEvent::new(
             format!("evt_cancel_{gs}"),
-            base + chrono::Duration::seconds(i64::try_from(i).expect("fits in i64")),
+            base + SignedDuration::from_secs(i64::try_from(i).expect("fits in i64")),
             BillingEventKind::SubscriptionDeleted(SubscriptionSnapshot::new(
                 format!("sub_stripe_{gs}"),
                 format!("cus_stripe_{gs}"),

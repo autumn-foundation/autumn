@@ -29,11 +29,11 @@ use autumn_web::config::DatabaseConfig;
 use autumn_web::current::with_actor;
 use autumn_web::db::{RuntimeConnection, create_pool};
 use autumn_web::hooks::Patch;
-use autumn_web::reexports::{chrono, diesel, diesel_async};
+use autumn_web::reexports::{diesel, diesel_async};
 use autumn_web::tenancy::with_tenant;
 use autumn_web::version_history::{VersionFilter, VersionOp};
 
-use chrono::Duration;
+use autumn_web::time::{SignedDuration, Timestamp};
 use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -250,13 +250,16 @@ async fn version_history_time_range_filter_on_sqlite() {
         .await
         .expect("insert");
 
-    let now = chrono::Utc::now();
+    let now = Timestamp::now();
 
     // A window straddling now includes the insert.
     let wide = repo
         .version_history(
             created.id,
-            VersionFilter::between(now - Duration::hours(1), now + Duration::hours(1)),
+            VersionFilter::between(
+                now - SignedDuration::from_hours(1),
+                now + SignedDuration::from_hours(1),
+            ),
         )
         .await
         .expect("wide range read");
@@ -270,7 +273,10 @@ async fn version_history_time_range_filter_on_sqlite() {
     let future = repo
         .version_history(
             created.id,
-            VersionFilter::between(now + Duration::hours(1), now + Duration::hours(2)),
+            VersionFilter::between(
+                now + SignedDuration::from_hours(1),
+                now + SignedDuration::from_hours(2),
+            ),
         )
         .await
         .expect("future range read");

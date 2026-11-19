@@ -777,7 +777,7 @@ fn build_contract(
         version: CONTRACT_VERSION,
         provenance: Provenance {
             autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
-            calibrated_at: chrono::Utc::now().to_rfc3339(),
+            calibrated_at: autumn_web::time::compat::rfc3339(jiff::Timestamp::now()),
             git_commit,
             git_dirty,
             route_graph_digest: route_graph_digest(&routes),

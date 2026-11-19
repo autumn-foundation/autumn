@@ -49,8 +49,8 @@ use std::time::Duration;
 // Run once, 24 hours from now.
 SendReminderJob::enqueue_in(ReminderArgs { user_id: 42 }, Duration::from_secs(24 * 60 * 60)).await?;
 
-// Run once, at an absolute UTC instant.
-let when = chrono::Utc::now() + chrono::TimeDelta::hours(2);
+// Run once, at an absolute UTC instant (an `autumn_web::time::Timestamp`).
+let when = autumn_web::time::ambient_now() + autumn_web::time::SignedDuration::from_hours(2);
 PublishPostJob::enqueue_at(PublishArgs { post_id: 7 }, when).await?;
 ```
 

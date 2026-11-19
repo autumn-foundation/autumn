@@ -20,7 +20,6 @@ use autumn_web::sim::Sim;
 use autumn_web::sim_test;
 use autumn_web::test::TestApp;
 use autumn_web::time::Clock;
-use chrono::{TimeZone, Utc};
 use futures::FutureExt as _;
 use std::panic::AssertUnwindSafe;
 
@@ -28,7 +27,7 @@ use std::panic::AssertUnwindSafe;
 /// clock advanced a full day in virtual time.
 #[get("/now")]
 async fn now_route(clock: Clock) -> String {
-    clock.now().to_rfc3339()
+    autumn_web::time::compat::rfc3339(clock.now())
 }
 
 /// A clean virtual run with the guard **on** does not trip it: advancing a full
@@ -51,9 +50,7 @@ async fn strict_wall_clock_passes_on_clean_virtual_run(mut sim: Sim) {
     after.assert_ok();
     assert_eq!(
         after.text(),
-        Utc.with_ymd_and_hms(2020, 1, 2, 0, 0, 0)
-            .unwrap()
-            .to_rfc3339(),
+        "2020-01-02T00:00:00+00:00",
         "the virtual clock must have advanced a full day"
     );
 

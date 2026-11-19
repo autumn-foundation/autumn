@@ -136,7 +136,7 @@ the framework almost certainly already generates or ships it:
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598; 0.8.0, #1634) |
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.8.0, #1634) |
 | Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
-| A `#[sim_test]` that calls a real downstream service, hopes for a timing race, or reads `Utc::now()` / `Instant::now()` in code with no clock in scope | `Sim::net(SimNet::new().host("payments", router).latency(..).drop_rate(..))` serves outbound `http_client` calls in-process with seeded latency, drops and `partition`/`heal`; `Sim::interleave` / `Sim::spawn` reorder ready work from the seed; `sim::crash_at(i, op)` drops an op at any await; `time::ambient_now()` / `ambient_instant()` follow the running `Sim`. See `docs/guide/simulation-testing.md` (#2967) |
+| A `#[sim_test]` that calls a real downstream service, hopes for a timing race, or reads `Timestamp::now()` / `Instant::now()` in code with no clock in scope | `Sim::net(SimNet::new().host("payments", router).latency(..).drop_rate(..))` serves outbound `http_client` calls in-process with seeded latency, drops and `partition`/`heal`; `Sim::interleave` / `Sim::spawn` reorder ready work from the seed; `sim::crash_at(i, op)` drops an op at any await; `time::ambient_now()` / `ambient_instant()` follow the running `Sim`. See `docs/guide/simulation-testing.md` (#2967) |
 | Testing job, scheduler or lock coordination with one app, or with two real processes and sleeps | `Sim::mount_replica("a", app)` / `mount_replica("b", app)` on one sim clock and one `SqliteSubstrate`; per-replica clocks (`Replica::named("b").clock_ahead(d)`, `Sim::step_replica_clock`), per-replica DB faults (`Sim::db_link(name)`: `lose_session`, `mid_query_errors`, `commit_ambiguity`), `kill_replica` / `restart_replica`, and `Sim::run_for(d)` to move time. See `docs/guide/simulation-testing.md` → "Multiple replicas" (#3067) |
 | Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.6.0, issue #1344). See `docs/guide/conditional-get.md` |
 
@@ -241,8 +241,7 @@ edition = "2024"
 
 [dependencies]
 autumn-web = { version = "0.11", features = ["db", "htmx", "maud"] }
-chrono = { version = "0.4", features = ["serde"] }
-diesel = { version = "2", features = ["postgres", "chrono"] }
+diesel = { version = "2", features = ["postgres"] }
 diesel-async = { version = "0.10", features = ["postgres"] }
 diesel_migrations = "2"
 maud = { version = "0.27", features = ["axum"] }
@@ -254,6 +253,18 @@ validator = { version = "0.21", features = ["derive"] }
 
 Use `pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }`
 when avoiding a system libpq install.
+
+Dates and times are `jiff` values that `autumn_web::time` re-exports: add no
+date crate and leave diesel's `chrono` feature off. A `#[model]` field is
+`Timestamp` (`TIMESTAMPTZ`), `civil::DateTime` (`TIMESTAMP`), `civil::Date`
+(`DATE`) or `civil::Time` (`TIME`), or an `Option` of one; a `chrono` type
+there is a compile error whose hint names the `jiff` type. Read "now" from the
+`Clock` extractor (`clock.now()`) or `autumn_web::time::ambient_now()`, never
+`Timestamp::now()`. A hand-written Diesel query binds a `jiff` value through
+`autumn_web::db::AsSqlTime` (`posts::created_at.lt(cutoff.as_sql_time())`) or
+the `SqlTimestamp` / `SqlDateTime` / `SqlDate` / `SqlTime` wrappers; a
+hand-derived `Queryable` field takes
+`#[diesel(deserialize_as = autumn_web::db::SqlDateTime)]` (and so on).
 
 For a reddit-clone-style app with live feeds, file uploads, and blob variants:
 ```toml
@@ -1140,7 +1151,7 @@ What to know when writing app code against it:
   add a column. A head at the current version is compared strictly.
 - **Two time axes.** `recorded_at` is transaction time; `valid_from` defaults to
   it, or comes from your own column via `ledgered(valid_time = "effective_at")`
-  (`DateTime<Utc>` / `NaiveDateTime` / `Option` of either). Query both with
+  (`Timestamp` / `civil::DateTime` / `Option` of either). Query both with
   `LedgerAsOf::{transaction, valid, bitemporal}` via `ledger_as_of_at`. Both
   bounds *filter*; the newest surviving revision wins.
 - **`ledger_verify` is the audit answer.** Beyond the hash chain it
@@ -1632,7 +1643,7 @@ Two things to get right when generating this code:
     - No stable event or delivery ID is transmitted: nothing Autumn sends
       distinguishes a first attempt from a retry of the same event, and the
       `Autumn-Signature` header's `t=` is recomputed per attempt but is
-      neither unique nor stable — it is a whole-second `Utc::now().timestamp()`
+      neither unique nor stable — it is a whole-second `ambient_now().as_second()`
       and nothing guarantees two attempts differ. Every backend uses full
       jitter (issue #3054), so the first retry can come 0-1000 ms later and the
       same second yields a byte-identical signature. (Do not enumerate
@@ -2322,7 +2333,7 @@ for the common cases:
 | `autocomplete_input(id, label, &AutocompleteConfig)` / `autocomplete_option(value, label)` / `autocomplete_empty_state(msg)` | Typeahead/autocomplete picker for choosing a related record and storing its ID — the companion to `active_search` when the user must pick one row rather than browse matches. Selection and input sync need the shipped `autumn-widgets.js` runtime (`<script src="/static/js/autumn-widgets.js" defer>`, no inline JS, CSP-compatible) on top of htmx; include it once in the layout or the picker will not select. Its `<noscript>` fallback is a bare `<select>`, NOT a form like `active_search`'s — it has to sit inside the surrounding application form to submit (`docs/guide/active-search-and-autocomplete.md`) |
 | `AutocompleteConfig::multiple()` (+ `.free_text()`, `.selected(..)`) / `autocomplete_input_for(&changeset, id, label, &config)` / `autocomplete_create_option(value, label)` | Tags / multi-select (0.10.0, issue #3410): each pick is a removable chip with one hidden `name=value` input, so bind a `#[serde(default)] Vec<T>` field — repeated keys decode into it. Use `autocomplete_input_for` on a 422 re-render: the changeset is the source of the chips and its field errors show. Return `autocomplete_create_option` after the matches for a "create new" entry; with `free_text()`, Enter adds the typed text. Validate and de-duplicate new values on the server. Needs `autumn-widgets.js`; the no-JS fallback is a `<select multiple>` that shows only `fallback_options` (`docs/guide/active-search-and-autocomplete.md`) |
 | `storage::form_helper::direct_upload_field(name, presign_url, &DirectUploadConfig::new().label(..).accept(..).multiple(..))` / `direct_upload_input(name, presign_url, accept)` | Direct-to-storage file field (feature `storage`, 0.10.0, #3411). With `autumn-widgets.js` it `POST`s `{filename, content_type, size}` to your presign route (CSRF token from `<meta name="csrf-token">`), reads `{url, method, headers, key}`, sends the file with a progress bar (drag and drop works) and adds a hidden `name=key` field. The form carries only keys: check each key's prefix, then call `complete_direct_upload`. Without JS it is a plain file input in a `multipart/form-data` form. Has a visible `<label>` and live status and error regions (`docs/guide/storage.md`) |
-| `local_datetime(dt, tz)` (`autumn_web::time_zone`) | Render a `DateTime<Utc>` in a user's IANA zone. Pair with the `TimeZone` extractor (resolves the requesting user's zone) and `set_time_zone_in_session` / `parse_iana`; take "now" from the `Clock` extractor rather than `Utc::now()` so rendering stays test-injectable (`docs/guide/time-zones.md`) |
+| `local_datetime(dt, &tz)` (`autumn_web::time_zone`) | Render a `Timestamp` in a user's IANA zone. Pair with the `TimeZone` extractor (resolves the requesting user's zone; it derefs to a `jiff::tz::TimeZone`, which is `Clone`, not `Copy`, so pass `&tz`) and `set_time_zone_in_session` / `parse_iana`; take "now" from the `Clock` extractor rather than `Timestamp::now()` so rendering stays test-injectable (`docs/guide/time-zones.md`) |
 | `wizard_progress(&ctx, step).await` / `wizard_progress_from_steps(&[WizardProgressStep])` (`autumn_web::wizard`) | Accessible step-progress `<nav>` (`aria-current="step"`, "Step N of M"). `wizard_progress` reads step states from the session; `wizard_progress_from_steps` is the sync form for steps you already have (0.10.0, #3398). The `/_stories` gallery shows it with pagination, flash and the `a11y` primitives |
 | `WidgetPack::new("pack").extend(stories).assets(&ASSETS)` + `app.widget_pack(pack)` (`autumn_web::widget_pack`) | Ship widgets as a plugin crate (0.10.0, #3400). Contract: `Render`, `&FieldOptions` passthrough, public tokens only (no raw colors, no setting `--primary`), `autumn-<pack>-*` classes, keyboard core `data-*` + `autumn:init` (no own arrow-key JS), CSP-safe, one story per widget with slug `<pack>-…`. `with_story_gallery` now ADDS (plugin galleries start from `StoryGallery::new()`). Non-input widgets write their root with `widget_pack::element(tag, attrs, &FieldOptions, body)`. Form inputs: `impl FieldRenderer` + `FieldContext::control` (radios: `grouped()` + `group_item`), then `custom_input_with(&cs, …)` or `form_for(..).override_field(f, FieldControl::custom(R))`. Check with `plugin_conformance::widgets::run_widget_conformance` and (feature `system-tests`) `browser::run_widget_browser_conformance(&pack, &axe_src)` (`docs/guide/widget-packs.md`) |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
@@ -2356,9 +2367,11 @@ let markup = form_for(&changeset, "/posts", "post") // non-GET/POST method emits
 Derived control mapping: strings/`Uuid`/unknown types → `Text` (promote enums
 via `.override_field`), integers → `Number` (step 1), floats/`Decimal` →
 `Number` (step any), `bool` → `Checkbox` (nullable `bool` → tri-state
-`Select`), `NaiveDate` → `Date`, `NaiveDateTime`/`DateTime<Utc>`/
-`DateTime<Local>` → `DateTime`, any other `DateTime` zone → `Text` (an
-offsetless `datetime-local` value is ambiguous there). Any
+`Select`), `civil::Date` → `Date`, `civil::Time` → `Time`,
+`civil::DateTime`/`Timestamp`/`ZonedDateTime` → `DateTime` (a `Timestamp`
+reads the offsetless `datetime-local` value as UTC, a `ZonedDateTime` in the
+server's zone). The `jiff` types come from `autumn_web::time`; a bare `Date`,
+`Time` or `DateTime` must be `jiff`'s civil type. Any
 `FieldControl::File` field (or `.multipart()`) makes `render()` emit
 `enctype="multipart/form-data"`.
 

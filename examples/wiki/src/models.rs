@@ -24,7 +24,7 @@ pub struct ApiCredential {
     #[encrypted]
     pub token: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[autumn_web::model]
@@ -52,9 +52,9 @@ pub struct Page {
     #[lock_version]
     pub lock_version: i32,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub updated_at: chrono::NaiveDateTime,
+    pub updated_at: autumn_web::time::civil::DateTime,
 }
 
 impl Page {
@@ -115,7 +115,8 @@ impl Page {
 pub struct Collection {
     pub id: i64,
     pub title: String,
-    pub created_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[derive(Debug, Clone, diesel::Insertable)]
@@ -133,7 +134,8 @@ pub struct CollectionLink {
     pub label: String,
     pub url: String,
     pub position: i32,
-    pub created_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[derive(Debug, Clone, diesel::Insertable)]
@@ -183,7 +185,8 @@ pub struct Revision {
     pub status: String,
     pub changed_by: Option<String>,
     pub summary: Option<String>,
-    pub created_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[derive(Debug, Clone, diesel::Insertable)]
@@ -210,8 +213,8 @@ mod state_machine_tests {
             body: body.into(),
             status: status.into(),
             lock_version: 0,
-            created_at: chrono::Utc::now().naive_utc(),
-            updated_at: chrono::Utc::now().naive_utc(),
+            created_at: autumn_web::time::ambient_civil_utc(),
+            updated_at: autumn_web::time::ambient_civil_utc(),
         }
     }
 

@@ -463,7 +463,7 @@ pub fn bar_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud:
 /// use autumn_web::widgets::line_chart;
 ///
 /// // A day-bucketed signup time series.
-/// let per_day: Vec<(chrono::NaiveDateTime, i64)> = repo
+/// let per_day: Vec<(autumn_web::time::civil::DateTime, i64)> = repo
 ///     .count_grouped_by_created_at()
 ///     .bucket(DateBucket::Day)
 ///     .filter_range(window_start, window_end)
@@ -471,7 +471,7 @@ pub fn bar_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud:
 ///     .await?;
 ///
 /// let labels: Vec<String> =
-///     per_day.iter().map(|(day, _)| day.format("%b %d").to_string()).collect();
+///     per_day.iter().map(|(day, _)| day.strftime("%b %d").to_string()).collect();
 /// let points: Vec<(&str, f64)> = per_day
 ///     .iter()
 ///     .zip(&labels)
@@ -480,7 +480,7 @@ pub fn bar_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud:
 /// let svg = line_chart(&points).into_string();
 ///
 /// // For a nullable aggregate (sum/avg), coalesce the Option first:
-/// // let revenue: Vec<(chrono::NaiveDateTime, Option<i64>)> = ...;
+/// // let revenue: Vec<(autumn_web::time::civil::DateTime, Option<i64>)> = ...;
 /// // let v = *value; let point = v.unwrap_or(0) as f64;
 /// ```
 #[must_use]

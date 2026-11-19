@@ -14,7 +14,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -23,7 +23,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
@@ -268,7 +267,11 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for LogCaptureLayer {
         let message = visitor.message.unwrap_or_default();
         let level = event.metadata().level().as_str().to_owned();
         let target = event.metadata().target().to_owned();
-        let timestamp = crate::time::ambient_now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let timestamp = crate::time::compat::rfc3339_opts(
+            crate::time::ambient_now(),
+            crate::time::compat::Digits::Millis,
+            true,
+        );
 
         let filter = self.buffer.filter();
         let mut fields = visitor.fields;

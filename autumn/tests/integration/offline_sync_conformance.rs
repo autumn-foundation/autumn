@@ -10,7 +10,7 @@ use autumn_web::sync::{
     Change, ChangeOutcome, LwwResolver, MemorySyncBackend, Op, PullResponse, PushRequest,
     SyncBackend, SyncScope,
 };
-use chrono::{Duration, Utc};
+use autumn_web::time::{SignedDuration, ambient_now};
 use serde_json::json;
 
 /// The single-tenant scope the linear script below runs in — what
@@ -26,7 +26,7 @@ fn change(change_id: &str, pk: &str, op: Op, payload: Option<serde_json::Value>)
         op,
         payload,
         base_version: 0,
-        updated_at: Utc::now(),
+        updated_at: ambient_now(),
     }
 }
 
@@ -146,7 +146,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "one-b"})),
     );
     winner.base_version = 0; // stale: n1 is at versions[0]
-    winner.updated_at = Utc::now() + Duration::seconds(30);
+    winner.updated_at = ambient_now() + SignedDuration::from_secs(30);
     let winner_request = push("device-b", vec![winner]);
     let response = backend
         .apply_push(SCOPE, &winner_request, &resolver)
@@ -203,7 +203,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "stale"})),
     );
     loser.base_version = versions[0]; // stale again
-    loser.updated_at = Utc::now() - Duration::seconds(3600);
+    loser.updated_at = ambient_now() - SignedDuration::from_secs(3600);
     let response = backend
         .apply_push(SCOPE, &push("device-c", vec![loser]), &resolver)
         .expect("losing conflict push");
@@ -487,7 +487,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "resurrected?"})),
     );
     stale_edit.base_version = versions[1]; // n2's pre-delete version (< horizon)
-    stale_edit.updated_at = Utc::now() - Duration::seconds(3600);
+    stale_edit.updated_at = ambient_now() - SignedDuration::from_secs(3600);
     let stale_request = push("device-offline", vec![stale_edit]);
     let response = backend
         .apply_push(SCOPE, &stale_request, &resolver)
@@ -550,7 +550,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "clock cheat"})),
     );
     skewed_edit.base_version = versions[1];
-    skewed_edit.updated_at = Utc::now() + Duration::days(365);
+    skewed_edit.updated_at = ambient_now() + SignedDuration::from_hours(8760);
     let response = backend
         .apply_push(SCOPE, &push("device-skewed", vec![skewed_edit]), &resolver)
         .expect("skewed push");
@@ -584,7 +584,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
             Some(json!({"title": "resurrected via repeat?"})),
         );
         repeat_edit.base_version = versions[1];
-        repeat_edit.updated_at = Utc::now() + Duration::days(365);
+        repeat_edit.updated_at = ambient_now() + SignedDuration::from_hours(8760);
         let response = backend
             .apply_push(SCOPE, &push("device-skewed", vec![repeat_edit]), &resolver)
             .expect("repeat stale push");
@@ -708,7 +708,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "ghost edit"})),
     );
     ghost_edit.base_version = first_life; // <= horizon
-    ghost_edit.updated_at = Utc::now() + Duration::days(365);
+    ghost_edit.updated_at = ambient_now() + SignedDuration::from_hours(8760);
     let response = backend
         .apply_push(SCOPE, &push("device-a", vec![ghost_edit]), &resolver)
         .expect("ghost edit push");
@@ -740,7 +740,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         None,
     );
     ghost_delete.base_version = first_life;
-    ghost_delete.updated_at = Utc::now() + Duration::days(365);
+    ghost_delete.updated_at = ambient_now() + SignedDuration::from_hours(8760);
     let response = backend
         .apply_push(SCOPE, &push("device-a", vec![ghost_delete]), &resolver)
         .expect("ghost delete push");
@@ -782,7 +782,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "third life"})),
     );
     third_life.base_version = second_life; // stale (row moved on) but > horizon
-    third_life.updated_at = Utc::now() + Duration::seconds(120);
+    third_life.updated_at = ambient_now() + SignedDuration::from_secs(120);
     let response = backend
         .apply_push(SCOPE, &push("device-c", vec![third_life]), &resolver)
         .expect("post-horizon conflict push");
@@ -893,7 +893,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "three"})),
     );
     offline_edit.base_version = bystander_v1;
-    offline_edit.updated_at = Utc::now() + Duration::seconds(60);
+    offline_edit.updated_at = ambient_now() + SignedDuration::from_secs(60);
     let response = backend
         .apply_push(SCOPE, &push("device-c", vec![offline_edit]), &resolver)
         .expect("offline edit");
@@ -920,7 +920,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "ancient"})),
     );
     losing_edit.base_version = bystander_v1;
-    losing_edit.updated_at = Utc::now() - Duration::seconds(3600);
+    losing_edit.updated_at = ambient_now() - SignedDuration::from_secs(3600);
     let response = backend
         .apply_push(SCOPE, &push("device-d", vec![losing_edit]), &resolver)
         .expect("losing offline edit");
@@ -1012,7 +1012,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "ghost flight"})),
     );
     phoenix_ghost.base_version = phoenix_v1;
-    phoenix_ghost.updated_at = Utc::now() + Duration::days(365);
+    phoenix_ghost.updated_at = ambient_now() + SignedDuration::from_hours(8760);
     let response = backend
         .apply_push(SCOPE, &push("device-c", vec![phoenix_ghost]), &resolver)
         .expect("phoenix ghost edit");
@@ -1144,7 +1144,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "ghost"})),
     );
     lazarus_ghost.base_version = lazarus_v1;
-    lazarus_ghost.updated_at = Utc::now() + Duration::days(365);
+    lazarus_ghost.updated_at = ambient_now() + SignedDuration::from_hours(8760);
     let response = backend
         .apply_push(SCOPE, &push("device-c", vec![lazarus_ghost]), &resolver)
         .expect("lazarus ghost edit");
@@ -1207,7 +1207,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "unwrapped?"})),
     );
     mummy_stale.base_version = mummy_v1; // strictly below the horizon
-    mummy_stale.updated_at = Utc::now() + Duration::days(365);
+    mummy_stale.updated_at = ambient_now() + SignedDuration::from_hours(8760);
     let response = backend
         .apply_push(SCOPE, &push("device-b", vec![mummy_stale]), &resolver)
         .expect("mummy stale push");
@@ -1252,7 +1252,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "ancient curse"})),
     );
     mummy_ghost.base_version = mummy_v1;
-    mummy_ghost.updated_at = Utc::now() + Duration::days(365);
+    mummy_ghost.updated_at = ambient_now() + SignedDuration::from_hours(8760);
     let response = backend
         .apply_push(SCOPE, &push("device-c", vec![mummy_ghost]), &resolver)
         .expect("mummy ghost edit");
@@ -1383,7 +1383,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "third tenant"})),
     );
     third_tenant.base_version = second_grave_tomb;
-    third_tenant.updated_at = Utc::now() + Duration::seconds(60);
+    third_tenant.updated_at = ambient_now() + SignedDuration::from_secs(60);
     let response = backend
         .apply_push(SCOPE, &push("device-d", vec![third_tenant]), &resolver)
         .expect("recreate from the original tombstone");
@@ -1413,7 +1413,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(json!({"title": "first tenant returns"})),
     );
     grave_ghost.base_version = grave_v1;
-    grave_ghost.updated_at = Utc::now() + Duration::days(365);
+    grave_ghost.updated_at = ambient_now() + SignedDuration::from_hours(8760);
     let response = backend
         .apply_push(SCOPE, &push("device-a", vec![grave_ghost]), &resolver)
         .expect("ghost edit");
@@ -1489,7 +1489,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
         Some(serde_json::Value::Null),
     );
     null_conflict.base_version = 0; // stale: the row is at null_version
-    null_conflict.updated_at = Utc::now() + Duration::seconds(60);
+    null_conflict.updated_at = ambient_now() + SignedDuration::from_secs(60);
     let null_request = push("device-b", vec![null_conflict]);
     let response = backend
         .apply_push(SCOPE, &null_request, &resolver)
@@ -1613,7 +1613,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // row only, even with a fast client clock.
     let mut cross = tenant_change("00000000-0000-4000-8000-000000000021", "cross-scope ghost");
     cross.base_version = version_a; // predates tenant-b's row entirely
-    cross.updated_at = Utc::now() + Duration::seconds(60);
+    cross.updated_at = ambient_now() + SignedDuration::from_secs(60);
     let response = backend
         .apply_push("tenant-b", &push("device-x", vec![cross]), &resolver)
         .expect("cross-scope-shaped push");
@@ -1736,7 +1736,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // timestamp wins.
     let mut conflict_a = tenant_change("00000000-0000-4000-8000-000000000024", "alpha 3");
     conflict_a.base_version = version_a;
-    conflict_a.updated_at = Utc::now() + Duration::seconds(60);
+    conflict_a.updated_at = ambient_now() + SignedDuration::from_secs(60);
     let response = backend
         .apply_push("tenant-a", &push("device-y", vec![conflict_a]), &resolver)
         .expect("tenant-a conflict");
@@ -1779,7 +1779,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     // Every applied change so far left one dedup record; an age-based GC
     // with a future cutoff removes them all, and re-running is a no-op.
     let removed = backend
-        .gc_applied(Utc::now() + Duration::seconds(3600))
+        .gc_applied(ambient_now() + SignedDuration::from_secs(3600))
         .expect("gc applied");
     assert!(
         removed >= 5,
@@ -1787,7 +1787,7 @@ pub fn run_backend_conformance(backend: &dyn SyncBackend) {
     );
     assert_eq!(
         backend
-            .gc_applied(Utc::now() + Duration::seconds(3600))
+            .gc_applied(ambient_now() + SignedDuration::from_secs(3600))
             .expect("re-gc applied"),
         0,
         "dedup GC is idempotent"

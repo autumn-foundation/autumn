@@ -1180,7 +1180,7 @@ fn run_plugin_index(action: IndexSubcommands) -> i32 {
                 reports.iter().map(std::path::PathBuf::from).collect();
             let inspects: Vec<std::path::PathBuf> =
                 inspects.iter().map(std::path::PathBuf::from).collect();
-            let today = chrono::Local::now().date_naive().to_string();
+            let today = jiff::ZonedDateTime::now().date().to_string();
             plugin::curate::run_record(&plugin::curate::RecordOptions {
                 index: std::path::Path::new(&index),
                 reports: &reports,
@@ -2125,7 +2125,9 @@ enum Commands {
     ///   bool                         (BOOLEAN)
     ///   f32, f64                     (REAL, DOUBLE PRECISION)
     ///   Uuid                         (UUID)
-    ///   `NaiveDateTime`, `DateTime`      (TIMESTAMP, TIMESTAMPTZ)
+    ///   `CivilDateTime`, `NaiveDateTime` (TIMESTAMP, `civil::DateTime`)
+    ///   Timestamp, `DateTime`          (TIMESTAMPTZ, `Timestamp`)
+    ///   Date                         (DATE, `civil::Date`)
     ///   `Vec<u8>`, Bytea               (BYTEA)
     ///   decimal{precision,scale}     (NUMERIC, default {12,2})
     ///   Option<...>                  (any of the above, nullable)
@@ -4744,8 +4746,9 @@ enum DeployMaintenanceCommands {
 enum GenerateCommands {
     /// Generate a `#[model]` struct, Diesel migration, and schema entry.
     ///
-    /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, `NaiveDateTime`,
-    /// `DateTime`, `Vec<u8>`/Bytea, Attachment, references, `enum{a,b,...}`, `Option<...>`.
+    /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, Timestamp
+    /// (alias `DateTime`), `CivilDateTime` (alias `NaiveDateTime`), Date,
+    /// `Vec<u8>`/Bytea, Attachment, references, `enum{a,b,...}`, `Option<...>`.
     ///
     /// `field:references` scaffolds a foreign key: a `field_id BIGINT` column
     /// with a `REFERENCES <table>(id)` constraint and an index, where `<table>`
@@ -5425,8 +5428,9 @@ enum GenerateCommands {
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
     ///
-    /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, `NaiveDateTime`,
-    /// `DateTime`, `Vec<u8>`/Bytea, Attachment, references, `enum{a,b,...}`, `Option<...>`.
+    /// Field types: String, Text, i32, i64, bool, f32, f64, Uuid, Timestamp
+    /// (alias `DateTime`), `CivilDateTime` (alias `NaiveDateTime`), Date,
+    /// `Vec<u8>`/Bytea, Attachment, references, `enum{a,b,...}`, `Option<...>`.
     ///
     /// `field:references` scaffolds a foreign key (`field_id BIGINT
     /// REFERENCES <table>(id)` plus an index), e.g.

@@ -40,7 +40,7 @@ pub struct RtSession {
     #[id]
     pub id: i64,
     pub token: String,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[autumn_web::repository(RtSession, table = "rt_sessions", retention(after = "30d", basis = created_at, batch_size = 2))]
@@ -60,8 +60,8 @@ pub struct RtPost {
     #[id]
     pub id: i64,
     pub title: String,
-    pub created_at: chrono::NaiveDateTime,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub created_at: autumn_web::time::civil::DateTime,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -85,7 +85,7 @@ pub struct RtPlain {
     #[id]
     pub id: i64,
     pub title: String,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // Opt-in (issue #1342 AC): no `retention(...)` attribute means no sweep is
@@ -137,7 +137,7 @@ pub struct RtCcChild {
     #[id]
     pub id: i64,
     pub parent_id: i64,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[autumn_web::repository(

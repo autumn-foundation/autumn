@@ -104,7 +104,8 @@ pub struct MutationContext {
     /// Correlation / request ID for tracing.
     pub request_id: Option<String>,
     /// Timestamp of the mutation.
-    pub now: chrono::DateTime<chrono::Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub now: crate::time::Timestamp,
     /// Cache keys to invalidate after the mutation.
     pub invalidate_keys: Vec<String>,
     /// Framework-scoped idempotency key for this mutation, when the mutation

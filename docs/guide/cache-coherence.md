@@ -368,7 +368,7 @@ has to key under it:
 autumn_web::cache::cache_fragment_global_in(
     "blog::routes::sidebar_fragment",
     format_args!("post:{}", post.id),
-    post.updated_at.timestamp(),
+    post.updated_at,
     None,
     || html! { … },
 );

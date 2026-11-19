@@ -49,13 +49,13 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// Narrow framework migration set required by `#[repository(..., versioned = true)]`.
@@ -195,7 +195,8 @@ pub struct VersionEntry {
     /// Column-level diff. For updates, only changed columns are included.
     pub changes: Vec<ColumnChange>,
     /// UTC timestamp when this entry was written.
-    pub recorded_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub recorded_at: Timestamp,
 }
 
 impl VersionEntry {
@@ -218,9 +219,9 @@ impl VersionEntry {
 #[derive(Debug, Clone)]
 pub struct VersionFilter {
     /// Only include entries recorded after this timestamp (inclusive).
-    pub from: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
     /// Only include entries recorded before this timestamp (inclusive).
-    pub to: Option<DateTime<Utc>>,
+    pub to: Option<Timestamp>,
     /// 1-indexed page number (defaults to 1).
     pub page: u64,
     /// Entries per page (defaults to 25).
@@ -241,7 +242,7 @@ impl Default for VersionFilter {
 impl VersionFilter {
     /// Create a filter for changes between two timestamps.
     #[must_use]
-    pub const fn between(from: DateTime<Utc>, to: DateTime<Utc>) -> Self {
+    pub const fn between(from: Timestamp, to: Timestamp) -> Self {
         Self {
             from: Some(from),
             to: Some(to),
@@ -599,7 +600,7 @@ pub struct VersionHistoryWrite<'a> {
 /// drops it (JSON is stored as TEXT) and binds `recorded_at` explicitly,
 /// because the DDL's `DEFAULT CURRENT_TIMESTAMP` yields `YYYY-MM-DD HH:MM:SS`
 /// with no offset, which is not lexicographically comparable with the
-/// offset-bearing encoding diesel produces for a bound `DateTime<Utc>` filter
+/// offset-bearing encoding `SqlTimestamp` produces for a bound filter
 /// value. Binding it here makes stored and filter values share one encoding so
 /// the `recorded_at >= / <=` TEXT comparisons in `version_history()` stay
 /// monotonic.
@@ -661,7 +662,7 @@ pub async fn append_version_history(
     {
         use diesel::sql_types::TimestamptzSqlite;
 
-        let recorded_at = crate::time::ambient_now();
+        let recorded_at = crate::db::SqlTimestamp(crate::time::ambient_now());
 
         diesel::sql_query(SQLITE_INSERT_SQL)
             .bind::<Text, _>(write.table_name)
@@ -779,7 +780,7 @@ pub async fn append_version_history_many(
             let mut query = diesel::sql_query(sql).into_boxed();
             for row in chunk {
                 // The same bind as the single-row path: see `append_version_history`.
-                let recorded_at = crate::time::ambient_now();
+                let recorded_at = crate::db::SqlTimestamp(crate::time::ambient_now());
                 query = query
                     .bind::<Text, _>(table_name)
                     .bind::<Nullable<Text>, _>(row.tenant_id)
@@ -843,7 +844,7 @@ mod tests {
         );
 
         // SQLite stores JSON as TEXT, so no cast. Its `DEFAULT CURRENT_TIMESTAMP` does not compare
-        // lexicographically with diesel's `DateTime<Utc>` encoding, so `recorded_at` is bound.
+        // lexicographically with `SqlTimestamp`'s encoding, so `recorded_at` is bound.
         assert!(
             !SQLITE_INSERT_SQL.contains("::jsonb"),
             "the SQLite write must drop the jsonb cast: {SQLITE_INSERT_SQL}"
@@ -964,7 +965,7 @@ mod tests {
                 Some(serde_json::json!("old")),
                 Some(serde_json::json!("new")),
             )],
-            recorded_at: DateTime::from_timestamp(0, 0).unwrap(),
+            recorded_at: Timestamp::from_second(0).unwrap(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: VersionEntry = serde_json::from_str(&json).unwrap();
@@ -981,7 +982,7 @@ mod tests {
             actor: VersionEntry::SYSTEM_ACTOR.to_owned(),
             request_id: None,
             changes: vec![],
-            recorded_at: Utc::now(),
+            recorded_at: Timestamp::UNIX_EPOCH,
         };
         assert!(entry.request_id.is_none());
     }
@@ -1047,8 +1048,8 @@ mod tests {
 
     #[test]
     fn version_filter_between_sets_timestamps() {
-        let from = DateTime::from_timestamp(1_000_000, 0).unwrap();
-        let to = DateTime::from_timestamp(2_000_000, 0).unwrap();
+        let from = Timestamp::from_second(1_000_000).unwrap();
+        let to = Timestamp::from_second(2_000_000).unwrap();
         let f = VersionFilter::between(from, to);
         assert_eq!(f.from, Some(from));
         assert_eq!(f.to, Some(to));
@@ -1818,7 +1819,7 @@ mod tests {
             actor: "system".to_owned(),
             request_id: None,
             changes: vec![],
-            recorded_at: Utc::now(),
+            recorded_at: Timestamp::UNIX_EPOCH,
         };
         entry.actor = "reassigned-in-test".to_owned(); // allowed for test setup
         assert_eq!(entry.actor, "reassigned-in-test");

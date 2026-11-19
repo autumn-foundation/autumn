@@ -1647,7 +1647,7 @@ fn strip_option(ty: &syn::Type) -> (bool, &syn::Type) {
 
 /// Render a `syn::Type` to a string [`ColumnType::from_rust_type`] accepts. That
 /// function normalizes whitespace and is path-tolerant, so the spacing `quote`
-/// introduces (`Vec < u8 >`, `chrono :: NaiveDateTime`) is handled there.
+/// introduces (`Vec < u8 >`, `civil :: DateTime`) is handled there.
 fn type_to_string(ty: &syn::Type) -> String {
     quote::quote!(#ty).to_string()
 }
@@ -1909,7 +1909,7 @@ mod tests {
                 pub views: Option<i32>,
                 pub published: bool,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -1947,7 +1947,7 @@ mod tests {
                 pub id: i64,
                 pub name: String,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -1978,7 +1978,7 @@ mod tests {
                 pub id: i64,
                 pub name: String,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -1994,7 +1994,7 @@ mod tests {
                 #[id]
                 pub id: i64,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#,
         );
@@ -2007,7 +2007,7 @@ mod tests {
                 #[id]
                 pub id: i64,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#,
         );
@@ -2020,7 +2020,7 @@ mod tests {
                 #[id]
                 pub id: i64,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#,
         );
@@ -2098,7 +2098,7 @@ mod tests {
                 pub post_id: i64,
                 pub body: String,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2126,7 +2126,7 @@ mod tests {
                 #[references(table = "blog_posts")]
                 pub post_id: i64,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2146,9 +2146,9 @@ mod tests {
                 #[id]
                 pub id: i64,
                 #[default]
-                pub occurred_at: chrono::NaiveDateTime,
+                pub occurred_at: autumn_web::time::civil::DateTime,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2165,7 +2165,7 @@ mod tests {
             pub struct Event {
                 #[id]
                 pub id: i64,
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2185,7 +2185,7 @@ mod tests {
                 pub id: i64,
                 pub post_id: i64,
                 pub score: i32,
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2204,9 +2204,9 @@ mod tests {
                 pub id: i64,
                 pub title: String,
                 #[default]
-                pub deleted_at: Option<chrono::NaiveDateTime>,
+                pub deleted_at: Option<autumn_web::time::civil::DateTime>,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2228,7 +2228,7 @@ mod tests {
                 pub id: uuid::Uuid,
                 pub token: String,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2277,7 +2277,7 @@ mod tests {
                 pub id: i64,
                 pub external_ref: uuid::Uuid,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2297,7 +2297,7 @@ mod tests {
                 pub id: i64,
                 pub title: String,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2317,7 +2317,7 @@ mod tests {
                 #[indexed]
                 pub slug: String,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2341,7 +2341,7 @@ mod tests {
                 #[indexed]
                 pub email: String,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2375,13 +2375,16 @@ mod tests {
                 pub e: f32,
                 pub f: f64,
                 pub g: uuid::Uuid,
-                pub h: chrono::NaiveDateTime,
-                pub i: chrono::DateTime<chrono::Utc>,
+                pub h: autumn_web::time::civil::DateTime,
+                pub i: autumn_web::time::Timestamp,
+                // A schema written before the move to jiff keeps parsing.
+                pub h_legacy: chrono::NaiveDateTime,
+                pub i_legacy: chrono::DateTime<chrono::Utc>,
                 pub j: Vec<u8>,
                 pub k: autumn_web::storage::Blob,
                 pub l: rust_decimal::Decimal,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2394,6 +2397,8 @@ mod tests {
         assert_eq!(col(&table, "g").ty, ColumnType::Uuid);
         assert_eq!(col(&table, "h").ty, ColumnType::Timestamp);
         assert_eq!(col(&table, "i").ty, ColumnType::TimestampTz);
+        assert_eq!(col(&table, "h_legacy").ty, ColumnType::Timestamp);
+        assert_eq!(col(&table, "i_legacy").ty, ColumnType::TimestampTz);
         assert_eq!(col(&table, "j").ty, ColumnType::Bytes);
         assert_eq!(col(&table, "k").ty, ColumnType::Attachment);
         assert_eq!(
@@ -2514,7 +2519,7 @@ mod tests {
                 pub title: String,
                 pub status: PostStatus,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let parsed = parse_model_source(src, Backend::Postgres).expect("parse");
@@ -2581,7 +2586,7 @@ mod tests {
                 pub legacy_key: i64,
                 pub name: String,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2602,7 +2607,7 @@ mod tests {
                 #[id]
                 pub id: i64,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let parsed = parse_model_source(src, Backend::Postgres).expect("parse");
@@ -2657,7 +2662,7 @@ mod tests {
                 #[id]
                 pub id: i64,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let parsed = parse_model_source(src, Backend::Sqlite).expect("parse");
@@ -2673,7 +2678,7 @@ mod tests {
                 #[id]
                 pub id: i64,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2689,7 +2694,7 @@ mod tests {
                 #[id]
                 pub id: i64,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);
@@ -2707,7 +2712,7 @@ mod tests {
                 #[references(table = "users", future_key = "x")]
                 pub author_id: i64,
                 #[default]
-                pub created_at: chrono::NaiveDateTime,
+                pub created_at: autumn_web::time::civil::DateTime,
             }
         "#;
         let table = parse_one(src);

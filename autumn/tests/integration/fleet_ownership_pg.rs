@@ -47,7 +47,7 @@ fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
 }
 
 fn clock() -> TickingClock {
-    TickingClock::starting_at(chrono::DateTime::from_timestamp_millis(1_000_000).unwrap())
+    TickingClock::starting_at(autumn_web::time::Timestamp::from_millisecond(1_000_000).unwrap())
 }
 
 /// A store on its own pool: one host.

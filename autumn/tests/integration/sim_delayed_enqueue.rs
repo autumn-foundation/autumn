@@ -1,6 +1,6 @@
 //! Sim-testing, the **direct `Utc::now()` gap** (issue #1797, RFC Phase 2): a
 //! delayed enqueue must resolve its absolute due instant from the injected
-//! [`ClockSource`], not from a direct `chrono::Utc::now()` call.
+//! [`ClockSource`], not from a direct `Timestamp::now()` call.
 //!
 //! `job::enqueue_in(name, payload, delay)` converts a relative delay into an
 //! absolute due time (`delay_to_when`). That conversion read `Utc::now()`

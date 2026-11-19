@@ -314,7 +314,7 @@ mod soft_delete_tests {
         #[id]
         pub id: i64,
         pub title: String,
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<autumn_web::time::civil::DateTime>,
     }
 
     #[autumn_web::repository(SdArticle, soft_delete)]

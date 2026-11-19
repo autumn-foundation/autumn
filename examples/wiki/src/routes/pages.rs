@@ -79,7 +79,7 @@ pub fn pages_list_snippet(pages: &[Page]) -> Markup {
                         (status_badge(&p.status))
                     }
                     div class="text-sm text-gray-400" {
-                        (p.updated_at.format("%Y-%m-%d %H:%M"))
+                        (p.updated_at.strftime("%Y-%m-%d %H:%M"))
                     }
                 }
             }
@@ -255,7 +255,7 @@ pub async fn show(
                                         (summary)
                                         " — "
                                     }
-                                    (r.created_at.format("%Y-%m-%d %H:%M"))
+                                    (r.created_at.strftime("%Y-%m-%d %H:%M"))
                                 }
                             }
                         }
@@ -264,7 +264,7 @@ pub async fn show(
                     }
                 }
                 div class="mt-4 text-sm text-gray-400" {
-                    "Last updated: " (page.updated_at.format("%Y-%m-%d %H:%M"))
+                    "Last updated: " (page.updated_at.strftime("%Y-%m-%d %H:%M"))
                 }
             }
         },
@@ -705,7 +705,7 @@ pub async fn history(
                                     (status_badge(&r.status))
                                 }
                                 span class="text-sm text-gray-400" {
-                                    (r.created_at.format("%Y-%m-%d %H:%M:%S"))
+                                    (r.created_at.strftime("%Y-%m-%d %H:%M:%S"))
                                 }
                             }
                             @if let Some(ref summary) = r.summary {

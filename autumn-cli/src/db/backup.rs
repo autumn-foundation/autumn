@@ -613,7 +613,7 @@ fn backup_into(
 
     let manifest = Manifest {
         autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
-        created_at: now_utc().to_rfc3339(),
+        created_at: autumn_web::time::compat::rfc3339(now_utc()),
         profile: profile.to_owned(),
         format: format.pg_dump_format_flag().to_owned(),
         targets: manifest_targets,
@@ -1784,8 +1784,8 @@ fn backup_root(dir: Option<&Path>, profile: &str) -> PathBuf {
 }
 
 /// The run-directory name for a given instant: a sortable UTC timestamp.
-fn run_dir_name(now: &chrono::DateTime<chrono::Utc>) -> String {
-    now.format("%Y%m%dT%H%M%SZ").to_string()
+fn run_dir_name(now: &jiff::Timestamp) -> String {
+    now.strftime("%Y%m%dT%H%M%SZ").to_string()
 }
 
 /// Create a fresh, uniquely-named run directory under `root`, starting from
@@ -1946,8 +1946,8 @@ fn exit_desc(code: Option<i32>) -> String {
 }
 
 /// Current UTC instant (indirection kept tiny so tests can reason about naming).
-fn now_utc() -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now()
+fn now_utc() -> jiff::Timestamp {
+    jiff::Timestamp::now()
 }
 
 // ─── Offsite S3 upload / restore (issue #1619) ───────────────────────────────
@@ -2988,8 +2988,7 @@ mod tests {
 
     #[test]
     fn run_dir_name_is_sortable_utc() {
-        use chrono::TimeZone as _;
-        let ts = chrono::Utc.with_ymd_and_hms(2026, 7, 10, 4, 5, 6).unwrap();
+        let ts: jiff::Timestamp = "2026-07-10T04:05:06Z".parse().unwrap();
         assert_eq!(run_dir_name(&ts), "20260710T040506Z");
     }
 

@@ -454,7 +454,7 @@ async fn an_unreadable_marker_fails_the_load() {
 
 #[test]
 fn decide_matches_the_tombstone_rule() {
-    let at = |ms| DateTime::from_timestamp_millis(ms).unwrap();
+    let at = |ms| Timestamp::from_millisecond(ms).unwrap();
     // `included` in verification/fleet_lake.rs, before the plan.
     assert_eq!(
         decide(true, None, Some(at(5))),
@@ -862,7 +862,7 @@ async fn the_manifest_table_records_each_tenant() {
     for (row, tenant) in rows.rows.iter().zip(snapshot.tenants()) {
         assert_eq!(text(&row[0]), tenant.tenant.as_str());
         assert_eq!(text(&row[1]), tenant.generation);
-        assert_eq!(row[2].as_i64(), Some(tenant.effective.timestamp_millis()));
+        assert_eq!(row[2].as_i64(), Some(tenant.effective.as_millisecond()));
     }
 }
 

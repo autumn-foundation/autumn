@@ -357,20 +357,21 @@ pub fn form_error_summary<T>(form: &autumn_web::form::ChangesetForm<T>, fields: 
 }
 
 /// Timestamp display helper.
-pub fn time_ago(dt: &chrono::NaiveDateTime) -> String {
-    let now = chrono::Utc::now().naive_utc();
-    let diff = now - *dt;
+pub fn time_ago(dt: &autumn_web::time::civil::DateTime) -> String {
+    let now = autumn_web::time::ambient_civil_utc();
+    let diff = now.duration_since(*dt);
+    let days = diff.as_secs() / 86_400;
 
-    if diff.num_days() > 365 {
-        format!("{}y ago", diff.num_days() / 365)
-    } else if diff.num_days() > 30 {
-        format!("{}mo ago", diff.num_days() / 30)
-    } else if diff.num_days() > 0 {
-        format!("{}d ago", diff.num_days())
-    } else if diff.num_hours() > 0 {
-        format!("{}h ago", diff.num_hours())
-    } else if diff.num_minutes() > 0 {
-        format!("{}m ago", diff.num_minutes())
+    if days > 365 {
+        format!("{}y ago", days / 365)
+    } else if days > 30 {
+        format!("{}mo ago", days / 30)
+    } else if days > 0 {
+        format!("{days}d ago")
+    } else if diff.as_hours() > 0 {
+        format!("{}h ago", diff.as_hours())
+    } else if diff.as_mins() > 0 {
+        format!("{}m ago", diff.as_mins())
     } else {
         "just now".to_string()
     }

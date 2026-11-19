@@ -14,7 +14,8 @@ pub struct User {
     pub password_hash: String,
     pub karma: i64,
     pub role: String,
-    pub created_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    pub created_at: autumn_web::time::civil::DateTime,
     /// Blob handle pointing into the configured `BlobStore`. Lifecycle
     /// (presence, deletion) is the application's job; the bytes are the
     /// store's. Demonstrates the `[storage]` feature's `#[model]`
@@ -57,7 +58,7 @@ pub struct Subreddit {
     #[default]
     pub comment_count: i64,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // Votable (#1362): `#[votable(by = User, aggregate = sum)]` is the whole
@@ -114,9 +115,9 @@ pub struct Post {
     #[default]
     pub comment_count: i64,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub updated_at: chrono::NaiveDateTime,
+    pub updated_at: autumn_web::time::civil::DateTime,
 }
 
 // Many-to-many (#1324): `#[has_many(Post, through = post_tags)]` is the
@@ -178,5 +179,5 @@ pub struct Vote {
     pub comment_id: Option<i64>,
     pub value: i16,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }

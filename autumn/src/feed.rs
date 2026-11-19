@@ -10,15 +10,15 @@
 //! machinery so feed pollers get a `304 Not Modified` on the unchanged-content
 //! path instead of re-downloading an unchanged feed.
 //!
-//! The feed clamps each date to the nearest limit its format allows: years
-//! 0000–9999 for Atom (RFC 3339), and 1900–9999 for RSS (RFC 2822) and
-//! `Last-Modified`.
+//! The feed clamps each date to the nearest limit its format allows: year
+//! 0000 through [`Timestamp::MAX`] for Atom (RFC 3339), and year 1900 through
+//! [`Timestamp::MAX`] for RSS (RFC 2822) and `Last-Modified`.
 //!
 //! ```
 //! use autumn_web::feed::{Feed, FeedEntry};
-//! use chrono::{TimeZone, Utc};
+//! use autumn_web::time::Timestamp;
 //!
-//! let published = Utc.with_ymd_and_hms(2026, 5, 31, 12, 0, 0).unwrap();
+//! let published: Timestamp = "2026-05-31T12:00:00Z".parse().unwrap();
 //! let feed = Feed::atom(
 //!     "My Blog",
 //!     "https://example.com/",
@@ -42,8 +42,8 @@
 use std::fmt::Write as _;
 
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Datelike as _, Timelike as _, Utc};
 use http::header::CONTENT_TYPE;
+use jiff::Timestamp;
 
 use crate::etag::{ETag, fresh_when, hash_etag};
 
@@ -76,7 +76,7 @@ pub struct Feed {
     self_link: String,
     author: Option<String>,
     description: Option<String>,
-    updated: Option<DateTime<Utc>>,
+    updated: Option<Timestamp>,
     entries: Vec<FeedEntry>,
 }
 
@@ -88,8 +88,8 @@ pub struct FeedEntry {
     link: String,
     summary: Option<String>,
     content: Option<String>,
-    published: Option<DateTime<Utc>>,
-    updated: Option<DateTime<Utc>>,
+    published: Option<Timestamp>,
+    updated: Option<Timestamp>,
 }
 
 impl Feed {
@@ -168,7 +168,7 @@ impl Feed {
     /// Set the channel `updated` timestamp explicitly. When unset it is derived
     /// from the newest entry.
     #[must_use]
-    pub const fn updated(mut self, updated: DateTime<Utc>) -> Self {
+    pub const fn updated(mut self, updated: Timestamp) -> Self {
         self.updated = Some(updated);
         self
     }
@@ -197,9 +197,9 @@ impl Feed {
     /// set, otherwise the maximum `updated`/`published` across entries.
     ///
     /// The value is not clamped. [`Feed::conditional`] clamps the
-    /// `Last-Modified` header to years 1900–9999.
+    /// `Last-Modified` header to year 1900 or later.
     #[must_use]
-    pub fn last_updated(&self) -> Option<DateTime<Utc>> {
+    pub fn last_updated(&self) -> Option<Timestamp> {
         if let Some(updated) = self.updated {
             return Some(updated);
         }
@@ -387,14 +387,14 @@ impl FeedEntry {
 
     /// Set the publication timestamp.
     #[must_use]
-    pub const fn published(mut self, published: DateTime<Utc>) -> Self {
+    pub const fn published(mut self, published: Timestamp) -> Self {
         self.published = Some(published);
         self
     }
 
     /// Set the last-updated timestamp.
     #[must_use]
-    pub const fn updated(mut self, updated: DateTime<Utc>) -> Self {
+    pub const fn updated(mut self, updated: Timestamp) -> Self {
         self.updated = Some(updated);
         self
     }
@@ -411,66 +411,63 @@ impl IntoResponse for Feed {
 /// Deterministic fallback used for `<updated>` / `lastBuildDate` when a feed
 /// has no channel timestamp and no dated entries, so the rendered body (and the
 /// `ETag` derived from it) stays stable across renders.
-const fn fallback_timestamp() -> DateTime<Utc> {
-    DateTime::from_timestamp(0, 0).expect("unix epoch is a valid timestamp")
+const fn fallback_timestamp() -> Timestamp {
+    Timestamp::UNIX_EPOCH
 }
 
 /// 0000-01-01T00:00:00Z: the earliest RFC 3339 date.
-const RFC3339_MIN: DateTime<Utc> =
-    DateTime::from_timestamp(-62_167_219_200, 0).expect("year 0 is valid");
+const RFC3339_MIN: Timestamp = Timestamp::constant(-62_167_219_200, 0);
 /// 1900-01-01T00:00:00Z: RFC 5322 §3.3 and HTTP dates need year 1900 or later.
-const RFC2822_MIN: DateTime<Utc> =
-    DateTime::from_timestamp(-2_208_988_800, 0).expect("year 1900 is valid");
-/// 9999-12-31T23:59:59Z: the last date with a 4-digit year.
-const DATE_MAX: DateTime<Utc> =
-    DateTime::from_timestamp(253_402_300_799, 0).expect("year 9999 is valid");
+const RFC2822_MIN: Timestamp = Timestamp::constant(-2_208_988_800, 0);
+/// The latest date a feed writes: [`Timestamp::MAX`], which is in year 9999,
+/// so every format still has a 4-digit year.
+const DATE_MAX: Timestamp = Timestamp::MAX;
 
-/// Clamp an RSS or HTTP date to years 1900–9999. `to_rfc2822` panics outside
-/// years 0000–9999 (issue #3093).
-fn clamp_rfc2822(dt: DateTime<Utc>) -> DateTime<Utc> {
+/// Clamp an RSS or HTTP date to year 1900 through [`DATE_MAX`] (issue #3093).
+fn clamp_rfc2822(dt: Timestamp) -> Timestamp {
     dt.clamp(RFC2822_MIN, DATE_MAX)
 }
 
 /// Append `prefix`, `dt` as `YYYY-MM-DDTHH:MM:SSZ`, then `suffix`. The date is
-/// clamped to years 0000–9999, so every field has a fixed width and is written
-/// straight into `out` without going through `core::fmt`.
-fn push_rfc3339(out: &mut String, prefix: &str, dt: DateTime<Utc>, suffix: &str) {
-    // The naive UTC value skips the offset arithmetic every `DateTime` accessor repeats.
-    let dt = dt.clamp(RFC3339_MIN, DATE_MAX).naive_utc();
+/// clamped to years 0000–9999 and its fraction truncated, so every field has a
+/// fixed width and is written straight into `out` without going through
+/// `core::fmt`.
+fn push_rfc3339(out: &mut String, prefix: &str, dt: Timestamp, suffix: &str) {
+    let dt = jiff::tz::Offset::UTC.to_datetime(dt.clamp(RFC3339_MIN, DATE_MAX));
+    // The clamp keeps the year in `0..=9999`.
     let year = dt.year().unsigned_abs();
     let mut buf = *b"0000-00-00T00:00:00Z";
-    let two = |buf: &mut [u8; 20], at: usize, v: u32| {
+    let two = |buf: &mut [u8; 20], at: usize, v: u16| {
         // `v` is at most 99, so both digits fit a `u8`.
         buf[at] = b'0' + u8::try_from(v / 10).unwrap_or(0);
         buf[at + 1] = b'0' + u8::try_from(v % 10).unwrap_or(0);
     };
+    let field = |v: i8| u16::from(v.unsigned_abs());
     two(&mut buf, 0, year / 100);
     two(&mut buf, 2, year % 100);
-    two(&mut buf, 5, dt.month());
-    two(&mut buf, 8, dt.day());
-    two(&mut buf, 11, dt.hour());
-    two(&mut buf, 14, dt.minute());
-    // A leap second is `:59` with a nanosecond field of a full second or more.
-    two(
-        &mut buf,
-        17,
-        dt.second() + u32::from(dt.nanosecond() >= 1_000_000_000),
-    );
+    two(&mut buf, 5, field(dt.month()));
+    two(&mut buf, 8, field(dt.day()));
+    two(&mut buf, 11, field(dt.hour()));
+    two(&mut buf, 14, field(dt.minute()));
+    two(&mut buf, 17, field(dt.second()));
     out.push_str(prefix);
-    out.push_str(std::str::from_utf8(&buf).expect("ASCII digits"));
+    // The buffer holds only ASCII digits and punctuation.
+    out.push_str(std::str::from_utf8(&buf).unwrap_or_default());
     out.push_str(suffix);
 }
 
-/// Chrono's own formatting of the same value (test oracle).
+/// The compat formatter's output for the same value (test oracle).
 #[cfg(test)]
-fn rfc3339(dt: DateTime<Utc>) -> String {
-    use chrono::SecondsFormat;
-    dt.clamp(RFC3339_MIN, DATE_MAX)
-        .to_rfc3339_opts(SecondsFormat::Secs, true)
+fn rfc3339(dt: Timestamp) -> String {
+    crate::time::compat::rfc3339_opts(
+        dt.clamp(RFC3339_MIN, DATE_MAX),
+        crate::time::compat::Digits::Secs,
+        true,
+    )
 }
 
-fn rfc2822(dt: DateTime<Utc>) -> String {
-    clamp_rfc2822(dt).to_rfc2822()
+fn rfc2822(dt: Timestamp) -> String {
+    crate::time::compat::rfc2822(clamp_rfc2822(dt))
 }
 
 /// XML-escape a text value: `&`, `<`, `>`, `"`, `'`. Characters outside the
@@ -616,7 +613,6 @@ mod proptests {
     //! Property-based invariants for XML escaping and feed rendering. `escape`
     //! is private, so it is exercised in-crate here.
     use super::*;
-    use chrono::TimeZone as _;
     use proptest::prelude::*;
 
     /// Reverse the five entities `escape` emits. `&amp;` is decoded LAST so a
@@ -688,34 +684,50 @@ mod proptests {
     }
 
     #[test]
-    fn push_rfc3339_matches_chrono() {
+    fn push_rfc3339_matches_the_compat_formatter() {
         let mut secs = vec![
-            i64::MIN / 1000,
+            Timestamp::MIN.as_second(),
             -62_167_219_201,
             -62_167_219_200,
             -1,
             0,
             951_782_399,
-            253_402_300_799,
-            253_402_300_800,
+            Timestamp::MAX.as_second(),
         ];
         secs.extend((0..2000).map(|i| -70_000_000_000 + i * 160_000_000));
         for t in secs {
-            let Some(dt) = DateTime::from_timestamp(t, 0) else {
+            let Ok(dt) = Timestamp::from_second(t) else {
                 continue;
             };
             let mut out = String::new();
             push_rfc3339(&mut out, "<a>", dt, "</a>\n");
             assert_eq!(out, format!("<a>{}</a>\n", rfc3339(dt)), "t={t}");
         }
-        let leap = Utc
-            .with_ymd_and_hms(2016, 12, 31, 23, 59, 59)
-            .unwrap()
-            .with_nanosecond(1_500_000_000)
-            .unwrap();
+        // A fraction is truncated, never rounded up into the next second.
         let mut out = String::new();
-        push_rfc3339(&mut out, "", leap, "");
-        assert_eq!(out, rfc3339(leap));
+        push_rfc3339(
+            &mut out,
+            "",
+            "2016-12-31T23:59:59.999Z".parse().unwrap(),
+            "",
+        );
+        assert_eq!(out, "2016-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn push_rfc3339_clamps_the_ends_of_the_range() {
+        let mut out = String::new();
+        push_rfc3339(&mut out, "", Timestamp::MIN, "");
+        assert_eq!(out, "0000-01-01T00:00:00Z");
+        out.clear();
+        push_rfc3339(&mut out, "", Timestamp::MAX, "");
+        assert_eq!(out, "9999-12-30T22:00:00Z");
+    }
+
+    #[test]
+    fn rfc2822_clamps_the_ends_of_the_range() {
+        assert_eq!(rfc2822(Timestamp::MIN), "Mon, 1 Jan 1900 00:00:00 +0000");
+        assert_eq!(rfc2822(Timestamp::MAX), "Thu, 30 Dec 9999 22:00:00 +0000");
     }
 
     proptest! {
@@ -769,19 +781,19 @@ mod proptests {
             prop_assert_eq!(out.matches("</feed>").count(), expected_close);
         }
 
-        /// Issue #3093: any `DateTime<Utc>` renders without a panic, and each
-        /// date parses back as the input clamped to years 0000–9999 (Atom) or
-        /// 1900–9999 (RSS).
+        /// Issue #3093: any `Timestamp` renders without a panic, and each
+        /// date parses back as the input clamped to year 0000 (Atom) or 1900
+        /// (RSS) through `Timestamp::MAX` truncated to the second.
         #[test]
         fn render_clamps_any_date(
             // Half the cases stay in years 0000–9999, where the date must not change.
             secs in prop_oneof![
-                -62_167_219_200_i64..=253_402_300_799,
-                DateTime::<Utc>::MIN_UTC.timestamp()..=DateTime::<Utc>::MAX_UTC.timestamp(),
+                -62_167_219_200_i64..=Timestamp::MAX.as_second(),
+                Timestamp::MIN.as_second()..=Timestamp::MAX.as_second(),
             ],
             rss in any::<bool>(),
         ) {
-            let dt = DateTime::from_timestamp(secs, 0).unwrap();
+            let dt = Timestamp::from_second(secs).unwrap();
             let feed = if rss {
                 Feed::rss("t", "https://example.com/", "https://example.com/feed.xml")
             } else {
@@ -790,11 +802,9 @@ mod proptests {
             .entry(FeedEntry::new("i", "t", "https://example.com/1").published(dt));
 
             let out = feed.render();
-            let min_year = if rss { 1900 } else { 0 };
-            let expected = dt.clamp(
-                Utc.with_ymd_and_hms(min_year, 1, 1, 0, 0, 0).unwrap(),
-                Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59).unwrap(),
-            );
+            let min = if rss { RFC2822_MIN } else { RFC3339_MIN };
+            let expected =
+                Timestamp::from_second(dt.clamp(min, DATE_MAX).as_second()).unwrap();
             let (open, close) = if rss {
                 ("<pubDate>", "</pubDate>")
             } else {
@@ -803,11 +813,11 @@ mod proptests {
             let start = out.find(open).unwrap() + open.len();
             let text = &out[start..start + out[start..].find(close).unwrap()];
             let parsed = if rss {
-                DateTime::parse_from_rfc2822(text)
+                jiff::fmt::rfc2822::parse(text).map(|z| z.timestamp())
             } else {
-                DateTime::parse_from_rfc3339(text)
+                text.parse::<Timestamp>()
             };
-            prop_assert_eq!(parsed.map(|d| d.to_utc()), Ok(expected), "{}", text);
+            prop_assert_eq!(parsed.ok(), Some(expected), "{}", text);
         }
     }
 }

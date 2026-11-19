@@ -65,6 +65,17 @@ changes — see CLAUDE.md "CI test sharding" for the two cases that do matter
 (renaming a `compile_fail.rs` test function, and what branch protection should
 require).
 
+## Base branch
+
+**Every PR targets `trunk-dev`.** Only the release PR, `trunk-dev` → `trunk`,
+targets `trunk`. A feature branch merged into `trunk` lands there as one
+squash commit that git cannot match to the `trunk-dev` commits it copies, so
+the next release PR conflicts on every file both sides touched. The
+`Base branch` workflow (`scripts/check-base-branch.sh`) fails such a PR; it
+blocks the merge only while a ruleset on `trunk` requires that check. A real
+hotfix into `trunk` carries the `trunk-hotfix` label and is ported to
+`trunk-dev` too.
+
 ## Changelog notes
 
 A release note does **not** go into `CHANGELOG.md`. It goes into its own file:
@@ -525,10 +536,11 @@ Which idiom is correct depends on what the value *means*:
 - **Deadlines and durations → `checked_*` with an explicit fallback,** or the
   crate-private helpers in `autumn/src/time_math.rs` that wrap that pattern:
   `time_math::saturating_deadline` (`Instant + Duration`),
-  `time_math::saturating_dt_add` (`DateTime<Utc> + TimeDelta`) and
-  `time_math::saturating_time_delta_secs` (`TimeDelta::seconds`, which panics
-  above `i64::MAX / 1_000`). For a `TimeDelta` you build yourself, use
-  `TimeDelta::try_seconds(..)` and handle the `None`. Clamping to a far-future
+  `time_math::saturating_ts_add` (`Timestamp + SignedDuration`, which panics
+  on overflow) and `time_math::saturating_duration_secs` (a `u64` second count
+  as a `SignedDuration`, clamped to `SignedDuration::MAX`). For a sum you
+  build yourself, use `Timestamp::checked_add(..)` and handle the `Err`, for
+  example with `.unwrap_or(Timestamp::MAX)`. Clamping to a far-future
   horizon is the safe direction for an expiry: a pathological TTL yields an
   effectively non-expiring entry rather than a dead process.
 - **Parser offsets and lengths → `checked_*` and early-reject.** Clamping is for
@@ -616,7 +628,9 @@ The gate makes that a compile error instead of a code-review hope.
 
 | Instead of | Use | Reachable from |
 |---|---|---|
-| `chrono::Utc::now()` | `state.clock().now()` | anything holding an `AppState`; the `Clock` extractor in a handler |
+| `jiff::Timestamp::now()` | `state.clock().now()` | anything holding an `AppState`; the `Clock` extractor in a handler |
+| `jiff::ZonedDateTime::now()` | `state.clock().now().to_zoned_datetime(tz)` | same |
+| `jiff::tz::TimeZone::system()` | a named zone: the request's `TimeZone`, the app's configured default, or `TimeZone::UTC` | same |
 | `std::time::Instant::now()` (measuring elapsed) | `clock.monotonic()` for the start reading and `state.monotonic()` for the closing one, then `MonotonicInstant::saturating_duration_since`. The `Clock` extractor **snapshots** at request start, so calling `Clock::monotonic` twice returns the same value | same |
 | `std::time::Instant::now()` (a deadline whose counterparty is `tokio::time::sleep`) | `tokio::time::Instant::now()` | anywhere — tokio's paused runtime already virtualizes it |
 | `std::time::SystemTime::now()` | `time::clock_unix_secs(clock)` / `time::clock_unix_duration(clock)` | same |
@@ -648,14 +662,14 @@ stays real time and never follows a simulation.
 
 ### What the gate covers
 
-`clippy.toml`'s `disallowed-methods` array bans the four calls workspace-wide,
+`clippy.toml`'s `disallowed-methods` array bans these calls workspace-wide,
 and each gated module re-denies `clippy::disallowed_methods` for its production
 code path:
 
 ```rust
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -715,10 +729,10 @@ Exempt surfaces mirror the panic gate: `#[cfg(test)]` code (the
 
 `scripts/check-determinism-gate.sh` is the gate on the gate, and it deliberately
 **never greps for the banned calls** — clippy does the detection, because clippy
-resolves `use chrono::Utc as U; U::now()` and proc-macro expansions that a grep
+resolves `use jiff::Timestamp as T; T::now()` and proc-macro expansions that a grep
 cannot, and, decisively, clippy does *not* see string literals. A grep gate would
-flag the ~30 templated `Utc::now()` occurrences inside `autumn-cli`'s code
-generators and the `include_dir!`-embedded starter apps, which are generated-app
+flag the templated clock reads (such as `SystemTime::now()` or `Instant::now()`) inside
+`autumn-cli`'s code generators and the `include_dir!`-embedded starter apps, which are generated-app
 *text*, not compiled code; "fixing" those would corrupt the apps the CLI emits.
 
 The script guards the things clippy cannot report on itself:

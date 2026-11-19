@@ -169,7 +169,7 @@ pub struct CcRevision {
     pub id: i64,
     pub page_id: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(CcRevision, table = "cc_revisions", soft_delete)]

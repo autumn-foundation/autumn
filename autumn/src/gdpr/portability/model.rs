@@ -243,7 +243,7 @@ impl CapsuleManifest {
             format: DATA_CAPSULE_FORMAT.to_owned(),
             format_version: DATA_CAPSULE_FORMAT_VERSION,
             subject: subject.to_owned(),
-            generated_at: crate::time::ambient_now().to_rfc3339(),
+            generated_at: crate::time::compat::rfc3339(crate::time::ambient_now()),
             framework_version: env!("CARGO_PKG_VERSION").to_owned(),
             models: Vec::new(),
             blobs: Vec::new(),
