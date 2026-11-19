@@ -71,9 +71,7 @@ def lookup(fn, dataset):
     return literals(fn_body(fn).split("_ =>", 1)[1])[0]
 
 
-# The batch statement is built in `sweep_batch_sql` when the source has one,
-# else inline in `sweep_postgres`.
-sweep = fn_body("sweep_batch_sql" if "fn sweep_batch_sql(" in text else "sweep_postgres")
+sweep = fn_body("sweep_postgres")
 delete = next(s for s in literals(sweep) if s.startswith("DELETE FROM"))
 count = next(s for s in literals(fn_body("count_stale")) if s.startswith("SELECT COUNT"))
 

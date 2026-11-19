@@ -979,18 +979,13 @@ const fn sweep_order(dataset: RetentionDataset) -> Option<&'static str> {
     }
 }
 
-/// One batch of the Postgres sweep of `dataset`: delete up to `$2` rows of
-/// `table` that match `predicate` at the cutoff `$1`, read in [`sweep_order`].
-#[cfg(all(feature = "db", any(test, not(feature = "sqlite"))))]
-fn sweep_batch_sql(dataset: RetentionDataset, table: &str, predicate: &str) -> String {
-    let key = sweep_key_column(dataset);
-    let order = sweep_order(dataset)
+/// The ` ORDER BY …` the batch sub-select of `dataset` ends with, or `""`
+/// where [`sweep_order`] leaves the order to the planner.
+#[cfg(any(test, all(feature = "db", not(feature = "sqlite"))))]
+fn sweep_order_clause(dataset: RetentionDataset) -> String {
+    sweep_order(dataset)
         .map(|order| format!(" ORDER BY {order}"))
-        .unwrap_or_default();
-    format!(
-        "DELETE FROM {table} WHERE {predicate} AND {key} IN \
-         (SELECT {key} FROM {table} WHERE {predicate}{order} LIMIT $2)"
-    )
+        .unwrap_or_default()
 }
 
 /// The primary-key column each sweepable table batches by.
@@ -1108,7 +1103,8 @@ async fn sweep_postgres(
             format!("{dataset} is not a sweep-enforced dataset"),
         ));
     };
-    let batch_sql = sweep_batch_sql(dataset, table, predicate);
+    let key = sweep_key_column(dataset);
+    let order = sweep_order_clause(dataset);
     let mut conn = pool.get().await.map_err(|e| {
         sweep_failed(
             0,
@@ -1134,20 +1130,23 @@ async fn sweep_postgres(
     // stops qualifying after the sub-select (a dead letter replayed to `enqueued`) survives.
     let mut removed: u64 = 0;
     for _ in 0..SWEEP_MAX_BATCHES {
-        let affected = diesel::sql_query(batch_sql.as_str())
-            .bind::<diesel::sql_types::Timestamptz, _>(crate::db::SqlTimestamp(cutoff))
-            .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
-            .execute(&mut *conn)
-            .await
-            // `removed`, not 0: earlier batches autocommitted.
-            .map_err(|e| {
-                sweep_failed_at(
-                    cutoff,
-                    removed,
-                    Some(eligible),
-                    format!("retention sweep of {table} failed: {e}"),
-                )
-            })?;
+        let affected = diesel::sql_query(format!(
+            "DELETE FROM {table} WHERE {predicate} AND {key} IN \
+             (SELECT {key} FROM {table} WHERE {predicate}{order} LIMIT $2)"
+        ))
+        .bind::<diesel::sql_types::Timestamptz, _>(crate::db::SqlTimestamp(cutoff))
+        .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
+        .execute(&mut *conn)
+        .await
+        // `removed`, not 0: earlier batches autocommitted.
+        .map_err(|e| {
+            sweep_failed_at(
+                cutoff,
+                removed,
+                Some(eligible),
+                format!("retention sweep of {table} failed: {e}"),
+            )
+        })?;
         removed = removed.saturating_add(u64::try_from(affected).unwrap_or(u64::MAX));
         // Stop on a batch that deleted nothing, not a short one: rows that stopped qualifying
         // after the sub-select make a batch short while stale rows remain.
@@ -2494,29 +2493,25 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "db")]
     #[test]
     fn sweep_batches_read_in_index_order_except_assignments() {
-        let batch = |dataset| {
-            let (table, predicate) = stale_row_predicate(dataset).expect("a swept dataset");
-            sweep_batch_sql(dataset, table, predicate)
-        };
-        assert!(
-            batch(RetentionDataset::JobHistory)
-                .ends_with("ORDER BY status DESC, finished_at LIMIT $2)"),
-            "{}",
-            batch(RetentionDataset::JobHistory)
-        );
-        assert!(batch(RetentionDataset::CommitHooks).ends_with("ORDER BY finished_at LIMIT $2)"));
         assert_eq!(
-            batch(RetentionDataset::JobTracking),
-            "DELETE FROM autumn_job_tracking WHERE updated_at < $1 AND key IN \
-             (SELECT key FROM autumn_job_tracking WHERE updated_at < $1 ORDER BY updated_at LIMIT $2)"
+            sweep_order_clause(RetentionDataset::JobHistory),
+            " ORDER BY status DESC, finished_at"
+        );
+        assert_eq!(
+            sweep_order_clause(RetentionDataset::CommitHooks),
+            " ORDER BY finished_at"
+        );
+        assert_eq!(
+            sweep_order_clause(RetentionDataset::JobTracking),
+            " ORDER BY updated_at"
         );
         // The anti-join keeps live experiments' rows; index order re-fetches them every batch.
-        let assignments = batch(RetentionDataset::ExperimentAssignments);
-        assert!(!assignments.contains("ORDER BY"), "{assignments}");
-        assert!(assignments.ends_with(") LIMIT $2)"), "{assignments}");
+        assert_eq!(
+            sweep_order_clause(RetentionDataset::ExperimentAssignments),
+            ""
+        );
     }
 
     #[test]
