@@ -209,7 +209,7 @@ impl<K: Eq + Hash> HotKeys<K> {
         self.lock().slots.is_empty()
     }
 
-    /// Halve every count, and forget keys whose count was at most 1.
+    /// Halve every count.
     ///
     /// Call it on a timer to age old traffic out: after `n` calls, an event
     /// weighs `1 / 2^n` of a new one.
@@ -219,17 +219,17 @@ impl<K: Eq + Hash> HotKeys<K> {
     /// guaranteed count and the total round down. So a decay can neither
     /// hide a key from [`heavy_hitters`](Self::heavy_hitters) nor make one
     /// `certain` that is not.
+    ///
+    /// A decay never removes a key: a count of 1 stays 1, with nothing
+    /// guaranteed. Cold keys have the lowest counts, so they are the first
+    /// to be evicted when new keys arrive.
     pub fn decay(&self) {
         let mut table = self.lock();
-        table.slots.retain(|_, slot| {
-            if slot.count <= 1 {
-                return false;
-            }
+        for slot in table.slots.values_mut() {
             let guaranteed = (slot.count - slot.error) / 2;
             slot.count = slot.count.div_ceil(2);
             slot.error = slot.count - guaranteed;
-            true
-        });
+        }
         table.total /= 2;
         table.total_ceiling = table.total_ceiling.div_ceil(2);
     }
@@ -422,14 +422,29 @@ mod tests {
     }
 
     #[test]
-    fn decay_halves_counts_and_drops_cold_keys() {
+    fn decay_halves_counts_and_keeps_cold_keys_until_evicted() {
         let hot = HotKeys::new(4);
         hot.record_weighted("hot", 8);
         hot.record("cold");
         hot.decay();
         assert_eq!(hot.estimate(&"hot").unwrap().count, 4);
-        assert!(hot.estimate(&"cold").is_none());
+        // Half an event is left: the count rounds up, nothing is guaranteed.
+        let cold = hot.estimate(&"cold").unwrap();
+        assert_eq!((cold.count, cold.guaranteed()), (1, 0));
         assert_eq!(hot.total(), 4);
+    }
+
+    #[test]
+    fn decay_keeps_the_residual_weight_of_a_count_of_one() {
+        let hot = HotKeys::new(2);
+        hot.record("a");
+        hot.decay();
+        // a is still all of the traffic.
+        let hh = hot.heavy_hitters(500_000);
+        assert_eq!(hh.iter().map(|h| h.key).collect::<Vec<_>>(), vec!["a"]);
+        // Its true weight is now 1.5; the estimate must not be below it.
+        hot.record("a");
+        assert!(hot.estimate(&"a").unwrap().count >= 2);
     }
 
     #[test]
