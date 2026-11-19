@@ -267,15 +267,21 @@ timers together, so a test crosses weekends and holidays with no real time.
 ```rust,ignore
 use autumn_web::sim::Sim;
 use autumn_web::sim_test;
+use autumn_web::time::Timestamp;
 
 #[sim_test]
 async fn first_response_breaches_after_the_holiday(mut sim: Sim) {
     sim.build(TestApp::new().routes(routes![open_ticket]).plugin(sla_plugin()));
 
-    sim.advance_to(&friday_3pm).await;
+    // Opened Thursday 24 December. Friday is the holiday, then the weekend,
+    // so two business days end on Tuesday at 15:00.
+    let thursday_3pm: Timestamp = "2026-12-24T15:00:00Z".parse().unwrap();
+    let tuesday_3_01pm: Timestamp = "2026-12-29T15:01:00Z".parse().unwrap();
+
+    sim.advance_to(thursday_3pm).await;
     sim.client().post("/tickets/1").send().await.assert_ok();
 
-    sim.advance_to(&wednesday_3_01pm).await;
+    sim.advance_to(tuesday_3_01pm).await;
     sim.run_to_idle().await;
     // assert the breach handler ran one time
 }

@@ -892,9 +892,9 @@ Free functions rendering changeset-aware, accessible inputs:
   `false`); datetime columns attach `deserialize_datetime_local_utc[_option]`
   / `deserialize_datetime_local_local[_option]` /
   `deserialize_naive_datetime_local[_option]` (offsetless `datetime-local`
-  values decode; RFC 3339 still accepted). `Timestamp`, `civil::DateTime`
-  and `ZonedDateTime` columns render a date-time picker; `civil::Date` a date
-  picker.
+  values decode; RFC 3339 still accepted). `Timestamp` and
+  `civil::DateTime` columns, and `ZonedDateTime` form fields, render a
+  date-time picker; `civil::Date` a date picker; `civil::Time` a time picker.
 - `rich_text_area(&changeset, field, label)` (#1255) renders a Markdown
   `<textarea>` with a syntax toolbar, a hint line, and (via
   `rich_text_area_htmx`/`rich_text_area_htmx_with_token_field`) an htmx live

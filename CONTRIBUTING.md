@@ -731,7 +731,7 @@ Exempt surfaces mirror the panic gate: `#[cfg(test)]` code (the
 **never greps for the banned calls** — clippy does the detection, because clippy
 resolves `use jiff::Timestamp as T; T::now()` and proc-macro expansions that a grep
 cannot, and, decisively, clippy does *not* see string literals. A grep gate would
-flag the templated clock reads (such as `Timestamp::now()`) inside
+flag the templated clock reads (such as `SystemTime::now()` or `Instant::now()`) inside
 `autumn-cli`'s code generators and the `include_dir!`-embedded starter apps, which are generated-app
 *text*, not compiled code; "fixing" those would corrupt the apps the CLI emits.
 

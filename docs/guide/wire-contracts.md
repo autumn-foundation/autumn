@@ -295,7 +295,7 @@ serves with the types of its release. The rules:
   `Option<T>`.
 * **Wire types.** A field's JSON form must not change. This is also true
   when the Rust type stays the same, for example a `Timestamp` that gets
-  `#[serde(with = "jiff::fmt::serde::timestamp::second::required")]` and
+  `#[serde(with = "autumn_web::time::fmt::serde::timestamp::second::required")]` and
   `#[wire(type = "integer")]`. A nullable
   form reads the form it wraps. `any` is not compared. See
   [Wire types](#wire-types).
@@ -559,7 +559,7 @@ When the macro cannot see the JSON form, name it with `#[wire(type = …)]`:
 ```rust
 #[derive(serde::Serialize, serde::Deserialize, WireShape)]
 pub struct Item {
-    #[serde(with = "jiff::fmt::serde::timestamp::second::required")]
+    #[serde(with = "autumn_web::time::fmt::serde::timestamp::second::required")]
     #[wire(type = "integer", format = "unix-seconds")]
     pub created_at: Timestamp,
     #[wire(type = "string", nullable)]
