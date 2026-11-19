@@ -119,9 +119,9 @@ pub enum ColumnType {
     Float64,
     /// `uuid::Uuid` — PG `UUID` / `SQLite` `TEXT` (canonical string form).
     Uuid,
-    /// `chrono::NaiveDateTime` — PG `TIMESTAMP` / `SQLite` `TEXT` (ISO-8601).
+    /// `autumn_web::time::civil::DateTime` — PG `TIMESTAMP` / `SQLite` `TEXT` (ISO-8601).
     Timestamp,
-    /// `chrono::DateTime<chrono::Utc>` — PG `TIMESTAMPTZ` / `SQLite` `TEXT` (RFC 3339).
+    /// `autumn_web::time::Timestamp` — PG `TIMESTAMPTZ` / `SQLite` `TEXT` (RFC 3339).
     TimestampTz,
     /// `Vec<u8>` — PG `BYTEA` / `SQLite` `BLOB`.
     Bytes,
@@ -197,8 +197,8 @@ impl ColumnType {
             Self::Float32 => "f32",
             Self::Float64 => "f64",
             Self::Uuid => "uuid::Uuid",
-            Self::Timestamp => "chrono::NaiveDateTime",
-            Self::TimestampTz => "chrono::DateTime<chrono::Utc>",
+            Self::Timestamp => "autumn_web::time::civil::DateTime",
+            Self::TimestampTz => "autumn_web::time::Timestamp",
             Self::Bytes => "Vec<u8>",
             Self::Attachment => "autumn_web::storage::Blob",
             Self::Json => "serde_json::Value",
@@ -267,11 +267,11 @@ impl ColumnType {
                 Self::Bool => "Bool",
                 Self::Float32 => "Float4",
                 Self::Float64 => "Float8",
-                // `NaiveDateTime` -> core, ungated `Timestamp` (compiles).
+                // `civil::DateTime` -> core, ungated `Timestamp` (compiles).
                 Self::Timestamp => "Timestamp",
-                // `DateTime<Utc>` -> diesel's SQLite `TimestamptzSqlite` (issue
-                // #1924); its `sqlite`+`chrono` conversion resolves through the
-                // app's `autumn-web` sqlite feature.
+                // `Timestamp` -> diesel's SQLite `TimestamptzSqlite` (issue
+                // #1924); `#[model]` binds it through `autumn_web::db::SqlTimestamp`,
+                // which the app's `autumn-web` sqlite feature compiles.
                 Self::TimestampTz => "TimestamptzSqlite",
                 Self::Bytes => "Binary",
                 // Diesel's own `Json` sql-type — not `Text` (no built-in
@@ -349,7 +349,7 @@ impl ColumnType {
 
     /// Whether this type's rendered Rust model type has a working diesel
     /// `FromSql`/`ToSql` on diesel's `SQLite` backend in a generated app's feature
-    /// set (diesel `sqlite` + `chrono`, without `uuid`/`numeric`).
+    /// set (diesel `sqlite`, without `uuid`/`numeric`).
     ///
     /// Mirrors `dsl::FieldKind::sqlite_has_diesel_conversion`: `true` for every
     /// mapped type as of issue #1924 — [`Timestamp`](Self::Timestamp) via the
@@ -530,8 +530,17 @@ impl ColumnType {
     /// Inverse of [`ColumnType::rust_type`]: resolve a Rust type token (as it
     /// would appear in a `#[model]` struct) back to a [`ColumnType`]. Intended
     /// for the slice-2 `syn`-backed parser, so it is **tolerant of leading path
-    /// segments** — `chrono::NaiveDateTime`, `NaiveDateTime`, and
-    /// `some::path::NaiveDateTime` all resolve identically.
+    /// segments** — `autumn_web::time::Timestamp`, `jiff::Timestamp` and
+    /// `Timestamp` all resolve identically.
+    ///
+    /// Date-time spellings resolve as follows:
+    ///
+    /// - `Timestamp` → [`TimestampTz`](Self::TimestampTz).
+    /// - `DateTime` with no generic arguments (`civil::DateTime`) →
+    ///   [`Timestamp`](Self::Timestamp).
+    /// - The `chrono` spellings an existing schema may still hold:
+    ///   `NaiveDateTime` → [`Timestamp`](Self::Timestamp), and `DateTime<…>`
+    ///   with any zone argument → [`TimestampTz`](Self::TimestampTz).
     ///
     /// [`Decimal`](Self::Decimal) resolves to the money-shaped default `{12, 2}`
     /// (a Rust `rust_decimal::Decimal` carries no precision/scale to recover).
@@ -557,7 +566,9 @@ impl ColumnType {
     #[must_use]
     pub fn from_rust_type(rust: &str) -> Option<Self> {
         // Normalise away all whitespace so `DateTime < Utc >` and
-        // `chrono::DateTime<chrono::Utc>` are handled uniformly.
+        // `chrono::DateTime<chrono::Utc>` are handled uniformly. The generic
+        // form is the zoned `chrono` spelling; the generic-less `DateTime` is
+        // a civil date-time and is matched by its leaf below.
         let normalized: String = rust.chars().filter(|c| !c.is_whitespace()).collect();
 
         // Generic forms must be matched before the path-segment split, whose
@@ -615,7 +626,8 @@ impl ColumnType {
             // declarative lane skips the column and every snapshot, diff and
             // generated `CREATE TABLE` silently omits it.
             "Uuid" | "SqliteUuid" => Some(Self::Uuid),
-            "NaiveDateTime" => Some(Self::Timestamp),
+            "NaiveDateTime" | "DateTime" => Some(Self::Timestamp),
+            "Timestamp" => Some(Self::TimestampTz),
             "Vec<u8>" => Some(Self::Bytes),
             "Blob" => Some(Self::Attachment),
             // The declared precision and scale do not survive into the Rust
@@ -1325,8 +1337,8 @@ mod tests {
                 ColumnType::Float32 => "f32",
                 ColumnType::Float64 => "f64",
                 ColumnType::Uuid => "uuid::Uuid",
-                ColumnType::Timestamp => "chrono::NaiveDateTime",
-                ColumnType::TimestampTz => "chrono::DateTime<chrono::Utc>",
+                ColumnType::Timestamp => "autumn_web::time::civil::DateTime",
+                ColumnType::TimestampTz => "autumn_web::time::Timestamp",
                 ColumnType::Bytes => "Vec<u8>",
                 ColumnType::Attachment => "autumn_web::storage::Blob",
                 ColumnType::Json => "serde_json::Value",
@@ -1796,6 +1808,23 @@ mod tests {
             ColumnType::from_rust_type("uuid::Uuid"),
             Some(ColumnType::Uuid)
         );
+        assert_eq!(
+            ColumnType::from_rust_type("autumn_web::time::civil::DateTime"),
+            Some(ColumnType::Timestamp)
+        );
+        assert_eq!(
+            ColumnType::from_rust_type("civil::DateTime"),
+            Some(ColumnType::Timestamp)
+        );
+        assert_eq!(
+            ColumnType::from_rust_type("autumn_web::time::Timestamp"),
+            Some(ColumnType::TimestampTz)
+        );
+        assert_eq!(
+            ColumnType::from_rust_type("jiff::Timestamp"),
+            Some(ColumnType::TimestampTz)
+        );
+        // The `chrono` spellings an existing schema may hold still parse.
         assert_eq!(
             ColumnType::from_rust_type("chrono::NaiveDateTime"),
             Some(ColumnType::Timestamp)

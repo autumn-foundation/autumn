@@ -128,7 +128,7 @@ pub struct Author {
     pub email: String,
     pub name: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[autumn_web::model(managed)]
@@ -142,9 +142,9 @@ pub struct Post {
     pub published: bool,
     pub rating: rust_decimal::Decimal,
     pub metadata: autumn_web::storage::Blob,
-    pub launched_at: chrono::DateTime<chrono::Utc>,
+    pub launched_at: autumn_web::time::Timestamp,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[autumn_web::model(managed)]
@@ -155,7 +155,7 @@ pub struct Session {
     pub weight: f64,
     pub note: Option<String>,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 ";
 
@@ -526,7 +526,7 @@ pub struct Member {
     #[id]
     pub id: i64,
     pub email: String,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 ",
     );
@@ -1884,9 +1884,9 @@ async fn schema_pull_distinguishes_plain_bigint_pk_from_bigserial() {
     write_models(
         &project,
         "#[autumn_web::model(managed)]\npub struct SerialId {\n    #[id]\n    pub id: i64,\n    \
-         pub label: String,\n    #[default]\n    pub created_at: chrono::NaiveDateTime,\n}\n\n\
+         pub label: String,\n    #[default]\n    pub created_at: autumn_web::time::civil::DateTime,\n}\n\n\
          #[autumn_web::model(managed)]\npub struct PlainId {\n    #[id]\n    pub id: i64,\n    \
-         pub label: String,\n    #[default]\n    pub created_at: chrono::NaiveDateTime,\n}\n",
+         pub label: String,\n    #[default]\n    pub created_at: autumn_web::time::civil::DateTime,\n}\n",
     );
     let (diff_out, diff_err, code) = run_autumn(&project, &["schema", "diff"], &envs);
     let combined = format!("{diff_out}{diff_err}");

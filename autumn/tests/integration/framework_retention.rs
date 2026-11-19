@@ -561,7 +561,8 @@ async fn seed_archive(path: &std::path::Path, ages_in_days: &[i64]) {
             None,
             autumn_web::audit::AuditStatus::Success,
         );
-        event.timestamp = chrono::Utc::now() - chrono::Duration::days(*age);
+        event.timestamp = autumn_web::time::ambient_now()
+            - autumn_web::time::SignedDuration::from_hours(*age * 24);
         autumn_web::audit::AuditSink::write(&sink, event)
             .await
             .expect("seed archive line");
@@ -701,7 +702,7 @@ async fn a_partial_archive_purge_reports_both_the_removals_and_the_failure() {
 
         fn purge_before(
             &self,
-            _cutoff: chrono::DateTime<chrono::Utc>,
+            _cutoff: autumn_web::time::Timestamp,
             _dry_run: bool,
         ) -> std::pin::Pin<
             Box<

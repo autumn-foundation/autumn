@@ -54,7 +54,7 @@ pub struct PostView {
     pub status: String,
     pub author_id: i64,
     pub comment_count: i64,
-    pub published_at: Option<chrono::NaiveDateTime>,
+    pub published_at: Option<autumn_web::time::civil::DateTime>,
     pub url: String,
     pub password_protected: bool,
 }
@@ -434,7 +434,7 @@ pub struct CommentView {
     pub parent_id: Option<i64>,
     pub author: String,
     pub body: String,
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 /// `GET /api/v1/posts/{id}/comments`.

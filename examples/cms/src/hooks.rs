@@ -243,7 +243,7 @@ fn normalize_post(new: &mut NewPost, imported: bool) -> AutumnResult<()> {
     // sitemap. A caller that supplied one (an importer preserving the
     // original date) keeps it.
     if new.published_at.is_none() && new.status == "publish" {
-        new.published_at = Some(chrono::Utc::now().naive_utc());
+        new.published_at = Some(autumn_web::time::ambient_civil_utc());
     }
     // The model's declared cap, which a direct insert never runs — the same
     // check `validate_post_update` makes on the edit path.
@@ -279,7 +279,7 @@ impl MutationHooks for PostHooks {
     ) -> AutumnResult<()> {
         validate_post_update(&draft.before, &mut draft.after)?;
 
-        draft.after.updated_at = chrono::Utc::now().naive_utc();
+        draft.after.updated_at = autumn_web::time::ambient_civil_utc();
 
         Ok(())
     }
@@ -349,7 +349,7 @@ pub fn validate_post_update(before: &Post, after: &mut Post) -> AutumnResult<()>
     // post carries the author's chosen future date, so an existing value always
     // wins.
     if after.published_at.is_none() && matches!(after.status.as_str(), "publish" | "private") {
-        after.published_at = Some(chrono::Utc::now().naive_utc());
+        after.published_at = Some(autumn_web::time::ambient_civil_utc());
     }
 
     Ok(())
@@ -592,7 +592,7 @@ impl MutationHooks for UserHooks {
         draft.after.role = crate::capabilities::Role::parse(&draft.after.role)
             .slug()
             .to_owned();
-        draft.after.updated_at = chrono::Utc::now().naive_utc();
+        draft.after.updated_at = autumn_web::time::ambient_civil_utc();
         Ok(())
     }
 }

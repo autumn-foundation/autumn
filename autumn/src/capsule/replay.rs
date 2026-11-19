@@ -1393,7 +1393,7 @@ mod tests {
         Capsule {
             format_version: crate::capsule::schema::CAPSULE_FORMAT_VERSION,
             id: "fixture".to_owned(),
-            captured_at: chrono::Utc::now(),
+            captured_at: crate::time::ambient_now(),
             autumn_version: env!("CARGO_PKG_VERSION").to_owned(),
             app: crate::capsule::schema::AppInfo::default(),
             request: CapsuleRequest {

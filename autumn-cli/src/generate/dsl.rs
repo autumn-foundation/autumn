@@ -500,12 +500,18 @@ pub enum FieldKind {
     F64,
     /// `Uuid` — `UUID`.
     Uuid,
-    /// `NaiveDateTime` — `TIMESTAMP`.
+    /// `CivilDateTime` (alias `NaiveDateTime`) — a wall-clock date and time,
+    /// `autumn_web::time::civil::DateTime`, `TIMESTAMP`.
     NaiveDateTime,
-    /// `DateTime` — `TIMESTAMPTZ`.
+    /// `Timestamp` (alias `DateTime`) — an instant,
+    /// `autumn_web::time::Timestamp`, `TIMESTAMPTZ`.
     DateTime,
-    /// `time` (alias `NaiveTime`) — `chrono::NaiveTime`, `TIME` (issue
-    /// #3405). The form renders `<input type="time">`.
+    /// `Date` (aliases `date`, `NaiveDate`) — a calendar date,
+    /// `autumn_web::time::civil::Date`, `DATE`. The form renders
+    /// `<input type="date">`.
+    Date,
+    /// `time` (alias `NaiveTime`) — `autumn_web::time::civil::Time`, `TIME`
+    /// (issue #3405). The form renders `<input type="time">`.
     Time,
     /// `Vec<u8>` / `Bytea` — `BYTEA`.
     Bytea,
@@ -634,9 +640,10 @@ impl FieldKind {
             Self::F32 => "f32",
             Self::F64 => "f64",
             Self::Uuid => "uuid::Uuid",
-            Self::NaiveDateTime => "chrono::NaiveDateTime",
-            Self::DateTime => "chrono::DateTime<chrono::Utc>",
-            Self::Time => "chrono::NaiveTime",
+            Self::NaiveDateTime => "autumn_web::time::civil::DateTime",
+            Self::DateTime => "autumn_web::time::Timestamp",
+            Self::Date => "autumn_web::time::civil::Date",
+            Self::Time => "autumn_web::time::civil::Time",
             Self::Bytea => "Vec<u8>",
             Self::Attachment => "autumn_web::storage::Blob",
             Self::Json => "serde_json::Value",
@@ -679,6 +686,7 @@ impl FieldKind {
             Self::Uuid => "Uuid",
             Self::NaiveDateTime => "Timestamp",
             Self::DateTime => "Timestamptz",
+            Self::Date => "Date",
             Self::Time => "Time",
             Self::Bytea => "Bytea",
             Self::Attachment | Self::Json => "Jsonb",
@@ -699,6 +707,7 @@ impl FieldKind {
             Self::Uuid => "UUID",
             Self::NaiveDateTime => "TIMESTAMP",
             Self::DateTime => "TIMESTAMPTZ",
+            Self::Date => "DATE",
             Self::Time => "TIME",
             Self::Bytea => "BYTEA",
             Self::Attachment | Self::Json => "JSONB",
@@ -715,9 +724,9 @@ impl FieldKind {
     /// - `bool` -> `INTEGER` (`SQLite` has no boolean type; `0`/`1`).
     /// - `f32`/`f64` -> `REAL` (`SQLite` `REAL` is always 8-byte double).
     /// - `Uuid` -> `TEXT` (no native `uuid`; stored as its canonical string).
-    /// - `NaiveDateTime`/`DateTime` -> `TEXT` (ISO-8601 / RFC 3339 string;
-    ///   `SQLite` has no dedicated timestamp type and its date functions operate
-    ///   on ISO-8601 text).
+    /// - `NaiveDateTime`/`DateTime`/`Date`/`time` -> `TEXT` (ISO-8601 text;
+    ///   `SQLite` has no dedicated date or time type and its date functions
+    ///   operate on ISO-8601 text).
     /// - `Bytea` -> `BLOB`.
     /// - `Attachment` -> `TEXT` (the `Blob` metadata JSON, stored as text
     ///   rather than Postgres `JSONB`).
@@ -744,7 +753,7 @@ impl FieldKind {
             | Self::Bool => "INTEGER",
             Self::F32 | Self::F64 => "REAL",
             Self::Uuid => "TEXT",
-            Self::NaiveDateTime | Self::DateTime | Self::Time => "TEXT",
+            Self::NaiveDateTime | Self::DateTime | Self::Date | Self::Time => "TEXT",
             Self::Bytea => "BLOB",
             Self::Attachment | Self::Json => "TEXT",
             Self::Decimal { .. } => "TEXT",
@@ -767,22 +776,20 @@ impl FieldKind {
     /// The Postgres-only diesel sql-types (`Timestamptz`, `Jsonb`, `Uuid`,
     /// `Bytea`, `Numeric`) are not implemented for diesel's `SQLite` backend, so
     /// they are remapped to types `SQLite` does support: `Uuid`/`Attachment`/
-    /// `Decimal` -> `Text`, `NaiveDateTime` -> `Timestamp`, `DateTime<Utc>` ->
-    /// `TimestamptzSqlite`, `Bytea` -> `Binary`.
+    /// `Decimal` -> `Text`, `NaiveDateTime` -> `Timestamp`, `DateTime`
+    /// (`Timestamp`) -> `TimestamptzSqlite`, `Bytea` -> `Binary`.
     ///
     /// `NaiveDateTime` maps to the core `diesel::sql_types::Timestamp` — a
     /// backend-agnostic sql-type that is exported without diesel's `sqlite`
-    /// feature and for which diesel implements `FromSql`/`ToSql<Timestamp,
-    /// Sqlite>` targeting `NaiveDateTime`, so it compiles in a generated app.
+    /// feature. `Date` and `time` map to the core `Date` and `Time` sql-types
+    /// the same way.
     ///
-    /// `DateTime<Utc>` maps to diesel's `TimestamptzSqlite` sql-type (issue
-    /// #1924). diesel implements `FromSql`/`ToSql<TimestamptzSqlite, Sqlite>`
-    /// for `DateTime<Utc>` under its `sqlite` + `chrono` features. A generated
-    /// `SQLite` app depends on `autumn-web` with the `sqlite` feature, which
-    /// pulls in `diesel/sqlite` (and `diesel/chrono`) by cargo feature
-    /// unification, so both `TimestamptzSqlite` and the conversion resolve — the
-    /// value round-trips as an RFC 3339 UTC string (`SQLite` `TEXT` affinity),
-    /// which sorts and compares chronologically.
+    /// `DateTime` maps to diesel's `TimestamptzSqlite` sql-type (issue #1924).
+    /// `#[model]` binds every date and time field through
+    /// `autumn_web::db::SqlTimestamp` and its siblings, which implement
+    /// `FromSql`/`ToSql` for these sql-types under `autumn-web`'s `sqlite`
+    /// feature. The value round-trips as UTC text (`SQLite` `TEXT` affinity)
+    /// that sorts and compares chronologically.
     ///
     /// `Attachment` (`autumn_web::storage::Blob`) maps to `Text` and stores the
     /// `Blob` metadata as its JSON body; `autumn-web` provides
@@ -820,10 +827,11 @@ impl FieldKind {
             Self::Uuid => "Text",
             // `NaiveDateTime` -> core `Timestamp` (ungated, compiles).
             Self::NaiveDateTime => "Timestamp",
-            // `DateTime<Utc>` -> `TimestamptzSqlite` (diesel's sqlite+chrono
-            // conversion, available via the app's `autumn-web` sqlite feature).
+            // `DateTime` -> `TimestamptzSqlite` (converted by
+            // `autumn_web::db::SqlTimestamp` under the `sqlite` feature).
             Self::DateTime => "TimestamptzSqlite",
-            // `NaiveTime` -> core `Time` (diesel's sqlite+chrono conversion).
+            // `Date` and `time` -> the core `Date` and `Time` sql-types.
+            Self::Date => "Date",
             Self::Time => "Time",
             Self::Bytea => "Binary",
             Self::Attachment => "Text",
@@ -837,14 +845,13 @@ impl FieldKind {
 
     /// Whether this kind's rendered Rust model type has a working diesel
     /// `FromSql`/`ToSql` on diesel's `SQLite` backend in a generated app's
-    /// feature set (diesel `sqlite` + `chrono`, without `uuid`/`numeric`) —
-    /// determined empirically (issue #1614 AC #4; conversions wired in #1924).
+    /// feature set (diesel `sqlite`, without `uuid`/`numeric`) — determined
+    /// empirically (issue #1614 AC #4; conversions wired in #1924).
     ///
     /// Supported on `SQLite` (issue #1924):
-    /// - `NaiveDateTime` via the core, ungated `Timestamp` sql-type.
-    /// - `DateTime<Utc>` via diesel's `TimestamptzSqlite` sql-type — its
-    ///   `sqlite`+`chrono` conversion resolves through the app's `autumn-web`
-    ///   `sqlite` feature (RFC 3339 UTC text, chronologically sortable).
+    /// - `NaiveDateTime`, `DateTime`, `Date` and `time` via the
+    ///   `autumn_web::db::Sql*` time wrappers `#[model]` binds them through
+    ///   (UTC text, chronologically sortable).
     /// - `Attachment` (`autumn_web::storage::Blob`) — `autumn-web` provides
     ///   `FromSql`/`ToSql<Text, Sqlite>` + `AsExpression`/`FromSqlRow<Text>` for
     ///   `Blob` under its `sqlite` feature (`Blob` is a local type, so these
@@ -883,6 +890,7 @@ impl FieldKind {
             | Self::Uuid
             | Self::NaiveDateTime
             | Self::DateTime
+            | Self::Date
             | Self::Time
             | Self::Bytea
             | Self::Attachment
@@ -924,6 +932,7 @@ impl FieldKind {
             Self::Uuid => "Uuid",
             Self::NaiveDateTime => "NaiveDateTime",
             Self::DateTime => "DateTime",
+            Self::Date => "Date",
             Self::Time => "time",
             Self::Bytea => "Bytea",
             Self::Attachment => "Attachment",
@@ -944,6 +953,20 @@ impl FieldKind {
     #[must_use]
     pub const fn is_attachment(self) -> bool {
         matches!(self, Self::Attachment)
+    }
+
+    /// Returns `true` for the date and time kinds (`NaiveDateTime`,
+    /// `DateTime`, `Date`, `time`).
+    ///
+    /// `#[model]` binds these through `#[diesel(serialize_as = …)]` with the
+    /// `autumn_web::db::Sql*` time wrappers, so raw-diesel code generated for
+    /// them must insert the owned record and wrap each bound value.
+    #[must_use]
+    pub const fn is_temporal(self) -> bool {
+        matches!(
+            self,
+            Self::NaiveDateTime | Self::DateTime | Self::Date | Self::Time
+        )
     }
 
     /// Returns `true` for a foreign-key `references` field.
@@ -1159,7 +1182,8 @@ impl IdType {
 
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
-    Uuid, NaiveDateTime, DateTime, time, Vec<u8>, Bytea, Attachment, json (alias jsonb), \
+    Uuid, NaiveDateTime (alias CivilDateTime), DateTime (alias Timestamp), Date, time, \
+    Vec<u8>, Bytea, Attachment, json (alias jsonb), \
     references, phone (alias tel), color, money, enum{a,b,…}, decimal{precision,scale}, \
     slug{from:col}, position (optionally \
     position{scope:col}), commentable, Option<…>, :unique, String{encrypted}, \
@@ -1171,7 +1195,8 @@ pub const SUPPORTED_TYPES: &str = "String, Text, richtext, i32, i64, bool, f32, 
 /// complement is every kind, so this mirrors [`SUPPORTED_TYPES`]; it is still
 /// the message a future unconvertible kind would be reported against.
 pub const SQLITE_SUPPORTED_KINDS: &str = "String, Text, richtext, i32, i64, bool, f32, f64, \
-    Uuid, NaiveDateTime, DateTime, time, Vec<u8>, Bytea, Attachment, json (alias jsonb), \
+    Uuid, NaiveDateTime (alias CivilDateTime), DateTime (alias Timestamp), Date, time, \
+    Vec<u8>, Bytea, Attachment, json (alias jsonb), \
     references, phone (alias tel), color, money, enum{a,b,…}, decimal{precision,scale}, \
     slug{from:col}, position (optionally \
     position{scope:col}), commentable, Option<…>, :unique";
@@ -1188,7 +1213,7 @@ pub const SQLITE_DECIMAL_RUST_TYPE: &str = "autumn_web::db::sqlite_types::Sqlite
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
 pub const SQL_SUPPORTED_TYPES: &str = "text, varchar, bpchar (-> String), int4 (-> i32), \
-    int8 (-> i64), bool, float4 (-> f32), float8 (-> f64), uuid, timestamp, timestamptz, time, bytea";
+    int8 (-> i64), bool, float4 (-> f32), float8 (-> f64), uuid, timestamp, timestamptz, date, time, bytea";
 
 /// Inverse of [`FieldKind::sql_type`] / [`FieldKind::schema_type`]: map a
 /// Postgres `udt_name` (the concrete catalog type identifier such as `int4`,
@@ -1222,6 +1247,7 @@ pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
         "uuid" => Some(FieldKind::Uuid),
         "timestamp" => Some(FieldKind::NaiveDateTime),
         "timestamptz" => Some(FieldKind::DateTime),
+        "date" => Some(FieldKind::Date),
         "time" => Some(FieldKind::Time),
         "bytea" => Some(FieldKind::Bytea),
         // `jsonb` stays unsupported: `Attachment` (`Blob`) and `json` (`serde_json::Value`) both
@@ -2589,9 +2615,15 @@ fn atomic_type(ty: &str) -> Option<FieldKind> {
         "f32" => Some(FieldKind::F32),
         "f64" => Some(FieldKind::F64),
         "Uuid" => Some(FieldKind::Uuid),
-        "NaiveDateTime" => Some(FieldKind::NaiveDateTime),
-        "DateTime" => Some(FieldKind::DateTime),
-        // time (issue #3405): a time of day, `chrono::NaiveTime`.
+        // A wall-clock date and time, `autumn_web::time::civil::DateTime`. The
+        // `NaiveDateTime` spelling is kept so existing commands still work.
+        "NaiveDateTime" | "CivilDateTime" => Some(FieldKind::NaiveDateTime),
+        // An instant, `autumn_web::time::Timestamp`. `DateTime` is kept for
+        // the same reason.
+        "DateTime" | "Timestamp" => Some(FieldKind::DateTime),
+        // A calendar date, `autumn_web::time::civil::Date`.
+        "date" | "Date" | "NaiveDate" => Some(FieldKind::Date),
+        // time (issue #3405): a time of day, `autumn_web::time::civil::Time`.
         "time" | "Time" | "NaiveTime" => Some(FieldKind::Time),
         "Bytea" => Some(FieldKind::Bytea),
         // A file-attachment blob stored as JSONB.
@@ -2822,7 +2854,7 @@ mod tests {
     #[test]
     fn parse_datetime() {
         let f = parse_field("created_at:DateTime").unwrap();
-        assert_eq!(f.rust_type(), "chrono::DateTime<chrono::Utc>");
+        assert_eq!(f.rust_type(), "autumn_web::time::Timestamp");
         assert_eq!(f.schema_type(), "Timestamptz");
     }
 
@@ -2972,7 +3004,7 @@ mod tests {
                 format!("Option<{SQLITE_UUID_RUST_TYPE}>"),
             ),
             ("title:String", "String".to_owned()),
-            ("at:DateTime", "chrono::DateTime<chrono::Utc>".to_owned()),
+            ("at:DateTime", "autumn_web::time::Timestamp".to_owned()),
             (
                 "cover:Attachment",
                 "Option<autumn_web::storage::Blob>".to_owned(),
@@ -3050,7 +3082,7 @@ mod tests {
     #[test]
     fn parse_naive_datetime() {
         let f = parse_field("created_at:NaiveDateTime").unwrap();
-        assert_eq!(f.rust_type(), "chrono::NaiveDateTime");
+        assert_eq!(f.rust_type(), "autumn_web::time::civil::DateTime");
         assert_eq!(f.schema_type(), "Timestamp");
     }
 
@@ -3587,7 +3619,7 @@ mod tests {
             assert!(!f.nullable, "{token}");
         }
         let f = parse_field("opens:time").unwrap();
-        assert_eq!(f.rust_type(), "chrono::NaiveTime");
+        assert_eq!(f.rust_type(), "autumn_web::time::civil::Time");
         assert_eq!(f.schema_type(), "Time");
         assert_eq!(f.sql_column_type_for(DatabaseBackend::Postgres), "TIME");
         assert_eq!(f.sql_column_type_for(DatabaseBackend::Sqlite), "TEXT");
@@ -3598,8 +3630,40 @@ mod tests {
         let f = parse_field("closes:Option<time>").unwrap();
         assert_eq!(f.kind, FieldKind::Time);
         assert!(f.nullable);
-        assert_eq!(f.rust_type(), "Option<chrono::NaiveTime>");
+        assert_eq!(f.rust_type(), "Option<autumn_web::time::civil::Time>");
         assert_eq!(sql_type_to_field_kind("time"), Some(FieldKind::Time));
+    }
+
+    #[test]
+    fn date_kind_is_a_civil_date_column_on_both_backends() {
+        for token in ["due:date", "due:Date", "due:NaiveDate"] {
+            let f = parse_field(token).unwrap();
+            assert_eq!(f.kind, FieldKind::Date, "{token}");
+            assert!(!f.nullable, "{token}");
+        }
+        let f = parse_field("due:Date").unwrap();
+        assert_eq!(f.rust_type(), "autumn_web::time::civil::Date");
+        assert_eq!(f.schema_type(), "Date");
+        assert_eq!(f.sql_column_type_for(DatabaseBackend::Postgres), "DATE");
+        assert_eq!(f.sql_column_type_for(DatabaseBackend::Sqlite), "TEXT");
+        assert_eq!(f.schema_type_for(DatabaseBackend::Sqlite), "Date");
+        assert!(FieldKind::Date.sqlite_has_diesel_conversion());
+        assert_eq!(FieldKind::Date.dsl_token(), "Date");
+
+        let f = parse_field("due:Option<Date>").unwrap();
+        assert!(f.nullable);
+        assert_eq!(f.rust_type(), "Option<autumn_web::time::civil::Date>");
+        assert_eq!(sql_type_to_field_kind("date"), Some(FieldKind::Date));
+    }
+
+    #[test]
+    fn jiff_spellings_alias_the_date_time_kinds() {
+        let f = parse_field("at:Timestamp").unwrap();
+        assert_eq!(f.kind, FieldKind::DateTime);
+        assert_eq!(f.rust_type(), "autumn_web::time::Timestamp");
+        let f = parse_field("at:CivilDateTime").unwrap();
+        assert_eq!(f.kind, FieldKind::NaiveDateTime);
+        assert_eq!(f.rust_type(), "autumn_web::time::civil::DateTime");
     }
 
     #[test]
@@ -3704,14 +3768,20 @@ mod tests {
             (
                 "timestamp",
                 FieldKind::NaiveDateTime,
-                "chrono::NaiveDateTime",
+                "autumn_web::time::civil::DateTime",
                 "Timestamp",
             ),
             (
                 "timestamptz",
                 FieldKind::DateTime,
-                "chrono::DateTime<chrono::Utc>",
+                "autumn_web::time::Timestamp",
                 "Timestamptz",
+            ),
+            (
+                "date",
+                FieldKind::Date,
+                "autumn_web::time::civil::Date",
+                "Date",
             ),
             ("bytea", FieldKind::Bytea, "Vec<u8>", "Bytea"),
         ];
@@ -3770,6 +3840,7 @@ mod tests {
             (FieldKind::Uuid, "uuid"),
             (FieldKind::NaiveDateTime, "timestamp"),
             (FieldKind::DateTime, "timestamptz"),
+            (FieldKind::Date, "date"),
             (FieldKind::Bytea, "bytea"),
         ] {
             let back = sql_type_to_field_kind(udt).unwrap();

@@ -65,7 +65,7 @@ use autumn_web::reporting::{ErrorEvent, ErrorReporter, ReportFuture};
 use autumn_web::sim::{Chaos, FaultEffect, FaultOutcome, FaultPlan, Sim};
 use autumn_web::sim_test;
 use autumn_web::test::TestApp;
-use chrono::{DateTime, TimeZone, Utc};
+use autumn_web::time::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 /// The seed every authored scenario in this module is built from. Explicit
@@ -81,10 +81,8 @@ const RETRY_WINDOW: Duration = Duration::from_millis(100);
 /// The fixed simulation epoch every `Sim` clock starts at (`autumn/src/sim.rs`,
 /// `SIM_EPOCH_UNIX_SECS`). `FiredFault::at` is read from that injected clock,
 /// so a fault fired before any [`Sim::advance`] is stamped exactly here.
-fn sim_epoch() -> DateTime<Utc> {
-    Utc.timestamp_opt(1_577_836_800, 0)
-        .single()
-        .expect("the sim epoch is a valid UTC instant")
+fn sim_epoch() -> Timestamp {
+    Timestamp::from_second(1_577_836_800).expect("the sim epoch is a valid UTC instant")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -644,7 +642,7 @@ async fn run_window_scenario(sim: &mut Sim, advance_by: Duration) -> FaultOutcom
 /// The same plan (`fail_job_execution(2).only_between(5s, 10s)`) is run twice.
 /// Advancing 6s before the second execution puts it inside the window: the
 /// fault fires, stamped at the sim epoch + 6s with `elapsed_ms == 6000` — the
-/// value a leaked `Utc::now()` / `Instant::now()` could not produce. Advancing
+/// value a leaked `Timestamp::now()` / `Instant::now()` could not produce. Advancing
 /// 11s instead puts the very same execution past the window: the ordinal is
 /// still consumed, but the fault is suppressed rather than fired.
 #[sim_test]
@@ -665,7 +663,7 @@ async fn fault_timing_is_gated_by_the_injected_clock(mut sim: Sim) {
     assert_eq!(fired.ordinal, 2);
     assert_eq!(
         fired.at,
-        sim_epoch() + chrono::Duration::seconds(6),
+        sim_epoch() + SignedDuration::from_secs(6),
         "the wall-clock stamp comes from the injected virtual clock"
     );
     assert_eq!(
@@ -814,7 +812,7 @@ async fn replay_once(seed: u64) -> String {
 /// because one `#[sim_test]` body only ever owns a single [`Sim`] (the pattern
 /// `sim_retry_storm.rs` uses for its two-run replay check). Anything that leaked
 /// real time, real entropy, or cross-run state into the scenario — a
-/// `Utc::now()` stamp on a `FiredFault`, OS-seeded retry jitter reordering the
+/// `Timestamp::now()` stamp on a `FiredFault`, OS-seeded retry jitter reordering the
 /// executions, a ledger shared between builds — shows up here as one differing
 /// record out of a hundred.
 ///

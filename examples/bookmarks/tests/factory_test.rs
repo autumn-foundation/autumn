@@ -40,7 +40,7 @@ pub struct Bookmark {
     #[default]
     pub alive: bool,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // ── In-memory build tests (no Docker needed) ──────────────────────────────────
@@ -188,7 +188,8 @@ async fn bookmark_factory_route_roundtrip() {
         title: String,
         tag: String,
         alive: bool,
-        created_at: chrono::NaiveDateTime,
+        #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+        created_at: autumn_web::time::civil::DateTime,
     }
 
     #[get("/bookmarks")]

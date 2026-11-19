@@ -10,7 +10,7 @@ use autumn_web::obligation;
 )]
 pub struct Ticket {
     pub id: i64,
-    pub opened_at: chrono::DateTime<chrono::Utc>,
+    pub opened_at: autumn_web::time::Timestamp,
 }
 
 fn main() {}

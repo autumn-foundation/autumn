@@ -377,7 +377,7 @@ pub use crate::state::AppState;
 // ── Time ─────────────────────────────────────────────────────────
 /// Deterministic, injectable wall-clock extractor.
 ///
-/// Use in handlers instead of `chrono::Utc::now()` to make time-sensitive
+/// Use in handlers instead of `Timestamp::now()` to make time-sensitive
 /// logic testable without sleeping. Override via `TestApp::with_clock`.
 pub use crate::time::{Clock, MonotonicInstant};
 
@@ -409,7 +409,7 @@ pub use crate::i18n::t;
 /// [`number_to_currency`]. See [`crate::format`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::format::CurrencyOptions;
-/// Format a `chrono` UTC timestamp with a strftime-style absolute format string.
+/// Format a UTC timestamp with a strftime-style absolute format string.
 #[cfg(feature = "maud")]
 pub use crate::format::format_datetime;
 /// Format a [`rust_decimal::Decimal`] as currency (`$1,234.50`) using sane defaults.

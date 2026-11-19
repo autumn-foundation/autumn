@@ -216,7 +216,7 @@ autumn_web::paths![list, by_tag, new_form, create];
 mod tests {
     use super::bookmark_card;
     use crate::models::Bookmark;
-    use chrono::{DateTime, Utc};
+    use autumn_web::time::civil;
 
     #[test]
     fn bookmark_delete_flow_uses_delete_swap_contract() {
@@ -226,9 +226,7 @@ mod tests {
             title: "Example".to_owned(),
             tag: "general".to_owned(),
             alive: true,
-            created_at: DateTime::<Utc>::from_timestamp(0, 0)
-                .expect("unix epoch should exist")
-                .naive_utc(),
+            created_at: civil::date(1970, 1, 1).at(0, 0, 0, 0),
         };
         let markup = bookmark_card(&bookmark).into_string();
 

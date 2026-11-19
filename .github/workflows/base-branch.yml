@@ -1,0 +1,37 @@
+name: Base branch
+
+# Every PR targets `trunk-dev`; only the release PR, `trunk-dev` -> `trunk`,
+# targets `trunk`. A feature branch merged into `trunk` makes the next release
+# PR conflict on every file it touched. Logic and the reason live in
+# scripts/check-base-branch.sh (run `--self-test` locally).
+#
+# Runs on every PR, not only PRs into `trunk`, so that changing a PR's base
+# from `trunk` to `trunk-dev` re-runs the check and turns it green.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  base-branch:
+    name: Base branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts
+      - name: Check the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: bash scripts/check-base-branch.sh

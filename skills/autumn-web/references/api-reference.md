@@ -135,7 +135,7 @@ copy of the publish order.
 | `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
-| `#[derive(OpenApiSchema)]` | Field-accurate component schema for a plain `Query<T>` / `Json<T>` type, registered in the back-fill inventory so no `register_schema` call is needed. Named-field structs, and enums whose variants are all unit variants (a JSON string enum honoring `rename` / `rename_all` / `skip`). Generic types, tuple structs, data-carrying variants and non-default enum representations (`#[serde(tag/content/untagged)]`) are compile errors — write the impl by hand for those. `#[model]` types register themselves and need no derive (#802). Scalar fields (`Uuid`, `DateTime`, `NaiveDate`, `NaiveDateTime`, `Decimal`, `SqliteUuid`, `SqliteDecimal`) document as inline scalars, never `$ref`. `Decimal` is `string`/`decimal`, or `number` if serde writes a number (#2582) |
+| `#[derive(OpenApiSchema)]` | Field-accurate component schema for a plain `Query<T>` / `Json<T>` type, registered in the back-fill inventory so no `register_schema` call is needed. Named-field structs, and enums whose variants are all unit variants (a JSON string enum honoring `rename` / `rename_all` / `skip`). Generic types, tuple structs, data-carrying variants and non-default enum representations (`#[serde(tag/content/untagged)]`) are compile errors — write the impl by hand for those. `#[model]` types register themselves and need no derive (#802). Scalar fields (`Uuid`, `Timestamp`, `civil::Date`, `civil::DateTime`, `civil::Time`, `Decimal`, `SqliteUuid`, `SqliteDecimal`) document as inline scalars, never `$ref`. `Decimal` is `string`/`decimal`, or `number` if serde writes a number (#2582) |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
 | `#[cached]` | Memoize function results; `key(a, b)` narrows the cache key, `reads(Model, …)` declares the cache-coherence dependency set, `acknowledge_stale = "…"` opts out of the gate (#1716) |
 | `#[scheduled]`, `tasks![...]` | Recurring scheduled tasks |
@@ -503,7 +503,7 @@ async fn delete_comment(&self, parent_id: i64, comment_id: i64) -> AutumnResult<
 async fn recompute_comment_count(&self, parent_id: i64) -> AutumnResult<i64>;
 
 pub struct Comment { pub id: i64, pub parent_id: Option<i64>, pub author_id: i64,
-                     pub body: String, pub created_at: chrono::NaiveDateTime,
+                     pub body: String, pub created_at: autumn_web::time::civil::DateTime,
                      pub author_name: Option<String> }
 pub struct CommentNode { pub comment: Comment, pub depth: usize,
                          pub replies: Vec<CommentNode> }
@@ -764,7 +764,7 @@ Needs the `sla` feature. Deadlines in business time. The clock runs only in work
 only the injected `Clock`.
 
 - `BusinessCalendar::new()` / `::weekdays(hours)` + `.hours(Weekday, hours)` /
-  `.holiday(NaiveDate)` / `.annual_holiday(month, day)` / `.zone(Tz)` /
+  `.holiday(civil::Date)` / `.annual_holiday(month, day)` / `.zone(jiff::tz::TimeZone)` /
   `.business_day(Duration)`; reads: `working_time(from, to, tz)`,
   `deadline(from, budget, tz)`, `is_working`, `next_working_instant`,
   `day_length`, `is_holiday`, `home_zone`.
@@ -849,7 +849,7 @@ Free functions rendering changeset-aware, accessible inputs:
   `File` field ⇒ `enctype="multipart/form-data"`), and **(0.10.0, #3405)**
   `Switch`, `Range { step }`, `Radio { options }`, `CheckboxGroup { options }`,
   `Segmented { options }`, `Email`, `Tel`, `Url`, `Time` (derived for a
-  `NaiveTime` column), `Month`, `Color`, `Hidden`, and **(0.10.0, #3412)**
+  `civil::Time` column), `Month`, `Color`, `Hidden`, and **(0.10.0, #3412)**
   `Otp(OtpFormat)`.
 - **(0.10.0, #3412)** `otp_input`, `required_otp_input`,
   `otp_input_with(.., OtpFormat, &FieldOptions)`: one
@@ -872,7 +872,7 @@ Free functions rendering changeset-aware, accessible inputs:
   `range_input(.., step)`, `radio_group(.., &[(value, label)])`,
   `checkbox_group(..)` (bind `#[serde(default)] Vec<String>`; prefilled from
   `Changeset::field_values`), `segmented_control(..)`, `email_input`,
-  `tel_input`, `url_input`, `time_input` (`HH:MM`, reads into `NaiveTime`),
+  `tel_input`, `url_input`, `time_input` (`HH:MM`, reads into `civil::Time`),
   `month_input` (`YYYY-MM` `String`), `color_input` (lowercase `#rrggbb`),
   `hidden_input(&cs, field)` (no label, no wrapper). `required_*` exists for
   switch, radio group, segmented, email, tel, url, time, month. Range, color
@@ -897,8 +897,9 @@ Free functions rendering changeset-aware, accessible inputs:
   `false`); datetime columns attach `deserialize_datetime_local_utc[_option]`
   / `deserialize_datetime_local_local[_option]` /
   `deserialize_naive_datetime_local[_option]` (offsetless `datetime-local`
-  values decode; RFC 3339 still accepted). `DateTime` columns with a zone
-  other than `Utc`/`Local` render as `Text` (RFC 3339 string), not a picker.
+  values decode; RFC 3339 still accepted). `Timestamp` and
+  `civil::DateTime` columns, and `ZonedDateTime` form fields, render a
+  date-time picker; `civil::Date` a date picker; `civil::Time` a time picker.
 - `rich_text_area(&changeset, field, label)` (#1255) renders a Markdown
   `<textarea>` with a syntax toolbar, a hint line, and (via
   `rich_text_area_htmx`/`rich_text_area_htmx_with_token_field`) an htmx live
@@ -1570,7 +1571,7 @@ double-submits and replays.
 
 ## Deterministic time and entropy (`autumn_web::time`, `autumn_web::entropy`)
 
-Read time and mint ids through the injected seams, never `Utc::now()` /
+Read time and mint ids through the injected seams, never `Timestamp::now()` /
 `Instant::now()` / `Uuid::new_v4()` directly — that is what lets a `#[sim_test]`
 replay a run byte-for-byte from its seed, and what makes elapsed-time math immune
 to a wall-clock jump in production.
@@ -1625,7 +1626,7 @@ jobs, the scheduler and locks across nodes.
 |---|---|
 | `Sim::mount_replica(name_or_Replica, app)` / `replica(name)` / `try_replica(name)` | Mount named apps next to each other. Each has its own state, job runtime and scheduled tasks |
 | `Sim::kill_replica(name)` / `restart_replica(name, app)` | Stop a replica's tasks as a crash does; mount it again |
-| `Replica::named("b").clock_ahead(d)` / `clock_behind(d)` / `clock_drift_ppm(p)` / `seeded_clock(max, ppm)` | A clock per replica. `Sim::step_replica_clock(name, TimeDelta)` is an NTP step. Keep the skew below `scheduler.lease_ttl_secs` |
+| `Replica::named("b").clock_ahead(d)` / `clock_behind(d)` / `clock_drift_ppm(p)` / `seeded_clock(max, ppm)` | A clock per replica. `Sim::step_replica_clock(name, SignedDuration)` is an NTP step. Keep the skew below `scheduler.lease_ttl_secs` |
 | `Sim::db_link(name)` + `SqliteSubstrate::replica_pool(&link)` | One replica's own pool on the shared database. `link.lose_session()` / `restore_session()`, `mid_query_errors(table, p)`, `commit_ambiguity(table, p)`, `clear_faults()`, `events()` |
 | `Sim::run_for(d)` | Move time one event at a time; time does not move while a query runs. Use it, not `advance`, with replicas |
 | `sim::runtime()` | The runtime `#[sim_test]` uses (one blocking thread, gated DB work), for a sim outside the macro |
@@ -1723,7 +1724,6 @@ db = [
     "dep:scoped-futures",
     "dep:tokio-postgres",
     "diesel/postgres",
-    "diesel/chrono",
 ]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
@@ -1826,13 +1826,12 @@ opentelemetry = { version = "0.31.0", default-features = false, features = ["tra
 opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
 redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
-chrono-tz = "0.10"
 validator = { version = "0.21", features = ["derive"] }
 bcrypt = "0.19"
 futures = "0.3"
 indexmap = "2"
 moka = { version = "0.12", features = ["sync"] }
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "1.0.0", default-features = false, features = ["std", "serde", "tz-system", "tz-fat", "tzdb-bundle-always", "perf-inline"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "minio"] }
 time = { version = ">=0.3, <0.4" }
@@ -1912,11 +1911,11 @@ Endpoint builders:
 
 - `feed::Feed` — channel builder. `Feed::atom(title, site_link, self_link)` and
   `Feed::rss(title, site_link, self_link)` (same signature) pick the format;
-  chain `.author(..)`, `.description(..)`, `.updated(DateTime<Utc>)`,
+  chain `.author(..)`, `.description(..)`, `.updated(Timestamp)`,
   `.entry(FeedEntry)`, `.entries(iter)`.
 - `feed::FeedEntry` — per-item builder. `FeedEntry::new(id, title, link)` plus
-  `.summary(..)`, `.content(..)`, `.published(DateTime<Utc>)`,
-  `.updated(DateTime<Utc>)`.
+  `.summary(..)`, `.content(..)`, `.published(Timestamp)`,
+  `.updated(Timestamp)`.
 - `Feed` implements `IntoResponse`, setting `Content-Type: application/atom+xml`
   (Atom) or `application/rss+xml` (RSS), UTF-8, and XML-escaping every text
   field. `Feed::render() -> String` returns the raw XML.
@@ -2388,9 +2387,9 @@ See `docs/guide/tls.md`.
 downstream macro compatibility:
 
 - `axum`
-- `chrono`
 - `diesel` and `diesel_async` with `db`
 - `http`
+- `jiff` (dates and times; `autumn_web::time` re-exports its types)
 - `tokio`
 - `tokio_util`
 - `tracing`

@@ -9,7 +9,11 @@
 use autumn_web::app::ApiVersion;
 use autumn_web::openapi::OpenApiConfig;
 use autumn_web::prelude::*;
-use chrono::{TimeZone, Utc};
+
+/// The instant an RFC 3339 literal names.
+fn utc(rfc3339: &str) -> autumn_web::time::Timestamp {
+    rfc3339.parse().expect("a valid RFC 3339 timestamp")
+}
 
 #[get("/v1/items", api_version = "v1")]
 async fn get_v1_items() -> &'static str {
@@ -47,18 +51,18 @@ fn test_openapi_spec_version_tagging_and_deprecation() {
     // v1 is deprecated (2020), v2 is active (2035)
     let v1 = ApiVersion {
         version: "v1".to_string(),
-        deprecated_at: Some(Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap()),
-        sunset_at: Some(Utc.with_ymd_and_hms(2040, 1, 1, 0, 0, 0).unwrap()),
+        deprecated_at: Some(utc("2020-01-01T00:00:00Z")),
+        sunset_at: Some(utc("2040-01-01T00:00:00Z")),
     };
     let v2 = ApiVersion {
         version: "v2".to_string(),
-        deprecated_at: Some(Utc.with_ymd_and_hms(2035, 1, 1, 0, 0, 0).unwrap()),
-        sunset_at: Some(Utc.with_ymd_and_hms(2040, 1, 1, 0, 0, 0).unwrap()),
+        deprecated_at: Some(utc("2035-01-01T00:00:00Z")),
+        sunset_at: Some(utc("2040-01-01T00:00:00Z")),
     };
     let v_sunset_only = ApiVersion {
         version: "v_sunset_only".to_string(),
         deprecated_at: None,
-        sunset_at: Some(Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap()),
+        sunset_at: Some(utc("2020-01-01T00:00:00Z")),
     };
 
     let mut config = OpenApiConfig::new("Versioning Test API", "1.0.0");

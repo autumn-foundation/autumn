@@ -431,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn step_up_allows_post_with_fresh_claim() {
         use autumn_web::step_up::STEP_UP_SESSION_KEY;
-        let now_ts = chrono::Utc::now().timestamp().to_string();
+        let now_ts = autumn_web::time::ambient_now().as_second().to_string();
         let session = Session::new_for_test(
             "sid".into(),
             HashMap::from([(STEP_UP_SESSION_KEY.to_string(), now_ts)]),
@@ -504,9 +504,7 @@ mod tests {
         // Claim set 10 seconds ago — within the default 5-min window but outside
         // a tighter 5-second window. Verifies that the captured max_age_secs is
         // actually used rather than a hard-coded constant.
-        let stale_ts = (chrono::Utc::now() - chrono::Duration::seconds(10))
-            .timestamp()
-            .to_string();
+        let stale_ts = (autumn_web::time::ambient_now().as_second() - 10).to_string();
         let session = Session::new_for_test(
             "sid".into(),
             HashMap::from([(STEP_UP_SESSION_KEY.to_string(), stale_ts)]),

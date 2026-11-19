@@ -1738,12 +1738,13 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `name = ident` (required): the obligation name.
 /// - `within = "..."` (required): the budget, such as `"2 business days"`.
 ///   A bad budget is a compile error.
-/// - `starts = field` (required): a `DateTime<Utc>` field. The clock starts
+/// - `starts = field` (required): a `Timestamp` field. The clock starts
 ///   there.
 /// - `calendar = "..."`: the calendar name. The default is `"default"`.
-/// - `met = field`: an `Option<DateTime<Utc>>` field. Your code sets it when
+/// - `met = field`: an `Option<Timestamp>` field. Your code sets it when
 ///   the subject meets the obligation.
-/// - `zone = field`: a time zone field (`Tz`, an IANA name, or an `Option`).
+/// - `zone = field`: a time zone field (`jiff::tz::TimeZone`, an IANA name,
+///   or an `Option`).
 /// - `subject = field`: the identity field. The default is `id`. The subject
 ///   is the `snake_case` type name, a colon, and the field value.
 ///
@@ -1756,8 +1757,8 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///              starts = opened_at, met = responded_at)]
 /// pub struct Ticket {
 ///     pub id: i64,
-///     pub opened_at: chrono::DateTime<chrono::Utc>,
-///     pub responded_at: Option<chrono::DateTime<chrono::Utc>>,
+///     pub opened_at: autumn_web::time::Timestamp,
+///     pub responded_at: Option<autumn_web::time::Timestamp>,
 /// }
 /// ```
 #[proc_macro_attribute]

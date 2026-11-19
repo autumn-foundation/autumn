@@ -121,11 +121,11 @@ For **universally correct** keyset pagination (e.g. backfilled or imported rows
 where timestamps and ids may diverge), also supply `cursor_key_type`:
 
 ```rust
-#[autumn_web::repository(Post, cursor_key = created_at, cursor_key_type = chrono::NaiveDateTime)]
+#[autumn_web::repository(Post, cursor_key = created_at, cursor_key_type = autumn_web::time::civil::DateTime)]
 pub trait PostRepository {}
 ```
 
-With `cursor_key_type` the cursor encodes both `(NaiveDateTime, i64)` and the
+With `cursor_key_type` the cursor encodes both `(civil::DateTime, i64)` and the
 WHERE clause becomes the full two-part predicate:
 ```sql
 WHERE (created_at < $after_k) OR (created_at = $after_k AND id < $after_id)

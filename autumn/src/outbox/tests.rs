@@ -143,7 +143,6 @@ mod sqlite {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use chrono::TimeZone as _;
     use scoped_futures::ScopedFutureExt as _;
 
     use super::*;
@@ -159,7 +158,8 @@ mod sqlite {
     async fn fixture(config: OutboxConfig, handlers: OutboxHandlers) -> Fixture {
         let substrate = SqliteSubstrate::new().expect("substrate");
         ensure_schema(&substrate.pool()).await.expect("schema");
-        let clock = TickingClock::starting_at(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
+        let clock =
+            TickingClock::starting_at("2026-01-01T00:00:00Z".parse().expect("start instant"));
         let state = AppState::for_test()
             .with_pool(substrate.pool())
             .with_clock(Arc::new(clock.clone()))

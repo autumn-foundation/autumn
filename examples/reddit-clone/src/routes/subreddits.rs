@@ -354,34 +354,41 @@ pub async fn show(
     // `page_req.limit()` / `page_req.offset()` come pre-clamped: `?size=0` and
     // `?size=99999` both land inside `1..=MAX_PAGE_SIZE`, so this route cannot
     // be turned into an unbounded read by a query parameter.
-    let rows: Vec<(i64, String, String, i64, i64, String, chrono::NaiveDateTime)> =
-        crate::schema::posts::table
-            .filter(crate::schema::posts::subreddit_id.eq(sub.id))
-            .inner_join(users::table.on(crate::schema::posts::author_id.eq(users::id)))
-            // The `id` tie-breaker is what makes the ORDER BY a TOTAL order,
-            // and it is load-bearing the moment LIMIT/OFFSET splits this query.
-            // `hot_rank` defaults to 0.0, so a fresh community is mostly ties,
-            // and PostgreSQL does not promise a stable order among equal keys:
-            // without a unique final column, two page requests can return the
-            // same post twice or skip one entirely, with nothing having
-            // changed. See docs/guide/pagination.md.
-            .order((
-                crate::schema::posts::hot_rank.desc(),
-                crate::schema::posts::id.desc(),
-            ))
-            .limit(page_req.limit())
-            .offset(page_req.offset())
-            .select((
-                crate::schema::posts::id,
-                crate::schema::posts::title,
-                crate::schema::posts::slug,
-                crate::schema::posts::score,
-                crate::schema::posts::comment_count,
-                users::username,
-                crate::schema::posts::created_at,
-            ))
-            .load(&mut *db)
-            .await?;
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+        String,
+        autumn_web::db::SqlDateTime,
+    )> = crate::schema::posts::table
+        .filter(crate::schema::posts::subreddit_id.eq(sub.id))
+        .inner_join(users::table.on(crate::schema::posts::author_id.eq(users::id)))
+        // The `id` tie-breaker is what makes the ORDER BY a TOTAL order,
+        // and it is load-bearing the moment LIMIT/OFFSET splits this query.
+        // `hot_rank` defaults to 0.0, so a fresh community is mostly ties,
+        // and PostgreSQL does not promise a stable order among equal keys:
+        // without a unique final column, two page requests can return the
+        // same post twice or skip one entirely, with nothing having
+        // changed. See docs/guide/pagination.md.
+        .order((
+            crate::schema::posts::hot_rank.desc(),
+            crate::schema::posts::id.desc(),
+        ))
+        .limit(page_req.limit())
+        .offset(page_req.offset())
+        .select((
+            crate::schema::posts::id,
+            crate::schema::posts::title,
+            crate::schema::posts::slug,
+            crate::schema::posts::score,
+            crate::schema::posts::comment_count,
+            users::username,
+            crate::schema::posts::created_at,
+        ))
+        .load(&mut *db)
+        .await?;
     let page = Page::new(rows, total, &page_req);
     let posts = page.content.as_slice();
 

@@ -16,8 +16,7 @@ use autumn_web::prelude::*;
 use autumn_web::reexports::axum::extract::Extension;
 use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
 use autumn_web::test::{TestApp, TestClient};
-use autumn_web::time::FixedClock;
-use chrono::{Duration as ChronoDuration, TimeZone as _, Utc};
+use autumn_web::time::{FixedClock, SignedDuration, Timestamp};
 use http::StatusCode;
 
 // ── Handlers gated purely on token scopes (no session) ────────────────────────
@@ -155,7 +154,7 @@ async fn token_with_required_scope_is_allowed_and_missing_scope_is_forbidden() {
 
 #[tokio::test]
 async fn expired_token_is_rejected_401() {
-    let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let now: Timestamp = "2026-01-01T00:00:00Z".parse().unwrap();
     let store =
         Arc::new(InMemoryApiTokenStore::default().with_clock(Arc::new(FixedClock::at(now))));
     let raw = store
@@ -163,7 +162,7 @@ async fn expired_token_is_rejected_401() {
             principal_id: "service:ci",
             name: "ci",
             scopes: &scopes(&["posts:read"]),
-            expires_at: Some(now - ChronoDuration::seconds(1)),
+            expires_at: Some(now - SignedDuration::from_secs(1)),
         })
         .await
         .unwrap();

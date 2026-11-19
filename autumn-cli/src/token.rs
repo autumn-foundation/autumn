@@ -5,8 +5,11 @@
 //! is resolved from `autumn.toml` or environment variables using the same
 //! logic as `autumn migrate`.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use hex::encode as hex_encode;
+use jiff::SignedDuration;
+use jiff::civil;
+use jiff::fmt::temporal::Pieces;
+use jiff::tz::Offset;
 use sha2::{Digest as _, Sha256};
 use std::process::{Command, Stdio};
 
@@ -125,66 +128,46 @@ fn sha256_hex(input: &str) -> String {
 /// Normalize an `expires_at` string to a UTC naive datetime suitable for a
 /// `TIMESTAMP` (no time zone) column that stores UTC values.
 ///
-/// Accepts RFC 3339 (with offset) and bare ISO 8601-ish forms (no offset,
-/// treated as UTC).  Returns the input unchanged if none of the known formats
-/// match, letting psql produce a clear error.
+/// Accepts RFC 3339 and the ISO 8601 shapes around it: a `T` or space
+/// separator, minute precision, `Z` or an offset written `+HH:MM`, `+HHMM` or
+/// `+HH`, optionally after a space (`2026-12-31 23:59:59 -05:00`). A value with
+/// no offset, or a bare date, is already UTC. Returns the input unchanged if it
+/// matches none of these, letting psql produce a clear error.
 fn normalize_expires_at_utc(s: &str) -> String {
     let s = s.trim();
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string();
+    utc_wall_clock(s)
+        .or_else(|| join_spaced_offset(s).and_then(|joined| utc_wall_clock(&joined)))
+        .map_or_else(
+            || s.to_owned(),
+            |dt| dt.strftime("%Y-%m-%dT%H:%M:%S").to_string(),
+        )
+}
+
+/// `s` moved to UTC wall-clock time, or `None` when it is not an ISO 8601
+/// date or date-time. A missing offset means the value is UTC already. A
+/// bracketed time zone name (`[America/New_York]`) is not resolved here, so
+/// such input is left for psql to judge.
+fn utc_wall_clock(s: &str) -> Option<civil::DateTime> {
+    let pieces = Pieces::parse(s).ok()?;
+    if pieces.time_zone_annotation().is_some() {
+        return None;
     }
-    // Minute precision with an offset (`date -Iminutes`): RFC 3339 requires seconds, so pad ":00".
-    if s.len() >= 17 {
-        let b = s.as_bytes();
-        if b[10] == b'T' && b[13] == b':' && matches!(b[16], b'Z' | b'+' | b'-') {
-            let padded = format!("{}:00{}", &s[..16], &s[16..]);
-            if let Ok(dt) = DateTime::parse_from_rfc3339(&padded) {
-                return dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string();
-            }
-        }
-    }
-    // Hour-only offset (ISO 8601 `±HH`): expand to `±HH:00` and re-parse. The separator check at
-    // index 10 keeps a date's own `-DD` from reading as an offset. The expanded string ends in
-    // `:MM`, so the recursion does not re-enter this branch.
-    {
-        let b = s.as_bytes();
-        let n = b.len();
-        if n >= 14
-            && matches!(b[10], b'T' | b' ')
-            && matches!(b[n - 3], b'+' | b'-')
-            && b[n - 2].is_ascii_digit()
-            && b[n - 1].is_ascii_digit()
-        {
-            return normalize_expires_at_utc(&format!("{s}:00"));
-        }
-    }
-    // Offset forms `parse_from_rfc3339` rejects: compact offsets (`date +%z`) and the
-    // space-separated SQL form psql prints. Must run before the naive formats, or the offset
-    // would be dropped.
-    for fmt in [
-        "%Y-%m-%dT%H:%M:%S%z",  // T, compact offset, seconds
-        "%Y-%m-%dT%H:%M%z",     // T, compact offset, minute-precision
-        "%Y-%m-%d %H:%M:%S%:z", // space, extended offset, seconds
-        "%Y-%m-%d %H:%M:%S%z",  // space, compact offset, seconds
-        "%Y-%m-%d %H:%M%:z",    // space, extended offset, minute-precision
-        "%Y-%m-%d %H:%M%z",     // space, compact offset, minute-precision
-    ] {
-        if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
-            return dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string();
-        }
-    }
-    // No offset: already UTC.
-    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"] {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
-            return naive.format("%Y-%m-%dT%H:%M:%S").to_string();
-        }
-    }
-    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return NaiveDateTime::new(date, NaiveTime::from_hms_opt(0, 0, 0).unwrap())
-            .format("%Y-%m-%dT%H:%M:%S")
-            .to_string();
-    }
-    s.to_owned()
+    let local = pieces
+        .date()
+        .to_datetime(pieces.time().unwrap_or_else(civil::Time::midnight));
+    let offset = pieces.to_numeric_offset().unwrap_or(Offset::UTC);
+    local
+        .checked_sub(SignedDuration::from_secs(i64::from(offset.seconds())))
+        .ok()
+}
+
+/// `s` with the whitespace before a trailing offset removed, so
+/// `2026-12-31 23:59:59 -05:00` reads as `2026-12-31 23:59:59-05:00`. `None`
+/// when the last word is not an offset.
+fn join_spaced_offset(s: &str) -> Option<String> {
+    let (head, tail) = s.rsplit_once(char::is_whitespace)?;
+    tail.starts_with(['+', '-', 'Z', 'z'])
+        .then(|| format!("{}{tail}", head.trim_end()))
 }
 
 /// Render flat scope strings as a JSON array for the `scopes` JSONB column.
@@ -447,6 +430,55 @@ mod tests {
         assert_eq!(
             normalize_expires_at_utc("2026-12-31T23:59:59-05"),
             "2027-01-01T04:59:59"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_space_before_offset() {
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31 23:59:59 -05:00"),
+            "2027-01-01T04:59:59"
+        );
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31 23:59:59 +0530"),
+            "2026-12-31T18:29:59"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_space_separator_without_offset() {
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31 23:59:59"),
+            "2026-12-31T23:59:59"
+        );
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31T23:59"),
+            "2026-12-31T23:59:00"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_truncates_fractional_seconds() {
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31T23:59:59.987+01:00"),
+            "2026-12-31T22:59:59"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_end_of_range_still_converts() {
+        // Past the last instant a `Timestamp` holds, but a valid `TIMESTAMP`.
+        assert_eq!(
+            normalize_expires_at_utc("9999-12-31T23:59:59Z"),
+            "9999-12-31T23:59:59"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_zone_annotation_passthrough() {
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31T23:59:59[America/New_York]"),
+            "2026-12-31T23:59:59[America/New_York]"
         );
     }
 

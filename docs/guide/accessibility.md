@@ -166,32 +166,35 @@ html! {
 ```
 
 `<input type="datetime-local">` has no timezone concept, so a
-`chrono::DateTime<Utc>` field's rendered value never carries an offset —
-chrono's default `Deserialize` for `DateTime<Utc>` requires one and rejects
-the submission. Attach `deserialize_datetime_local_utc` (or
-`deserialize_datetime_local_utc_option` for `Option<DateTime<Utc>>`):
+`Timestamp` field's rendered value never carries an offset — the default
+`Deserialize` for `autumn_web::time::Timestamp` (a `jiff::Timestamp`)
+requires one and rejects the submission. Attach
+`deserialize_datetime_local_utc` (or `deserialize_datetime_local_utc_option`
+for `Option<Timestamp>`). It reads the offsetless value as UTC and still
+accepts RFC 3339 with an offset, so a struct that doubles as a JSON body keeps
+decoding:
 
 ```rust
 #[derive(serde::Deserialize)]
 struct EventForm {
     #[serde(deserialize_with = "autumn_web::form::deserialize_datetime_local_utc")]
-    starts_at: chrono::DateTime<chrono::Utc>,
+    starts_at: autumn_web::time::Timestamp,
 }
 ```
 
-`chrono::NaiveDateTime` fields don't hit that offset problem, but a value
-the user actively edits through the browser's native picker isn't
-guaranteed to include seconds (unlike the always-seconds-inclusive
-pre-filled value), which chrono's default `Deserialize` also rejects.
-Attach `deserialize_naive_datetime_local` (or
-`deserialize_naive_datetime_local_option` for `Option<NaiveDateTime>`) as a
-defensive measure:
+`civil::DateTime` fields don't hit that offset problem, and the default
+`Deserialize` reads a value without seconds, which the browser's native
+picker may post. It is looser than the control, though: it also takes a bare
+date (as midnight) and a value with an offset, which it drops. Attach
+`deserialize_naive_datetime_local` (or
+`deserialize_naive_datetime_local_option` for `Option<civil::DateTime>`) to
+accept exactly the `YYYY-MM-DDTHH:MM[:SS[.f]]` shape the control posts:
 
 ```rust
 #[derive(serde::Deserialize)]
 struct EventForm {
     #[serde(deserialize_with = "autumn_web::form::deserialize_naive_datetime_local")]
-    starts_at: chrono::NaiveDateTime,
+    starts_at: autumn_web::time::civil::DateTime,
 }
 ```
 

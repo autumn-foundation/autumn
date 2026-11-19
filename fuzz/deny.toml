@@ -18,6 +18,10 @@
 # NCSA for this satellite graph (or the crate is dropped), `licenses` stays
 # ungated here — tracked in docs/reports/2026-09-07-ballast-dependency-
 # ledger-audit.md.
+#
+# `bans` holds only the chrono ban, the same one the root `deny.toml` carries,
+# so a local `cargo deny check bans` here catches chrono creeping back in
+# through autumn-web's features.
 
 [graph]
 all-features = false
@@ -53,6 +57,14 @@ ignore = [
     # loom 0.7.2, through autumn-web's `cfg(loom_models)` model checks. No
     # loom release drops it. Review-by: 2026-12-05.
     { id = "RUSTSEC-2026-0441", reason = "pin-utils unmaintained; via loom 0.7.2 (cfg(loom_models) only), same as root deny.toml; no release drops it; review-by 2026-12-05" },
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+deny = [
+    { crate = "chrono", reason = "Autumn's time types are jiff; use autumn_web::time" },
+    { crate = "chrono-tz", reason = "Autumn's time zones are jiff::tz; use autumn_web::time::tz" },
 ]
 
 [sources]

@@ -89,7 +89,7 @@ pub struct SoftNoShardSetPost {
     pub id: i64,
     pub tenant_id: String,
     pub title: String,
-    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(

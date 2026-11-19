@@ -963,7 +963,7 @@ impl DatabaseFleet<SqliteEngine> {
     pub async fn restore(
         &self,
         key: &FleetDbKey,
-        target: Option<chrono::DateTime<chrono::Utc>>,
+        target: Option<crate::time::Timestamp>,
     ) -> Result<crate::replication::RestoreOutcome, FleetError> {
         self.restore_to_point(key, target)
             .await?
@@ -1605,7 +1605,7 @@ pub(super) fn restore_in_place(
     root: &Path,
     replication: &crate::db::fleet_replication::FleetReplication,
     key: &FleetDbKey,
-    target: Option<chrono::DateTime<chrono::Utc>>,
+    target: Option<crate::time::Timestamp>,
     path: &Path,
 ) -> Result<crate::replication::RestoreOutcome, FleetError> {
     let name = key.name();

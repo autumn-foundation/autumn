@@ -63,7 +63,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -545,22 +545,31 @@ impl_scalar_schema!(
     serde_json::json!({ "type": "string", "format": "uuid" })
 );
 impl_scalar_schema!(
-    chrono::DateTime<chrono::Utc>,
+    jiff::Timestamp,
     "date-time",
     serde_json::json!({ "type": "string", "format": "date-time" })
 );
 impl_scalar_schema!(
-    chrono::NaiveDate,
+    jiff::civil::Date,
     "date",
     serde_json::json!({ "type": "string", "format": "date" })
 );
-// No `format`. A naive value has no UTC offset, so `date-time` is wrong.
+// No `format`. A civil value has no UTC offset, so `date-time` and `time`
+// are wrong.
 impl_scalar_schema!(
-    chrono::NaiveDateTime,
+    jiff::civil::DateTime,
     "naive-date-time",
     serde_json::json!({
         "type": "string",
         "description": "ISO 8601 date-time with no UTC offset, e.g. 2026-09-06T18:00:00",
+    })
+);
+impl_scalar_schema!(
+    jiff::civil::Time,
+    "naive-time",
+    serde_json::json!({
+        "type": "string",
+        "description": "ISO 8601 time with no UTC offset, e.g. 18:00:00",
     })
 );
 impl_scalar_schema!(rust_decimal::Decimal, "decimal", decimal_scalar_schema());
@@ -1648,7 +1657,7 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
 pub fn generate_spec_at(
     config: &OpenApiConfig,
     routes: &[&ApiDoc],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
 ) -> OpenApiSpec {
     let mut paths: BTreeMap<String, PathItem> = BTreeMap::new();
 
@@ -1752,7 +1761,7 @@ pub fn generate_spec_at(
 fn operation_for(
     api_doc: &ApiDoc,
     api_versions: &[crate::app::ApiVersion],
-    now: chrono::DateTime<chrono::Utc>,
+    now: jiff::Timestamp,
     index: &SchemaComponentIndex,
 ) -> Operation {
     let mut tags = if api_doc.tags.is_empty() {
@@ -3214,23 +3223,27 @@ mod scalar_schema_tests {
                 json!({"type": "string", "format": "uuid"}),
             ),
             (
-                <chrono::DateTime<chrono::Utc> as OpenApiSchema>::schema(),
+                <jiff::Timestamp as OpenApiSchema>::schema(),
                 json!({"type": "string", "format": "date-time"}),
             ),
             (
-                <chrono::NaiveDate as OpenApiSchema>::schema(),
+                <jiff::civil::Date as OpenApiSchema>::schema(),
                 json!({"type": "string", "format": "date"}),
             ),
         ];
         for (got, want) in cases {
             assert_eq!(got, want);
         }
-        let naive = <chrono::NaiveDateTime as OpenApiSchema>::schema();
-        assert_eq!(naive["type"], "string");
-        assert!(
-            naive.get("format").is_none(),
-            "naive has no offset: {naive}"
-        );
+        for civil in [
+            <jiff::civil::DateTime as OpenApiSchema>::schema(),
+            <jiff::civil::Time as OpenApiSchema>::schema(),
+        ] {
+            assert_eq!(civil["type"], "string");
+            assert!(
+                civil.get("format").is_none(),
+                "civil has no offset: {civil}"
+            );
+        }
     }
 
     #[test]

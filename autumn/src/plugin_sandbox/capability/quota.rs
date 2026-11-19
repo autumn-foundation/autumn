@@ -18,7 +18,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -259,14 +259,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use chrono::{TimeZone, Utc};
-
     use super::{CapabilityRateLimiter, SandboxCapability};
     use crate::time::{TickingClock, install_ambient};
 
     #[test]
     fn a_bucket_from_a_nested_timeline_refills_on_the_outer_one() {
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = "2020-01-01T00:00:00Z"
+            .parse::<crate::time::Timestamp>()
+            .unwrap();
         let capability = SandboxCapability::ALL[0];
         let outer = TickingClock::starting_at(epoch);
         let _outer = install_ambient(Arc::new(outer.clone()));

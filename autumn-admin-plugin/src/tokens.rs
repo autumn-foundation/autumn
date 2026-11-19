@@ -6,9 +6,11 @@
 //! non-secret metadata (name, principal, scopes, expiry, last-used, revoked).
 
 use autumn_web::auth::{generate_raw_token, hash_api_token, scopes_from_json};
-use chrono::{DateTime, NaiveDateTime, Utc};
+use autumn_web::db::{SqlDateTime, SqlNullableDateTime};
+use autumn_web::time::{Timestamp, civil, tz};
 use serde_json::Value;
 
+use crate::traits::utc_rfc3339;
 use crate::{
     AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, ListParams, ListResult,
 };
@@ -205,7 +207,8 @@ impl AdminModel for TokenAdminModel {
                     .collect(),
             )
             .to_string();
-            let expires_at_naive = expires_at.map(|dt| dt.naive_utc());
+            let expires_at_naive =
+                SqlNullableDateTime(expires_at.map(|ts| tz::Offset::UTC.to_datetime(ts)));
 
             let mut conn = pool
                 .get()
@@ -398,7 +401,10 @@ fn parse_scopes(value: Option<&Value>) -> Result<Vec<String>, AdminError> {
 }
 
 /// Parse the optional `expires_at` form value into a UTC instant.
-fn parse_expires_at(value: Option<&Value>) -> Result<Option<DateTime<Utc>>, AdminError> {
+///
+/// Accepts RFC 3339 with an offset, or a wall-clock value read as UTC in one
+/// of `YYYY-MM-DDTHH:MM:SS`, `YYYY-MM-DDTHH:MM` and `YYYY-MM-DD HH:MM:SS`.
+fn parse_expires_at(value: Option<&Value>) -> Result<Option<Timestamp>, AdminError> {
     let Some(s) = value.and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -406,12 +412,14 @@ fn parse_expires_at(value: Option<&Value>) -> Result<Option<DateTime<Utc>>, Admi
     if s.is_empty() {
         return Ok(None);
     }
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
-        return Ok(Some(dt.with_timezone(&Utc)));
+    if let Ok(ts) = s.parse::<Timestamp>() {
+        return Ok(Some(ts));
     }
     for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"] {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Ok(Some(DateTime::from_naive_utc_and_offset(naive, Utc)));
+        if let Ok(ts) =
+            civil::DateTime::strptime(fmt, s).and_then(|naive| tz::Offset::UTC.to_timestamp(naive))
+        {
+            return Ok(Some(ts));
         }
     }
     Err(AdminError::Validation(format!(
@@ -435,14 +443,23 @@ struct TokenRow {
     principal_id: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     scopes: String,
-    #[diesel(sql_type = diesel::sql_types::Timestamp)]
-    created_at: NaiveDateTime,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamp>)]
-    expires_at: Option<NaiveDateTime>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamp>)]
-    last_used_at: Option<NaiveDateTime>,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamp>)]
-    revoked_at: Option<NaiveDateTime>,
+    #[diesel(sql_type = diesel::sql_types::Timestamp, deserialize_as = SqlDateTime)]
+    created_at: civil::DateTime,
+    #[diesel(
+        sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamp>,
+        deserialize_as = SqlNullableDateTime
+    )]
+    expires_at: Option<civil::DateTime>,
+    #[diesel(
+        sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamp>,
+        deserialize_as = SqlNullableDateTime
+    )]
+    last_used_at: Option<civil::DateTime>,
+    #[diesel(
+        sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamp>,
+        deserialize_as = SqlNullableDateTime
+    )]
+    revoked_at: Option<civil::DateTime>,
 }
 
 impl TokenRow {
@@ -453,10 +470,10 @@ impl TokenRow {
             "name": self.name,
             "principal_id": self.principal_id,
             "scopes": scopes,
-            "created_at": self.created_at.and_utc().to_rfc3339(),
-            "expires_at": self.expires_at.map(|d| d.and_utc().to_rfc3339()),
-            "last_used_at": self.last_used_at.map(|d| d.and_utc().to_rfc3339()),
-            "revoked_at": self.revoked_at.map(|d| d.and_utc().to_rfc3339()),
+            "created_at": utc_rfc3339(self.created_at),
+            "expires_at": self.expires_at.map(utc_rfc3339),
+            "last_used_at": self.last_used_at.map(utc_rfc3339),
+            "revoked_at": self.revoked_at.map(utc_rfc3339),
         })
     }
 }
@@ -550,13 +567,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_expires_at_reads_offsets_and_wall_clock_as_utc() {
+        let parse = |s: &str| {
+            parse_expires_at(Some(&Value::String(s.into())))
+                .unwrap()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(parse("2026-12-31T23:59:59+05:00"), "2026-12-31T18:59:59Z");
+        assert_eq!(parse("2026-12-31T23:59:59"), "2026-12-31T23:59:59Z");
+        assert_eq!(parse("2026-12-31T23:59"), "2026-12-31T23:59:00Z");
+        assert_eq!(parse("2026-12-31 23:59:59"), "2026-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn token_row_into_json_writes_rfc3339_with_utc_offset() {
+        let row = TokenRow {
+            id: 1,
+            name: "ci".into(),
+            principal_id: "service:ci".into(),
+            scopes: "[]".into(),
+            created_at: civil::DateTime::constant(2024, 1, 2, 3, 4, 5, 100_000_000),
+            expires_at: Some(civil::DateTime::constant(2026, 12, 31, 23, 59, 59, 0)),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        let json = row.into_json();
+        assert_eq!(json["created_at"], "2024-01-02T03:04:05.100+00:00");
+        assert_eq!(json["expires_at"], "2026-12-31T23:59:59+00:00");
+        assert!(json["last_used_at"].is_null());
+    }
+
+    #[test]
     fn token_row_into_json_omits_secret_and_parses_scopes() {
         let row = TokenRow {
             id: 7,
             name: "ci".into(),
             principal_id: "service:ci".into(),
             scopes: "[\"posts:read\"]".into(),
-            created_at: NaiveDateTime::default(),
+            created_at: civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
             expires_at: None,
             last_used_at: None,
             revoked_at: None,

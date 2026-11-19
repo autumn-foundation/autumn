@@ -7,13 +7,13 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -79,7 +79,8 @@ pub struct WebhookDeliveryLog {
     pub max_attempts: u32,
     pub is_dlq: bool,
     pub last_error: Option<String>,
-    pub timestamp: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub timestamp: Timestamp,
 }
 
 /// `true` when [`OutboundWebhookHandler::log_delivery`] must ignore `new`:
@@ -804,7 +805,7 @@ pub fn deliver_webhook_job(
 
         // Stripe-style `t=<timestamp>,v1=<signature>`. The receiver checks `t=` against its real
         // clock, so sign with the ambient clock: real time outside a `Sim` (#2967).
-        let timestamp = crate::time::ambient_now().timestamp();
+        let timestamp = crate::time::ambient_now().as_second();
         let signing_payload = format!("{timestamp}.{}", log.payload);
         let signature = crate::security::config::hmac_sha256_hex(
             sub.secret.as_bytes(),
@@ -1172,7 +1173,7 @@ mod tests {
             max_attempts: 5,
             is_dlq: false,
             last_error: None,
-            timestamp: Utc::now(),
+            timestamp: crate::time::ambient_now(),
         }
     }
 

@@ -24,11 +24,16 @@ use std::sync::Arc;
 
 use autumn_media_plugin::rooms::{RoomError, RoomStore};
 use autumn_media_plugin::rooms_db::DbRoomStore;
-use chrono::{Duration, SubsecRound as _, Utc};
+use autumn_web::db::SqlDateTime;
+use autumn_web::time::ambient_now;
+use autumn_web::time::compat::sqlite_naive_text;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
+use jiff::civil;
+use jiff::tz::Offset;
+use jiff::{RoundMode, SignedDuration, Timestamp, TimestampRound, Unit};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -118,11 +123,11 @@ async fn seed(
     pool: &Pool<AsyncPgConnection>,
     namespace: &str,
     room_id: &str,
-    created_at: chrono::DateTime<Utc>,
-    seats: &[(&str, &str, chrono::DateTime<Utc>)],
+    created_at: Timestamp,
+    seats: &[(&str, &str, Timestamp)],
 ) {
     let mut conn = pool.get().await.expect("conn");
-    let created = created_at.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f");
+    let created = column_text(created_at);
     diesel::sql_query(format!(
         "INSERT INTO media_rooms (namespace, room_id, max_participants, created_at) \
          VALUES ('{namespace}', '{room_id}', 6, '{created}')"
@@ -131,7 +136,7 @@ async fn seed(
     .await
     .expect("seed room");
     for (id, token, last_seen) in seats {
-        let seen = last_seen.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f");
+        let seen = column_text(*last_seen);
         diesel::sql_query(format!(
             "INSERT INTO media_room_participants \
              (namespace, room_id, participant_id, display_name, token, joined_at, token_expires_at, last_seen_at) \
@@ -143,11 +148,33 @@ async fn seed(
     }
 }
 
+/// `ts` truncated to whole microseconds, the resolution of a `Timestamp`
+/// column.
+fn micros(ts: Timestamp) -> Timestamp {
+    ts.round(
+        TimestampRound::new()
+            .smallest(Unit::Microsecond)
+            .mode(RoundMode::Trunc),
+    )
+    .expect("truncating to microseconds stays in range")
+}
+
+/// The UTC wall-clock value a `Timestamp` column stores for `ts`.
+fn naive(ts: Timestamp) -> civil::DateTime {
+    Offset::UTC.to_datetime(ts)
+}
+
+/// `ts` as a `Timestamp` column literal, truncated to microseconds first so
+/// Postgres does not round it.
+fn column_text(ts: Timestamp) -> String {
+    sqlite_naive_text(naive(micros(ts)))
+}
+
 /// One `token_expires_at` column, for reading a renewal back out of the row.
 #[derive(diesel::QueryableByName)]
 struct ExpiryRow {
     #[diesel(sql_type = diesel::sql_types::Timestamp)]
-    token_expires_at: chrono::NaiveDateTime,
+    token_expires_at: SqlDateTime,
 }
 
 #[tokio::test]
@@ -168,7 +195,7 @@ async fn create_join_roster_leave_round_trips_and_persists() {
             "tenant-a",
             &room.id,
             Some("Ada".to_owned()),
-            Duration::seconds(300),
+            SignedDuration::from_secs(300),
         )
         .await
         .expect("join first");
@@ -177,7 +204,7 @@ async fn create_join_roster_leave_round_trips_and_persists() {
             "tenant-a",
             &room.id,
             Some("Grace".to_owned()),
-            Duration::seconds(300),
+            SignedDuration::from_secs(300),
         )
         .await
         .expect("join second");
@@ -190,7 +217,7 @@ async fn create_join_roster_leave_round_trips_and_persists() {
             "tenant-a",
             &room.id,
             first.token.expose(),
-            Duration::hours(12),
+            SignedDuration::from_hours(12),
         )
         .await
         .expect("roster");
@@ -210,7 +237,7 @@ async fn create_join_roster_leave_round_trips_and_persists() {
             "tenant-a",
             &room.id,
             second.token.expose(),
-            Duration::hours(12),
+            SignedDuration::from_hours(12),
         )
         .await
         .expect("second instance roster");
@@ -231,7 +258,7 @@ async fn create_join_roster_leave_round_trips_and_persists() {
             "tenant-a",
             &room.id,
             second.token.expose(),
-            Duration::hours(12),
+            SignedDuration::from_hours(12),
         )
         .await
         .expect("roster after leave");
@@ -247,26 +274,28 @@ async fn roster_is_member_gated_fail_closed() {
 
     let room = store.create_room("", 4).await.expect("create");
     store
-        .join_room("", &room.id, None, Duration::seconds(300))
+        .join_room("", &room.id, None, SignedDuration::from_secs(300))
         .await
         .expect("join");
 
     // No token / a wrong token resolve to the SAME error a nonexistent room
     // returns — no membership oracle.
     assert!(matches!(
-        store.roster("", &room.id, "", Duration::hours(12)).await,
+        store
+            .roster("", &room.id, "", SignedDuration::from_hours(12))
+            .await,
         Err(RoomError::RoomNotFound)
     ));
     assert!(matches!(
         store
-            .roster("", &room.id, "not-a-member", Duration::hours(12))
+            .roster("", &room.id, "not-a-member", SignedDuration::from_hours(12))
             .await,
         Err(RoomError::RoomNotFound)
     ));
     // Wrong namespace never leaks the room.
     assert!(matches!(
         store
-            .roster("other", &room.id, "", Duration::hours(12))
+            .roster("other", &room.id, "", SignedDuration::from_hours(12))
             .await,
         Err(RoomError::RoomNotFound)
     ));
@@ -280,13 +309,13 @@ async fn join_enforces_capacity_and_leave_drops_empty_room() {
 
     let room = store.create_room("", 1).await.expect("create");
     let only = store
-        .join_room("", &room.id, None, Duration::seconds(300))
+        .join_room("", &room.id, None, SignedDuration::from_secs(300))
         .await
         .expect("join");
     // The room is now full (cap 1).
     assert!(matches!(
         store
-            .join_room("", &room.id, None, Duration::seconds(300))
+            .join_room("", &room.id, None, SignedDuration::from_secs(300))
             .await,
         Err(RoomError::RoomFull { max: 1 })
     ));
@@ -298,7 +327,7 @@ async fn join_enforces_capacity_and_leave_drops_empty_room() {
     // Rejoining a dropped room is RoomNotFound.
     assert!(matches!(
         store
-            .join_room("", &room.id, None, Duration::seconds(300))
+            .join_room("", &room.id, None, SignedDuration::from_secs(300))
             .await,
         Err(RoomError::RoomNotFound)
     ));
@@ -309,18 +338,18 @@ async fn join_enforces_capacity_and_leave_drops_empty_room() {
 async fn reap_evicts_stale_participant_and_drops_emptied_room() {
     let (pool, _container) = setup_pool().await;
     let store = DbRoomStore::new(pool.clone(), 6);
-    let now = Utc::now();
-    let ttl = Duration::minutes(30);
+    let now = ambient_now();
+    let ttl = SignedDuration::from_mins(30);
 
     // room-keep: one stale + one fresh seat → stale evicted, room survives.
     seed(
         &pool,
         "",
         "room-keep",
-        now - Duration::hours(2),
+        now - SignedDuration::from_hours(2),
         &[
-            ("stale", "tok-stale", now - Duration::hours(1)),
-            ("fresh", "tok-fresh", now - Duration::minutes(5)),
+            ("stale", "tok-stale", now - SignedDuration::from_hours(1)),
+            ("fresh", "tok-fresh", now - SignedDuration::from_mins(5)),
         ],
     )
     .await;
@@ -329,8 +358,8 @@ async fn reap_evicts_stale_participant_and_drops_emptied_room() {
         &pool,
         "",
         "room-drop",
-        now - Duration::hours(2),
-        &[("stale", "tok", now - Duration::hours(1))],
+        now - SignedDuration::from_hours(2),
+        &[("stale", "tok", now - SignedDuration::from_hours(1))],
     )
     .await;
 
@@ -341,20 +370,20 @@ async fn reap_evicts_stale_participant_and_drops_emptied_room() {
     // room-keep still resolves for its fresh member; the stale one is gone.
     assert!(
         store
-            .roster("", "room-keep", "tok-fresh", Duration::hours(12))
+            .roster("", "room-keep", "tok-fresh", SignedDuration::from_hours(12))
             .await
             .is_ok()
     );
     assert!(matches!(
         store
-            .roster("", "room-keep", "tok-stale", Duration::hours(12))
+            .roster("", "room-keep", "tok-stale", SignedDuration::from_hours(12))
             .await,
         Err(RoomError::RoomNotFound)
     ));
     // room-drop is gone entirely.
     assert!(matches!(
         store
-            .roster("", "room-drop", "tok", Duration::hours(12))
+            .roster("", "room-drop", "tok", SignedDuration::from_hours(12))
             .await,
         Err(RoomError::RoomNotFound)
     ));
@@ -370,11 +399,25 @@ async fn reap_evicts_stale_participant_and_drops_emptied_room() {
 async fn reap_drops_created_never_joined_room_but_keeps_a_fresh_empty_room() {
     let (pool, _container) = setup_pool().await;
     let store = DbRoomStore::new(pool.clone(), 6);
-    let now = Utc::now();
-    let ttl = Duration::minutes(30);
+    let now = ambient_now();
+    let ttl = SignedDuration::from_mins(30);
 
-    seed(&pool, "", "old-empty", now - Duration::hours(1), &[]).await;
-    seed(&pool, "", "new-empty", now - Duration::minutes(5), &[]).await;
+    seed(
+        &pool,
+        "",
+        "old-empty",
+        now - SignedDuration::from_hours(1),
+        &[],
+    )
+    .await;
+    seed(
+        &pool,
+        "",
+        "new-empty",
+        now - SignedDuration::from_mins(5),
+        &[],
+    )
+    .await;
 
     let stats = store.reap_stale(now, ttl).await;
     assert_eq!(stats.participants_reaped, 0);
@@ -383,7 +426,7 @@ async fn reap_drops_created_never_joined_room_but_keeps_a_fresh_empty_room() {
     // A just-created empty room within the TTL survives (create→first-join
     // window is never reaped out from under a joiner); an old empty one is gone.
     let fresh = store
-        .join_room("", "new-empty", None, Duration::seconds(300))
+        .join_room("", "new-empty", None, SignedDuration::from_secs(300))
         .await;
     assert!(
         fresh.is_ok(),
@@ -391,7 +434,7 @@ async fn reap_drops_created_never_joined_room_but_keeps_a_fresh_empty_room() {
     );
     assert!(matches!(
         store
-            .join_room("", "old-empty", None, Duration::seconds(300))
+            .join_room("", "old-empty", None, SignedDuration::from_secs(300))
             .await,
         Err(RoomError::RoomNotFound)
     ));
@@ -402,24 +445,24 @@ async fn reap_drops_created_never_joined_room_but_keeps_a_fresh_empty_room() {
 async fn reap_never_crosses_namespaces() {
     let (pool, _container) = setup_pool().await;
     let store = DbRoomStore::new(pool.clone(), 6);
-    let now = Utc::now();
-    let ttl = Duration::minutes(30);
+    let now = ambient_now();
+    let ttl = SignedDuration::from_mins(30);
 
     // Same room_id in two namespaces: ns "a" is stale, ns "b" is fresh.
     seed(
         &pool,
         "a",
         "shared-id",
-        now - Duration::hours(2),
-        &[("stale", "tok-a", now - Duration::hours(1))],
+        now - SignedDuration::from_hours(2),
+        &[("stale", "tok-a", now - SignedDuration::from_hours(1))],
     )
     .await;
     seed(
         &pool,
         "b",
         "shared-id",
-        now - Duration::minutes(1),
-        &[("fresh", "tok-b", now - Duration::minutes(1))],
+        now - SignedDuration::from_mins(1),
+        &[("fresh", "tok-b", now - SignedDuration::from_mins(1))],
     )
     .await;
 
@@ -430,13 +473,13 @@ async fn reap_never_crosses_namespaces() {
     // ns "a" room reaped; the identically-named ns "b" room is untouched.
     assert!(matches!(
         store
-            .roster("a", "shared-id", "tok-a", Duration::hours(12))
+            .roster("a", "shared-id", "tok-a", SignedDuration::from_hours(12))
             .await,
         Err(RoomError::RoomNotFound)
     ));
     assert!(
         store
-            .roster("b", "shared-id", "tok-b", Duration::hours(12))
+            .roster("b", "shared-id", "tok-b", SignedDuration::from_hours(12))
             .await
             .is_ok()
     );
@@ -447,23 +490,23 @@ async fn reap_never_crosses_namespaces() {
 async fn reap_on_a_clean_store_is_a_zero_count_no_op() {
     let (pool, _container) = setup_pool().await;
     let store = DbRoomStore::new(pool.clone(), 6);
-    let now = Utc::now();
+    let now = ambient_now();
 
     // A fresh room+seat: nothing to reap.
     seed(
         &pool,
         "",
         "room-1",
-        now - Duration::minutes(1),
-        &[("fresh", "tok", now - Duration::minutes(1))],
+        now - SignedDuration::from_mins(1),
+        &[("fresh", "tok", now - SignedDuration::from_mins(1))],
     )
     .await;
-    let stats = store.reap_stale(now, Duration::minutes(30)).await;
+    let stats = store.reap_stale(now, SignedDuration::from_mins(30)).await;
     assert_eq!(stats.participants_reaped, 0);
     assert_eq!(stats.rooms_reaped, 0);
     assert!(
         store
-            .roster("", "room-1", "tok", Duration::hours(12))
+            .roster("", "room-1", "tok", SignedDuration::from_hours(12))
             .await
             .is_ok()
     );
@@ -474,34 +517,34 @@ async fn reap_on_a_clean_store_is_a_zero_count_no_op() {
 async fn heartbeat_holds_a_seat_across_a_sweep_and_renews_the_advisory_expiry() {
     let (pool, _container) = setup_pool().await;
     let store = DbRoomStore::new(pool.clone(), 6);
-    let stale = Utc::now() - Duration::hours(1);
+    let stale = ambient_now() - SignedDuration::from_hours(1);
     seed(
         &pool,
         "",
         "room-1",
-        Utc::now() - Duration::hours(2),
+        ambient_now() - SignedDuration::from_hours(2),
         &[("beating", "tok-a", stale), ("silent", "tok-b", stale)],
     )
     .await;
 
-    let before = Utc::now();
+    let before = ambient_now();
     let renewed = store
         .heartbeat(
             "",
             "room-1",
             "beating",
             "tok-a",
-            Duration::seconds(300),
-            Duration::hours(12),
+            SignedDuration::from_secs(300),
+            SignedDuration::from_hours(12),
         )
         .await
         .expect("heartbeat");
     // The renewal honors the supplied TTL, not some other horizon.
-    assert!(renewed >= before + Duration::seconds(300) - Duration::microseconds(1));
-    assert!(renewed <= Utc::now() + Duration::seconds(300));
+    assert!(renewed >= before + SignedDuration::from_secs(300) - SignedDuration::from_micros(1));
+    assert!(renewed <= ambient_now() + SignedDuration::from_secs(300));
 
     // The renewed expiry is persisted, so another process sees it.
-    let persisted: chrono::NaiveDateTime = {
+    let persisted: SqlDateTime = {
         let mut conn = pool.get().await.expect("conn");
         let row: ExpiryRow = diesel::sql_query(
             "SELECT token_expires_at FROM media_room_participants \
@@ -512,14 +555,16 @@ async fn heartbeat_holds_a_seat_across_a_sweep_and_renews_the_advisory_expiry() 
         .expect("read expiry");
         row.token_expires_at
     };
-    assert_eq!(persisted, renewed.naive_utc());
+    assert_eq!(persisted.0, naive(renewed));
 
     // The heartbeat — not a roster poll — is what saves the seat.
-    let stats = store.reap_stale(Utc::now(), Duration::minutes(30)).await;
+    let stats = store
+        .reap_stale(ambient_now(), SignedDuration::from_mins(30))
+        .await;
     assert_eq!(stats.participants_reaped, 1, "only the silent seat reaped");
     assert!(
         store
-            .roster("", "room-1", "tok-a", Duration::hours(12))
+            .roster("", "room-1", "tok-a", SignedDuration::from_hours(12))
             .await
             .is_ok()
     );
@@ -530,9 +575,9 @@ async fn heartbeat_holds_a_seat_across_a_sweep_and_renews_the_advisory_expiry() 
 async fn heartbeat_is_fail_closed_with_no_membership_oracle() {
     let (pool, _container) = setup_pool().await;
     let store = DbRoomStore::new(pool.clone(), 6);
-    let now = Utc::now();
+    let now = ambient_now();
     seed(&pool, "tenant-a", "room-1", now, &[("p1", "tok", now)]).await;
-    let ttl = Duration::seconds(300);
+    let ttl = SignedDuration::from_secs(300);
 
     for (namespace, room, participant, token, case) in [
         ("tenant-a", "nope", "p1", "tok", "unknown room"),
@@ -549,7 +594,7 @@ async fn heartbeat_is_fail_closed_with_no_membership_oracle() {
                         participant,
                         token,
                         ttl,
-                        Duration::hours(12)
+                        SignedDuration::from_hours(12)
                     )
                     .await,
                 Err(RoomError::RoomNotFound)
@@ -566,7 +611,7 @@ async fn heartbeat_rejects_a_sibling_participants_token() {
     // member of the room.
     let (pool, _container) = setup_pool().await;
     let store = DbRoomStore::new(pool.clone(), 6);
-    let now = Utc::now();
+    let now = ambient_now();
     seed(
         &pool,
         "",
@@ -583,8 +628,8 @@ async fn heartbeat_rejects_a_sibling_participants_token() {
                 "room-1",
                 "p2",
                 "tok-1",
-                Duration::seconds(300),
-                Duration::hours(12)
+                SignedDuration::from_secs(300),
+                SignedDuration::from_hours(12)
             )
             .await,
         Err(RoomError::RoomNotFound)
@@ -598,10 +643,12 @@ async fn heartbeat_on_a_seat_reaped_concurrently_reports_it_gone() {
     // leave) between the two renews nothing, which must not read as success.
     let (pool, _container) = setup_pool().await;
     let store = DbRoomStore::new(pool.clone(), 6);
-    let stale = Utc::now() - Duration::hours(1);
+    let stale = ambient_now() - SignedDuration::from_hours(1);
     seed(&pool, "", "room-1", stale, &[("p1", "tok", stale)]).await;
 
-    let stats = store.reap_stale(Utc::now(), Duration::minutes(30)).await;
+    let stats = store
+        .reap_stale(ambient_now(), SignedDuration::from_mins(30))
+        .await;
     assert_eq!(stats.participants_reaped, 1);
 
     assert!(matches!(
@@ -611,8 +658,8 @@ async fn heartbeat_on_a_seat_reaped_concurrently_reports_it_gone() {
                 "room-1",
                 "p1",
                 "tok",
-                Duration::seconds(300),
-                Duration::hours(12)
+                SignedDuration::from_secs(300),
+                SignedDuration::from_hours(12)
             )
             .await,
         Err(RoomError::RoomNotFound)
@@ -625,7 +672,8 @@ async fn heartbeat_caps_the_expiry_at_the_session_limit() {
     let (pool, _container) = setup_pool().await;
     let store = DbRoomStore::new(pool.clone(), 6);
     // Seeded rows hold microseconds, so truncate before the compare.
-    let joined = (Utc::now() - Duration::hours(12) + Duration::minutes(1)).trunc_subsecs(6);
+    let joined =
+        micros(ambient_now() - SignedDuration::from_hours(12) + SignedDuration::from_mins(1));
     seed(&pool, "", "room-1", joined, &[("p1", "tok", joined)]).await;
 
     let renewed = store
@@ -634,13 +682,13 @@ async fn heartbeat_caps_the_expiry_at_the_session_limit() {
             "room-1",
             "p1",
             "tok",
-            Duration::seconds(300),
-            Duration::hours(12),
+            SignedDuration::from_secs(300),
+            SignedDuration::from_hours(12),
         )
         .await
         .expect("heartbeat inside the session limit");
 
-    assert_eq!(renewed, joined + Duration::hours(12));
+    assert_eq!(renewed, joined + SignedDuration::from_hours(12));
 }
 
 #[tokio::test]
@@ -648,7 +696,7 @@ async fn heartbeat_caps_the_expiry_at_the_session_limit() {
 async fn heartbeat_after_the_session_limit_is_refused() {
     let (pool, _container) = setup_pool().await;
     let store = DbRoomStore::new(pool.clone(), 6);
-    let joined = (Utc::now() - Duration::hours(13)).trunc_subsecs(6);
+    let joined = micros(ambient_now() - SignedDuration::from_hours(13));
     seed(&pool, "", "room-1", joined, &[("p1", "tok", joined)]).await;
 
     let result = store
@@ -657,23 +705,15 @@ async fn heartbeat_after_the_session_limit_is_refused() {
             "room-1",
             "p1",
             "tok",
-            Duration::seconds(300),
-            Duration::hours(12),
+            SignedDuration::from_secs(300),
+            SignedDuration::from_hours(12),
         )
         .await;
 
     assert!(matches!(result, Err(RoomError::RoomNotFound)));
     let (expires, seen) = seat_clocks(&pool, "p1").await;
-    assert_eq!(
-        expires,
-        joined.naive_utc().trunc_subsecs(6),
-        "no expiry renewal"
-    );
-    assert_eq!(
-        seen,
-        joined.naive_utc().trunc_subsecs(6),
-        "no liveness refresh"
-    );
+    assert_eq!(expires.0, naive(joined), "no expiry renewal");
+    assert_eq!(seen.0, naive(joined), "no liveness refresh");
 }
 
 #[tokio::test]
@@ -681,21 +721,23 @@ async fn heartbeat_after_the_session_limit_is_refused() {
 async fn roster_after_the_session_limit_is_refused() {
     let (pool, _container) = setup_pool().await;
     let store = DbRoomStore::new(pool.clone(), 6);
-    let joined = (Utc::now() - Duration::hours(13)).trunc_subsecs(6);
+    let joined = micros(ambient_now() - SignedDuration::from_hours(13));
     seed(&pool, "", "room-1", joined, &[("p1", "tok", joined)]).await;
 
-    let result = store.roster("", "room-1", "tok", Duration::hours(12)).await;
+    let result = store
+        .roster("", "room-1", "tok", SignedDuration::from_hours(12))
+        .await;
 
     assert!(matches!(result, Err(RoomError::RoomNotFound)));
     let (_, seen) = seat_clocks(&pool, "p1").await;
-    assert_eq!(seen, joined.naive_utc(), "no liveness refresh");
+    assert_eq!(seen.0, naive(joined), "no liveness refresh");
 }
 
 /// One seat's `(token_expires_at, last_seen_at)` in room `room-1`.
 async fn seat_clocks(
     pool: &Pool<AsyncPgConnection>,
     participant_id: &str,
-) -> (chrono::NaiveDateTime, chrono::NaiveDateTime) {
+) -> (SqlDateTime, SqlDateTime) {
     let mut conn = pool.get().await.expect("conn");
     let row: ClockRow = diesel::sql_query(format!(
         "SELECT token_expires_at, last_seen_at FROM media_room_participants \
@@ -711,9 +753,9 @@ async fn seat_clocks(
 #[derive(diesel::QueryableByName)]
 struct ClockRow {
     #[diesel(sql_type = diesel::sql_types::Timestamp)]
-    token_expires_at: chrono::NaiveDateTime,
+    token_expires_at: SqlDateTime,
     #[diesel(sql_type = diesel::sql_types::Timestamp)]
-    last_seen_at: chrono::NaiveDateTime,
+    last_seen_at: SqlDateTime,
 }
 
 // ── Concurrency: the seat cap and a returned seat hold (#2864, #3104, #2407) ──
@@ -849,7 +891,7 @@ fn spawn_join(
     let (store, room_id) = (store.clone(), room_id.to_owned());
     tokio::spawn(async move {
         store
-            .join_room("", &room_id, None, Duration::seconds(300))
+            .join_room("", &room_id, None, SignedDuration::from_secs(300))
             .await
     })
 }
@@ -882,7 +924,7 @@ async fn concurrent_joins_from_two_processes_never_pass_the_seat_cap() {
             joins.push(tokio::spawn(async move {
                 barrier.wait().await;
                 store
-                    .join_room("", &room_id, None, Duration::seconds(300))
+                    .join_room("", &room_id, None, SignedDuration::from_secs(300))
                     .await
             }));
         }
@@ -911,7 +953,7 @@ async fn join_racing_the_reaper_never_returns_a_seat_that_is_gone() {
     // the delete waits must not get a seat that the cascade then deletes.
     let (pool, _container) = setup_pool().await;
     let store = Arc::new(DbRoomStore::new(pool.clone(), 6));
-    let idle = Utc::now() - Duration::hours(1);
+    let idle = ambient_now() - SignedDuration::from_hours(1);
     seed(&pool, "", "room-1", idle, &[]).await;
     // A second idle room proves that the sweep ran and committed.
     seed(&pool, "", "room-2", idle, &[]).await;
@@ -919,7 +961,11 @@ async fn join_racing_the_reaper_never_returns_a_seat_that_is_gone() {
     let mut holder = hold_room_row(&pool, "room-1").await;
     let reaper = {
         let store = store.clone();
-        tokio::spawn(async move { store.reap_stale(Utc::now(), Duration::minutes(30)).await })
+        tokio::spawn(async move {
+            store
+                .reap_stale(ambient_now(), SignedDuration::from_mins(30))
+                .await
+        })
     };
     settle(&pool, &reaper, 1).await;
     let join = spawn_join(&store, "room-1");
@@ -949,8 +995,8 @@ async fn join_racing_the_last_leave_never_returns_a_seat_that_is_gone() {
         &pool,
         "",
         "room-1",
-        Utc::now(),
-        &[("p1", "tok", Utc::now())],
+        ambient_now(),
+        &[("p1", "tok", ambient_now())],
     )
     .await;
 
@@ -982,7 +1028,7 @@ async fn reaper_racing_a_join_that_got_the_row_first_keeps_the_room_and_its_cap(
     // snapshot), so the restore step must put the cap back.
     let (pool, _container) = setup_pool().await;
     let store = Arc::new(DbRoomStore::new(pool.clone(), 6));
-    let idle = Utc::now() - Duration::hours(1);
+    let idle = ambient_now() - SignedDuration::from_hours(1);
     seed(&pool, "", "room-1", idle, &[]).await;
     seed(&pool, "", "room-2", idle, &[]).await;
 
@@ -991,7 +1037,11 @@ async fn reaper_racing_a_join_that_got_the_row_first_keeps_the_room_and_its_cap(
     settle(&pool, &join, 1).await;
     let reaper = {
         let store = store.clone();
-        tokio::spawn(async move { store.reap_stale(Utc::now(), Duration::minutes(30)).await })
+        tokio::spawn(async move {
+            store
+                .reap_stale(ambient_now(), SignedDuration::from_mins(30))
+                .await
+        })
     };
     settle(&pool, &reaper, 2).await;
     release(&mut holder).await;
@@ -1002,7 +1052,12 @@ async fn reaper_racing_a_join_that_got_the_row_first_keeps_the_room_and_its_cap(
     assert_eq!(room_rows(&pool, "room-2").await, 0);
     assert_eq!(seat_rows(&pool, "room-1").await, 1);
     let roster = store
-        .roster("", "room-1", joined.token.expose(), Duration::hours(12))
+        .roster(
+            "",
+            "room-1",
+            joined.token.expose(),
+            SignedDuration::from_hours(12),
+        )
         .await
         .expect("roster");
     assert_eq!(roster.max_participants, 6, "the claim is restored");
@@ -1016,7 +1071,7 @@ async fn a_dropped_join_does_not_leave_the_room_row_locked() {
     // locked for every later join.
     let (pool, _container) = setup_pool().await;
     let store = Arc::new(DbRoomStore::new(pool.clone(), 6));
-    seed(&pool, "", "room-1", Utc::now(), &[]).await;
+    seed(&pool, "", "room-1", ambient_now(), &[]).await;
 
     let mut holder = hold_room_row(&pool, "room-1").await;
     let dropped = spawn_join(&store, "room-1");
@@ -1027,7 +1082,7 @@ async fn a_dropped_join_does_not_leave_the_room_row_locked() {
 
     let next = tokio::time::timeout(
         CALL_LIMIT,
-        store.join_room("", "room-1", None, Duration::seconds(300)),
+        store.join_room("", "room-1", None, SignedDuration::from_secs(300)),
     )
     .await
     .expect("a later join must not wait on a dropped one");
@@ -1047,8 +1102,8 @@ async fn a_leave_with_a_wrong_token_takes_no_lock() {
         &pool,
         "",
         "room-1",
-        Utc::now(),
-        &[("p1", "tok", Utc::now())],
+        ambient_now(),
+        &[("p1", "tok", ambient_now())],
     )
     .await;
 
@@ -1072,7 +1127,7 @@ async fn a_join_dropped_while_it_waits_for_the_pool_does_no_work() {
     // check out a connection later and queue on the room lock.
     let (pool, _container) = setup_pool().await;
     let store = Arc::new(DbRoomStore::new(pool.clone(), 6));
-    seed(&pool, "", "room-1", Utc::now(), &[]).await;
+    seed(&pool, "", "room-1", ambient_now(), &[]).await;
 
     let mut holder = hold_room_row(&pool, "room-1").await;
     let mut rest = Vec::new();
@@ -1106,8 +1161,8 @@ async fn a_leave_dropped_while_it_waits_for_the_pool_does_no_work() {
         &pool,
         "",
         "room-1",
-        Utc::now(),
-        &[("p1", "tok", Utc::now())],
+        ambient_now(),
+        &[("p1", "tok", ambient_now())],
     )
     .await;
 

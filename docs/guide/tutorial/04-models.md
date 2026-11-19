@@ -41,7 +41,7 @@ Adding `GET /todos/{id}` with `.find()` and `.first()`. Using
 
 ### Adding Dependencies
 
-Updating `Cargo.toml` with `diesel`, `diesel-async`, `chrono`, and `serde`.
+Updating `Cargo.toml` with `diesel`, `diesel-async`, and `serde`. Dates and times come from `autumn_web::time`, so there is no date crate to add.
 
 ### Checkpoint
 

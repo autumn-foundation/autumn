@@ -113,7 +113,7 @@ use autumn_web::time::Clock;
 async fn invoice_pdf(id: Path<i64>, clock: Clock) -> Pdf {
     let markup = html! {
         h1 { "Invoice #" (*id) }
-        p { "Generated at " (clock.now().to_rfc3339()) }
+        p { "Generated at " (clock.now()) }
     };
     Pdf::from_markup(markup).filename("invoice.pdf")
 }

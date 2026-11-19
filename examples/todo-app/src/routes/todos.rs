@@ -53,6 +53,8 @@ use autumn_web::form::{ChangesetForm, method_input};
 use autumn_web::pagination::{Page, PageRequest};
 use autumn_web::prelude::{HxRequest, IntoResponse, StatusCode, Validate};
 use autumn_web::security::CsrfToken;
+use autumn_web::time::tz::TimeZone;
+use autumn_web::time::{Timestamp, civil};
 use autumn_web::{
     AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, public,
 };
@@ -380,7 +382,7 @@ fn detail_view(todo: &Todo, csrf_token: Option<&str>) -> Markup {
                         }
                     }
                     span class="text-stone-400 text-xs" {
-                        "Created " (todo.created_at.format("%b %d, %Y at %H:%M"))
+                        "Created " (todo.created_at.strftime("%b %d, %Y at %H:%M"))
                     }
                 }
 
@@ -438,13 +440,26 @@ pub async fn detail(
     let csrf_tok = csrf.as_ref().map(CsrfToken::token).unwrap_or_default();
     let etag_input = format!(
         "{}-{}-{}",
-        todo.created_at.and_utc().timestamp(),
+        unix_seconds(todo.created_at),
         todo.completed,
         csrf_tok
     );
     let fw = fresh_when(&headers, etag_input.as_str());
 
     Ok(fw.or(detail_view(&todo, csrf.as_ref().map(CsrfToken::token))))
+}
+
+/// Whole seconds since the Unix epoch for a stored UTC wall-clock value,
+/// clamped to the nearer end of the instant range when it falls outside it.
+fn unix_seconds(utc: civil::DateTime) -> i64 {
+    TimeZone::UTC
+        .to_timestamp(utc)
+        .unwrap_or(if utc.year() < 1970 {
+            Timestamp::MIN
+        } else {
+            Timestamp::MAX
+        })
+        .as_second()
 }
 
 /// Inline field validation for the todo title (htmx endpoint).
@@ -621,6 +636,20 @@ mod tests {
     use super::*;
     use autumn_web::form::IntoChangeset;
 
+    /// 1970-01-01T00:00:00 as a stored UTC wall-clock value.
+    fn unix_epoch() -> civil::DateTime {
+        TimeZone::UTC.to_datetime(Timestamp::UNIX_EPOCH)
+    }
+
+    #[test]
+    fn unix_seconds_reads_the_value_as_utc() {
+        assert_eq!(unix_seconds(unix_epoch()), 0);
+        assert_eq!(
+            unix_seconds(civil::date(2024, 1, 2).at(3, 4, 5, 0)),
+            1_704_164_645
+        );
+    }
+
     #[test]
     fn test_path_helpers_correct() {
         assert_eq!(paths::list(), "/todos");
@@ -654,7 +683,7 @@ mod tests {
             id: 1,
             title: "Test Todo".into(),
             completed: true,
-            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+            created_at: unix_epoch(),
         };
         let markup = todo_item(&todo);
         let html = markup.into_string();
@@ -668,7 +697,7 @@ mod tests {
             id: 1,
             title: "Test Todo".into(),
             completed: false,
-            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+            created_at: unix_epoch(),
         };
         let markup = todo_item(&todo);
         let html = markup.into_string();
@@ -682,7 +711,7 @@ mod tests {
             id: 42,
             title: "Check paths".into(),
             completed: false,
-            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+            created_at: unix_epoch(),
         };
         let markup = todo_item(&todo);
         let html = markup.into_string();
@@ -723,7 +752,7 @@ mod tests {
             id: 42,
             title: "Write docs".into(),
             completed: false,
-            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+            created_at: unix_epoch(),
         };
         let html = detail_view(&todo, Some("csrf-tok-xyz")).into_string();
         assert!(html.contains(r#"method="post""#), "{html}");
@@ -740,7 +769,7 @@ mod tests {
             id: 7,
             title: "No csrf".into(),
             completed: true,
-            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+            created_at: unix_epoch(),
         };
         let html = detail_view(&todo, None).into_string();
         assert!(html.contains(r#"name="_method""#), "{html}");
@@ -756,7 +785,7 @@ mod tests {
                 id: i,
                 title: format!("Todo {i}"),
                 completed: false,
-                created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+                created_at: unix_epoch(),
             })
             .collect();
         let page: Page<Todo> = Page::new(items, 12, &req);
@@ -787,7 +816,7 @@ mod tests {
                 id: i,
                 title: format!("Todo {i}"),
                 completed: false,
-                created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+                created_at: unix_epoch(),
             })
             .collect();
         let page: Page<Todo> = Page::new(items, 5, &req);

@@ -28,8 +28,8 @@
 use autumn_web::current::with_actor;
 use autumn_web::hooks::Patch;
 use autumn_web::ledger::LedgerBreak;
+use autumn_web::time::{SignedDuration, Timestamp, civil};
 use autumn_web::version_history::VersionOp;
-use chrono::{DateTime, Duration, Utc};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection as _};
@@ -63,7 +63,7 @@ pub struct LedgerTenantNote {
     pub body: String,
     pub tenant_id: String,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -90,7 +90,7 @@ pub struct LedgerInvoice {
     /// would actually bite.
     pub amount_rate: f64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -189,8 +189,8 @@ fn assert_same_record<T: serde::Serialize>(left: &T, right: &T, context: &str) {
     clippy::disallowed_methods,
     reason = "test asserts against real recorded_at values"
 )]
-fn now() -> DateTime<Utc> {
-    Utc::now()
+fn now() -> Timestamp {
+    Timestamp::now()
 }
 
 async fn tick() {
@@ -207,7 +207,7 @@ async fn ledger_records_chains_and_reconstructs_on_postgres() {
     let (pool, _container) = setup_pool().await;
     let repo = build_repo(pool.clone());
 
-    let mut oracle: Vec<(DateTime<Utc>, LedgerInvoice)> = Vec::new();
+    let mut oracle: Vec<(Timestamp, LedgerInvoice)> = Vec::new();
 
     let created = with_actor("alice", async {
         repo.save(&NewLedgerInvoice {
@@ -292,7 +292,7 @@ async fn ledger_records_chains_and_reconstructs_on_postgres() {
         );
     }
     assert!(
-        repo.ledger_as_of(id, oracle[0].0 - Duration::seconds(60))
+        repo.ledger_as_of(id, oracle[0].0 - SignedDuration::from_secs(60))
             .await
             .expect("as-of read")
             .is_none(),
@@ -368,7 +368,7 @@ async fn a_float_snapshot_round_trips_without_renormalization() {
     );
 
     let reconstructed = repo
-        .ledger_as_of(created.id, Utc::now() + Duration::seconds(1))
+        .ledger_as_of(created.id, now() + SignedDuration::from_secs(1))
         .await
         .expect("as-of")
         .expect("state");
@@ -376,7 +376,7 @@ async fn a_float_snapshot_round_trips_without_renormalization() {
 
     // And a window with no writes reports no phantom change.
     let quiet = repo
-        .ledger_diff(created.id, Utc::now(), Utc::now() + Duration::seconds(1))
+        .ledger_diff(created.id, now(), now() + SignedDuration::from_secs(1))
         .await
         .expect("diff");
     assert!(quiet.is_empty(), "{quiet:?}");
@@ -412,7 +412,7 @@ async fn restore_records_a_revision_on_postgres() {
         .expect("live read")
         .expect("live row");
     let reconstructed = repo
-        .ledger_as_of(created.id, Utc::now() + Duration::seconds(1))
+        .ledger_as_of(created.id, now() + SignedDuration::from_secs(1))
         .await
         .expect("as-of")
         .expect("state");
@@ -631,7 +631,7 @@ async fn transaction_time_comes_from_the_database_and_never_regresses_on_postgre
         .expect("update");
     }
 
-    let recorded: Vec<DateTime<Utc>> = repo
+    let recorded: Vec<Timestamp> = repo
         .ledger_revisions(created.id)
         .await
         .expect("revisions")
@@ -648,7 +648,7 @@ async fn transaction_time_comes_from_the_database_and_never_regresses_on_postgre
     // `clock_timestamp()` advances per statement rather than being frozen at the
     // transaction's start, which `now()` would have been.
     assert!(
-        recorded[0] >= before - Duration::minutes(5),
+        recorded[0] >= before - SignedDuration::from_mins(5),
         "the database clock read is a real instant: {:?}",
         recorded[0]
     );
@@ -660,7 +660,7 @@ async fn transaction_time_comes_from_the_database_and_never_regresses_on_postgre
     // The mark's instant is the floor only where it is the *only* floor: after
     // the revision that carried the real instant is gone. Lop the head off and
     // push the mark forward, as a fast host clock would have left it.
-    let ahead = autumn_web::ledger::truncate_to_micros(now() + Duration::minutes(30));
+    let ahead = autumn_web::ledger::truncate_to_micros(now() + SignedDuration::from_mins(30));
     {
         let mut conn = pool.get().await.expect("conn");
         diesel::sql_query(
@@ -675,7 +675,7 @@ async fn transaction_time_comes_from_the_database_and_never_regresses_on_postgre
             "UPDATE _autumn_ledger_high_water SET recorded_at = $1 \
              WHERE table_name = 'test_ledger_invoices' AND record_id = $2",
         )
-        .bind::<diesel::sql_types::Timestamptz, _>(ahead)
+        .bind::<diesel::sql_types::Timestamptz, _>(autumn_web::db::SqlTimestamp(ahead))
         .bind::<diesel::sql_types::BigInt, _>(created.id)
         .execute(&mut conn)
         .await
@@ -741,7 +741,8 @@ async fn a_poisoned_transaction_time_floor_refuses_the_write_on_postgres() {
     .await
     .expect("update");
 
-    let far = autumn_web::ledger::truncate_to_micros(now() + Duration::days(365 * 900));
+    let far =
+        autumn_web::ledger::truncate_to_micros(now() + SignedDuration::from_hours(365 * 900 * 24));
     {
         let mut conn = pool.get().await.expect("conn");
         diesel::sql_query(
@@ -756,7 +757,7 @@ async fn a_poisoned_transaction_time_floor_refuses_the_write_on_postgres() {
             "UPDATE _autumn_ledger_high_water SET recorded_at = $1 \
              WHERE table_name = 'test_ledger_invoices' AND record_id = $2",
         )
-        .bind::<diesel::sql_types::Timestamptz, _>(far)
+        .bind::<diesel::sql_types::Timestamptz, _>(autumn_web::db::SqlTimestamp(far))
         .bind::<diesel::sql_types::BigInt, _>(created.id)
         .execute(&mut conn)
         .await
@@ -938,7 +939,7 @@ async fn soft_delete_appends_a_revision_and_the_chain_index_refuses_a_fork() {
     // A soft-deleted record still reconstructs, carrying the deleted_at a
     // `with_deleted()` query would have shown.
     let latest = repo
-        .ledger_as_of(id, Utc::now() + Duration::seconds(1))
+        .ledger_as_of(id, now() + SignedDuration::from_secs(1))
         .await
         .expect("as-of")
         .expect("state exists");
@@ -1009,6 +1010,8 @@ pub trait LedgerLinkPostRepository {}
 /// The ledgered join table. Its own module: the `has_many(through)` macro
 /// declares a hidden table of the same name in the parent scope.
 mod link_rows {
+    use autumn_web::time::civil;
+
     diesel::table! {
         test_ledger_post_tags (id) {
             id -> Int8,
@@ -1025,7 +1028,7 @@ mod link_rows {
         pub post_id: i64,
         pub tag_id: i64,
         #[default]
-        pub deleted_at: Option<chrono::NaiveDateTime>,
+        pub deleted_at: Option<civil::DateTime>,
     }
 
     #[autumn_web::repository(

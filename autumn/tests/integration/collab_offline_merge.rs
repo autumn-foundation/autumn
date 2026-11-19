@@ -12,11 +12,11 @@ use autumn_web::collab::{CollabResolver, CollabText};
 use autumn_web::sync::protocol::{Change, Op, PullResponse, PushRequest, RemoteRow};
 use autumn_web::sync::resolver::{ConflictResolver, LwwResolver, Resolution};
 use autumn_web::sync::{MemorySyncBackend, SyncBackend, SyncScope};
-use chrono::{Duration, Utc};
+use autumn_web::time::{SignedDuration, Timestamp, ambient_now};
 use serde_json::{Value, json};
 
 /// A row as the device pushes it.
-fn client_change(payload: Value, updated_at: chrono::DateTime<Utc>) -> Change {
+fn client_change(payload: Value, updated_at: Timestamp) -> Change {
     Change {
         change_id: "c1".to_owned(),
         collection: "notes".to_owned(),
@@ -29,7 +29,7 @@ fn client_change(payload: Value, updated_at: chrono::DateTime<Utc>) -> Change {
 }
 
 /// The row the server already holds.
-fn server_row(payload: Value, updated_at: chrono::DateTime<Utc>) -> RemoteRow {
+fn server_row(payload: Value, updated_at: Timestamp) -> RemoteRow {
     RemoteRow {
         collection: "notes".to_owned(),
         pk: "n1".to_owned(),
@@ -59,11 +59,14 @@ fn branched() -> (CollabText, CollabText) {
 /// is thrown away whole.
 #[test]
 fn last_write_wins_discards_the_offline_edit() {
-    let now = Utc::now();
+    let now = ambient_now();
     let (offline, online) = branched();
     let verdict = LwwResolver.resolve(
         "phone",
-        &client_change(json!({ "body": offline }), now - Duration::seconds(5)),
+        &client_change(
+            json!({ "body": offline }),
+            now - SignedDuration::from_secs(5),
+        ),
         &server_row(json!({ "body": online }), now),
     );
     assert_eq!(
@@ -76,11 +79,14 @@ fn last_write_wins_discards_the_offline_edit() {
 /// AC4: the same conflict, resolved convergently — both edits survive.
 #[test]
 fn a_collaborative_field_merges_instead_of_clobbering() {
-    let now = Utc::now();
+    let now = ambient_now();
     let (offline, online) = branched();
     let verdict = CollabResolver::new(["body"]).resolve(
         "phone",
-        &client_change(json!({ "body": offline }), now - Duration::seconds(5)),
+        &client_change(
+            json!({ "body": offline }),
+            now - SignedDuration::from_secs(5),
+        ),
         &server_row(json!({ "body": online }), now),
     );
 
@@ -94,18 +100,24 @@ fn a_collaborative_field_merges_instead_of_clobbering() {
 /// The merge is symmetric: whichever side is newer, the text is the same.
 #[test]
 fn the_merge_does_not_depend_on_which_side_is_newer() {
-    let now = Utc::now();
+    let now = ambient_now();
     let (offline, online) = branched();
     let resolver = CollabResolver::new(["body"]);
 
     let client_newer = resolver.resolve(
         "phone",
-        &client_change(json!({ "body": offline }), now + Duration::seconds(5)),
+        &client_change(
+            json!({ "body": offline }),
+            now + SignedDuration::from_secs(5),
+        ),
         &server_row(json!({ "body": online }), now),
     );
     let server_newer = resolver.resolve(
         "phone",
-        &client_change(json!({ "body": offline }), now - Duration::seconds(5)),
+        &client_change(
+            json!({ "body": offline }),
+            now - SignedDuration::from_secs(5),
+        ),
         &server_row(json!({ "body": online }), now),
     );
 
@@ -122,13 +134,13 @@ fn the_merge_does_not_depend_on_which_side_is_newer() {
 /// existing engine's default is unchanged for everything not marked.
 #[test]
 fn a_plain_column_still_takes_the_winning_side() {
-    let now = Utc::now();
+    let now = ambient_now();
     let (offline, online) = branched();
     let verdict = CollabResolver::new(["body"]).resolve(
         "phone",
         &client_change(
             json!({ "body": offline, "title": "from the phone" }),
-            now - Duration::seconds(5),
+            now - SignedDuration::from_secs(5),
         ),
         &server_row(json!({ "body": online, "title": "from the laptop" }), now),
     );
@@ -145,12 +157,12 @@ fn a_plain_column_still_takes_the_winning_side() {
 /// document keeps the wrapped verdict — no guessing, no corruption.
 #[test]
 fn a_non_document_field_keeps_the_wrapped_verdict() {
-    let now = Utc::now();
+    let now = ambient_now();
     let verdict = CollabResolver::new(["body"]).resolve(
         "phone",
         &client_change(
             json!({ "body": "just a string" }),
-            now + Duration::seconds(5),
+            now + SignedDuration::from_secs(5),
         ),
         &server_row(json!({ "body": "another string" }), now),
     );
@@ -162,12 +174,15 @@ fn a_non_document_field_keeps_the_wrapped_verdict() {
 /// empty document, the merge would write "no text" over real characters.
 #[test]
 fn an_unrelated_json_object_in_the_field_keeps_the_wrapped_verdict() {
-    let now = Utc::now();
+    let now = ambient_now();
     let (offline, _) = branched();
     let verdict = CollabResolver::new(["body"]).resolve(
         "phone",
         &client_change(json!({ "body": { "note": "not a document" } }), now),
-        &server_row(json!({ "body": offline }), now + Duration::seconds(5)),
+        &server_row(
+            json!({ "body": offline }),
+            now + SignedDuration::from_secs(5),
+        ),
     );
     assert_eq!(
         verdict,
@@ -180,10 +195,13 @@ fn an_unrelated_json_object_in_the_field_keeps_the_wrapped_verdict() {
 /// wrapped resolver. Merging would resurrect a deleted row silently.
 #[test]
 fn a_delete_is_left_to_the_wrapped_resolver() {
-    let now = Utc::now();
+    let now = ambient_now();
     let (offline, online) = branched();
 
-    let mut deleting = client_change(json!({ "body": offline }), now + Duration::seconds(5));
+    let mut deleting = client_change(
+        json!({ "body": offline }),
+        now + SignedDuration::from_secs(5),
+    );
     deleting.op = Op::Delete;
     deleting.payload = None;
     assert_eq!(
@@ -200,7 +218,10 @@ fn a_delete_is_left_to_the_wrapped_resolver() {
     assert_eq!(
         CollabResolver::new(["body"]).resolve(
             "phone",
-            &client_change(json!({ "body": offline }), now - Duration::seconds(5)),
+            &client_change(
+                json!({ "body": offline }),
+                now - SignedDuration::from_secs(5)
+            ),
             &deleted_row
         ),
         Resolution::KeepServer,
@@ -210,11 +231,14 @@ fn a_delete_is_left_to_the_wrapped_resolver() {
 /// A field present on only one side is adopted whole rather than dropped.
 #[test]
 fn a_field_present_on_one_side_only_is_adopted() {
-    let now = Utc::now();
+    let now = ambient_now();
     let (offline, _) = branched();
     let verdict = CollabResolver::new(["body"]).resolve(
         "phone",
-        &client_change(json!({ "body": offline }), now - Duration::seconds(5)),
+        &client_change(
+            json!({ "body": offline }),
+            now - SignedDuration::from_secs(5),
+        ),
         &server_row(json!({ "title": "no body here" }), now),
     );
     let Resolution::Merge(merged) = verdict else {
@@ -228,10 +252,13 @@ fn a_field_present_on_one_side_only_is_adopted() {
 /// engine retries at-least-once, so the resolver has to be idempotent.
 #[test]
 fn replaying_the_same_push_is_idempotent() {
-    let now = Utc::now();
+    let now = ambient_now();
     let (offline, online) = branched();
     let resolver = CollabResolver::new(["body"]);
-    let change = client_change(json!({ "body": offline }), now - Duration::seconds(5));
+    let change = client_change(
+        json!({ "body": offline }),
+        now - SignedDuration::from_secs(5),
+    );
 
     let first = resolver.resolve(
         "phone",
@@ -268,7 +295,7 @@ fn upsert(change_id: &str, base_version: i64, body: &CollabText) -> Change {
         op: Op::Upsert,
         payload: Some(json!({ "body": body, "title": "Shopping list" })),
         base_version,
-        updated_at: Utc::now(),
+        updated_at: ambient_now(),
     }
 }
 
@@ -395,7 +422,7 @@ fn the_same_script_under_last_write_wins_loses_the_offline_edit() {
         .insert("laptop", 11, "!")
         .expect("collab edit refused");
     let mut online_change = upsert("00000000-0000-4000-8000-000000000012", 1, &online);
-    online_change.updated_at = Utc::now() + Duration::seconds(60);
+    online_change.updated_at = ambient_now() + SignedDuration::from_secs(60);
     backend
         .apply_push(scope, &push("laptop", online_change), &resolver)
         .expect("online push");
@@ -434,7 +461,7 @@ fn the_same_script_under_last_write_wins_loses_the_offline_edit() {
 /// another collection keeps last-write-wins, which is what its name promises.
 #[test]
 fn for_table_does_not_merge_another_collections_field() {
-    let now = Utc::now();
+    let now = ambient_now();
     let (offline, online) = branched();
     // No model registers `test_scoped_notes`, so drive the scoping directly.
     let resolver = CollabResolver::new(["body"]).in_collection("notes");
@@ -469,7 +496,7 @@ fn for_table_does_not_merge_another_collections_field() {
 /// before the replay, so the resolver skips the field instead of replaying it.
 #[test]
 fn an_oversized_collaborative_field_is_skipped_not_replayed() {
-    let now = Utc::now();
+    let now = ambient_now();
     let resolver = CollabResolver::new(["body"]);
 
     // The adversarial shape: every operation blocks until the last arrives.
@@ -516,7 +543,7 @@ fn an_oversized_collaborative_field_is_skipped_not_replayed() {
 fn a_merge_that_would_pass_the_hubs_total_is_not_stored() {
     use autumn_web::collab::{MAX_WIRE_ELEMENTS, MAX_WIRE_PENDING};
 
-    let now = Utc::now();
+    let now = ambient_now();
     let resolver = CollabResolver::new(["body"]);
 
     // Each side is openable on its own: the shared elements are well under

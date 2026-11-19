@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
 
-use chrono::NaiveDateTime;
+use autumn_web::time::civil;
 
 use reddit_clone::vote_core::VoteState;
 
@@ -23,7 +23,7 @@ pub struct PostRow {
     pub author_id: i64,
     pub title: String,
     pub slug: String,
-    pub created_at: NaiveDateTime,
+    pub created_at: civil::DateTime,
     pub score: i64,
     pub version: u64,
     pub hot_rank: f64,
@@ -76,7 +76,7 @@ impl Store {
     }
 
     /// Insert a post at version 0 and return its id.
-    pub fn create_post(&self, author_id: i64, title: &str, slug: &str, at: NaiveDateTime) -> i64 {
+    pub fn create_post(&self, author_id: i64, title: &str, slug: &str, at: civil::DateTime) -> i64 {
         self.with(|t| {
             t.next_post_id += 1;
             let id = t.next_post_id;
