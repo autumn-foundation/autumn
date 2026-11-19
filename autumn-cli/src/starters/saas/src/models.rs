@@ -18,7 +18,8 @@ pub struct User {
     pub email: String,
     pub password_hash: String,
     pub tenant_id: String,
-    pub created_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 /// Data needed to create a new account.
@@ -50,7 +51,7 @@ pub struct Project {
     #[validate(length(min = 1, max = 200))]
     pub name: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 /// Form body for creating a project. The tenant is taken from the session, not
@@ -78,5 +79,5 @@ pub struct PasswordResetToken {
     pub user_id: i64,
     pub token_hash: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }

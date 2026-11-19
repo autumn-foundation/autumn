@@ -16,13 +16,13 @@ use autumn_web::prelude::*;
 #[must_use]
 pub fn calculate_hot_rank(
     score: i64,
-    created_at: chrono::NaiveDateTime,
-    now: chrono::NaiveDateTime,
+    created_at: autumn_web::time::civil::DateTime,
+    now: autumn_web::time::civil::DateTime,
 ) -> f64 {
     // A post from the future (clock skew) ranks as a new post. An age below
     // -2 hours makes `(age + 2) ^ 1.5` NaN.
     #[allow(clippy::cast_precision_loss)] // Ranking math intentionally uses floats.
-    let age_hours = ((now - created_at).num_seconds() as f64 / 3600.0).max(0.0);
+    let age_hours = (now.duration_since(created_at).as_secs() as f64 / 3600.0).max(0.0);
     #[allow(clippy::cast_precision_loss)]
     {
         score as f64 / (age_hours + 2.0_f64).powf(1.5)
@@ -43,7 +43,7 @@ pub async fn recalculate_hot_ranks(state: AppState) -> AutumnResult<()> {
 
     let mut conn = pool.get().await.map_err(AutumnError::from)?;
 
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
 
     // Perform a single bulk update directly in the database
     let query = diesel::sql_query(
@@ -58,7 +58,7 @@ pub async fn recalculate_hot_ranks(state: AppState) -> AutumnResult<()> {
     );
 
     let updated = query
-        .bind::<diesel::sql_types::Timestamp, _>(now)
+        .bind::<diesel::sql_types::Timestamp, _>(autumn_web::db::SqlDateTime::from(now))
         .execute(&mut conn)
         .await?;
 
@@ -76,14 +76,15 @@ pub async fn prune_live_feed_events(state: AppState) -> AutumnResult<()> {
 #[cfg(test)]
 mod tests {
     use super::calculate_hot_rank;
+    use autumn_web::time::{SignedDuration, civil};
 
     /// Found by the DST nightly. A replica clock that is more than 2 hours
     /// slow sees a new post "from the future". An age below -2 hours makes
     /// `(age + 2) ^ 1.5` NaN.
     #[test]
     fn a_post_from_the_future_ranks_as_a_new_post() {
-        let now = chrono::NaiveDateTime::default();
-        let future = now + chrono::TimeDelta::hours(3);
+        let now = civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0);
+        let future = now + SignedDuration::from_hours(3);
         let rank = calculate_hot_rank(100, future, now);
         assert!(rank.is_finite(), "rank is {rank}");
         assert!((rank - calculate_hot_rank(100, now, now)).abs() < 1e-12);

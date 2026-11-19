@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use autumn_web::background::{BackgroundTask, PluginCapability};
 use autumn_web::job::{JobClient, JobInfo};
+use autumn_web::time::{SignedDuration, Timestamp};
 use autumn_web::{AppState, AutumnResult, Capability, job};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::BillingService;
@@ -78,30 +78,30 @@ pub fn job_infos() -> Vec<JobInfo> {
 /// # Errors
 ///
 /// Returns [`BillingError::Config`] when the delay does not fit the calendar.
-pub(crate) fn due_at(now: DateTime<Utc>, delay: Duration) -> Result<DateTime<Utc>, BillingError> {
-    let delta = chrono::Duration::from_std(delay)
+pub(crate) fn due_at(now: Timestamp, delay: Duration) -> Result<Timestamp, BillingError> {
+    let delta = SignedDuration::try_from(delay)
         .map_err(|error| BillingError::Config(format!("dunning delay out of range: {error}")))?;
-    now.checked_add_signed(delta)
-        .ok_or_else(|| BillingError::Config("dunning delay overflows the calendar".to_owned()))
+    now.checked_add(delta)
+        .map_err(|_| BillingError::Config("dunning delay overflows the calendar".to_owned()))
 }
 
 /// `at - delay`, or `None` when it does not fit the calendar.
-fn before(at: DateTime<Utc>, delay: Duration) -> Option<DateTime<Utc>> {
-    chrono::Duration::from_std(delay)
+fn before(at: Timestamp, delay: Duration) -> Option<Timestamp> {
+    SignedDuration::try_from(delay)
         .ok()
-        .and_then(|delta| at.checked_sub_signed(delta))
+        .and_then(|delta| at.checked_sub(delta).ok())
 }
 
 /// When a `Running` row may be reclaimed: `updated_at + RUNNING_STALE_AFTER`.
-fn reclaim_at(row: &DunningAttempt) -> Option<DateTime<Utc>> {
-    chrono::Duration::from_std(RUNNING_STALE_AFTER)
+fn reclaim_at(row: &DunningAttempt) -> Option<Timestamp> {
+    SignedDuration::try_from(RUNNING_STALE_AFTER)
         .ok()
-        .and_then(|delta| row.updated_at.checked_add_signed(delta))
+        .and_then(|delta| row.updated_at.checked_add(delta).ok())
 }
 
 /// `true` when a `Running` row was abandoned: not updated since before
 /// `now - RUNNING_STALE_AFTER`.
-fn is_stale_running(row: &DunningAttempt, now: DateTime<Utc>) -> bool {
+fn is_stale_running(row: &DunningAttempt, now: Timestamp) -> bool {
     row.state == DunningState::Running
         && before(now, RUNNING_STALE_AFTER).is_some_and(|cutoff| row.updated_at < cutoff)
 }
@@ -128,7 +128,7 @@ pub(crate) fn job_client(state: &AppState) -> Result<Arc<JobClient>, BillingErro
 pub(crate) async fn schedule(
     state: &AppState,
     invoice_id: &str,
-    when: DateTime<Utc>,
+    when: Timestamp,
 ) -> Result<(), BillingError> {
     let client = job_client(state)?;
     let payload = serde_json::to_value(DunningRetryArgs {
@@ -262,7 +262,7 @@ async fn attempt(
     state: &AppState,
     service: &BillingService,
     row: &DunningAttempt,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), BillingError> {
     let store = service.store();
     let invoice_id = row.invoice_id.as_str();
@@ -336,7 +336,7 @@ async fn settle(
 async fn restore_pending(
     service: &BillingService,
     row: &DunningAttempt,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<bool, BillingError> {
     let mut pending = row.clone();
     pending.state = DunningState::Pending;
@@ -358,7 +358,7 @@ async fn recovered(
     service: &BillingService,
     row: &DunningAttempt,
     invoice: Invoice,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), BillingError> {
     let store = service.store();
     let mut paid = InvoiceUpsert::new(
@@ -407,7 +407,7 @@ async fn declined(
     row: &DunningAttempt,
     invoice: Invoice,
     reason: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), BillingError> {
     let store = service.store();
     let policy = &service.config().dunning;
@@ -465,7 +465,7 @@ async fn exhausted(
     row: &DunningAttempt,
     invoice: Invoice,
     reason: &str,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), BillingError> {
     let store = service.store();
     let mut exhausted = row.clone();
@@ -568,7 +568,7 @@ async fn undo_unpaid(
     service: &BillingService,
     subscription_id: &str,
     previous: Option<Subscription>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(), BillingError> {
     let store = service.store();
     let restore = previous

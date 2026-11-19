@@ -16,8 +16,7 @@ use autumn_billing::{ProviderId, SubscriptionStatus};
 use autumn_web::notifications::Notifications;
 use autumn_web::prelude::*;
 use autumn_web::test::{TestApp, TestClient};
-use autumn_web::time::{FixedClock, TickingClock};
-use chrono::{DateTime, TimeZone, Utc};
+use autumn_web::time::{FixedClock, SignedDuration, TickingClock, Timestamp};
 use serde_json::Value;
 
 use super::support::{
@@ -48,8 +47,8 @@ async fn unread(notifications: Notifications) -> AutumnResult<Json<u64>> {
 
 /// The pinned app clock. Fixture period ends must be later than this minus
 /// the 72h grace.
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 9, 10, 12, 0, 0).unwrap()
+fn now() -> Timestamp {
+    "2026-09-10T12:00:00Z".parse().unwrap()
 }
 
 fn e2e_app(store: Arc<MemoryBillingStore>) -> Harness {
@@ -213,7 +212,10 @@ async fn payment_failed_opens_dunning_and_invoice_paid_recovers() {
         .expect("dunning row");
     assert_eq!(dunning.state, DunningState::Pending);
     assert_eq!(dunning.attempt, 1);
-    assert_eq!(dunning.next_attempt_at, now() + chrono::Duration::hours(1));
+    assert_eq!(
+        dunning.next_attempt_at,
+        now() + SignedDuration::from_hours(1)
+    );
     h.client.assert_job_enqueued(RETRY_JOB_NAME);
     assert_eq!(
         unread_count(&h.client).await,

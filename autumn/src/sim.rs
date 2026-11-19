@@ -84,7 +84,9 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, LocalResult, NaiveDateTime, Offset, TimeZone, Utc};
+use jiff::Timestamp;
+use jiff::civil::DateTime as CivilDateTime;
+use jiff::tz::{Disambiguation, TimeZone};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use uuid::Uuid;
@@ -724,7 +726,7 @@ impl Sim {
     /// # Panics
     ///
     /// Panics if no replica with this name was mounted.
-    pub fn step_replica_clock(&self, name: &str, by: chrono::TimeDelta) {
+    pub fn step_replica_clock(&self, name: &str, by: jiff::SignedDuration) {
         let index = self.expect_replica_index(name);
         self.replicas[index].clock.step(by);
     }
@@ -934,7 +936,7 @@ impl Sim {
     /// wall-clock time leaking into a step that should have taken virtually none.
     ///
     /// It is **not** off-seam-read detection. It cannot tell you that some code
-    /// read `Utc::now()` / `Instant::now()` directly instead of through the
+    /// read `Timestamp::now()` / `Instant::now()` directly instead of through the
     /// injected clock — a free-function `now()` call has no runtime interception
     /// point in safe Rust, so its *absence* is not observable at runtime. Finding
     /// those reads is a static-analysis (deny-lint) job; this guard is the
@@ -1028,7 +1030,7 @@ impl Sim {
     /// The framework [`crate::time::Clock`] extractor (backed by the
     /// simulation's virtual clock) and tokio's virtual timer (`tokio::time::sleep`,
     /// job backoff delays, delayed enqueues) move by exactly the same amount, so
-    /// `Utc::now()`-via-extractor and a sleeping task stay in lockstep — a job
+    /// the extractor's `now()` and a sleeping task stay in lockstep — a job
     /// whose retry backs off 24 hours fires the instant this advances 24 hours,
     /// with zero wall-clock delay. Timers that come due within the window fire
     /// and their tasks are polled before this returns.
@@ -1055,29 +1057,23 @@ impl Sim {
         self.enforce_wall_clock_budget(guard_start);
     }
 
-    /// Advance virtual time **to** a specific zoned instant, resolving the
-    /// timezone (including any DST transition) to the correct UTC instant and
-    /// then stepping forward by the delta from the current sim instant.
+    /// Advance virtual time **to** a specific instant, then step forward by the
+    /// delta from the current sim instant.
     ///
-    /// This is the timezone/DST-aware companion to [`advance`](Sim::advance):
-    /// where `advance` takes a raw [`std::time::Duration`], `advance_to` takes a
-    /// *wall-clock target in any timezone* and computes the real (UTC) delta for
-    /// you. It is generic over any [`chrono::TimeZone`] — pass a
-    /// `chrono::DateTime<Utc>`, a `chrono::DateTime<chrono::FixedOffset>`, or a
-    /// `chrono::DateTime<chrono_tz::Tz>` from the `chrono-tz` crate — so a caller
-    /// can express a zoned target without this crate hard-depending on any
-    /// particular timezone database.
+    /// This is the instant-based companion to [`advance`](Sim::advance): where
+    /// `advance` takes a raw [`std::time::Duration`], `advance_to` takes a target
+    /// instant and computes the real delta for you. It accepts anything that
+    /// converts into a [`jiff::Timestamp`]: a `Timestamp` itself, or a
+    /// [`jiff::ZonedDateTime`] (`&ZonedDateTime` too) in any time zone, which
+    /// already names a single instant.
     ///
-    /// The target is converted to UTC via [`chrono::DateTime::with_timezone`],
-    /// which is unambiguous (every zoned `DateTime` already names a single
-    /// instant), and the sim then reuses [`advance`](Sim::advance) internally so
-    /// the injected wall clock and tokio's paused timer wheel stay in **exact
-    /// lockstep** — any `tokio::time::sleep` / job-backoff timer whose deadline
-    /// falls inside the crossed wall-clock window (a DST "spring-forward" gap
-    /// included) fires during the advance, then its task is polled before this
-    /// returns. Because the injected clock is UTC and monotonic, a spring-forward
-    /// boundary is just a shorter real interval — the timers inside it still fire
-    /// correctly.
+    /// The sim reuses [`advance`](Sim::advance) internally so the injected wall
+    /// clock and tokio's paused timer wheel stay in **exact lockstep**: any
+    /// `tokio::time::sleep` / job-backoff timer whose deadline falls inside the
+    /// crossed window (a DST "spring-forward" gap included) fires during the
+    /// advance, then its task is polled before this returns. Because the
+    /// injected clock is UTC and monotonic, a spring-forward boundary is just a
+    /// shorter real interval, and the timers inside it still fire correctly.
     ///
     /// # Forward-only semantics
     ///
@@ -1095,86 +1091,72 @@ impl Sim {
     ///
     /// # Panics
     ///
-    /// Panics if `target` resolves to a UTC instant strictly before the current
-    /// sim instant (see *Forward-only semantics*).
+    /// Panics if `target` is strictly before the current sim instant (see
+    /// *Forward-only semantics*).
     ///
     /// ```rust,ignore
-    /// use chrono::{TimeZone, Utc};
+    /// use autumn_web::time::Timestamp;
     /// // Advance the sim clock to a specific UTC instant.
-    /// let target = Utc.with_ymd_and_hms(2020, 3, 8, 12, 0, 0).unwrap();
-    /// sim.advance_to(&target).await;
+    /// let target: Timestamp = "2020-03-08T12:00:00Z".parse().unwrap();
+    /// sim.advance_to(target).await;
     /// sim.run_to_idle().await;
     /// ```
     ///
-    /// Written as a non-`async fn` returning a future so the generic zoned
-    /// `target` is resolved to UTC **synchronously** and never captured across an
-    /// `.await` — the returned future holds only `&self` and the resolved
-    /// `DateTime<Utc>`, so it stays `Send` for any `Tz` (a borrowed or non-`Sync`
-    /// `Tz` would otherwise poison the future).
-    pub fn advance_to<Tz>(
-        &self,
-        target: &DateTime<Tz>,
-    ) -> impl std::future::Future<Output = ()> + '_
+    /// Written as a non-`async fn` returning a future so `target` is converted
+    /// **synchronously** and never captured across an `.await`: the returned
+    /// future holds only `&self` and the resolved [`Timestamp`], so it stays
+    /// `Send` whatever `T` is.
+    pub fn advance_to<T>(&self, target: T) -> impl std::future::Future<Output = ()> + '_
     where
-        Tz: TimeZone,
+        T: Into<Timestamp>,
     {
-        let target_utc = target.with_timezone(&Utc);
-        self.advance_to_utc(target_utc)
+        self.advance_to_utc(target.into())
     }
 
-    /// Advance virtual time to a **naive local wall-clock time** interpreted in
-    /// timezone `tz`, resolving DST edge cases explicitly (no `.unwrap()` on a
-    /// [`chrono::LocalResult`]).
+    /// Advance virtual time to a **civil local wall-clock time** interpreted in
+    /// time zone `tz`, resolving DST edge cases deterministically.
     ///
     /// Convenience wrapper over [`advance_to`](Sim::advance_to) for the common
-    /// "advance to 2:30 AM local on this date" shape, where the naive local time
-    /// must be mapped to a single UTC instant. `tz` is any
-    /// [`chrono::TimeZone`] (e.g. a `chrono_tz::Tz`); the forward-only /
-    /// panic-on-past semantics of [`advance_to`](Sim::advance_to) apply once the
-    /// instant is resolved.
+    /// "advance to 2:30 AM local on this date" shape, where the civil local time
+    /// must be mapped to a single instant. The forward-only / panic-on-past
+    /// semantics of [`advance_to`](Sim::advance_to) apply once the instant is
+    /// resolved.
     ///
     /// # DST resolution (deterministic)
     ///
-    /// A naive local time need not correspond to exactly one UTC instant:
+    /// A civil local time need not correspond to exactly one instant. It is
+    /// resolved with [`Disambiguation::Compatible`]:
     ///
-    /// - **Unambiguous** ([`LocalResult::Single`])
-    ///   → that instant.
-    /// - **Fall-back / ambiguous** ([`LocalResult::Ambiguous`],
-    ///   the wall time occurs twice as the clock rolls back) → the **earlier**
-    ///   of the two UTC instants.
-    /// - **Spring-forward gap** ([`LocalResult::None`],
-    ///   the wall time never occurs because the clock jumps forward) → the
-    ///   nonexistent wall time is carried **forward across** the gap to a single
-    ///   deterministic post-transition instant (it is resolved by looking up the
-    ///   zone's offset at the matching UTC-clock reading and applying it, which
-    ///   shifts the requested time past the boundary rather than erroring). For
-    ///   example a request for the nonexistent `02:30` on a US spring-forward
-    ///   day resolves to `03:30` local (the same instant, one gap-length later).
+    /// - **Unambiguous** → that instant.
+    /// - **Fall-back / ambiguous** (the wall time occurs twice as the clock
+    ///   rolls back) → the **earlier** of the two instants.
+    /// - **Spring-forward gap** (the wall time never occurs because the clock
+    ///   jumps forward) → the wall time is read with the offset in effect before
+    ///   the gap, which carries it **forward across** the gap. For example a
+    ///   request for the nonexistent `02:30` on a US spring-forward day resolves
+    ///   to `03:30` local.
     ///
     /// # Panics
     ///
     /// Panics if the resolved instant is strictly before the current sim instant
-    /// (see [`advance_to`](Sim::advance_to)).
+    /// (see [`advance_to`](Sim::advance_to)), or if the local time is outside
+    /// the range a [`Timestamp`] can represent.
     ///
     /// ```rust,ignore
-    /// use chrono::NaiveDate;
-    /// let local = NaiveDate::from_ymd_opt(2020, 3, 8).unwrap()
-    ///     .and_hms_opt(3, 30, 0).unwrap();
-    /// sim.advance_to_local(local, &chrono_tz::America::New_York).await;
+    /// use autumn_web::time::{civil, tz::TimeZone};
+    /// let local = civil::date(2020, 3, 8).at(3, 30, 0, 0);
+    /// let new_york = TimeZone::get("America/New_York").unwrap();
+    /// sim.advance_to_local(local, &new_york).await;
     /// ```
     ///
     /// Like [`advance_to`](Sim::advance_to), this is a non-`async fn` returning a
     /// future: the `&tz` reference is used only while resolving the instant
-    /// synchronously and is **not** captured by the returned future, so the
-    /// future stays `Send` even though `Tz` need not be `Sync`.
-    pub fn advance_to_local<Tz>(
+    /// synchronously and is **not** captured by the returned future.
+    pub fn advance_to_local(
         &self,
-        local: NaiveDateTime,
-        tz: &Tz,
-    ) -> impl std::future::Future<Output = ()> + '_
-    where
-        Tz: TimeZone,
-    {
+        local: CivilDateTime,
+        tz: &TimeZone,
+    ) -> impl std::future::Future<Output = ()> + '_ {
         self.advance_to_utc(resolve_local_to_utc(local, tz))
     }
 
@@ -1182,7 +1164,7 @@ impl Sim {
     /// [`advance_to_local`](Sim::advance_to_local): plan the step against the
     /// current sim instant, then reuse [`advance`](Sim::advance) so the clock and
     /// timer wheel stay in lockstep.
-    async fn advance_to_utc(&self, target: DateTime<Utc>) {
+    async fn advance_to_utc(&self, target: Timestamp) {
         match plan_advance_to(self.clock.now(), target) {
             AdvancePlan::NoOp => {}
             AdvancePlan::Advance(delta) => self.advance(delta).await,
@@ -1365,11 +1347,9 @@ fn drain_fingerprint() -> (u64, usize) {
     (DRAIN_PROGRESS.with(std::cell::Cell::get), tasks)
 }
 
-/// The fixed sim epoch as a `DateTime`.
-fn sim_epoch() -> DateTime<Utc> {
-    Utc.timestamp_opt(SIM_EPOCH_UNIX_SECS, 0)
-        .single()
-        .unwrap_or_else(|| Utc.timestamp_nanos(0))
+/// The fixed sim epoch as a [`Timestamp`].
+fn sim_epoch() -> Timestamp {
+    Timestamp::from_second(SIM_EPOCH_UNIX_SECS).unwrap_or(Timestamp::UNIX_EPOCH)
 }
 
 /// A `u64` derived from `seed` and `purpose`.
@@ -1591,45 +1571,42 @@ enum AdvancePlan {
 /// Panics when `target` is strictly before `now`: virtual time is forward-only,
 /// and a past target signals a test-arithmetic bug that silent no-op behavior
 /// would hide.
-fn plan_advance_to(now: DateTime<Utc>, target: DateTime<Utc>) -> AdvancePlan {
-    let delta = target - now;
-    match delta.cmp(&chrono::Duration::zero()) {
+fn plan_advance_to(now: Timestamp, target: Timestamp) -> AdvancePlan {
+    match target.cmp(&now) {
         std::cmp::Ordering::Equal => AdvancePlan::NoOp,
         std::cmp::Ordering::Less => panic!(
             "Sim::advance_to target {target} is strictly before the current sim instant {now}; \
              virtual time is forward-only (advancing to a past instant is a test bug)"
         ),
-        std::cmp::Ordering::Greater => AdvancePlan::Advance(
-            delta
-                .to_std()
-                .expect("a strictly-positive chrono delta always converts to std::time::Duration"),
-        ),
+        std::cmp::Ordering::Greater => {
+            let delta = target.duration_since(now);
+            AdvancePlan::Advance(
+                std::time::Duration::try_from(delta)
+                    .expect("a strictly-positive delta always converts to std::time::Duration"),
+            )
+        }
     }
 }
 
-/// Resolve a naive local wall-clock time in timezone `tz` to a single UTC
+/// Resolve a civil local wall-clock time in time zone `tz` to a single
 /// instant, handling DST edges deterministically (see
 /// [`Sim::advance_to_local`] for the documented policy).
 ///
-/// Ambiguous (fall-back) local times resolve to the **earlier** instant; a
-/// nonexistent (spring-forward gap) local time is carried across the gap using
-/// the post-transition UTC offset. Never `.unwrap()`s a
-/// [`chrono::LocalResult`].
-fn resolve_local_to_utc<Tz>(local: NaiveDateTime, tz: &Tz) -> DateTime<Utc>
-where
-    Tz: TimeZone,
-{
-    match tz.from_local_datetime(&local) {
-        LocalResult::Single(dt) => dt.with_timezone(&Utc),
-        LocalResult::Ambiguous(earlier, _later) => earlier.with_timezone(&Utc),
-        LocalResult::None => {
-            // Spring-forward gap: apply the zone's offset at the UTC reading numerically equal
-            // to the wall time, which carries the time forward past the gap.
-            let offset_secs =
-                i64::from(tz.offset_from_utc_datetime(&local).fix().local_minus_utc());
-            (local - chrono::Duration::seconds(offset_secs)).and_utc()
-        }
-    }
+/// Uses [`Disambiguation::Compatible`]: an ambiguous (fall-back) local time
+/// resolves to the **earlier** instant, and a nonexistent (spring-forward gap)
+/// local time is read with the pre-transition offset, which carries it past
+/// the gap.
+///
+/// # Panics
+///
+/// Panics if the local time is outside the range a [`Timestamp`] can
+/// represent in `tz`.
+fn resolve_local_to_utc(local: CivilDateTime, tz: &TimeZone) -> Timestamp {
+    tz.to_ambiguous_timestamp(local)
+        .disambiguate(Disambiguation::Compatible)
+        .unwrap_or_else(|err| {
+            panic!("Sim::advance_to_local: {local} in {tz:?} is not a valid instant: {err}")
+        })
 }
 
 /// A seeded, deterministic random number generator handle.
@@ -1713,7 +1690,7 @@ impl SimRng {
 /// Wraps a [`TickingClock`] started at the fixed sim epoch. [`Sim::advance`]
 /// steps this clock (the wall-clock time a [`crate::time::Clock`] extractor
 /// reports) in lockstep with tokio's paused virtual timer, so
-/// `Utc::now()`-via-extractor and `tokio::time::sleep` never drift apart.
+/// the extractor's `now()` and `tokio::time::sleep` never drift apart.
 pub(crate) struct SimClock {
     inner: TickingClock,
 }
@@ -1745,7 +1722,7 @@ impl SimClock {
     ///
     /// Read by [`Sim::advance_to`] to compute the forward delta to a zoned
     /// target.
-    pub(crate) fn now(&self) -> DateTime<Utc> {
+    pub(crate) fn now(&self) -> Timestamp {
         crate::time::ClockSource::now(&self.inner)
     }
 }
@@ -1947,7 +1924,7 @@ fn note_own_advance(sim: &AmbientSimClock, duration: std::time::Duration) {
 }
 
 impl crate::time::ClockSource for AmbientSimClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> crate::time::Timestamp {
         self.wall
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2045,8 +2022,18 @@ mod tests {
         mount_entropy_seed, parse_liveness_budget, parse_seed, parse_strict_budget_ms,
         plan_advance_to, resolve_local_to_utc, strict_budget_from_env_or,
     };
-    use chrono::{NaiveDate, TimeZone, Utc};
+    use jiff::Timestamp;
+    use jiff::civil::date;
+    use jiff::tz::TimeZone;
     use rand::Rng;
+
+    fn utc(y: i16, mo: i8, d: i8, h: i8) -> Timestamp {
+        date(y, mo, d)
+            .at(h, 0, 0, 0)
+            .to_zoned_datetime(TimeZone::UTC)
+            .unwrap()
+            .timestamp()
+    }
 
     #[tokio::test(start_paused = true)]
     async fn blocking_work_reads_auto_advanced_sim_time() {
@@ -2164,14 +2151,14 @@ mod tests {
 
     #[test]
     fn plan_advance_to_equal_target_is_noop() {
-        let now = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let now = utc(2020, 1, 1, 0);
         assert_eq!(plan_advance_to(now, now), AdvancePlan::NoOp);
     }
 
     #[test]
     fn plan_advance_to_future_target_is_exact_delta() {
-        let now = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-        let target = Utc.with_ymd_and_hms(2020, 1, 1, 1, 0, 0).unwrap();
+        let now = utc(2020, 1, 1, 0);
+        let target = utc(2020, 1, 1, 1);
         assert_eq!(
             plan_advance_to(now, target),
             AdvancePlan::Advance(std::time::Duration::from_secs(3600))
@@ -2181,8 +2168,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "forward-only")]
     fn plan_advance_to_past_target_panics() {
-        let now = Utc.with_ymd_and_hms(2020, 1, 1, 1, 0, 0).unwrap();
-        let target = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let now = utc(2020, 1, 1, 1);
+        let target = utc(2020, 1, 1, 0);
         let _ = plan_advance_to(now, target);
     }
 
@@ -2234,12 +2221,20 @@ mod tests {
     #[test]
     fn resolve_local_unambiguous_maps_to_single_instant() {
         // A plain UTC-offset zone: 12:00 at +00:00 is exactly 12:00Z.
-        let local = NaiveDate::from_ymd_opt(2020, 6, 1)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap();
-        let got = resolve_local_to_utc(local, &Utc);
-        assert_eq!(got, Utc.with_ymd_and_hms(2020, 6, 1, 12, 0, 0).unwrap());
+        let local = date(2020, 6, 1).at(12, 0, 0, 0);
+        let got = resolve_local_to_utc(local, &TimeZone::UTC);
+        assert_eq!(got, utc(2020, 6, 1, 12));
+    }
+
+    #[test]
+    fn resolve_local_gap_moves_forward_and_fold_takes_the_earlier_instant() {
+        let new_york = TimeZone::get("America/New_York").unwrap();
+        // 02:30 does not exist on 2020-03-08: read at -05:00, it is 07:30Z (03:30 EDT).
+        let gap = resolve_local_to_utc(date(2020, 3, 8).at(2, 30, 0, 0), &new_york);
+        assert_eq!(gap, "2020-03-08T07:30:00Z".parse::<Timestamp>().unwrap());
+        // 01:30 occurs twice on 2020-11-01: the first one, in EDT, is 05:30Z.
+        let fold = resolve_local_to_utc(date(2020, 11, 1).at(1, 30, 0, 0), &new_york);
+        assert_eq!(fold, "2020-11-01T05:30:00Z".parse::<Timestamp>().unwrap());
     }
 
     /// A replica on the sim network is a host of that network, and its app

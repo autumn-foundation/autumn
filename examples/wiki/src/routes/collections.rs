@@ -188,7 +188,7 @@ pub async fn list(mut db: Db) -> AutumnResult<Markup> {
                             a href=(paths::show(c.id))
                               class="text-emerald-700 font-medium hover:underline" { (c.title) }
                             span class="text-sm text-gray-400" {
-                                (c.created_at.format("%Y-%m-%d %H:%M"))
+                                (c.created_at.strftime("%Y-%m-%d %H:%M"))
                             }
                         }
                     }

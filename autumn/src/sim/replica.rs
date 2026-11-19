@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use jiff::{SignedDuration, Timestamp};
 
 use crate::entropy::SeededEntropy;
 use crate::time::{ClockSource, MonotonicInstant};
@@ -38,7 +38,7 @@ const MAX_DRIFT_PPM: i64 = 999_999;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Replica {
     name: String,
-    offset: TimeDelta,
+    offset: SignedDuration,
     drift_ppm: i64,
     seeded: Option<(Duration, u32)>,
 }
@@ -49,7 +49,7 @@ impl Replica {
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            offset: TimeDelta::zero(),
+            offset: SignedDuration::ZERO,
             drift_ppm: 0,
             seeded: None,
         }
@@ -106,7 +106,7 @@ impl Replica {
             let max_ms = i64::try_from(max_offset.as_millis()).unwrap_or(i64::MAX / 4);
             let offset_ms = symmetric_draw(offset_bits, max_ms);
             let drift = symmetric_draw(drift_bits, i64::from(max_drift_ppm));
-            clock.offset = add_delta(clock.offset, TimeDelta::milliseconds(offset_ms));
+            clock.offset = add_delta(clock.offset, SignedDuration::from_millis(offset_ms));
             clock.drift_ppm = clock
                 .drift_ppm
                 .saturating_add(drift)
@@ -139,16 +139,16 @@ fn symmetric_draw(bits: u64, max: i64) -> i64 {
     value - max
 }
 
-fn delta(duration: Duration) -> TimeDelta {
-    TimeDelta::from_std(duration).unwrap_or(TimeDelta::MAX)
+fn delta(duration: Duration) -> SignedDuration {
+    SignedDuration::try_from(duration).unwrap_or(SignedDuration::MAX)
 }
 
-fn add_delta(a: TimeDelta, b: TimeDelta) -> TimeDelta {
-    a.checked_add(&b).unwrap_or_else(|| {
-        if b < TimeDelta::zero() {
-            TimeDelta::MIN
+fn add_delta(a: SignedDuration, b: SignedDuration) -> SignedDuration {
+    a.checked_add(b).unwrap_or_else(|| {
+        if b.is_negative() {
+            SignedDuration::MIN
         } else {
-            TimeDelta::MAX
+            SignedDuration::MAX
         }
     })
 }
@@ -157,7 +157,7 @@ fn add_delta(a: TimeDelta, b: TimeDelta) -> TimeDelta {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReplicaClock {
-    offset: TimeDelta,
+    offset: SignedDuration,
     drift_ppm: i64,
 }
 
@@ -165,7 +165,7 @@ impl ReplicaClock {
     /// How far the replica clock is ahead of the sim clock (negative: behind),
     /// before drift. Includes every step.
     #[must_use]
-    pub const fn offset(&self) -> TimeDelta {
+    pub const fn offset(&self) -> SignedDuration {
         self.offset
     }
 
@@ -189,17 +189,17 @@ struct NodeClockInner {
     /// The sim's elapsed-time source (its ambient monotonic clock).
     elapsed: Arc<dyn ClockSource>,
     /// The wall time at sim elapsed zero.
-    epoch: DateTime<Utc>,
+    epoch: Timestamp,
     /// Sim elapsed time at the mount. Drift counts from here.
     anchor: Duration,
     drift_ppm: i64,
-    offset: Mutex<TimeDelta>,
+    offset: Mutex<SignedDuration>,
 }
 
 impl NodeClock {
     pub(crate) fn new(
         elapsed: Arc<dyn ClockSource>,
-        epoch: DateTime<Utc>,
+        epoch: Timestamp,
         clock: ReplicaClock,
     ) -> Self {
         let anchor = elapsed.monotonic().since_origin();
@@ -223,12 +223,12 @@ impl NodeClock {
     }
 
     /// Jump the clock by `by`, as an NTP step does.
-    pub(crate) fn step(&self, by: TimeDelta) {
+    pub(crate) fn step(&self, by: SignedDuration) {
         let mut offset = self.offset();
         *offset = add_delta(*offset, by);
     }
 
-    fn offset(&self) -> std::sync::MutexGuard<'_, TimeDelta> {
+    fn offset(&self) -> std::sync::MutexGuard<'_, SignedDuration> {
         self.inner
             .offset
             .lock()
@@ -248,11 +248,15 @@ fn drift_nanos(since: Duration, ppm: i64) -> i128 {
 }
 
 impl ClockSource for NodeClock {
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         let (elapsed, since) = self.elapsed();
         let drift = i64::try_from(drift_nanos(since, self.inner.drift_ppm)).unwrap_or(0);
-        let wall = self.inner.epoch + delta(elapsed);
-        wall.checked_add_signed(add_delta(TimeDelta::nanoseconds(drift), *self.offset()))
+        let wall = self
+            .inner
+            .epoch
+            .checked_add(delta(elapsed))
+            .unwrap_or(Timestamp::MAX);
+        wall.checked_add(add_delta(SignedDuration::from_nanos(drift), *self.offset()))
             .unwrap_or(wall)
     }
 
@@ -274,13 +278,13 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use chrono::{TimeDelta, TimeZone, Utc};
+    use jiff::{SignedDuration, Timestamp};
 
     use super::{NodeClock, Replica, ReplicaClock, symmetric_draw};
     use crate::time::{ClockSource, TickingClock};
 
     fn node(spec: &Replica) -> (TickingClock, NodeClock) {
-        let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+        let epoch = Timestamp::from_second(1_577_836_800).unwrap();
         let base = TickingClock::starting_at(epoch);
         let elapsed: Arc<dyn ClockSource> = Arc::new(base.clone());
         (base, NodeClock::new(elapsed, epoch, spec.resolve(0)))
@@ -293,11 +297,11 @@ mod tests {
             .clock_behind(Duration::from_secs(2))
             .clock_drift_ppm(500_000);
         let (base, clock) = node(&spec);
-        assert_eq!(clock.now() - base.now(), TimeDelta::seconds(3));
+        assert_eq!(clock.now() - base.now(), SignedDuration::from_secs(3));
         base.advance(Duration::from_secs(10));
         assert_eq!(
             clock.now() - base.now(),
-            TimeDelta::seconds(8),
+            SignedDuration::from_secs(8),
             "3 s offset + 5 s drift"
         );
         assert_eq!(
@@ -321,10 +325,10 @@ mod tests {
         let (_base, clock) = node(&Replica::named("a"));
         let wall = clock.now();
         let mono = clock.monotonic();
-        clock.step(TimeDelta::seconds(-30));
-        assert_eq!(wall - clock.now(), TimeDelta::seconds(30));
+        clock.step(SignedDuration::from_secs(-30));
+        assert_eq!(wall - clock.now(), SignedDuration::from_secs(30));
         assert_eq!(clock.monotonic(), mono);
-        assert_eq!(clock.settings().offset(), TimeDelta::seconds(-30));
+        assert_eq!(clock.settings().offset(), SignedDuration::from_secs(-30));
     }
 
     #[test]
@@ -335,7 +339,7 @@ mod tests {
         let mut differs = false;
         for seed in 0..200 {
             let ReplicaClock { offset, drift_ppm } = spec.resolve(seed);
-            assert!(offset.abs() <= TimeDelta::milliseconds(250), "{offset}");
+            assert!(offset.abs() <= SignedDuration::from_millis(250), "{offset}");
             assert!(drift_ppm.abs() <= 40, "{drift_ppm}");
             differs |= spec.resolve(seed) != other.resolve(seed);
         }

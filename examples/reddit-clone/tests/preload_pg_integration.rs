@@ -303,7 +303,7 @@ fn accessing_not_preloaded_is_typed_error() {
         creator_id: 1,
         subscriber_count: 0,
         comment_count: 0,
-        created_at: chrono::NaiveDateTime::default(),
+        created_at: autumn_web::time::civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
     });
     let err = sub.creator().expect_err("must be NotLoaded");
     assert_eq!(err.model, "Subreddit");

@@ -164,7 +164,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     /// [`FleetReplication::replicated_through`](crate::db::fleet_replication::FleetReplication::replicated_through).
     /// `None` with no replication.
     #[must_use]
-    pub fn replicated_through(&self, key: &FleetDbKey) -> Option<chrono::DateTime<chrono::Utc>> {
+    pub fn replicated_through(&self, key: &FleetDbKey) -> Option<crate::time::Timestamp> {
         self.replication()
             .and_then(|replication| replication.replicated_through(key))
     }
@@ -180,7 +180,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     pub async fn wait_replicated(
         &self,
         key: &FleetDbKey,
-        committed_at: chrono::DateTime<chrono::Utc>,
+        committed_at: crate::time::Timestamp,
         timeout: Duration,
     ) -> Result<(), crate::db::fleet_replication::ReplicatedWaitError> {
         let Some(replication) = self.replication() else {
@@ -449,7 +449,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
     pub(super) async fn replace_from_replica(
         &self,
         key: &FleetDbKey,
-        target: Option<chrono::DateTime<chrono::Utc>>,
+        target: Option<crate::time::Timestamp>,
     ) -> Result<Option<crate::replication::RestoreOutcome>, FleetError> {
         let mode = self.inner.engine.ship_mode();
         let replication = self.replication().cloned();
@@ -979,8 +979,8 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 report.last_error.clone_from(&row.last_error);
             }
         }
-        let stale = chrono::Duration::from_std(crate::db::fleet_tombstones::STALE_PENDING)
-            .is_ok_and(|stale| now.signed_duration_since(row.deleted_at) > stale);
+        let stale = jiff::SignedDuration::try_from(crate::db::fleet_tombstones::STALE_PENDING)
+            .is_ok_and(|stale| now.duration_since(row.deleted_at) > stale);
         if self.exists(&key) {
             // A confirmed row next to a live file is stale: a restore or a
             // re-create drops the row before it publishes. A pending row is
@@ -1169,7 +1169,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
 
 /// Remove the scratch files and staging directories under `dir` that were
 /// last changed more than [`SCRATCH_STALE`] before `now`. Blocking.
-fn sweep_scratch(dir: &Path, now: chrono::DateTime<chrono::Utc>) {
+fn sweep_scratch(dir: &Path, now: crate::time::Timestamp) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1177,11 +1177,10 @@ fn sweep_scratch(dir: &Path, now: chrono::DateTime<chrono::Utc>) {
         let changed = entry
             .metadata()
             .and_then(|meta| meta.modified())
-            .map(chrono::DateTime::<chrono::Utc>::from);
-        let old = changed.is_ok_and(|changed| {
-            now.signed_duration_since(changed)
-                .to_std()
-                .is_ok_and(|age| age > SCRATCH_STALE)
+            .ok()
+            .and_then(|modified| crate::time::Timestamp::try_from(modified).ok());
+        let old = changed.is_some_and(|changed| {
+            Duration::try_from(now.duration_since(changed)).is_ok_and(|age| age > SCRATCH_STALE)
         });
         if !old {
             continue;
@@ -1205,7 +1204,7 @@ fn sweep_scratch(dir: &Path, now: chrono::DateTime<chrono::Utc>) {
 async fn newest_generation(
     replication: &Arc<crate::db::fleet_replication::FleetReplication>,
     key: &FleetDbKey,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+) -> Result<Option<crate::time::Timestamp>, String> {
     let (reader, key) = (Arc::clone(replication), key.clone());
     crate::time::spawn_blocking(move || reader.newest_generation(&key))
         .await

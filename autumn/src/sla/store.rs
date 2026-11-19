@@ -5,7 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use uuid::Uuid;
 
 use super::{Obligation, SlaError};
@@ -23,25 +23,27 @@ pub struct ObligationRecord {
     /// key make a record with a new generation.
     pub generation: Uuid,
     /// The instant when the escalation was claimed.
-    pub escalated_at: Option<DateTime<Utc>>,
+    pub escalated_at: Option<Timestamp>,
     /// The deadline that decides the escalation. `track` sets it, and
     /// `Sla::reconcile` changes it. `None` means the calendar decides.
-    /// `9999-12-31T23:59:59Z` means no deadline: no claim matches it. A
-    /// calendar deadline at or after that instant counts as no deadline.
-    pub due_at: Option<DateTime<Utc>>,
+    /// [`Timestamp::MAX`] means no deadline: no claim matches it. A store
+    /// that reads back a later instant than it can hold (such as the
+    /// `9999-12-31T23:59:59Z` marker of older versions) must clamp it to
+    /// [`Timestamp::MAX`].
+    pub due_at: Option<Timestamp>,
     /// The token of the escalate job that runs the handler. The first job
     /// that sets it runs; a job with another token does not.
     pub dispatch_token: Option<Uuid>,
 }
 
 /// The stored deadline for "no deadline". No claim matches it.
-pub(super) fn no_deadline() -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(253_402_300_799, 0).unwrap_or(DateTime::<Utc>::MAX_UTC)
+pub(super) const fn no_deadline() -> Timestamp {
+    Timestamp::MAX
 }
 
 /// A calendar deadline, or `None` if it is at or after [`no_deadline`].
 /// Thus no real deadline is ever the marker.
-pub(super) fn real_deadline(due: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+pub(super) fn real_deadline(due: Option<Timestamp>) -> Option<Timestamp> {
     due.filter(|due| *due < no_deadline())
 }
 
@@ -60,7 +62,7 @@ impl ObligationRecord {
 
     /// Set the stored deadline.
     #[must_use]
-    pub const fn with_due_at(mut self, due_at: DateTime<Utc>) -> Self {
+    pub const fn with_due_at(mut self, due_at: Timestamp) -> Self {
         self.due_at = Some(due_at);
         self
     }
@@ -94,7 +96,7 @@ pub trait ObligationStore: Send + Sync + 'static {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> StoreFuture<'a, bool>;
 
     /// Set the deadline to `due_at` if the escalation is not set. Return
@@ -103,7 +105,7 @@ pub trait ObligationStore: Send + Sync + 'static {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        due_at: DateTime<Utc>,
+        due_at: Timestamp,
     ) -> StoreFuture<'a, bool>;
 
     /// Set the dispatch token to `token` if it is not set, the stored
@@ -115,7 +117,7 @@ pub trait ObligationStore: Send + Sync + 'static {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        due_at: DateTime<Utc>,
+        due_at: Timestamp,
         token: Uuid,
     ) -> StoreFuture<'a, bool>;
 
@@ -130,8 +132,8 @@ pub trait ObligationStore: Send + Sync + 'static {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        due_at: DateTime<Utc>,
-        at: DateTime<Utc>,
+        due_at: Timestamp,
+        at: Timestamp,
     ) -> StoreFuture<'a, bool>;
 
     /// Clear the escalation instant after a failed enqueue, only if it is
@@ -140,7 +142,7 @@ pub trait ObligationStore: Send + Sync + 'static {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        claimed_at: DateTime<Utc>,
+        claimed_at: Timestamp,
     ) -> StoreFuture<'a, ()>;
 
     /// Remove the record for `key`, whatever its generation. Return `true`
@@ -215,7 +217,7 @@ impl ObligationStore for MemoryObligationStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> StoreFuture<'a, bool> {
         let changed = self.with_instance(key, generation, |record| {
             let unset = record.obligation.met().is_none();
@@ -231,7 +233,7 @@ impl ObligationStore for MemoryObligationStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        due_at: DateTime<Utc>,
+        due_at: Timestamp,
     ) -> StoreFuture<'a, bool> {
         let changed = self.with_instance(key, generation, |record| {
             let open = record.escalated_at.is_none();
@@ -247,7 +249,7 @@ impl ObligationStore for MemoryObligationStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        due_at: DateTime<Utc>,
+        due_at: Timestamp,
         token: Uuid,
     ) -> StoreFuture<'a, bool> {
         let owned = self.with_instance(key, generation, |record| {
@@ -268,8 +270,8 @@ impl ObligationStore for MemoryObligationStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        due_at: DateTime<Utc>,
-        at: DateTime<Utc>,
+        due_at: Timestamp,
+        at: Timestamp,
     ) -> StoreFuture<'a, bool> {
         let claimed = self.with_instance(key, generation, |record| {
             let open = record.escalated_at.is_none()
@@ -287,7 +289,7 @@ impl ObligationStore for MemoryObligationStore {
         &'a self,
         key: &'a str,
         generation: Uuid,
-        claimed_at: DateTime<Utc>,
+        claimed_at: Timestamp,
     ) -> StoreFuture<'a, ()> {
         let released = self.with_instance(key, generation, |record| {
             if record.escalated_at == Some(claimed_at) && record.dispatch_token.is_none() {

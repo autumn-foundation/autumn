@@ -75,7 +75,7 @@ fn dashboard_page(
                 @for project in projects {
                     li class="bg-white rounded-lg shadow p-4 flex items-center justify-between" {
                         span class="font-medium" { (project.name) }
-                        span class="text-xs text-gray-400" { (project.created_at.format("%Y-%m-%d %H:%M").to_string()) }
+                        span class="text-xs text-gray-400" { (project.created_at.strftime("%Y-%m-%d %H:%M").to_string()) }
                     }
                 }
                 @if projects.is_empty() {

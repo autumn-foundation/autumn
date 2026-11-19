@@ -55,8 +55,8 @@ mod tests {
             score: 0,
             hot_rank: 0.0,
             comment_count: 0,
-            created_at: chrono::NaiveDateTime::default(),
-            updated_at: chrono::NaiveDateTime::default(),
+            created_at: autumn_web::time::civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
+            updated_at: autumn_web::time::civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
         }
     }
 

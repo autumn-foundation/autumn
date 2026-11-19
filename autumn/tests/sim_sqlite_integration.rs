@@ -145,7 +145,7 @@ impl Plugin for SimJobsPlugin {
 /// `sim.build` mounted both the `SQLite` substrate and the sim clock.
 #[get("/now")]
 async fn now_route(clock: Clock) -> String {
-    clock.now().to_rfc3339()
+    autumn_web::time::compat::rfc3339(clock.now())
 }
 
 #[derive(diesel::QueryableByName)]

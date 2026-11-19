@@ -155,6 +155,7 @@ mod imp {
     use autumn_web::fleet_layout::FleetDbKey;
     use autumn_web::migrate::MigrationScope;
     use autumn_web::replication::ReplicationSettings;
+    use autumn_web::time::compat;
 
     use super::FleetCommand;
     use crate::db::replica;
@@ -860,7 +861,7 @@ mod imp {
                  (database.fleet.replica_retention_after_delete). Until that time, `autumn \
                  fleet restore {key} --force` brings it back. After that time, the app \
                  purges it.",
-                row.purge_after.to_rfc3339()
+                compat::rfc3339(row.purge_after)
             ),
             Ok(Some(row)) => eprintln!(
                 "  \u{26A0} Its replica is not purged yet: {}.\n    A tombstone records it: \
@@ -996,7 +997,7 @@ mod imp {
             outcome.bytes,
             outcome.output.display(),
             outcome.frames_replayed,
-            outcome.plan.effective.to_rfc3339()
+            compat::rfc3339(outcome.plan.effective)
         );
         Ok(())
     }
@@ -1207,7 +1208,7 @@ mod imp {
         target: &Target,
         args: &LakeArgs<'_>,
         sql: &str,
-        at: Option<chrono::DateTime<chrono::Utc>>,
+        at: Option<autumn_web::time::Timestamp>,
         destination: Arc<dyn autumn_web::replication::ReplicaDestination>,
         base: String,
         out: Option<(&Path, std::fs::File)>,
@@ -1416,8 +1417,8 @@ mod imp {
         ) {
             eprintln!(
                 "  \u{2139} each tenant is current as of its own instant: oldest {}, newest {}",
-                oldest.to_rfc3339(),
-                newest.to_rfc3339()
+                compat::rfc3339(oldest),
+                compat::rfc3339(newest)
             );
         }
         eprintln!(

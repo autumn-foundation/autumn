@@ -18,9 +18,7 @@ autumn-web = { version = "{{autumn_version}}", features = [
     "multipart",
     "variants",
 ] }
-chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
-diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }
+diesel = { version = "2", features = ["postgres", "serde_json"] }
 diesel-async = { version = "0.10", features = ["postgres"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 diesel_migrations = "2"

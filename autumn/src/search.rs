@@ -518,18 +518,16 @@ impl_search_text_value_via_display!(
     f32,
     f64,
     char,
-    chrono::NaiveDate,
-    chrono::NaiveTime,
-    chrono::NaiveDateTime,
+    jiff::civil::Date,
+    jiff::civil::Time,
+    jiff::civil::DateTime,
     uuid::Uuid,
 );
 
-impl<Tz: chrono::TimeZone> SearchTextValue for chrono::DateTime<Tz>
-where
-    Tz::Offset: fmt::Display,
-{
+/// An instant indexes as RFC 3339 with a `+00:00` offset.
+impl SearchTextValue for jiff::Timestamp {
     fn search_text_value(&self) -> String {
-        self.to_rfc3339()
+        crate::time::compat::rfc3339(*self)
     }
 }
 

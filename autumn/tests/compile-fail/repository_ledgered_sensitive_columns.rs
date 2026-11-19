@@ -26,7 +26,7 @@ pub struct LedgeredSensitiveNote {
     pub content: String,
     pub secret: String,
     #[default]
-    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[version_history(sensitive = ["secret"])]

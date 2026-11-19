@@ -129,7 +129,7 @@ pub struct VotableSoftTarget {
     #[default]
     pub score: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(VotableSoftTarget, table = "votable_soft_targets", soft_delete)]
@@ -182,7 +182,7 @@ pub struct VotableSoftLikeTarget {
     #[default]
     pub soft_like_count: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(

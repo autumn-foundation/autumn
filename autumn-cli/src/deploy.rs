@@ -3386,7 +3386,9 @@ fn resolve_release_binary(resolved: &ResolvedDeployConfig) -> Result<PathBuf, De
 /// Nondeterministic by design in production; tests inject a fixed id instead
 /// through [`exec::first_deploy_ops`].
 fn default_release_id() -> String {
-    chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
+    jiff::Timestamp::now()
+        .strftime("%Y%m%dT%H%M%SZ")
+        .to_string()
 }
 
 /// Resolve the ordered local project directories the deploy reads config from.

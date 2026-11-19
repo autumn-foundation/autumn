@@ -2230,26 +2230,26 @@ pub struct {pascal_name} {{
 {totp_fields}    #[default]
     pub failed_attempts: i32,
     #[default]
-    pub locked_at: Option<chrono::NaiveDateTime>,
+    pub locked_at: Option<autumn_web::time::civil::DateTime>,
     pub reset_token_digest: Option<String>,
-    pub reset_token_expires_at: Option<chrono::NaiveDateTime>,
+    pub reset_token_expires_at: Option<autumn_web::time::civil::DateTime>,
     pub confirm_token_digest: Option<String>,
-    pub confirm_token_expires_at: Option<chrono::NaiveDateTime>,
+    pub confirm_token_expires_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub email_confirmed_at: Option<chrono::NaiveDateTime>,
+    pub email_confirmed_at: Option<autumn_web::time::civil::DateTime>,
     // Pending email-change target (issue #1396). Nullable: set when a change is
     // requested, cleared when the new-address token is confirmed. The old
     // `email` stays valid for sign-in until confirmation swaps it.
     #[default]
     pub pending_email: Option<String>,
     #[default]
-    pub export_requested_at: Option<chrono::NaiveDateTime>,
+    pub export_requested_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub delete_requested_at: Option<chrono::NaiveDateTime>,
+    pub delete_requested_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub delete_scheduled_at: Option<chrono::NaiveDateTime>,
+    pub delete_scheduled_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 "
     )
@@ -2276,9 +2276,9 @@ pub struct RecoveryCode {{
     pub user_id: i64,
     pub code_digest: String,
     // Kept in `NewRecoveryCode` so inserts set it explicitly to `None`.
-    pub used_at: Option<chrono::NaiveDateTime>,
+    pub used_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 "
     )
@@ -2328,9 +2328,9 @@ pub struct {user_pascal}Session {{
     #[default]
     pub label: Option<String>,
     #[default]
-    pub last_seen_at: chrono::NaiveDateTime,
+    pub last_seen_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 
 impl {user_pascal}Session {{
@@ -2483,8 +2483,8 @@ pub struct {user_pascal}RememberToken {{
     /// When the current token was minted (the last rotation); bounds how long
     /// `previous_token_hash` stays acceptable.
     #[default]
-    pub rotated_at: Option<chrono::NaiveDateTime>,
-    pub expires_at: chrono::NaiveDateTime,
+    pub rotated_at: Option<autumn_web::time::civil::DateTime>,
+    pub expires_at: autumn_web::time::civil::DateTime,
     pub ip: String,
     pub user_agent: String,
     pub ua_family: String,
@@ -2493,16 +2493,20 @@ pub struct {user_pascal}RememberToken {{
     #[default]
     pub label: Option<String>,
     #[default]
-    pub last_used_at: Option<chrono::NaiveDateTime>,
+    pub last_used_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 
 impl {user_pascal}RememberToken {{
-    /// Absolute expiry as a UTC datetime, for `autumn_web::auth::evaluate_remember`.
+    /// Absolute expiry as an instant, for `autumn_web::auth::evaluate_remember`.
+    /// The column holds a UTC wall-clock time; one past the end of the
+    /// supported range reads as the latest representable instant.
     #[must_use]
-    pub fn expires_at_utc(&self) -> chrono::DateTime<chrono::Utc> {{
-        self.expires_at.and_utc()
+    pub fn expires_at_utc(&self) -> autumn_web::time::Timestamp {{
+        autumn_web::time::tz::TimeZone::UTC
+            .to_timestamp(self.expires_at)
+            .unwrap_or(autumn_web::time::Timestamp::MAX)
     }}
 
     /// Human-readable device line for the sessions page, preferring the
@@ -2525,7 +2529,7 @@ impl {user_pascal}RememberToken {{
 /// Persist a new remember chain for a successful "remember me" login.
 pub async fn insert_remember_token(
     conn: &mut impl diesel_async::AsyncConnection<Backend = ::autumn_web::RuntimeBackend>,
-    row: &New{user_pascal}RememberToken,
+    row: New{user_pascal}RememberToken,
 ) -> autumn_web::AutumnResult<()> {{
     diesel::insert_into({rem_table}::table)
         .values(row)
@@ -2568,8 +2572,8 @@ pub async fn rotate_remember_token(
     series: &str,
     old_hash: &str,
     new_hash: &str,
-    new_expiry: chrono::NaiveDateTime,
-    now: chrono::NaiveDateTime,
+    new_expiry: autumn_web::time::civil::DateTime,
+    now: autumn_web::time::civil::DateTime,
 ) -> autumn_web::AutumnResult<usize> {{
     diesel::update(
         {rem_table}::table
@@ -2579,9 +2583,9 @@ pub async fn rotate_remember_token(
     .set((
         {rem_table}::previous_token_hash.eq(Some(old_hash)),
         {rem_table}::token_hash.eq(new_hash),
-        {rem_table}::rotated_at.eq(Some(now)),
-        {rem_table}::expires_at.eq(new_expiry),
-        {rem_table}::last_used_at.eq(Some(now)),
+        {rem_table}::rotated_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
+        {rem_table}::expires_at.eq(autumn_web::db::SqlDateTime::from(new_expiry)),
+        {rem_table}::last_used_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
     ))
     .execute(conn)
     .await
@@ -2713,12 +2717,12 @@ pub struct MagicLinkToken {{
     // References {user_table}(id).
     pub user_id: i64,
     pub token_digest: String,
-    pub expires_at: chrono::NaiveDateTime,
+    pub expires_at: autumn_web::time::civil::DateTime,
     // Single-use marker: set to `now` on the first successful verify. A second
     // verify of the same token finds it non-NULL and is rejected.
-    pub consumed_at: Option<chrono::NaiveDateTime>,
+    pub consumed_at: Option<autumn_web::time::civil::DateTime>,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 "
     )
@@ -3002,14 +3006,18 @@ async fn rebind_tracked_session_on_rotation(
     Ok(())
 }}
 
-/// The sliding expiry `duration_secs` in the future, as a naive UTC timestamp
+/// The sliding expiry `duration_secs` in the future, as a UTC wall-clock time
 /// (the column type), guarding the `u64 → i64` cast and saturating (rather than
 /// panicking) on an absurd configured duration.
-fn remember_expiry(config: &RememberConfig, now: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDateTime {{
+fn remember_expiry(
+    config: &RememberConfig,
+    now: autumn_web::time::Timestamp,
+) -> autumn_web::time::civil::DateTime {{
     let secs = i64::try_from(config.duration_secs).unwrap_or(2_592_000);
-    now.checked_add_signed(chrono::Duration::seconds(secs))
-        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
-        .naive_utc()
+    let expiry = now
+        .checked_add(autumn_web::time::SignedDuration::from_secs(secs))
+        .unwrap_or(autumn_web::time::Timestamp::MAX);
+    autumn_web::time::tz::TimeZone::UTC.to_datetime(expiry)
 }}
 
 /// Whether to set the `Secure` cookie attribute — mirrors the session cookie by
@@ -3067,14 +3075,14 @@ pub async fn issue_remember_cookie(
         series: cred.series.clone(),
         user_id: {snake_name}_id,
         token_hash: hash_remember_token(&cred.token),
-        expires_at: remember_expiry(config, chrono::Utc::now()),
+        expires_at: remember_expiry(config, autumn_web::time::ambient_now()),
         ip: ip.to_string(),
         user_agent,
         ua_family: parsed.family,
         ua_os: parsed.os,
         ua_device: parsed.device_class.to_string(),
     }};
-    insert_remember_token(&mut **db, &row).await?;
+    insert_remember_token(&mut **db, row).await?;
     Ok(build_remember_cookie(
         config,
         &cred.series,
@@ -3107,7 +3115,9 @@ fn to_remember_record(r: &{pascal_name}RememberToken) -> RememberRecord {{
         series: r.series.clone(),
         token_hash: r.token_hash.clone(),
         previous_token_hash: r.previous_token_hash.clone(),
-        rotated_at: r.rotated_at.map(|t| t.and_utc()),
+        rotated_at: r
+            .rotated_at
+            .and_then(|t| autumn_web::time::tz::TimeZone::UTC.to_timestamp(t).ok()),
         expires_at: r.expires_at_utc(),
     }}
 }}
@@ -3209,7 +3219,7 @@ pub async fn remember_me(
         }}
     }};
 
-    let now = chrono::Utc::now();
+    let now = autumn_web::time::ambient_now();
     let secure = remember_secure(request.headers());
     let grace = autumn_web::auth::default_rotation_grace();
     let ip = request
@@ -3236,7 +3246,7 @@ pub async fn remember_me(
                 &row.token_hash,
                 &new_hash,
                 new_expiry,
-                now.naive_utc(),
+                autumn_web::time::tz::TimeZone::UTC.to_datetime(now),
             )
             .await
             {{
@@ -3495,12 +3505,12 @@ pub async fn require_tracked_session(
     // would deep-clone every section to read one field on a request path.
     let config = state.config_arc();
     let sessions_cfg = &config.auth.sessions;
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
     let window =
-        chrono::Duration::seconds(i64::try_from(sessions_cfg.last_seen_update_secs).unwrap_or(60));
-    if now.signed_duration_since(tracked.last_seen_at) >= window {{
+        autumn_web::time::SignedDuration::from_secs(i64::try_from(sessions_cfg.last_seen_update_secs).unwrap_or(60));
+    if now.duration_since(tracked.last_seen_at) >= window {{
         let _ = diesel::update({sess_table}::table.find(tracked.id))
-            .set({sess_table}::last_seen_at.eq(now))
+            .set({sess_table}::last_seen_at.eq(autumn_web::db::SqlDateTime::from(now)))
             .execute(&mut **db)
             .await;
     }}
@@ -3542,9 +3552,9 @@ fn sessions_list_fragment(
                             @if current {{ " — this device" }}
                         }}
                         p {{
-                            "Signed in " (s.created_at.format("%Y-%m-%d %H:%M UTC").to_string())
+                            "Signed in " (s.created_at.strftime("%Y-%m-%d %H:%M UTC").to_string())
                             " from " (s.ip)
-                            " · last seen " (s.last_seen_at.format("%Y-%m-%d %H:%M UTC").to_string())
+                            " · last seen " (s.last_seen_at.strftime("%Y-%m-%d %H:%M UTC").to_string())
                         }}
                         @if !current {{
                             // Real form so revocation works without JavaScript;
@@ -3581,10 +3591,10 @@ fn sessions_list_fragment(
                             " — Persistent login (Remember me)"
                         }}
                         p {{
-                            "Created " (r.created_at.format("%Y-%m-%d %H:%M UTC").to_string())
+                            "Created " (r.created_at.strftime("%Y-%m-%d %H:%M UTC").to_string())
                             " from " (r.ip)
                             @if let Some(last) = r.last_used_at {{
-                                " · last used " (last.format("%Y-%m-%d %H:%M UTC").to_string())
+                                " · last used " (last.strftime("%Y-%m-%d %H:%M UTC").to_string())
                             }}
                         }}
                         // Revoke this persistent chain by its stable series id,
@@ -3904,7 +3914,7 @@ pub async fn signup(
 
     let raw_confirm_token = generate_confirmation_token();
     let confirm_digest = sha256_hex(&raw_confirm_token);
-    let confirm_expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::hours(24);
+    let confirm_expires_at = autumn_web::time::ambient_civil_utc() + autumn_web::time::SignedDuration::from_hours(24);
 
     let password_digest = hash_password(&form.password).await?;
     let new_{snake_name} = New{pascal_name} {{
@@ -3918,7 +3928,7 @@ pub async fn signup(
     }};
 
     let result: Result<{pascal_name}, _> = diesel::insert_into({table}::table)
-        .values(&new_{snake_name})
+        .values(new_{snake_name})
         .returning({pascal_name}::as_returning())
         .get_result(&mut *db)
         .await;
@@ -4029,7 +4039,7 @@ async fn stamp_lockout(db: &mut Db, id: i64, threshold: i32) -> AutumnResult<boo
             .filter({table}::failed_attempts.ge(threshold))
             .filter({table}::locked_at.is_null()),
     )
-    .set({table}::locked_at.eq(Some(chrono::Utc::now().naive_utc())))
+    .set({table}::locked_at.eq(Some(autumn_web::db::SqlDateTime::from(autumn_web::time::ambient_civil_utc()))))
     .execute(&mut **db)
     .await
     .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
@@ -4085,8 +4095,8 @@ pub async fn login(
 
     if let Some(ref {snake_name}) = found_{snake_name} {{
         if lockout_enabled {{
-            let now = chrono::Utc::now().naive_utc();
-            let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+            let now = autumn_web::time::ambient_civil_utc();
+            let cooloff = autumn_web::time::SignedDuration::from_secs(lockout_cfg.cooloff_secs as i64);
 
             // Track local state; reset if cool-off has elapsed so the first new
             // failure after expiry is counted as attempt #1, not a re-lock.
@@ -4130,7 +4140,7 @@ pub async fn login(
                     diesel::update({table}::table.find({snake_name}.id))
                         .set((
                             {table}::failed_attempts.eq(1i32),
-                            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+                            {table}::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
                         ))
                         .execute(&mut *db)
                         .await
@@ -4215,20 +4225,20 @@ pub async fn login(
     // If zero rows match after excluding active (non-expired) locks, the
     // account was just locked concurrently — reject the login.
     if lockout_enabled {{
-        let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
-        let lock_expired_before = chrono::Utc::now().naive_utc() - cooloff;
+        let cooloff = autumn_web::time::SignedDuration::from_secs(lockout_cfg.cooloff_secs as i64);
+        let lock_expired_before = autumn_web::time::ambient_civil_utc() - cooloff;
         let rows_cleared = diesel::update(
             {table}::table
                 .find({snake_name}.id)
                 .filter(
                     {table}::locked_at.is_null().or(
-                        {table}::locked_at.le(lock_expired_before)
+                        {table}::locked_at.le(autumn_web::db::SqlDateTime::from(lock_expired_before))
                     )
                 ),
         )
         .set((
             {table}::failed_attempts.eq(0),
-            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+            {table}::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
         ))
         .execute(&mut *db)
         .await
@@ -4381,7 +4391,7 @@ pub async fn unlock_account(
     diesel::update({table}::table.filter({table}::email.eq(&email)))
         .set((
             {table}::failed_attempts.eq(0),
-            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+            {table}::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
         ))
         .execute(&mut *db)
         .await
@@ -4419,7 +4429,7 @@ pub async fn account(session: Session, State(state): State<AppState>, mut db: Db
             div style="border:1px solid #c00;padding:0.75rem;margin-bottom:1rem;" {{
                 p {{
                     "⚠️ Your account is scheduled for deletion on "
-                    (scheduled.format("%Y-%m-%d").to_string())
+                    (scheduled.strftime("%Y-%m-%d").to_string())
                     ". Log in before then to cancel."
                 }}
                 form action="/account/delete/cancel" method="post" {{
@@ -4649,7 +4659,7 @@ pub async fn change_password(
                     // an unexpired reset_token_digest, so a link minted before this
                     // change could otherwise overwrite the just-secured password.
                     {table}::reset_token_digest.eq(None::<String>),
-                    {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                    {table}::reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
                 ))
                 .execute(conn)
                 .await?;
@@ -4831,7 +4841,7 @@ pub async fn change_email(
     // prior pending change is superseded (AC4).
     let raw_token = generate_confirmation_token();
     let confirm_digest = sha256_hex(&raw_token);
-    let confirm_expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::hours(24);
+    let confirm_expires_at = autumn_web::time::ambient_civil_utc() + autumn_web::time::SignedDuration::from_hours(24);
 
     // Send the confirmation link to the NEW address first; only persist the
     // pending change on success, so a transient mail failure leaves the account
@@ -4842,7 +4852,7 @@ pub async fn change_email(
         .set((
             {table}::pending_email.eq(Some(&new_email)),
             {table}::confirm_token_digest.eq(Some(&confirm_digest)),
-            {table}::confirm_token_expires_at.eq(Some(confirm_expires_at)),
+            {table}::confirm_token_expires_at.eq(Some(autumn_web::db::SqlDateTime::from(confirm_expires_at))),
         ))
         .execute(&mut *db)
         .await
@@ -4877,7 +4887,7 @@ pub async fn confirm_email_change(
     Path(params): Path<ConfirmEmailPath>,
 ) -> AutumnResult<Response> {{
     let token_digest = sha256_hex(&params.token);
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
     let generic = || {{
         AutumnError::unprocessable_msg(
             "This email-change link is invalid or has expired. \
@@ -4890,7 +4900,7 @@ pub async fn confirm_email_change(
     // shares the `confirm_token_digest` column but never sets `pending_email`.
     let {snake_name}: {pascal_name} = {table}::table
         .filter({table}::confirm_token_digest.eq(Some(&token_digest)))
-        .filter({table}::confirm_token_expires_at.gt(now))
+        .filter({table}::confirm_token_expires_at.gt(autumn_web::db::SqlDateTime::from(now)))
         .filter({table}::pending_email.is_not_null())
         .select({pascal_name}::as_select())
         .first(&mut *db)
@@ -4921,13 +4931,13 @@ pub async fn confirm_email_change(
                 {table}::email.eq(&new_email),
                 {table}::pending_email.eq(None::<String>),
                 {table}::confirm_token_digest.eq(None::<String>),
-                {table}::confirm_token_expires_at.eq(None::<chrono::NaiveDateTime>),
-                {table}::email_confirmed_at.eq(Some(now)),
+                {table}::confirm_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
+                {table}::email_confirmed_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
                 // Invalidate any outstanding reset token: a link sent to the OLD
                 // mailbox before this change must not be usable to reset the
                 // account after it has moved to the new address.
                 {table}::reset_token_digest.eq(None::<String>),
-                {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                {table}::reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
             ))
             .execute(conn)
             .await?;
@@ -5117,7 +5127,7 @@ pub async fn reauth(
         }})
         .is_some_and(|(ts, id)| {{
             id == {snake_name}.id
-                && chrono::Utc::now().timestamp() - ts < REAUTH_PW_VALID_SECS
+                && autumn_web::time::ambient_now().as_second() - ts < REAUTH_PW_VALID_SECS
         }});
     if !pw_verified_recently {{
         // Helper to render the reauth error form without duplicating markup.
@@ -5143,8 +5153,8 @@ pub async fn reauth(
         let lockout_enabled = lockout_cfg.enabled && lockout_cfg.threshold > 0;
 
         if lockout_enabled {{
-            let now = chrono::Utc::now().naive_utc();
-            let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+            let now = autumn_web::time::ambient_civil_utc();
+            let cooloff = autumn_web::time::SignedDuration::from_secs(lockout_cfg.cooloff_secs as i64);
 
             // Local mutable counters reset when cool-off has elapsed.
             let mut current_attempts = {snake_name}.failed_attempts;
@@ -5178,7 +5188,7 @@ pub async fn reauth(
                     diesel::update({table}::table.find({snake_name}.id))
                         .set((
                             {table}::failed_attempts.eq(1i32),
-                            {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+                            {table}::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
                         ))
                         .execute(&mut *db)
                         .await
@@ -5196,19 +5206,19 @@ pub async fn reauth(
             // Correct password — reset lockout counters. The WHERE guard
             // excludes accounts locked by a concurrent bad-password request
             // between our check and now, treating that race as auth failure.
-            let lock_expired_before = chrono::Utc::now().naive_utc() - cooloff;
+            let lock_expired_before = autumn_web::time::ambient_civil_utc() - cooloff;
             let rows_cleared = diesel::update(
                 {table}::table
                     .find({snake_name}.id)
                     .filter(
                         {table}::locked_at.is_null().or(
-                            {table}::locked_at.le(lock_expired_before)
+                            {table}::locked_at.le(autumn_web::db::SqlDateTime::from(lock_expired_before))
                         ),
                     ),
             )
             .set((
                 {table}::failed_attempts.eq(0i32),
-                {table}::locked_at.eq(None::<chrono::NaiveDateTime>),
+                {table}::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
             ))
             .execute(&mut *db)
             .await
@@ -5231,7 +5241,7 @@ pub async fn reauth(
         session
             .insert(
                 "reauth_pw_ok",
-                format!("{{}}:{{}}", chrono::Utc::now().timestamp(), {snake_name}.id),
+                format!("{{}}:{{}}", autumn_web::time::ambient_now().as_second(), {snake_name}.id),
             )
             .await;
     }}
@@ -5326,12 +5336,12 @@ pub async fn forgot_password(
         let raw_token = generate_reset_token();
         let token_digest = sha256_hex(&raw_token);
         let expires_at =
-            chrono::Utc::now().naive_utc() + chrono::Duration::hours(2);
+            autumn_web::time::ambient_civil_utc() + autumn_web::time::SignedDuration::from_hours(2);
 
         diesel::update({table}::table.find({snake_name}.id))
             .set((
                 {table}::reset_token_digest.eq(Some(&token_digest)),
-                {table}::reset_token_expires_at.eq(Some(expires_at)),
+                {table}::reset_token_expires_at.eq(Some(autumn_web::db::SqlDateTime::from(expires_at))),
             ))
             .execute(&mut *db)
             .await?;
@@ -5462,11 +5472,11 @@ pub async fn reset_password(
     }}
 
     let token_digest = sha256_hex(&form.token);
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
 
     let {snake_name}: {pascal_name} = {table}::table
         .filter({table}::reset_token_digest.eq(Some(&token_digest)))
-        .filter({table}::reset_token_expires_at.gt(now))
+        .filter({table}::reset_token_expires_at.gt(autumn_web::db::SqlDateTime::from(now)))
         .select({pascal_name}::as_select())
         .first(&mut *db)
         .await
@@ -5510,7 +5520,7 @@ pub async fn reset_password(
                 .set((
                     {table}::password_digest.eq(&new_digest),
                     {table}::reset_token_digest.eq(None::<String>),
-                    {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                    {table}::reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
                 ))
                 .execute(conn)
                 .await?;
@@ -5654,7 +5664,7 @@ pub async fn confirm_email(
     Path(params): Path<ConfirmEmailPath>,
 ) -> AutumnResult<Response> {{
     let token_digest = sha256_hex(&params.token);
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
 
     // Atomic UPDATE…RETURNING: filter, stamp, and invalidate in a single
     // statement so concurrent requests with the same token cannot both
@@ -5662,7 +5672,7 @@ pub async fn confirm_email(
     let {snake_name}: {pascal_name} = diesel::update(
         {table}::table
             .filter({table}::confirm_token_digest.eq(Some(&token_digest)))
-            .filter({table}::confirm_token_expires_at.gt(now))
+            .filter({table}::confirm_token_expires_at.gt(autumn_web::db::SqlDateTime::from(now)))
             // Disambiguate from an email-CHANGE token, which shares the
             // `confirm_token_digest` column but sets `pending_email`. Without this
             // reverse guard a change-email token could satisfy this signup-confirm
@@ -5672,9 +5682,9 @@ pub async fn confirm_email(
             .filter({table}::pending_email.is_null()),
     )
     .set((
-        {table}::email_confirmed_at.eq(Some(now)),
+        {table}::email_confirmed_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
         {table}::confirm_token_digest.eq(None::<String>),
-        {table}::confirm_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+        {table}::confirm_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
     ))
     .returning({pascal_name}::as_returning())
     .get_result(&mut *db)
@@ -5760,7 +5770,7 @@ pub async fn resend_confirmation(
 
     // Throttle: skip re-issue if a token was minted in the last 5 minutes
     // (expires_at would still be > 23h55m from now).  Non-enumerating.
-    let throttle_threshold = chrono::Utc::now().naive_utc() + chrono::Duration::minutes(23 * 60 + 55);
+    let throttle_threshold = autumn_web::time::ambient_civil_utc() + autumn_web::time::SignedDuration::from_mins(23 * 60 + 55);
 
     // Check eligibility before generating a new token.  We send the email
     // FIRST and only overwrite the stored token on success — so a transient
@@ -5772,7 +5782,7 @@ pub async fn resend_confirmation(
         .filter(
             {table}::confirm_token_expires_at
                 .is_null()
-                .or({table}::confirm_token_expires_at.le(throttle_threshold)),
+                .or({table}::confirm_token_expires_at.le(autumn_web::db::SqlDateTime::from(throttle_threshold))),
         )
         .count()
         .get_result::<i64>(&mut *db)
@@ -5783,7 +5793,7 @@ pub async fn resend_confirmation(
     if eligible {{
         let raw_confirm_token = generate_confirmation_token();
         let confirm_digest = sha256_hex(&raw_confirm_token);
-        let confirm_expires_at = chrono::Utc::now().naive_utc() + chrono::Duration::hours(24);
+        let confirm_expires_at = autumn_web::time::ambient_civil_utc() + autumn_web::time::SignedDuration::from_hours(24);
 
         match send_confirmation_email(&mailer, &email, &raw_confirm_token).await {{
             Ok(()) => {{
@@ -5795,7 +5805,7 @@ pub async fn resend_confirmation(
                 )
                 .set((
                     {table}::confirm_token_digest.eq(Some(&confirm_digest)),
-                    {table}::confirm_token_expires_at.eq(Some(confirm_expires_at)),
+                    {table}::confirm_token_expires_at.eq(Some(autumn_web::db::SqlDateTime::from(confirm_expires_at))),
                 ))
                 .execute(&mut *db)
                 .await;
@@ -5916,17 +5926,17 @@ pub async fn data_export(
     let {snake_name}_id: i64 = require_tracked_session(&session, &mut db, &state).await?.id;
 
     let mailer = state.extension::<Mailer>();
-    let now = chrono::Utc::now().naive_utc();
-    let one_hour_ago = now - chrono::Duration::hours(1);
+    let now = autumn_web::time::ambient_civil_utc();
+    let one_hour_ago = now - autumn_web::time::SignedDuration::from_hours(1);
 
     // Idempotency: only update (and enqueue) if no export was requested in the last hour.
     let updated = diesel::update({table}::table.find({snake_name}_id))
         .filter(
             {table}::export_requested_at
                 .is_null()
-                .or({table}::export_requested_at.lt(Some(one_hour_ago))),
+                .or({table}::export_requested_at.lt(Some(autumn_web::db::SqlDateTime::from(one_hour_ago)))),
         )
-        .set({table}::export_requested_at.eq(Some(now)))
+        .set({table}::export_requested_at.eq(Some(autumn_web::db::SqlDateTime::from(now))))
         .execute(&mut *db)
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to record export request."))?;
@@ -6061,13 +6071,13 @@ pub async fn delete_account(
         }}).into_response());
     }}
 
-    let now = chrono::Utc::now().naive_utc();
-    let grace_until = now + chrono::Duration::days(30);
+    let now = autumn_web::time::ambient_civil_utc();
+    let grace_until = now + autumn_web::time::SignedDuration::from_hours(30 * 24);
 
     diesel::update({table}::table.find({snake_name}_id))
         .set((
-            {table}::delete_requested_at.eq(Some(now)),
-            {table}::delete_scheduled_at.eq(Some(grace_until)),
+            {table}::delete_requested_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
+            {table}::delete_scheduled_at.eq(Some(autumn_web::db::SqlDateTime::from(grace_until))),
         ))
         .execute(&mut *db)
         .await
@@ -6117,10 +6127,10 @@ pub async fn cancel_delete_account(
 
     // Only cancel if a future deletion is scheduled; reject once the deadline has passed.
     let rows = diesel::update({table}::table.find({snake_name}_id))
-        .filter({table}::delete_scheduled_at.gt(Some(chrono::Utc::now().naive_utc())))
+        .filter({table}::delete_scheduled_at.gt(Some(autumn_web::db::SqlDateTime::from(autumn_web::time::ambient_civil_utc()))))
         .set((
-            {table}::delete_requested_at.eq(None::<chrono::NaiveDateTime>),
-            {table}::delete_scheduled_at.eq(None::<chrono::NaiveDateTime>),
+            {table}::delete_requested_at.eq(None::<autumn_web::db::SqlDateTime>),
+            {table}::delete_scheduled_at.eq(None::<autumn_web::db::SqlDateTime>),
         ))
         .execute(&mut *db)
         .await
@@ -6185,9 +6195,9 @@ pub async fn admin_data_export(
 
     let mailer = state.extension::<Mailer>();
 
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
     let updated = diesel::update({table}::table.find(user_id))
-        .set({table}::export_requested_at.eq(Some(now)))
+        .set({table}::export_requested_at.eq(Some(autumn_web::db::SqlDateTime::from(now))))
         .execute(&mut *db)
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to record export request."))?;
@@ -6237,13 +6247,13 @@ pub async fn admin_delete_account(
         return Err(AutumnError::unprocessable_msg("Reason is required for admin GDPR actions."));
     }}
 
-    let now = chrono::Utc::now().naive_utc();
-    let grace_until = now + chrono::Duration::days(30);
+    let now = autumn_web::time::ambient_civil_utc();
+    let grace_until = now + autumn_web::time::SignedDuration::from_hours(30 * 24);
 
     let updated = diesel::update({table}::table.find(user_id))
         .set((
-            {table}::delete_requested_at.eq(Some(now)),
-            {table}::delete_scheduled_at.eq(Some(grace_until)),
+            {table}::delete_requested_at.eq(Some(autumn_web::db::SqlDateTime::from(now))),
+            {table}::delete_scheduled_at.eq(Some(autumn_web::db::SqlDateTime::from(grace_until))),
         ))
         .execute(&mut *db)
         .await
@@ -8636,7 +8646,7 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                             .find(rc.id)
                             .filter(recovery_codes::used_at.is_null()),
                     )
-                    .set(recovery_codes::used_at.eq(Some(chrono::Utc::now().naive_utc())))
+                    .set(recovery_codes::used_at.eq(Some(autumn_web::db::SqlDateTime::from(autumn_web::time::ambient_civil_utc()))))
                     .execute(&mut *db)
                     .await?;
                     if affected == 1 {
@@ -9324,7 +9334,7 @@ pub async fn login_verify(
                         .find(rc.id)
                         .filter(recovery_codes::used_at.is_null()),
                 )
-                .set(recovery_codes::used_at.eq(Some(chrono::Utc::now().naive_utc())))
+                .set(recovery_codes::used_at.eq(Some(autumn_web::db::SqlDateTime::from(autumn_web::time::ambient_civil_utc()))))
                 .execute(&mut *db)
                 .await?;
                 if affected == 1 {
@@ -9350,7 +9360,7 @@ pub async fn login_verify(
         session.remove("totp_pending_reset_digest").await;
         session.remove("totp_pending_reset_token").await;
         let committed = if let Some(token) = stored_token {
-            let now = chrono::Utc::now().naive_utc();
+            let now = autumn_web::time::ambient_civil_utc();
             // Commit the password change and the session revocation
             // atomically; a transaction error rolls both back (token
             // preserved) and is treated as not-committed below.
@@ -9361,11 +9371,11 @@ pub async fn login_verify(
                 .transaction::<_, diesel::result::Error, _>(async move |conn| {
                     let updated = diesel::update(__TABLE__::table.find(user_id))
                         .filter(__TABLE__::reset_token_digest.eq(Some(token.as_str())))
-                        .filter(__TABLE__::reset_token_expires_at.gt(now))
+                        .filter(__TABLE__::reset_token_expires_at.gt(autumn_web::db::SqlDateTime::from(now)))
                         .set((
                             __TABLE__::password_digest.eq(&new_digest),
                             __TABLE__::reset_token_digest.eq(None::<String>),
-                            __TABLE__::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                            __TABLE__::reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>),
                         ))
                         .execute(conn)
                         .await?;
@@ -9610,7 +9620,7 @@ pub async fn magic_link_request(
     }
 
     let email = form.email.trim().to_lowercase();
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
     // Sourced from `[auth.magic_link]` in autumn.toml (defaults: 15 min TTL, 60s
     // cooldown). Keep `ttl_minutes` ≤ 15 for a tight link-lifetime window.
     // One shared read for both fields; `config()` would deep-clone every
@@ -9635,12 +9645,12 @@ pub async fn magic_link_request(
     if let Some(__SNAKE__) = maybe___SNAKE__ {
         // Per-email cooldown (AC6): skip re-minting when an unexpired,
         // unconsumed token was issued for this account within the window.
-        let cooldown_start = now - chrono::Duration::seconds(email_cooldown_secs as i64);
+        let cooldown_start = now - autumn_web::time::SignedDuration::from_secs(email_cooldown_secs as i64);
         let recent: i64 = magic_link_tokens::table
             .filter(magic_link_tokens::user_id.eq(__SNAKE__.id))
             .filter(magic_link_tokens::consumed_at.is_null())
-            .filter(magic_link_tokens::expires_at.gt(now))
-            .filter(magic_link_tokens::created_at.gt(cooldown_start))
+            .filter(magic_link_tokens::expires_at.gt(autumn_web::db::SqlDateTime::from(now)))
+            .filter(magic_link_tokens::created_at.gt(autumn_web::db::SqlDateTime::from(cooldown_start)))
             .count()
             .get_result(&mut *db)
             .await
@@ -9651,7 +9661,7 @@ pub async fn magic_link_request(
             // SHA-256 digest is stored; the raw token appears only in the link.
             let raw_token = generate_reset_token();
             let token_digest = sha256_hex(&raw_token);
-            let expires_at = now + chrono::Duration::minutes(ttl_minutes as i64);
+            let expires_at = now + autumn_web::time::SignedDuration::from_mins(ttl_minutes as i64);
             let new_token = NewMagicLinkToken {
                 user_id: __SNAKE__.id,
                 token_digest,
@@ -9661,7 +9671,7 @@ pub async fn magic_link_request(
             // Persist the digest, then email the raw link. A mail failure is
             // logged but never surfaced (stays non-enumerating).
             if let Err(e) = diesel::insert_into(magic_link_tokens::table)
-                .values(&new_token)
+                .values(new_token)
                 .execute(&mut *db)
                 .await
             {
@@ -9759,16 +9769,16 @@ pub async fn magic_link_verify(
     Form(form): Form<MagicLinkVerifyForm>,
 ) -> AutumnResult<Response> {
     let token_digest = sha256_hex(&form.token);
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
 
     // Atomic single-use consume. Only one concurrent verify can match.
     let consumed: MagicLinkToken = match diesel::update(
         magic_link_tokens::table
             .filter(magic_link_tokens::token_digest.eq(&token_digest))
             .filter(magic_link_tokens::consumed_at.is_null())
-            .filter(magic_link_tokens::expires_at.gt(now)),
+            .filter(magic_link_tokens::expires_at.gt(autumn_web::db::SqlDateTime::from(now))),
     )
-    .set(magic_link_tokens::consumed_at.eq(Some(now)))
+    .set(magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now))))
     .returning(MagicLinkToken::as_returning())
     .get_result(&mut *db)
     .await
@@ -9812,20 +9822,20 @@ pub async fn magic_link_verify(
     let lockout_cfg = &config.auth.lockout;
     let lockout_enabled = lockout_cfg.enabled && lockout_cfg.threshold > 0;
     if lockout_enabled {
-        let cooloff = chrono::Duration::seconds(lockout_cfg.cooloff_secs as i64);
+        let cooloff = autumn_web::time::SignedDuration::from_secs(lockout_cfg.cooloff_secs as i64);
         let lock_expired_before = now - cooloff;
         let rows_cleared = diesel::update(
             __TABLE__::table
                 .find(__SNAKE__.id)
                 .filter(
                     __TABLE__::locked_at.is_null().or(
-                        __TABLE__::locked_at.le(lock_expired_before)
+                        __TABLE__::locked_at.le(autumn_web::db::SqlDateTime::from(lock_expired_before))
                     )
                 ),
         )
         .set((
             __TABLE__::failed_attempts.eq(0),
-            __TABLE__::locked_at.eq(None::<chrono::NaiveDateTime>),
+            __TABLE__::locked_at.eq(None::<autumn_web::db::SqlDateTime>),
         ))
         .execute(&mut *db)
         .await
@@ -10203,8 +10213,8 @@ pub struct WebauthnCredential {{
     pub credential_json: String,
     pub name: String,
     #[default]
-    pub last_used_at: Option<chrono::NaiveDateTime>,
-    pub created_at: chrono::NaiveDateTime,
+    pub last_used_at: Option<autumn_web::time::civil::DateTime>,
+    pub created_at: autumn_web::time::civil::DateTime,
 }}
 
 diesel::joinable!(webauthn_credentials -> {user_table} (user_id));
@@ -10645,12 +10655,12 @@ pub async fn passkey_login_finish(
             .await
             .map_err(|_| AutumnError::unauthorized_msg("Unknown credential."))?
     };
-    let (__SNAKE___email, email_confirmed_at): (String, Option<chrono::NaiveDateTime>) = {
+    let (__SNAKE___email, email_confirmed_at): (String, Option<autumn_web::db::SqlDateTime>) = {
         use crate::schema::__TABLE__;
         __TABLE__::table
             .find(__SNAKE___id)
             .select((__TABLE__::email, __TABLE__::email_confirmed_at))
-            .first::<(String, Option<chrono::NaiveDateTime>)>(&mut *db)
+            .first::<(String, Option<autumn_web::db::SqlDateTime>)>(&mut *db)
             .await
             .map_err(|_| AutumnError::unauthorized_msg("User not found."))?
     };
@@ -10660,7 +10670,7 @@ pub async fn passkey_login_finish(
             "Email address not confirmed. Please check your email for a confirmation link.",
         ));
     }
-    let now = chrono::Utc::now().naive_utc();
+    let now = autumn_web::time::ambient_civil_utc();
     if auth_result.needs_update() {
         let mut passkey: Passkey = serde_json::from_str(&cred_json)
             .unwrap_or_else(|_| serde_json::from_value(serde_json::Value::Null).unwrap());
@@ -10669,7 +10679,7 @@ pub async fn passkey_login_finish(
         diesel::update(crate::schema::webauthn_credentials::table.find(wc_id))
             .set((
                 crate::schema::webauthn_credentials::credential_json.eq(&new_json),
-                crate::schema::webauthn_credentials::last_used_at.eq(now),
+                crate::schema::webauthn_credentials::last_used_at.eq(autumn_web::db::SqlDateTime::from(now)),
             ))
             .execute(&mut *db)
             .await
@@ -10678,7 +10688,7 @@ pub async fn passkey_login_finish(
             })?;
     } else {
         diesel::update(crate::schema::webauthn_credentials::table.find(wc_id))
-            .set(crate::schema::webauthn_credentials::last_used_at.eq(now))
+            .set(crate::schema::webauthn_credentials::last_used_at.eq(autumn_web::db::SqlDateTime::from(now)))
             .execute(&mut *db)
             .await
             .map_err(|_| {
@@ -10721,7 +10731,7 @@ pub async fn passkey_list(
     let __SNAKE___id: i64 = crate::routes::auth::require_tracked_session(&session, &mut db, &state)
         .await?
         .id;
-    let rows: Vec<(i64, String, chrono::NaiveDateTime)> = {
+    let rows: Vec<(i64, String, autumn_web::db::SqlDateTime)> = {
         use crate::schema::webauthn_credentials;
         webauthn_credentials::table
             .filter(webauthn_credentials::user_id.eq(__SNAKE___id))
@@ -12347,7 +12357,9 @@ mod tests {
             .expect("POST verify handler follows the GET form");
         let get_body = &routes[get_start..get_end];
         assert!(
-            !get_body.contains("magic_link_tokens::consumed_at.eq(Some(now))"),
+            !get_body.contains(
+                "magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))"
+            ),
             "GET verify must NOT consume the token: {get_body}"
         );
         assert!(
@@ -12362,7 +12374,9 @@ mod tests {
 
         let post_body = magic_link_verify_body(&routes);
         assert!(
-            post_body.contains("magic_link_tokens::consumed_at.eq(Some(now))"),
+            post_body.contains(
+                "magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))"
+            ),
             "POST verify must consume the token: {post_body}"
         );
         assert!(
@@ -12508,7 +12522,7 @@ mod tests {
         let routes = magic_link_routes(tmp.path());
         assert!(
             routes.contains("magic_link_tokens::consumed_at.is_null()")
-                && routes.contains("magic_link_tokens::consumed_at.eq(Some(now))"),
+                && routes.contains("magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))"),
             "verify must atomically consume the token (single-use)"
         );
         assert!(
@@ -12598,14 +12612,16 @@ mod tests {
         assert!(
             body.contains("let rows_cleared = diesel::update(")
                 && body.contains("users::locked_at.is_null().or(")
-                && body.contains("users::locked_at.le(lock_expired_before)")
+                && body.contains(
+                    "users::locked_at.le(autumn_web::db::SqlDateTime::from(lock_expired_before))"
+                )
                 && body.contains("users::failed_attempts.eq(0),")
                 && body.contains("if rows_cleared == 0 {"),
             "verify must re-read locked_at at the DB via a guarded UPDATE (mirrors \
              password login), not the stale in-memory row: {body}"
         );
         let consume = body
-            .find("magic_link_tokens::consumed_at.eq(Some(now))")
+            .find("magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))")
             .expect("token consume present");
         let recheck = body
             .find("let rows_cleared = diesel::update(")
@@ -12639,12 +12655,14 @@ mod tests {
         assert!(
             body.contains("let rows_cleared = diesel::update(")
                 && body.contains("users::locked_at.is_null().or(")
-                && body.contains("users::locked_at.le(lock_expired_before)")
+                && body.contains(
+                    "users::locked_at.le(autumn_web::db::SqlDateTime::from(lock_expired_before))"
+                )
                 && body.contains("if rows_cleared == 0 {"),
             "totp variant must re-read locked_at at the DB via a guarded UPDATE: {body}"
         );
         let consume = body
-            .find("magic_link_tokens::consumed_at.eq(Some(now))")
+            .find("magic_link_tokens::consumed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))")
             .expect("token consume present");
         let recheck = body
             .find("let rows_cleared = diesel::update(")
@@ -12889,15 +12907,17 @@ mod tests {
     fn magic_link_config_knobs_are_unsigned_to_reject_negative_values() {
         // The config knobs are `u64`, so a negative value in autumn.toml fails to deserialize; a
         // negative cooldown would put `cooldown_start` in the future and disable the per-email
-        // throttle. The chrono math casts them with `as i64`.
+        // throttle. The duration math casts them with `as i64`.
         for totp in [false, true] {
             let routes = render_routes_file("User", "user", "users", &[], totp, true);
             assert!(
-                routes.contains("chrono::Duration::seconds(email_cooldown_secs as i64)"),
+                routes.contains(
+                    "autumn_web::time::SignedDuration::from_secs(email_cooldown_secs as i64)"
+                ),
                 "cooldown math must cast the unsigned config knob via `as i64` (totp={totp}): {routes}"
             );
             assert!(
-                routes.contains("chrono::Duration::minutes(ttl_minutes as i64)"),
+                routes.contains("autumn_web::time::SignedDuration::from_mins(ttl_minutes as i64)"),
                 "TTL math must cast the unsigned config knob via `as i64` (totp={totp}): {routes}"
             );
             assert!(
@@ -12973,7 +12993,7 @@ mod tests {
         assert!(
             model.contains("pub struct MagicLinkToken")
                 && model.contains("pub token_digest: String")
-                && model.contains("pub consumed_at: Option<chrono::NaiveDateTime>"),
+                && model.contains("pub consumed_at: Option<autumn_web::time::civil::DateTime>"),
             "magic_link_token model must mirror the reset-token invariants: {model}"
         );
         let model_mod = fs::read_to_string(tmp.path().join("src/models/mod.rs")).unwrap();
@@ -14126,7 +14146,7 @@ mod tests {
             "change_password must clear reset_token_digest"
         );
         assert!(
-            body.contains("reset_token_expires_at.eq(None::<chrono::NaiveDateTime>)"),
+            body.contains("reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>)"),
             "change_password must clear reset_token_expires_at"
         );
     }
@@ -14354,7 +14374,7 @@ mod tests {
             "must clear pending_email on confirm"
         );
         assert!(
-            body.contains("email_confirmed_at.eq(Some(now))"),
+            body.contains("email_confirmed_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))"),
             "must stamp email_confirmed_at on confirm"
         );
         // Not found, expired and consumed share one message (no oracle).
@@ -14383,7 +14403,7 @@ mod tests {
             "confirm_email_change must clear reset_token_digest"
         );
         assert!(
-            body.contains("reset_token_expires_at.eq(None::<chrono::NaiveDateTime>)"),
+            body.contains("reset_token_expires_at.eq(None::<autumn_web::db::SqlDateTime>)"),
             "confirm_email_change must clear reset_token_expires_at"
         );
     }
@@ -17673,7 +17693,7 @@ mod tests {
             "login and reauth must both call `stamp_lockout`: {routes}"
         );
         assert!(
-            !routes.contains("locked_at.eq(Some(now))"),
+            !routes.contains("locked_at.eq(Some(autumn_web::db::SqlDateTime::from(now)))"),
             "no handler may stamp `locked_at` with its request-start `now`: {routes}"
         );
         let stamp_at = routes
@@ -17690,7 +17710,7 @@ mod tests {
         );
         let following = routes.get(stamp_at..stamp_at + 120).unwrap_or_default();
         assert!(
-            following.contains("chrono::Utc::now().naive_utc()"),
+            following.contains("autumn_web::time::ambient_civil_utc()"),
             "stamp must read the clock inside the helper, at write time: {routes}"
         );
     }

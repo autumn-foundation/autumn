@@ -19,7 +19,7 @@ pub struct Author {
     pub id: i64,
     pub name: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 #[autumn_web::model(managed)]
@@ -30,7 +30,7 @@ pub struct Post {
     pub author_id: i64,
     pub title: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 ";
 

@@ -1,0 +1,5 @@
+error: `#[model]` stores dates and times as `jiff` values: use `autumn_web::time::civil::DateTime` instead of the `chrono` type
+  --> tests/compile-fail/model_chrono_time_field.rs:14:20
+   |
+14 |     pub starts_at: chrono::NaiveDateTime,
+   |                    ^^^^^^^^^^^^^^^^^^^^^

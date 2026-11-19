@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use super::{BusinessCalendar, BusinessDuration};
 
@@ -16,9 +16,9 @@ pub struct Obligation {
     subject: String,
     within: BusinessDuration,
     calendar: String,
-    zone: Option<Tz>,
-    started_at: Option<DateTime<Utc>>,
-    met_at: Option<DateTime<Utc>>,
+    zone: Option<TimeZone>,
+    started_at: Option<Timestamp>,
+    met_at: Option<Timestamp>,
 }
 
 impl Obligation {
@@ -59,7 +59,7 @@ impl Obligation {
 
     /// Set the time zone.
     #[must_use]
-    pub const fn zone(mut self, zone: Tz) -> Self {
+    pub fn zone(mut self, zone: TimeZone) -> Self {
         self.zone = Some(zone);
         self
     }
@@ -75,14 +75,14 @@ impl Obligation {
 
     /// Set the start instant.
     #[must_use]
-    pub const fn starting_at(mut self, at: DateTime<Utc>) -> Self {
+    pub const fn starting_at(mut self, at: Timestamp) -> Self {
         self.started_at = Some(at);
         self
     }
 
     /// Set the instant when the subject met the obligation.
     #[must_use]
-    pub fn met_at(mut self, at: impl Into<Option<DateTime<Utc>>>) -> Self {
+    pub fn met_at(mut self, at: impl Into<Option<Timestamp>>) -> Self {
         self.met_at = at.into();
         self
     }
@@ -121,19 +121,19 @@ impl Obligation {
 
     /// The time zone, if set.
     #[must_use]
-    pub const fn time_zone(&self) -> Option<Tz> {
-        self.zone
+    pub const fn time_zone(&self) -> Option<&TimeZone> {
+        self.zone.as_ref()
     }
 
     /// The start instant, if set.
     #[must_use]
-    pub const fn started_at(&self) -> Option<DateTime<Utc>> {
+    pub const fn started_at(&self) -> Option<Timestamp> {
         self.started_at
     }
 
     /// The met instant, if set.
     #[must_use]
-    pub const fn met(&self) -> Option<DateTime<Utc>> {
+    pub const fn met(&self) -> Option<Timestamp> {
         self.met_at
     }
 
@@ -144,8 +144,8 @@ impl Obligation {
     pub fn status_with(
         &self,
         calendar: &BusinessCalendar,
-        zone: Tz,
-        now: DateTime<Utc>,
+        zone: &TimeZone,
+        now: Timestamp,
     ) -> ObligationStatus {
         let started_at = self.started_at.unwrap_or(now);
         let budget = self.within.resolve(calendar);
@@ -159,9 +159,9 @@ impl Obligation {
     pub(super) fn status_with_due(
         &self,
         calendar: &BusinessCalendar,
-        zone: Tz,
-        now: DateTime<Utc>,
-        due_at: DateTime<Utc>,
+        zone: &TimeZone,
+        now: Timestamp,
+        due_at: Timestamp,
     ) -> ObligationStatus {
         let mut status = self.status_at(calendar, zone, now, Some(due_at));
         if matches!(
@@ -177,8 +177,8 @@ impl Obligation {
     pub(super) fn status_without_due(
         &self,
         calendar: &BusinessCalendar,
-        zone: Tz,
-        now: DateTime<Utc>,
+        zone: &TimeZone,
+        now: Timestamp,
     ) -> ObligationStatus {
         self.status_at(calendar, zone, now, None)
     }
@@ -187,9 +187,9 @@ impl Obligation {
     fn status_at(
         &self,
         calendar: &BusinessCalendar,
-        zone: Tz,
-        now: DateTime<Utc>,
-        due_at: Option<DateTime<Utc>>,
+        zone: &TimeZone,
+        now: Timestamp,
+        due_at: Option<Timestamp>,
     ) -> ObligationStatus {
         let started_at = self.started_at.unwrap_or(now);
         let budget = self.within.resolve(calendar);
@@ -217,7 +217,7 @@ impl Obligation {
         ObligationStatus {
             key: self.key(),
             state,
-            zone,
+            zone: zone.clone(),
             started_at,
             due_at,
             met_at,
@@ -234,7 +234,7 @@ impl Obligation {
     }
 
     /// Set the met instant in place.
-    pub(super) const fn set_met(&mut self, at: DateTime<Utc>) {
+    pub(super) const fn set_met(&mut self, at: Timestamp) {
         self.met_at = Some(at);
     }
 }
@@ -271,8 +271,8 @@ impl ObligationState {
 
 /// The status of an obligation at one instant.
 ///
-/// It serializes to JSON for an API. The zone is its IANA name. Durations
-/// are whole seconds.
+/// It serializes to JSON for an API. The zone is its IANA name. Instants are
+/// RFC 3339 in UTC (`2024-01-09T17:00:00Z`). Durations are whole seconds.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub struct ObligationStatus {
@@ -282,17 +282,22 @@ pub struct ObligationStatus {
     pub state: ObligationState,
     /// The time zone that the calendar hours use.
     #[serde(serialize_with = "zone_name")]
-    pub zone: Tz,
+    pub zone: TimeZone,
     /// The start instant.
-    pub started_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub started_at: Timestamp,
     /// The deadline. `None` when there is no deadline in one hundred years.
-    pub due_at: Option<DateTime<Utc>>,
+    #[serde(with = "crate::time::compat::serde_autosi_option")]
+    pub due_at: Option<Timestamp>,
     /// The met instant.
-    pub met_at: Option<DateTime<Utc>>,
+    #[serde(with = "crate::time::compat::serde_autosi_option")]
+    pub met_at: Option<Timestamp>,
     /// The instant when the escalation was claimed.
-    pub escalated_at: Option<DateTime<Utc>>,
+    #[serde(with = "crate::time::compat::serde_autosi_option")]
+    pub escalated_at: Option<Timestamp>,
     /// The next working instant while [`ObligationState::Paused`].
-    pub resumes_at: Option<DateTime<Utc>>,
+    #[serde(with = "crate::time::compat::serde_autosi_option")]
+    pub resumes_at: Option<Timestamp>,
     /// The budget as working time.
     #[serde(serialize_with = "whole_seconds")]
     pub budget: Duration,
@@ -304,12 +309,22 @@ pub struct ObligationStatus {
     pub remaining: Duration,
 }
 
-#[allow(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde `serialize_with` passes a reference"
-)]
-fn zone_name<S: serde::Serializer>(zone: &Tz, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(zone.name())
+fn zone_name<S: serde::Serializer>(zone: &TimeZone, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&zone_label(zone))
+}
+
+/// The IANA name of `zone`. A zone without one, such as a fixed offset, is
+/// named by its offset (`+05:30`), and any other by `Etc/Unknown`.
+pub(super) fn zone_label(zone: &TimeZone) -> std::borrow::Cow<'_, str> {
+    zone.iana_name().map_or_else(
+        || {
+            std::borrow::Cow::Owned(
+                zone.to_fixed_offset()
+                    .map_or_else(|_| "Etc/Unknown".to_owned(), |offset| offset.to_string()),
+            )
+        },
+        std::borrow::Cow::Borrowed,
+    )
 }
 
 fn whole_seconds<S: serde::Serializer>(
@@ -321,45 +336,45 @@ fn whole_seconds<S: serde::Serializer>(
 
 /// A value that can give the time zone of an obligation.
 ///
-/// `#[obligation(zone = field)]` uses it, so the field can be a [`Tz`], an
-/// IANA name, or an `Option` of one.
+/// `#[obligation(zone = field)]` uses it, so the field can be a
+/// [`jiff::tz::TimeZone`], an IANA name, or an `Option` of one.
 pub trait ObligationZone {
     /// The time zone, or `None` to use the fallback zone.
-    fn obligation_zone(&self) -> Option<Tz>;
+    fn obligation_zone(&self) -> Option<TimeZone>;
 }
 
-impl ObligationZone for Tz {
-    fn obligation_zone(&self) -> Option<Tz> {
-        Some(*self)
+impl ObligationZone for TimeZone {
+    fn obligation_zone(&self) -> Option<TimeZone> {
+        Some(self.clone())
     }
 }
 
 impl ObligationZone for crate::time_zone::TimeZone {
-    fn obligation_zone(&self) -> Option<Tz> {
-        Some(self.tz())
+    fn obligation_zone(&self) -> Option<TimeZone> {
+        Some(self.tz().clone())
     }
 }
 
 impl ObligationZone for str {
-    fn obligation_zone(&self) -> Option<Tz> {
+    fn obligation_zone(&self) -> Option<TimeZone> {
         crate::time_zone::parse_iana(self)
     }
 }
 
 impl ObligationZone for String {
-    fn obligation_zone(&self) -> Option<Tz> {
+    fn obligation_zone(&self) -> Option<TimeZone> {
         self.as_str().obligation_zone()
     }
 }
 
 impl<Z: ObligationZone> ObligationZone for Option<Z> {
-    fn obligation_zone(&self) -> Option<Tz> {
+    fn obligation_zone(&self) -> Option<TimeZone> {
         self.as_ref().and_then(ObligationZone::obligation_zone)
     }
 }
 
 impl<Z: ObligationZone + ?Sized> ObligationZone for &Z {
-    fn obligation_zone(&self) -> Option<Tz> {
+    fn obligation_zone(&self) -> Option<TimeZone> {
         (**self).obligation_zone()
     }
 }

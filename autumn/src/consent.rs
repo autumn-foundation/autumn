@@ -61,7 +61,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -189,7 +189,7 @@ impl Consent {
         let mut parts = decoded.splitn(3, '|');
         let version: u32 = parts.next()?.parse().ok()?;
         let decided_at = parts.next()?;
-        if decided_at.is_empty() || chrono::DateTime::parse_from_rfc3339(decided_at).is_err() {
+        if decided_at.is_empty() || decided_at.parse::<jiff::Timestamp>().is_err() {
             return None;
         }
         let categories_field = parts.next().unwrap_or("");
@@ -359,7 +359,7 @@ pub fn reject_non_essential_cookie(policy_version: u32) -> String {
 }
 
 fn build_consent_cookie(categories: &[&str], policy_version: u32) -> String {
-    let decided_at = crate::time::ambient_now().to_rfc3339();
+    let decided_at = crate::time::compat::rfc3339(crate::time::ambient_now());
     let value = encode_cookie_value(policy_version, &decided_at, categories);
     format!(
         "{CONSENT_COOKIE_NAME}={value}; Path=/; Max-Age={MAX_AGE_SECS}; HttpOnly; Secure; SameSite=Lax"

@@ -1263,33 +1263,28 @@ impl DisplayTopicField for ::uuid::Uuid {
     }
 }
 
-impl DisplayTopicField for ::chrono::NaiveDateTime {
-    fn to_topic_string(&self) -> String {
-        self.to_string()
-    }
+/// `Display` for `jiff` values: `2024-01-02T03:04:05Z` for a [`jiff::Timestamp`],
+/// `2024-01-02T03:04:05` for a civil date-time, and the RFC 9557 form with a
+/// `[Zone]` suffix for a [`jiff::ZonedDateTime`].
+macro_rules! impl_display_topic_field_display {
+    ($($t:ty),*) => {
+        $(
+            impl DisplayTopicField for $t {
+                fn to_topic_string(&self) -> String {
+                    self.to_string()
+                }
+            }
+        )*
+    };
 }
 
-impl DisplayTopicField for ::chrono::NaiveDate {
-    fn to_topic_string(&self) -> String {
-        self.to_string()
-    }
-}
-
-impl DisplayTopicField for ::chrono::NaiveTime {
-    fn to_topic_string(&self) -> String {
-        self.to_string()
-    }
-}
-
-impl<T> DisplayTopicField for ::chrono::DateTime<T>
-where
-    T: ::chrono::TimeZone,
-    T::Offset: std::fmt::Display,
-{
-    fn to_topic_string(&self) -> String {
-        self.to_string()
-    }
-}
+impl_display_topic_field_display!(
+    ::jiff::Timestamp,
+    ::jiff::civil::DateTime,
+    ::jiff::civil::Date,
+    ::jiff::civil::Time,
+    ::jiff::ZonedDateTime
+);
 
 impl<T: DisplayTopicField> DisplayTopicField for Option<T> {
     fn to_topic_string(&self) -> String {

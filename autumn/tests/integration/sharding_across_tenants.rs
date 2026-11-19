@@ -41,7 +41,7 @@ pub struct ShardedTenantPost {
     pub id: i64,
     pub tenant_id: String,
     pub title: String,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 /// Matching repository — tenant_scoped so `across_tenants()` is generated,

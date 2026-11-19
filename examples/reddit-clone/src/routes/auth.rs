@@ -404,7 +404,7 @@ mod tests {
             password_hash: "hashed".to_owned(),
             karma: 0,
             role: "user".to_owned(),
-            created_at: chrono::DateTime::UNIX_EPOCH.naive_utc(),
+            created_at: autumn_web::time::civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
             avatar: None,
         };
 
@@ -729,7 +729,7 @@ pub async fn profile(
                         p class="text-sm text-gray-500" {
                             (user.karma) " karma"
                             " \u{2022} joined "
-                            (user.created_at.format("%b %d, %Y"))
+                            (user.created_at.strftime("%b %d, %Y"))
                         }
                         @if is_self {
                             p class="text-xs mt-1" {

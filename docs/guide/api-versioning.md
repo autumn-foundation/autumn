@@ -10,7 +10,7 @@ Define your API versions and their lifecycles when initializing the application 
 
 ```rust
 use autumn_web::app::ApiVersion;
-use chrono::TimeZone;
+use autumn_web::time::Timestamp;
 
 #[autumn_web::main]
 async fn main() {
@@ -18,8 +18,8 @@ async fn main() {
         // Register API v1: Deprecated on 2026-06-01, Sunset on 2026-12-01
         .api_version(ApiVersion {
             version: "v1".to_string(),
-            deprecated_at: Some(chrono::Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap()),
-            sunset_at: Some(chrono::Utc.with_ymd_and_hms(2026, 12, 1, 0, 0, 0).unwrap()),
+            deprecated_at: Some("2026-06-01T00:00:00Z".parse::<Timestamp>().unwrap()),
+            sunset_at: Some("2026-12-01T00:00:00Z".parse::<Timestamp>().unwrap()),
         })
         // Register API v2: Active (no deprecation/sunset schedule yet)
         .api_version(ApiVersion {

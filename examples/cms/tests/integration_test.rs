@@ -1800,7 +1800,9 @@ async fn changing_the_permalink_structure_does_not_break_existing_urls() {
         .assert_status(303);
 
     // The new URL works…
-    let year = chrono::Utc::now().format("%Y/%m/%d").to_string();
+    let year = autumn_web::time::ambient_civil_utc()
+        .strftime("%Y/%m/%d")
+        .to_string();
     client
         .get(&format!("/{year}/durable"))
         .send()
@@ -3321,9 +3323,13 @@ async fn a_malformed_date_format_is_refused_rather_than_crashing_the_site() {
         .send()
         .await
         .assert_ok()
-        .assert_body_contains(&chrono::Utc::now().format("%Y/%m/%d").to_string());
+        .assert_body_contains(
+            &autumn_web::time::ambient_civil_utc()
+                .strftime("%Y/%m/%d")
+                .to_string(),
+        );
 
-    // A pattern chrono cannot render is refused rather than accepted-and-dropped.
+    // A pattern strftime cannot render is refused rather than accepted-and-dropped.
     let refused = client
         .post("/admin/settings")
         .header("cookie", &cookie)
@@ -3345,7 +3351,11 @@ async fn a_malformed_date_format_is_refused_rather_than_crashing_the_site() {
         .send()
         .await
         .assert_ok()
-        .assert_body_contains(&chrono::Utc::now().format("%Y/%m/%d").to_string());
+        .assert_body_contains(
+            &autumn_web::time::ambient_civil_utc()
+                .strftime("%Y/%m/%d")
+                .to_string(),
+        );
 }
 
 /// A failed private creation leaves nothing behind.
@@ -3654,7 +3664,9 @@ async fn a_post_is_not_served_from_arbitrary_paths() {
         .assert_status(303);
 
     sign_out(&client);
-    let dated = chrono::Utc::now().format("%Y/%m/%d").to_string();
+    let dated = autumn_web::time::ambient_civil_utc()
+        .strftime("%Y/%m/%d")
+        .to_string();
     client
         .get(&format!("/{dated}/hello"))
         .send()
@@ -3787,10 +3799,10 @@ async fn a_dated_permalink_matches_only_the_posts_own_date() {
         .assert_status(303);
 
     sign_out(&client);
-    let now = chrono::Utc::now();
-    let day = now.format("%Y/%m/%d").to_string();
-    let month = now.format("%Y/%m").to_string();
-    let year = now.format("%Y").to_string();
+    let now = autumn_web::time::ambient_civil_utc();
+    let day = now.strftime("%Y/%m/%d").to_string();
+    let month = now.strftime("%Y/%m").to_string();
+    let year = now.strftime("%Y").to_string();
 
     // Its own date, in both dated shapes — these are the aliases that exist so
     // that changing the permalink structure does not 404 shared links.
@@ -3823,7 +3835,7 @@ async fn a_dated_permalink_matches_only_the_posts_own_date() {
     }
 
     // Unpadded is not what the generator writes, so it is not an alias either.
-    let unpadded = format!("/{}/{}/hello", now.format("%Y"), now.format("%-m"));
+    let unpadded = format!("/{}/{}/hello", now.strftime("%Y"), now.strftime("%-m"));
     if unpadded != format!("/{month}/hello") {
         assert_eq!(client.get(&unpadded).send().await.status, 404);
     }
@@ -4947,16 +4959,17 @@ async fn saving_a_published_post_does_not_move_its_date() {
     .await
     .expect("stamp a precise date");
 
-    let stored = async || -> Option<chrono::NaiveDateTime> {
+    let stored = async || -> Option<autumn_web::time::civil::DateTime> {
         let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
-        RunQueryDsl::first(
+        let stored: autumn_web::db::SqlNullableDateTime = RunQueryDsl::first(
             cms::schema::posts::table
                 .find(id)
                 .select(cms::schema::posts::published_at),
             &mut conn,
         )
         .await
-        .expect("the post")
+        .expect("the post");
+        stored.0
     };
 
     // Open the editor and save it back exactly as rendered — the browser
@@ -5005,12 +5018,7 @@ async fn saving_a_published_post_does_not_move_its_date() {
 
     assert_eq!(
         stored().await,
-        Some(
-            chrono::NaiveDate::from_ymd_opt(2026, 3, 4)
-                .unwrap()
-                .and_hms_opt(5, 6, 7)
-                .unwrap()
-        ),
+        Some(autumn_web::time::civil::date(2026, 3, 4).at(5, 6, 7, 0)),
         "an untouched field must leave the publication record alone, seconds included"
     );
 
@@ -5040,12 +5048,7 @@ async fn saving_a_published_post_does_not_move_its_date() {
         .assert_status(303);
     assert_eq!(
         stored().await,
-        Some(
-            chrono::NaiveDate::from_ymd_opt(2026, 3, 5)
-                .unwrap()
-                .and_hms_opt(9, 30, 0)
-                .unwrap()
-        ),
+        Some(autumn_web::time::civil::date(2026, 3, 5).at(9, 30, 0, 0)),
         "a date the editor actually typed is applied"
     );
 }
@@ -7301,8 +7304,7 @@ async fn a_scheduled_publication_snapshots_the_scheduled_state() {
     // Make it a scheduled post that is already due, at a date this test names
     // so the guard can be given exactly what the sweep would have observed.
     let db = TestDb::shared().await;
-    let due = chrono::NaiveDateTime::parse_from_str("2026-01-02 03:04:05", "%Y-%m-%d %H:%M:%S")
-        .expect("a fixed due date");
+    let due = autumn_web::time::civil::date(2026, 1, 2).at(3, 4, 5, 0);
     try_execute(
         db,
         &format!("UPDATE posts SET status = 'future', published_at = '{due}' WHERE id = {id}"),
@@ -7637,9 +7639,10 @@ async fn scheduling_requires_a_future_date() {
     }
 
     // A genuinely future one schedules.
-    let future = (chrono::Utc::now() + chrono::Duration::days(7))
-        .format("%Y-%m-%dT%H:%M")
-        .to_string();
+    let future = (autumn_web::time::ambient_civil_utc()
+        + autumn_web::time::SignedDuration::from_hours(7 * 24))
+    .strftime("%Y-%m-%dT%H:%M")
+    .to_string();
     client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
@@ -9162,10 +9165,10 @@ async fn a_scheduled_date_is_read_in_the_sites_timezone() {
 
     // Far enough out that it is in the future in every zone, so the test is
     // about the *offset* rather than about the guard.
-    let local = (chrono::Utc::now() + chrono::Duration::days(30))
-        .naive_utc()
-        .format("%Y-%m-%dT09:00")
-        .to_string();
+    let local = (autumn_web::time::ambient_civil_utc()
+        + autumn_web::time::SignedDuration::from_hours(30 * 24))
+    .strftime("%Y-%m-%dT09:00")
+    .to_string();
     let created = client
         .post("/admin/content/post")
         .header("cookie", &cookie)
@@ -9196,14 +9199,15 @@ async fn a_scheduled_date_is_read_in_the_sites_timezone() {
         use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
         let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
-        let when: Option<chrono::NaiveDateTime> = cms::schema::posts::table
+        let when: autumn_web::db::SqlNullableDateTime = cms::schema::posts::table
             .find(id.parse::<i64>().expect("id"))
             .select(cms::schema::posts::published_at)
             .first(&mut conn)
             .await
             .expect("the scheduled post");
-        when.expect("a scheduled post has a date")
-            .format("%H:%M")
+        when.0
+            .expect("a scheduled post has a date")
+            .strftime("%H:%M")
             .to_string()
     };
     assert!(
@@ -9286,10 +9290,10 @@ async fn scheduling_a_post_with_a_past_publish_date_redisplays_the_editor() {
     let client = db_client().await;
     let cookie = register(&client, "owner").await;
 
-    let past = (chrono::Utc::now() - chrono::Duration::days(1))
-        .naive_utc()
-        .format("%Y-%m-%dT%H:%M")
-        .to_string();
+    let past = (autumn_web::time::ambient_civil_utc()
+        - autumn_web::time::SignedDuration::from_hours(24))
+    .strftime("%Y-%m-%dT%H:%M")
+    .to_string();
     let resp = client
         .post("/admin/content/post")
         .header("cookie", &cookie)
@@ -9498,10 +9502,10 @@ async fn validation_redisplay_keeps_the_submitted_stale_lock_version() {
 
     // A fixes the date and resubmits the same (still-stale) lock_version, as
     // the redisplayed form's hidden field instructs them to.
-    let future = (chrono::Utc::now() + chrono::Duration::days(1))
-        .naive_utc()
-        .format("%Y-%m-%dT%H:%M")
-        .to_string();
+    let future = (autumn_web::time::ambient_civil_utc()
+        + autumn_web::time::SignedDuration::from_hours(24))
+    .strftime("%Y-%m-%dT%H:%M")
+    .to_string();
     let retry = client
         .post(&format!("/admin/content/post/{id}"))
         .header("cookie", &cookie)
@@ -10352,10 +10356,10 @@ async fn unscheduling_a_post_clears_its_publish_date() {
     let client = db_client().await;
     let cookie = register(&client, "owner").await;
 
-    let when = (chrono::Utc::now() + chrono::Duration::days(30))
-        .naive_utc()
-        .format("%Y-%m-%dT09:00")
-        .to_string();
+    let when = (autumn_web::time::ambient_civil_utc()
+        + autumn_web::time::SignedDuration::from_hours(30 * 24))
+    .strftime("%Y-%m-%dT09:00")
+    .to_string();
     let created = client
         .post("/admin/content/post")
         .header("cookie", &cookie)
@@ -10402,16 +10406,17 @@ async fn unscheduling_a_post_clears_its_publish_date() {
         .await
         .assert_status(303);
 
-    let stored: Option<chrono::NaiveDateTime> = {
+    let stored: Option<autumn_web::time::civil::DateTime> = {
         use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
         let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
         cms::schema::posts::table
             .find(id.parse::<i64>().expect("id"))
             .select(cms::schema::posts::published_at)
-            .first(&mut conn)
+            .first::<autumn_web::db::SqlNullableDateTime>(&mut conn)
             .await
             .expect("the post")
+            .0
     };
     assert!(
         stored.is_none(),
@@ -10425,20 +10430,21 @@ async fn unscheduling_a_post_clears_its_publish_date() {
         .send()
         .await
         .assert_status(303);
-    let stored: chrono::NaiveDateTime = {
+    let stored: autumn_web::time::civil::DateTime = {
         use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
         let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
         cms::schema::posts::table
             .find(id.parse::<i64>().expect("id"))
             .select(cms::schema::posts::published_at)
-            .first::<Option<chrono::NaiveDateTime>>(&mut conn)
+            .first::<autumn_web::db::SqlNullableDateTime>(&mut conn)
             .await
             .expect("the post")
+            .0
             .expect("a published post is dated")
     };
     assert!(
-        stored <= chrono::Utc::now().naive_utc(),
+        stored <= autumn_web::time::ambient_civil_utc(),
         "a post published now must not be dated in the future: {stored}"
     );
 
@@ -10471,19 +10477,20 @@ async fn unscheduling_a_post_clears_its_publish_date() {
         .send()
         .await
         .assert_status(303);
-    let kept: Option<chrono::NaiveDateTime> = {
+    let kept: Option<autumn_web::time::civil::DateTime> = {
         use diesel::prelude::*;
         use diesel_async::RunQueryDsl;
         let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
         cms::schema::posts::table
             .find(live)
             .select(cms::schema::posts::published_at)
-            .first(&mut conn)
+            .first::<autumn_web::db::SqlNullableDateTime>(&mut conn)
             .await
             .expect("the post")
+            .0
     };
     assert!(
-        kept.is_some_and(|when| when.format("%Y").to_string() == "2020"),
+        kept.is_some_and(|when| when.year() == 2020),
         "editing a published post must never reorder the blog index: {kept:?}"
     );
 }
@@ -10552,10 +10559,10 @@ async fn an_import_publishes_a_schedule_that_has_already_passed() {
     );
 
     // A schedule still in the future is restored as a schedule.
-    let future = (chrono::Utc::now() + chrono::Duration::days(30))
-        .naive_utc()
-        .format("%Y-%m-%dT%H:%M:%S")
-        .to_string();
+    let future = (autumn_web::time::ambient_civil_utc()
+        + autumn_web::time::SignedDuration::from_hours(30 * 24))
+    .strftime("%Y-%m-%dT%H:%M:%S")
+    .to_string();
     let payload = serde_json::json!({
         "version": 3,
         "site_title": "Elsewhere",
@@ -15402,7 +15409,7 @@ async fn seeding_skips_a_slug_the_other_bare_type_already_holds() {
     // The seed must complete rather than abort on the constraint.
     {
         let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
-        cms::seed::seed_posts(&mut conn, author, chrono::Utc::now().naive_utc())
+        cms::seed::seed_posts(&mut conn, author, autumn_web::time::ambient_civil_utc())
             .await
             .expect("the seed skips what is already there rather than failing");
     }
@@ -16391,10 +16398,7 @@ async fn import_comments_ignores_unrelated_existing_comments() {
         author_url: String::new(),
         body: "From the backup".to_owned(),
         status: "approved".to_owned(),
-        created_at: chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
-            .expect("date")
-            .and_hms_opt(12, 0, 0)
-            .expect("time"),
+        created_at: autumn_web::time::civil::date(2024, 1, 15).at(12, 0, 0, 0),
         replies: vec![],
     }];
 

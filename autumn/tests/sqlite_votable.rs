@@ -120,7 +120,7 @@ pub struct VotePost {
     #[default]
     pub score: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(VotePost, table = "votable_vote_posts", soft_delete)]

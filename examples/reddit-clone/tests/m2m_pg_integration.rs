@@ -261,8 +261,8 @@ fn m2m_not_preloaded_is_typed_error() {
         score: 0,
         hot_rank: 0.0,
         comment_count: 0,
-        created_at: chrono::NaiveDateTime::default(),
-        updated_at: chrono::NaiveDateTime::default(),
+        created_at: autumn_web::time::civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
+        updated_at: autumn_web::time::civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0),
     });
     let err = post.tags().expect_err("must be NotLoaded");
     assert_eq!(err.model, "Post");

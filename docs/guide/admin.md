@@ -87,7 +87,8 @@ Field types are mapped to admin widgets automatically:
 | `bool`             | Checkbox               | Filterable                       |
 | `f32` / `f64`      | Number input           |                                  |
 | `Uuid`             | Text input             | Read-only                        |
-| `NaiveDateTime` / `DateTime` | Date-time picker | Read-only, optional       |
+| `CivilDateTime` / `Timestamp` (or `NaiveDateTime` / `DateTime`) | Date-time picker | Read-only, optional |
+| `Date`             | Date picker            |                                  |
 | `Bytea`            | Hidden                 | Excluded from update             |
 
 The `id` field is always hidden, read-only, and excluded from the list table.

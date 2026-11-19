@@ -47,7 +47,7 @@
 use std::hint::black_box;
 
 use autumn_web::feed::{Feed, FeedEntry};
-use chrono::{TimeZone, Utc};
+use autumn_web::time::Timestamp;
 
 /// Realistic post-body paragraphs, cycled across entries. Most are plain
 /// ASCII prose with no XML-special characters; several carry an apostrophe
@@ -101,7 +101,7 @@ const TITLES: &[&str] = &[
 ];
 
 fn sample_feed() -> Feed {
-    let published = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+    let published: Timestamp = "2026-01-01T12:00:00Z".parse().unwrap();
     Feed::atom(
         "Autumn Blog",
         "https://autumn-demo.example.com/",

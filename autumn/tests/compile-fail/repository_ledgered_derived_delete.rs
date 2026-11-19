@@ -22,7 +22,7 @@ pub struct LedgeredDerivedDeleteNote {
     pub id: i64,
     pub title: String,
     #[default]
-    pub deleted_at: Option<autumn_web::reexports::chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(

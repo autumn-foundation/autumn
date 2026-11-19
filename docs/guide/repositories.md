@@ -317,7 +317,7 @@ let score = repo
 
 // A day-bucketed time series over a bounded window.
 use autumn_web::aggregate::DateBucket;
-let per_day: Vec<(chrono::NaiveDateTime, i64)> = repo
+let per_day: Vec<(autumn_web::time::civil::DateTime, i64)> = repo
     .count_grouped_by_created_at()
     .bucket(DateBucket::Day)
     .filter_range(window_start, window_end)
@@ -373,16 +373,16 @@ raw query, or group on a non-encrypted column.
 - `.bucket(DateBucket::{Day, Week, Month})` — group by
   `date_trunc('<unit>', <col>)`, producing a time series keyed by bucket start.
   This method is **only available when the group column is a timestamp type**
-  (`NaiveDateTime` or `DateTime<Utc>`); non-temporal group keys (e.g. an `i64`
+  (`civil::DateTime` or `Timestamp`, from `autumn_web::time`); non-temporal group keys (e.g. an `i64`
   `post_id`) have no `.bucket()` method, so an invalid `date_trunc` over a
   non-timestamp column is a compile error rather than a runtime failure.
-  The truncation zone follows the key type: a `NaiveDateTime`
+  The truncation zone follows the key type: a `civil::DateTime`
   (`timestamp WITHOUT time zone`) bucket truncates on the **stored wall-clock**
   value (a deterministic field truncation, independent of the session
-  `TimeZone`), while a `DateTime<Utc>` (`timestamptz`) bucket is computed **in
+  `TimeZone`), while a `Timestamp` (`timestamptz`) bucket is computed **in
   UTC** — the generated SQL uses `date_trunc('<unit>', <col>, 'UTC')` so bucket
   boundaries stay stable across deployments regardless of the DB session zone,
-  consistent with the `DateTime<Utc>` key type.
+  consistent with the `Timestamp` key type.
 
 ### Scoping comes for free
 

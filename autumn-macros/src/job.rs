@@ -487,7 +487,7 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// Enqueue this job to run once at the absolute instant `when`.
             pub async fn enqueue_at(
                 args: #args_type,
-                when: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                when: ::autumn_web::time::Timestamp,
             ) -> ::autumn_web::AutumnResult<()> {
                 let payload = ::autumn_web::reexports::serde_json::to_value(&args)
                     .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
@@ -867,10 +867,10 @@ mod tests {
             expanded.contains(":: autumn_web :: job :: enqueue_at"),
             "{expanded}"
         );
-        // enqueue_at takes a chrono UTC instant.
+        // enqueue_at takes an absolute UTC instant.
         assert!(
-            expanded.contains("chrono :: DateTime"),
-            "enqueue_at should take a DateTime: {expanded}"
+            expanded.contains("when : :: autumn_web :: time :: Timestamp"),
+            "enqueue_at should take a Timestamp: {expanded}"
         );
     }
 

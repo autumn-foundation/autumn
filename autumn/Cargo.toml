@@ -138,7 +138,6 @@ db = [
     "dep:scoped-futures",
     # The fleet core takes OS file locks on its root (path and volume locks).
     "dep:fd-lock",
-    "diesel/chrono",
     "diesel/serde_json",
     # The repository layer records history, money and retention itself.
     "ledger",
@@ -514,11 +513,10 @@ validator.workspace = true
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.10"
 rand_chacha = "0.10"
-chrono = { workspace = true }
-chrono-tz.workspace = true
+jiff.workspace = true
 # `serde` is a default feature, named here because `SqliteDecimal` depends on it.
 rust_decimal = { workspace = true, features = ["serde"] }
-croner = "4.0.2"
+croner = { version = "4.0.3", default-features = false }
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 proptest = { version = "1.4", optional = true }
@@ -641,7 +639,7 @@ autumn-schema-core = { path = "../autumn-schema-core" }
 # Criterion benches (issue #3068, `benches/admission.rs`). No plots: only the
 # statistics and the `cargo bench` harness.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-diesel = { version = "2", features = ["chrono", "postgres"] }
+diesel = { version = "2", features = ["postgres"] }
 # `rust_decimal`'s diesel impls (`AsExpression<Numeric>`, `ToSql`/`FromSql` on
 # the Pg backend) back the `#[model]` Postgres-`Decimal` integration test
 # (issue #2597): generated apps get `db-diesel2-postgres` from the model

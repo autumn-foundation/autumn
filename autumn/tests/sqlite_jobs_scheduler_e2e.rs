@@ -1721,7 +1721,7 @@ async fn sqlite_tracking_store_swaps_on_a_version_not_a_timestamp() {
 
     // A clock frozen at one instant: `updated_at` is identical for every write.
     let clock = std::sync::Arc::new(autumn_web::time::FixedClock::at(
-        chrono::DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid instant"),
+        autumn_web::time::Timestamp::from_millisecond(1_700_000_000_000).expect("valid instant"),
     ));
     let store = SqliteJobTrackingStore::new(pool.clone(), 3_600).with_clock(clock);
 
@@ -1804,7 +1804,7 @@ async fn sqlite_retry_reset_is_a_no_op_after_a_write_under_a_frozen_clock() {
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let pool = build_sqlite_pool(&tmp);
     let clock = std::sync::Arc::new(autumn_web::time::FixedClock::at(
-        chrono::DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid instant"),
+        autumn_web::time::Timestamp::from_millisecond(1_700_000_000_000).expect("valid instant"),
     ));
     let store = SqliteJobTrackingStore::new(pool, 3_600).with_clock(clock);
 
@@ -2802,14 +2802,12 @@ async fn sqlite_unknown_tracked_job_settles_failed_after_the_ack() {
 /// period frees after the TTL.
 #[tokio::test]
 async fn sqlite_fixed_delay_tick_stays_claimed_for_its_delay() {
-    use chrono::TimeZone as _;
     use scheduler::SchedulerCoordinator as _;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let clock = autumn_web::time::TickingClock::starting_at(
-        chrono::Utc
-            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
-            .single()
+        "2026-01-01T00:00:00Z"
+            .parse::<autumn_web::time::Timestamp>()
             .expect("valid date"),
     );
     let coordinator = scheduler::SqliteLeaseSchedulerCoordinator::new(
@@ -2860,14 +2858,12 @@ async fn sqlite_fixed_delay_tick_stays_claimed_for_its_delay() {
 /// `release_and_free` frees it at once, and only the caller's own row.
 #[tokio::test]
 async fn sqlite_release_and_free_frees_only_its_own_row() {
-    use chrono::TimeZone as _;
     use scheduler::SchedulerCoordinator as _;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let clock = autumn_web::time::TickingClock::starting_at(
-        chrono::Utc
-            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
-            .single()
+        "2026-01-01T00:00:00Z"
+            .parse::<autumn_web::time::Timestamp>()
             .expect("valid date"),
     );
     let pool = build_sqlite_pool(&tmp);
@@ -2930,14 +2926,12 @@ async fn sqlite_release_and_free_frees_only_its_own_row() {
 /// the window was.
 #[tokio::test]
 async fn sqlite_a_freed_deferred_tick_runs_on_one_replica() {
-    use chrono::TimeZone as _;
     use scheduler::SchedulerCoordinator as _;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let clock = autumn_web::time::TickingClock::starting_at(
-        chrono::Utc
-            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
-            .single()
+        "2026-01-01T00:00:00Z"
+            .parse::<autumn_web::time::Timestamp>()
             .expect("valid date"),
     );
     let pool = build_sqlite_pool(&tmp);

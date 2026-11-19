@@ -2646,11 +2646,11 @@ fn render_repository_queries(pascal_name: &str, queries: &[QuerySpec]) -> String
 
 /// The `parse_local_datetime` helper the generated `into_new` uses to turn a
 /// browser `datetime-local` string (`YYYY-MM-DDTHH:MM`, seconds optional) back
-/// into a `chrono::NaiveDateTime`. Emitted only when the model has a
-/// `NaiveDateTime`/`DateTime` field.
+/// into an `autumn_web::time::civil::DateTime`. Emitted only when the model has
+/// a `NaiveDateTime`/`DateTime` field.
 const PARSE_LOCAL_DATETIME_FN: &str = r#"
 /// Parse a browser `datetime-local` value (`YYYY-MM-DDTHH:MM`, seconds and
-/// fractional seconds optional) into a `NaiveDateTime`. A malformed value is
+/// fractional seconds optional) into a civil date-time. A malformed value is
 /// a 400 (undecodable input) rather than a field validation error.
 ///
 /// Accepts a trailing `%.f` so a value pre-filled from a stored row (see the
@@ -2658,32 +2658,52 @@ const PARSE_LOCAL_DATETIME_FN: &str = r#"
 /// trips exactly on a no-op resubmit instead of being silently truncated to
 /// whole seconds — the generated `update` handler writes every column back
 /// unconditionally, so any precision lost here would corrupt the stored value.
-fn parse_local_datetime(value: &str) -> AutumnResult<chrono::NaiveDateTime> {
-    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M"))__IMPORT_DATETIME_FORMAT__
+fn parse_local_datetime(value: &str) -> AutumnResult<autumn_web::time::civil::DateTime> {
+    use autumn_web::time::civil::DateTime;
+    DateTime::strptime("%Y-%m-%dT%H:%M:%S%.f", value)
+        .or_else(|_| DateTime::strptime("%Y-%m-%dT%H:%M", value))__IMPORT_DATETIME_FORMAT__
+        .map_err(|err| AutumnError::bad_request_msg(format!("invalid datetime: {err}")))
+}
+"#;
+
+/// The `parse_utc_datetime` helper for a `DateTime` (`Timestamp`) field: the
+/// browser sends a wall-clock value, which the column stores as UTC. Emitted
+/// after [`PARSE_LOCAL_DATETIME_FN`], only when the model has such a field.
+const PARSE_UTC_DATETIME_FN: &str = r#"
+/// Parse a browser `datetime-local` value as a UTC wall-clock time. A value
+/// outside the supported range is a 400, like a malformed one.
+fn parse_utc_datetime(value: &str) -> AutumnResult<autumn_web::time::Timestamp> {
+    let local = parse_local_datetime(value)?;
+    autumn_web::time::tz::TimeZone::UTC
+        .to_timestamp(local)
         .map_err(|err| AutumnError::bad_request_msg(format!("invalid datetime: {err}")))
 }
 "#;
 
 /// The extra datetime format a `--import` scaffold accepts (issue #1393).
 ///
-/// The CSV export writes a timestamp with chrono's `Display`, which separates
-/// date and time with a SPACE; the browser's `datetime-local` control sends a
-/// `T`. Without this arm a file this app exported would fail to re-import on
-/// exactly the column it had just written — the round trip the import promises.
-/// Spliced into `PARSE_LOCAL_DATETIME_FN` only under `--import`, so a scaffold
-/// without the flag emits the pre-#1393 helper byte-for-byte.
+/// The CSV export writes a timestamp with its `Display`: `2026-08-26T12:00:00`
+/// for a civil column and `2026-08-26T12:00:00Z` for a TZ-aware one. Files
+/// exported by apps built on chrono separate date and time with a SPACE and
+/// end a TZ-aware value with ` UTC`. Without these arms a file this app
+/// exported would fail to re-import on exactly the column it had just written
+/// — the round trip the import promises. Spliced into
+/// `PARSE_LOCAL_DATETIME_FN` only under `--import`, so a scaffold without the
+/// flag emits the plain helper.
 const IMPORT_DATETIME_FORMAT_ARM: &str = r#"
-        // The CSV export's format (chrono's `Display`: a space, not a `T`), so
-        // an exported file re-imports on this column. Harmless for the browser
-        // path, which never sends this shape.
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f"))
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
-        // A TZ-AWARE column's `Display` appends the zone name
-        // (`2026-08-26 12:00:00 UTC`). The zone is redundant on the way back in
-        // — the caller re-attaches UTC — but without this arm every row of an
-        // exported file fails on that column.
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f %Z"))"#;
+        // The CSV export's formats, so an exported file re-imports on this
+        // column. A TZ-aware value ends in `Z` (or ` UTC` in an older export);
+        // the zone is redundant on the way back in, because the caller
+        // re-attaches UTC. Harmless for the browser path, which never sends
+        // these shapes.
+        .or_else(|_| {
+            let bare = value
+                .strip_suffix(" UTC")
+                .or_else(|| value.strip_suffix('Z'))
+                .unwrap_or(value);
+            DateTime::strptime("%Y-%m-%dT%H:%M:%S%.f", bare)
+                .or_else(|_| DateTime::strptime("%Y-%m-%d %H:%M:%S%.f", bare))
+        })"#;
 
 /// The generated pieces backing the changeset round-trip (issue #1124): the
 /// public, validating `{Pascal}Form` struct, its fallible conversion into
@@ -2735,6 +2755,7 @@ fn render_model_form(
     let mut into_new = String::new();
     let mut from_row = String::new();
     let mut needs_datetime = false;
+    let mut needs_utc_datetime = false;
 
     for f in fields {
         let name = &f.name;
@@ -2801,34 +2822,43 @@ fn render_model_form(
             }
         } else if matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime) {
             // A `String` on the form (the browser's wire shape), so it always decodes;
-            // `into_new` parses it.
+            // `into_new` parses it. A `DateTime` (`Timestamp`) column reads the wall-clock value
+            // as UTC and shows its UTC wall clock back.
             needs_datetime = true;
-            let to_utc = if f.kind == FieldKind::DateTime {
-                ".and_utc()"
+            let utc = f.kind == FieldKind::DateTime;
+            needs_utc_datetime |= utc;
+            let parse = if utc {
+                "parse_utc_datetime"
             } else {
-                ""
+                "parse_local_datetime"
+            };
+            let wall_clock = |value: &str| {
+                if utc {
+                    format!("autumn_web::time::tz::TimeZone::UTC.to_datetime({value})")
+                } else {
+                    value.to_owned()
+                }
             };
             if f.nullable {
                 let _ = writeln!(struct_fields, "    pub {name}: Option<String>,");
                 let _ = writeln!(
                     into_new,
                     "        {name}: form.{name}.as_deref().filter(|value| !value.is_empty())\n\
-                     \x20\x20\x20\x20\x20\x20\x20\x20.map(|value| parse_local_datetime(value).map(|dt| dt{to_utc}))\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20.map({parse})\n\
                      \x20\x20\x20\x20\x20\x20\x20\x20.transpose()?,"
                 );
                 let _ = writeln!(
                     from_row,
-                    "            {name}: row.{name}.as_ref().map(|dt| dt.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()),"
+                    "            {name}: row.{name}.map(|dt| {}.strftime(\"%Y-%m-%dT%H:%M:%S%.f\").to_string()),",
+                    wall_clock("dt")
                 );
             } else {
                 let _ = writeln!(struct_fields, "    pub {name}: String,");
-                let _ = writeln!(
-                    into_new,
-                    "        {name}: parse_local_datetime(&form.{name})?{to_utc},"
-                );
+                let _ = writeln!(into_new, "        {name}: {parse}(&form.{name})?,");
                 let _ = writeln!(
                     from_row,
-                    "            {name}: row.{name}.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string(),"
+                    "            {name}: {}.strftime(\"%Y-%m-%dT%H:%M:%S%.f\").to_string(),",
+                    wall_clock(&format!("row.{name}"))
                 );
             }
         } else if let Some(enum_ty) = f.enum_type_name() {
@@ -2908,8 +2938,10 @@ fn render_model_form(
                     | FieldKind::Uuid
                     | FieldKind::Decimal { .. }
                     | FieldKind::References
-                    // `NaiveTime::default()` is midnight (issue #3405).
+                    // `civil::Time::default()` is midnight (issue #3405), and
+                    // `civil::Date::default()` is a real date.
                     | FieldKind::Time
+                    | FieldKind::Date
             )
         {
             // A `String` on the form: `T::default()` (`0`, the nil UUID) looks like a real
@@ -2935,8 +2967,11 @@ fn render_model_form(
                 "    pub {name}: {rust_type},",
                 rust_type = f.rust_type_for(backend)
             );
-            let _ = writeln!(into_new, "        {name}: form.{name}.clone(),");
-            let _ = writeln!(from_row, "            {name}: row.{name}.clone(),");
+            // A nullable `Date`/`time` is `Option` of a `Copy` value, which
+            // `clippy::clone_on_copy` flags.
+            let clone = if f.kind.is_temporal() { "" } else { ".clone()" };
+            let _ = writeln!(into_new, "        {name}: form.{name}{clone},");
+            let _ = writeln!(from_row, "            {name}: row.{name}{clone},");
         }
     }
 
@@ -2968,7 +3003,7 @@ fn render_model_form(
          }}"
     );
 
-    let datetime_helper = if needs_datetime {
+    let mut datetime_helper = if needs_datetime {
         PARSE_LOCAL_DATETIME_FN.replace(
             "__IMPORT_DATETIME_FORMAT__",
             if import {
@@ -2980,6 +3015,9 @@ fn render_model_form(
     } else {
         String::new()
     };
+    if needs_utc_datetime {
+        datetime_helper.push_str(PARSE_UTC_DATETIME_FN);
+    }
 
     ModelFormParts {
         form_struct,
@@ -3587,7 +3625,7 @@ fn render_routes_file(
         // Filtering on `deleted_at IS NULL` makes a second delete a 404, like a hard delete.
         format!(
             "let deleted = diesel::update(\n        {plural}::table.{find_expr}.filter({plural}::deleted_at.is_null()),\n    )\n        \
-                 .set({plural}::deleted_at.eq(Some(chrono::Utc::now().naive_utc())))\n        \
+                 .set({plural}::deleted_at.eq(Some(autumn_web::db::SqlDateTime::from(autumn_web::time::ambient_civil_utc()))))\n        \
                  .execute(&mut *db)\n        .await?;"
         )
     } else {
@@ -4259,7 +4297,7 @@ mod attachment_read_back_tests {{
                  if field.file_name().is_some_and(|file_name| !file_name.is_empty()) {{\n                    \
                  let key = format!(\n                        \
                  \"{plural}/{name}/{{}}_{{}}{{}}\",\n                        \
-                 chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),\n                        \
+                 autumn_web::time::ambient_now().as_nanosecond(),\n                        \
                  uuid::Uuid::new_v4(),\n                        \
                  upload_extension(field.file_name())\n                    \
                  );\n                    \
@@ -7844,7 +7882,7 @@ fn render_form_for_helper(
                 );
             }
             // A `phone` or `color` column is a `String` with its own native control (#3405). A
-            // `time` column needs none: the derive maps `NaiveTime` to `FieldControl::Time`.
+            // `time` column needs none: the derive maps `civil::Time` to `FieldControl::Time`.
             _ if f.constraints.widget.is_some() => {
                 if let Some(widget) = f.constraints.widget {
                     let _ = write!(
@@ -8325,6 +8363,12 @@ fn render_changeset_form_inputs(
                 (FieldKind::Time, true) => {
                     format!("(autumn_web::form::time_input(&{cv}, \"{name}\", \"{label}\"))")
                 }
+                (FieldKind::Date, false) => format!(
+                    "(autumn_web::form::required_date_input(&{cv}, \"{name}\", \"{label}\"))"
+                ),
+                (FieldKind::Date, true) => {
+                    format!("(autumn_web::form::date_input(&{cv}, \"{name}\", \"{label}\"))")
+                }
                 (FieldKind::String, nullable) if f.constraints.widget.is_some() => {
                     match (f.constraints.widget, nullable) {
                         (Some(StringWidget::Color), _) => format!(
@@ -8712,7 +8756,7 @@ fn render_live_reference_select(field: &Field, changeset_var: &str) -> String {
 /// Produce the cell-body expression for a `data_table` column closure.
 ///
 /// Every arm must evaluate to a type that implements `maud::Render` (`&str`,
-/// `String`, `Cow<str>`, integers). `bool`, `Option<T>`, chrono types, `Uuid`,
+/// `String`, `Cow<str>`, integers). `bool`, `Option<T>`, jiff types, `Uuid`,
 /// `Vec<u8>`, and `Blob` do NOT implement `Render` in maud 0.27, so we always
 /// coerce via `to_string()` / `unwrap_or_default()`.
 fn cell_value_expr(field: &Field) -> String {
@@ -8741,7 +8785,7 @@ fn cell_value_expr(field: &Field) -> String {
         (false, FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64) => {
             format!("row.{name}")
         }
-        // Bool, Uuid and chrono types have no maud `Render` impl; go through `Display`.
+        // Bool, Uuid and jiff types have no maud `Render` impl; go through `Display`.
         (false, _) => format!("row.{name}.to_string()"),
     }
 }
@@ -10707,6 +10751,13 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
                 name = f.name,
                 wrapper = encryption_wrapper_type(mode),
             ),
+            // A date/time field has no diesel impl of its own; `#[model]` binds it through
+            // the `autumn_web::db::Sql*` wrappers, and so must this raw write.
+            None if f.kind.is_temporal() => write!(
+                out,
+                "{plural}::{name}.eq(autumn_web::db::AsSqlTime::as_sql_time(&new.{name}))",
+                name = f.name
+            ),
             None if is_copy_field_kind(f) => {
                 // A `Copy` field reads straight out of the reference; `.clone()` would trip
                 // `clippy::clone_on_copy`.
@@ -10725,21 +10776,25 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
 
 /// How the generated raw-diesel insert passes the `New{Model}` record to
 /// `.values(…)` — `&new` normally, `new` (owned) once any column is
-/// `{encrypted}` (issue #1340).
+/// `{encrypted}` (issue #1340) or a date/time kind.
 ///
 /// `#[diesel(serialize_as = …)]`, which the `#[model]` macro attaches to every
-/// `#[encrypted]` field, *consumes* the field on the way to SQL, so diesel
+/// `#[encrypted]` field and every date/time field, *consumes* the field on the
+/// way to SQL, so diesel
 /// implements `Insertable<table>` for the owned `New{Model}` only — never for
 /// `&New{Model}`. Borrowing would fail to compile the generated app with
 /// "the trait bound `&NewX: Insertable<table>` is not satisfied". The macro's
 /// own factory and bulk-upsert codegen already pass owned records for exactly
 /// this reason.
 ///
-/// The borrowed form is kept for every other scaffold so unencrypted output
-/// stays byte-for-byte identical; `new` is not read after the insert on either
+/// The borrowed form is kept for every other scaffold so its output stays
+/// byte-for-byte identical; `new` is not read after the insert on either
 /// path, so the move is always sound.
 fn insert_record_expr(fields: &[Field]) -> &'static str {
-    if fields.iter().any(Field::is_encrypted) {
+    if fields
+        .iter()
+        .any(|f| f.is_encrypted() || f.kind.is_temporal())
+    {
         "new"
     } else {
         "&new"
@@ -13072,9 +13127,10 @@ fn sql_sample_literal(backend: DatabaseBackend, kind: FieldKind) -> String {
         FieldKind::Uuid => "gen_random_uuid()".to_owned(),
         FieldKind::NaiveDateTime | FieldKind::DateTime if sqlite => "CURRENT_TIMESTAMP".to_owned(),
         FieldKind::NaiveDateTime | FieldKind::DateTime => "NOW()".to_owned(),
-        // #3405: Postgres casts the literal; SQLite stores it as text, which diesel reads
-        // back as a `NaiveTime`.
+        // #3405: Postgres casts the literal; SQLite stores it as text, which `#[model]` reads
+        // back as a `civil::Time`. A date literal works the same way.
         FieldKind::Time => "'09:30:00'".to_owned(),
+        FieldKind::Date => "'2024-01-01'".to_owned(),
         FieldKind::Bytea if sqlite => "X'00'".to_owned(),
         FieldKind::Bytea => "'\\x00'::bytea".to_owned(),
         // Always nullable (see `FieldKind::Attachment`).
@@ -13124,6 +13180,9 @@ fn sql_seed_value_expr(backend: DatabaseBackend, f: &Field) -> String {
         // Vary per row (#3405) so a `unique` time column does not collide.
         FieldKind::Time if sqlite => "time('00:00:00', '+' || g || ' seconds')".to_owned(),
         FieldKind::Time => "TIME '00:00:00' + (g || ' seconds')::interval".to_owned(),
+        // Vary per row so a `unique` date column does not collide.
+        FieldKind::Date if sqlite => "date('2024-01-01', '+' || g || ' days')".to_owned(),
+        FieldKind::Date => "DATE '2024-01-01' + g".to_owned(),
         // Enum must stay inside its declared set — pick a real variant.
         FieldKind::Enum => {
             format!("'{}'", f.variants.first().expect("enum field has variants"))
@@ -13360,6 +13419,7 @@ fn unique_sample_literal(backend: DatabaseBackend, kind: FieldKind) -> String {
         FieldKind::NaiveDateTime => "'2024-01-01 00:00:00'::timestamp".to_owned(),
         FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz".to_owned(),
         FieldKind::Time => "'10:00:00'".to_owned(),
+        FieldKind::Date => "'2024-01-10'".to_owned(),
         FieldKind::Bytea if sqlite => "X'DEADBEEF'".to_owned(),
         FieldKind::Bytea => "'\\xDEADBEEF'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
@@ -13402,6 +13462,7 @@ fn unique_sample_literal_variant(backend: DatabaseBackend, kind: FieldKind) -> S
         FieldKind::NaiveDateTime => "'2024-01-02 00:00:00'::timestamp".to_owned(),
         FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz".to_owned(),
         FieldKind::Time => "'11:00:00'".to_owned(),
+        FieldKind::Date => "'2024-01-11'".to_owned(),
         FieldKind::Bytea if sqlite => "X'BEEFDEAD'".to_owned(),
         FieldKind::Bytea => "'\\xBEEFDEAD'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
@@ -16074,7 +16135,7 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         assert!(
-            routes.contains("posts::deleted_at.eq(Some(chrono::Utc::now().naive_utc()))"),
+            routes.contains("posts::deleted_at.eq(Some(autumn_web::db::SqlDateTime::from(autumn_web::time::ambient_civil_utc())))"),
             "soft-delete destroy must mark deleted_at: {routes}"
         );
         assert!(
@@ -16354,7 +16415,7 @@ async fn main() {
                 "{field}: {routes}"
             );
         }
-        // The derive maps `NaiveTime` to `FieldControl::Time`.
+        // The derive maps `civil::Time` to `FieldControl::Time`.
         for field in ["opens", "closes"] {
             assert!(
                 !routes.contains(&format!(".override_field(\"{field}\"")),
@@ -16372,17 +16433,20 @@ async fn main() {
         // not show the `Default` midnight.
         assert!(routes.contains("    pub opens: String,"), "{routes}");
         assert!(
-            routes.contains("form.opens.parse::<chrono::NaiveTime>()"),
+            routes.contains("form.opens.parse::<autumn_web::time::civil::Time>()"),
             "{routes}"
         );
         assert!(
-            routes.contains("    pub closes: Option<chrono::NaiveTime>,"),
+            routes.contains("    pub closes: Option<autumn_web::time::civil::Time>,"),
             "{routes}"
         );
 
-        assert!(model.contains("pub opens: chrono::NaiveTime"), "{model}");
         assert!(
-            model.contains("pub closes: Option<chrono::NaiveTime>"),
+            model.contains("pub opens: autumn_web::time::civil::Time"),
+            "{model}"
+        );
+        assert!(
+            model.contains("pub closes: Option<autumn_web::time::civil::Time>"),
             "{model}"
         );
         assert!(model.contains("pub mobile: String"), "{model}");
@@ -16888,10 +16952,12 @@ async fn main() {
         // resubmit would otherwise truncate the stored value.
         assert!(
             routes.contains(
-                "published_at: row.published_at.format(\"%Y-%m-%dT%H:%M:%S%.f\").to_string(),"
+                "published_at: row.published_at.strftime(\"%Y-%m-%dT%H:%M:%S%.f\").to_string(),"
             ),
             "{routes}"
         );
+        // Only a `DateTime` (`Timestamp`) column needs the UTC helper.
+        assert!(!routes.contains("fn parse_utc_datetime("), "{routes}");
     }
 
     #[test]
@@ -16914,9 +16980,18 @@ async fn main() {
         );
         assert!(routes.contains("pub scheduled_at: String,"), "{routes}");
         assert!(
-            routes.contains("scheduled_at: parse_local_datetime(&form.scheduled_at)?.and_utc(),"),
+            routes.contains("scheduled_at: parse_utc_datetime(&form.scheduled_at)?,"),
             "{routes}"
         );
+        // The stored instant is shown back as its UTC wall clock.
+        assert!(
+            routes.contains(
+                "scheduled_at: autumn_web::time::tz::TimeZone::UTC.to_datetime(row.scheduled_at).strftime(\"%Y-%m-%dT%H:%M:%S%.f\").to_string(),"
+            ),
+            "{routes}"
+        );
+        assert!(routes.contains("fn parse_utc_datetime("), "{routes}");
+        assert!(routes.contains(".to_timestamp(local)"), "{routes}");
     }
 
     #[test]
