@@ -78,7 +78,7 @@ INSERT INTO autumn_idempotency_keys
      locked_until_ms, expires_at_ms, ttl_ms, record_owner)
 SELECT 'v2:' || encode(sha256(('fixture-' || i)::bytea), 'hex'),
        CASE WHEN i % 200 < 192
-            THEN decode(repeat(md5(i::text), 13 + (i * 7919) % 75), 'hex') END,
+            THEN decode(repeat(md5(i::text), 13 + ((i::bigint * 7919) % 75)::int), 'hex') END,
        CASE WHEN i % 200 BETWEEN 192 AND 195 THEN 'step-' || (i % 4) END,
        CASE WHEN i % 200 BETWEEN 192 AND 195 THEN sha256(i::text::bytea) END,
        CASE WHEN i % 200 = 196 THEN md5('owner' || i) END,
@@ -114,6 +114,8 @@ struct StatementRow {
     temp: i64,
     #[diesel(sql_type = BigInt)]
     wal: i64,
+    #[diesel(sql_type = BigInt)]
+    fpi: i64,
 }
 
 async fn count(conn: &mut AsyncPgConnection, sql: &str) -> i64 {
@@ -168,7 +170,7 @@ async fn profile(conn: &mut AsyncPgConnection, label: &str, requests: i64, befor
         "SELECT query, calls, rows, \
                 (shared_blks_hit + shared_blks_read)::bigint AS buffers, \
                 (temp_blks_read + temp_blks_written)::bigint AS temp, \
-                wal_bytes::bigint AS wal \
+                wal_bytes::bigint AS wal, wal_fpi::bigint AS fpi \
          FROM pg_stat_statements \
          WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
            AND query NOT ILIKE '%pg_stat%' AND query NOT ILIKE '%pg_current_wal_lsn%' \
@@ -179,16 +181,16 @@ async fn profile(conn: &mut AsyncPgConnection, label: &str, requests: i64, befor
     .expect("read pg_stat_statements");
     println!("\n=== {label}: {requests} requests ===");
     println!(
-        "{:>6} {:>8} {:>9} {:>5} {:>10}  statement",
-        "calls", "rows", "buffers", "temp", "wal_bytes"
+        "{:>6} {:>8} {:>9} {:>5} {:>10} {:>6}  statement",
+        "calls", "rows", "buffers", "temp", "wal_bytes", "fpi"
     );
     let (mut calls, mut buffers, mut wal) = (0, 0, 0);
     for row in &rows {
         let text: String = row.query.split_whitespace().collect::<Vec<_>>().join(" ");
         let short: String = text.chars().take(150).collect();
         println!(
-            "{:>6} {:>8} {:>9} {:>5} {:>10}  {short}",
-            row.calls, row.rows, row.buffers, row.temp, row.wal
+            "{:>6} {:>8} {:>9} {:>5} {:>10} {:>6}  {short}",
+            row.calls, row.rows, row.buffers, row.temp, row.wal, row.fpi
         );
         calls += row.calls;
         buffers += row.buffers;
@@ -216,7 +218,9 @@ async fn profile(conn: &mut AsyncPgConnection, label: &str, requests: i64, befor
 }
 
 async fn reset(conn: &mut AsyncPgConnection) -> [i64; 5] {
-    conn.batch_execute("SELECT pg_stat_statements_reset()")
+    // A checkpoint first, so every phase starts with no page written since
+    // one: each page's first change then logs one full-page image.
+    conn.batch_execute("CHECKPOINT; SELECT pg_stat_statements_reset()")
         .await
         .expect("reset pg_stat_statements");
     table_counters(conn).await
@@ -302,6 +306,28 @@ async fn post_all(client: &TestClient, path: &str, keys: &[String], expect: Stat
     }
 }
 
+/// One measured phase. The app gets a pool of its own, warmed by one request
+/// before the counters reset, and dropped before they are read: its backends
+/// exit, so their table statistics are flushed.
+async fn phase(url: &str, conn: &mut AsyncPgConnection, label: &str, path: &str, keys: &[String]) {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    let pool = Pool::builder(manager).max_size(4).build().expect("pool");
+    let client = client(&pool);
+    post_all(
+        &client,
+        "/plain",
+        &[format!("warm-up-{label}")],
+        StatusCode::CREATED,
+    )
+    .await;
+    let before = reset(conn).await;
+    post_all(&client, path, keys, StatusCode::CREATED).await;
+    drop(client);
+    pool.close();
+    drop(pool);
+    profile(conn, label, i64::try_from(keys.len()).expect("len"), before).await;
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn idempotency_db_request_profile() {
@@ -337,25 +363,13 @@ async fn idempotency_db_request_profile() {
         size / 1_048_576
     );
 
-    let client = client(&pool);
-    // One request first, so lazy statics and the pool are warm.
-    post_all(&client, "/plain", &["warm-up".to_owned()], StatusCode::CREATED).await;
-
     let fresh_tx: Vec<String> = (0..1024).map(|i| format!("pay-{i:05}")).collect();
     let fresh_plain: Vec<String> = (0..1024).map(|i| format!("plain-{i:05}")).collect();
     let replay: Vec<String> = fresh_tx.iter().step_by(2).cloned().collect();
 
-    let before = reset(&mut conn).await;
-    post_all(&client, "/pay", &fresh_tx, StatusCode::CREATED).await;
-    profile(&mut conn, "fresh-tx", 1024, before).await;
-
-    let before = reset(&mut conn).await;
-    post_all(&client, "/plain", &fresh_plain, StatusCode::CREATED).await;
-    profile(&mut conn, "fresh-plain", 1024, before).await;
-
-    let before = reset(&mut conn).await;
-    post_all(&client, "/pay", &replay, StatusCode::CREATED).await;
-    profile(&mut conn, "replay", 512, before).await;
+    phase(&url, &mut conn, "fresh-tx", "/pay", &fresh_tx).await;
+    phase(&url, &mut conn, "fresh-plain", "/plain", &fresh_plain).await;
+    phase(&url, &mut conn, "replay", "/pay", &replay).await;
 
     let payments = count(&mut conn, "SELECT COUNT(*) AS n FROM ledger_idem_payments").await;
     assert_eq!(payments, 1024, "a replay must not charge twice");
