@@ -284,6 +284,7 @@ async fn server() -> (String, Option<testcontainers::ContainerAsync<Postgres>>) 
 }
 
 /// The seeded request sequence: a raw token and the status it must get.
+#[allow(clippy::cast_precision_loss)] // ranks and draws are below 2^52
 fn requests(hot: &[i64], rows: i64) -> Vec<(String, StatusCode)> {
     let mut state: u64 = 0x5eed_1ed6_e400_0001;
     let mut next = move || {
@@ -309,11 +310,9 @@ fn requests(hot: &[i64], rows: i64) -> Vec<(String, StatusCode)> {
             } else {
                 // Zipf-like: rank k with weight 1 / (k + 1).
                 let weights: f64 = (1..=hot.len()).map(|k| 1.0 / k as f64).sum();
-                #[allow(clippy::cast_precision_loss)]
                 let mut pick = (next() % 1_000_000) as f64 / 1_000_000.0 * weights;
                 let mut index = hot.len() - 1;
                 for (k, _) in hot.iter().enumerate() {
-                    #[allow(clippy::cast_precision_loss)]
                     let w = 1.0 / (k + 1) as f64;
                     if pick < w {
                         index = k;
