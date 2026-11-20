@@ -2901,6 +2901,21 @@ Published 0.5.0 behavior:
   process. Every `[log]` knob, the access log and the PII scrubber included,
   is documented on one page: `docs/guide/logging-pii.md`.
 
+### Top keys of a stream — `heavy_hitters` (unreleased)
+
+To find the hottest tenant, route or client IP without a counter per key,
+use `autumn_web::heavy_hitters::HeavyHitters` (no feature, std only). It
+holds `capacity` counters (Space-Saving): every key over `total / capacity`
+stays in the table, and each `Hitter` carries `count` (never below the truth)
+and `guaranteed()` (never above it). `frequent(share_ppm)` has no false
+positives; `take()` hands back the window and starts a fresh one:
+
+```rust
+let hot = Arc::new(HeavyHitters::new(100));
+hot.observe(tenant_id.clone());          // or observe_n(route, bytes)
+for hit in hot.frequent(50_000) { /* each is surely >= 5 % of traffic */ }
+```
+
 ### Runtime log levels (0.6.0)
 
 `PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
