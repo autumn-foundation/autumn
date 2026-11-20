@@ -16,6 +16,8 @@ mod after_commit_integration;
 #[cfg(feature = "mcp")]
 mod agent_authority;
 mod alerts;
+#[cfg(all(feature = "db", feature = "postgres"))]
+mod api_token_verify_profile;
 mod api_versioning_integration;
 #[cfg(feature = "openapi")]
 mod api_versioning_openapi;
