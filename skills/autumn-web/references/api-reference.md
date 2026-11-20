@@ -707,6 +707,17 @@ delete actions remain last-write-wins.
   ceiling)`, `with_max_hedges`), using `initial` until 20 samples are in.
   Keep one per upstream, in shared state.
 
+## Hot keys (`autumn_web::hot_keys`)
+
+- `HotKeys::new(capacity)` tracks the busiest keys (IPs, tenants, tokens) in
+  at most `capacity` entries (Space-Saving). `record(key)` /
+  `record_weighted(key, w)` per event; `top(n)` → `HotKey { key, count,
+  error }`, where the true count is in `[guaranteed(), count]`;
+  `heavy_hitters(share_ppm)` → keys over that share, `certain` when even
+  `guaranteed()` is over it; `estimate(&key)`, `total()`, `decay()` (halve
+  every count; call on a timer), `clear()`. Keep one per thing counted, in
+  shared state.
+
 ## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
 
 Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
