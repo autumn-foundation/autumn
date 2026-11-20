@@ -304,10 +304,7 @@ fn requests(hot: &[i64], rows: i64) -> Vec<(String, StatusCode)> {
                         .expect("id")
                         * 100
                         + 7;
-                    (
-                        format!("fixture-token-{revoked}"),
-                        StatusCode::UNAUTHORIZED,
-                    )
+                    (format!("fixture-token-{revoked}"), StatusCode::UNAUTHORIZED)
                 }
             } else {
                 // Zipf-like: rank k with weight 1 / (k + 1).
@@ -420,13 +417,14 @@ async fn api_token_verify_profile() {
         .await
         .expect("fill");
     let hot_sql = HOT.replace(":rows", &rows.to_string());
-    let hot: Vec<i64> = diesel::sql_query(hot_sql.replace("SELECT i FROM", "SELECT i::bigint AS n FROM"))
-        .load::<Count>(&mut conn)
-        .await
-        .expect("hot ids")
-        .into_iter()
-        .map(|c| c.n)
-        .collect();
+    let hot: Vec<i64> =
+        diesel::sql_query(hot_sql.replace("SELECT i FROM", "SELECT i::bigint AS n FROM"))
+            .load::<Count>(&mut conn)
+            .await
+            .expect("hot ids")
+            .into_iter()
+            .map(|c| c.n)
+            .collect();
     assert_eq!(hot.len(), 64, "fixture too small for 64 hot tokens");
     println!(
         "fixture: {rows} rows, dead tuples {}, heap {} MB, indexes {} MB",
