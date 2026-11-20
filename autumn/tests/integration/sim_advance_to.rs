@@ -14,14 +14,36 @@ use autumn_web::sim::Sim;
 use autumn_web::sim_test;
 use autumn_web::test::TestApp;
 use autumn_web::time::Clock;
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use chrono_tz::America::New_York;
+use autumn_web::time::compat::rfc3339;
+use autumn_web::time::tz::TimeZone;
+use autumn_web::time::{SignedDuration, Timestamp, ZonedDateTime, civil};
+
+fn new_york() -> TimeZone {
+    TimeZone::get("America/New_York").expect("bundled tzdb has America/New_York")
+}
+
+/// `y-mo-d h:mi:00` as a UTC instant.
+fn utc(y: i16, mo: i8, d: i8, h: i8, mi: i8) -> Timestamp {
+    civil::date(y, mo, d)
+        .at(h, mi, 0, 0)
+        .to_zoned_datetime(TimeZone::UTC)
+        .unwrap()
+        .timestamp()
+}
+
+/// `y-mo-d h:mi:00` local time in `America/New_York`.
+fn new_york_at(y: i16, mo: i8, d: i8, h: i8, mi: i8) -> ZonedDateTime {
+    civil::date(y, mo, d)
+        .at(h, mi, 0, 0)
+        .to_zoned_datetime(new_york())
+        .unwrap()
+}
 
 /// Reads the injected (virtual) wall clock so the test can prove where the sim
 /// clock has advanced to.
 #[get("/now")]
 async fn now_route(clock: Clock) -> String {
-    clock.now().to_rfc3339()
+    autumn_web::time::compat::rfc3339(clock.now())
 }
 
 /// `advance_to` a plain future UTC target moves the sim clock to *exactly* that
@@ -36,12 +58,12 @@ async fn advance_to_utc_target_lands_exactly(mut sim: Sim) {
     assert_eq!(before.text(), "2020-01-01T00:00:00+00:00");
 
     // Advance to a specific UTC instant a bit over two months out.
-    let target = Utc.with_ymd_and_hms(2020, 3, 8, 12, 0, 0).unwrap();
-    sim.advance_to(&target).await;
+    let target = utc(2020, 3, 8, 12, 0);
+    sim.advance_to(target).await;
 
     let after = sim.client().get("/now").send().await;
     after.assert_ok();
-    assert_eq!(after.text(), target.to_rfc3339());
+    assert_eq!(after.text(), rfc3339(target));
 }
 
 /// `advance_to` the *current* instant is a no-op (time never moves backward and
@@ -50,8 +72,8 @@ async fn advance_to_utc_target_lands_exactly(mut sim: Sim) {
 async fn advance_to_current_instant_is_noop(mut sim: Sim) {
     sim.build(TestApp::new().routes(routes![now_route]));
 
-    let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-    sim.advance_to(&epoch).await;
+    let epoch = utc(2020, 1, 1, 0, 0);
+    sim.advance_to(epoch).await;
 
     let after = sim.client().get("/now").send().await;
     after.assert_ok();
@@ -68,10 +90,10 @@ async fn advance_to_across_spring_forward_resolves_utc(mut sim: Sim) {
     // 03:30 local on the spring-forward day is a *valid* wall time in EDT
     // (offset -04:00), so it resolves to 07:30 UTC — not the 08:30 UTC it would
     // be if the day were treated as a normal -05:00 EST day.
-    let target_local = New_York.with_ymd_and_hms(2020, 3, 8, 3, 30, 0).unwrap();
-    let expected_utc = Utc.with_ymd_and_hms(2020, 3, 8, 7, 30, 0).unwrap();
+    let target_local = new_york_at(2020, 3, 8, 3, 30);
+    let expected_utc = utc(2020, 3, 8, 7, 30);
     assert_eq!(
-        target_local.with_timezone(&Utc),
+        target_local.timestamp(),
         expected_utc,
         "DST-aware zone must resolve 03:30 EDT to 07:30 UTC"
     );
@@ -80,7 +102,7 @@ async fn advance_to_across_spring_forward_resolves_utc(mut sim: Sim) {
 
     let after = sim.client().get("/now").send().await;
     after.assert_ok();
-    assert_eq!(after.text(), expected_utc.to_rfc3339());
+    assert_eq!(after.text(), rfc3339(expected_utc));
 }
 
 /// The DST heart of the feature: a `tokio::time::sleep`-backed effect whose
@@ -94,16 +116,16 @@ async fn timer_inside_crossed_dst_window_fires_in_virtual_time(mut sim: Sim) {
     // Target: 04:00 EDT on the spring-forward day = 08:00 UTC. The epoch is
     // 2020-01-01T00:00:00Z, so the crossed window is ~67 days long and includes
     // the 02:00→03:00 local jump.
-    let target_local = New_York.with_ymd_and_hms(2020, 3, 8, 4, 0, 0).unwrap();
-    let expected_utc = Utc.with_ymd_and_hms(2020, 3, 8, 8, 0, 0).unwrap();
-    assert_eq!(target_local.with_timezone(&Utc), expected_utc);
+    let target_local = new_york_at(2020, 3, 8, 4, 0);
+    let expected_utc = utc(2020, 3, 8, 8, 0);
+    assert_eq!(target_local.timestamp(), expected_utc);
 
     // Arm a timer to fire ~1 hour before the target (well inside the crossed
     // window, and after the DST transition instant at 07:00 UTC).
-    let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-    let until_fire = (expected_utc - chrono::Duration::hours(1) - epoch)
-        .to_std()
-        .unwrap();
+    let epoch = utc(2020, 1, 1, 0, 0);
+    let until_fire =
+        Duration::try_from(expected_utc.duration_since(epoch) - SignedDuration::from_hours(1))
+            .unwrap();
 
     let fired = Arc::new(AtomicBool::new(false));
     let fired_task = Arc::clone(&fired);
@@ -137,7 +159,7 @@ async fn timer_inside_crossed_dst_window_fires_in_virtual_time(mut sim: Sim) {
     after.assert_ok();
     assert_eq!(
         after.text(),
-        expected_utc.to_rfc3339(),
+        rfc3339(expected_utc),
         "the sim clock must land exactly on the zoned target instant"
     );
 
@@ -148,9 +170,9 @@ async fn timer_inside_crossed_dst_window_fires_in_virtual_time(mut sim: Sim) {
     );
 }
 
-/// The naive-local convenience form resolves a spring-forward **gap** (a wall
-/// time that never exists) deterministically — no panic, no `.unwrap()` on a
-/// `LocalResult::None` — and still lands the clock in the future.
+/// The civil-local convenience form resolves a spring-forward **gap** (a wall
+/// time that never exists) deterministically, with no panic, and still lands
+/// the clock in the future.
 #[sim_test]
 async fn advance_to_local_gap_time_resolves_deterministically(mut sim: Sim) {
     sim.build(TestApp::new().routes(routes![now_route]));
@@ -159,15 +181,12 @@ async fn advance_to_local_gap_time_resolves_deterministically(mut sim: Sim) {
     // 02:00 EST → 03:00 EDT). The nonexistent wall time is carried forward across
     // the gap deterministically, landing at 07:30 UTC (i.e. 03:30 EDT — shifted
     // past the transition by the gap length) rather than erroring.
-    let gap_local = NaiveDate::from_ymd_opt(2020, 3, 8)
-        .unwrap()
-        .and_hms_opt(2, 30, 0)
-        .unwrap();
-    let expected_utc: DateTime<Utc> = Utc.with_ymd_and_hms(2020, 3, 8, 7, 30, 0).unwrap();
+    let gap_local = civil::date(2020, 3, 8).at(2, 30, 0, 0);
+    let expected_utc = utc(2020, 3, 8, 7, 30);
 
-    sim.advance_to_local(gap_local, &New_York).await;
+    sim.advance_to_local(gap_local, &new_york()).await;
 
     let after = sim.client().get("/now").send().await;
     after.assert_ok();
-    assert_eq!(after.text(), expected_utc.to_rfc3339());
+    assert_eq!(after.text(), rfc3339(expected_utc));
 }

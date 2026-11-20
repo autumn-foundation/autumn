@@ -12,8 +12,7 @@ use autumn_web::lifecycle;
 use autumn_web::pdf::Pdf;
 use autumn_web::prelude::*;
 use autumn_web::seo::SeoMeta;
-use autumn_web::time::Clock;
-use chrono::{DateTime, Utc};
+use autumn_web::time::{Clock, Timestamp, compat};
 
 // ── Invoice lifecycle (issue #1675) ──────────────────────────────────────────
 //
@@ -104,7 +103,7 @@ fn format_cents(cents: u64) -> String {
 }
 
 /// The single view shared by the on-screen detail page and the PDF export.
-fn invoice_view(invoice: &Invoice, generated_at: DateTime<Utc>) -> Markup {
+fn invoice_view(invoice: &Invoice, generated_at: Timestamp) -> Markup {
     html! {
         h1 { "Invoice #" (invoice.id) }
         p { "Billed to: " (invoice.customer) }
@@ -120,7 +119,7 @@ fn invoice_view(invoice: &Invoice, generated_at: DateTime<Utc>) -> Markup {
         }
         p { strong { "Total: " (format_cents(invoice.total_cents())) } }
         p { "Status: " (format!("{:?}", invoice.state)) }
-        p { "Generated at " (generated_at.to_rfc3339()) }
+        p { "Generated at " (compat::rfc3339(generated_at)) }
     }
 }
 

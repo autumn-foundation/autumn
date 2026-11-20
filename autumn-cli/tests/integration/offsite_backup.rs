@@ -83,9 +83,9 @@ async fn start_minio() -> testcontainers::ContainerAsync<testcontainers_modules:
 }
 
 async fn create_bucket(endpoint: &str, access: &str, secret: &str, region: &str, bucket: &str) {
-    let now = chrono::Utc::now();
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date = now.format("%Y%m%d").to_string();
+    let now = jiff::Timestamp::now();
+    let amz_date = now.strftime("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.strftime("%Y%m%d").to_string();
     let payload_hash = sha256_hex(b"");
     let url = url::Url::parse(endpoint).unwrap();
     let host_str = url.host_str().unwrap().to_owned();
@@ -139,9 +139,9 @@ async fn signed_request(
     secret: &str,
     region: &str,
 ) -> reqwest::Response {
-    let now = chrono::Utc::now();
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date = now.format("%Y%m%d").to_string();
+    let now = jiff::Timestamp::now();
+    let amz_date = now.strftime("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.strftime("%Y%m%d").to_string();
     let payload_hash = sha256_hex(b"");
     let parsed = url::Url::parse(url).unwrap();
     let host_str = parsed.host_str().unwrap().to_owned();

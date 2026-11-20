@@ -193,7 +193,7 @@ target, `CARGO_INCREMENTAL=0`, the gate's `cargo build --target <host>`.
 - The 60 s / 90 s target is met on the faster runner (p95 52.8 s) and not on
   the slower one (p95 76.9 s). It is still open as a target for each runner.
 - An app with `default-features = false`, no `reporting`, and
-  `[failure_capture] enabled = true` fails boot. See `docs/migrations/next.md`.
+  `[failure_capture] enabled = true` fails boot. See `docs/migrations/0.11.0.md`.
 - A new app builds its dependencies with no debug info. A backtrace frame in
   a dependency shows the function name with no file and line. The template
   comment gives the setting that brings them back.

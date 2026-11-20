@@ -4,11 +4,9 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::time::Duration;
 
-use chrono::{
-    DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeDelta, TimeZone, Timelike,
-    Utc, Weekday,
-};
-use chrono_tz::Tz;
+use jiff::civil::{self, Date, Weekday};
+use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp};
 
 use super::SlaError;
 
@@ -20,11 +18,11 @@ const SCAN_DAYS: usize = 36_525;
 
 /// Monday to Friday.
 const WEEKDAYS: [Weekday; 5] = [
-    Weekday::Mon,
-    Weekday::Tue,
-    Weekday::Wed,
-    Weekday::Thu,
-    Weekday::Fri,
+    Weekday::Monday,
+    Weekday::Tuesday,
+    Weekday::Wednesday,
+    Weekday::Thursday,
+    Weekday::Friday,
 ];
 
 /// One working window in a day, in local wall time.
@@ -50,12 +48,12 @@ impl WorkingHours {
     /// # Errors
     ///
     /// Returns [`SlaError::InvalidHours`] when `close` is not after `open`.
-    pub fn new(open: NaiveTime, close: NaiveTime) -> Result<Self, SlaError> {
-        let close_secs = match close.num_seconds_from_midnight() {
+    pub fn new(open: civil::Time, close: civil::Time) -> Result<Self, SlaError> {
+        let close_secs = match seconds_from_midnight(close) {
             0 => DAY_SECS,
             secs => secs,
         };
-        Self::from_secs(open.num_seconds_from_midnight(), close_secs)
+        Self::from_secs(seconds_from_midnight(open), close_secs)
             .ok_or_else(|| SlaError::InvalidHours(format!("{open}-{close}")))
     }
 
@@ -81,6 +79,11 @@ impl FromStr for WorkingHours {
         let close = parse_clock(close).ok_or_else(invalid)?;
         Self::from_secs(open, close).ok_or_else(invalid)
     }
+}
+
+/// The whole seconds of `time` after midnight. A fraction is dropped.
+fn seconds_from_midnight(time: civil::Time) -> u32 {
+    u32::try_from(time.duration_since(civil::Time::midnight()).as_secs()).unwrap_or(0)
 }
 
 /// Parse `"HH:MM"` (up to `"24:00"`) to seconds after midnight.
@@ -113,20 +116,20 @@ fn parse_clock(text: &str) -> Option<u32> {
 ///
 /// ```rust
 /// use autumn_web::sla::BusinessCalendar;
-/// use chrono::NaiveDate;
+/// use autumn_web::time::civil::date;
 ///
 /// # fn main() -> Result<(), autumn_web::sla::SlaError> {
 /// let calendar = BusinessCalendar::weekdays("09:00-17:00".parse()?)
-///     .holiday(NaiveDate::from_ymd_opt(2026, 11, 26).unwrap())
+///     .holiday(date(2026, 11, 26))
 ///     .annual_holiday(12, 25);
 /// # Ok(()) }
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BusinessCalendar {
     windows: [Vec<WorkingHours>; 7],
-    holidays: BTreeSet<NaiveDate>,
+    holidays: BTreeSet<Date>,
     annual_holidays: BTreeSet<(u32, u32)>,
-    zone: Option<Tz>,
+    zone: Option<TimeZone>,
     day_length: Option<Duration>,
 }
 
@@ -157,7 +160,7 @@ impl BusinessCalendar {
 
     /// Add a holiday on one date.
     #[must_use]
-    pub fn holiday(mut self, date: NaiveDate) -> Self {
+    pub fn holiday(mut self, date: Date) -> Self {
         self.holidays.insert(date);
         self
     }
@@ -171,7 +174,7 @@ impl BusinessCalendar {
 
     /// Set the home time zone of the calendar.
     #[must_use]
-    pub const fn zone(mut self, zone: Tz) -> Self {
+    pub fn zone(mut self, zone: TimeZone) -> Self {
         self.zone = Some(zone);
         self
     }
@@ -187,8 +190,8 @@ impl BusinessCalendar {
 
     /// The home time zone, if set.
     #[must_use]
-    pub const fn home_zone(&self) -> Option<Tz> {
-        self.zone
+    pub const fn home_zone(&self) -> Option<&TimeZone> {
+        self.zone.as_ref()
     }
 
     /// The length of one business day.
@@ -208,13 +211,15 @@ impl BusinessCalendar {
 
     /// Whether `date` is a holiday.
     #[must_use]
-    pub fn is_holiday(&self, date: NaiveDate) -> bool {
-        self.holidays.contains(&date) || self.annual_holidays.contains(&(date.month(), date.day()))
+    pub fn is_holiday(&self, date: Date) -> bool {
+        let month = u32::from(date.month().unsigned_abs());
+        let day = u32::from(date.day().unsigned_abs());
+        self.holidays.contains(&date) || self.annual_holidays.contains(&(month, day))
     }
 
     /// Whether `at` is in working time in `zone`.
     #[must_use]
-    pub fn is_working(&self, at: DateTime<Utc>, zone: Tz) -> bool {
+    pub fn is_working(&self, at: Timestamp, zone: &TimeZone) -> bool {
         self.intervals(local_date(at, zone), zone)
             .iter()
             .any(|(start, end)| *start <= at && at < *end)
@@ -224,7 +229,7 @@ impl BusinessCalendar {
     ///
     /// Returns `None` when no working time exists in the scan horizon.
     #[must_use]
-    pub fn next_working_instant(&self, at: DateTime<Utc>, zone: Tz) -> Option<DateTime<Utc>> {
+    pub fn next_working_instant(&self, at: Timestamp, zone: &TimeZone) -> Option<Timestamp> {
         self.scan(at, zone)
             .find(|(_, end)| *end > at)
             .map(|(start, _)| start.max(at))
@@ -234,14 +239,13 @@ impl BusinessCalendar {
     ///
     /// It counts at most the scan horizon (one hundred years) after `from`.
     #[must_use]
-    pub fn working_time(&self, from: DateTime<Utc>, to: DateTime<Utc>, zone: Tz) -> Duration {
+    pub fn working_time(&self, from: Timestamp, to: Timestamp, zone: &TimeZone) -> Duration {
         if to <= from || !self.has_working_time() {
             return Duration::ZERO;
         }
         let last = local_date(to, zone);
-        let mut total = TimeDelta::zero();
-        for date in local_date(from, zone)
-            .iter_days()
+        let mut total = SignedDuration::ZERO;
+        for date in days_from(local_date(from, zone))
             .take(SCAN_DAYS)
             .take_while(|d| *d <= last)
         {
@@ -249,12 +253,12 @@ impl BusinessCalendar {
                 let (start, end) = (start.max(from), end.min(to));
                 if end > start {
                     total = total
-                        .checked_add(&end.signed_duration_since(start))
-                        .unwrap_or(TimeDelta::MAX);
+                        .checked_add(end.duration_since(start))
+                        .unwrap_or(SignedDuration::MAX);
                 }
             }
         }
-        total.to_std().unwrap_or(Duration::ZERO)
+        Duration::try_from(total).unwrap_or(Duration::ZERO)
     }
 
     /// The instant when `budget` of working time after `from` is used.
@@ -265,11 +269,11 @@ impl BusinessCalendar {
     #[must_use]
     pub fn deadline(
         &self,
-        from: DateTime<Utc>,
+        from: Timestamp,
         budget: Duration,
-        zone: Tz,
-    ) -> Option<DateTime<Utc>> {
-        let mut left = TimeDelta::from_std(budget).ok()?;
+        zone: &TimeZone,
+    ) -> Option<Timestamp> {
+        let mut left = SignedDuration::try_from(budget).ok()?;
         if left.is_zero() {
             return self.next_working_instant(from, zone);
         }
@@ -278,11 +282,11 @@ impl BusinessCalendar {
             if end <= start {
                 continue;
             }
-            let available = end.signed_duration_since(start);
+            let available = end.duration_since(start);
             if available >= left {
-                return start.checked_add_signed(left);
+                return start.checked_add(left).ok();
             }
-            left = left.checked_sub(&available)?;
+            left = left.checked_sub(available)?;
         }
         None
     }
@@ -294,24 +298,23 @@ impl BusinessCalendar {
     /// The working intervals from the local date of `from`, day by day, up to
     /// the scan horizon. Weekdays and annual holidays repeat only every 400
     /// years, so no shorter cutoff is safe.
-    fn scan(
-        &self,
-        from: DateTime<Utc>,
-        zone: Tz,
-    ) -> impl Iterator<Item = (DateTime<Utc>, DateTime<Utc>)> + '_ {
+    fn scan<'a>(
+        &'a self,
+        from: Timestamp,
+        zone: &'a TimeZone,
+    ) -> impl Iterator<Item = (Timestamp, Timestamp)> + 'a {
         let days = if self.has_working_time() {
             SCAN_DAYS
         } else {
             0
         };
-        local_date(from, zone)
-            .iter_days()
+        days_from(local_date(from, zone))
             .take(days)
             .flat_map(move |date| self.intervals(date, zone))
     }
 
     /// The working intervals of one local date, as UTC instants.
-    fn intervals(&self, date: NaiveDate, zone: Tz) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    fn intervals(&self, date: Date, zone: &TimeZone) -> Vec<(Timestamp, Timestamp)> {
         if self.is_holiday(date) {
             return Vec::new();
         }
@@ -320,14 +323,16 @@ impl BusinessCalendar {
             .map(|windows| {
                 // A window stays inside its own local date. On a skipped
                 // date (a whole-day gap) every window moves past the end of
-                // the date, so the date has no working time.
-                let day_end = local_instant(date, DAY_SECS, zone);
+                // the date, so the date has no working time. A close past
+                // the end of the time range stops at `Timestamp::MAX`.
+                let day_end = local_instant(date, DAY_SECS, zone).unwrap_or(Timestamp::MAX);
                 let resolved: Vec<_> = windows
                     .iter()
                     .filter_map(|w| {
                         let start = local_instant(date, w.open, zone)?;
-                        let end = local_instant(date, w.close, zone)?;
-                        let end = day_end.map_or(end, |day_end| end.min(day_end));
+                        let end = local_instant(date, w.close, zone)
+                            .unwrap_or(Timestamp::MAX)
+                            .min(day_end);
                         (end > start).then_some((start, end))
                     })
                     .collect();
@@ -339,11 +344,9 @@ impl BusinessCalendar {
 }
 
 /// Sort UTC intervals and merge the ones that overlap or touch.
-fn merge_instants(
-    mut intervals: Vec<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+fn merge_instants(mut intervals: Vec<(Timestamp, Timestamp)>) -> Vec<(Timestamp, Timestamp)> {
     intervals.sort_unstable();
-    let mut merged: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::with_capacity(intervals.len());
+    let mut merged: Vec<(Timestamp, Timestamp)> = Vec::with_capacity(intervals.len());
     for (start, end) in intervals {
         match merged.last_mut() {
             Some(last) if start <= last.1 => last.1 = last.1.max(end),
@@ -353,8 +356,13 @@ fn merge_instants(
     merged
 }
 
-const fn day_index(day: Weekday) -> usize {
-    day.num_days_from_monday() as usize
+fn day_index(day: Weekday) -> usize {
+    usize::from(day.to_monday_zero_offset().unsigned_abs())
+}
+
+/// `first` and each date after it, up to the end of the date range.
+fn days_from(first: Date) -> impl Iterator<Item = Date> {
+    std::iter::successors(Some(first), |date| date.tomorrow().ok())
 }
 
 /// Sort windows and merge the ones that overlap or touch.
@@ -370,13 +378,10 @@ fn merge(mut windows: Vec<WorkingHours>) -> Vec<WorkingHours> {
     merged
 }
 
-/// The local date of `at` in `zone`. At the far ends of the time range it
-/// falls back to the UTC date and does not panic.
-fn local_date(at: DateTime<Utc>, zone: Tz) -> NaiveDate {
-    let offset = zone.offset_from_utc_datetime(&at.naive_utc()).fix();
-    at.naive_utc()
-        .checked_add_offset(offset)
-        .map_or_else(|| at.date_naive(), |local| local.date())
+/// The local date of `at` in `zone`. Every timestamp has a local date in
+/// every zone, so this never fails.
+fn local_date(at: Timestamp, zone: &TimeZone) -> Date {
+    zone.to_datetime(at).date()
 }
 
 /// The UTC instant of `secs` after local midnight on `date`.
@@ -384,14 +389,10 @@ fn local_date(at: DateTime<Utc>, zone: Tz) -> NaiveDate {
 /// A time that occurs two times takes the first one. A time in a gap (a
 /// daylight-saving change or a skipped day) uses the offset before the gap,
 /// so it moves forward by the length of the gap.
-fn local_instant(date: NaiveDate, secs: u32, zone: Tz) -> Option<DateTime<Utc>> {
-    let naive: NaiveDateTime = date
-        .and_time(NaiveTime::MIN)
-        .checked_add_signed(TimeDelta::try_seconds(i64::from(secs))?)?;
-    if let Some(local) = zone.from_local_datetime(&naive).earliest() {
-        return Some(local.with_timezone(&Utc));
-    }
-    let before = naive.checked_sub_signed(TimeDelta::try_days(2)?)?;
-    let offset = zone.from_local_datetime(&before).earliest()?.offset().fix();
-    Some(naive.checked_sub_offset(offset)?.and_utc())
+fn local_instant(date: Date, secs: u32, zone: &TimeZone) -> Option<Timestamp> {
+    let local = date
+        .to_datetime(civil::Time::midnight())
+        .checked_add(SignedDuration::from_secs(i64::from(secs)))
+        .ok()?;
+    zone.to_ambiguous_timestamp(local).compatible().ok()
 }

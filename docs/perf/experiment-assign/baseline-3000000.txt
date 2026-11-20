@@ -1,0 +1,62 @@
+
+running 1 test
+fixture: assignments=2456435 distinct_actors=886958 dead_tuples=88902
+
+=== pg_stat_statements: ExperimentService::assign, returning actors ===
+ calls   exec_buf   plan_buf  statement
+  1600          0          0  SET CLIENT_ENCODING TO 'UTF8'
+  1600          0          0  SET TIME ZONE 'UTC'
+  1600          0          0  SET statement_timeout = 5000
+   800     136856          0  SELECT experiment, actor, variant, is_override, EXTRACT($3 FROM assigned_at)::bigint AS assigned_at_secs FROM 
+   800      84800          0  SELECT variant FROM autumn_experiment_overrides WHERE experiment = $1 AND actor = $2
+-- total: statements=6400 (SET statement_timeout=1600) exec_buffers=221656 plan_buffers=0 buffers=221656 --
+assign[returning actors]: calls=800 ok=800 excluded=0 sessions_opened=1600 sessions/call=2.00 statements/call=8.00 stmt_buffers/call=277.1 backend_io_buffers/call=573.2
+
+=== pg_stat_statements: ExperimentService::assign, new actors ===
+ calls   exec_buf   plan_buf  statement
+   505          0          0  SET CLIENT_ENCODING TO 'UTF8'
+   505          0          0  SET TIME ZONE 'UTC'
+   505          0          0  SET statement_timeout = 5000
+   150          0          0  BEGIN
+   150          0          0  COMMIT
+   150      13965          0  INSERT INTO autumn_experiment_assignments (experiment, actor, variant, is_override) VALUES ($1, $2, $3, $4) ON
+   150      17250          0  SELECT exclusion_group FROM autumn_experiments WHERE name = $1
+   150      25500          0  SELECT experiment, actor, variant, is_override, EXTRACT($3 FROM assigned_at)::bigint AS assigned_at_secs FROM 
+   150          0          0  SELECT pg_advisory_xact_lock(hashtext($1))
+   150      15900          0  SELECT variant FROM autumn_experiment_overrides WHERE experiment = $1 AND actor = $2
+   110      32560          0  SELECT EXISTS ( SELECT $4 FROM autumn_experiment_assignments a JOIN autumn_experiments e ON e.name = a.experim
+-- total: statements=2675 (SET statement_timeout=505) exec_buffers=105175 plan_buffers=0 buffers=105175 --
+assign[new actors]: calls=150 ok=150 excluded=0 sessions_opened=505 sessions/call=3.37 statements/call=17.83 stmt_buffers/call=701.2 backend_io_buffers/call=1231.3
+
+=== pg_stat_statements: ExperimentService::assign, QA overrides ===
+ calls   exec_buf   plan_buf  statement
+    40          0          0  SET CLIENT_ENCODING TO 'UTF8'
+    40          0          0  SET TIME ZONE 'UTC'
+    40          0          0  SET statement_timeout = 5000
+    20          0          0  BEGIN
+    20          0          0  COMMIT
+    20       2980          0  INSERT INTO autumn_experiment_assignments (experiment, actor, variant, is_override) VALUES ($1, $2, $3, $4) ON
+    20          0          0  SELECT pg_advisory_xact_lock(hashtext($1))
+    20       2120          0  SELECT variant FROM autumn_experiment_overrides WHERE experiment = $1 AND actor = $2
+-- total: statements=220 (SET statement_timeout=40) exec_buffers=5100 plan_buffers=0 buffers=5100 --
+assign[QA overrides]: calls=20 ok=20 excluded=0 sessions_opened=40 sessions/call=2.00 statements/call=11.00 stmt_buffers/call=255.0 backend_io_buffers/call=524.5
+
+=== pg_stat_statements: ExperimentService::assign, concluded experiments ===
+ calls   exec_buf   plan_buf  statement
+-- total: statements=0 (SET statement_timeout=0) exec_buffers=0 plan_buffers=0 buffers=0 --
+assign[concluded experiments]: calls=30 ok=30 excluded=0 sessions_opened=0 sessions/call=0.00 statements/call=0.00 stmt_buffers/call=0.0 backend_io_buffers/call=1.7
+assign[all]: calls=1000 ok=1000 sessions_opened=2145 sessions/call=2.15 statements/call=9.29 stmt_buffers/call=331.9 backend_io_buffers/call=653.8
+
+=== pg_stat_statements: returning-actor reads on one held connection ===
+ calls   exec_buf   plan_buf  statement
+   800       3317          0  SELECT experiment, actor, variant, is_override, EXTRACT($3 FROM assigned_at)::bigint AS assigned_at_secs FROM 
+   800        905          0  SELECT variant FROM autumn_experiment_overrides WHERE experiment = $1 AND actor = $2
+     1          0          0  SET CLIENT_ENCODING TO 'UTF8'
+     1          0          0  SET TIME ZONE 'UTC'
+     1          0          0  SET statement_timeout = 5000
+-- total: statements=1603 (SET statement_timeout=1) exec_buffers=4222 plan_buffers=0 buffers=4222 --
+held: calls=800 sessions_opened=1 statements/call=2.00 buffers/call=5.3 backend_io_buffers=4465 backend_io_buffers/call=5.6
+new assignments written=150
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2950 filtered out; finished in 357.23s
+

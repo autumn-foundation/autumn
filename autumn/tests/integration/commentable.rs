@@ -254,7 +254,7 @@ pub struct CmtSoft {
     pub title: String,
     #[default]
     pub comment_count: i64,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(CmtSoft, table = "cmt_softs", soft_delete)]
@@ -308,7 +308,7 @@ pub struct CmtAuditSoft {
     pub title: String,
     #[default]
     pub comment_count: i64,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(CmtAuditSoft, table = "cmt_audit_softs")]
@@ -335,7 +335,7 @@ pub struct CmtDual {
     pub title: String,
     #[default]
     pub comment_count: i64,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(CmtDual, table = "cmt_duals", soft_delete)]

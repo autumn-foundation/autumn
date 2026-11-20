@@ -679,10 +679,10 @@ mod redis_backend {
     struct SkewedClock;
 
     impl autumn_web::time::ClockSource for SkewedClock {
-        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        fn now(&self) -> autumn_web::time::Timestamp {
             #[allow(clippy::disallowed_methods, reason = "a test clock reads real time")]
-            let now = chrono::Utc::now();
-            now + chrono::Duration::hours(1)
+            let now = autumn_web::time::Timestamp::now();
+            now + autumn_web::time::SignedDuration::from_hours(1)
         }
     }
 

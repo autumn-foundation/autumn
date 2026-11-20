@@ -20,7 +20,7 @@
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -627,10 +627,9 @@ pub use self::db_store::DbPushSubscriptionStore;
 #[cfg(feature = "db")]
 mod db_store {
     use super::{PUSH_SUBSCRIPTIONS_TABLE, PushError, PushSubscriptionStore, StoredSubscription};
-    use crate::db::RuntimeConnection;
+    use crate::db::{RuntimeConnection, SqlTimestamp};
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use chrono::{DateTime, Utc};
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::deadpool::Pool;
@@ -686,7 +685,7 @@ mod db_store {
         endpoint: String,
         p256dh: String,
         auth: String,
-        created_at: DateTime<Utc>,
+        created_at: SqlTimestamp,
     }
 
     impl TryFrom<SubscriptionRow> for StoredSubscription {
@@ -855,7 +854,7 @@ mod db_store {
                     endpoint: endpoint.clone(),
                     p256dh: p256dh.clone(),
                     auth: auth.clone(),
-                    created_at: crate::time::ambient_now(),
+                    created_at: crate::time::ambient_now().into(),
                 })
                 .on_conflict(dsl::endpoint)
                 .do_update()

@@ -8,7 +8,7 @@
 //!   [`ChangeOutcome`] per change, in order).
 //! - `GET <base>/pull?cursor=N&limit=M` → [`PullResponse`].
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// Server-assigned change sequence number. `0` means "never synced".
@@ -110,7 +110,8 @@ pub struct Change {
     pub base_version: Version,
     /// Wall-clock time of the local write, used only by conflict
     /// resolvers — never for change-feed ordering.
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub updated_at: Timestamp,
 }
 
 /// Body of `POST <base>/push`.
@@ -144,7 +145,8 @@ pub struct RemoteRow {
     /// `true` if the row is a tombstone.
     pub deleted: bool,
     /// `updated_at` of the write that produced this row state.
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "crate::time::compat::serde_autosi")]
+    pub updated_at: Timestamp,
     /// Device that produced this row state (empty for server-side writes).
     pub device_id: String,
 }
@@ -253,7 +255,10 @@ pub enum PullResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+
+    fn noon() -> Timestamp {
+        "2026-07-07T12:00:00Z".parse().unwrap()
+    }
 
     fn sample_change() -> Change {
         Change {
@@ -263,7 +268,7 @@ mod tests {
             op: Op::Upsert,
             payload: Some(serde_json::json!({"title": "hi"})),
             base_version: 3,
-            updated_at: Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap(),
+            updated_at: noon(),
         }
     }
 
@@ -330,7 +335,7 @@ mod tests {
             payload,
             version: 7,
             deleted,
-            updated_at: chrono::Utc::now(),
+            updated_at: crate::time::ambient_now(),
             device_id: "d".to_owned(),
         };
         // Tombstone: payload key omitted entirely.
@@ -381,7 +386,7 @@ mod tests {
                 payload: None,
                 version: 9,
                 deleted: true,
-                updated_at: Utc.with_ymd_and_hms(2026, 7, 7, 12, 0, 0).unwrap(),
+                updated_at: noon(),
                 device_id: "device-a".into(),
             }],
             next_cursor: 9,

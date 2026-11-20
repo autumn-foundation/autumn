@@ -180,7 +180,7 @@ async fn db_pull_regenerates_models_from_existing_schema_and_compiles() {
     assert!(model.contains("pub token: uuid::Uuid,"));
     assert!(model.contains("pub published: bool,"));
     assert!(model.contains("pub summary: Option<String>,"));
-    assert!(model.contains("#[default]\n    pub created_at: chrono::NaiveDateTime,"));
+    assert!(model.contains("#[default]\n    pub created_at: autumn_web::time::civil::DateTime,"));
 
     let schema = std::fs::read_to_string(project.join("src/schema.rs")).unwrap();
     assert!(schema.contains("posts (id)"));

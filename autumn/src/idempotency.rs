@@ -1,6 +1,6 @@
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
-// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// Entropy), never `Instant::now()` / `Timestamp::now()` / `SystemTime::now()` /
 // `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
 // (issue #1797). Justify exceptions with
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
@@ -1795,7 +1795,7 @@ fn lock_deadline_bound_ms(in_flight_ttl: Duration) -> i64 {
         in_flight_ttl
     };
     crate::time::ambient_now()
-        .timestamp_millis()
+        .as_millisecond()
         .saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX))
 }
 

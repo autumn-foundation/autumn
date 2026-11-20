@@ -28,14 +28,12 @@ const JOB_DEPS_BASE: &[(&str, &str)] = &[("serde", "{ version = \"1\", features 
 /// Extra deps needed when the args struct uses `uuid::Uuid` fields.
 const JOB_DEPS_UUID: (&str, &str) = ("uuid", "{ version = \"1\", features = [\"serde\"] }");
 
-/// Extra deps needed when the args struct uses `chrono` date/time fields.
-const JOB_DEPS_CHRONO: (&str, &str) = ("chrono", "{ version = \"0.4\", features = [\"serde\"] }");
-
 /// Extra dep needed when the args struct uses a `decimal` field — mirrors
 /// `model.rs`'s `MODEL_DEPS`/`plan_model` conditional so `render_fields`'s
 /// `f.rust_type()` (`"rust_decimal::Decimal"`) always has a matching
-/// Cargo.toml entry, the same way `JOB_DEPS_UUID`/`JOB_DEPS_CHRONO` already
-/// do for `uuid::Uuid`/`chrono` fields.
+/// Cargo.toml entry, the same way `JOB_DEPS_UUID` already does for
+/// `uuid::Uuid` fields. Date and time fields need no entry: they name
+/// `autumn_web::time`, whose `jiff` types `autumn-web` builds with `serde`.
 ///
 /// Backend-aware for the same reason `model.rs`'s is (issue #1924): asking a
 /// `SQLite` app for `rust_decimal`'s *Postgres* diesel feature is wrong, and the
@@ -57,14 +55,6 @@ fn job_deps(fields: &[Field], backend: DatabaseBackend) -> Vec<(&'static str, &'
     let mut deps: Vec<(&str, &str)> = JOB_DEPS_BASE.to_vec();
     if fields.iter().any(|f| matches!(f.kind, FieldKind::Uuid)) {
         deps.push(JOB_DEPS_UUID);
-    }
-    if fields.iter().any(|f| {
-        matches!(
-            f.kind,
-            FieldKind::NaiveDateTime | FieldKind::DateTime | FieldKind::Time
-        )
-    }) {
-        deps.push(JOB_DEPS_CHRONO);
     }
     if fields.iter().any(|f| f.kind.is_decimal()) {
         deps.push(job_deps_decimal(backend));
@@ -170,7 +160,7 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
         owner_dir: project_root.join("src").join("jobs"),
     });
 
-    // ── Cargo.toml: ensure serde (always) plus uuid/chrono/decimal if used ──
+    // ── Cargo.toml: ensure serde (always) plus uuid/decimal if used ──
     // The decimal dep's features are backend-specific (issue #1924).
     let backend = super::detect_backend(project_root);
     if parsed_fields.iter().any(|f| f.kind.is_decimal()) {
@@ -304,12 +294,17 @@ async fn main() {
     }
 
     #[test]
-    fn a_time_field_adds_the_chrono_dependency() {
-        // Issue #3405: a `time` field is a `chrono::NaiveTime`.
-        let fields = crate::generate::dsl::parse_fields(&["opens:time".to_owned()]).unwrap();
-        assert!(job_deps(&fields, DatabaseBackend::Postgres).contains(&JOB_DEPS_CHRONO));
-        let fields = crate::generate::dsl::parse_fields(&["name:String".to_owned()]).unwrap();
-        assert!(!job_deps(&fields, DatabaseBackend::Postgres).contains(&JOB_DEPS_CHRONO));
+    fn date_and_time_fields_add_no_dependency() {
+        // A `time` field is an `autumn_web::time::civil::Time` (issue #3405), and every other
+        // date/time kind is an `autumn_web::time` type too, so none needs a crate of its own.
+        let fields = crate::generate::dsl::parse_fields(&[
+            "opens:time".to_owned(),
+            "at:DateTime".to_owned(),
+            "due:Date".to_owned(),
+            "run_at:NaiveDateTime".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(job_deps(&fields, DatabaseBackend::Postgres), JOB_DEPS_BASE);
     }
 
     #[test]
@@ -888,7 +883,7 @@ async fn main() {
     }
 
     #[test]
-    fn datetime_field_adds_chrono_dep_to_cargo_toml() {
+    fn datetime_field_adds_no_chrono_dep_to_cargo_toml() {
         let tmp = project_with_main(default_main());
         plan_job(
             tmp.path(),
@@ -901,8 +896,8 @@ async fn main() {
 
         let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
         assert!(
-            cargo.contains("chrono"),
-            "Cargo.toml must include chrono: {cargo}"
+            !cargo.contains("chrono"),
+            "a date/time field names autumn_web::time, not chrono: {cargo}"
         );
     }
 

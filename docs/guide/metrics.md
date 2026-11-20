@@ -434,7 +434,7 @@ Deprecated: the `Db` extractor also writes each hold under
 that, the key holds only `SELECT` statements from `run_instrumented`. Until
 then, a `run_instrumented` `SELECT` on a route that takes `Db` shares that
 key with the hold. See
-the [migration guide](../migrations/next.md#metrics-the-route-select-key-is-deprecated).
+the [migration guide](../migrations/0.11.0.md#metrics-the-route-select-key-is-deprecated).
 
 ---
 

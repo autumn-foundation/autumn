@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use chrono::{DateTime, Utc};
+use autumn_web::time::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -257,7 +257,7 @@ pub struct AdminHistoryEntry {
     /// Column-level changes, serialized as JSON for template rendering.
     pub changes: Vec<Value>,
     /// When this entry was recorded.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: Timestamp,
 }
 
 /// Paginated history result for the admin History pane.
@@ -787,6 +787,26 @@ pub fn dispatch_restore_purge_or_unhandled<'a>(
 }
 
 // ── VersionPage → AdminHistoryPage conversion ──────────────────────
+
+/// A UTC wall-clock value as an instant. A value past either end of
+/// [`Timestamp`]'s range saturates to [`Timestamp::MAX`] / [`Timestamp::MIN`].
+pub fn utc_instant(dt: autumn_web::time::civil::DateTime) -> Timestamp {
+    autumn_web::time::tz::Offset::UTC
+        .to_timestamp(dt)
+        .unwrap_or_else(|_| {
+            if dt.year() < 0 {
+                Timestamp::MIN
+            } else {
+                Timestamp::MAX
+            }
+        })
+}
+
+/// A UTC wall-clock value as RFC 3339 with a `+00:00` offset, e.g.
+/// `2024-01-02T03:04:05.100+00:00`, the text the admin JSON API returns.
+pub fn utc_rfc3339(dt: autumn_web::time::civil::DateTime) -> String {
+    autumn_web::time::compat::rfc3339(utc_instant(dt))
+}
 
 impl From<autumn_web::version_history::VersionEntry> for AdminHistoryEntry {
     fn from(e: autumn_web::version_history::VersionEntry) -> Self {
@@ -1595,8 +1615,6 @@ mod tests {
     #[test]
     fn version_page_converts_to_admin_history_page() {
         use autumn_web::version_history::{ColumnChange, VersionEntry, VersionOp, VersionPage};
-        use chrono::Utc;
-
         let entry = VersionEntry {
             id: 1,
             table_name: "posts".to_owned(),
@@ -1609,7 +1627,7 @@ mod tests {
                 Some(serde_json::json!("old")),
                 Some(serde_json::json!("new")),
             )],
-            recorded_at: Utc::now(),
+            recorded_at: autumn_web::time::Timestamp::UNIX_EPOCH,
         };
         let vp = VersionPage {
             entries: vec![entry],
@@ -1634,8 +1652,6 @@ mod tests {
     #[test]
     fn version_entry_converts_to_admin_history_entry() {
         use autumn_web::version_history::{ColumnChange, VersionEntry, VersionOp};
-        use chrono::Utc;
-
         let entry = VersionEntry {
             id: 7,
             table_name: "users".to_owned(),
@@ -1644,7 +1660,7 @@ mod tests {
             actor: "system".to_owned(),
             request_id: None,
             changes: vec![ColumnChange::sensitive("password_digest")],
-            recorded_at: Utc::now(),
+            recorded_at: autumn_web::time::Timestamp::UNIX_EPOCH,
         };
 
         let admin_entry = AdminHistoryEntry::from(entry);

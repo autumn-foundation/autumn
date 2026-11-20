@@ -11,7 +11,8 @@
 use std::time::Duration;
 
 use autumn_web::RuntimeConnection;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use autumn_web::db::SqlDateTime;
+use autumn_web::time::{SignedDuration, Timestamp, tz};
 use diesel::prelude::*;
 use diesel::result::{DatabaseErrorKind, Error as DieselError};
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -115,8 +116,8 @@ struct CustomerRow {
     provider: String,
     provider_customer_id: String,
     email: Option<String>,
-    created_at: NaiveDateTime,
-    updated_at: NaiveDateTime,
+    created_at: SqlDateTime,
+    updated_at: SqlDateTime,
 }
 
 #[derive(Debug, Queryable, Selectable, Insertable, AsChangeset)]
@@ -130,11 +131,11 @@ struct SubscriptionRow {
     plan_id: Option<String>,
     status: String,
     quantity: i64,
-    current_period_end: Option<NaiveDateTime>,
+    current_period_end: Option<SqlDateTime>,
     cancel_at_period_end: i64,
-    last_event_at: NaiveDateTime,
-    created_at: NaiveDateTime,
-    updated_at: NaiveDateTime,
+    last_event_at: SqlDateTime,
+    created_at: SqlDateTime,
+    updated_at: SqlDateTime,
 }
 
 #[derive(Debug, Queryable, Selectable, Insertable, AsChangeset)]
@@ -150,10 +151,10 @@ struct InvoiceRow {
     amount_paid_minor: i64,
     currency: String,
     attempt_count: i64,
-    next_payment_attempt: Option<NaiveDateTime>,
-    last_event_at: NaiveDateTime,
-    created_at: NaiveDateTime,
-    updated_at: NaiveDateTime,
+    next_payment_attempt: Option<SqlDateTime>,
+    last_event_at: SqlDateTime,
+    created_at: SqlDateTime,
+    updated_at: SqlDateTime,
     // Keep last. The migration appends this column, and `Queryable` reads by position.
     provider_subscription_id: Option<String>,
 }
@@ -164,8 +165,8 @@ struct InvoiceRow {
 struct EventRow {
     provider_event_id: String,
     kind: String,
-    claimed_at: NaiveDateTime,
-    applied_at: Option<NaiveDateTime>,
+    claimed_at: SqlDateTime,
+    applied_at: Option<SqlDateTime>,
 }
 
 #[derive(Debug, Queryable, Selectable, Insertable, AsChangeset)]
@@ -176,19 +177,28 @@ struct DunningRow {
     customer_id: String,
     subscription_id: Option<String>,
     attempt: i64,
-    next_attempt_at: NaiveDateTime,
+    next_attempt_at: SqlDateTime,
     state: String,
-    updated_at: NaiveDateTime,
+    updated_at: SqlDateTime,
 }
 
 // ── Conversions ─────────────────────────────────────────────────────────
 
-const fn to_naive(at: DateTime<Utc>) -> NaiveDateTime {
-    at.naive_utc()
+/// An instant as the UTC wall-clock value the `Timestamp` columns hold.
+fn to_naive(at: Timestamp) -> SqlDateTime {
+    SqlDateTime(tz::Offset::UTC.to_datetime(at))
 }
 
-const fn to_utc(at: NaiveDateTime) -> DateTime<Utc> {
-    at.and_utc()
+/// A stored UTC wall-clock value as an instant. A value past either end of
+/// [`Timestamp`]'s range saturates to [`Timestamp::MAX`] / [`Timestamp::MIN`].
+fn to_utc(at: SqlDateTime) -> Timestamp {
+    tz::Offset::UTC.to_timestamp(at.0).unwrap_or_else(|_| {
+        if at.0.year() < 0 {
+            Timestamp::MIN
+        } else {
+            Timestamp::MAX
+        }
+    })
 }
 
 const fn bool_to_int(value: bool) -> i64 {
@@ -214,7 +224,7 @@ impl CustomerRow {
 }
 
 impl SubscriptionRow {
-    fn from_upsert(id: String, created_at: DateTime<Utc>, upsert: SubscriptionUpsert) -> Self {
+    fn from_upsert(id: String, created_at: Timestamp, upsert: SubscriptionUpsert) -> Self {
         Self {
             id,
             customer_id: upsert.customer_id,
@@ -254,7 +264,7 @@ impl SubscriptionRow {
 impl InvoiceRow {
     fn from_upsert(
         id: String,
-        created_at: DateTime<Utc>,
+        created_at: Timestamp,
         subscription_id: Option<String>,
         provider_subscription_id: Option<String>,
         upsert: InvoiceUpsert,
@@ -412,10 +422,10 @@ impl DbBillingStore {
 }
 
 /// The cutoff before which a `processing` claim counts as abandoned.
-fn stale_cutoff(now: DateTime<Utc>, stale_after: Duration) -> Option<NaiveDateTime> {
-    chrono::Duration::from_std(stale_after)
+fn stale_cutoff(now: Timestamp, stale_after: Duration) -> Option<SqlDateTime> {
+    SignedDuration::try_from(stale_after)
         .ok()
-        .and_then(|d| now.checked_sub_signed(d))
+        .and_then(|d| now.checked_sub(d).ok())
         .map(to_naive)
 }
 
@@ -506,12 +516,12 @@ impl BillingStore for DbBillingStore {
         &'a self,
         event_id: &'a str,
         kind: &'a str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         stale_after: Duration,
     ) -> StoreFuture<'a, EventClaim> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
-            let existing: Option<Option<NaiveDateTime>> = billing_events::table
+            let existing: Option<Option<SqlDateTime>> = billing_events::table
                 .find(event_id)
                 .select(billing_events::applied_at)
                 .first(&mut conn)
@@ -569,7 +579,7 @@ impl BillingStore for DbBillingStore {
         })
     }
 
-    fn finish_event<'a>(&'a self, event_id: &'a str, now: DateTime<Utc>) -> StoreFuture<'a, ()> {
+    fn finish_event<'a>(&'a self, event_id: &'a str, now: Timestamp) -> StoreFuture<'a, ()> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
             diesel::update(billing_events::table.find(event_id))
@@ -778,7 +788,7 @@ impl BillingStore for DbBillingStore {
         &'a self,
         id: &'a str,
         user_id: String,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, Option<Customer>> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
@@ -899,7 +909,7 @@ impl BillingStore for DbBillingStore {
         &'a self,
         id: &'a str,
         status: SubscriptionStatus,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, Option<Subscription>> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
@@ -1000,7 +1010,7 @@ impl BillingStore for DbBillingStore {
         &'a self,
         provider_subscription_id: &'a ProviderId,
         subscription_id: &'a str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, ()> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
@@ -1130,7 +1140,7 @@ impl BillingStore for DbBillingStore {
         &'a self,
         invoice_id: &'a str,
         attempt: i64,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, bool> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
@@ -1239,7 +1249,7 @@ impl BillingStore for DbBillingStore {
         })
     }
 
-    fn prune_events(&self, before: DateTime<Utc>) -> StoreFuture<'_, u64> {
+    fn prune_events(&self, before: Timestamp) -> StoreFuture<'_, u64> {
         Box::pin(async move {
             let mut conn = self.conn().await?;
             let deleted = diesel::delete(
@@ -1259,10 +1269,31 @@ mod tests {
 
     #[test]
     fn stale_cutoff_is_now_minus_stale_after() {
-        let now = DateTime::from_timestamp(1_700_000_000, 0).expect("valid");
+        let now = Timestamp::from_second(1_700_000_000).expect("valid");
         let cutoff = stale_cutoff(now, Duration::from_secs(300)).expect("cutoff");
-        assert_eq!(cutoff, to_naive(now) - chrono::Duration::seconds(300));
+        assert_eq!(cutoff.0, to_naive(now).0 - SignedDuration::from_secs(300));
         assert!(stale_cutoff(now, Duration::MAX).is_none());
+    }
+
+    #[test]
+    fn instants_round_trip_through_utc_wall_clock() {
+        let at = Timestamp::from_second(1_700_000_000)
+            .expect("valid")
+            .checked_add(SignedDuration::from_millis(250))
+            .expect("in range");
+        assert_eq!(to_utc(to_naive(at)), at);
+        assert_eq!(
+            to_naive(at).0,
+            autumn_web::time::civil::date(2023, 11, 14).at(22, 13, 20, 250_000_000)
+        );
+    }
+
+    #[test]
+    fn wall_clock_past_the_instant_range_saturates() {
+        let late = SqlDateTime(autumn_web::time::civil::DateTime::MAX);
+        let early = SqlDateTime(autumn_web::time::civil::DateTime::MIN);
+        assert_eq!(to_utc(late), Timestamp::MAX);
+        assert_eq!(to_utc(early), Timestamp::MIN);
     }
 
     #[test]

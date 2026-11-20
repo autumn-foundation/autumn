@@ -1,0 +1,25 @@
+=== v4 post ids
+accounts|220003|061ee8607418d632c1cf15fd6f8a0f5f
+transactions|101795|0e8e74a85b2246fd1173a687feb113b9
+postings|392935|ba5f6cdf780f66a302a4d0f5fcce7e2c
+orphan postings|0|
+trial balance|1|USD=0
+read-back rows|392935|1514bca68d56ff23d15ecda7c9eef429
+ids unique|true|
+ids by version|4|101795 ids, all canonical: true
+=== v7 post ids
+accounts|220003|061ee8607418d632c1cf15fd6f8a0f5f
+transactions|101795|0e8e74a85b2246fd1173a687feb113b9
+postings|392935|ba5f6cdf780f66a302a4d0f5fcce7e2c
+orphan postings|0|
+trial balance|1|USD=0
+read-back rows|392935|1514bca68d56ff23d15ecda7c9eef429
+ids unique|true|
+ids by version|4|100000 ids, all canonical: true
+ids by version|7|1795 ids, all canonical: true
+=== diff (the version line is the only one expected to differ)
+8c8,9
+< ids by version|4|101795 ids, all canonical: true
+---
+> ids by version|4|100000 ids, all canonical: true
+> ids by version|7|1795 ids, all canonical: true

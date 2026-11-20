@@ -1,0 +1,154 @@
+CHECKPOINT
+BEGIN
+=== charge 1: INSERT postings (id 76228fa2-7ab6-4bb4-b6f9-0ef60c063caa)
+                                                                                         QUERY PLAN                                                                                         
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public._autumn_money_postings (actual rows=0 loops=1)
+   Buffers: shared hit=83 read=25 dirtied=7
+   I/O Timings: shared read=0.645
+   WAL: records=13 fpi=6 bytes=29376
+   ->  Values Scan on "*VALUES*" (actual rows=3 loops=1)
+         Output: nextval('_autumn_money_postings_id_seq'::regclass), "*VALUES*".column1, "*VALUES*".column2, "*VALUES*".column3, "*VALUES*".column4, "*VALUES*".column5, "*VALUES*".column6
+         Buffers: shared hit=9 read=6 dirtied=1
+         I/O Timings: shared read=0.243
+         WAL: records=1 bytes=99
+ Query Identifier: 7113983371015365280
+ Planning:
+   Buffers: shared hit=2 read=1
+   I/O Timings: shared read=0.006
+ Planning Time: 0.054 ms
+ Trigger RI_ConstraintTrigger_c_17468 for constraint _autumn_money_postings_account_id_fkey: calls=3
+ Trigger _autumn_money_postings_balance: calls=1
+ Execution Time: 4.419 ms
+(17 rows)
+
+=== charge 1: INSERT transaction
+                                                                                                                            QUERY PLAN                                                                                                                             
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public._autumn_money_transactions (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Conflict Arbiter Indexes: _autumn_money_transactions_idempotency_key_key
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=5 read=11 dirtied=3
+   I/O Timings: shared read=0.490
+   WAL: records=4 fpi=3 bytes=19172
+   ->  Result (actual rows=1 loops=1)
+         Output: '76228fa2-7ab6-4bb4-b6f9-0ef60c063caa'::text, 'fb3a35e988bc3f0d92e35473ba25f3b7532098f01ccd7719963642bc7837353e'::text, 'fb3a35e988bc3f0d92e35473ba25f3b7532098f01ccd7719963642bc7837353e'::text, 'USD'::text, 'explain'::text, CURRENT_TIMESTAMP
+ Query Identifier: -2547931233013281812
+ Planning:
+   Buffers: shared hit=25
+ Planning Time: 0.037 ms
+ Execution Time: 0.552 ms
+(15 rows)
+
+=== charge 1: read back the postings by transaction id
+                                                       QUERY PLAN                                                        
+-------------------------------------------------------------------------------------------------------------------------
+ Index Scan using _autumn_money_postings_transaction_id_seq_key on public._autumn_money_postings (actual rows=3 loops=1)
+   Output: account_id, amount_minor, currency, seq
+   Index Cond: (_autumn_money_postings.transaction_id = '76228fa2-7ab6-4bb4-b6f9-0ef60c063caa'::text)
+   Buffers: shared hit=5
+ Query Identifier: 819531433549964362
+ Planning:
+   Buffers: shared hit=48 read=4
+   I/O Timings: shared read=0.085
+ Planning Time: 0.201 ms
+ Execution Time: 0.018 ms
+(10 rows)
+
+=== charge 2: INSERT postings (id 12e79fcc-433d-4ed8-a5b1-9e6fa07f60f4)
+                                                                                         QUERY PLAN                                                                                         
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public._autumn_money_postings (actual rows=0 loops=1)
+   Buffers: shared hit=23 read=7 dirtied=3
+   I/O Timings: shared read=0.141
+   WAL: records=12 fpi=3 bytes=19716
+   ->  Values Scan on "*VALUES*" (actual rows=3 loops=1)
+         Output: nextval('_autumn_money_postings_id_seq'::regclass), "*VALUES*".column1, "*VALUES*".column2, "*VALUES*".column3, "*VALUES*".column4, "*VALUES*".column5, "*VALUES*".column6
+         Buffers: shared hit=3
+ Query Identifier: 7113983371015365280
+ Planning Time: 0.014 ms
+ Trigger RI_ConstraintTrigger_c_17468 for constraint _autumn_money_postings_account_id_fkey: calls=3
+ Trigger _autumn_money_postings_balance: calls=1
+ Execution Time: 0.420 ms
+(12 rows)
+
+=== charge 2: INSERT transaction
+                                                                                                                            QUERY PLAN                                                                                                                             
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public._autumn_money_transactions (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Conflict Arbiter Indexes: _autumn_money_transactions_idempotency_key_key
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=8 read=5 dirtied=2
+   I/O Timings: shared read=0.246
+   WAL: records=4 fpi=2 bytes=10153
+   ->  Result (actual rows=1 loops=1)
+         Output: '12e79fcc-433d-4ed8-a5b1-9e6fa07f60f4'::text, '2810734bbcf95232ddee46e78ff26e01e1c106ccd8e1d59120ea662ec09004b4'::text, '2810734bbcf95232ddee46e78ff26e01e1c106ccd8e1d59120ea662ec09004b4'::text, 'USD'::text, 'explain'::text, CURRENT_TIMESTAMP
+ Query Identifier: -2547931233013281812
+ Planning Time: 0.008 ms
+ Execution Time: 0.283 ms
+(13 rows)
+
+=== charge 2: read back the postings by transaction id
+                                                       QUERY PLAN                                                        
+-------------------------------------------------------------------------------------------------------------------------
+ Index Scan using _autumn_money_postings_transaction_id_seq_key on public._autumn_money_postings (actual rows=3 loops=1)
+   Output: account_id, amount_minor, currency, seq
+   Index Cond: (_autumn_money_postings.transaction_id = '12e79fcc-433d-4ed8-a5b1-9e6fa07f60f4'::text)
+   Buffers: shared hit=5
+ Query Identifier: 819531433549964362
+ Planning Time: 0.030 ms
+ Execution Time: 0.014 ms
+(7 rows)
+
+=== charge 3: INSERT postings (id 74a36544-51d9-460c-9000-fb14e610e42e)
+                                                                                         QUERY PLAN                                                                                         
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public._autumn_money_postings (actual rows=0 loops=1)
+   Buffers: shared hit=24 read=6 dirtied=3
+   I/O Timings: shared read=0.039
+   WAL: records=12 fpi=3 bytes=21640
+   ->  Values Scan on "*VALUES*" (actual rows=3 loops=1)
+         Output: nextval('_autumn_money_postings_id_seq'::regclass), "*VALUES*".column1, "*VALUES*".column2, "*VALUES*".column3, "*VALUES*".column4, "*VALUES*".column5, "*VALUES*".column6
+         Buffers: shared hit=3
+ Query Identifier: 7113983371015365280
+ Planning Time: 0.012 ms
+ Trigger RI_ConstraintTrigger_c_17468 for constraint _autumn_money_postings_account_id_fkey: calls=3
+ Trigger _autumn_money_postings_balance: calls=1
+ Execution Time: 0.342 ms
+(12 rows)
+
+=== charge 3: INSERT transaction
+                                                                                                                            QUERY PLAN                                                                                                                             
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public._autumn_money_transactions (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Conflict Arbiter Indexes: _autumn_money_transactions_idempotency_key_key
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=9 read=4 dirtied=2
+   I/O Timings: shared read=0.190
+   WAL: records=4 fpi=2 bytes=12473
+   ->  Result (actual rows=1 loops=1)
+         Output: '74a36544-51d9-460c-9000-fb14e610e42e'::text, 'bc1d94cf139a9c01b2eebc98cb44a4c5a8e11342d90864f0290a807ed05b1904'::text, 'bc1d94cf139a9c01b2eebc98cb44a4c5a8e11342d90864f0290a807ed05b1904'::text, 'USD'::text, 'explain'::text, CURRENT_TIMESTAMP
+ Query Identifier: -2547931233013281812
+ Planning Time: 0.013 ms
+ Execution Time: 0.231 ms
+(13 rows)
+
+=== charge 3: read back the postings by transaction id
+                                                       QUERY PLAN                                                        
+-------------------------------------------------------------------------------------------------------------------------
+ Index Scan using _autumn_money_postings_transaction_id_seq_key on public._autumn_money_postings (actual rows=3 loops=1)
+   Output: account_id, amount_minor, currency, seq
+   Index Cond: (_autumn_money_postings.transaction_id = '74a36544-51d9-460c-9000-fb14e610e42e'::text)
+   Buffers: shared hit=5
+ Query Identifier: 819531433549964362
+ Planning Time: 0.034 ms
+ Execution Time: 0.013 ms
+(7 rows)
+
+ROLLBACK

@@ -252,7 +252,7 @@ async fn feature_flag_admin_history_reads_utc_under_a_non_utc_session_timezone()
         .find(|e| e.op == "pinned")
         .expect("the pinned audit row");
     assert_eq!(
-        pinned.recorded_at.to_rfc3339(),
+        autumn_web::time::compat::rfc3339(pinned.recorded_at),
         "2024-01-15T12:34:56+00:00",
         "the audit timestamp must stay UTC under a non-UTC session time zone"
     );

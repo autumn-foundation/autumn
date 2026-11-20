@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
+use autumn_web::time::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::money::Money;
@@ -209,9 +209,11 @@ pub struct Customer {
     /// Email known to the provider.
     pub email: Option<String>,
     /// Creation time (app clock).
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub created_at: Timestamp,
     /// Last update time (app clock).
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub updated_at: Timestamp,
 }
 
 impl Customer {
@@ -221,7 +223,7 @@ impl Customer {
         id: impl Into<String>,
         provider: impl Into<String>,
         provider_customer_id: impl Into<ProviderId>,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Self {
         Self {
             id: id.into(),
@@ -268,15 +270,19 @@ pub struct Subscription {
     /// Seat quantity.
     pub quantity: i64,
     /// End of the current billing period.
-    pub current_period_end: Option<DateTime<Utc>>,
+    #[serde(default, with = "autumn_web::time::compat::serde_autosi_option")]
+    pub current_period_end: Option<Timestamp>,
     /// Cancels at period end.
     pub cancel_at_period_end: bool,
     /// Provider time of the last event applied.
-    pub last_event_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub last_event_at: Timestamp,
     /// Creation time (app clock).
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub created_at: Timestamp,
     /// Last update time (app clock).
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub updated_at: Timestamp,
 }
 
 impl Subscription {
@@ -288,8 +294,8 @@ impl Subscription {
         customer_id: impl Into<String>,
         provider_subscription_id: impl Into<ProviderId>,
         status: SubscriptionStatus,
-        last_event_at: DateTime<Utc>,
-        now: DateTime<Utc>,
+        last_event_at: Timestamp,
+        now: Timestamp,
     ) -> Self {
         Self {
             id: id.into(),
@@ -330,7 +336,7 @@ impl Subscription {
 
     /// Set the period end.
     #[must_use]
-    pub const fn with_period_end(mut self, end: DateTime<Utc>) -> Self {
+    pub const fn with_period_end(mut self, end: Timestamp) -> Self {
         self.current_period_end = Some(end);
         self
     }
@@ -369,13 +375,17 @@ pub struct Invoice {
     /// Provider payment attempts so far.
     pub attempt_count: i64,
     /// Provider's own next attempt time, when reported.
-    pub next_payment_attempt: Option<DateTime<Utc>>,
+    #[serde(default, with = "autumn_web::time::compat::serde_autosi_option")]
+    pub next_payment_attempt: Option<Timestamp>,
     /// Provider time of the last event applied.
-    pub last_event_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub last_event_at: Timestamp,
     /// Creation time (app clock).
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub created_at: Timestamp,
     /// Last update time (app clock).
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub updated_at: Timestamp,
 }
 
 impl Invoice {
@@ -393,8 +403,8 @@ impl Invoice {
         status: InvoiceStatus,
         amount_due: Money,
         amount_paid: Money,
-        last_event_at: DateTime<Utc>,
-        now: DateTime<Utc>,
+        last_event_at: Timestamp,
+        now: Timestamp,
     ) -> Self {
         Self {
             id: id.into(),
@@ -436,7 +446,7 @@ impl Invoice {
 
     /// Set the provider's next attempt time.
     #[must_use]
-    pub const fn with_next_payment_attempt(mut self, at: DateTime<Utc>) -> Self {
+    pub const fn with_next_payment_attempt(mut self, at: Timestamp) -> Self {
         self.next_payment_attempt = Some(at);
         self
     }
@@ -500,11 +510,13 @@ pub struct DunningAttempt {
     /// Number of the next retry to run (1-based).
     pub attempt: i64,
     /// When the next retry is due.
-    pub next_attempt_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub next_attempt_at: Timestamp,
     /// State.
     pub state: DunningState,
     /// Last update time (app clock).
-    pub updated_at: DateTime<Utc>,
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub updated_at: Timestamp,
 }
 
 impl DunningAttempt {
@@ -514,9 +526,9 @@ impl DunningAttempt {
         invoice_id: impl Into<String>,
         customer_id: impl Into<String>,
         attempt: i64,
-        next_attempt_at: DateTime<Utc>,
+        next_attempt_at: Timestamp,
         state: DunningState,
-        updated_at: DateTime<Utc>,
+        updated_at: Timestamp,
     ) -> Self {
         Self {
             invoice_id: invoice_id.into(),
@@ -534,5 +546,62 @@ impl DunningAttempt {
     pub fn with_subscription(mut self, subscription_id: impl Into<String>) -> Self {
         self.subscription_id = Some(subscription_id.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use autumn_web::time::{SignedDuration, Timestamp};
+
+    use super::{DunningAttempt, DunningState, Subscription, SubscriptionStatus};
+
+    fn at_millis(millis: i64) -> Timestamp {
+        Timestamp::from_second(1_700_000_000).expect("in range")
+            + SignedDuration::from_millis(millis)
+    }
+
+    /// Timestamps serialize with a 0, 3, 6 or 9 digit fraction and `Z`, the
+    /// text earlier versions stored, so stored JSON compares equal.
+    #[test]
+    fn timestamps_serialize_with_whole_digit_groups() {
+        let row = DunningAttempt::new(
+            "inv",
+            "cust",
+            1,
+            at_millis(120),
+            DunningState::Pending,
+            at_millis(0),
+        );
+        let json = serde_json::to_value(&row).expect("serialize");
+        assert_eq!(json["next_attempt_at"], "2023-11-14T22:13:20.120Z");
+        assert_eq!(json["updated_at"], "2023-11-14T22:13:20Z");
+        let back: DunningAttempt = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, row);
+    }
+
+    /// An absent optional timestamp reads as `None`, and `None` writes `null`.
+    #[test]
+    fn optional_timestamps_default_to_none() {
+        let row = Subscription::new(
+            "sub",
+            "cust",
+            "sub_1",
+            SubscriptionStatus::Active,
+            at_millis(0),
+            at_millis(0),
+        );
+        let mut json = serde_json::to_value(&row).expect("serialize");
+        assert_eq!(json["current_period_end"], serde_json::Value::Null);
+        json.as_object_mut()
+            .expect("object")
+            .remove("current_period_end");
+        let back: Subscription = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.current_period_end, None);
+
+        let ended = row.with_period_end(at_millis(1_500));
+        let json = serde_json::to_value(&ended).expect("serialize");
+        assert_eq!(json["current_period_end"], "2023-11-14T22:13:21.500Z");
+        let back: Subscription = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, ended);
     }
 }

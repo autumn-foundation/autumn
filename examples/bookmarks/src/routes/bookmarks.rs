@@ -27,6 +27,7 @@ use autumn_web::form::Changeset;
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
 use autumn_web::reexports::http::HeaderMap;
+use autumn_web::time::{SignedDuration, civil};
 use autumn_web::widgets::{Column, DataTableConfig, data_table, property_list};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -322,9 +323,10 @@ pub async fn stats(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
 
     // Daily activity over the trailing window: bucket the raw `created_at`
     // timestamps into days, keyed by each day's midnight.
-    let window_end = chrono::Utc::now().naive_utc();
-    let window_start = window_end - chrono::Duration::days(ACTIVITY_WINDOW_DAYS);
-    let mut per_day: Vec<(chrono::NaiveDateTime, i64)> = repo
+    let window_end = autumn_web::time::ambient_civil_utc();
+    let window_start =
+        window_end.saturating_sub(SignedDuration::from_hours(24 * ACTIVITY_WINDOW_DAYS));
+    let mut per_day: Vec<(civil::DateTime, i64)> = repo
         .count_grouped_by_created_at()
         .bucket(DateBucket::Day)
         .filter_range(window_start, window_end)
@@ -386,7 +388,7 @@ pub async fn stats(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
                         tbody {
                             @for (day, count) in &per_day {
                                 tr class="border-t border-gray-100" {
-                                    td class="px-4 py-2 tabular-nums" { (day.format("%Y-%m-%d")) }
+                                    td class="px-4 py-2 tabular-nums" { (day.strftime("%Y-%m-%d")) }
                                     td class="px-4 py-2 text-right tabular-nums" { (count) }
                                 }
                             }

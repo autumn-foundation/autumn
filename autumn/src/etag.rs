@@ -244,7 +244,7 @@ fn entity_tags(list: &str) -> impl Iterator<Item = Option<&str>> {
 /// |------------|-----------------|
 /// | `String` / `&str` | SHA-256 of the string bytes (strong) |
 /// | `i64` | SHA-256 of the integer (strong) — suitable for `#[lock_version]` |
-/// | `(NaiveDateTime, i64)` | SHA-256 of `updated_at` + `lock_version` (strong) |
+/// | `(civil::DateTime, i64)` | SHA-256 of `updated_at` + `lock_version` (strong) |
 /// | Any `impl Hash` via [`hash_etag`] | `SipHash` → hex (weak) |
 /// | `ETag` | identity |
 pub trait IntoETag {
@@ -284,17 +284,37 @@ impl IntoETag for i32 {
 
 /// `(updated_at, lock_version)` tuple — the idiomatic combo when a model has
 /// both a timestamp and an optimistic-lock version.
-impl IntoETag for (chrono::NaiveDateTime, i64) {
+///
+/// The hash covers the UTC Unix seconds (floored) and the nanoseconds past
+/// that second, so the tag for a given row is the same on every release.
+impl IntoETag for (jiff::civil::DateTime, i64) {
     fn into_etag(self) -> ETag {
+        let (secs, nanos) = unix_parts(self.0);
         let mut hasher = sha2::Sha256::new();
-        hasher.update(self.0.and_utc().timestamp().to_be_bytes());
-        hasher.update(self.0.and_utc().timestamp_subsec_nanos().to_be_bytes());
+        hasher.update(secs.to_be_bytes());
+        hasher.update(nanos.to_be_bytes());
         hasher.update(self.1.to_be_bytes());
         ETag::strong(hex::encode(hasher.finalize()))
     }
 }
 
-impl IntoETag for (chrono::NaiveDateTime, i32) {
+/// `dt` read as UTC: whole seconds since the Unix epoch, rounded toward
+/// negative infinity, and the nanoseconds past that second (`0..1e9`).
+fn unix_parts(dt: jiff::civil::DateTime) -> (i64, u32) {
+    let since = dt.duration_since(jiff::civil::DateTime::constant(1970, 1, 1, 0, 0, 0, 0));
+    let (secs, nanos) = (since.as_secs(), since.subsec_nanos());
+    if nanos < 0 {
+        // A civil value's span from the epoch is far from `i64::MIN` seconds.
+        (
+            secs.saturating_sub(1),
+            u32::try_from(nanos.saturating_add(1_000_000_000)).unwrap_or(0),
+        )
+    } else {
+        (secs, u32::try_from(nanos).unwrap_or(0))
+    }
+}
+
+impl IntoETag for (jiff::civil::DateTime, i32) {
     fn into_etag(self) -> ETag {
         (self.0, i64::from(self.1)).into_etag()
     }
@@ -344,7 +364,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[must_use = "call `.or(response)` to resolve the conditional-GET result"]
 pub struct FreshWhen {
     etag: ETag,
-    last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    last_modified: Option<jiff::Timestamp>,
     is_fresh: bool,
     /// Whether the request carried an `If-None-Match` header.
     /// Per RFC 7232 §3.3, `If-Modified-Since` MUST be ignored when this is true.
@@ -370,7 +390,7 @@ impl FreshWhen {
     /// If the request contained an `If-Modified-Since` header but **no**
     /// `If-None-Match` header (RFC 7232 §3.3), this method re-evaluates
     /// freshness: the resource is considered fresh when `dt ≤ If-Modified-Since`.
-    pub fn last_modified(mut self, dt: impl Into<Option<chrono::DateTime<chrono::Utc>>>) -> Self {
+    pub fn last_modified(mut self, dt: impl Into<Option<jiff::Timestamp>>) -> Self {
         self.last_modified = dt.into();
         // RFC 7232 §3.3: evaluate IMS only when INM is absent.
         if !self.if_none_match_present
@@ -379,9 +399,8 @@ impl FreshWhen {
         {
             // HTTP dates carry whole seconds. Truncate so a sub-second `lm` does not read as
             // newer than its own round-tripped IMS value.
-            let lm_secs = chrono::DateTime::from_timestamp(lm.timestamp(), 0).unwrap_or(lm);
-            self.is_fresh = parse_http_date(ims_str)
-                .is_some_and(|parsed| std::time::SystemTime::from(lm_secs) <= parsed);
+            let lm_secs = whole_second(lm);
+            self.is_fresh = parse_http_date(ims_str).is_some_and(|parsed| lm_secs <= parsed);
         }
         self
     }
@@ -519,10 +538,7 @@ fn check_if_none_match(headers: &HeaderMap, etag: &ETag) -> bool {
     )
 }
 
-fn not_modified_response(
-    etag: &ETag,
-    last_modified: Option<chrono::DateTime<chrono::Utc>>,
-) -> Response<Body> {
+fn not_modified_response(etag: &ETag, last_modified: Option<jiff::Timestamp>) -> Response<Body> {
     let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
     let headers = builder.headers_mut().expect("builder not consumed");
     headers.insert(ETAG, etag.header_value());
@@ -536,26 +552,33 @@ fn not_modified_response(
         .expect("304 body is always valid")
 }
 
-fn http_date(dt: chrono::DateTime<chrono::Utc>) -> String {
-    dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+/// `dt` as an RFC 9110 IMF-fixdate: `Tue, 15 Nov 1994 08:12:31 GMT`.
+fn http_date(dt: jiff::Timestamp) -> String {
+    crate::time::compat::http_date(dt)
 }
 
-fn parse_http_date(s: &str) -> Option<std::time::SystemTime> {
-    // Try RFC 7231 / RFC 1123 format: "Tue, 15 Nov 1994 08:12:31 GMT"
-    chrono::DateTime::parse_from_rfc2822(s)
-        .map(|dt| std::time::SystemTime::from(dt.with_timezone(&chrono::Utc)))
-        .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(
-                s.trim_end_matches(" GMT"),
-                "%a, %d %b %Y %H:%M:%S",
-            )
-            .map(|ndt| {
-                std::time::SystemTime::from(
-                    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(ndt, chrono::Utc),
-                )
-            })
-        })
-        .ok()
+/// `ts` with its fraction of a second dropped (toward the earlier second).
+fn whole_second(ts: jiff::Timestamp) -> jiff::Timestamp {
+    let secs = if ts.subsec_nanosecond() < 0 {
+        ts.as_second().saturating_sub(1)
+    } else {
+        ts.as_second()
+    };
+    jiff::Timestamp::from_second(secs).unwrap_or(ts)
+}
+
+/// HTTP date parser shared by every conditional-request check.
+static HTTP_DATE_PARSER: jiff::fmt::rfc2822::DateTimeParser =
+    jiff::fmt::rfc2822::DateTimeParser::new().relaxed_weekday(true);
+
+fn parse_http_date(s: &str) -> Option<jiff::Timestamp> {
+    // RFC 9110 / RFC 2822: "Tue, 15 Nov 1994 08:12:31 GMT". The weekday is
+    // not checked against the date.
+    HTTP_DATE_PARSER.parse_timestamp(s).ok().or_else(|| {
+        jiff::civil::DateTime::strptime("%a, %d %b %Y %H:%M:%S", s.trim_end_matches(" GMT"))
+            .ok()
+            .and_then(|dt| jiff::tz::Offset::UTC.to_timestamp(dt).ok())
+    })
 }
 
 // ── Cache-Control freshness ─────────────────────────────────────────────────
@@ -1126,7 +1149,7 @@ pub(crate) fn not_modified_from(headers: &HeaderMap) -> Response<Body> {
 pub fn build_not_modified(
     original_headers: &HeaderMap,
     etag: &ETag,
-    last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    last_modified: Option<jiff::Timestamp>,
 ) -> Response<Body> {
     let mut response = not_modified_response(etag, last_modified);
     for name in [CACHE_CONTROL, VARY, CONTENT_LOCATION, DATE, EXPIRES] {
@@ -1224,9 +1247,7 @@ mod tests {
 
     #[test]
     fn tuple_into_etag_is_deterministic() {
-        let dt = chrono::DateTime::from_timestamp(1_000_000, 0)
-            .unwrap()
-            .naive_utc();
+        let dt = jiff::civil::date(1970, 1, 12).at(13, 46, 40, 0);
         let e1: ETag = (dt, 3_i64).into_etag();
         let e2: ETag = (dt, 3_i64).into_etag();
         assert_eq!(e1, e2);
@@ -1235,9 +1256,7 @@ mod tests {
 
     #[test]
     fn tuple_etag_differs_when_lock_version_differs() {
-        let dt = chrono::DateTime::from_timestamp(1_000_000, 0)
-            .unwrap()
-            .naive_utc();
+        let dt = jiff::civil::date(1970, 1, 12).at(13, 46, 40, 0);
         let e1: ETag = (dt, 1_i64).into_etag();
         let e2: ETag = (dt, 2_i64).into_etag();
         assert_ne!(e1, e2);
@@ -1245,15 +1264,55 @@ mod tests {
 
     #[test]
     fn tuple_etag_differs_when_timestamp_differs() {
-        let dt1 = chrono::DateTime::from_timestamp(1_000_000, 0)
-            .unwrap()
-            .naive_utc();
-        let dt2 = chrono::DateTime::from_timestamp(1_000_001, 0)
-            .unwrap()
-            .naive_utc();
+        let dt1 = jiff::civil::date(1970, 1, 12).at(13, 46, 40, 0);
+        let dt2 = jiff::civil::date(1970, 1, 12).at(13, 46, 41, 0);
         let e1: ETag = (dt1, 1_i64).into_etag();
         let e2: ETag = (dt2, 1_i64).into_etag();
         assert_ne!(e1, e2);
+    }
+
+    #[test]
+    fn tuple_etag_hashes_floored_unix_seconds_and_nanos() {
+        assert_eq!(
+            unix_parts(jiff::civil::date(1970, 1, 12).at(13, 46, 40, 5)),
+            (1_000_000, 5)
+        );
+        assert_eq!(
+            unix_parts(jiff::civil::date(1969, 12, 31).at(23, 59, 59, 500_000_000)),
+            (-1, 500_000_000)
+        );
+        assert_eq!(
+            unix_parts(jiff::civil::date(1969, 12, 31).at(23, 59, 59, 0)),
+            (-1, 0)
+        );
+
+        let dt = jiff::civil::date(2024, 1, 2).at(3, 4, 5, 120_000_000);
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(1_704_164_645_i64.to_be_bytes());
+        hasher.update(120_000_000_u32.to_be_bytes());
+        hasher.update(7_i64.to_be_bytes());
+        let expected = ETag::strong(hex::encode(hasher.finalize()));
+        assert_eq!((dt, 7_i64).into_etag(), expected);
+        assert_eq!((dt, 7_i32).into_etag(), expected);
+    }
+
+    #[test]
+    fn http_date_round_trips_and_parses_relaxed_input() {
+        let ts = jiff::Timestamp::from_second(784_111_777).unwrap();
+        assert_eq!(http_date(ts), "Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(parse_http_date(&http_date(ts)), Some(ts));
+        // A wrong weekday is ignored, as before.
+        assert_eq!(parse_http_date("Mon, 06 Nov 1994 08:49:37 GMT"), Some(ts));
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 09:49:37 +0100"), Some(ts));
+        assert_eq!(parse_http_date("not a date"), None);
+    }
+
+    #[test]
+    fn whole_second_drops_the_fraction_toward_the_past() {
+        let ts = |s: i64, n: i32| jiff::Timestamp::new(s, n).unwrap();
+        assert_eq!(whole_second(ts(10, 900_000_000)), ts(10, 0));
+        assert_eq!(whole_second(ts(-1, -500_000_000)), ts(-2, 0));
+        assert_eq!(whole_second(ts(-1, 0)), ts(-1, 0));
     }
 
     #[test]
@@ -1406,10 +1465,8 @@ mod tests {
 
     #[test]
     fn fresh_when_last_modified_sets_header_on_stale_response() {
-        use chrono::TimeZone;
-
         let headers = HeaderMap::new();
-        let last_modified = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let last_modified = jiff::Timestamp::from_second(1_700_000_000).unwrap();
 
         let response = fresh_when(&headers, 1_i64)
             .last_modified(last_modified)
@@ -1422,10 +1479,8 @@ mod tests {
 
     #[test]
     fn fresh_when_last_modified_sets_header_on_304() {
-        use chrono::TimeZone;
-
         let etag: ETag = 9_i64.into_etag();
-        let last_modified = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let last_modified = jiff::Timestamp::from_second(1_700_000_000).unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, etag.header_value());
@@ -1443,10 +1498,8 @@ mod tests {
 
     #[test]
     fn fresh_when_if_modified_since_fresh_when_last_modified_not_newer() {
-        use chrono::TimeZone;
-
-        let last_modified = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        let ims_time = chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+        let last_modified = jiff::Timestamp::from_second(1_700_000_000).unwrap();
+        let ims_time = jiff::Timestamp::from_second(1_700_000_001).unwrap();
         let ims_str = http_date(ims_time);
 
         let mut headers = HeaderMap::new();
@@ -1458,10 +1511,8 @@ mod tests {
 
     #[test]
     fn fresh_when_if_modified_since_stale_when_resource_newer_than_ims() {
-        use chrono::TimeZone;
-
-        let last_modified = chrono::Utc.timestamp_opt(1_700_000_002, 0).unwrap();
-        let ims_time = chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+        let last_modified = jiff::Timestamp::from_second(1_700_000_002).unwrap();
+        let ims_time = jiff::Timestamp::from_second(1_700_000_001).unwrap();
         let ims_str = http_date(ims_time);
 
         let mut headers = HeaderMap::new();
@@ -1473,10 +1524,8 @@ mod tests {
 
     #[test]
     fn fresh_when_ignores_ims_when_inm_present_rfc7232_s3_3() {
-        use chrono::TimeZone;
-
-        let last_modified = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        let ims_time = chrono::Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+        let last_modified = jiff::Timestamp::from_second(1_700_000_000).unwrap();
+        let ims_time = jiff::Timestamp::from_second(1_700_000_001).unwrap();
         let ims_str = http_date(ims_time);
 
         let wrong_etag: ETag = 99_i64.into_etag();

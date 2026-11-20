@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use autumn_web::config::{AutumnConfig, ReplicationConfig};
 use autumn_web::replication::{ReplicaDestination, restore, segment};
-use chrono::{DateTime, Utc};
+use autumn_web::time::Timestamp;
 
 use crate::migrate;
 
@@ -320,10 +320,11 @@ fn fastrand_u64() -> u64 {
 }
 
 /// Parse `--timestamp` as RFC 3339.
-pub fn parse_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>, ReplicaError> {
+pub fn parse_timestamp(value: Option<&str>) -> Result<Option<Timestamp>, ReplicaError> {
     value.map_or(Ok(None), |raw| {
-        DateTime::parse_from_rfc3339(raw.trim())
-            .map(|t| Some(t.with_timezone(&Utc)))
+        raw.trim()
+            .parse::<Timestamp>()
+            .map(Some)
             .map_err(|_| ReplicaError::BadTimestamp {
                 value: raw.to_owned(),
             })
@@ -376,10 +377,13 @@ fn run_restore(
         "  \u{2139} generation {} ({} segment(s)) \u{2192} {}",
         plan.generation,
         plan.segments.len(),
-        plan.effective.to_rfc3339()
+        autumn_web::time::compat::rfc3339(plan.effective)
     );
     if let Some(requested) = plan.requested {
-        eprintln!("  \u{2139} requested {}", requested.to_rfc3339());
+        eprintln!(
+            "  \u{2139} requested {}",
+            autumn_web::time::compat::rfc3339(requested)
+        );
     }
 
     let outcome = restore::apply(remote.as_ref(), &plan, &destination_path).map_err(|e| {
@@ -393,7 +397,7 @@ fn run_restore(
         outcome.bytes,
         outcome.output.display(),
         outcome.frames_replayed,
-        outcome.plan.effective.to_rfc3339()
+        autumn_web::time::compat::rfc3339(outcome.plan.effective)
     );
     Ok(())
 }
@@ -408,17 +412,17 @@ fn run_status(profile: Option<&str>, json: bool) -> Result<(), ReplicaError> {
     let plan = restore::plan(remote.as_ref(), &root, None).map_err(|e| ReplicaError::Restore {
         detail: e.to_string(),
     })?;
-    let lag = Utc::now()
-        .signed_duration_since(plan.effective)
-        .num_seconds()
+    let lag = Timestamp::now()
+        .duration_since(plan.effective)
+        .as_secs()
         .max(0);
     if json {
         // JSON goes to stdout: this is the monitoring surface.
         let report = serde_json::json!({
             "generation": plan.generation,
-            "opened": plan.generation_started_at.to_rfc3339(),
+            "opened": autumn_web::time::compat::rfc3339(plan.generation_started_at),
             "segments": plan.segments.len(),
-            "current_as_of": plan.effective.to_rfc3339(),
+            "current_as_of": autumn_web::time::compat::rfc3339(plan.effective),
             "replication_lag_seconds": lag,
             "retention_hours": loaded.replication.retention_hours,
             "rpo_seconds": loaded.replication.rpo_secs,
@@ -429,10 +433,13 @@ fn run_status(profile: Option<&str>, json: bool) -> Result<(), ReplicaError> {
     println!("generation      {}", plan.generation);
     println!(
         "opened          {}",
-        plan.generation_started_at.to_rfc3339()
+        autumn_web::time::compat::rfc3339(plan.generation_started_at)
     );
     println!("segments        {}", plan.segments.len());
-    println!("current as of   {}", plan.effective.to_rfc3339());
+    println!(
+        "current as of   {}",
+        autumn_web::time::compat::rfc3339(plan.effective)
+    );
     println!("replication lag {lag}s");
     println!(
         "retention       {} hour(s)",
@@ -464,7 +471,7 @@ fn run_verify(profile: Option<&str>) -> Result<(), ReplicaError> {
             eprintln!(
                 "\n\u{2713} Replica is restorable: {} byte(s), current as of {}.",
                 outcome.bytes,
-                outcome.plan.effective.to_rfc3339()
+                autumn_web::time::compat::rfc3339(outcome.plan.effective)
             );
             Ok(())
         }

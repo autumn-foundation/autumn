@@ -18,14 +18,14 @@ use schema::events;
 pub struct Event {
     #[id]
     pub id: i64,
-    pub created_at: autumn_web::reexports::chrono::DateTime<autumn_web::reexports::chrono::Utc>,
+    pub created_at: autumn_web::time::Timestamp,
 }
 
 #[autumn_web::repository(
     Event,
     api = "/api/events",
     cursor_key = created_at,
-    cursor_key_type = autumn_web::reexports::chrono::DateTime<autumn_web::reexports::chrono::Utc>,
+    cursor_key_type = autumn_web::time::Timestamp,
 )]
 pub trait EventRepository {}
 

@@ -3786,15 +3786,12 @@ path = "/shop/panel"
     fn a_dropped_call_keeps_its_own_time_not_the_time_of_ingest() {
         // #2523: the log ingests a request when it ends, and a slow request must not make its
         // old drops look recent.
-        use chrono::TimeZone as _;
-
         use crate::time::{TickingClock, install_ambient};
 
         let hour = std::time::Duration::from_secs(3600);
         let clock = TickingClock::starting_at(
-            chrono::Utc
-                .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
-                .single()
+            "2020-01-01T00:00:00Z"
+                .parse::<crate::time::Timestamp>()
                 .expect("a valid date"),
         );
         let _clock = install_ambient(Arc::new(clock.clone()));

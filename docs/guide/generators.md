@@ -79,9 +79,10 @@ set.
 | `score:f64`       | `f64`                           | `Float8`           | `DOUBLE PRECISION`  |
 | `published:bool`  | `bool`                          | `Bool`             | `BOOLEAN`           |
 | `token:Uuid`      | `uuid::Uuid`                    | `Uuid`             | `UUID`              |
-| `at:NaiveDateTime`| `chrono::NaiveDateTime`         | `Timestamp`        | `TIMESTAMP`         |
-| `at:DateTime`     | `chrono::DateTime<chrono::Utc>` | `Timestamptz`      | `TIMESTAMPTZ`       |
-| `opens:time` *(or `NaiveTime`)* | `chrono::NaiveTime` | `Time`         | `TIME`              |
+| `at:CivilDateTime` *(or `NaiveDateTime`)* | `autumn_web::time::civil::DateTime` | `Timestamp` | `TIMESTAMP` |
+| `at:Timestamp` *(or `DateTime`)* | `autumn_web::time::Timestamp` | `Timestamptz` | `TIMESTAMPTZ`  |
+| `due:Date` *(or `date`, `NaiveDate`)* | `autumn_web::time::civil::Date` | `Date` | `DATE`         |
+| `opens:time` *(or `Time`, `NaiveTime`)* | `autumn_web::time::civil::Time` | `Time` | `TIME`       |
 | `mobile:phone` *(or `tel`)* | `String`              | `Text`             | `TEXT`              |
 | `accent:color`    | `String` (`#rrggbb`)            | `Text`             | `TEXT`              |
 | `price:money`     | `rust_decimal::Decimal`         | `Numeric`          | `NUMERIC(12,2)`     |
@@ -93,16 +94,17 @@ set.
 | `comments:commentable` | `i64` (server-managed `comment_count`) | `Int8` | `BIGINT`            |
 
 Wrap any of the above in `Option<…>` to make the column nullable
-(`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
+(`Option<String>`, `Option<i64>`, `Option<CivilDateTime>`, …). The generator
 emits both `NULL` in the migration SQL and `Nullable<T>` in `schema.rs`.
 
-### `time`, `phone`, `color` and `money` — native form controls
+### `time`, `Date`, `phone`, `color` and `money` — native form controls
 
 These kinds pick a native form control (issue #3405):
 
 | Kind | Form control | Notes |
 |---|---|---|
 | `time` | `<input type="time">` (`FieldControl::Time`) | The browser posts `HH:MM`. On `SQLite` the column is `TEXT`. |
+| `Date` (alias `date`) | `<input type="date">` (`FieldControl::Date`) | The browser posts `YYYY-MM-DD`. On `SQLite` the column is `TEXT`. |
 | `phone` (alias `tel`) | `<input type="tel">` (`FieldControl::Tel`) | A `String` column. The browser does not check the format. |
 | `color` | `<input type="color">` (`FieldControl::Color`) | A `String` column. The browser posts a lowercase `#rrggbb`. A color input always posts a value, so `Option<color>` is an error: use `Option<String>`. |
 | `money` | `<input type="number" step="0.01">` | The same column as a bare `decimal`: `NUMERIC(12,2)`. |
@@ -547,7 +549,7 @@ pub struct Post {
     pub body: String,
     pub published: bool,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 ```
 
@@ -1688,7 +1690,7 @@ Contract of the generated handler:
 | A model with no settable column at all | Refused, with a warning. An empty form decodes *any* row, so such an importer could only ever commit rows of database defaults — and a file with any header would do it. Reached when every column is an `Attachment` or `--default`ed. |
 | `Bytea` column | Round-trips. The export writes `\x` + lowercase hex (the Postgres `bytea` text form), so no byte is lost. The import decodes it back byte-identically. Upper-case hex is also accepted. A cell without the `\x` prefix, with an odd number of digits, or with a non-hex character fails its row. The `\x` prefix stops a spreadsheet from reading the cell as a number, so leading zeros stay. A blank value is NULL in a nullable column and empty bytes in a required one; `\x` alone is empty bytes. A spreadsheet can cut a cell that is too long (about 32 000 characters in Excel), so edit large blobs with care. The edit form uses the same text. The index and show views stay lossy, because they only display. |
 | `Attachment` column | Not importable — a storage key in a cell is not a file. The column is left NULL; upload the file through the record's own edit form afterwards. |
-| `datetime` column | Round-trips, naive and tz-aware alike: the export writes chrono's `Display` form (a space between date and time, plus a zone name for a tz-aware column) and an `--import` scaffold's `parse_local_datetime` accepts both shapes alongside the browser's `datetime-local` `T` form. Without the flag the helper is unchanged. |
+| `datetime` column | Round-trips, civil and tz-aware alike. The export writes the value's `Display` form: `2026-08-26T12:00:00` for a `CivilDateTime` column and `2026-08-26T12:00:00Z` for a `Timestamp` column. An `--import` scaffold's `parse_local_datetime` reads that form, the browser's `datetime-local` form, and the form apps on Autumn 0.10 and earlier exported (a space between date and time, and ` UTC` at the end of a tz-aware value). The zone suffix is dropped on the way in, because the column is UTC. Without the flag the helper reads only the browser's form. |
 | A value that looks like a formula | Round-trips too. The export prefixes an apostrophe to a text cell beginning `=`, `+`, `-`, `@`, TAB or CR; the import strips it back off — but only in exactly that shape, so `'tis` is left alone. A value someone really typed as `'=x` is indistinguishable from a guarded `=x` in the file and resolves to the latter; drop the `csv_unguard_cell` call if you would rather store the apostrophe. |
 | `slug` column | Imported verbatim from the file. The blank-slug derivation `create` performs needs a database probe, which the parse closure (a synchronous callback) cannot do — so a blank slug reaches the insert as-is and its `UNIQUE` index reports the collision per row. A file exported from this app already carries its slugs. |
 | Route vs `/<plural>/{id}` | The static `import` segment outranks the `{id}` parameter, the same way `/<plural>/new` already does. With a `slug` route key the DERIVED-slug guard treats `"import"` as taken, so a post titled "Import" gets `import-2` — but a slug submitted explicitly (including one imported from a CSV column) is not rejected, and a record whose slug is literally `import` is unreachable at its own URL. Same caveat `new` and `export.csv` already carry. |
@@ -2327,7 +2329,7 @@ other generators:
 This is **read-only**: no migration is written and no data is touched — the
 tables already exist. Column types are the inverse of the [field-type DSL
 table](#the-field-type-dsl) (`int8` → `i64`, `text` → `String`, `timestamptz`
-→ `chrono::DateTime`, …); nullable columns become `Option<T>`. The primary key
+→ `autumn_web::time::Timestamp`, `date` → `autumn_web::time::civil::Date`, …); nullable columns become `Option<T>`. The primary key
 is annotated `#[id]` and a `created_at` column is annotated `#[default]`, so a
 table created by `autumn generate model` and then re-derived by `db pull`
 produces a field-for-field equivalent model. A column whose SQL type is outside

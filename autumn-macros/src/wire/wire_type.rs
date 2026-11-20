@@ -218,11 +218,15 @@ impl Mapper<'_> {
         if let Some(scalar) = scalar(&name) {
             return scalar;
         }
+        if let Some(time) = jiff_time(path, &name, &args) {
+            return time;
+        }
         match name.as_str() {
             "Self" if self.opaque => WireType::Any,
             "Self" => WireType::object(self.own),
             // chrono's `DateTime<Tz>`. A `DateTime` with no time zone is
-            // another crate's type, with another form.
+            // `jiff`'s civil one after `civil::` (see `jiff_time`), and
+            // otherwise another crate's type, with another form.
             "DateTime" if args.len() == 1 => WireType::string_in(format::DATE_TIME),
             "NonZero" => match arg(0) {
                 integer @ WireType::Integer { .. } => integer,
@@ -283,6 +287,35 @@ fn scalar(name: &str) -> Option<WireType> {
         "Ipv6Addr" => text(format::IPV6),
         // serde_json writes bytes as an array of numbers.
         "Bytes" | "ByteBuf" => Some(WireType::array(WireType::integer(8, false))),
+        _ => None,
+    }
+}
+
+/// The wire type of a `jiff` date or time value, read off its name and the
+/// path segment before it.
+///
+/// `Timestamp` and `ZonedDateTime` are known bare, or after `jiff::` or
+/// `time::` (`autumn_web::time`). `Date`, `Time` and a `DateTime` with no type
+/// arguments are `jiff`'s civil types only after `civil::`: other crates use
+/// those names for values with other JSON forms. A `ZonedDateTime` writes its
+/// offset and a bracketed zone name (RFC 9557), which no known format names.
+fn jiff_time(path: &syn::Path, name: &str, args: &[&syn::Type]) -> Option<WireType> {
+    if !args.is_empty() {
+        return None;
+    }
+    let parent = path
+        .segments
+        .iter()
+        .rev()
+        .nth(1)
+        .map(|segment| segment.ident.to_string());
+    let text = |format: &str| Some(WireType::string_in(format));
+    match (name, parent.as_deref()) {
+        ("Timestamp", None | Some("jiff" | "time")) => text(format::DATE_TIME),
+        ("ZonedDateTime", None | Some("jiff" | "time")) => Some(WireType::string()),
+        ("DateTime", Some("civil")) => text(format::LOCAL_DATE_TIME),
+        ("Date", Some("civil")) => text(format::DATE),
+        ("Time", Some("civil")) => text(format::LOCAL_TIME),
         _ => None,
     }
 }

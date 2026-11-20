@@ -9,8 +9,7 @@ use autumn_billing::prelude::*;
 use autumn_billing::store::{CustomerUpsert, SubscriptionUpsert};
 use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
-use autumn_web::time::FixedClock;
-use chrono::{DateTime, TimeZone, Utc};
+use autumn_web::time::{FixedClock, SignedDuration, Timestamp};
 
 use super::support::{self, FakeProvider, Harness, PRO_PRICE, TEAM_PRICE};
 
@@ -51,12 +50,12 @@ async fn any_plan(_e: Entitled<AnyPlan>) -> &'static str {
 }
 
 /// The pinned app clock.
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 9, 10, 12, 0, 0).unwrap()
+fn now() -> Timestamp {
+    "2026-09-10T12:00:00Z".parse().unwrap()
 }
 
-const fn hours(n: i64) -> chrono::Duration {
-    chrono::Duration::hours(n)
+const fn hours(n: i64) -> SignedDuration {
+    SignedDuration::from_hours(n)
 }
 
 fn gate_routes(app: TestApp) -> TestApp {
@@ -99,8 +98,8 @@ fn sub(
     key: &str,
     price: Option<&str>,
     status: SubscriptionStatus,
-    period_end: Option<DateTime<Utc>>,
-    occurred_at: DateTime<Utc>,
+    period_end: Option<Timestamp>,
+    occurred_at: Timestamp,
 ) -> SubscriptionUpsert {
     let plan_id = match price {
         Some(PRO_PRICE) => Some(PlanId::new("pro")),
@@ -274,7 +273,7 @@ async fn zero_grace_makes_expired_period_403() {
             "1",
             Some(PRO_PRICE),
             SubscriptionStatus::Active,
-            Some(now() - chrono::Duration::seconds(1)),
+            Some(now() - SignedDuration::from_secs(1)),
             now(),
         ))
         .await

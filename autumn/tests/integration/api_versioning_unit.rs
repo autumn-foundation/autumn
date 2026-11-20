@@ -2,6 +2,11 @@ use autumn_web::error::AutumnError;
 use autumn_web::openapi::ApiDoc;
 use http::StatusCode;
 
+/// The instant an RFC 3339 literal names.
+fn utc(rfc3339: &str) -> autumn_web::time::Timestamp {
+    rfc3339.parse().expect("a valid RFC 3339 timestamp")
+}
+
 #[test]
 fn test_route_version_fields() {
     let route = autumn_web::Route {
@@ -39,8 +44,7 @@ fn test_autumn_error_gone() {
 
 #[test]
 fn test_app_builder_api_version_registry() {
-    use chrono::TimeZone;
-    let deprecated_date = chrono::Utc.with_ymd_and_hms(2026, 6, 2, 0, 0, 0).unwrap();
+    let deprecated_date = utc("2026-06-02T00:00:00Z");
 
     let app = autumn_web::app()
         .api_version(autumn_web::app::ApiVersion {
@@ -79,22 +83,21 @@ async fn test_startup_validation_rejects_unregistered_version() {
 fn test_route_listing_with_version_and_status() {
     use autumn_web::app::ApiVersion;
     use autumn_web::route_listing::collect_route_infos;
-    use chrono::{TimeZone, Utc};
 
     let active_version = ApiVersion {
         version: "v1".to_string(),
-        deprecated_at: Some(Utc.with_ymd_and_hms(2035, 1, 1, 0, 0, 0).unwrap()),
-        sunset_at: Some(Utc.with_ymd_and_hms(2040, 1, 1, 0, 0, 0).unwrap()),
+        deprecated_at: Some(utc("2035-01-01T00:00:00Z")),
+        sunset_at: Some(utc("2040-01-01T00:00:00Z")),
     };
     let deprecated_version = ApiVersion {
         version: "v2_dep".to_string(),
-        deprecated_at: Some(Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap()),
-        sunset_at: Some(Utc.with_ymd_and_hms(2040, 1, 1, 0, 0, 0).unwrap()),
+        deprecated_at: Some(utc("2020-01-01T00:00:00Z")),
+        sunset_at: Some(utc("2040-01-01T00:00:00Z")),
     };
     let sunset_version = ApiVersion {
         version: "v3_sun".to_string(),
-        deprecated_at: Some(Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap()),
-        sunset_at: Some(Utc.with_ymd_and_hms(2021, 1, 1, 0, 0, 0).unwrap()),
+        deprecated_at: Some(utc("2020-01-01T00:00:00Z")),
+        sunset_at: Some(utc("2021-01-01T00:00:00Z")),
     };
 
     let routes = vec![

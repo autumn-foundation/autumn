@@ -1150,8 +1150,18 @@ fn extract_originating_tenant_from_context(context: &str) -> (Value, Option<Stri
 /// (which share the leading second-precision prefix), and the fractional part
 /// gives the worker sub-second retry/lease resolution.
 #[cfg(feature = "sqlite")]
-fn sqlite_timestamp(instant: chrono::DateTime<chrono::Utc>) -> String {
-    instant.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+fn sqlite_timestamp(instant: jiff::Timestamp) -> String {
+    let dt = jiff::tz::Offset::UTC.to_datetime(instant);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        dt.year(),
+        dt.month(),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+        dt.millisecond()
+    )
 }
 
 #[cfg(all(feature = "ws", not(feature = "sqlite")))]
@@ -1857,11 +1867,13 @@ async fn recover_stale_repository_commit_hooks(pool: &RtPool, worker_id: &str) {
 /// `SQLite`: the UTC instant before which a still-`running` (or leased-pending)
 /// claim is considered abandoned by a dead worker.
 #[cfg(feature = "sqlite")]
-fn sqlite_stale_claim_cutoff() -> chrono::DateTime<chrono::Utc> {
-    let stale_after = chrono::Duration::from_std(HOOK_STALE_CLAIM_AFTER)
-        .unwrap_or_else(|_| chrono::Duration::seconds(60));
+fn sqlite_stale_claim_cutoff() -> jiff::Timestamp {
+    let stale_after = jiff::SignedDuration::try_from(HOOK_STALE_CLAIM_AFTER)
+        .unwrap_or_else(|_| jiff::SignedDuration::from_secs(60));
     // Real time: SQLite stamps `claimed_at` with its own `CURRENT_TIMESTAMP`.
-    chrono::Utc::now() - stale_after
+    jiff::Timestamp::now()
+        .checked_sub(stale_after)
+        .unwrap_or(jiff::Timestamp::MIN)
 }
 
 // ── `SQLite` claim / drain / nack ───────────────────────────────────────────────
@@ -1884,7 +1896,7 @@ async fn sqlite_claim_next_repository_commit_hook(
     let mut conn = pool.get().await.ok()?;
     // Real time: SQLite stamps `run_at` with its own `CURRENT_TIMESTAMP`, so a
     // virtual clock would never reach it (issue #2967).
-    let now = sqlite_timestamp(chrono::Utc::now());
+    let now = sqlite_timestamp(jiff::Timestamp::now());
     // Handler keys are Rust type paths, not user input. Inlining them keeps the bind arity
     // fixed; quotes are still doubled defensively.
     let handler_in_list = handler_keys
@@ -2149,9 +2161,9 @@ async fn sqlite_nack_repository_commit_hook_failure(
         let delay_ms = retry_delay_ms(row.initial_backoff_ms, row.attempt);
         // Real time, to match the claim query above.
         let run_at = sqlite_timestamp(
-            chrono::Utc::now()
-                + chrono::Duration::try_milliseconds(delay_ms)
-                    .unwrap_or_else(chrono::Duration::zero),
+            jiff::Timestamp::now()
+                .checked_add(jiff::SignedDuration::from_millis(delay_ms))
+                .unwrap_or(jiff::Timestamp::MAX),
         );
         diesel::sql_query(
             "UPDATE autumn_repository_commit_hooks \

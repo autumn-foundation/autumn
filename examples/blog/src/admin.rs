@@ -2,6 +2,7 @@ use autumn_admin_plugin::prelude::*;
 use autumn_admin_plugin::{
     AdminHistoryEntry, AdminHistoryPage, AdminImportRowResult, CsvImportMode,
 };
+use autumn_web::time::SignedDuration;
 use diesel::OptionalExtension;
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
@@ -219,12 +220,12 @@ impl AdminModel for PostAdmin {
                 published: Some(new_post.published),
                 // Bump the version token so the cached post card re-renders on
                 // the next request (Postgres has no ON UPDATE trigger).
-                updated_at: Some(chrono::Utc::now().naive_utc()),
+                updated_at: Some(autumn_web::time::ambient_civil_utc()),
             };
             let mut conn = pool.get().await.map_err(Self::pool_error)?;
 
             let updated = diesel::update(posts::table.find(id))
-                .set(&changes)
+                .set(changes)
                 .returning(Post::as_returning())
                 .get_result::<Post>(&mut conn)
                 .await
@@ -383,7 +384,7 @@ impl AdminModel for PostAdmin {
                         serde_json::json!({"column": "title", "before": null, "after": "Hello World", "sensitive": false}),
                         serde_json::json!({"column": "published", "before": null, "after": false, "sensitive": false}),
                     ],
-                    recorded_at: chrono::Utc::now() - chrono::Duration::hours(2),
+                    recorded_at: autumn_web::time::ambient_now() - SignedDuration::from_hours(2),
                 },
                 AdminHistoryEntry {
                     id: 2,
@@ -393,7 +394,7 @@ impl AdminModel for PostAdmin {
                     changes: vec![
                         serde_json::json!({"column": "published", "before": false, "after": true, "sensitive": false}),
                     ],
-                    recorded_at: chrono::Utc::now() - chrono::Duration::hours(1),
+                    recorded_at: autumn_web::time::ambient_now() - SignedDuration::from_hours(1),
                 },
             ];
             let total = entries.len() as u64;

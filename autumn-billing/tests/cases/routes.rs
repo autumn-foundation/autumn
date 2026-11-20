@@ -8,8 +8,7 @@ use autumn_billing::store::{CustomerUpsert, SubscriptionUpsert};
 use autumn_billing::{PortalRequest, ProviderId, SubscriptionStatus};
 use autumn_web::tenancy::with_tenant;
 use autumn_web::test::TestApp;
-use autumn_web::time::FixedClock;
-use chrono::{DateTime, TimeZone, Utc};
+use autumn_web::time::{FixedClock, SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
 use autumn_web::config::AutumnConfig;
@@ -18,8 +17,8 @@ use super::support::{
     self, FailingStore, FakeCall, FakeParser, FakeProvider, Harness, PRO_PRICE, fixture_with,
 };
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 9, 10, 12, 0, 0).unwrap()
+fn now() -> Timestamp {
+    "2026-09-10T12:00:00Z".parse().unwrap()
 }
 
 fn pinned(app: TestApp) -> TestApp {
@@ -58,7 +57,7 @@ async fn seed_subscription(
             )
             .with_price(PRO_PRICE)
             .with_plan("pro")
-            .with_period_end(now() + chrono::Duration::days(30)),
+            .with_period_end(now() + SignedDuration::from_hours(30 * 24)),
         )
         .await
         .expect("subscription");

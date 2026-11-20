@@ -81,8 +81,8 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   macros or other internals need to reach, but user code must not depend on
   them.
 - Anything under `autumn_web::reexports`. The crates re-exported there
-  (`axum`, `diesel`, `diesel_async`, `http`, `tokio`, `tokio_util`,
-  `tracing`, `validator`, `chrono`) follow *their own* versioning. See
+  (`axum`, `diesel`, `diesel_async`, `http`, `jiff`, `tokio`, `tokio_util`,
+  `tracing`, `validator`) follow *their own* versioning. See
   [Dependencies and re-exports](#dependencies-and-re-exports).
 - Exact error messages (`Display` output, log lines, rendered HTML error
   pages). Only *types* and *status codes* are stable.

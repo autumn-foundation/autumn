@@ -81,7 +81,7 @@ async fn create_room(State(state): State<AppState>) -> AutumnResult<Redirect> {
     log.push(RoomEntry {
         id: room.id.clone(),
         max_participants: room.max_participants,
-        created_at: room.created_at.to_rfc3339(),
+        created_at: autumn_web::time::compat::rfc3339(room.created_at),
     });
     Ok(Redirect::to("/"))
 }

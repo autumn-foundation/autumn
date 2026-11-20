@@ -125,7 +125,6 @@ impl MutationHooks for PageHooks {
 mod tests {
     use super::*;
     use autumn_web::hooks::MutationOp;
-    use chrono::Utc;
 
     #[tokio::test]
     async fn test_before_update_updates_slug_if_title_changes() {
@@ -138,8 +137,8 @@ mod tests {
             body: "Old Content".into(),
             status: "published".into(),
             lock_version: 0,
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
+            created_at: autumn_web::time::ambient_civil_utc(),
+            updated_at: autumn_web::time::ambient_civil_utc(),
         };
 
         let mut after = before.clone();
@@ -163,8 +162,8 @@ mod tests {
             body: "Old Content".into(),
             status: "published".into(),
             lock_version: 0,
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
+            created_at: autumn_web::time::ambient_civil_utc(),
+            updated_at: autumn_web::time::ambient_civil_utc(),
         };
 
         let mut after = before.clone();
@@ -189,8 +188,8 @@ mod tests {
             body: "Body".into(),
             status: "published".into(),
             lock_version: 1,
-            created_at: chrono::Utc::now().naive_utc(),
-            updated_at: chrono::Utc::now().naive_utc(),
+            created_at: autumn_web::time::ambient_civil_utc(),
+            updated_at: autumn_web::time::ambient_civil_utc(),
         };
 
         // Simulate what the app would do in after_update:
@@ -232,8 +231,8 @@ mod tests {
             body: body.into(),
             status: status.into(),
             lock_version: 0,
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
+            created_at: autumn_web::time::ambient_civil_utc(),
+            updated_at: autumn_web::time::ambient_civil_utc(),
         }
     }
 
@@ -298,8 +297,8 @@ mod tests {
             body: "Original content".into(),
             status: "published".into(),
             lock_version: 0,
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
+            created_at: autumn_web::time::ambient_civil_utc(),
+            updated_at: autumn_web::time::ambient_civil_utc(),
         };
         let mut after = before.clone();
         after.body = String::new(); // clear body without changing status
@@ -324,8 +323,8 @@ mod tests {
             body: "Original content".into(),
             status: "published".into(),
             lock_version: 0,
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
+            created_at: autumn_web::time::ambient_civil_utc(),
+            updated_at: autumn_web::time::ambient_civil_utc(),
         };
         let mut after = before.clone();
         after.body = "Updated content".into();

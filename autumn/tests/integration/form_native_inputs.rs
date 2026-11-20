@@ -520,10 +520,10 @@ fn color_value_is_a_lowercase_simple_color_or_nothing() {
 }
 
 #[test]
-fn a_time_input_value_decodes_into_naive_time() {
+fn a_time_input_value_decodes_into_a_civil_time() {
     #[derive(serde::Deserialize)]
     struct Slot {
-        starts: chrono::NaiveTime,
+        starts: autumn_web::time::civil::Time,
     }
     for (body, want) in [
         (&b"starts=09%3A30"[..], "09:30:00"),

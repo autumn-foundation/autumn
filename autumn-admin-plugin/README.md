@@ -33,8 +33,8 @@ builder chain and printed these lines for you):
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.10", features = ["db", "flash", "htmx", "maud"] }
-autumn-admin-plugin = "0.10"
+autumn-web = { version = "0.11", features = ["db", "flash", "htmx", "maud"] }
+autumn-admin-plugin = "0.11"
 ```
 
 `autumn-admin-plugin` expects a configured Autumn database pool: model
@@ -144,7 +144,8 @@ Your own models choose their own SQL. Four rules keep it portable.
    SQLite has none of the three. Use `CAST(x AS TEXT)`, an `IN` list, and
    separate statements in one transaction.
 4. **Use `CURRENT_TIMESTAMP`, not `NOW()`.** Read a timestamp column as
-   `Timestamp` into a `NaiveDateTime`. The `Timestamptz` SQL type is
+   `Timestamp` into a `civil::DateTime` (through
+   `autumn_web::db::SqlDateTime`). The `Timestamptz` SQL type is
    Postgres-only.
 
 `tests/custom_admin_model.rs` is a worked example. The same test body runs on

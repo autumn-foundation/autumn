@@ -104,4 +104,4 @@ How can the fix still fail?
   the `403`.
 
 See [Tenant sources](../guide/tenant-cells.md#tenant-sources) and the
-[migration guide](../migrations/next.md#tenancy-the-tenant-header-needs-header_trust).
+[migration guide](../migrations/0.11.0.md#tenancy-the-tenant-header-needs-header_trust).

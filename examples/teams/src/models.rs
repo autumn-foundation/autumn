@@ -17,7 +17,8 @@ pub struct User {
     pub id: i64,
     pub email: String,
     pub password_hash: String,
-    pub created_at: chrono::NaiveDateTime,
+    #[diesel(deserialize_as = autumn_web::db::SqlDateTime)]
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 /// Data needed to create a new account.
@@ -42,7 +43,7 @@ pub struct Organization {
     #[validate(length(min = 1, max = 200))]
     pub name: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // ── Membership ───────────────────────────────────────────────────────────────
@@ -68,7 +69,7 @@ pub struct Membership {
     pub user_id: i64,
     pub role: String,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // ── Invitation ───────────────────────────────────────────────────────────────
@@ -91,9 +92,9 @@ pub struct Invitation {
     // also sets it explicitly.
     pub status: String,
     pub invited_by_user_id: i64,
-    pub expires_at: chrono::NaiveDateTime,
+    pub expires_at: autumn_web::time::civil::DateTime,
     #[default]
-    pub created_at: chrono::NaiveDateTime,
+    pub created_at: autumn_web::time::civil::DateTime,
 }
 
 // ── Forms ────────────────────────────────────────────────────────────────────

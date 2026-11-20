@@ -12,7 +12,7 @@ full quarter of business time forward in less than one second, with no
 > **Status:** opt-in. Enable the `sla` Cargo feature. Issue #1826.
 >
 > ```toml
-> autumn-web = { version = "0.10", features = ["sla"] }
+> autumn-web = { version = "0.11", features = ["sla"] }
 > ```
 
 ---
@@ -24,10 +24,10 @@ full quarter of business time forward in less than one second, with no
 ```rust,ignore
 use autumn_web::prelude::*;
 use autumn_web::sla::{BusinessCalendar, SlaPlugin};
-use chrono::NaiveDate;
+use autumn_web::time::civil;
 
 let support = BusinessCalendar::weekdays("09:00-17:00".parse()?)
-    .holiday(NaiveDate::from_ymd_opt(2026, 12, 25).unwrap());
+    .holiday(civil::date(2026, 12, 25));
 
 let sla = SlaPlugin::new()
     .calendar("support", support)
@@ -50,7 +50,7 @@ async fn open_ticket(sla: Sla, tz: TimeZone, Path(id): Path<i64>) -> AutumnResul
     let obligation = Obligation::new("first_response", format!("ticket:{id}"))
         .within("2 business days".parse()?)
         .calendar("support")
-        .zone(*tz);
+        .zone(tz.tz().clone());
     let status = sla.track(&obligation).await?;
     Ok(format!("due at {:?}", status.due_at))
 }
@@ -92,8 +92,8 @@ use autumn_web::obligation;
 )]
 pub struct Ticket {
     pub id: i64,
-    pub opened_at: chrono::DateTime<chrono::Utc>,
-    pub responded_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub opened_at: autumn_web::time::Timestamp,
+    pub responded_at: Option<autumn_web::time::Timestamp>,
     pub customer_zone: String,
 }
 
@@ -104,10 +104,10 @@ sla.track(&ticket.first_response_obligation()).await?;
 | --- | --- | --- |
 | `name` | yes | The obligation name, as an identifier. |
 | `within` | yes | The budget. A bad budget is a compile error. |
-| `starts` | yes | A `DateTime<Utc>` field. The clock starts there. |
+| `starts` | yes | A `Timestamp` field. The clock starts there. |
 | `calendar` | no | The calendar name. The default is `"default"`. |
-| `met` | no | An `Option<DateTime<Utc>>` field. Set it when the obligation is met. |
-| `zone` | no | A time zone field: a `Tz`, an IANA name, or an `Option` of one. |
+| `met` | no | An `Option<Timestamp>` field. Set it when the obligation is met. |
+| `zone` | no | A time zone field: a `jiff::tz::TimeZone`, an IANA name, or an `Option` of one. |
 | `subject` | no | The identity field. The default is `id`. |
 
 The subject is `"<snake_case type>:<subject field>"`, for example
@@ -140,7 +140,7 @@ time of the longest working day (8 hours for `09:00-17:00`). Change it with
 | Method | Effect |
 | --- | --- |
 | `BusinessCalendar::weekdays(hours)` | Work `hours` from Monday to Friday. |
-| `.hours(Weekday::Sat, hours)` | Add a window to a day. Windows that overlap merge. |
+| `.hours(Weekday::Saturday, hours)` | Add a window to a day (`autumn_web::time::civil::Weekday`). Windows that overlap merge. |
 | `.holiday(date)` | Stop the clock on one date. |
 | `.annual_holiday(12, 25)` | Stop the clock on the same date each year. |
 | `.zone(tz)` | Set the home time zone. |
@@ -267,15 +267,21 @@ timers together, so a test crosses weekends and holidays with no real time.
 ```rust,ignore
 use autumn_web::sim::Sim;
 use autumn_web::sim_test;
+use autumn_web::time::Timestamp;
 
 #[sim_test]
 async fn first_response_breaches_after_the_holiday(mut sim: Sim) {
     sim.build(TestApp::new().routes(routes![open_ticket]).plugin(sla_plugin()));
 
-    sim.advance_to(&friday_3pm).await;
+    // Opened Thursday 24 December. Friday is the holiday, then the weekend,
+    // so two business days end on Tuesday at 15:00.
+    let thursday_3pm: Timestamp = "2026-12-24T15:00:00Z".parse().unwrap();
+    let tuesday_3_01pm: Timestamp = "2026-12-29T15:01:00Z".parse().unwrap();
+
+    sim.advance_to(thursday_3pm).await;
     sim.client().post("/tickets/1").send().await.assert_ok();
 
-    sim.advance_to(&wednesday_3_01pm).await;
+    sim.advance_to(tuesday_3_01pm).await;
     sim.run_to_idle().await;
     // assert the breach handler ran one time
 }

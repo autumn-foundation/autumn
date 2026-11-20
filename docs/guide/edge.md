@@ -109,10 +109,10 @@ out of the capsule:
 
 ```toml
 [dependencies]
-autumn-edge = "0.10"
+autumn-edge = "0.11"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-autumn-web = { version = "0.10", features = ["edge"] }
+autumn-web = { version = "0.11", features = ["edge"] }
 ```
 
 ### What an edge handler may use
@@ -308,7 +308,7 @@ promise, and a handler can still be non-deterministic:
 - **Anything address-derived.** Pointer values, `{:p}`, and default `Hash`
   seeds differ per process.
 - **Ambient time and randomness.** `SystemTime::now()`, `getrandom`, and
-  anything built on them (`Utc::now()`, `Uuid::new_v4()`) compile at the edge —
+  anything built on them (`Timestamp::now()`, `Uuid::new_v4()`) compile at the edge —
   WASI provides both syscalls — and return whatever the host decides. The
   reference host pins them; a CDN host will not. Keep them out of `#[edge]`
   handlers.

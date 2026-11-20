@@ -1,0 +1,16 @@
+        name         |       before       |       after        | result 
+---------------------+--------------------+--------------------+--------
+ expired lock        |      1000086400000 |      1000086400000 | same
+ later expiry kept?  |      1000086460000 |      1000086460000 | same
+ live lock           |      1000086460000 |      1000086460000 | same
+ lock ends at now    |      1000086400000 |      1000086400000 | same
+ other owner         |      1000086400000 |      1000086400000 | same
+ ttl at the clamp    | 576461752303483487 | 576461752303483487 | same
+ zero ttl, live lock |      1000000060000 |      1000000060000 | same
+(7 rows)
+
+ differing_rows 
+----------------
+              0
+(1 row)
+

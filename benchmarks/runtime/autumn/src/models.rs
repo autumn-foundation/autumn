@@ -1,9 +1,10 @@
-use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 
+use autumn_web::db::SqlTimestamp;
 use autumn_web::error::{AutumnError, AutumnResult};
+use autumn_web::time::Timestamp;
 
 use crate::schema::{api_tokens, posts};
 
@@ -18,8 +19,12 @@ pub struct Post {
     pub body: String,
     pub published: bool,
     pub author: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    #[diesel(deserialize_as = SqlTimestamp)]
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub created_at: Timestamp,
+    #[diesel(deserialize_as = SqlTimestamp)]
+    #[serde(with = "autumn_web::time::compat::serde_autosi")]
+    pub updated_at: Timestamp,
 }
 
 impl Post {

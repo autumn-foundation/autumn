@@ -130,6 +130,8 @@ mod error_validation_details;
 mod event_wire_contract;
 mod events_integration;
 #[cfg(feature = "db")]
+mod experiments_assign_connection_profile;
+#[cfg(feature = "db")]
 mod experiments_pg_integration;
 #[cfg(feature = "db")]
 mod export_csv_list_count_profile;
@@ -196,6 +198,8 @@ mod htmx_serving;
 mod http_latency_histogram;
 #[cfg(feature = "i18n")]
 mod i18n_integration;
+#[cfg(feature = "db")]
+mod idempotency_db_request_profile;
 #[cfg(feature = "db")]
 mod idempotency_db_store;
 mod idempotency_middleware;

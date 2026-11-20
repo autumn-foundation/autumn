@@ -1,0 +1,124 @@
+=== fixture: txns=100000, history ids v4; workload: T=2000, post ids v7
+ accounts | null_balance | transactions | postings 
+----------+--------------+--------------+----------
+   220003 |         1935 |       100000 |   385680
+(1 row)
+
+          relname           | heap  | heap_blocks | indexes 
+----------------------------+-------+-------------+---------
+ _autumn_money_accounts     | 20 MB |        2565 | 12 MB
+ _autumn_money_postings     | 46 MB |        5934 | 47 MB
+ _autumn_money_transactions | 21 MB |        2712 | 19 MB
+(3 rows)
+
+=== workload
+pgbench: setting random seed to 3743
+number of transactions actually processed: 2000/2000
+number of failed transactions: 0 (0.000%)
+SQL script 1: charge.pgbench
+ - weight: 85 (targets 85.0% of total)
+ - number of failed transactions: 0 (0.000%)
+SQL script 2: replay.pgbench
+ - weight: 10 (targets 10.0% of total)
+ - number of failed transactions: 0 (0.000%)
+SQL script 3: payout.pgbench
+ - weight: 5 (targets 5.0% of total)
+ - number of failed transactions: 0 (0.000%)
+CREATE VIEW
+=== top statements by buffers (shared_blks_hit + shared_blks_read)
+ top | calls | rows | buffers |  hit   | read | temp_w | pct_buf | pct_calls | buf_per_call |                                                                         query                                                                          
+-----+-------+------+---------+--------+------+--------+---------+-----------+--------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ t   |  1685 | 5055 |  121736 | 121736 |    0 |      0 |    41.4 |       9.0 |         72.2 | INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+ t   |   110 | 2200 |   52682 |  52682 |    0 |      0 |    17.9 |       0.6 |        478.9 | INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+ t   |  7255 | 7255 |   36275 |  36275 |    0 |      0 |    12.3 |      38.9 |          5.0 | SELECT $2 FROM ONLY "public"."_autumn_money_transactions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+ t   |  1890 | 5670 |   30285 |  30285 |    0 |      0 |    10.3 |      10.1 |         16.0 | SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2, $3) ORDER BY id FOR UPDATE
+ t   |  1795 | 1795 |   19956 |  19956 |    0 |      0 |     6.8 |       9.6 |         11.1 | INSERT INTO _autumn_money_transactions (id, idempotency_key, request_hash, currency, memo, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) O
+ t   |  3795 | 2000 |   13385 |  13385 |    0 |      0 |     4.6 |      20.3 |          3.5 | SELECT id, idempotency_key, request_hash, currency, memo, CAST(posted_at AS TEXT) AS posted_at FROM _autumn_money_transactions WHERE idempotency_key =
+ t   |   110 | 2200 |   11235 |  11235 |    0 |      0 |     3.8 |       0.6 |        102.1 | SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $1
+ t   |  2000 | 8108 |    8093 |   8093 |    0 |      0 |     2.8 |      10.7 |          4.0 | SELECT account_id, amount_minor, currency FROM _autumn_money_postings WHERE transaction_id = $1 ORDER BY seq
+ t   |    14 |   14 |     153 |    153 |    0 |      0 |     0.1 |       0.1 |         10.9 | UPDATE _autumn_money_accounts SET balance_minor = $1 WHERE id = $2 AND balance_minor IS NULL
+ t   |    14 |    9 |      67 |     67 |    0 |      0 |     0.0 |       0.1 |          4.8 | SELECT account_id, CAST(COALESCE(SUM(amount_minor / $2), $3) AS BIGINT) AS hi, CAST(COALESCE(SUM(amount_minor % $4), $5) AS BIGINT) AS lo FROM _autumn
+ f   |  1795 | 7255 |   63282 |  63282 |    0 |      0 |    62.7 |      19.8 |         35.3 | UPDATE _autumn_money_accounts AS a SET balance_minor = CASE WHEN a.balance_minor::NUMERIC + d.delta BETWEEN 
+ f   |  7255 | 7255 |   37631 |  37631 |    0 |      0 |    37.3 |      80.2 |          5.2 | SELECT $2 FROM ONLY "public"."_autumn_money_accounts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+
+=== top statements by calls
+ top | calls | buffers |                                                                         query                                                                          
+-----+-------+---------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ t   |  7255 |   36275 | SELECT $2 FROM ONLY "public"."_autumn_money_transactions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+ f   |  7255 |   37631 | SELECT $2 FROM ONLY "public"."_autumn_money_accounts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+ t   |  3795 |   13385 | SELECT id, idempotency_key, request_hash, currency, memo, CAST(posted_at AS TEXT) AS posted_at FROM _autumn_money_transactions WHERE idempotency_key =
+ t   |  2000 |    8093 | SELECT account_id, amount_minor, currency FROM _autumn_money_postings WHERE transaction_id = $1 ORDER BY seq
+ t   |  1890 |   30285 | SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2, $3) ORDER BY id FOR UPDATE
+ t   |  1795 |   19956 | INSERT INTO _autumn_money_transactions (id, idempotency_key, request_hash, currency, memo, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) O
+ f   |  1795 |   63282 | UPDATE _autumn_money_accounts AS a SET balance_minor = CASE WHEN a.balance_minor::NUMERIC + d.delta BETWEEN 
+ t   |  1685 |  121736 | INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+ t   |   110 |   11235 | SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $1
+ t   |   110 |   52682 | INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+ t   |    14 |     153 | UPDATE _autumn_money_accounts SET balance_minor = $1 WHERE id = $2 AND balance_minor IS NULL
+ t   |    14 |      67 | SELECT account_id, CAST(COALESCE(SUM(amount_minor / $2), $3) AS BIGINT) AS hi, CAST(COALESCE(SUM(amount_minor % $4), $5) AS BIGINT) AS lo FROM _autumn
+ t   |     1 |       9 | SELECT toplevel AS top, calls, rows, buffers, hit, read, temp_w, round($1 * buffers / NULLIF(sum(buffers) OVER (PARTITION BY toplevel), $2), $3
+
+=== top statements by WAL bytes
+ top | calls | wal_records | wal_fpi | wal_bytes | wal_per_call |                                                                         query                                                                          
+-----+-------+-------------+---------+-----------+--------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ t   |  1890 |        8337 |    1159 |   8019704 |         4243 | SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2, $3) ORDER BY id FOR UPDATE
+ t   |  1795 |        7227 |    1059 |   7340270 |         4089 | INSERT INTO _autumn_money_transactions (id, idempotency_key, request_hash, currency, memo, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) O
+ t   |  1685 |       26224 |     714 |   7057910 |         4189 | INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+ t   |   110 |       11626 |     240 |   2550594 |        23187 | INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency, posted_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+ t   |   110 |        3936 |     216 |   1965296 |        17866 | SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $1
+ f   |  1795 |        8284 |     235 |   1574726 |          877 | UPDATE _autumn_money_accounts AS a SET balance_minor = CASE WHEN a.balance_minor::NUMERIC + d.delta BETWEEN 
+ t   |  7255 |        1795 |       0 |     96930 |           13 | SELECT $2 FROM ONLY "public"."_autumn_money_transactions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+ t   |    14 |          24 |       3 |     14183 |         1013 | UPDATE _autumn_money_accounts SET balance_minor = $1 WHERE id = $2 AND balance_minor IS NULL
+ t   |     1 |           0 |       0 |         0 |            0 | SELECT toplevel AS top, calls, rows, buffers, hit, read, temp_w, round($1 * buffers / NULLIF(sum(buffers) OVER (PARTITION BY toplevel), $2), $3
+ f   |  7255 |           0 |       0 |         0 |            0 | SELECT $2 FROM ONLY "public"."_autumn_money_accounts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+
+=== totals (a nested statement — the balance trigger, an FK check — is counted again inside the top-level statement that fired it, so top = everything)
+ top | calls | buffers | temp_written | wal_fpi | wal_bytes 
+-----+-------+---------+--------------+---------+-----------
+ t   | 18671 |  293881 |            0 |    3391 |  27044887
+ f   |  9050 |  100913 |            0 |     235 |   1574726
+
+=== WAL since start (pg_current_wal_lsn delta, all activity)
+ wal_bytes_total 
+-----------------
+        27437840
+
+=== pg_stat_wal (reset before the workload)
+ wal_records | wal_fpi | wal_bytes 
+-------------+---------+-----------
+       61682 |    3391 |  27143134
+
+=== pg_stat_user_tables
+          relname           | seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_ins | n_tup_upd | n_tup_hot_upd | n_dead_tup 
+----------------------------+----------+--------------+----------+---------------+-----------+-----------+---------------+------------
+ _autumn_money_accounts     |        0 |            0 |    24079 |         24079 |         0 |      7269 |          6760 |       1959
+ _autumn_money_postings     |        0 |            0 |     2629 |          8986 |      7255 |         0 |             0 |          0
+ _autumn_money_transactions |        0 |            0 |    13460 |          9460 |      1795 |         0 |             0 |          0
+
+=== pg_stat_user_indexes
+          relname           |                  indexrelname                  | idx_scan | idx_tup_read 
+----------------------------+------------------------------------------------+----------+--------------
+ _autumn_money_accounts     | _autumn_money_accounts_pkey                    |    24079 |        24881
+ _autumn_money_postings     | _autumn_money_postings_account_idx             |       14 |           25
+ _autumn_money_postings     | _autumn_money_postings_pkey                    |        0 |            0
+ _autumn_money_postings     | _autumn_money_postings_transaction_id_seq_key  |     2615 |         9371
+ _autumn_money_transactions | _autumn_money_transactions_idempotency_key_key |     5795 |         2205
+ _autumn_money_transactions | _autumn_money_transactions_pkey                |     7665 |         7665
+
+=== pg_statio_user_tables
+          relname           | heap  |  idx  | toast 
+----------------------------+-------+-------+-------
+ _autumn_money_accounts     | 75557 | 73771 |     0
+ _autumn_money_postings     | 24745 | 59049 |     0
+ _autumn_money_transactions | 20832 | 51246 |     0
+
+=== full-page images in the workload's WAL, by relation (pg_waldump)
+    1377  _autumn_money_accounts
+    1055  _autumn_money_transactions_idempotency_key_key
+     711  _autumn_money_postings_account_idx
+     236  _autumn_money_accounts_pkey
+       5  _autumn_money_postings_transaction_id_seq_key
+       3  _autumn_money_transactions_pkey
+       2  _autumn_money_postings_pkey
+       1  _autumn_money_transactions
+       1  _autumn_money_postings

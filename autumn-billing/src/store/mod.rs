@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use autumn_web::time::Timestamp;
 
 use crate::error::BillingError;
 use crate::model::{
@@ -131,10 +131,10 @@ pub(crate) enum Guard {
 /// leave a terminal status.
 #[must_use]
 pub(crate) fn guard(
-    existing_at: DateTime<Utc>,
+    existing_at: Timestamp,
     existing_rank: u8,
     existing_terminal: bool,
-    incoming_at: DateTime<Utc>,
+    incoming_at: Timestamp,
     incoming_rank: u8,
 ) -> Guard {
     if incoming_at == existing_at && incoming_rank == existing_rank {
@@ -163,9 +163,9 @@ pub(crate) fn guard(
 /// write are one atomic step, so two concurrent writers cannot both miss it.
 #[must_use]
 pub(crate) fn guard_subscription(
-    existing_at: DateTime<Utc>,
+    existing_at: Timestamp,
     existing_status: SubscriptionStatus,
-    incoming_at: DateTime<Utc>,
+    incoming_at: Timestamp,
     incoming_status: SubscriptionStatus,
     authoritative: bool,
     check_ties: bool,
@@ -206,7 +206,7 @@ pub struct CustomerUpsert {
     /// Email. Replaces the stored email when `Some`.
     pub email: Option<String>,
     /// App clock.
-    pub now: DateTime<Utc>,
+    pub now: Timestamp,
 }
 
 impl CustomerUpsert {
@@ -216,7 +216,7 @@ impl CustomerUpsert {
         new_id: impl Into<String>,
         provider: impl Into<String>,
         provider_customer_id: impl Into<ProviderId>,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Self {
         Self {
             new_id: new_id.into(),
@@ -262,11 +262,11 @@ pub struct SubscriptionUpsert {
     /// Seat quantity.
     pub quantity: i64,
     /// Period end.
-    pub current_period_end: Option<DateTime<Utc>>,
+    pub current_period_end: Option<Timestamp>,
     /// Cancels at period end.
     pub cancel_at_period_end: bool,
     /// Provider event time (ordering key).
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: Timestamp,
     /// The state was read from the provider (not decoded from one event), so
     /// it settles a same-instant tie instead of being ranked against it. See
     /// [`SubscriptionUpsert::with_authoritative`].
@@ -275,7 +275,7 @@ pub struct SubscriptionUpsert {
     /// [`SubscriptionUpsert::with_tie_check`].
     pub check_ties: bool,
     /// App clock.
-    pub now: DateTime<Utc>,
+    pub now: Timestamp,
 }
 
 impl SubscriptionUpsert {
@@ -286,8 +286,8 @@ impl SubscriptionUpsert {
         customer_id: impl Into<String>,
         provider_subscription_id: impl Into<ProviderId>,
         status: SubscriptionStatus,
-        occurred_at: DateTime<Utc>,
-        now: DateTime<Utc>,
+        occurred_at: Timestamp,
+        now: Timestamp,
     ) -> Self {
         Self {
             new_id: new_id.into(),
@@ -348,7 +348,7 @@ impl SubscriptionUpsert {
 
     /// Set the period end.
     #[must_use]
-    pub const fn with_period_end(mut self, end: DateTime<Utc>) -> Self {
+    pub const fn with_period_end(mut self, end: Timestamp) -> Self {
         self.current_period_end = Some(end);
         self
     }
@@ -384,11 +384,11 @@ pub struct InvoiceUpsert {
     /// Provider attempt count.
     pub attempt_count: i64,
     /// Provider next attempt.
-    pub next_payment_attempt: Option<DateTime<Utc>>,
+    pub next_payment_attempt: Option<Timestamp>,
     /// Provider event time (ordering key).
-    pub occurred_at: DateTime<Utc>,
+    pub occurred_at: Timestamp,
     /// App clock.
-    pub now: DateTime<Utc>,
+    pub now: Timestamp,
 }
 
 impl InvoiceUpsert {
@@ -402,8 +402,8 @@ impl InvoiceUpsert {
         status: InvoiceStatus,
         amount_due: Money,
         amount_paid: Money,
-        occurred_at: DateTime<Utc>,
-        now: DateTime<Utc>,
+        occurred_at: Timestamp,
+        now: Timestamp,
     ) -> Self {
         Self {
             new_id: new_id.into(),
@@ -444,7 +444,7 @@ impl InvoiceUpsert {
 
     /// Set the provider's next attempt time.
     #[must_use]
-    pub const fn with_next_payment_attempt(mut self, at: DateTime<Utc>) -> Self {
+    pub const fn with_next_payment_attempt(mut self, at: Timestamp) -> Self {
         self.next_payment_attempt = Some(at);
         self
     }
@@ -464,12 +464,12 @@ pub trait BillingStore: Send + Sync + 'static {
         &'a self,
         event_id: &'a str,
         kind: &'a str,
-        now: DateTime<Utc>,
+        now: Timestamp,
         stale_after: Duration,
     ) -> StoreFuture<'a, EventClaim>;
 
     /// Mark `event_id` applied.
-    fn finish_event<'a>(&'a self, event_id: &'a str, now: DateTime<Utc>) -> StoreFuture<'a, ()>;
+    fn finish_event<'a>(&'a self, event_id: &'a str, now: Timestamp) -> StoreFuture<'a, ()>;
 
     /// Drop the claim so the provider's redelivery is processed again.
     fn release_event<'a>(&'a self, event_id: &'a str) -> StoreFuture<'a, ()>;
@@ -523,7 +523,7 @@ pub trait BillingStore: Send + Sync + 'static {
         &'a self,
         id: &'a str,
         user_id: String,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, Option<Customer>> {
         let _ = (id, user_id, now);
         Box::pin(std::future::ready(Err(BillingError::Unsupported(
@@ -559,7 +559,7 @@ pub trait BillingStore: Send + Sync + 'static {
         &'a self,
         id: &'a str,
         status: SubscriptionStatus,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, Option<Subscription>>;
 
     // ── Invoices ────────────────────────────────────────────────────────
@@ -587,7 +587,7 @@ pub trait BillingStore: Send + Sync + 'static {
         &'a self,
         provider_subscription_id: &'a ProviderId,
         subscription_id: &'a str,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, ()> {
         let _ = (provider_subscription_id, subscription_id, now);
         Box::pin(std::future::ready(Ok(())))
@@ -610,7 +610,7 @@ pub trait BillingStore: Send + Sync + 'static {
         &'a self,
         invoice_id: &'a str,
         attempt: i64,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> StoreFuture<'a, bool>;
 
     /// Every row in `Pending` or `Running`, ordered by `next_attempt_at`.
@@ -640,5 +640,5 @@ pub trait BillingStore: Send + Sync + 'static {
 
     /// Delete applied ledger rows with `applied_at < before`. In-flight
     /// claims are kept. Returns the number of rows deleted.
-    fn prune_events(&self, before: DateTime<Utc>) -> StoreFuture<'_, u64>;
+    fn prune_events(&self, before: Timestamp) -> StoreFuture<'_, u64>;
 }

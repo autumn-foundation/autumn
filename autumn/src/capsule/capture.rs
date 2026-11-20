@@ -44,7 +44,6 @@ use std::task::{Context, Poll};
 use axum::body::Body;
 use axum::extract::MatchedPath;
 use axum::http::{Request, Response};
-use chrono::{DateTime, Utc};
 use tower::{Layer, Service};
 
 use crate::capsule::redact::{CapturedBody, RawRequest};
@@ -493,7 +492,7 @@ pub struct CaptureScope {
     filter: Arc<ParameterFilter>,
     request: OnceLock<RawRequest>,
     body: Mutex<BodyTap>,
-    clock: Mutex<Vec<DateTime<Utc>>>,
+    clock: Mutex<Vec<crate::time::Timestamp>>,
     /// Monotonic readings, as offsets from the recording clock's origin.
     monotonic: Mutex<Vec<std::time::Duration>>,
     client_identity: OnceLock<CapturedClientIdentity>,
@@ -700,7 +699,7 @@ impl CaptureScope {
 
     /// Bounded: a pathological loop reading `now()` must not grow the buffer
     /// without limit, and a capsule that long is not replayable anyway.
-    pub fn record_clock(&self, reading: DateTime<Utc>) {
+    pub fn record_clock(&self, reading: crate::time::Timestamp) {
         if let Ok(mut readings) = self.clock.lock() {
             if readings.len() >= MAX_CLOCK_READINGS {
                 self.truncated.store(true, Ordering::Relaxed);
@@ -712,7 +711,7 @@ impl CaptureScope {
 
     /// The clock readings taken during the request, in order.
     #[must_use]
-    pub fn clock_readings(&self) -> Vec<DateTime<Utc>> {
+    pub fn clock_readings(&self) -> Vec<crate::time::Timestamp> {
         self.clock
             .lock()
             .map(|readings| readings.clone())

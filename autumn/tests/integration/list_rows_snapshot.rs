@@ -42,7 +42,7 @@ pub struct SnapshotRow {
     pub id: i64,
     pub owner_id: i64,
     pub status: String,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<autumn_web::time::civil::DateTime>,
 }
 
 #[autumn_web::repository(SnapshotRow, table = "snapshot_rows", soft_delete, owner = owner_id)]

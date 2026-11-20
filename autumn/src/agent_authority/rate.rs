@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 
 /// A parsed `rate` string: `count` calls per `period_secs`.
 ///
@@ -41,7 +41,7 @@ pub fn parse_rate(rate: &str) -> Option<RateCap> {
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
     tokens: f64,
-    last_refill: DateTime<Utc>,
+    last_refill: Timestamp,
 }
 
 /// One token bucket per grant, keyed by its name and declaration site.
@@ -64,7 +64,7 @@ impl RateLimiter {
         name: &str,
         location: &str,
         cap: RateCap,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<(), u64> {
         let burst = cap.count;
         let per_sec = burst / f64::from(cap.period_secs);
@@ -80,8 +80,7 @@ impl RateLimiter {
             });
         // A clock that moved backwards refills nothing, and the refill time
         // stays put: moving it back would count the same seconds twice.
-        let elapsed = (now - bucket.last_refill)
-            .to_std()
+        let elapsed = std::time::Duration::try_from(now.duration_since(bucket.last_refill))
             .map_or(0.0, |d| d.as_secs_f64());
         bucket.tokens = elapsed.mul_add(per_sec, bucket.tokens).min(burst);
         bucket.last_refill = bucket.last_refill.max(now);
@@ -99,10 +98,10 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use crate::time::SignedDuration;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("valid timestamp")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(1_700_000_000 + secs).expect("valid timestamp")
     }
 
     const TWO_PER_MIN: RateCap = RateCap {
@@ -170,7 +169,7 @@ mod tests {
         limiter
             .check("g", "here", TWO_PER_MIN, at(0))
             .expect("first");
-        let later = at(0) + Duration::days(1);
+        let later = at(0) + SignedDuration::from_hours(24);
         assert_eq!(limiter.check("g", "here", TWO_PER_MIN, later), Ok(()));
         assert_eq!(limiter.check("g", "here", TWO_PER_MIN, later), Ok(()));
         assert!(limiter.check("g", "here", TWO_PER_MIN, later).is_err());

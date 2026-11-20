@@ -131,7 +131,7 @@ pub struct DirRich {
     pub display_name: String,
     pub active: bool,
     pub nickname: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: autumn_web::time::Timestamp,
 }
 
 #[autumn_web::model(table = "dir_split")]

@@ -156,10 +156,11 @@ pub fn layout_with_seo(
 fn post_card(post: &Post) -> Markup {
     cache_fragment_global(
         format_args!("blog:post_card:{}", post.id),
-        // Microsecond resolution so two edits in the same wall-clock second
-        // still produce distinct cache keys (a plain `timestamp()` would
-        // collide and serve the first edit's stale markup).
-        post.updated_at.and_utc().timestamp_micros(),
+        // The full civil timestamp, fractional seconds included, so two edits
+        // in the same wall-clock second still produce distinct cache keys
+        // (whole seconds would collide and serve the first edit's stale
+        // markup).
+        post.updated_at,
         None,
         || render_post_card(post),
     )
@@ -167,7 +168,7 @@ fn post_card(post: &Post) -> Markup {
 
 /// The actual Maud render for a post card (executed only on a cache miss).
 fn render_post_card(post: &Post) -> Markup {
-    let date = post.created_at.format("%b %d, %Y");
+    let date = post.created_at.strftime("%b %d, %Y");
     let preview: String = post.body.chars().take(200).collect::<String>();
     let preview = if post.body.len() > 200 {
         format!("{preview}...")
@@ -182,7 +183,7 @@ fn render_post_card(post: &Post) -> Markup {
                       hover:border-amber-300 shadow-sm hover:shadow-md \
                       transition-all p-6" {
                 div class="flex items-center gap-2 mb-3" {
-                    time class="text-xs text-stone-500" datetime=(post.created_at.format("%Y-%m-%d")) {
+                    time class="text-xs text-stone-500" datetime=(post.created_at.strftime("%Y-%m-%d")) {
                         (date)
                     }
                     @if !post.published {
@@ -366,7 +367,7 @@ pub async fn show(
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let p = Post::find_by_slug(&slug, &mut db).await?;
-    let date = p.created_at.format("%B %d, %Y");
+    let date = p.created_at.strftime("%B %d, %Y");
 
     // Simple paragraph rendering — split on double newlines
     let paragraphs: Vec<&str> = p.body.split("\n\n").collect();
@@ -412,7 +413,7 @@ pub async fn show(
                     h1 class="text-3xl font-bold tracking-tight text-stone-900 mb-3" {
                         (p.title)
                     }
-                    time class="text-sm text-stone-500" datetime=(p.created_at.format("%Y-%m-%d")) {
+                    time class="text-sm text-stone-500" datetime=(p.created_at.strftime("%Y-%m-%d")) {
                         (date)
                     }
                 }
@@ -493,7 +494,7 @@ pub async fn admin_list(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
                                     }
                                 }
                                 p class="text-xs text-stone-500 mt-0.5" {
-                                    "/" (p.slug) " \u{2022} " (p.created_at.format("%b %d, %Y"))
+                                    "/" (p.slug) " \u{2022} " (p.created_at.strftime("%b %d, %Y"))
                                 }
                             }
                             div class="flex items-center gap-2 ml-4 shrink-0" {
@@ -655,11 +656,11 @@ pub async fn update(
         published: Some(valid.published),
         // Bump the version token so the cached post card re-renders on the
         // next request (Postgres has no ON UPDATE trigger for `updated_at`).
-        updated_at: Some(chrono::Utc::now().naive_utc()),
+        updated_at: Some(autumn_web::time::ambient_civil_utc()),
     };
 
     let updated = diesel::update(posts::table.find(*id))
-        .set(&changes)
+        .set(changes)
         .execute(&mut *db)
         .await?;
 

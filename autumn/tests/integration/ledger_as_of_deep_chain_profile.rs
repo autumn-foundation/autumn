@@ -51,7 +51,7 @@
 
 use autumn_web::current::with_actor;
 use autumn_web::hooks::Patch;
-use chrono::{DateTime, Utc};
+use autumn_web::time::{Timestamp, civil};
 use diesel::connection::SimpleConnection;
 use diesel::sql_types::{BigInt, Text};
 use diesel::{Connection, PgConnection, QueryableByName};
@@ -78,7 +78,7 @@ pub struct LedgerDeepChainAccount {
     pub external_ref: String,
     pub balance_cents: i64,
     #[default]
-    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub deleted_at: Option<civil::DateTime>,
 }
 
 #[autumn_web::repository(
@@ -163,7 +163,7 @@ async fn setup() -> (
 /// `depth` total revisions (1 insert + `depth - 1` updates), each committed
 /// before the next is issued (a chain is inherently sequential — each append
 /// reads the previous head). Returns the record id and, for every revision,
-/// a `Utc::now()` sampled immediately after that write's `await` returned —
+/// a `Timestamp::now()` sampled immediately after that write's `await` returned —
 /// strictly after the database committed that revision and strictly before
 /// the next one starts, so `oracle[k]` is a safe "as of" instant for "the
 /// state after revision k+1" (`oracle.len() == depth`).
@@ -171,7 +171,7 @@ async fn seed_hot_chain(
     pool: Pool<AsyncPgConnection>,
     external_ref: &str,
     depth: usize,
-) -> (i64, Vec<DateTime<Utc>>) {
+) -> (i64, Vec<Timestamp>) {
     let repo = build_repo(pool);
     let created = with_actor("system", async {
         repo.save(&NewLedgerDeepChainAccount {
@@ -184,7 +184,7 @@ async fn seed_hot_chain(
     .await;
     let id = created.id;
     let mut oracle = Vec::with_capacity(depth);
-    oracle.push(Utc::now());
+    oracle.push(Timestamp::now());
     for i in 1..depth {
         with_actor("system", async {
             repo.update(
@@ -198,7 +198,7 @@ async fn seed_hot_chain(
             .expect("update hot account")
         })
         .await;
-        oracle.push(Utc::now());
+        oracle.push(Timestamp::now());
     }
     (id, oracle)
 }
@@ -345,7 +345,7 @@ async fn ledger_as_of_deep_chain_profile() {
         .expect("analyze");
 
     let repo = build_repo(pool);
-    let chains: [(&str, i64, &[DateTime<Utc>]); 3] = [
+    let chains: [(&str, i64, &[Timestamp]); 3] = [
         ("hot-300", hot_300, &oracle_300),
         ("hot-700", hot_700, &oracle_700),
         ("hot-1200", hot_1200, &oracle_1200),
@@ -469,8 +469,8 @@ async fn ledger_as_of_deep_chain_profile() {
              AND ('{}'::timestamptz IS NULL OR recorded_at <= '{}'::timestamptz) \
              AND (NULL::timestamptz IS NULL OR valid_from <= NULL) \
              ORDER BY seq DESC LIMIT 1",
-            oracle_1200[oracle_1200.len() - 6].to_rfc3339(),
-            oracle_1200[oracle_1200.len() - 6].to_rfc3339(),
+            autumn_web::time::compat::rfc3339(oracle_1200[oracle_1200.len() - 6]),
+            autumn_web::time::compat::rfc3339(oracle_1200[oracle_1200.len() - 6]),
         ),
     );
     explain(
@@ -488,8 +488,8 @@ async fn ledger_as_of_deep_chain_profile() {
              AND ('{}'::timestamptz IS NULL OR recorded_at <= '{}'::timestamptz) \
              AND (NULL::timestamptz IS NULL OR valid_from <= NULL) \
              ORDER BY seq DESC LIMIT 1",
-            oracle_1200[0].to_rfc3339(),
-            oracle_1200[0].to_rfc3339(),
+            autumn_web::time::compat::rfc3339(oracle_1200[0]),
+            autumn_web::time::compat::rfc3339(oracle_1200[0]),
         ),
     );
 }

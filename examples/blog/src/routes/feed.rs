@@ -7,12 +7,27 @@
 use autumn_web::feed::{Feed, FeedEntry};
 use autumn_web::reexports::axum::response::Response;
 use autumn_web::reexports::http::HeaderMap;
+use autumn_web::time::tz::TimeZone;
+use autumn_web::time::{Timestamp, civil};
 use autumn_web::{AutumnResult, Db, get};
 
 use crate::models::Post;
 
 /// Base URL used to build absolute links in the feed.
 const SITE_URL: &str = "https://autumn-demo.example.com";
+
+/// A stored UTC wall-clock value as the instant it names.
+///
+/// A value outside the range an instant can hold clamps to the nearer end.
+fn utc_instant(utc: civil::DateTime) -> Timestamp {
+    TimeZone::UTC.to_timestamp(utc).unwrap_or_else(|_| {
+        if utc.year() < 1970 {
+            Timestamp::MIN
+        } else {
+            Timestamp::MAX
+        }
+    })
+}
 
 /// Atom feed of published posts with conditional-GET (304) support.
 ///
@@ -29,8 +44,8 @@ pub async fn feed_xml(mut db: Db, headers: HeaderMap) -> AutumnResult<Response> 
             let url = format!("{SITE_URL}/posts/{}", p.slug);
             FeedEntry::new(url.clone(), p.title.as_str(), url)
                 .summary(p.body.as_str())
-                .published(p.created_at.and_utc())
-                .updated(p.updated_at.and_utc())
+                .published(utc_instant(p.created_at))
+                .updated(utc_instant(p.updated_at))
         }));
 
     Ok(feed.conditional(&headers))

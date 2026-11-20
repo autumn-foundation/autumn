@@ -45,10 +45,10 @@ fn post_card(post: &Post) -> Markup {
     cache_fragment_global(
         // identity: which fragment is this?
         format_args!("post_card:{}", post.id),
-        // version: bump this whenever the record changes. Use a sub-second
-        // resolution token (micros) so two edits in the same second still
-        // produce distinct keys.
-        post.updated_at.and_utc().timestamp_micros(),
+        // version: bump this whenever the record changes. The timestamp's
+        // Display keeps every sub-second digit, so two edits in the same
+        // second still produce distinct keys.
+        post.updated_at,
         // optional TTL (None = no expiry)
         None,
         // render closure: only runs on a cache miss
@@ -113,7 +113,7 @@ pub async fn index(state: AppState, mut db: Db) -> AutumnResult<Markup> {
             (cache_fragment(
                 cache.as_deref(),
                 format_args!("post_card:{}", post.id),
-                post.updated_at.and_utc().timestamp_micros(),
+                post.updated_at,
                 None,
                 || render_post_card(post),
             ))
@@ -135,7 +135,7 @@ them and silently clears nothing.
 cache_fragment_global_in(
     "blog::routes::sidebar_fragment",   // the same string the declaration uses as `id`
     format_args!("post_card:{}", post.id),
-    post.updated_at.and_utc().timestamp_micros(),
+    post.updated_at,
     None,
     || render_post_card(post),
 )
@@ -161,9 +161,10 @@ separate. You can put whatever you like in either half.
   choices are the record's `updated_at` timestamp or a version-history sequence
   number (see [version history](version-history.md)). Bumping it yields a cache
   miss, so a write naturally re-renders the fragment. Prefer a **sub-second**
-  token — `timestamp_micros()` rather than `timestamp()` — so two writes within
-  the same wall-clock second still produce distinct keys (a sequence number
-  sidesteps this entirely).
+  token — the `civil::DateTime` or `Timestamp` itself, whose `Display` keeps
+  every sub-second digit, rather than whole seconds (`as_second()`) — so two
+  writes within the same wall-clock second still produce distinct keys (a
+  sequence number sidesteps this entirely).
 
 > **Important:** if the fragment's appearance depends on data *outside* the
 > record (e.g. the current user's vote state), fold that into the identity or
@@ -181,8 +182,7 @@ fn comment_thread(thread: &Thread) -> Markup {
         // outer version derived from the children, so the outer re-renders
         // whenever *any* child changes
         thread.comments.iter().map(|c| c.updated_at).max()
-            .map(|t| t.and_utc().timestamp_micros())
-            .unwrap_or(0),
+            .map_or_else(String::new, |t| t.to_string()),
         None,
         || html! {
             ul {
@@ -197,7 +197,7 @@ fn comment_thread(thread: &Thread) -> Markup {
 fn comment_card(comment: &Comment) -> Markup {
     cache_fragment_global(
         format_args!("comment:{}", comment.id),
-        comment.updated_at.and_utc().timestamp_micros(),
+        comment.updated_at,
         None,
         || html! { li { (comment.body) } },
     )

@@ -46,7 +46,7 @@ To compile and ship only the core, turn default features off and name the
 families you use:
 
 ```toml
-autumn-web = { version = "0.10", default-features = false, features = ["maud", "htmx", "widgets-search"] }
+autumn-web = { version = "0.11", default-features = false, features = ["maud", "htmx", "widgets-search"] }
 ```
 
 The `#[commentable]` router renders `comment_thread`, so it needs
