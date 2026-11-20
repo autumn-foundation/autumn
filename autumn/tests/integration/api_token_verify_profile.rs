@@ -362,7 +362,7 @@ async fn phase(
     for (token, expect) in requests {
         let response = client
             .get("/data")
-            .header("authorization", format!("Bearer {token}"))
+            .header("authorization", &format!("Bearer {token}"))
             .send()
             .await;
         assert_eq!(response.status, *expect, "{token}");

@@ -1,0 +1,18 @@
+test integration::api_token_verify_profile::api_token_verify_profile ... fixture: 100000 rows, dead tuples 0, heap 19 MB, indexes 26 MB
+=== steady: 2048 requests ===
+ calls     rows   buffers  temp  wal_bytes  statement
+  2048     2007      8193     0     554554  SELECT "api_tokens"."id", "api_tokens"."principal_id", "api_tokens"."name", "api_tokens"."expires_at", "api_tokens"."scopes" FROM "api_tokens" WHERE ((("api_tokens"."toke
+  2007       16      6113     0      33832  UPDATE "api_tokens" SET "last_used_at" = $1 WHERE (("api_tokens"."id" = $2) AND (("api_tokens"."last_used_at" IS NULL) OR ("api_tokens"."last_used_at" < $3)))
+  2048     2048         0     0          0  SELECT $1
+-- total: statements=6103 (2.98/req) buffers=14306 (6.99/req) statement_wal=588386 (287/req) --
+-- api_tokens: updates=16 hot_updates=15 --
+-- outcome: 200=2007 401=41 stamped_hot_ids=[5375,10375,15375,20375,25375,30375,35375,40375,45375,50375,55375,60375,65375,70375,75375,80375] (16 tokens) --
+=== all-due: 2048 requests ===
+ calls     rows   buffers  temp  wal_bytes  statement
+  2048     2007      8181     0     339745  SELECT "api_tokens"."id", "api_tokens"."principal_id", "api_tokens"."name", "api_tokens"."expires_at", "api_tokens"."scopes" FROM "api_tokens" WHERE ((("api_tokens"."toke
+  2007       64      6187     0      36870  UPDATE "api_tokens" SET "last_used_at" = $1 WHERE (("api_tokens"."id" = $2) AND (("api_tokens"."last_used_at" IS NULL) OR ("api_tokens"."last_used_at" < $3)))
+  2048     2048         0     0          0  SELECT $1
+-- total: statements=6103 (2.98/req) buffers=14368 (7.02/req) statement_wal=376615 (184/req) --
+-- api_tokens: updates=64 hot_updates=63 --
+-- outcome: 200=2007 401=41 stamped_hot_ids=[2250,2875,4750,5375,7250,7875,9750,10375,12250,12875,14750,15375,17250,17875,19750,20375,22250,22875,24750,25375,27250,27875,29750,30375,32250,32875,34750,35375,37250,37875,39750,40375,42250,42875,44750,45375,47250,47875,49750,50375,52250,52875,54750,55375,57250,57875,59750,60375,62250,62875,64750,65375,67250,67875,69750,70375,72250,72875,74750,75375,77250,77875,79750,80375] (64 tokens) --
+ok
