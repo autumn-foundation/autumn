@@ -15,7 +15,6 @@
 //! See `docs/guide/cache-coherence.md`.
 
 use std::fmt::Write as _;
-use std::process::Command;
 
 use autumn_web::cache::coherence::{
     CoherenceManifest, UndeterminedRead, audit_exit_code, format_diagnostic, gate_failed,
@@ -194,29 +193,7 @@ pub fn run(opts: &CacheAuditOptions<'_>) {
     routes::compile_binary_with(opts.package, opts.bin, &opts.features, &opts.profile);
     let binary = routes::find_binary_in_profile(opts.package, opts.bin, &opts.profile);
 
-    let mut command = Command::new(&binary);
-    command.env(DUMP_ENV, "1");
-    routes::clear_other_dump_modes(&mut command, DUMP_ENV);
-    let output = command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
-            std::process::exit(1);
-        });
-
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-
-    if !output.status.success() {
-        eprintln!(
-            "\u{2717} Binary exited with status {} while dumping the cache-coherence manifest",
-            output.status
-        );
-        std::process::exit(output.status.code().unwrap_or(1));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = routes::run_dump_mode(&binary, DUMP_ENV, "the cache-coherence manifest");
     let Some(manifest) = parse_manifest_dump(&stdout) else {
         eprintln!(
             "\u{2717} The app produced no cache-coherence manifest. Either it was built against \

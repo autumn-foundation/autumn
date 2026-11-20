@@ -147,6 +147,47 @@ pub fn clear_other_one_shot_envs(command: &mut Command, own: &str) {
     }
 }
 
+/// Spawn `binary` in the one-shot dump mode `dump_env`, clearing every other
+/// [`ALL_DUMP_MODE_ENVS`] entry first, and return its stdout (UTF-8, lossy).
+///
+/// Shared by every dump-mode command that reports failure the same way:
+/// `cache audit`, `graph show`, `agents manifest` and `data-flow` each spawn,
+/// forward the child's stderr, and check its exit status before going on to
+/// parse their own manifest type from stdout. `what` names the dump in the
+/// exit-status message (e.g. `"the cache-coherence manifest"`) — the one
+/// thing that differs between callers, and data every caller already has.
+///
+/// Exits the process, after forwarding stderr, when the binary cannot be
+/// spawned or exits non-zero. A caller that needs to continue (or that
+/// post-processes the child's stderr before checking its status, as
+/// `openapi`, `routes_audit` and `plugin_check` do) spawns its own `Command`
+/// instead of calling this.
+pub fn run_dump_mode(binary: &Path, dump_env: &str, what: &str) -> String {
+    let mut command = Command::new(binary);
+    command.env(dump_env, "1");
+    clear_other_dump_modes(&mut command, dump_env);
+    let output = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| {
+            eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
+            std::process::exit(1);
+        });
+
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+
+    if !output.status.success() {
+        eprintln!(
+            "\u{2717} Binary exited with status {} while dumping {what}",
+            output.status
+        );
+        std::process::exit(output.status.code().unwrap_or(1));
+    }
+
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// Run `autumn routes`.
 pub fn run(opts: &RoutesOptions<'_>) {
     eprintln!("\u{1F342} autumn routes\n");
