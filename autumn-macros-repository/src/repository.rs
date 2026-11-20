@@ -9141,6 +9141,19 @@ struct HookedInsertManyInputs<'a> {
 }
 
 /// The bulk insert bodies of [`emit_crud_bodies_hooked`].
+///
+/// Clone class: this function's `SQLite` arm hand-writes the "insert one row
+/// at a time, short-circuit on the first error" loop 9 times (3 in
+/// `save_many_body`, 6 in `save_many_skip_invalid_body`), and its sibling
+/// [`emit_plain_insert_many`] hand-writes it 6 more times -- 15 in total.
+/// Diesel's `SQLite` backend has no `QueryFragment<Sqlite>` for
+/// `BatchInsert<_, false>` and no multi-row `RETURNING`, so every
+/// batch-insert path on every backend needs this exact fallback; it is one
+/// Diesel limitation applied 15 times, not 15 decisions (introduced
+/// together in `3a9b500c`, "sqlite: repository CRUD -- FOR UPDATE removal +
+/// `on_conflict`/batch dialect (#1996)"). Linked, not merged, for now:
+/// `sqlite_insert_fallback_loops_are_identical` in this file's `mod tests`
+/// fails the build if any of the 15 copies drifts from the first.
 #[allow(
     clippy::too_many_lines,
     clippy::option_if_let_else,
@@ -12732,6 +12745,11 @@ struct PlainInsertManyInputs<'a> {
 }
 
 /// The bulk insert bodies of [`emit_crud_bodies_plain`].
+///
+/// Clone class: shares the `SQLite` insert-one-row-at-a-time fallback loop
+/// with its sibling [`emit_hooked_insert_many`] -- see that function's doc
+/// comment for the full clone-class note (15 copies total, linked not
+/// merged, drift caught by `sqlite_insert_fallback_loops_are_identical`).
 #[allow(
     clippy::too_many_lines,
     clippy::option_if_let_else,
@@ -30682,5 +30700,76 @@ mod tests {
         let s = ts_string(&rewritten);
         assert_no_leaked_autumn_web_token_path(&s);
         assert!(s.contains("renamed_autumn_web"), "got: {s}");
+    }
+
+    // ── Echo: SQLite insert-fallback loop clone class (linked, not merged) ──
+    //
+    // `emit_hooked_insert_many` and `emit_plain_insert_many` each hand-write
+    // the same "insert one row at a time, short-circuit on the first error"
+    // loop for every tenant/validation branch they emit (see the doc
+    // comments above both functions): 15 copies in this file, byte-identical
+    // except for the one line naming the collection to iterate (`values` or
+    // `chunk.to_vec()`). This test fails the build the instant any copy
+    // drifts from the first, so a fix applied to one copy can no longer
+    // silently miss the other 14 the way it could before this test existed.
+    #[test]
+    fn sqlite_insert_fallback_loops_are_identical() {
+        const START: &str = "let mut __autumn_inserted = ::std::vec::Vec::new();";
+        const END: &str = "__autumn_res.map(|()| __autumn_inserted)";
+
+        // The only line allowed to differ is the loop header: some callers
+        // iterate `values` (an owned, pre-filtered Vec), others
+        // `chunk.to_vec()` (the unfiltered slice). Blank it out before compare.
+        fn normalize(block: &str) -> String {
+            block
+                .lines()
+                .map(|line| {
+                    if line.trim_start().starts_with("for __autumn_row in") {
+                        "        for __autumn_row in /* values | chunk.to_vec() */ {"
+                    } else {
+                        line
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let source = include_str!("repository.rs");
+        // Only the generated code above `mod tests` can contain real copies;
+        // searching past this point would also match this test's own marker
+        // string literals, above.
+        let source = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+
+        let mut blocks = Vec::new();
+        let mut from = 0usize;
+        while let Some(rel_start) = source[from..].find(START) {
+            let start = from + rel_start;
+            let rel_end = source[start..]
+                .find(END)
+                .expect("every start marker must have a matching end marker");
+            let end = start + rel_end + END.len();
+            blocks.push(&source[start..end]);
+            from = end;
+        }
+
+        assert_eq!(
+            blocks.len(),
+            15,
+            "expected 15 copies of the SQLite insert-fallback loop (9 in \
+             emit_hooked_insert_many, 6 in emit_plain_insert_many); the count \
+             changed -- update this test, and consider whether the new count \
+             and history finally clear Echo's bar for extracting a shared \
+             `sqlite_insert_one_row_at_a_time` helper"
+        );
+
+        let first = normalize(blocks[0]);
+        for (i, block) in blocks.iter().enumerate().skip(1) {
+            assert_eq!(
+                normalize(block),
+                first,
+                "SQLite insert-fallback loop #{i} has drifted from loop #0 -- \
+                 this is the exact disease this clone class exists to catch"
+            );
+        }
     }
 }
