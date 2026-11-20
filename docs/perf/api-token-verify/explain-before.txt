@@ -1,0 +1,54 @@
+--- verify_scoped: look up the live token (before: no last_used_at)
+                                                                      QUERY PLAN                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   Output: id, principal_id, name, expires_at, scopes
+   Buffers: shared hit=5
+   ->  Index Scan using idx_api_tokens_hash on public.api_tokens (actual rows=1 loops=1)
+         Output: id, principal_id, name, expires_at, scopes
+         Index Cond: (api_tokens.token_hash = '617abc18781c123a0b1cd02118f7990459a0400170a6bf0f512d4c544816df1c'::text)
+         Filter: ((api_tokens.revoked_at IS NULL) AND ((api_tokens.expires_at IS NULL) OR (api_tokens.expires_at > (now() AT TIME ZONE 'UTC'::text))))
+         Buffers: shared hit=5
+ Query Identifier: -6311008593878850970
+ Planning:
+   Buffers: shared hit=22
+ Planning Time: 0.152 ms
+ Execution Time: 0.051 ms
+(13 rows)
+
+--- verify_scoped: look up the live token (after: with last_used_at)
+                                                                      QUERY PLAN                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   Output: id, principal_id, name, expires_at, scopes, last_used_at
+   Buffers: shared hit=5
+   ->  Index Scan using idx_api_tokens_hash on public.api_tokens (actual rows=1 loops=1)
+         Output: id, principal_id, name, expires_at, scopes, last_used_at
+         Index Cond: (api_tokens.token_hash = '617abc18781c123a0b1cd02118f7990459a0400170a6bf0f512d4c544816df1c'::text)
+         Filter: ((api_tokens.revoked_at IS NULL) AND ((api_tokens.expires_at IS NULL) OR (api_tokens.expires_at > (now() AT TIME ZONE 'UTC'::text))))
+         Buffers: shared hit=5
+ Query Identifier: 2257451281161123524
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.091 ms
+ Execution Time: 0.026 ms
+(13 rows)
+
+--- verify_scoped: stamp last_used_at (not due: matches no row)
+                                                                  QUERY PLAN                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.api_tokens (actual rows=0 loops=1)
+   Buffers: shared hit=7
+   ->  Index Scan using api_tokens_pkey on public.api_tokens (actual rows=0 loops=1)
+         Output: (now() AT TIME ZONE 'UTC'::text), ctid
+         Index Cond: (api_tokens.id = 19750)
+         Filter: ((api_tokens.last_used_at IS NULL) OR (api_tokens.last_used_at < ((now() AT TIME ZONE 'UTC'::text) - '00:05:00'::interval)))
+         Rows Removed by Filter: 1
+         Buffers: shared hit=7
+ Query Identifier: 6983333184835529105
+ Planning:
+   Buffers: shared hit=8
+ Planning Time: 0.126 ms
+ Execution Time: 0.057 ms
+(13 rows)
+

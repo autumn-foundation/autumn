@@ -2872,28 +2872,38 @@ mod db_store {
                 let now = to_column(self.clock.now());
                 let mut conn = self.conn().await?;
                 // Live tokens only: not revoked, and either no expiry or not yet expired.
-                let row: Option<(i64, String, String, Option<SqlDateTime>, serde_json::Value)> =
-                    api_tokens::table
-                        .filter(api_tokens::token_hash.eq(&hash))
-                        .filter(api_tokens::revoked_at.is_null())
-                        .filter(
-                            api_tokens::expires_at
-                                .is_null()
-                                .or(api_tokens::expires_at.gt(now)),
-                        )
-                        .select((
-                            api_tokens::id,
-                            api_tokens::principal_id,
-                            api_tokens::name,
-                            api_tokens::expires_at,
-                            api_tokens::scopes,
-                        ))
-                        .first(&mut conn)
-                        .await
-                        .optional()
-                        .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                #[allow(clippy::type_complexity)]
+                let row: Option<(
+                    i64,
+                    String,
+                    String,
+                    Option<SqlDateTime>,
+                    serde_json::Value,
+                    Option<SqlDateTime>,
+                )> = api_tokens::table
+                    .filter(api_tokens::token_hash.eq(&hash))
+                    .filter(api_tokens::revoked_at.is_null())
+                    .filter(
+                        api_tokens::expires_at
+                            .is_null()
+                            .or(api_tokens::expires_at.gt(now)),
+                    )
+                    .select((
+                        api_tokens::id,
+                        api_tokens::principal_id,
+                        api_tokens::name,
+                        api_tokens::expires_at,
+                        api_tokens::scopes,
+                        api_tokens::last_used_at,
+                    ))
+                    .first(&mut conn)
+                    .await
+                    .optional()
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
 
-                let Some((id, principal_id, name, expires_at_naive, scopes_json)) = row else {
+                let Some((id, principal_id, name, expires_at_naive, scopes_json, last_used_at)) =
+                    row
+                else {
                     return Ok(None);
                 };
                 // Stamp `last_used_at` at most every 5 minutes, not on every request.
@@ -2902,16 +2912,20 @@ mod db_store {
                         .checked_sub(SignedDuration::from_mins(5))
                         .unwrap_or(civil::DateTime::MIN),
                 );
-                let _ = diesel::update(
-                    api_tokens::table.filter(api_tokens::id.eq(id)).filter(
-                        api_tokens::last_used_at
-                            .is_null()
-                            .or(api_tokens::last_used_at.lt(threshold)),
-                    ),
-                )
-                .set(api_tokens::last_used_at.eq(Some(now)))
-                .execute(&mut conn)
-                .await;
+                // The stamp only moves forward, so a recent stamp read above is still recent:
+                // the `UPDATE` below would match no row. Skip the round trip.
+                if last_used_at.is_none_or(|used| used.0 < threshold.0) {
+                    let _ = diesel::update(
+                        api_tokens::table.filter(api_tokens::id.eq(id)).filter(
+                            api_tokens::last_used_at
+                                .is_null()
+                                .or(api_tokens::last_used_at.lt(threshold)),
+                        ),
+                    )
+                    .set(api_tokens::last_used_at.eq(Some(now)))
+                    .execute(&mut conn)
+                    .await;
+                }
                 Ok(Some(VerifiedToken {
                     principal_id,
                     scopes: scopes_from_json(&scopes_json),
