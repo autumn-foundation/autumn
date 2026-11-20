@@ -1,0 +1,46 @@
+--- commit: write the record
+                                                                                                                                                                                                                                                                                                                                                          QUERY PLAN                                                                                                                                                                                                                                                                                                                                                           
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.autumn_idempotency_keys  (cost=0.55..8.57 rows=0 width=0) (actual time=0.030..0.030 rows=0 loops=1)
+   Buffers: shared hit=7
+   WAL: records=1 bytes=439
+   ->  Index Scan using autumn_idempotency_keys_pkey on public.autumn_idempotency_keys  (cost=0.55..8.57 rows=1 width=86) (actual time=0.009..0.010 rows=1 loops=1)
+         Output: '\xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab'::bytea, '1795197153238'::bigint, '86400000'::bigint, 'owner-explain'::text, ctid
+         Index Cond: (autumn_idempotency_keys.storage_key = 'v2:explain'::text)
+         Filter: (autumn_idempotency_keys.locked_by = 'owner-explain'::text)
+         Buffers: shared hit=5
+ Query Identifier: -8961666805928745496
+ Planning:
+   Buffers: shared hit=72
+ Planning Time: 0.303 ms
+ Execution Time: 0.063 ms
+(13 rows)
+
+--- commit: keep_past_crash_lock
+                                                                                                                        QUERY PLAN                                                                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.autumn_idempotency_keys  (cost=0.55..8.58 rows=0 width=0) (actual time=0.050..0.051 rows=0 loops=1)
+   Buffers: shared hit=17 dirtied=1
+   WAL: records=4 fpi=1 bytes=8431
+   ->  Index Scan using autumn_idempotency_keys_pkey on public.autumn_idempotency_keys  (cost=0.55..8.58 rows=1 width=14) (actual time=0.009..0.009 rows=1 loops=1)
+         Output: (locked_until_ms + 86400000), ctid
+         Index Cond: (autumn_idempotency_keys.storage_key = 'v2:explain'::text)
+         Filter: ((autumn_idempotency_keys.locked_until_ms > '1795110753238'::bigint) AND (autumn_idempotency_keys.locked_by = 'owner-explain'::text) AND (autumn_idempotency_keys.expires_at_ms < (autumn_idempotency_keys.locked_until_ms + 86400000)))
+         Buffers: shared hit=5
+ Query Identifier: -8895138337550899655
+ Planning:
+   Buffers: shared hit=6
+ Planning Time: 0.048 ms
+ Execution Time: 0.060 ms
+(13 rows)
+
+ wal_bytes_for_the_writes 
+--------------------------
+                     8904
+(1 row)
+
+ expiry_after_now_ms 
+---------------------
+            86460000
+(1 row)
+

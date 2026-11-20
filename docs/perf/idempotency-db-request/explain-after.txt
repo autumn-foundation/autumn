@@ -1,0 +1,28 @@
+--- commit: write the record
+                                                                                                                                                                                                                                                                                                                                                                                                           QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                                           
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.autumn_idempotency_keys  (cost=0.55..8.58 rows=0 width=0) (actual time=0.062..0.063 rows=0 loops=1)
+   Buffers: shared hit=15 dirtied=1
+   WAL: records=3 fpi=1 bytes=3804
+   ->  Index Scan using autumn_idempotency_keys_pkey on public.autumn_idempotency_keys  (cost=0.55..8.58 rows=1 width=86) (actual time=0.014..0.015 rows=1 loops=1)
+         Output: '\xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab'::bytea, CASE WHEN (locked_until_ms > '1795111800634'::bigint) THEN (locked_until_ms + 86400000) ELSE '1795198200634'::bigint END, '86400000'::bigint, 'owner-explain'::text, ctid
+         Index Cond: (autumn_idempotency_keys.storage_key = 'v2:explain'::text)
+         Filter: (autumn_idempotency_keys.locked_by = 'owner-explain'::text)
+         Buffers: shared hit=5
+ Query Identifier: -4485134018897870066
+ Planning:
+   Buffers: shared hit=75
+ Planning Time: 0.378 ms
+ Execution Time: 0.115 ms
+(13 rows)
+
+ wal_bytes_for_the_writes 
+--------------------------
+                     3808
+(1 row)
+
+ expiry_after_now_ms 
+---------------------
+            86460000
+(1 row)
+

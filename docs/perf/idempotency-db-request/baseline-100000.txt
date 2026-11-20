@@ -1,0 +1,41 @@
+test integration::idempotency_db_request_profile::idempotency_db_request_profile ... fixture: 100000 rows, dead tuples 3044, total size 108 MB
+=== fresh-tx: 1024 requests ===
+ calls     rows   buffers  temp  wal_bytes    fpi  statement
+  1024     1024     13553     0     442733     13  UPDATE "autumn_idempotency_keys" SET "expires_at_ms" = ("autumn_idempotency_keys"."locked_until_ms" + $1) WHERE (((("autumn_idempotency_keys"."storage
+  1024     1024     12399     0     890002     13  UPDATE "autumn_idempotency_keys" SET "record" = $1, "expires_at_ms" = $2, "ttl_ms" = $3, "record_owner" = $4 WHERE (("autumn_idempotency_keys"."storag
+  1024     1024     12391     0     419765     13  UPDATE "autumn_idempotency_keys" SET "expires_at_ms" = ("autumn_idempotency_keys"."ttl_ms" + $1), "locked_by" = $2, "locked_until_ms" = $3 WHERE (("au
+  1024     1024     10324     0    5056321    766  INSERT INTO "autumn_idempotency_keys" ("storage_key", "locked_by", "locked_until_ms", "expires_at_ms") VALUES ($1, $2, $3, $4) ON CONFLICT ("storage_k
+  2048        0      7168     0      18442      0  SELECT "autumn_idempotency_keys"."record" FROM "autumn_idempotency_keys" WHERE ((("autumn_idempotency_keys"."storage_key" = $1) AND ("autumn_idempoten
+  1024     1024      4197     0      25765      0  SELECT "autumn_idempotency_keys"."storage_key" FROM "autumn_idempotency_keys" WHERE ((("autumn_idempotency_keys"."storage_key" = $1) AND ("autumn_idem
+  1024        0      4098     0         59      0  DELETE FROM "autumn_idempotency_keys" WHERE (((("autumn_idempotency_keys"."storage_key" = $1) AND ("autumn_idempotency_keys"."locked_by" = $2)) AND ("
+  1024     1024      4096     0          0      0  SELECT "autumn_idempotency_keys"."recovery_point", "autumn_idempotency_keys"."recovery_body_hash" FROM "autumn_idempotency_keys" WHERE (("autumn_idemp
+  1024     1024      3727     0     143068      0  INSERT INTO ledger_idem_payments (amount) VALUES ($1) RETURNING id
+  1024        0      3072     0          0      0  DELETE FROM "autumn_idempotency_keys" WHERE ((("autumn_idempotency_keys"."storage_key" = $1) AND ("autumn_idempotency_keys"."expires_at_ms" <= $2)) AN
+  1024        0      3072     0          0      0  SELECT "autumn_idempotency_keys"."storage_key" FROM "autumn_idempotency_keys" WHERE (("autumn_idempotency_keys"."storage_key" = $1) AND (("autumn_idem
+     8        0       489     0      26868    143  DELETE FROM "autumn_idempotency_keys" WHERE (("autumn_idempotency_keys"."expires_at_ms" <= $1) AND ("autumn_idempotency_keys"."locked_until_ms" <= $2)
+  6144     6144         0     0          0      0  SELECT $1
+  1024        0         0     0          0      0  BEGIN
+  1024        0         0     0          0      0  COMMIT
+  1024        0         0     0          0      0  SET statement_timeout = 0
+-- total: statements=21512 (21.01/req) buffers=78586 (76.7/req) statement_wal=7023023 (6858/req) --
+-- autumn_idempotency_keys: inserts=1025 updates=3074 hot_updates=0 deletes=1493 | wal_lsn_delta=7187944 (7019/req) --
+=== fresh-plain: 1024 requests ===
+ calls     rows   buffers  temp  wal_bytes    fpi  statement
+  1024     1024     12537     0     453882     13  UPDATE "autumn_idempotency_keys" SET "expires_at_ms" = ("autumn_idempotency_keys"."ttl_ms" + $1), "locked_by" = $2, "locked_until_ms" = $3 WHERE (("au
+  1024     1024     12396     0     841819      1  INSERT INTO "autumn_idempotency_keys" ("storage_key", "record", "locked_by", "locked_until_ms", "expires_at_ms", "ttl_ms", "record_owner") VALUES ($1,
+  1024     1024     10357     0    5201675    767  INSERT INTO "autumn_idempotency_keys" ("storage_key", "locked_by", "locked_until_ms", "expires_at_ms") VALUES ($1, $2, $3, $4) ON CONFLICT ("storage_k
+  2048        0      7168     0      24928      0  SELECT "autumn_idempotency_keys"."record" FROM "autumn_idempotency_keys" WHERE ((("autumn_idempotency_keys"."storage_key" = $1) AND ("autumn_idempoten
+  1024        0      5131     0       9694      0  DELETE FROM "autumn_idempotency_keys" WHERE (((("autumn_idempotency_keys"."storage_key" = $1) AND ("autumn_idempotency_keys"."locked_by" = $2)) AND ("
+  1024        0      3072     0          0      0  DELETE FROM "autumn_idempotency_keys" WHERE ((("autumn_idempotency_keys"."storage_key" = $1) AND ("autumn_idempotency_keys"."expires_at_ms" <= $2)) AN
+  1024        0      3072     0          0      0  SELECT "autumn_idempotency_keys"."storage_key" FROM "autumn_idempotency_keys" WHERE (("autumn_idempotency_keys"."storage_key" = $1) AND (("autumn_idem
+    16        0       256     0          0      0  DELETE FROM "autumn_idempotency_keys" WHERE (("autumn_idempotency_keys"."expires_at_ms" <= $1) AND ("autumn_idempotency_keys"."locked_until_ms" <= $2)
+  5120     5120         0     0          0      0  SELECT $1
+-- total: statements=13328 (13.02/req) buffers=53989 (52.7/req) statement_wal=6531998 (6379/req) --
+-- autumn_idempotency_keys: inserts=1025 updates=2050 hot_updates=0 deletes=0 | wal_lsn_delta=6690784 (6534/req) --
+=== replay: 512 requests ===
+ calls     rows   buffers  temp  wal_bytes    fpi  statement
+   512      512      2056     0      83396     11  SELECT "autumn_idempotency_keys"."record" FROM "autumn_idempotency_keys" WHERE ((("autumn_idempotency_keys"."storage_key" = $1) AND ("autumn_idempoten
+   512      512         0     0          0      0  SELECT $1
+-- total: statements=1024 (2.00/req) buffers=2056 (4.0/req) statement_wal=83396 (163/req) --
+-- autumn_idempotency_keys: inserts=1 updates=2 hot_updates=0 deletes=0 | wal_lsn_delta=83648 (163/req) --
+ok

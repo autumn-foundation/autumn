@@ -199,6 +199,8 @@ mod http_latency_histogram;
 #[cfg(feature = "i18n")]
 mod i18n_integration;
 #[cfg(feature = "db")]
+mod idempotency_db_request_profile;
+#[cfg(feature = "db")]
 mod idempotency_db_store;
 mod idempotency_middleware;
 #[cfg(feature = "redis")]
