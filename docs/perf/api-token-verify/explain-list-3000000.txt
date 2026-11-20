@@ -1,0 +1,32 @@
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Gather Merge (actual rows=3 loops=1)
+   Workers Planned: 2
+   Params Evaluated: $0
+   Workers Launched: 2
+   Buffers: shared hit=16186 read=58362
+   I/O Timings: shared read=110.314
+   InitPlan 1 (returns $0)
+     ->  Index Scan using api_tokens_pkey on api_tokens api_tokens_1 (actual rows=1 loops=1)
+           Index Cond: (id = 19750)
+           Buffers: shared hit=3 read=4
+           I/O Timings: shared read=0.022
+   ->  Sort (actual rows=1 loops=3)
+         Sort Key: api_tokens.id
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=16183 read=58358
+         I/O Timings: shared read=110.293
+         Worker 0:  Sort Method: quicksort  Memory: 25kB
+         Worker 1:  Sort Method: quicksort  Memory: 25kB
+         ->  Parallel Seq Scan on api_tokens (actual rows=1 loops=3)
+               Filter: (principal_id = $0)
+               Rows Removed by Filter: 999999
+               Buffers: shared hit=16167 read=58358
+               I/O Timings: shared read=110.293
+ Planning:
+   Buffers: shared hit=107 read=22
+   I/O Timings: shared read=0.143
+ Planning Time: 0.682 ms
+ Execution Time: 154.969 ms
+(28 rows)
+

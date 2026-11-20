@@ -1,0 +1,38 @@
+--- per case: rows written (old, new); -1 = not a live token
+ id |                            note                            | old | new 
+----+------------------------------------------------------------+-----+-----
+  1 | never used                                                 |   1 |   1
+  2 | threshold - 1us                                            |   1 |   1
+  3 | exactly threshold                                          |   0 |   0
+  4 | threshold + 1us                                            |   0 |   0
+  5 | used 1s ago                                                |   0 |   0
+  6 | stamped by a clock 3 min ahead                             |   0 |   0
+  7 | used 7 weeks ago                                           |   1 |   1
+  8 | revoked                                                    |  -1 |  -1
+  9 | expired                                                    |  -1 |  -1
+ 10 | future expiry, fresh                                       |   0 |   0
+ 11 | stale; another replica stamps it between SELECT and UPDATE |   0 |   0
+(11 rows)
+
+--- second request, same instant (old, new)
+ id | old | new 
+----+-----+-----
+  1 |   0 |   0
+  2 |   0 |   0
+  3 |   0 |   0
+  4 |   0 |   0
+  5 |   0 |   0
+  6 |   0 |   0
+  7 |   0 |   0
+  8 |  -1 |  -1
+  9 |  -1 |  -1
+ 10 |   0 |   0
+ 11 |   0 |   0
+(11 rows)
+
+--- rows that differ between the two tables after both requests
+ differing_rows 
+----------------
+              0
+(1 row)
+
