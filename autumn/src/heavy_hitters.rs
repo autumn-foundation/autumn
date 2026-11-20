@@ -94,6 +94,7 @@ pub struct SpaceSaving<K> {
     slots: Vec<Slot<K>>,
     index: HashMap<K, usize>,
     total: u64,
+    saturated: bool,
 }
 
 impl<K: Eq + Hash + Clone> SpaceSaving<K> {
@@ -106,6 +107,7 @@ impl<K: Eq + Hash + Clone> SpaceSaving<K> {
             slots: Vec::with_capacity(capacity),
             index: HashMap::with_capacity(capacity),
             total: 0,
+            saturated: false,
         }
     }
 
@@ -121,6 +123,15 @@ impl<K: Eq + Hash + Clone> SpaceSaving<K> {
         self.total
     }
 
+    /// Whether the weights observed passed `u64::MAX`. From then on
+    /// [`total`](Self::total) understates the stream, so
+    /// [`frequent`](Self::frequent) answers nothing rather than a share it
+    /// cannot vouch for. [`clear`](Self::clear) resets it.
+    #[must_use]
+    pub const fn is_saturated(&self) -> bool {
+        self.saturated
+    }
+
     /// Counts one occurrence of `key`.
     pub fn observe(&mut self, key: K) {
         self.observe_n(key, 1);
@@ -132,7 +143,12 @@ impl<K: Eq + Hash + Clone> SpaceSaving<K> {
         if weight == 0 {
             return;
         }
-        self.total = self.total.saturating_add(weight);
+        if let Some(total) = self.total.checked_add(weight) {
+            self.total = total;
+        } else {
+            self.total = u64::MAX;
+            self.saturated = true;
+        }
 
         if let Some(slot) = self.index.get(&key).and_then(|&at| self.slots.get_mut(at)) {
             slot.count = slot.count.saturating_add(weight);
@@ -193,8 +209,13 @@ impl<K: Eq + Hash + Clone> SpaceSaving<K> {
     /// No key in the answer is a false positive. A key over the share can be
     /// missing only when the share is at most `1_000_000 / capacity` ppm or
     /// its error hides it; a larger table narrows both.
+    ///
+    /// Empty once the table [is saturated](Self::is_saturated).
     #[must_use]
     pub fn frequent(&self, share_ppm: u32) -> Vec<Hitter<K>> {
+        if self.saturated {
+            return Vec::new();
+        }
         let threshold = u128::from(self.total).saturating_mul(u128::from(share_ppm));
         let mut hits: Vec<Hitter<K>> = self
             .top(self.capacity)
@@ -210,6 +231,7 @@ impl<K: Eq + Hash + Clone> SpaceSaving<K> {
         self.slots.clear();
         self.index.clear();
         self.total = 0;
+        self.saturated = false;
     }
 
     fn hitter(slot: &Slot<K>) -> Hitter<K> {
@@ -250,6 +272,12 @@ impl<K: Eq + Hash + Clone> HeavyHitters<K> {
     #[must_use]
     pub fn total(&self) -> u64 {
         self.with(|table| table.total())
+    }
+
+    /// See [`SpaceSaving::is_saturated`].
+    #[must_use]
+    pub fn is_saturated(&self) -> bool {
+        self.with(|table| table.is_saturated())
     }
 
     /// See [`SpaceSaving::estimate`].
@@ -391,6 +419,19 @@ mod tests {
         table.observe("a");
         assert_eq!(table.total(), u64::MAX);
         assert_eq!(table.estimate(&"a").map(|h| h.count), Some(u64::MAX));
+    }
+
+    #[test]
+    fn a_saturated_total_reports_no_share() {
+        let mut table = SpaceSaving::new(2);
+        table.observe_n("a", u64::MAX);
+        assert!(!table.is_saturated());
+        table.observe_n("b", u64::MAX);
+        assert!(table.is_saturated());
+        assert!(table.frequent(1_000_000).is_empty());
+        assert!(table.frequent(0).is_empty());
+        table.clear();
+        assert!(!table.is_saturated());
     }
 
     #[test]
