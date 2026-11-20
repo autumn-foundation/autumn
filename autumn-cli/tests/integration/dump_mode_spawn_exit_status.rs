@@ -2,8 +2,8 @@
 //! audit`, `autumn graph show`, `autumn agents manifest` and `autumn
 //! data-flow` before the Echo merge that unifies their byte-identical
 //! "compile, spawn in dump mode, forward stderr, check exit status" block
-//! into one `routes::run_dump_mode` (jscpd clone class: cache_audit.rs,
-//! graph.rs, agents.rs, data_flow.rs).
+//! into one `routes::run_dump_mode` (jscpd clone class: `cache_audit.rs`,
+//! `graph.rs`, `agents.rs`, `data_flow.rs`).
 //!
 //! Each of the four commands reaches this same block regardless of what it
 //! dumps, so one trivial fixture binary — which never prints a manifest —
@@ -129,7 +129,7 @@ fn nonzero_exit_is_reported_with_the_right_label_and_propagated_code() {
             describe(&output)
         );
         assert!(
-            stderr.contains(&format!("Binary exited with status")) && stderr.contains(*exit_label),
+            stderr.contains("Binary exited with status") && stderr.contains(*exit_label),
             "`autumn {}` did not report the exit status against {exit_label}: {}",
             args.join(" "),
             describe(&output)
