@@ -159,6 +159,9 @@ pub mod download;
 pub mod fleet;
 pub mod fleet_layout;
 mod fs_atomic; // Owner-only atomic write shared by `acme::store` and `capsule::persist`.
+// Length-prefixed hash field framing, shared by `idempotency`,
+// `repository_commit_hooks`, `money::ledger` and `derivation`.
+mod hashing;
 mod media_type; // Case-insensitive media-type match shared by the form gates (#3267).
 #[cfg(test)]
 pub(crate) mod test_urls;

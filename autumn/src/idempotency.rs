@@ -40,6 +40,8 @@ use axum::response::IntoResponse;
 use sha2::Digest as _;
 use tower::{Layer, Service};
 
+use crate::hashing::push_length_prefixed_field as push_storage_key_component;
+
 static IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 static X_IDEMPOTENT_REPLAYED: &str = "x-idempotent-replayed";
 
@@ -85,15 +87,6 @@ fn principal_scope_digest(session_id: Option<&str>) -> String {
         hasher.update(session_id.as_bytes());
     }
     hex::encode(hasher.finalize())
-}
-
-fn push_storage_key_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
-    hasher.update(label.as_bytes());
-    hasher.update(b":");
-    hasher.update((value.len() as u64).to_be_bytes());
-    hasher.update(b":");
-    hasher.update(value);
-    hasher.update(b";");
 }
 
 /// The tenant Autumn's own tenancy middleware resolved for the in-flight

@@ -14,6 +14,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::hashing::push_length_prefixed_field as push_hook_id_component;
+
 use diesel::OptionalExtension as _;
 use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -2259,15 +2261,6 @@ fn repository_commit_hook_id(
         push_hook_id_component(&mut hasher, "record", record.as_bytes());
     }
     format!("idempotent:{}", hex::encode(hasher.finalize()))
-}
-
-fn push_hook_id_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
-    hasher.update(label.as_bytes());
-    hasher.update(b":");
-    hasher.update((value.len() as u64).to_be_bytes());
-    hasher.update(b":");
-    hasher.update(value);
-    hasher.update(b";");
 }
 
 pub fn repository_commit_hook_worker_id() -> String {

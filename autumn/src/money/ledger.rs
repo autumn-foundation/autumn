@@ -915,17 +915,7 @@ impl CurrencyTotal {
 
 // ── Hashing helpers ─────────────────────────────────────────────────────────
 
-/// Length-prefix one labelled field into the hash.
-///
-/// The length prefix stops two different field splits from hashing the same.
-fn push_field(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
-    hasher.update(label.as_bytes());
-    hasher.update(b":");
-    hasher.update((value.len() as u64).to_be_bytes());
-    hasher.update(b":");
-    hasher.update(value);
-    hasher.update(b";");
-}
+use crate::hashing::push_length_prefixed_field as push_field;
 
 /// Hash the postings in a canonical order, so build order does not matter.
 ///
