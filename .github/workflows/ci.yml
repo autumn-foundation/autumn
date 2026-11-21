@@ -3205,6 +3205,12 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- assets:: \
             | tee "$RUNNER_TEMP/cli-assets-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-assets-cov.log"
+          # PR #3774: same gap for `routes::run_dump_mode`, which runs through
+          # the `cli_tests` binary (it spawns the real `autumn` binary, which no
+          # other lane instruments). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- dump_mode_spawn_exit_status:: \
+            | tee "$RUNNER_TEMP/cli-dump-mode-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-dump-mode-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
