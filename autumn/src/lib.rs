@@ -402,6 +402,7 @@ pub(crate) mod counter_cache;
 /// Maintained derived read models: `#[derivation]` (#1769).
 #[cfg(feature = "db")]
 pub mod derivation;
+pub mod distinct;
 
 #[cfg(feature = "db")]
 pub mod commentable;

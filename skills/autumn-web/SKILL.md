@@ -2916,6 +2916,22 @@ hot.observe(tenant_id.clone());          // or observe_n(route, bytes)
 for hit in hot.frequent(50_000) { /* each is surely >= 5 % of traffic */ }
 ```
 
+### Distinct counts of a stream — `distinct` (unreleased)
+
+To count unique visitors, client IPs or tenants without keeping every key,
+use `autumn_web::distinct::DistinctCounter` (no feature, std only). It is a
+HyperLogLog of `2^precision` one-byte registers, accurate to
+`1.04 / sqrt(2^precision)`; duplicates change nothing. Sketches of the same
+precision `merge` into the union, so each replica counts its own and the
+merged sketch counts the fleet's. `to_bytes`/`from_bytes` ship a sketch:
+
+```rust
+let visitors = Arc::new(DistinctCounter::new(14)); // 16 KiB, ~0.8 % error
+visitors.insert(&session_id);
+let today = visitors.take();                        // fresh window, old sketch back
+fleet_total.merge(&HyperLogLog::from_bytes(&peer_bytes).unwrap())?;
+```
+
 ### Runtime log levels (0.6.0)
 
 `PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
