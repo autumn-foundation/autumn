@@ -33,8 +33,6 @@
 //!
 //! See `docs/guide/agent-authority.md`.
 
-use std::process::Command;
-
 use autumn_web::agent_authority::manifest::{
     ActionRow, AgentAuthorityManifest, UngovernedTool, UnregisteredAuthority, parse_manifest_dump,
 };
@@ -654,29 +652,7 @@ pub fn run(opts: &AgentsManifestOptions<'_>) {
     routes::compile_binary_with(opts.package, opts.bin, &opts.features, &profile);
     let binary = routes::find_binary_in_profile(opts.package, opts.bin, &profile);
 
-    let mut command = Command::new(&binary);
-    command.env(DUMP_ENV, "1");
-    routes::clear_other_dump_modes(&mut command, DUMP_ENV);
-    let output = command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
-            std::process::exit(1);
-        });
-
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-
-    if !output.status.success() {
-        eprintln!(
-            "\u{2717} Binary exited with status {} while dumping the agent-authority manifest",
-            output.status
-        );
-        std::process::exit(output.status.code().unwrap_or(1));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = routes::run_dump_mode(&binary, DUMP_ENV, "the agent-authority manifest");
     let Some(manifest) = parse_manifest_dump(&stdout) else {
         eprintln!(
             "\u{2717} The app produced no agent-authority manifest. Either it was built against \

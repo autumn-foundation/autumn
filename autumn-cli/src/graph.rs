@@ -27,8 +27,6 @@
 //!
 //! See `docs/guide/architecture-graph.md`.
 
-use std::process::Command;
-
 use autumn_web::graph::manifest::{
     ArchitectureGraph, Completeness, DeclaredMount, parse_manifest_dump,
 };
@@ -482,29 +480,7 @@ pub fn dump(target: &BuildTarget<'_>) -> ArchitectureGraph {
     let profile = routes::CargoProfile::from_release(target.release);
     routes::compile_binary_with(target.package, target.bin, &target.features, &profile);
     let binary = routes::find_binary_in_profile(target.package, target.bin, &profile);
-    let mut command = Command::new(&binary);
-    command.env(DUMP_ENV, "1");
-    routes::clear_other_dump_modes(&mut command, DUMP_ENV);
-    let output = command
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap_or_else(|e| {
-            eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
-            std::process::exit(1);
-        });
-
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-
-    if !output.status.success() {
-        eprintln!(
-            "\u{2717} Binary exited with status {} while dumping the architecture graph",
-            output.status
-        );
-        std::process::exit(output.status.code().unwrap_or(1));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = routes::run_dump_mode(&binary, DUMP_ENV, "the architecture graph");
     let Some(graph) = parse_manifest_dump(&stdout) else {
         eprintln!(
             "\u{2717} The app produced no architecture graph. Either it was built against an \

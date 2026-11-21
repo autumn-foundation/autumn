@@ -18,6 +18,7 @@ mod dependency_dev_loop;
 mod deploy;
 mod destroy_module_import_features;
 mod destroy_provenance;
+mod dump_mode_spawn_exit_status;
 mod edge;
 mod fleet_cli;
 mod generate_json_postgres;
