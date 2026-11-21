@@ -185,7 +185,7 @@ impl HyperLogLog {
         }
         let mut z = m * tau(1.0 - count(q.wrapping_add(1)) / m);
         for rank in (1..=q).rev() {
-            z = 0.5 * (z + count(rank));
+            z = f64::midpoint(z, count(rank));
         }
         z = m.mul_add(sigma(empty / m), z);
         let estimate = m * m / (2.0 * std::f64::consts::LN_2 * z);
