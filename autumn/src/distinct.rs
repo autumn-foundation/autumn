@@ -7,7 +7,9 @@
 //! the traffic: 16 KiB counts a billion distinct keys to within about 1 %.
 //!
 //! It is the `HyperLogLog` algorithm (Flajolet, Fusy, Gandouet and Meunier,
-//! 2007), with linear counting for small sets. Each key is hashed to 64 bits.
+//! 2007), read with Ertl's improved estimator (2017), which stays unbiased
+//! from a handful of keys to billions with no switch between ranges. Each key
+//! is hashed to 64 bits.
 //! The top `precision` bits pick a register, and the register keeps the
 //! longest run of leading zeros seen in the rest. Long runs are rare, so the
 //! registers together say how many different hashes went by.
@@ -23,10 +25,15 @@
 //!   hit two replicas. [`to_bytes`](HyperLogLog::to_bytes) and
 //!   [`from_bytes`](HyperLogLog::from_bytes) carry a sketch between processes.
 //!
-//! Keys are hashed with a fixed, unkeyed hash that writes integers in
-//! little-endian order, so the same key lands in the same register on every
-//! run and every machine. That is what makes sketches from different
-//! processes mergeable, and it makes a stream replay identically. It also
+//! Keys are hashed with a fixed, unkeyed hash, so the same key lands in the
+//! same register on every run. That is what makes sketches from different
+//! processes mergeable, and it makes a stream replay identically. Strings,
+//! byte slices, integers (written little-endian, `usize` and `isize` as 64
+//! bits) and tuples or structs of those hash the same on every machine too.
+//! A slice or array of multi-byte integers does not: the standard library
+//! hashes it as native-endian bytes. Encode such a key yourself (for example
+//! as a little-endian byte string) before merging sketches across
+//! architectures. It also
 //! means a client who picks keys can aim them at registers: count keys the
 //! server derives (a session id, a tenant), or hash untrusted input with your
 //! own keyed hash and pass it to [`insert_hash`](HyperLogLog::insert_hash).
@@ -158,31 +165,30 @@ impl HyperLogLog {
     /// The estimated number of distinct keys counted.
     #[must_use]
     pub fn estimate(&self) -> u64 {
+        // Ertl's improved estimator ("New cardinality estimation algorithms
+        // for HyperLogLog sketches", 2017). It reads the histogram of
+        // register values and needs no switch between small and large ranges,
+        // so it has no bias spike where classic HyperLogLog hands over from
+        // linear counting to the raw estimate.
         let m = self.register_count();
-        let (sum, zeros) =
-            self.registers
-                .iter()
-                .fold((0.0_f64, 0_u32), |(sum, zeros), &register| {
-                    let zeros = if register == 0 {
-                        zeros.saturating_add(1)
-                    } else {
-                        zeros
-                    };
-                    (sum + (-f64::from(register)).exp2(), zeros)
-                });
-        let alpha = match self.precision {
-            4 => 0.673,
-            5 => 0.697,
-            6 => 0.709,
-            _ => 0.7213 / (1.0 + 1.079 / m),
-        };
-        let raw = alpha * m * m / sum;
-        let estimate = if raw <= 2.5 * m && zeros > 0 {
-            // Linear counting: far more accurate while registers are empty.
-            m * (m / f64::from(zeros)).ln()
-        } else {
-            raw
-        };
+        let q = 64_u8.wrapping_sub(self.precision);
+        let mut histogram = [0_u32; 66];
+        for &register in &self.registers {
+            if let Some(bucket) = histogram.get_mut(usize::from(register)) {
+                *bucket = bucket.saturating_add(1);
+            }
+        }
+        let count = |rank: u8| f64::from(histogram.get(usize::from(rank)).copied().unwrap_or(0));
+        let empty = count(0);
+        if empty >= m {
+            return 0;
+        }
+        let mut z = m * tau(1.0 - count(q.wrapping_add(1)) / m);
+        for rank in (1..=q).rev() {
+            z = 0.5 * (z + count(rank));
+        }
+        z = m.mul_add(sigma(empty / m), z);
+        let estimate = m * m / (2.0 * std::f64::consts::LN_2 * z);
         // The estimate is finite, non-negative and far below `u64::MAX`.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let rounded = estimate.round() as u64;
@@ -247,6 +253,46 @@ impl HyperLogLog {
     }
 }
 
+/// `x + sum(2^(k-1) * x^(2^k))` over `k >= 1`, the correction for empty
+/// registers. `x` is below 1 here, so the terms shrink to nothing. The loop
+/// stops once a term no longer changes `z` (an exact float comparison).
+#[allow(clippy::float_cmp)]
+fn sigma(mut x: f64) -> f64 {
+    let mut y = 1.0;
+    let mut z = x;
+    for _ in 0..128 {
+        x *= x;
+        let previous = z;
+        z = x.mul_add(y, z);
+        y += y;
+        if z == previous {
+            break;
+        }
+    }
+    z
+}
+
+/// `(1 - x - sum((1 - x^(2^-k))^2 * 2^-k)) / 3` over `k >= 1`, the
+/// correction for saturated registers. Stops like [`sigma`].
+#[allow(clippy::float_cmp)]
+fn tau(mut x: f64) -> f64 {
+    if x <= 0.0 || x >= 1.0 {
+        return 0.0;
+    }
+    let mut y = 1.0;
+    let mut z = 1.0 - x;
+    for _ in 0..128 {
+        x = x.sqrt();
+        let previous = z;
+        y *= 0.5;
+        z = ((1.0 - x) * (1.0 - x)).mul_add(-y, z);
+        if z == previous {
+            break;
+        }
+    }
+    z / 3.0
+}
+
 /// FNV-1a over the bytes, then the `MurmurHash3` 64-bit finalizer so every
 /// output bit depends on every input bit. Unkeyed and fixed, so a key hashes
 /// the same in every process. Integers are written little-endian, so it is
@@ -286,6 +332,11 @@ impl Hasher for StableHasher {
     fn write_usize(&mut self, i: usize) {
         // As a u64, so a 32-bit and a 64-bit machine agree.
         self.write_u64(i as u64);
+    }
+
+    fn write_isize(&mut self, i: isize) {
+        // Sign-extended to 64 bits, for the same reason.
+        self.write_u64((i as i64).cast_unsigned());
     }
 
     fn finish(&self) -> u64 {
@@ -444,6 +495,34 @@ mod tests {
             }
             assert_close(&sketch, truth, 3.0);
         }
+    }
+
+    #[test]
+    fn no_bias_across_the_small_range_cutoff() {
+        // Classic HyperLogLog switches from linear counting to the raw
+        // estimate at 2.5 m and is biased high just past it. Sweep 1 m..6 m
+        // at a high precision, where the standard error is tightest.
+        let mut sketch = HyperLogLog::new(16);
+        let m = 1_u64 << 16;
+        let mut inserted = 0_u64;
+        for step in 1..=12_u64 {
+            let truth = step * m / 2;
+            while inserted < truth {
+                sketch.insert(&inserted);
+                inserted += 1;
+            }
+            assert_close(&sketch, truth, 3.0);
+        }
+    }
+
+    #[test]
+    fn isize_keys_hash_as_64_bit() {
+        // A negative isize must not depend on the target's pointer width.
+        let mut sketch = HyperLogLog::new(4);
+        sketch.insert(&-1_isize);
+        let mut expected = HyperLogLog::new(4);
+        expected.insert(&-1_i64);
+        assert_eq!(sketch, expected);
     }
 
     #[test]
