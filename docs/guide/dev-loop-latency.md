@@ -173,7 +173,7 @@ features (ADR 0027). The daemon starter turns them off, and `psl` leaves its
 build. A default build does not change. On one 4 vCPU box a cold `hello`
 build fell from 118 s to 101 s.
 
-Issue #2309 had raised the budget to p95 130 s / max 160 s. The scheduled
+An earlier change had raised the budget to p95 130 s / max 160 s. The scheduled
 CI runs after ADR 0027 measured 89-104 s. The budget then became p95 125 s /
 max 150 s. The gate checks p95 and max only, and with 3 runs p95 is the slowest
 sample. p95 is about 20% above the slowest sample seen.
