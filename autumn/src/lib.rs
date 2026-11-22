@@ -403,6 +403,7 @@ pub(crate) mod counter_cache;
 #[cfg(feature = "db")]
 pub mod derivation;
 pub mod distinct;
+pub mod quantiles;
 
 #[cfg(feature = "db")]
 pub mod commentable;
