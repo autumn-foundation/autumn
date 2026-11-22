@@ -162,6 +162,7 @@ Why the result cannot change:
   closing `COUNT(*)` still reports any stale row that is left as
   `truncated`.
 
+The existing `framework_retention_pg` suite (22 tests) passes unchanged.
 
 ## Write cost
 

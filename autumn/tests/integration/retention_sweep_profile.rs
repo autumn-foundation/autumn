@@ -217,7 +217,11 @@ const DATASETS: &[(&str, &str, &str)] = &[
     ("job_history", "autumn_jobs", "id"),
     ("commit_hooks", "autumn_repository_commit_hooks", "id"),
     ("job_tracking", "autumn_job_tracking", "key"),
-    ("experiment_assignments", "autumn_experiment_assignments", "id::text"),
+    (
+        "experiment_assignments",
+        "autumn_experiment_assignments",
+        "id::text",
+    ),
 ];
 
 #[derive(QueryableByName)]
@@ -391,7 +395,9 @@ async fn retention_sweep_profile() {
     for ddl in MIGRATIONS {
         conn.batch_execute(ddl).await.expect("migration");
     }
-    conn.batch_execute(&fill_jobs(jobs)).await.expect("fill jobs");
+    conn.batch_execute(&fill_jobs(jobs))
+        .await
+        .expect("fill jobs");
     conn.batch_execute(&fill_commit_hooks(jobs / 4))
         .await
         .expect("fill commit hooks");
@@ -402,10 +408,7 @@ async fn retention_sweep_profile() {
         .await
         .expect("fill experiments");
 
-    println!(
-        "server: {}",
-        text(&mut conn, "SELECT version() AS s").await
-    );
+    println!("server: {}", text(&mut conn, "SELECT version() AS s").await);
     for (_, table, _) in DATASETS {
         println!(
             "fixture: {table} rows={} dead={} heap={}MB indexes={}MB",
@@ -418,7 +421,11 @@ async fn retention_sweep_profile() {
             )
             .await,
             count(&mut conn, &format!("SELECT pg_table_size('{table}') AS n")).await / 1_048_576,
-            count(&mut conn, &format!("SELECT pg_indexes_size('{table}') AS n")).await
+            count(
+                &mut conn,
+                &format!("SELECT pg_indexes_size('{table}') AS n")
+            )
+            .await
                 / 1_048_576,
         );
     }
