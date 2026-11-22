@@ -19,7 +19,7 @@
 //!   retention_sweep_profile --nocapture --test-threads=1
 //! ```
 //!
-//! See `docs/perf/retention-sweep/README.md` for the recorded results.
+//! See `docs/perf/retention-sweep-ctid/README.md` for the recorded results.
 //!
 //! ## Fixture
 //!

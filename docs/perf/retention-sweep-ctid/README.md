@@ -181,10 +181,13 @@ with the square of the batch count. At 3M (227 MB) and on `autumn_jobs` at 1M
 Postgres starts each sequential scan where the last one stopped
 (`synchronize_seqscans`), which hides the re-scan.
 
-Bounding each batch by the last key it deleted would fix this, but it changes
-how the loop walks the table, and it needs a key the batch can order by on
-every dataset. It is left for a separate change. This PR's buffer counts
-include the re-scan in both columns.
+Open PR #3759 fixes this re-scan by ordering the sub-select by an index
+that already serves each predicate. That change and this one are on
+different nodes of the same statement: #3759 changes how the sub-select
+finds its 500 rows, this one changes how the delete reaches them. They
+compose as `ctid = ANY(ARRAY(SELECT ctid … ORDER BY … LIMIT 500))`. Both
+edit the same line, so this change should be re-measured on top of #3759
+once it lands. This PR's buffer counts include the re-scan in both columns.
 
 ## Reproduce
 
@@ -200,7 +203,7 @@ for n in 300000 1000000 3000000; do
     cargo test -p autumn-web --test integration_tests -- --ignored \
       retention_sweep_profile --nocapture --test-threads=1
 done
-docs/perf/retention-sweep/explain.sh postgres://postgres@localhost/retention
+docs/perf/retention-sweep-ctid/explain.sh postgres://postgres@localhost/retention
 ```
 
 Check out the baseline commit (the parent of the `ctid` change) for the
