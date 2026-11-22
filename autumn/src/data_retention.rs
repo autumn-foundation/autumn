@@ -938,8 +938,9 @@ const fn stale_row_predicate(dataset: RetentionDataset) -> Option<(&'static str,
     }
 }
 
-/// The primary-key column each sweepable table batches by.
-#[cfg(feature = "db")]
+/// The primary-key column each sweepable table batches by on `SQLite`.
+/// Postgres batches by `ctid` (see [`sweep_postgres`]).
+#[cfg(all(feature = "db", feature = "sqlite"))]
 const fn sweep_key_column(dataset: RetentionDataset) -> &'static str {
     match dataset {
         RetentionDataset::JobTracking => "key",
@@ -1053,7 +1054,6 @@ async fn sweep_postgres(
             format!("{dataset} is not a sweep-enforced dataset"),
         ));
     };
-    let key = sweep_key_column(dataset);
     let mut conn = pool.get().await.map_err(|e| {
         sweep_failed(
             0,
@@ -1075,13 +1075,20 @@ async fn sweep_postgres(
 
     // Batched deletes: never one unbounded DELETE over a hot table.
     //
+    // The batch names its rows by `ctid`, so the delete reads each row's heap page directly
+    // (a Tid Scan) instead of probing the primary key again for every row the sub-select found.
+    // The sub-select and the delete run in one statement, under one snapshot, so no row it
+    // names can be vacuumed away and its `ctid` reused in between.
+    //
     // The predicate is repeated on the outer delete so READ COMMITTED re-checks it: a row that
-    // stops qualifying after the sub-select (a dead letter replayed to `enqueued`) survives.
+    // stops qualifying after the sub-select (a dead letter replayed to `enqueued`) survives. A
+    // row updated after the sub-select has a new `ctid`, so this batch skips it and a later
+    // batch or run deletes it if it still qualifies. Every row deleted matches the predicate.
     let mut removed: u64 = 0;
     for _ in 0..SWEEP_MAX_BATCHES {
         let affected = diesel::sql_query(format!(
-            "DELETE FROM {table} WHERE {predicate} AND {key} IN \
-             (SELECT {key} FROM {table} WHERE {predicate} LIMIT $2)"
+            "DELETE FROM {table} WHERE {predicate} AND ctid = ANY(ARRAY(\
+             SELECT ctid FROM {table} WHERE {predicate} LIMIT $2))"
         ))
         .bind::<diesel::sql_types::Timestamptz, _>(crate::db::SqlTimestamp(cutoff))
         .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
