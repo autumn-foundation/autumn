@@ -1,0 +1,47 @@
+server: PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+fixture: autumn_jobs rows=3000000 dead=119793 heap=700MB indexes=444MB
+fixture: autumn_repository_commit_hooks rows=750000 dead=29172 heap=204MB indexes=73MB
+fixture: autumn_job_tracking rows=750000 dead=29778 heap=152MB indexes=97MB
+fixture: autumn_experiment_assignments rows=3000000 dead=120000 heap=227MB indexes=507MB
+=== job_history (autumn_jobs) ===
+ calls     rows   buffers       hit  temp   wal_bytes  statement
+  1000   500000   3024169   2979504     0   149630874  DELETE FROM autumn_jobs WHERE status IN ($3, $4, $5) AND finished_at IS NOT NULL AND finished_at < $1 AND NOT (unique_key IS NOT NULL AND unique_window = $6) AND id IN (SELECT id FROM autumn
+     2        2    179356     18663     0      757494  SELECT COUNT(*) AS count FROM autumn_jobs WHERE status IN ($2, $3, $4) AND finished_at IS NOT NULL AND finished_at < $1 AND NOT (unique_key IS NOT NULL AND unique_window = $5)
+     1        1         0         0     0           0  SELECT NOW() - make_interval(secs => $1) AS cutoff
+     1        0         0         0     0           0  SET CLIENT_ENCODING TO 'UTF8'
+     1        0         0         0     0           0  SET TIME ZONE 'UTC'
+-- total: statements=1005 buffers=3203525 temp=0 statement_wal=150388368 --
+-- report: eligible=Some(542452) removed=500000 truncated=true --
+-- autumn_jobs: seq_scan=919 seq_tup_read=5085031 idx_scan=458828 n_tup_del=457000 --
+-- survivors: 2500000 rows, md5 818d808643bcd9731ccaad32348a7366 --
+=== commit_hooks (autumn_repository_commit_hooks) ===
+ calls     rows   buffers       hit  temp   wal_bytes  statement
+   276   137042    783839    776630     0    47008814  DELETE FROM autumn_repository_commit_hooks WHERE status IN ($3, $4, $5) AND finished_at IS NOT NULL AND finished_at < $1 AND id IN (SELECT id FROM autumn_repository_commit_hooks WHERE status
+     2        2     18468     13065     0           0  SELECT COUNT(*) AS count FROM autumn_repository_commit_hooks WHERE status IN ($2, $3, $4) AND finished_at IS NOT NULL AND finished_at < $1
+     1        1         0         0     0           0  SELECT $1
+     1        1         0         0     0           0  SELECT NOW() - make_interval(secs => $1) AS cutoff
+-- total: statements=280 buffers=802307 temp=0 statement_wal=47008814 --
+-- report: eligible=Some(137042) removed=137042 truncated=false --
+-- autumn_repository_commit_hooks: seq_scan=0 seq_tup_read=0 idx_scan=92050 n_tup_del=91500 --
+-- survivors: 612958 rows, md5 32066b22370820415096f7b9f53efd68 --
+=== job_tracking (autumn_job_tracking) ===
+ calls     rows   buffers       hit  temp   wal_bytes  statement
+   342   170196   1005198    996865     0    44627218  DELETE FROM autumn_job_tracking WHERE updated_at < $1 AND key IN (SELECT key FROM autumn_job_tracking WHERE updated_at < $1 LIMIT $2)
+     2        2     31354     26461     0           0  SELECT COUNT(*) AS count FROM autumn_job_tracking WHERE updated_at < $1
+     1        1         0         0     0           0  SELECT $1
+     1        1         0         0     0           0  SELECT NOW() - make_interval(secs => $1) AS cutoff
+-- total: statements=346 buffers=1036552 temp=0 statement_wal=44627218 --
+-- report: eligible=Some(170196) removed=170196 truncated=false --
+-- autumn_job_tracking: seq_scan=0 seq_tup_read=0 idx_scan=88533 n_tup_del=88000 --
+-- survivors: 579804 rows, md5 d1b118924d03caa82ee29bf6927ddcce --
+=== experiment_assignments (autumn_experiment_assignments) ===
+ calls     rows   buffers       hit  temp   wal_bytes  statement
+  1000   500000   2519333   2507931     0    97312380  DELETE FROM autumn_experiment_assignments WHERE assigned_at < $1 AND NOT EXISTS ( SELECT $3 FROM autumn_experiments e WHERE e.name = autumn_experiment_assignments.experiment AND e.state IN (
+     2        2     58592      9184     0      371746  SELECT COUNT(*) AS count FROM autumn_experiment_assignments WHERE assigned_at < $1 AND NOT EXISTS ( SELECT $2 FROM autumn_experiments e WHERE e.name = autumn_experiment_assignments.experimen
+     1        1         0         0     0           0  SELECT $1
+     1        1         0         0     0           0  SELECT NOW() - make_interval(secs => $1) AS cutoff
+-- total: statements=1004 buffers=2577925 temp=0 statement_wal=97684126 --
+-- report: eligible=Some(1278924) removed=500000 truncated=true --
+-- autumn_experiment_assignments: seq_scan=915 seq_tup_read=5637566 idx_scan=456820 n_tup_del=455000 --
+-- survivors: 2500000 rows, md5 d2eacec05de0081e20afcfbcc37881a3 --
+ok
