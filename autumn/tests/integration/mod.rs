@@ -485,6 +485,8 @@ mod request_id_propagation;
 mod request_timeout;
 #[cfg(feature = "db")]
 mod retention;
+#[cfg(all(feature = "db", feature = "postgres"))]
+mod retention_sweep_profile;
 #[cfg(all(feature = "markdown", feature = "maud"))]
 mod rich_text;
 mod route_macro;
