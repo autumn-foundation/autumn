@@ -11,13 +11,18 @@
 //!
 //! - **Every quantile is within `α` of the true sample at its rank**, whatever
 //!   the shape of the data: long tails, bursts and bimodal latency included.
-//! - **Sketches merge exactly.** Two sketches of the same accuracy add bucket
-//!   by bucket, and the sum equals the sketch of both streams. Each pod can
+//! - **Sketches merge exactly.** Two sketches of the same accuracy and cap
+//!   add bucket by bucket, and the sum equals the sketch of both streams
+//!   (see [`DdSketch::merge`] for folded sketches). Each pod can
 //!   sketch its own traffic and a reporter adds them up, which an average of
 //!   per-pod percentiles can never do.
 //! - **Memory is capped.** Past `max_buckets` the two lowest buckets fold
-//!   together. The low end loses accuracy first, the tail never does, and the
-//!   tail is what a latency SLO reads.
+//!   together, so the low end loses accuracy first. A quantile whose rank
+//!   falls in the folded bucket loses its guarantee, whatever `q` is: if 99 %
+//!   of the samples sit below the kept range, p99 reads high too. Quantiles
+//!   ranked above the folded bucket keep it. [`DdSketch::is_collapsed`] says
+//!   when folding has happened; at 1 % accuracy the default cap covers a
+//!   nanosecond to over a decade, so request latencies never fold.
 //!
 //! The rank of quantile `q` over `n` samples is `floor(q * (n - 1))`. `q = 0`
 //! and `q = 1` return the exact minimum and maximum. Zero has its own bucket.
@@ -69,7 +74,7 @@ pub const MIN_RELATIVE_ACCURACY: f64 = 1e-4;
 /// The coarsest accuracy a sketch takes: 50 %.
 pub const MAX_RELATIVE_ACCURACY: f64 = 0.5;
 /// The default bucket cap. At 1 % accuracy, 2048 buckets cover values from
-/// one nanosecond to over a century without folding.
+/// one nanosecond to over a decade without folding.
 pub const DEFAULT_MAX_BUCKETS: usize = 2048;
 
 /// [`DdSketch::merge`] refused a sketch of another accuracy: their buckets
@@ -98,8 +103,9 @@ impl std::error::Error for IncompatibleSketch {}
 #[derive(Debug, Clone, PartialEq)]
 pub struct DdSketch {
     alpha: f64,
-    gamma: f64,
     ln_gamma: f64,
+    /// `ln(2 / (γ + 1))`: bucket `k` is reported as `exp(k ln γ + ln_offset)`.
+    ln_offset: f64,
     max_buckets: usize,
     buckets: BTreeMap<i32, u64>,
     zeros: u64,
@@ -124,8 +130,8 @@ impl DdSketch {
         let gamma = (1.0 + alpha) / (1.0 - alpha);
         Self {
             alpha,
-            gamma,
             ln_gamma: gamma.ln(),
+            ln_offset: (2.0 / (gamma + 1.0)).ln(),
             max_buckets: DEFAULT_MAX_BUCKETS,
             buckets: BTreeMap::new(),
             zeros: 0,
@@ -162,8 +168,9 @@ impl DdSketch {
         self.buckets.len()
     }
 
-    /// Whether the cap has folded low buckets together. Quantiles at the low
-    /// end may then read high; the tail keeps its accuracy.
+    /// Whether the cap has folded low buckets together. A quantile whose rank
+    /// falls in the folded (lowest) bucket may then read high; quantiles
+    /// ranked above it keep their accuracy.
     #[must_use]
     pub const fn is_collapsed(&self) -> bool {
         self.collapsed
@@ -250,7 +257,10 @@ impl DdSketch {
     }
 
     /// Adds `other` into this sketch. The result equals the sketch of both
-    /// streams, folded to this sketch's cap.
+    /// streams, folded to this sketch's cap, when `other` has not folded or
+    /// this cap is no larger than `other`'s. A folded `other` merged under a
+    /// larger cap keeps its folded mass in its lowest bucket, so quantiles
+    /// ranked there stay as inaccurate as they were in `other`.
     ///
     /// # Errors
     ///
@@ -300,7 +310,10 @@ impl DdSketch {
     }
 
     fn value(&self, key: i32) -> f64 {
-        2.0 * (f64::from(key) * self.ln_gamma).exp() / (self.gamma + 1.0)
+        // `2 γ^k / (γ + 1)` in one exponent: `γ^k` alone overflows for the
+        // top buckets of the f64 range, while the representative itself
+        // stays within `α` of the values in its bucket.
+        f64::from(key).mul_add(self.ln_gamma, self.ln_offset).exp()
     }
 
     fn fold_to_cap(&mut self) {
@@ -581,6 +594,31 @@ mod tests {
             assert_relative(got, exact(&values, q), alpha);
         }
         assert_eq!(sketch.quantile(0.0), sketch.min());
+    }
+
+    #[test]
+    fn values_near_f64_max_keep_their_accuracy() {
+        let mut sketch = DdSketch::new(0.01);
+        for x in [1e308, 1e308, 1.7e308] {
+            sketch.observe(x);
+        }
+        assert_relative(sketch.quantile(0.5).expect("non-empty"), 1e308, 0.01);
+    }
+
+    /// A merge is exact when the recipient's cap is no larger than the cap
+    /// the other sketch folded under.
+    #[test]
+    fn merging_a_folded_sketch_is_exact_at_its_cap_or_below() {
+        let values = [1.0, 1.0, 1e3, 1e6];
+        let mut folded = DdSketch::new(0.01).with_max_buckets(2);
+        let mut whole = DdSketch::new(0.01).with_max_buckets(2);
+        for x in values {
+            folded.observe(x);
+            whole.observe(x);
+        }
+        let mut recipient = DdSketch::new(0.01).with_max_buckets(2);
+        recipient.merge(&folded).expect("same accuracy");
+        assert_eq!(recipient, whole);
     }
 
     #[test]
