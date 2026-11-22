@@ -1,0 +1,318 @@
+--- autumn_jobs: by key (before)
+                                                                                                                                                      QUERY PLAN                                                                                                                                                      
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_jobs  (cost=154.30..4431.88 rows=0 width=0) (actual time=11.677..11.680 rows=0 loops=1)
+   Buffers: shared hit=2458 read=1999 dirtied=16
+   I/O Timings: shared read=5.870
+   ->  Nested Loop  (cost=154.30..4431.88 rows=91 width=63) (actual time=5.191..11.380 rows=500 loops=1)
+         Output: autumn_jobs.ctid, "ANY_subquery".*
+         Inner Unique: true
+         Buffers: shared hit=1958 read=1999
+         I/O Timings: shared read=5.870
+         ->  HashAggregate  (cost=153.74..158.74 rows=500 width=90) (actual time=5.144..5.280 rows=500 loops=1)
+               Output: "ANY_subquery".*, "ANY_subquery".id
+               Group Key: "ANY_subquery".id
+               Batches: 1  Memory Usage: 169kB
+               Buffers: shared hit=193 read=1264
+               I/O Timings: shared read=2.279
+               ->  Subquery Scan on "ANY_subquery"  (cost=0.00..152.49 rows=500 width=90) (actual time=4.664..4.946 rows=500 loops=1)
+                     Output: "ANY_subquery".*, "ANY_subquery".id
+                     Buffers: shared hit=193 read=1264
+                     I/O Timings: shared read=2.279
+                     ->  Limit  (cost=0.00..147.49 rows=500 width=33) (actual time=4.642..4.850 rows=500 loops=1)
+                           Output: autumn_jobs_1.id
+                           Buffers: shared hit=193 read=1264
+                           I/O Timings: shared read=2.279
+                           ->  Seq Scan on public.autumn_jobs autumn_jobs_1  (cost=0.00..160927.27 rows=545548 width=33) (actual time=4.640..4.814 rows=500 loops=1)
+                                 Output: autumn_jobs_1.id
+                                 Filter: ((autumn_jobs_1.finished_at IS NOT NULL) AND ((autumn_jobs_1.unique_key IS NULL) OR (autumn_jobs_1.unique_window <> 'ttl'::text)) AND (autumn_jobs_1.status = ANY ('{completed,failed,discarded}'::text[])) AND (autumn_jobs_1.finished_at < (now() - '30 days'::interval)))
+                                 Rows Removed by Filter: 2430
+                                 Buffers: shared hit=193 read=1264
+                                 I/O Timings: shared read=2.279
+         ->  Index Scan using autumn_jobs_pkey on public.autumn_jobs  (cost=0.56..8.55 rows=1 width=39) (actual time=0.012..0.012 rows=1 loops=500)
+               Output: autumn_jobs.ctid, autumn_jobs.id
+               Index Cond: (autumn_jobs.id = "ANY_subquery".id)
+               Filter: ((autumn_jobs.finished_at IS NOT NULL) AND ((autumn_jobs.unique_key IS NULL) OR (autumn_jobs.unique_window <> 'ttl'::text)) AND (autumn_jobs.status = ANY ('{completed,failed,discarded}'::text[])) AND (autumn_jobs.finished_at < (now() - '30 days'::interval)))
+               Buffers: shared hit=1765 read=735
+               I/O Timings: shared read=3.591
+ Query Identifier: 7849971211916660973
+ Planning:
+   Buffers: shared hit=338 read=30
+   I/O Timings: shared read=0.164
+ Planning Time: 1.286 ms
+ Execution Time: 11.861 ms
+(40 rows)
+
+--- autumn_jobs: by ctid (after)
+                                                                                                                                              QUERY PLAN                                                                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_jobs  (cost=147.50..187.74 rows=0 width=0) (actual time=0.802..0.803 rows=0 loops=1)
+   Buffers: shared hit=1005 read=11 dirtied=15
+   I/O Timings: shared read=0.048
+   InitPlan 1 (returns $0)
+     ->  Limit  (cost=0.00..147.49 rows=500 width=6) (actual time=0.019..0.292 rows=500 loops=1)
+           Output: autumn_jobs_1.ctid
+           Buffers: shared hit=5 read=11
+           I/O Timings: shared read=0.048
+           ->  Seq Scan on public.autumn_jobs autumn_jobs_1  (cost=0.00..160927.27 rows=545548 width=6) (actual time=0.018..0.225 rows=500 loops=1)
+                 Output: autumn_jobs_1.ctid
+                 Filter: ((autumn_jobs_1.finished_at IS NOT NULL) AND ((autumn_jobs_1.unique_key IS NULL) OR (autumn_jobs_1.unique_window <> 'ttl'::text)) AND (autumn_jobs_1.status = ANY ('{completed,failed,discarded}'::text[])) AND (autumn_jobs_1.finished_at < (now() - '30 days'::interval)))
+                 Rows Removed by Filter: 26
+                 Buffers: shared hit=5 read=11
+                 I/O Timings: shared read=0.048
+   ->  Tid Scan on public.autumn_jobs  (cost=0.01..40.25 rows=2 width=6) (actual time=0.340..0.555 rows=500 loops=1)
+         Output: autumn_jobs.ctid
+         TID Cond: (autumn_jobs.ctid = ANY ($0))
+         Filter: ((autumn_jobs.finished_at IS NOT NULL) AND ((autumn_jobs.unique_key IS NULL) OR (autumn_jobs.unique_window <> 'ttl'::text)) AND (autumn_jobs.status = ANY ('{completed,failed,discarded}'::text[])) AND (autumn_jobs.finished_at < (now() - '30 days'::interval)))
+         Buffers: shared hit=505 read=11
+         I/O Timings: shared read=0.048
+ Query Identifier: 6355343214799500375
+ Planning:
+   Buffers: shared hit=325
+ Planning Time: 0.864 ms
+ Execution Time: 0.869 ms
+(25 rows)
+
+--- autumn_repository_commit_hooks: by key (before)
+                                                                                                                              QUERY PLAN                                                                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_repository_commit_hooks  (cost=96.81..4248.32 rows=0 width=0) (actual time=1.676..1.679 rows=0 loops=1)
+   Buffers: shared hit=382
+   ->  Nested Loop  (cost=96.81..4248.32 rows=83 width=63) (actual time=1.674..1.676 rows=0 loops=1)
+         Output: autumn_repository_commit_hooks.ctid, "ANY_subquery".*
+         Inner Unique: true
+         Buffers: shared hit=382
+         ->  HashAggregate  (cost=96.38..101.38 rows=500 width=90) (actual time=1.673..1.675 rows=0 loops=1)
+               Output: "ANY_subquery".*, "ANY_subquery".id
+               Group Key: "ANY_subquery".id
+               Batches: 1  Memory Usage: 49kB
+               Buffers: shared hit=382
+               ->  Subquery Scan on "ANY_subquery"  (cost=0.43..95.13 rows=500 width=90) (actual time=1.666..1.668 rows=0 loops=1)
+                     Output: "ANY_subquery".*, "ANY_subquery".id
+                     Buffers: shared hit=382
+                     ->  Limit  (cost=0.43..90.13 rows=500 width=33) (actual time=1.665..1.666 rows=0 loops=1)
+                           Output: autumn_repository_commit_hooks_1.id
+                           Buffers: shared hit=382
+                           ->  Index Scan using idx_autumn_commit_hooks_finished on public.autumn_repository_commit_hooks autumn_repository_commit_hooks_1  (cost=0.43..22383.98 rows=124763 width=33) (actual time=1.664..1.665 rows=0 loops=1)
+                                 Output: autumn_repository_commit_hooks_1.id
+                                 Index Cond: ((autumn_repository_commit_hooks_1.finished_at IS NOT NULL) AND (autumn_repository_commit_hooks_1.finished_at < (now() - '30 days'::interval)))
+                                 Buffers: shared hit=382
+         ->  Index Scan using autumn_repository_commit_hooks_pkey on public.autumn_repository_commit_hooks  (cost=0.42..8.29 rows=1 width=39) (never executed)
+               Output: autumn_repository_commit_hooks.ctid, autumn_repository_commit_hooks.id
+               Index Cond: (autumn_repository_commit_hooks.id = "ANY_subquery".id)
+               Filter: ((autumn_repository_commit_hooks.finished_at IS NOT NULL) AND (autumn_repository_commit_hooks.status = ANY ('{completed,failed,after_hook_failed}'::text[])) AND (autumn_repository_commit_hooks.finished_at < (now() - '30 days'::interval)))
+ Query Identifier: -955874462638480134
+ Planning:
+   Buffers: shared hit=302 read=9
+   I/O Timings: shared read=0.054
+ Planning Time: 1.033 ms
+ Execution Time: 1.864 ms
+(31 rows)
+
+--- autumn_repository_commit_hooks: by ctid (after)
+                                                                                                                           QUERY PLAN                                                                                                                           
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_repository_commit_hooks  (cost=90.15..130.36 rows=0 width=0) (actual time=1.520..1.521 rows=0 loops=1)
+   Buffers: shared hit=382
+   InitPlan 1 (returns $0)
+     ->  Limit  (cost=0.43..90.13 rows=500 width=6) (actual time=1.505..1.506 rows=0 loops=1)
+           Output: autumn_repository_commit_hooks_1.ctid
+           Buffers: shared hit=382
+           ->  Index Scan using idx_autumn_commit_hooks_finished on public.autumn_repository_commit_hooks autumn_repository_commit_hooks_1  (cost=0.43..22383.98 rows=124763 width=6) (actual time=1.504..1.504 rows=0 loops=1)
+                 Output: autumn_repository_commit_hooks_1.ctid
+                 Index Cond: ((autumn_repository_commit_hooks_1.finished_at IS NOT NULL) AND (autumn_repository_commit_hooks_1.finished_at < (now() - '30 days'::interval)))
+                 Buffers: shared hit=382
+   ->  Tid Scan on public.autumn_repository_commit_hooks  (cost=0.01..40.23 rows=2 width=6) (actual time=1.516..1.516 rows=0 loops=1)
+         Output: autumn_repository_commit_hooks.ctid
+         TID Cond: (autumn_repository_commit_hooks.ctid = ANY ($0))
+         Filter: ((autumn_repository_commit_hooks.finished_at IS NOT NULL) AND (autumn_repository_commit_hooks.status = ANY ('{completed,failed,after_hook_failed}'::text[])) AND (autumn_repository_commit_hooks.finished_at < (now() - '30 days'::interval)))
+         Buffers: shared hit=382
+ Query Identifier: 4559442879475996479
+ Planning:
+   Buffers: shared hit=258
+ Planning Time: 0.758 ms
+ Execution Time: 1.588 ms
+(20 rows)
+
+--- autumn_job_tracking: by key (before)
+                                                                                                         QUERY PLAN                                                                                                          
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_job_tracking  (cost=67.11..4216.73 rows=0 width=0) (actual time=1.917..1.920 rows=0 loops=1)
+   Buffers: shared hit=468
+   ->  Nested Loop  (cost=67.11..4216.73 rows=113 width=76) (actual time=1.914..1.917 rows=0 loops=1)
+         Output: autumn_job_tracking.ctid, "ANY_subquery".*
+         Inner Unique: true
+         Buffers: shared hit=468
+         ->  HashAggregate  (cost=66.68..71.68 rows=500 width=116) (actual time=1.914..1.916 rows=0 loops=1)
+               Output: "ANY_subquery".*, "ANY_subquery".key
+               Group Key: "ANY_subquery".key
+               Batches: 1  Memory Usage: 49kB
+               Buffers: shared hit=468
+               ->  Subquery Scan on "ANY_subquery"  (cost=0.43..65.43 rows=500 width=116) (actual time=1.906..1.907 rows=0 loops=1)
+                     Output: "ANY_subquery".*, "ANY_subquery".key
+                     Buffers: shared hit=468
+                     ->  Limit  (cost=0.43..60.43 rows=500 width=46) (actual time=1.904..1.905 rows=0 loops=1)
+                           Output: autumn_job_tracking_1.key
+                           Buffers: shared hit=468
+                           ->  Index Scan using idx_autumn_job_tracking_updated_at on public.autumn_job_tracking autumn_job_tracking_1  (cost=0.43..20290.98 rows=169081 width=46) (actual time=1.903..1.903 rows=0 loops=1)
+                                 Output: autumn_job_tracking_1.key
+                                 Index Cond: (autumn_job_tracking_1.updated_at < (now() - '7 days'::interval))
+                                 Buffers: shared hit=468
+         ->  Index Scan using autumn_job_tracking_pkey on public.autumn_job_tracking  (cost=0.42..8.29 rows=1 width=52) (never executed)
+               Output: autumn_job_tracking.ctid, autumn_job_tracking.key
+               Index Cond: (autumn_job_tracking.key = "ANY_subquery".key)
+               Filter: (autumn_job_tracking.updated_at < (now() - '7 days'::interval))
+ Query Identifier: 8138301687475620722
+ Planning:
+   Buffers: shared hit=253
+ Planning Time: 0.889 ms
+ Execution Time: 2.044 ms
+(30 rows)
+
+--- autumn_job_tracking: by ctid (after)
+                                                                                                 QUERY PLAN                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_job_tracking  (cost=60.44..100.62 rows=0 width=0) (actual time=1.808..1.810 rows=0 loops=1)
+   Buffers: shared hit=468
+   InitPlan 1 (returns $0)
+     ->  Limit  (cost=0.43..60.43 rows=500 width=6) (actual time=1.795..1.796 rows=0 loops=1)
+           Output: autumn_job_tracking_1.ctid
+           Buffers: shared hit=468
+           ->  Index Scan using idx_autumn_job_tracking_updated_at on public.autumn_job_tracking autumn_job_tracking_1  (cost=0.43..20290.98 rows=169081 width=6) (actual time=1.793..1.794 rows=0 loops=1)
+                 Output: autumn_job_tracking_1.ctid
+                 Index Cond: (autumn_job_tracking_1.updated_at < (now() - '7 days'::interval))
+                 Buffers: shared hit=468
+   ->  Tid Scan on public.autumn_job_tracking  (cost=0.01..40.19 rows=2 width=6) (actual time=1.806..1.807 rows=0 loops=1)
+         Output: autumn_job_tracking.ctid
+         TID Cond: (autumn_job_tracking.ctid = ANY ($0))
+         Filter: (autumn_job_tracking.updated_at < (now() - '7 days'::interval))
+         Buffers: shared hit=468
+ Query Identifier: 1433074479909131242
+ Planning:
+   Buffers: shared hit=138
+ Planning Time: 0.571 ms
+ Execution Time: 1.877 ms
+(20 rows)
+
+--- autumn_experiment_assignments: by key (before)
+                                                                                                                                                  QUERY PLAN                                                                                                                                                  
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_experiment_assignments  (cost=45.69..4209.36 rows=0 width=0) (actual time=1.637..1.640 rows=0 loops=1)
+   Buffers: shared hit=2500 read=12 dirtied=9
+   I/O Timings: shared read=0.057
+   ->  Hash Anti Join  (cost=45.69..4209.36 rows=242 width=44) (actual time=0.713..1.443 rows=500 loops=1)
+         Output: autumn_experiment_assignments.ctid, e.ctid, "ANY_subquery".*
+         Hash Cond: (autumn_experiment_assignments.experiment = e.name)
+         Buffers: shared hit=2000 read=12
+         I/O Timings: shared read=0.057
+         ->  Nested Loop  (cost=43.97..4204.04 rows=387 width=44) (actual time=0.687..1.350 rows=500 loops=1)
+               Output: autumn_experiment_assignments.ctid, autumn_experiment_assignments.experiment, "ANY_subquery".*
+               Inner Unique: true
+               Buffers: shared hit=1999 read=12
+               I/O Timings: shared read=0.057
+               ->  HashAggregate  (cost=43.54..48.54 rows=500 width=40) (actual time=0.663..0.715 rows=500 loops=1)
+                     Output: "ANY_subquery".*, "ANY_subquery".id
+                     Group Key: "ANY_subquery".id
+                     Batches: 1  Memory Usage: 105kB
+                     Buffers: shared hit=2 read=9
+                     I/O Timings: shared read=0.044
+                     ->  Subquery Scan on "ANY_subquery"  (cost=1.72..42.29 rows=500 width=40) (actual time=0.082..0.556 rows=500 loops=1)
+                           Output: "ANY_subquery".*, "ANY_subquery".id
+                           Buffers: shared hit=2 read=9
+                           I/O Timings: shared read=0.044
+                           ->  Limit  (cost=1.72..37.29 rows=500 width=8) (actual time=0.062..0.430 rows=500 loops=1)
+                                 Output: autumn_experiment_assignments_1.id
+                                 Buffers: shared hit=2 read=9
+                                 I/O Timings: shared read=0.044
+                                 ->  Hash Anti Join  (cost=1.72..103254.52 rows=1451684 width=8) (actual time=0.062..0.394 rows=500 loops=1)
+                                       Output: autumn_experiment_assignments_1.id
+                                       Hash Cond: (autumn_experiment_assignments_1.experiment = e_1.name)
+                                       Buffers: shared hit=2 read=9
+                                       I/O Timings: shared read=0.044
+                                       ->  Seq Scan on public.autumn_experiment_assignments autumn_experiment_assignments_1  (cost=0.00..81659.00 rows=2322694 width=14) (actual time=0.023..0.254 rows=937 loops=1)
+                                             Output: autumn_experiment_assignments_1.id, autumn_experiment_assignments_1.experiment, autumn_experiment_assignments_1.actor, autumn_experiment_assignments_1.variant, autumn_experiment_assignments_1.is_override, autumn_experiment_assignments_1.assigned_at
+                                             Filter: (autumn_experiment_assignments_1.assigned_at < (now() - '90 days'::interval))
+                                             Buffers: shared hit=1 read=9
+                                             I/O Timings: shared read=0.044
+                                       ->  Hash  (cost=1.54..1.54 rows=15 width=6) (actual time=0.016..0.017 rows=15 loops=1)
+                                             Output: e_1.name
+                                             Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                             Buffers: shared hit=1
+                                             ->  Seq Scan on public.autumn_experiments e_1  (cost=0.00..1.54 rows=15 width=6) (actual time=0.006..0.007 rows=15 loops=1)
+                                                   Output: e_1.name
+                                                   Filter: (e_1.state = ANY ('{draft,running,concluded}'::autumn_experiment_state[]))
+                                                   Rows Removed by Filter: 24
+                                                   Buffers: shared hit=1
+               ->  Index Scan using autumn_experiment_assignments_pkey on public.autumn_experiment_assignments  (cost=0.43..8.31 rows=1 width=20) (actual time=0.001..0.001 rows=1 loops=500)
+                     Output: autumn_experiment_assignments.ctid, autumn_experiment_assignments.experiment, autumn_experiment_assignments.id
+                     Index Cond: (autumn_experiment_assignments.id = "ANY_subquery".id)
+                     Filter: (autumn_experiment_assignments.assigned_at < (now() - '90 days'::interval))
+                     Buffers: shared hit=1997 read=3
+                     I/O Timings: shared read=0.013
+         ->  Hash  (cost=1.54..1.54 rows=15 width=12) (actual time=0.011..0.011 rows=15 loops=1)
+               Output: e.ctid, e.name
+               Buckets: 1024  Batches: 1  Memory Usage: 9kB
+               Buffers: shared hit=1
+               ->  Seq Scan on public.autumn_experiments e  (cost=0.00..1.54 rows=15 width=12) (actual time=0.004..0.006 rows=15 loops=1)
+                     Output: e.ctid, e.name
+                     Filter: (e.state = ANY ('{draft,running,concluded}'::autumn_experiment_state[]))
+                     Rows Removed by Filter: 24
+                     Buffers: shared hit=1
+ Query Identifier: 6530088332930331188
+ Planning:
+   Buffers: shared hit=449
+ Planning Time: 1.262 ms
+ Execution Time: 1.788 ms
+(66 rows)
+
+--- autumn_experiment_assignments: by ctid (after)
+                                                                                          QUERY PLAN                                                                                           
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_experiment_assignments  (cost=39.02..79.27 rows=0 width=0) (actual time=0.872..0.874 rows=0 loops=1)
+   Buffers: shared hit=1012
+   InitPlan 1 (returns $0)
+     ->  Limit  (cost=1.72..37.29 rows=500 width=6) (actual time=0.102..0.459 rows=500 loops=1)
+           Output: autumn_experiment_assignments_1.ctid
+           Buffers: shared hit=11
+           ->  Hash Anti Join  (cost=1.72..103254.52 rows=1451684 width=6) (actual time=0.101..0.423 rows=500 loops=1)
+                 Output: autumn_experiment_assignments_1.ctid
+                 Hash Cond: (autumn_experiment_assignments_1.experiment = e_1.name)
+                 Buffers: shared hit=11
+                 ->  Seq Scan on public.autumn_experiment_assignments autumn_experiment_assignments_1  (cost=0.00..81659.00 rows=2322694 width=12) (actual time=0.020..0.253 rows=937 loops=1)
+                       Output: autumn_experiment_assignments_1.ctid, autumn_experiment_assignments_1.experiment
+                       Filter: (autumn_experiment_assignments_1.assigned_at < (now() - '90 days'::interval))
+                       Buffers: shared hit=10
+                 ->  Hash  (cost=1.54..1.54 rows=15 width=6) (actual time=0.022..0.023 rows=15 loops=1)
+                       Output: e_1.name
+                       Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                       Buffers: shared hit=1
+                       ->  Seq Scan on public.autumn_experiments e_1  (cost=0.00..1.54 rows=15 width=6) (actual time=0.007..0.009 rows=15 loops=1)
+                             Output: e_1.name
+                             Filter: (e_1.state = ANY ('{draft,running,concluded}'::autumn_experiment_state[]))
+                             Rows Removed by Filter: 24
+                             Buffers: shared hit=1
+   ->  Hash Anti Join  (cost=1.74..41.99 rows=5 width=12) (actual time=0.530..0.703 rows=500 loops=1)
+         Output: autumn_experiment_assignments.ctid, e.ctid
+         Hash Cond: (autumn_experiment_assignments.experiment = e.name)
+         Buffers: shared hit=512
+         ->  Tid Scan on public.autumn_experiment_assignments  (cost=0.01..40.19 rows=8 width=12) (actual time=0.513..0.631 rows=500 loops=1)
+               Output: autumn_experiment_assignments.ctid, autumn_experiment_assignments.experiment
+               TID Cond: (autumn_experiment_assignments.ctid = ANY ($0))
+               Filter: (autumn_experiment_assignments.assigned_at < (now() - '90 days'::interval))
+               Buffers: shared hit=511
+         ->  Hash  (cost=1.54..1.54 rows=15 width=12) (actual time=0.009..0.009 rows=15 loops=1)
+               Output: e.ctid, e.name
+               Buckets: 1024  Batches: 1  Memory Usage: 9kB
+               Buffers: shared hit=1
+               ->  Seq Scan on public.autumn_experiments e  (cost=0.00..1.54 rows=15 width=12) (actual time=0.004..0.005 rows=15 loops=1)
+                     Output: e.ctid, e.name
+                     Filter: (e.state = ANY ('{draft,running,concluded}'::autumn_experiment_state[]))
+                     Rows Removed by Filter: 24
+                     Buffers: shared hit=1
+ Query Identifier: -1429258334763245081
+ Planning:
+   Buffers: shared hit=402
+ Planning Time: 0.901 ms
+ Execution Time: 1.001 ms
+(46 rows)
+
