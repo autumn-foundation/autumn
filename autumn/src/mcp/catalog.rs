@@ -368,7 +368,12 @@ pub fn search(tools: &[McpTool], index: &[ToolWords], args: &SearchArgs) -> Valu
         .take(args.limit)
         .map(|(_, tool)| entry(tool, args.detail))
         .collect();
-    json!({ "total": hits.len(), "tools": entries })
+    // Built by hand: `json!` would run `to_value` over `entries` and deep-copy
+    // every entry just to drop the original.
+    let mut result = serde_json::Map::with_capacity(2);
+    result.insert("total".into(), Value::from(hits.len()));
+    result.insert("tools".into(), Value::Array(entries));
+    Value::Object(result)
 }
 
 /// The search result entry of one tool.
