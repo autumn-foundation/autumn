@@ -2932,6 +2932,24 @@ let today = visitors.take();                        // fresh window, old sketch 
 fleet_total.merge(&HyperLogLog::from_bytes(&peer_bytes).unwrap())?;
 ```
 
+### Quantiles of a stream — `quantiles` (unreleased)
+
+For the p50/p99/p999 of latencies, sizes or job durations without keeping
+every sample, use `autumn_web::quantiles::QuantileMeter` (no feature, std
+only). It is a DDSketch: every quantile is within a relative accuracy you pick
+(1 % by default) of the true sample, and min/max/count/sum are exact. Negative
+and non-finite values are refused. Sketches of one accuracy `merge` exactly, so
+the fleet's p99 comes from merging the replicas' sketches, never from averaging
+their p99s. `to_bytes`/`from_bytes` ship a sketch:
+
+```rust
+let latency = Arc::new(QuantileMeter::new(0.01));   // within 1 %
+latency.record(started.elapsed());                   // seconds
+let p99 = latency.quantile(0.99);                    // Option<f64>
+let minute = latency.take();                         // fresh window, old sketch back
+fleet.merge(&QuantileSketch::from_bytes(&peer_bytes).unwrap())?;
+```
+
 ### Runtime log levels (0.6.0)
 
 `PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
