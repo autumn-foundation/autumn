@@ -2932,6 +2932,24 @@ let today = visitors.take();                        // fresh window, old sketch 
 fleet_total.merge(&HyperLogLog::from_bytes(&peer_bytes).unwrap())?;
 ```
 
+### Percentiles of a stream — `quantiles` (unreleased)
+
+To report p50/p99/p99.9 latency or payload size without keeping every sample,
+use `autumn_web::quantiles::Quantiles` (no feature, std only). It is a
+DDSketch: every quantile is within the relative accuracy you pass (`0.01` =
+1 %) of the true sample at its rank, and min/max are exact. Sketches of the
+same accuracy `merge` exactly, so each replica sketches its own traffic and
+the merged sketch gives the fleet's percentiles — averaging per-pod p99s
+cannot:
+
+```rust
+let latency = Arc::new(Quantiles::new(0.01));
+latency.observe_duration(started.elapsed());
+let p99 = latency.quantile_duration(0.99);    // Option<Duration>
+let window = latency.take();                  // fresh window, old sketch back
+fleet.merge(&window)?;                        // IncompatibleSketch if accuracies differ
+```
+
 ### Runtime log levels (0.6.0)
 
 `PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
