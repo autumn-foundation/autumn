@@ -100,7 +100,7 @@ ignore = [
     # Review-by: 2026-12-05 (reconfirmed unreachable 2026-11-09: `rsa` 0.10.0
     # final now exists upstream but both consumers are still blocked from
     # taking it; see docs/reports/2026-11-09-ballast-dependency-ledger-audit.md).
-    { id = "RUSTSEC-2023-0071", reason = "verify-only; reaches this app only through jsonwebtoken's RSA-family JWT verification path (autumn-web `jwt` feature, default-on), never signing; rsa 0.10.0 final now exists but jsonwebtoken (^0.9) and webauthn-rs/crypto-glue (rc pin vs. final's mandatory sha2 feature) both block taking it; reconfirmed unreachable 2026-11-09; review-by 2026-12-05" },
+    { id = "RUSTSEC-2023-0071", reason = "verify-only; reaches this app only through jsonwebtoken's RSA-family JWT verification path (autumn-web `jwt` feature, default-on), never signing; rsa 0.10.0 final now exists; jsonwebtoken 12.0.0 has itself moved to rsa ^0.10 so it no longer blocks this, but webauthn-rs/crypto-glue (rc pin vs. final's mandatory sha2 feature) still does; reconfirmed unreachable 2026-11-23; review-by 2026-12-05" },
     # RUSTSEC-2026-0387 — `crypto-bigint` has secret-dependent branches in
     # nominally constant-time operations.
     # https://rustsec.org/advisories/RUSTSEC-2026-0387
@@ -111,9 +111,14 @@ ignore = [
     # ECDSA secrets; no network-reachable signing oracle. Drop this waiver when
     # `jsonwebtoken` moves to p256 0.14 (crypto-bigint 0.7), or when this app
     # leaves out autumn-web's `jwt` feature (and `oauth2`, which turns it on).
-    # Reconfirmed unchanged 2026-11-09 (jsonwebtoken still at latest 11.1.0,
-    # still on p256/p384 0.13). Review-by: 2026-11-23.
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.x via jsonwebtoken ES256/ES384 (autumn-web `jwt` feature, default-on) -> p256/p384 -> elliptic-curve 0.13; fix needs crypto-bigint >=0.7.6; reconfirmed unchanged 2026-11-09; review-by 2026-11-23" },
+    # jsonwebtoken 12.0.0 (2026-11-13) ships that p256/p384 0.14 move, but
+    # autumn-web can't take it yet: 12.0.0 also raises its own `rsa`
+    # requirement to ^0.10, which conflicts with webauthn-rs 0.6.2's
+    # crypto-glue 0.2.2, pinned to `rsa = "^0.10.0-rc.18", features =
+    # ["sha2"]` (a feature the final 0.10.0 release dropped). Rehearsed in
+    # the framework repo 2026-11-23: blocked on exactly that conflict.
+    # Review-by: 2026-12-05 (aligned with RUSTSEC-2023-0071's date below).
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.x via jsonwebtoken ES256/ES384 (autumn-web `jwt` feature, default-on) -> p256/p384 -> elliptic-curve 0.13; fix needs crypto-bigint >=0.7.6; jsonwebtoken 12.0.0 exists and fixes this but is blocked by webauthn-rs/crypto-glue's rsa ^0.10.0-rc.18 + sha2-feature pin (same blocker as RUSTSEC-2023-0071); review-by 2026-12-05" },
     # RUSTSEC-2026-0441 — `pin-utils` is unmaintained: no one fixes a new bug in it.
     # https://rustsec.org/advisories/RUSTSEC-2026-0441
     #
