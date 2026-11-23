@@ -133,7 +133,7 @@ runs:
         fi
     # v1 as of 2026-09-25.
     - if: runner.os != 'macOS'
-      uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed
+      uses: kunobi-ninja/kache-action@061011817fd04b0e460f79d6bb3c115b1fc8f029
       with:
         version: v2.0.0
         cache-key-prefix: ${{ steps.key.outputs.prefix }}
