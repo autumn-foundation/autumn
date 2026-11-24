@@ -1,0 +1,21 @@
+== 307f0404 (307f0404)
+autumn_jobs|987459|54838c27012bd224557f6e6c4ea7c1b5
+autumn_job_tracking|982114|fa86ce359aad95d59b03c47b39042d5b
+autumn_repository_commit_hooks|982132|8d4589156df7809c6137f141b0186143
+autumn_experiment_assignments|984443|80f3a7cb85cc733a0b44049c1d166ca9
+edge kept|edge-live-old edge-null-finished edge-null-window edge-ttl-unique
+edge kept hooks|edge-null-finished edge-pending-old
+edge kept assignments|edge:2 edge:3
+at cutoff kept|50|50|50
+stale left|0|0
+== 74470c05 (74470c05)
+autumn_jobs|987459|54838c27012bd224557f6e6c4ea7c1b5
+autumn_job_tracking|982114|fa86ce359aad95d59b03c47b39042d5b
+autumn_repository_commit_hooks|982132|8d4589156df7809c6137f141b0186143
+autumn_experiment_assignments|984443|80f3a7cb85cc733a0b44049c1d166ca9
+edge kept|edge-live-old edge-null-finished edge-null-window edge-ttl-unique
+edge kept hooks|edge-null-finished edge-pending-old
+edge kept assignments|edge:2 edge:3
+at cutoff kept|50|50|50
+stale left|0|0
+IDENTICAL

@@ -938,6 +938,56 @@ const fn stale_row_predicate(dataset: RetentionDataset) -> Option<(&'static str,
     }
 }
 
+/// The order each batch's sub-select reads the stale rows in: the order of the
+/// index that serves the dataset's predicate. `None` leaves the order to the
+/// planner.
+///
+/// Without an order, the sub-select is a sequential scan from the first heap
+/// page. Old rows sit at the front of the heap, and the rows earlier batches
+/// deleted stay there as dead tuples until a vacuum, so batch `k` re-reads
+/// every page batch `k - 1` emptied: a pass costs the square of its rows. In
+/// index order, a batch steps over index entries instead, and a scan marks
+/// the dead ones so the next batch skips them.
+///
+/// Index order only pays when the index returns rows the predicate keeps. A
+/// row the index returns and a filter then rejects stays, and every later
+/// batch fetches it from the heap again.
+///
+/// Oldest rows first, so a pass that stops at [`SWEEP_MAX_BATCHES`] leaves the
+/// youngest stale rows for the next tick.
+#[cfg(any(test, all(feature = "db", not(feature = "sqlite"))))]
+#[must_use]
+const fn sweep_order(dataset: RetentionDataset) -> Option<&'static str> {
+    match dataset {
+        // `idx_autumn_jobs_status_finished (status, finished_at DESC)`, read backward. Only
+        // the `ttl` unique jobs are filtered out, about 1 in 100 stale rows.
+        RetentionDataset::JobHistory => Some("status DESC, finished_at"),
+        // `idx_autumn_commit_hooks_finished (finished_at)`, partial on the terminal statuses.
+        RetentionDataset::CommitHooks => Some("finished_at"),
+        // `idx_autumn_job_tracking_updated_at`.
+        RetentionDataset::JobTracking => Some("updated_at"),
+        // The `NOT EXISTS` keeps every assignment of a live experiment. In `assigned_at`
+        // order, each batch fetches all of those it already passed from the heap again,
+        // which costs more than the sequential scan.
+        RetentionDataset::ExperimentAssignments
+        // Not swept on Postgres: `stale_row_predicate` has no predicate for these.
+        | RetentionDataset::Idempotency
+        | RetentionDataset::WebhookReplay
+        | RetentionDataset::Sessions
+        | RetentionDataset::AuditArchives
+        | RetentionDataset::CustomDomains => None,
+    }
+}
+
+/// The ` ORDER BY …` the batch sub-select of `dataset` ends with, or `""`
+/// where [`sweep_order`] leaves the order to the planner.
+#[cfg(any(test, all(feature = "db", not(feature = "sqlite"))))]
+fn sweep_order_clause(dataset: RetentionDataset) -> String {
+    sweep_order(dataset)
+        .map(|order| format!(" ORDER BY {order}"))
+        .unwrap_or_default()
+}
+
 /// The primary-key column each sweepable table batches by.
 #[cfg(feature = "db")]
 const fn sweep_key_column(dataset: RetentionDataset) -> &'static str {
@@ -1054,6 +1104,7 @@ async fn sweep_postgres(
         ));
     };
     let key = sweep_key_column(dataset);
+    let order = sweep_order_clause(dataset);
     let mut conn = pool.get().await.map_err(|e| {
         sweep_failed(
             0,
@@ -1081,7 +1132,7 @@ async fn sweep_postgres(
     for _ in 0..SWEEP_MAX_BATCHES {
         let affected = diesel::sql_query(format!(
             "DELETE FROM {table} WHERE {predicate} AND {key} IN \
-             (SELECT {key} FROM {table} WHERE {predicate} LIMIT $2)"
+             (SELECT {key} FROM {table} WHERE {predicate}{order} LIMIT $2)"
         ))
         .bind::<diesel::sql_types::Timestamptz, _>(crate::db::SqlTimestamp(cutoff))
         .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
@@ -2419,6 +2470,48 @@ mod tests {
             .collect();
         statuses.sort();
         statuses
+    }
+
+    #[test]
+    fn sweep_order_reads_the_predicate_columns() {
+        // The batch sub-select is ordered by the index that serves the predicate, so every
+        // column it orders by is one the predicate filters on.
+        for dataset in RETENTION_DATASETS {
+            let Some((_, predicate)) = stale_row_predicate(dataset) else {
+                continue;
+            };
+            let Some(order) = sweep_order(dataset) else {
+                continue;
+            };
+            for term in order.split(',') {
+                let column = term.split_whitespace().next().expect("an order column");
+                assert!(
+                    predicate.contains(column),
+                    "{dataset}: the sweep orders by {column}, which its predicate does not filter on"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_batches_read_in_index_order_except_assignments() {
+        assert_eq!(
+            sweep_order_clause(RetentionDataset::JobHistory),
+            " ORDER BY status DESC, finished_at"
+        );
+        assert_eq!(
+            sweep_order_clause(RetentionDataset::CommitHooks),
+            " ORDER BY finished_at"
+        );
+        assert_eq!(
+            sweep_order_clause(RetentionDataset::JobTracking),
+            " ORDER BY updated_at"
+        );
+        // The anti-join keeps live experiments' rows; index order re-fetches them every batch.
+        assert_eq!(
+            sweep_order_clause(RetentionDataset::ExperimentAssignments),
+            ""
+        );
     }
 
     #[test]
