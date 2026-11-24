@@ -1,0 +1,138 @@
+--- page 1, post 10 (15,000 comments)
+Sort  (cost=1875.32..1875.35 rows=15 width=214) (actual time=7.066..7.132 rows=886 loops=1)
+  Output: c.id, c.parent_id, c.author_id, c.body, c.created_at, __autumn_cmt_author.username, t.depth
+  Sort Key: c.created_at, c.id
+  Sort Method: quicksort  Memory: 238kB
+  Buffers: shared hit=10642
+  CTE __autumn_cmt_tree
+    ->  Recursive Union  (cost=0.43..1736.96 rows=15 width=16) (actual time=0.017..2.391 rows=886 loops=1)
+          Buffers: shared hit=3551
+          ->  Subquery Scan on __autumn_cmt_page  (cost=0.43..27.91 rows=5 width=16) (actual time=0.016..0.094 rows=50 loops=1)
+                Output: __autumn_cmt_page.id, '0'::bigint
+                Buffers: shared hit=54
+                ->  Limit  (cost=0.43..27.86 rows=5 width=16) (actual time=0.016..0.087 rows=50 loops=1)
+                      Output: c_1.id, c_1.created_at
+                      Buffers: shared hit=54
+                      ->  Index Scan using idx_comments_thread on public.comments c_1  (cost=0.43..296.69 rows=54 width=16) (actual time=0.015..0.082 rows=50 loops=1)
+                            Output: c_1.id, c_1.created_at
+                            Index Cond: ((c_1.commentable_type = $1) AND (c_1.commentable_id = $2))
+                            Filter: ((c_1.deleted_at IS NULL) AND (c_1.parent_id IS NULL))
+                            Rows Removed by Filter: 91
+                            Buffers: shared hit=54
+          ->  Nested Loop  (cost=0.43..170.89 rows=1 width=16) (actual time=0.004..0.143 rows=56 loops=15)
+                Output: r.id, (t_1.depth + 1)
+                Buffers: shared hit=3497
+                ->  WorkTable Scan on __autumn_cmt_tree t_1  (cost=0.00..1.12 rows=17 width=16) (actual time=0.000..0.006 rows=59 loops=15)
+                      Output: t_1.id, t_1.depth
+                      Filter: (t_1.depth < 1000)
+                ->  Index Scan using idx_comments_parent_id on public.comments r  (cost=0.43..9.98 rows=1 width=16) (actual time=0.002..0.002 rows=1 loops=886)
+                      Output: r.id, r.commentable_type, r.commentable_id, r.parent_id, r.author_id, r.body, r.created_at, r.deleted_at
+                      Index Cond: (r.parent_id = t_1.id)
+                      Filter: ((r.deleted_at IS NULL) AND (r.commentable_type = $4) AND (r.commentable_id = $5))
+                      Rows Removed by Filter: 0
+                      Buffers: shared hit=3497
+  InitPlan 2 (returns $3)
+    ->  Index Only Scan using posts_pkey on public.posts  (cost=0.29..4.31 rows=1 width=0) (actual time=0.010..0.010 rows=1 loops=1)
+          Index Cond: (posts.id = $6)
+          Heap Fetches: 0
+          Buffers: shared hit=3
+  ->  Result  (cost=0.85..133.75 rows=15 width=214) (actual time=0.038..6.561 rows=886 loops=1)
+        Output: c.id, c.parent_id, c.author_id, c.body, c.created_at, __autumn_cmt_author.username, t.depth
+        One-Time Filter: $3
+        Buffers: shared hit=10642
+        ->  Nested Loop Left Join  (cost=0.85..133.75 rows=15 width=214) (actual time=0.027..6.385 rows=886 loops=1)
+              Output: t.depth, c.id, c.parent_id, c.author_id, c.body, c.created_at, __autumn_cmt_author.username
+              Inner Unique: true
+              Buffers: shared hit=10639
+              ->  Nested Loop  (cost=0.43..126.98 rows=15 width=203) (actual time=0.023..4.250 rows=886 loops=1)
+                    Output: t.depth, c.id, c.parent_id, c.author_id, c.body, c.created_at
+                    Inner Unique: true
+                    Buffers: shared hit=7095
+                    ->  CTE Scan on __autumn_cmt_tree t  (cost=0.00..0.30 rows=15 width=16) (actual time=0.018..2.690 rows=886 loops=1)
+                          Output: t.id, t.depth
+                          Buffers: shared hit=3551
+                    ->  Index Scan using comments_pkey on public.comments c  (cost=0.43..8.45 rows=1 width=195) (actual time=0.001..0.001 rows=1 loops=886)
+                          Output: c.id, c.commentable_type, c.commentable_id, c.parent_id, c.author_id, c.body, c.created_at, c.deleted_at
+                          Index Cond: (c.id = t.id)
+                          Buffers: shared hit=3544
+              ->  Index Scan using users_pkey on public.users __autumn_cmt_author  (cost=0.42..0.44 rows=1 width=19) (actual time=0.002..0.002 rows=1 loops=886)
+                    Output: __autumn_cmt_author.id, __autumn_cmt_author.username
+                    Index Cond: (__autumn_cmt_author.id = c.author_id)
+                    Buffers: shared hit=3544
+Query Identifier: 8857094510594766480
+Planning:
+  Buffers: shared hit=8
+Planning Time: 0.427 ms
+Execution Time: 7.209 ms
+--- page 2, post 1 (150,000 comments), after 734347
+Sort  (cost=835.29..835.32 rows=12 width=214) (actual time=9.242..9.325 rows=1019 loops=1)
+  Output: c.id, c.parent_id, c.author_id, c.body, c.created_at, __autumn_cmt_author.username, t.depth
+  Sort Key: c.created_at, c.id
+  Sort Method: quicksort  Memory: 269kB
+  Buffers: shared hit=12251
+  CTE __autumn_cmt_tree
+    ->  Recursive Union  (cost=8.88..723.76 rows=12 width=16) (actual time=0.023..3.438 rows=1019 loops=1)
+          Buffers: shared hit=4096
+          ->  Subquery Scan on __autumn_cmt_page  (cost=8.88..20.09 rows=2 width=16) (actual time=0.023..0.123 rows=50 loops=1)
+                Output: __autumn_cmt_page.id, '0'::bigint
+                Buffers: shared hit=42
+                ->  Limit  (cost=8.88..20.07 rows=2 width=16) (actual time=0.022..0.116 rows=50 loops=1)
+                      Output: c_1.id, c_1.created_at
+                      Buffers: shared hit=42
+                      InitPlan 1 (returns $1,$2)
+                        ->  Index Scan using comments_pkey on public.comments k  (cost=0.43..8.45 rows=1 width=16) (actual time=0.008..0.009 rows=1 loops=1)
+                              Output: k.created_at, k.id
+                              Index Cond: (k.id = $3)
+                              Filter: ((k.commentable_type = $4) AND (k.commentable_id = $5))
+                              Buffers: shared hit=4
+                      ->  Index Scan using idx_comments_thread on public.comments c_1  (cost=0.43..101.18 rows=18 width=16) (actual time=0.022..0.109 rows=50 loops=1)
+                            Output: c_1.id, c_1.created_at
+                            Index Cond: ((c_1.commentable_type = $1) AND (c_1.commentable_id = $2) AND (ROW(c_1.created_at, c_1.id) > ROW($1, $2)))
+                            Filter: ((c_1.deleted_at IS NULL) AND (c_1.parent_id IS NULL))
+                            Rows Removed by Filter: 125
+                            Buffers: shared hit=42
+          ->  Nested Loop  (cost=0.43..70.35 rows=1 width=16) (actual time=0.005..0.195 rows=61 loops=16)
+                Output: r.id, (t_1.depth + 1)
+                Buffers: shared hit=4054
+                ->  WorkTable Scan on __autumn_cmt_tree t_1  (cost=0.00..0.45 rows=7 width=16) (actual time=0.000..0.007 rows=64 loops=16)
+                      Output: t_1.id, t_1.depth
+                      Filter: (t_1.depth < 1000)
+                ->  Index Scan using idx_comments_parent_id on public.comments r  (cost=0.43..9.98 rows=1 width=16) (actual time=0.002..0.003 rows=1 loops=1019)
+                      Output: r.id, r.commentable_type, r.commentable_id, r.parent_id, r.author_id, r.body, r.created_at, r.deleted_at
+                      Index Cond: (r.parent_id = t_1.id)
+                      Filter: ((r.deleted_at IS NULL) AND (r.commentable_type = $7) AND (r.commentable_id = $8))
+                      Rows Removed by Filter: 0
+                      Buffers: shared hit=4054
+  InitPlan 3 (returns $5)
+    ->  Index Only Scan using posts_pkey on public.posts  (cost=0.29..4.31 rows=1 width=0) (actual time=0.005..0.005 rows=1 loops=1)
+          Index Cond: (posts.id = $9)
+          Heap Fetches: 0
+          Buffers: shared hit=3
+  ->  Result  (cost=0.85..107.00 rows=12 width=214) (actual time=0.038..8.727 rows=1019 loops=1)
+        Output: c.id, c.parent_id, c.author_id, c.body, c.created_at, __autumn_cmt_author.username, t.depth
+        One-Time Filter: $5
+        Buffers: shared hit=12251
+        ->  Nested Loop Left Join  (cost=0.85..107.00 rows=12 width=214) (actual time=0.032..8.560 rows=1019 loops=1)
+              Output: t.depth, c.id, c.parent_id, c.author_id, c.body, c.created_at, __autumn_cmt_author.username
+              Inner Unique: true
+              Buffers: shared hit=12248
+              ->  Nested Loop  (cost=0.43..101.58 rows=12 width=203) (actual time=0.027..5.959 rows=1019 loops=1)
+                    Output: t.depth, c.id, c.parent_id, c.author_id, c.body, c.created_at
+                    Inner Unique: true
+                    Buffers: shared hit=8172
+                    ->  CTE Scan on __autumn_cmt_tree t  (cost=0.00..0.24 rows=12 width=16) (actual time=0.024..3.679 rows=1019 loops=1)
+                          Output: t.id, t.depth
+                          Buffers: shared hit=4096
+                    ->  Index Scan using comments_pkey on public.comments c  (cost=0.43..8.45 rows=1 width=195) (actual time=0.002..0.002 rows=1 loops=1019)
+                          Output: c.id, c.commentable_type, c.commentable_id, c.parent_id, c.author_id, c.body, c.created_at, c.deleted_at
+                          Index Cond: (c.id = t.id)
+                          Buffers: shared hit=4076
+              ->  Index Scan using users_pkey on public.users __autumn_cmt_author  (cost=0.42..0.44 rows=1 width=19) (actual time=0.002..0.002 rows=1 loops=1019)
+                    Output: __autumn_cmt_author.id, __autumn_cmt_author.username
+                    Index Cond: (__autumn_cmt_author.id = c.author_id)
+                    Buffers: shared hit=4076
+Query Identifier: 5767955536337154004
+Planning:
+  Buffers: shared hit=8
+Planning Time: 0.475 ms
+Execution Time: 9.439 ms

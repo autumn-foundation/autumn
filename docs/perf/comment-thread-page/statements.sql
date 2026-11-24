@@ -1,0 +1,16 @@
+-- The statements `commentable::comment_thread_page` issues for a spec with
+-- table `comments`, parent `posts` (no tenant column, no soft delete), a
+-- soft-deleting comments table, and `by = User, author_name = username`.
+-- Text is byte-for-byte what autumn/src/commentable.rs formats
+-- (probe_parent, page_statement, next_top_level), with Postgres `$n` binds.
+PREPARE probe(bigint) AS
+SELECT "id" AS id FROM "posts" WHERE "posts"."id" = $1;
+
+PREPARE page_first(text, bigint, bigint, text, bigint, bigint) AS
+WITH RECURSIVE __autumn_cmt_page AS (SELECT c."id" AS id FROM "comments" AS c WHERE c."commentable_type" = $1 AND c."commentable_id" = $2 AND c."deleted_at" IS NULL AND c."parent_id" IS NULL ORDER BY c."created_at" ASC, c."id" ASC LIMIT $3), __autumn_cmt_tree(id, depth) AS (SELECT id, CAST(0 AS BIGINT) FROM __autumn_cmt_page UNION ALL SELECT r."id", t.depth + 1 FROM "comments" AS r JOIN __autumn_cmt_tree AS t ON r."parent_id" = t.id WHERE t.depth < 1000 AND r."commentable_type" = $4 AND r."commentable_id" = $5 AND r."deleted_at" IS NULL) SELECT c."id" AS id, c."parent_id" AS parent_id, c."author_id" AS author_id, c."body" AS body, c."created_at" AS created_at, __autumn_cmt_author."username" AS author_name, t.depth AS depth FROM __autumn_cmt_tree AS t JOIN "comments" AS c ON c."id" = t.id LEFT JOIN "users" AS __autumn_cmt_author ON __autumn_cmt_author."id" = c."author_id" WHERE EXISTS (SELECT 1 FROM "posts" WHERE "posts"."id" = $6) ORDER BY c."created_at" ASC, c."id" ASC;
+
+PREPARE page_after(text, bigint, bigint, text, bigint, bigint, text, bigint, bigint) AS
+WITH RECURSIVE __autumn_cmt_page AS (SELECT c."id" AS id FROM "comments" AS c WHERE c."commentable_type" = $1 AND c."commentable_id" = $2 AND c."deleted_at" IS NULL AND c."parent_id" IS NULL AND (c."created_at", c."id") > (SELECT k."created_at", k."id" FROM "comments" AS k WHERE k."id" = $3 AND k."commentable_type" = $4 AND k."commentable_id" = $5) ORDER BY c."created_at" ASC, c."id" ASC LIMIT $6), __autumn_cmt_tree(id, depth) AS (SELECT id, CAST(0 AS BIGINT) FROM __autumn_cmt_page UNION ALL SELECT r."id", t.depth + 1 FROM "comments" AS r JOIN __autumn_cmt_tree AS t ON r."parent_id" = t.id WHERE t.depth < 1000 AND r."commentable_type" = $7 AND r."commentable_id" = $8 AND r."deleted_at" IS NULL) SELECT c."id" AS id, c."parent_id" AS parent_id, c."author_id" AS author_id, c."body" AS body, c."created_at" AS created_at, __autumn_cmt_author."username" AS author_name, t.depth AS depth FROM __autumn_cmt_tree AS t JOIN "comments" AS c ON c."id" = t.id LEFT JOIN "users" AS __autumn_cmt_author ON __autumn_cmt_author."id" = c."author_id" WHERE EXISTS (SELECT 1 FROM "posts" WHERE "posts"."id" = $9) ORDER BY c."created_at" ASC, c."id" ASC;
+
+PREPARE next_top(text, bigint, bigint, text, bigint) AS
+SELECT c."id" AS id FROM "comments" AS c WHERE c."commentable_type" = $1 AND c."commentable_id" = $2 AND c."deleted_at" IS NULL AND c."parent_id" IS NULL AND (c."created_at", c."id") > (SELECT k."created_at", k."id" FROM "comments" AS k WHERE k."id" = $3 AND k."commentable_type" = $4 AND k."commentable_id" = $5) ORDER BY c."created_at" ASC, c."id" ASC LIMIT 1;
