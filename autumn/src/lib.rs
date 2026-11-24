@@ -404,6 +404,7 @@ pub(crate) mod counter_cache;
 pub mod derivation;
 pub mod distinct;
 pub mod quantiles;
+pub mod reservoir;
 
 #[cfg(feature = "db")]
 pub mod commentable;

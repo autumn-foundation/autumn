@@ -2950,6 +2950,23 @@ let window = latency.take();                  // fresh window, old sketch back
 fleet.merge(&window)?;                        // IncompatibleSketch if accuracies differ
 ```
 
+### A fair sample of a stream — `reservoir` (unreleased)
+
+To keep a few examples of a stream (requests to an endpoint, payloads that
+failed validation, slow traces) without keeping all of it, use
+`autumn_web::reservoir::Sampler` (no feature, std only). It holds `k` items,
+and every item offered had the same `k / n` chance of being one of them.
+`offer` returns whether the item was kept. Reservoirs of the same capacity
+`merge` into a uniform sample of both streams, weighted by how many items each
+side saw, so a quiet replica is not over-represented:
+
+```rust
+let slow = Arc::new(Sampler::new(20));
+if slow.offer(request_id) { capture_trace(request_id); } // kept: worth the cost
+let window = slow.take();                 // fresh window, old Reservoir back
+fleet.merge(&window)?;                    // CapacityMismatch if capacities differ
+```
+
 ### Runtime log levels (0.6.0)
 
 `PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
