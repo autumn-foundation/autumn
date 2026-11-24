@@ -1,0 +1,176 @@
+== autumn_jobs: batch 401 of a pass over 1000000 rows
+                                                                                                                                                      QUERY PLAN                                                                                                                                                      
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_jobs  (cost=188.72..4362.94 rows=0 width=0) (actual rows=0 loops=1)
+   Buffers: shared hit=7560 dirtied=20
+   ->  Nested Loop  (cost=188.72..4362.94 rows=210 width=67) (actual rows=500 loops=1)
+         Output: autumn_jobs.ctid, "ANY_subquery".*
+         Inner Unique: true
+         Buffers: shared hit=7060 dirtied=9
+         ->  HashAggregate  (cost=188.30..193.30 rows=500 width=98) (actual rows=500 loops=1)
+               Output: "ANY_subquery".*, "ANY_subquery".id
+               Group Key: "ANY_subquery".id
+               Batches: 1  Memory Usage: 169kB
+               Buffers: shared hit=5016 dirtied=6
+               ->  Subquery Scan on "ANY_subquery"  (cost=0.42..187.05 rows=500 width=98) (actual rows=500 loops=1)
+                     Output: "ANY_subquery".*, "ANY_subquery".id
+                     Buffers: shared hit=5016 dirtied=6
+                     ->  Limit  (cost=0.42..182.05 rows=500 width=54) (actual rows=500 loops=1)
+                           Output: autumn_jobs_1.id, autumn_jobs_1.status, autumn_jobs_1.finished_at
+                           Buffers: shared hit=5016 dirtied=6
+                           ->  Index Scan Backward using idx_autumn_jobs_status_finished on public.autumn_jobs autumn_jobs_1  (cost=0.42..152933.58 rows=421015 width=54) (actual rows=500 loops=1)
+                                 Output: autumn_jobs_1.id, autumn_jobs_1.status, autumn_jobs_1.finished_at
+                                 Index Cond: ((autumn_jobs_1.status = ANY ('{completed,failed,discarded}'::text[])) AND (autumn_jobs_1.finished_at IS NOT NULL) AND (autumn_jobs_1.finished_at < '2026-10-19 17:37:15.907527+00'::timestamp with time zone))
+                                 Filter: ((autumn_jobs_1.unique_key IS NULL) OR (autumn_jobs_1.unique_window <> 'ttl'::text))
+                                 Rows Removed by Filter: 2085
+                                 Buffers: shared hit=5016 dirtied=6
+         ->  Index Scan using autumn_jobs_pkey on public.autumn_jobs  (cost=0.42..8.34 rows=1 width=43) (actual rows=1 loops=500)
+               Output: autumn_jobs.ctid, autumn_jobs.id
+               Index Cond: (autumn_jobs.id = "ANY_subquery".id)
+               Filter: ((autumn_jobs.finished_at IS NOT NULL) AND (autumn_jobs.finished_at < '2026-10-19 17:37:15.907527+00'::timestamp with time zone) AND ((autumn_jobs.unique_key IS NULL) OR (autumn_jobs.unique_window <> 'ttl'::text)) AND (autumn_jobs.status = ANY ('{completed,failed,discarded}'::text[])))
+               Buffers: shared hit=2022
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: 5416695397158200710
+ Planning:
+   Buffers: shared hit=10
+ Planning Time: 0.322 ms
+ Execution Time: 6.681 ms
+(34 rows)
+
+== autumn_job_tracking: batch 401 of a pass over 1000000 rows
+                                                                                                 QUERY PLAN                                                                                                  
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_job_tracking  (cost=83.15..4328.62 rows=0 width=0) (actual rows=0 loops=1)
+   Buffers: shared hit=3734 dirtied=37
+   ->  Nested Loop  (cost=83.15..4328.62 rows=225 width=80) (actual rows=500 loops=1)
+         Output: autumn_job_tracking.ctid, "ANY_subquery".*
+         Inner Unique: true
+         Buffers: shared hit=3234 dirtied=28
+         ->  HashAggregate  (cost=82.60..87.60 rows=500 width=124) (actual rows=500 loops=1)
+               Output: "ANY_subquery".*, "ANY_subquery".key
+               Group Key: "ANY_subquery".key
+               Batches: 1  Memory Usage: 297kB
+               Buffers: shared hit=686 dirtied=17
+               ->  Subquery Scan on "ANY_subquery"  (cost=0.42..81.35 rows=500 width=124) (actual rows=500 loops=1)
+                     Output: "ANY_subquery".*, "ANY_subquery".key
+                     Buffers: shared hit=686 dirtied=17
+                     ->  Limit  (cost=0.42..76.35 rows=500 width=58) (actual rows=500 loops=1)
+                           Output: autumn_job_tracking_1.key, autumn_job_tracking_1.updated_at
+                           Buffers: shared hit=686 dirtied=17
+                           ->  Index Scan using idx_autumn_job_tracking_updated_at on public.autumn_job_tracking autumn_job_tracking_1  (cost=0.42..68208.21 rows=449167 width=58) (actual rows=500 loops=1)
+                                 Output: autumn_job_tracking_1.key, autumn_job_tracking_1.updated_at
+                                 Index Cond: (autumn_job_tracking_1.updated_at < '2026-10-19 17:37:19.222604+00'::timestamp with time zone)
+                                 Buffers: shared hit=686 dirtied=17
+         ->  Index Scan using autumn_job_tracking_pkey on public.autumn_job_tracking  (cost=0.55..8.48 rows=1 width=56) (actual rows=1 loops=500)
+               Output: autumn_job_tracking.ctid, autumn_job_tracking.key
+               Index Cond: (autumn_job_tracking.key = "ANY_subquery".key)
+               Filter: (autumn_job_tracking.updated_at < '2026-10-19 17:37:19.222604+00'::timestamp with time zone)
+               Buffers: shared hit=2524
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -674465219737186323
+ Planning:
+   Buffers: shared hit=10
+ Planning Time: 0.242 ms
+ Execution Time: 3.924 ms
+(32 rows)
+
+== autumn_repository_commit_hooks: batch 401 of a pass over 1000000 rows
+                                                                                                                                            QUERY PLAN                                                                                                                                            
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_repository_commit_hooks  (cost=52.39..4213.35 rows=0 width=0) (actual rows=0 loops=1)
+   Buffers: shared hit=3248 dirtied=12
+   ->  Nested Loop  (cost=52.39..4213.35 rows=220 width=67) (actual rows=500 loops=1)
+         Output: autumn_repository_commit_hooks.ctid, "ANY_subquery".*
+         Inner Unique: true
+         Buffers: shared hit=2748 dirtied=12
+         ->  HashAggregate  (cost=51.96..56.96 rows=500 width=98) (actual rows=500 loops=1)
+               Output: "ANY_subquery".*, "ANY_subquery".id
+               Group Key: "ANY_subquery".id
+               Batches: 1  Memory Usage: 169kB
+               Buffers: shared hit=686 dirtied=12
+               ->  Subquery Scan on "ANY_subquery"  (cost=0.42..50.71 rows=500 width=98) (actual rows=500 loops=1)
+                     Output: "ANY_subquery".*, "ANY_subquery".id
+                     Buffers: shared hit=686 dirtied=12
+                     ->  Limit  (cost=0.42..45.71 rows=500 width=45) (actual rows=500 loops=1)
+                           Output: autumn_repository_commit_hooks_1.id, autumn_repository_commit_hooks_1.finished_at
+                           Buffers: shared hit=686 dirtied=12
+                           ->  Index Scan using idx_autumn_commit_hooks_finished on public.autumn_repository_commit_hooks autumn_repository_commit_hooks_1  (cost=0.42..39783.94 rows=439254 width=45) (actual rows=500 loops=1)
+                                 Output: autumn_repository_commit_hooks_1.id, autumn_repository_commit_hooks_1.finished_at
+                                 Index Cond: ((autumn_repository_commit_hooks_1.finished_at IS NOT NULL) AND (autumn_repository_commit_hooks_1.finished_at < '2026-10-19 17:37:21.365601+00'::timestamp with time zone))
+                                 Buffers: shared hit=686 dirtied=12
+         ->  Index Scan using autumn_repository_commit_hooks_pkey on public.autumn_repository_commit_hooks  (cost=0.42..8.31 rows=1 width=43) (actual rows=1 loops=500)
+               Output: autumn_repository_commit_hooks.ctid, autumn_repository_commit_hooks.id
+               Index Cond: (autumn_repository_commit_hooks.id = "ANY_subquery".id)
+               Filter: ((autumn_repository_commit_hooks.finished_at IS NOT NULL) AND (autumn_repository_commit_hooks.finished_at < '2026-10-19 17:37:21.365601+00'::timestamp with time zone) AND (autumn_repository_commit_hooks.status = ANY ('{completed,failed,after_hook_failed}'::text[])))
+               Buffers: shared hit=2031
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: -2576539021074675498
+ Planning:
+   Buffers: shared hit=18
+ Planning Time: 0.342 ms
+ Execution Time: 4.537 ms
+(32 rows)
+
+== autumn_experiment_assignments: batch 401 of a pass over 1000000 rows
+                                                                                                                                                  QUERY PLAN                                                                                                                                                  
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_experiment_assignments  (cost=142.17..4192.14 rows=0 width=0) (actual rows=0 loops=1)
+   Buffers: shared hit=8308
+   ->  Nested Loop Anti Join  (cost=142.17..4192.14 rows=166 width=44) (actual rows=500 loops=1)
+         Output: autumn_experiment_assignments.ctid, e.ctid, "ANY_subquery".*
+         Join Filter: (e.name = autumn_experiment_assignments.experiment)
+         Rows Removed by Join Filter: 5000
+         Buffers: shared hit=7808
+         ->  Nested Loop  (cost=142.17..4157.26 rows=222 width=44) (actual rows=500 loops=1)
+               Output: autumn_experiment_assignments.ctid, autumn_experiment_assignments.experiment, "ANY_subquery".*
+               Inner Unique: true
+               Buffers: shared hit=7807
+               ->  HashAggregate  (cost=141.74..146.74 rows=500 width=40) (actual rows=500 loops=1)
+                     Output: "ANY_subquery".*, "ANY_subquery".id
+                     Group Key: "ANY_subquery".id
+                     Batches: 1  Memory Usage: 105kB
+                     Buffers: shared hit=5759
+                     ->  Subquery Scan on "ANY_subquery"  (cost=0.42..140.49 rows=500 width=40) (actual rows=500 loops=1)
+                           Output: "ANY_subquery".*, "ANY_subquery".id
+                           Buffers: shared hit=5759
+                           ->  Limit  (cost=0.42..135.49 rows=500 width=16) (actual rows=500 loops=1)
+                                 Output: autumn_experiment_assignments_1.id, autumn_experiment_assignments_1.assigned_at
+                                 Buffers: shared hit=5759
+                                 ->  Nested Loop Anti Join  (cost=0.42..89778.24 rows=332339 width=16) (actual rows=500 loops=1)
+                                       Output: autumn_experiment_assignments_1.id, autumn_experiment_assignments_1.assigned_at
+                                       Join Filter: (e_1.name = autumn_experiment_assignments_1.experiment)
+                                       Rows Removed by Join Filter: 141868
+                                       Buffers: shared hit=5759
+                                       ->  Index Scan using idx_autumn_exp_assignments_assigned_at on public.autumn_experiment_assignments autumn_experiment_assignments_1  (cost=0.42..23308.82 rows=443119 width=22) (actual rows=31556 loops=1)
+                                             Output: autumn_experiment_assignments_1.id, autumn_experiment_assignments_1.experiment, autumn_experiment_assignments_1.actor, autumn_experiment_assignments_1.variant, autumn_experiment_assignments_1.is_override, autumn_experiment_assignments_1.assigned_at
+                                             Index Cond: (autumn_experiment_assignments_1.assigned_at < '2026-10-19 17:37:23.285384+00'::timestamp with time zone)
+                                             Buffers: shared hit=5758
+                                       ->  Materialize  (cost=0.00..1.60 rows=10 width=6) (actual rows=5 loops=31556)
+                                             Output: e_1.name
+                                             Buffers: shared hit=1
+                                             ->  Seq Scan on public.autumn_experiments e_1  (cost=0.00..1.55 rows=10 width=6) (actual rows=10 loops=1)
+                                                   Output: e_1.name
+                                                   Filter: (e_1.state = ANY ('{draft,running,concluded}'::autumn_experiment_state[]))
+                                                   Rows Removed by Filter: 30
+                                                   Buffers: shared hit=1
+               ->  Index Scan using autumn_experiment_assignments_pkey on public.autumn_experiment_assignments  (cost=0.42..8.02 rows=1 width=20) (actual rows=1 loops=500)
+                     Output: autumn_experiment_assignments.ctid, autumn_experiment_assignments.experiment, autumn_experiment_assignments.id
+                     Index Cond: (autumn_experiment_assignments.id = "ANY_subquery".id)
+                     Filter: (autumn_experiment_assignments.assigned_at < '2026-10-19 17:37:23.285384+00'::timestamp with time zone)
+                     Buffers: shared hit=2024
+         ->  Materialize  (cost=0.00..1.60 rows=10 width=12) (actual rows=10 loops=500)
+               Output: e.ctid, e.name
+               Buffers: shared hit=1
+               ->  Seq Scan on public.autumn_experiments e  (cost=0.00..1.55 rows=10 width=12) (actual rows=10 loops=1)
+                     Output: e.ctid, e.name
+                     Filter: (e.state = ANY ('{draft,running,concluded}'::autumn_experiment_state[]))
+                     Rows Removed by Filter: 30
+                     Buffers: shared hit=1
+ Settings: plan_cache_mode = 'force_custom_plan'
+ Query Identifier: 2722380576746584563
+ Planning:
+   Buffers: shared hit=16
+ Planning Time: 0.410 ms
+ Execution Time: 24.450 ms
+(58 rows)
+

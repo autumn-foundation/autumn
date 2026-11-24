@@ -1,0 +1,48 @@
+== autumn_jobs (rows=400000, window=30d)
+     stmt     | calls |  rows  | buffers |   hit   | read | temp_w | wal_bytes | buffers_per_call 
+--------------+-------+--------+---------+---------+------+--------+-----------+------------------
+ count        |     2 |      2 |   38948 |   38948 |    0 |      0 |  92824672 |          19474.0
+ delete batch |   353 | 175952 | 1731273 | 1731273 |    0 |      0 |  35594922 |           4904.5
+(2 rows)
+
+ seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_del | heap_blocks 
+----------+--------------+----------+---------------+-----------+-------------
+        6 |       628048 |   177658 |        681811 |    175952 |       19471
+(1 row)
+
+== autumn_job_tracking (rows=400000, window=30d)
+     stmt     | calls |  rows  | buffers |   hit   | read | temp_w | wal_bytes | buffers_per_call 
+--------------+-------+--------+---------+---------+------+--------+-----------+------------------
+ count        |     2 |      2 |   41998 |   41998 |    0 |      0 |  96887152 |          20999.0
+ delete batch |   358 | 178344 | 1050454 | 1050454 |    0 |      0 |  39922900 |           2934.2
+(2 rows)
+
+ seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_del | heap_blocks 
+----------+--------------+----------+---------------+-----------+-------------
+        6 |       621656 |   179418 |        357404 |    178344 |       20999
+(1 row)
+
+== autumn_repository_commit_hooks (rows=400000, window=30d)
+     stmt     | calls |  rows  | buffers |   hit   | read | temp_w | wal_bytes | buffers_per_call 
+--------------+-------+--------+---------+---------+------+--------+-----------+------------------
+ count        |     2 |      2 |   19336 |   19336 |    0 |      0 |  30469206 |           9668.0
+ delete batch |   358 | 178218 | 1041606 | 1041606 |    0 |      0 |  15240784 |           2909.5
+(2 rows)
+
+ seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_del | heap_blocks 
+----------+--------------+----------+---------------+-----------+-------------
+        6 |       621782 |   179292 |        357152 |    178218 |        9668
+(1 row)
+
+== autumn_experiment_assignments (rows=400000, window=30d)
+     stmt     | calls |  rows  | buffers |   hit   | read | temp_w | wal_bytes | buffers_per_call 
+--------------+-------+--------+---------+---------+------+--------+-----------+------------------
+ count        |     2 |      2 |    8126 |    8126 |    0 |      0 |    245645 |           4063.0
+ delete batch |   309 | 153755 | 1478571 | 1478571 |    0 |      0 |   8673635 |           4785.0
+(2 rows)
+
+ seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_del | heap_blocks 
+----------+--------------+----------+---------------+-----------+-------------
+        6 |       646245 |   154682 |       4063088 |    153755 |        3926
+(1 row)
+
