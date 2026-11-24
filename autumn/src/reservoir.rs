@@ -202,10 +202,11 @@ impl<T> Reservoir<T> {
             }
         }
         // Each side's sample is uniform over its own stream, so a uniform
-        // subset of that sample is too.
-        keep_random(&mut self.items, from_self, &mut self.rng);
+        // subset of that sample is too. The other side is cloned before this
+        // sample is touched, so a panicking `clone` leaves it intact.
         let mut theirs = other.items.clone();
         keep_random(&mut theirs, from_other, &mut self.rng);
+        keep_random(&mut self.items, from_self, &mut self.rng);
         self.items.append(&mut theirs);
         self.seen = self.seen.saturating_add(other.seen);
         Ok(())
@@ -589,5 +590,32 @@ mod tests {
         fleet.merge(&window).unwrap();
         sampler.merge(&fleet).unwrap();
         assert_eq!(sampler.seen(), 11);
+    }
+
+    #[test]
+    fn a_panicking_clone_leaves_the_sample_intact() {
+        #[derive(Debug, PartialEq)]
+        struct Fragile(u32);
+        impl Clone for Fragile {
+            fn clone(&self) -> Self {
+                assert!(self.0 != 13, "clone of 13 fails");
+                Self(self.0)
+            }
+        }
+        let sampler = Sampler::with_seed(10, 1);
+        for item in 0..20 {
+            sampler.offer(Fragile(item));
+        }
+        let mut other = Reservoir::with_seed(10, 2);
+        for item in 10..30 {
+            other.offer(Fragile(item));
+        }
+        assert!(other.as_slice().contains(&Fragile(13)));
+        let merged =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sampler.merge(&other)));
+        assert!(merged.is_err());
+        // The lock is poisoned and recovered; the sample still matches `seen`.
+        assert_eq!(sampler.seen(), 20);
+        assert_eq!(sampler.take().len(), 10);
     }
 }
