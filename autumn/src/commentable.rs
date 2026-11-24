@@ -2467,6 +2467,54 @@ mod tests {
     /// Issue #2287: the real thread statement must check parent visibility.
     /// A test of only the fragment cannot find a read without the `EXISTS`.
     #[test]
+    fn the_page_statement_reads_each_comment_once() {
+        let spec = sample_spec();
+        for after in [None, Some(7)] {
+            let scope = PageScope {
+                spec: &spec,
+                parent_type: "Post",
+                parent_id: 3,
+                tenant: None,
+                soft_deletes: false,
+            };
+            let query = page_statement(&scope, after, 50);
+            let sql = diesel::debug_query::<crate::db::RuntimeBackend, _>(&query).to_string();
+            // Both CTEs carry the row, so the outer query never joins `comments` again.
+            assert!(
+                sql.contains(
+                    "__autumn_cmt_tree(id, parent_id, author_id, body, created_at, depth)"
+                ),
+                "{sql}"
+            );
+            assert!(
+                sql.contains(
+                    "SELECT r.\"id\", r.\"parent_id\", r.\"author_id\", r.\"body\", r.\"created_at\""
+                ),
+                "{sql}"
+            );
+            assert!(!sql.contains("JOIN \"comments\" AS c"), "{sql}");
+            assert!(
+                sql.contains(
+                    "LEFT JOIN \"users\" AS __autumn_cmt_author \
+                     ON __autumn_cmt_author.\"id\" = t.author_id"
+                ),
+                "{sql}"
+            );
+            assert!(sql.contains("ORDER BY t.created_at ASC, t.id ASC"), "{sql}");
+        }
+
+        // The whole-thread read keeps its author key on the comment row.
+        let statement = thread_statement(&spec, false, None);
+        assert!(
+            statement
+                .sql
+                .contains("ON __autumn_cmt_author.\"id\" = c.\"author_id\""),
+            "{}",
+            statement.sql
+        );
+    }
+
+    #[test]
     fn the_thread_statement_rechecks_parent_visibility() {
         let mut spec = sample_spec();
         spec.parent_tenant_column = Some("tenant_id");
