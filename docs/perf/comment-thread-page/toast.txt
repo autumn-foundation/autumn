@@ -1,0 +1,2 @@
+before heap_blks=183 idx_blks=199 toast_blks=5 toast_idx_blks=6
+after heap_blks=120 idx_blks=63 toast_blks=5 toast_idx_blks=6
