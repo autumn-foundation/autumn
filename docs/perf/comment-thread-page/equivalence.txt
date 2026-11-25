@@ -1,0 +1,41 @@
+--- every page, both statements: post | page size | pages | rows | identical
+1 | 50 | 1022 | 137853 | true
+2 | 50 | 508 | 69056 | true
+3 | 50 | 338 | 46201 | true
+10 | 50 | 103 | 13702 | true
+30 | 50 | 35 | 4553 | true
+100 | 50 | 11 | 1346 | true
+1000 | 50 | 2 | 126 | true
+1000 | 2 | 27 | 126 | true
+5000 | 50 | 1 | 16 | true
+5000 | 2 | 4 | 16 | true
+10000 | 50 | 1 | 14 | true
+10000 | 2 | 3 | 14 | true
+40000 | 50 | 1 | 3 | true
+40000 | 2 | 1 | 3 | true
+40001 | 50 | 1 | 0 | true
+40001 | 2 | 1 | 0 | true
+40002 | 50 | 1 | 0 | true
+40002 | 2 | 1 | 0 | true
+40003 | 50 | 1 | 9 | true
+40003 | 2 | 4 | 9 | true
+40004 | 50 | 1 | 0 | true
+40004 | 2 | 1 | 0 | true
+--- single pages: case | old | new
+cursor from another thread (a 40004 row, on 40003) | 0 rows d41d8cd98f00b204e9800998ecf8427e | 0 rows d41d8cd98f00b204e9800998ecf8427e
+cursor that names no row | 0 rows d41d8cd98f00b204e9800998ecf8427e | 0 rows d41d8cd98f00b204e9800998ecf8427e
+cursor on a deleted top-level comment | 0 rows d41d8cd98f00b204e9800998ecf8427e | 0 rows d41d8cd98f00b204e9800998ecf8427e
+cursor inside a created_at tie, page size 2 | 2 rows bcdf98ddc12babd78116441b741c2c04 | 2 rows bcdf98ddc12babd78116441b741c2c04
+parent that does not exist (40005) | 0 rows d41d8cd98f00b204e9800998ecf8427e | 0 rows d41d8cd98f00b204e9800998ecf8427e
+--- post 40003, first page: rows only in old
+--- post 40003, first page: rows only in new
+--- post 40003, first page, new statement
+9000010||999999|dangling author|15|2026-01-01 00:00:00||0
+9000011||2|4f2900f2fdfaf3f77bd599391218f49f|204800|2026-01-01 00:00:01|user_2|0
+9000012||3|tie a|5|2026-01-02 00:00:00|user_3|0
+9000013||3|tie b|5|2026-01-02 00:00:00|user_3|0
+9000014||3|tie c|5|2026-01-02 00:00:00|user_3|0
+9000015||3|tie d|5|2026-01-02 00:00:00|user_3|0
+9000016||3|tie e|5|2026-01-02 00:00:00|user_3|0
+9000024|9000023|5|nested reply, created_at ties to|44|2026-01-02 00:00:00|user_5|2
+9000023|9000011|5|reply to toast|14|2026-01-03 03:00:00|user_5|1

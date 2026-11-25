@@ -1146,7 +1146,7 @@ fn thread_statement(
     let type_column = quote_ident(spec.type_column);
     let id_column = quote_ident(spec.id_column);
     let live = spec.live_comments("c");
-    let (author_join, author_name) = author_name_fragments(spec);
+    let (author_join, author_name) = author_name_fragments(spec, &format!("c.{author_column}"));
 
     let sql = format!(
         "SELECT c.{pk} AS id, c.{parent_column} AS parent_id, \
@@ -1166,18 +1166,18 @@ fn thread_statement(
     }
 }
 
-/// `(join clause, author-name expression)` for the thread query.
+/// `(join clause, author-name expression)` for a thread read whose author
+/// key is the SQL expression `author_key`.
 ///
 /// `CAST(NULL AS TEXT)` rather than a bare `NULL` so the column has a type on
 /// both backends and `QueryableByName` can read it as `Nullable<Text>`.
-fn author_name_fragments(spec: &CommentableSpec) -> (String, String) {
+fn author_name_fragments(spec: &CommentableSpec, author_key: &str) -> (String, String) {
     match (spec.author_table, spec.author_name_column) {
         (Some(table), Some(column)) => (
             format!(
-                " LEFT JOIN {} AS __autumn_cmt_author ON __autumn_cmt_author.{} = c.{}",
+                " LEFT JOIN {} AS __autumn_cmt_author ON __autumn_cmt_author.{} = {author_key}",
                 quote_ident(table),
                 quote_ident(spec.author_pk),
-                quote_ident(spec.author_column),
             ),
             format!("__autumn_cmt_author.{}", quote_ident(column)),
         ),
@@ -1477,6 +1477,12 @@ async fn read_page(
 ///
 /// The `EXISTS` clause checks parent visibility inside the read, as
 /// [`thread_statement`] does.
+///
+/// Both CTEs carry every column the page returns. The walk already reads each
+/// comment's row to test its thread and liveness, so the outer query reads
+/// no comment again: joining back on the primary key cost a second index
+/// descent and heap visit per comment, about a third of the statement's
+/// buffers (see `docs/perf/comment-thread-page`).
 fn page_statement(scope: &PageScope<'_>, after: Option<i64>, limit: i64) -> PageQuery {
     let spec = scope.spec;
     let comments = quote_ident(spec.comments_table);
@@ -1488,7 +1494,7 @@ fn page_statement(scope: &PageScope<'_>, after: Option<i64>, limit: i64) -> Page
     let type_column = quote_ident(spec.type_column);
     let id_column = quote_ident(spec.id_column);
     let parent_table = quote_ident(spec.parent_table);
-    let (author_join, author_name) = author_name_fragments(spec);
+    let (author_join, author_name) = author_name_fragments(spec, "t.author_id");
     let reply_live = spec.live_comments("r");
 
     let mut sql = PageSql::default();
@@ -1514,25 +1520,29 @@ fn page_statement(scope: &PageScope<'_>, after: Option<i64>, limit: i64) -> Page
 
     let text = format!(
         "WITH RECURSIVE __autumn_cmt_page AS (\
-           SELECT c.{pk} AS id FROM {comments} AS c \
+           SELECT c.{pk} AS id, c.{parent_column} AS parent_id, \
+                  c.{author_column} AS author_id, c.{body_column} AS body, \
+                  c.{created_at} AS created_at \
+             FROM {comments} AS c \
             WHERE c.{type_column} = {top_type} AND c.{id_column} = {top_id}{top_level}{cursor} \
             ORDER BY c.{created_at} ASC, c.{pk} ASC \
             LIMIT {limit}\
-         ), __autumn_cmt_tree(id, depth) AS (\
-           SELECT id, CAST(0 AS BIGINT) FROM __autumn_cmt_page \
+         ), __autumn_cmt_tree(id, parent_id, author_id, body, created_at, depth) AS (\
+           SELECT id, parent_id, author_id, body, created_at, CAST(0 AS BIGINT) \
+             FROM __autumn_cmt_page \
            UNION ALL \
-           SELECT r.{pk}, t.depth + 1 \
+           SELECT r.{pk}, r.{parent_column}, r.{author_column}, r.{body_column}, \
+                  r.{created_at}, t.depth + 1 \
              FROM {comments} AS r JOIN __autumn_cmt_tree AS t ON r.{parent_column} = t.id \
             WHERE t.depth < {RECURSION_GUARD} \
               AND r.{type_column} = {reply_type} AND r.{id_column} = {reply_id}{reply_live}\
          ) \
-         SELECT c.{pk} AS id, c.{parent_column} AS parent_id, \
-                c.{author_column} AS author_id, c.{body_column} AS body, \
-                c.{created_at} AS created_at, {author_name} AS author_name, \
+         SELECT t.id AS id, t.parent_id AS parent_id, t.author_id AS author_id, \
+                t.body AS body, t.created_at AS created_at, {author_name} AS author_name, \
                 t.depth AS depth \
-           FROM __autumn_cmt_tree AS t JOIN {comments} AS c ON c.{pk} = t.id{author_join} \
+           FROM __autumn_cmt_tree AS t{author_join} \
           WHERE EXISTS (SELECT 1 FROM {parent_table} WHERE {}) \
-          ORDER BY c.{created_at} ASC, c.{pk} ASC",
+          ORDER BY t.created_at ASC, t.id ASC",
         visibility.predicate
     );
     sql.query(text)
@@ -2456,6 +2466,54 @@ mod tests {
 
     /// Issue #2287: the real thread statement must check parent visibility.
     /// A test of only the fragment cannot find a read without the `EXISTS`.
+    #[test]
+    fn the_page_statement_reads_each_comment_once() {
+        let spec = sample_spec();
+        for after in [None, Some(7)] {
+            let scope = PageScope {
+                spec: &spec,
+                parent_type: "Post",
+                parent_id: 3,
+                tenant: None,
+                soft_deletes: false,
+            };
+            let query = page_statement(&scope, after, 50);
+            let sql = diesel::debug_query::<crate::db::RuntimeBackend, _>(&query).to_string();
+            // Both CTEs carry the row, so the outer query never joins `comments` again.
+            assert!(
+                sql.contains(
+                    "__autumn_cmt_tree(id, parent_id, author_id, body, created_at, depth)"
+                ),
+                "{sql}"
+            );
+            assert!(
+                sql.contains(
+                    "SELECT r.\"id\", r.\"parent_id\", r.\"author_id\", r.\"body\", r.\"created_at\""
+                ),
+                "{sql}"
+            );
+            assert!(!sql.contains("JOIN \"comments\" AS c"), "{sql}");
+            assert!(
+                sql.contains(
+                    "LEFT JOIN \"users\" AS __autumn_cmt_author \
+                     ON __autumn_cmt_author.\"id\" = t.author_id"
+                ),
+                "{sql}"
+            );
+            assert!(sql.contains("ORDER BY t.created_at ASC, t.id ASC"), "{sql}");
+        }
+
+        // The whole-thread read keeps its author key on the comment row.
+        let statement = thread_statement(&spec, false, None);
+        assert!(
+            statement
+                .sql
+                .contains("ON __autumn_cmt_author.\"id\" = c.\"author_id\""),
+            "{}",
+            statement.sql
+        );
+    }
+
     #[test]
     fn the_thread_statement_rechecks_parent_visibility() {
         let mut spec = sample_spec();
