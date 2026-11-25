@@ -813,6 +813,11 @@ fn to_json<T: Serialize + ?Sized>(value: &T, what: &str) -> AutumnResult<Value> 
 
 /// Insert one row. With no `aggregate`, the message id is the aggregate, so
 /// the message has no order constraint.
+///
+/// The id is a UUID v7: it starts with the write time, so the unique index
+/// on `id` and the inbox key grow at their right edge. A random v4 put each
+/// write on a fresh leaf of both indexes, and the first write to a leaf
+/// after a checkpoint logs the whole page (`docs/perf/outbox-message-id`).
 async fn insert_message(
     conn: &mut RuntimeConnection,
     entropy: &dyn Entropy,
@@ -821,7 +826,8 @@ async fn insert_message(
     topic: &str,
     payload: &Value,
 ) -> AutumnResult<String> {
-    let id = entropy.uuid_v4().to_string();
+    let millis = u64::try_from(to_millis(clock.now())).unwrap_or(0);
+    let id = entropy.uuid_v7(millis).to_string();
     insert_message_with_id(conn, id, clock, aggregate, topic, payload).await
 }
 

@@ -1,0 +1,18 @@
+=== message ids v4
+outbox rows digest:  df62c9163573fc6ac07f8f0dc697168b
+inbox rows digest:   2cbcd6e2d5ea4488a747b6bc544ff11d
+inbox rows with no outbox row: 0
+  ids  | distinct_ids | rfc4122 | versions | canonical_text | v7_time_off 
+-------+--------------+---------+----------+----------------+-------------
+ 20000 |        20000 |   20000 | 4        | t              |           0
+(1 row)
+
+=== message ids v7
+outbox rows digest:  df62c9163573fc6ac07f8f0dc697168b
+inbox rows digest:   2cbcd6e2d5ea4488a747b6bc544ff11d
+inbox rows with no outbox row: 0
+  ids  | distinct_ids | rfc4122 | versions | canonical_text | v7_time_off 
+-------+--------------+---------+----------+----------------+-------------
+ 20000 |        20000 |   20000 | 7        | t              |           0
+(1 row)
+

@@ -1,0 +1,111 @@
+=== fixture: history=3000000, history ids v4; workload: messages=20000, message ids v7
+ outbox_rows | pending | inbox_rows 
+-------------+---------+------------
+     3000000 |       0 |    1200000
+(1 row)
+
+           relname            |    size    | blocks 
+------------------------------+------------+--------
+ autumn_inbox                 | 97 MB      |  12372
+ autumn_inbox_pkey            | 103 MB     |  13151
+ autumn_outbox                | 1236 MB    | 158236
+ autumn_outbox_id_key         | 220 MB     |  28160
+ autumn_outbox_pkey           | 64 MB      |   8228
+ autumn_outbox_seq_seq        | 8192 bytes |      1
+ idx_autumn_inbox_seen_at     | 26 MB      |   3293
+ idx_autumn_outbox_claim      | 8192 bytes |      1
+ idx_autumn_outbox_dispatched | 64 MB      |   8228
+ idx_autumn_outbox_pending    | 8192 bytes |      1
+(10 rows)
+
+=== workload
+ left_pending | sent_by_workload 
+--------------+------------------
+            0 |            20000
+(1 row)
+
+ inbox_rows_after 
+------------------
+          1208000
+(1 row)
+
+CREATE VIEW
+=== top statements by buffers (shared_blks_hit + shared_blks_read)
+ top | calls | rows  | buffers |  hit   |  read  | temp_w | pct_buf | pct_calls | buf_per_call |                                                                         query                                                                          
+-----+-------+-------+---------+--------+--------+--------+---------+-----------+--------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ t   |   200 | 20000 |  568163 | 568163 |      0 |      0 |    40.9 |       0.4 |       2840.8 | UPDATE autumn_outbox SET claim_token = $1, locked_until = $2, attempts = attempts + $3 WHERE seq IN ( SELECT o.seq FROM autumn_outbox o WHERE o.dispat
+ t   | 20000 | 20000 |  356528 | 356525 |      3 |      0 |    25.7 |      41.5 |         17.8 | UPDATE autumn_outbox SET dispatched_at = $1, claim_token = $2, locked_until = $3, last_error = $4 WHERE seq = $5 AND claim_token = $6
+ t   | 20000 | 20000 |  201706 | 201678 |     28 |      0 |    14.5 |      41.5 |         10.1 | INSERT INTO autumn_outbox (id, aggregate, topic, payload, created_at, available_at) VALUES ($1, $2, $3, $4, $5, $6)
+ t   |     1 |     1 |  160557 |   2426 | 158131 |      0 |    11.6 |       0.0 |     160557.0 | SELECT count(*) FILTER (WHERE dispatched_at IS NULL) AS left_pending, count(*) FILTER (WHERE seq > (SELECT max(seq) - $1 FROM autum
+ t   |  8000 |  8000 |   88902 |  88894 |      8 |      0 |     6.4 |      16.6 |         11.1 | INSERT INTO autumn_inbox (consumer, message_id, seen_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING
+ t   |     1 |     1 |   12454 |    936 |  11518 |      0 |     0.9 |       0.0 |      12454.0 | SELECT count(*) AS inbox_rows_after FROM autumn_inbox
+
+=== top statements by calls
+ top | calls | buffers |                                                                         query                                                                          
+-----+-------+---------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ t   | 20000 |  356528 | UPDATE autumn_outbox SET dispatched_at = $1, claim_token = $2, locked_until = $3, last_error = $4 WHERE seq = $5 AND claim_token = $6
+ t   | 20000 |  201706 | INSERT INTO autumn_outbox (id, aggregate, topic, payload, created_at, available_at) VALUES ($1, $2, $3, $4, $5, $6)
+ t   |  8000 |   88902 | INSERT INTO autumn_inbox (consumer, message_id, seen_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING
+ t   |   200 |  568163 | UPDATE autumn_outbox SET claim_token = $1, locked_until = $2, attempts = attempts + $3 WHERE seq IN ( SELECT o.seq FROM autumn_outbox o WHERE o.dispat
+ t   |     1 |   12454 | SELECT count(*) AS inbox_rows_after FROM autumn_inbox
+ t   |     1 |       9 | SELECT toplevel AS top, calls, rows, buffers, hit, read, temp_w, round($1 * buffers / NULLIF(sum(buffers) OVER (PARTITION BY toplevel), $2), $3
+ t   |     1 |  160557 | SELECT count(*) FILTER (WHERE dispatched_at IS NULL) AS left_pending, count(*) FILTER (WHERE seq > (SELECT max(seq) - $1 FROM autum
+
+=== top statements by WAL bytes
+ top | calls | wal_records | wal_fpi | wal_bytes | wal_per_call |                                                                         query                                                                          
+-----+-------+-------------+---------+-----------+--------------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ t   |   200 |      143529 |       1 |  19702691 |        98513 | UPDATE autumn_outbox SET claim_token = $1, locked_until = $2, attempts = attempts + $3 WHERE seq IN ( SELECT o.seq FROM autumn_outbox o WHERE o.dispat
+ t   | 20000 |      101242 |      16 |  17264704 |          863 | INSERT INTO autumn_outbox (id, aggregate, topic, payload, created_at, available_at) VALUES ($1, $2, $3, $4, $5, $6)
+ t   | 20000 |       98938 |       2 |   7814914 |          391 | UPDATE autumn_outbox SET dispatched_at = $1, claim_token = $2, locked_until = $3, last_error = $4 WHERE seq = $5 AND claim_token = $6
+ t   |  8000 |       32248 |       8 |   3151354 |          394 | INSERT INTO autumn_inbox (consumer, message_id, seen_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING
+ t   |     1 |          47 |       0 |      2785 |         2785 | SELECT count(*) FILTER (WHERE dispatched_at IS NULL) AS left_pending, count(*) FILTER (WHERE seq > (SELECT max(seq) - $1 FROM autum
+ t   |     1 |           0 |       0 |         0 |            0 | SELECT count(*) AS inbox_rows_after FROM autumn_inbox
+ t   |     1 |           0 |       0 |         0 |            0 | SELECT toplevel AS top, calls, rows, buffers, hit, read, temp_w, round($1 * buffers / NULLIF(sum(buffers) OVER (PARTITION BY toplevel), $2), $3
+ t   |     1 |           0 |       0 |         0 |            0 | SELECT toplevel AS top, calls, buffers, query FROM s ORDER BY calls DESC LIMIT $1
+
+=== totals (a nested statement — none in this workload — is counted again inside the top-level statement that fired it, so top = everything)
+ top | calls | buffers | temp_written | wal_fpi | wal_bytes 
+-----+-------+---------+--------------+---------+-----------
+ t   | 48205 | 1388324 |            0 |      27 |  47936448
+
+=== WAL since start (pg_current_wal_lsn delta, all activity)
+ wal_bytes_total 
+-----------------
+        50816400
+
+=== pg_stat_wal (reset before the workload)
+ wal_records | wal_fpi | wal_bytes 
+-------------+---------+-----------
+      425616 |      27 |  49693833
+
+=== pg_stat_user_tables
+    relname    | seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_ins | n_tup_upd | n_tup_hot_upd | n_dead_tup 
+---------------+----------+--------------+----------+---------------+-----------+-----------+---------------+------------
+ autumn_inbox  |        3 |      1208000 |     8000 |             0 |      8000 |         0 |             0 |          0
+ autumn_outbox |        3 |      3020000 |    60801 |       2080201 |     20000 |     40000 |           479 |      39540
+
+=== pg_stat_user_indexes
+    relname    |         indexrelname         | idx_scan | idx_tup_read 
+---------------+------------------------------+----------+--------------
+ autumn_inbox  | autumn_inbox_pkey            |     8000 |            0
+ autumn_inbox  | idx_autumn_inbox_seen_at     |        0 |            0
+ autumn_outbox | autumn_outbox_id_key         |        0 |            0
+ autumn_outbox | autumn_outbox_pkey           |    40401 |        57631
+ autumn_outbox | idx_autumn_outbox_claim      |    20400 |      2097977
+ autumn_outbox | idx_autumn_outbox_dispatched |        0 |            0
+ autumn_outbox | idx_autumn_outbox_pending    |        0 |            0
+
+=== pg_statio_user_tables
+    relname    |  heap  |  idx   | toast 
+---------------+--------+--------+-------
+ autumn_inbox  |  28629 |  72701 |     0
+ autumn_outbox | 705616 | 602724 |     0
+
+=== full-page images in the workload's WAL, by relation (pg_waldump)
+      10  autumn_outbox
+       5  autumn_outbox_id_key
+       5  autumn_inbox_pkey
+       2  idx_autumn_outbox_dispatched
+       2  idx_autumn_inbox_seen_at
+       2  autumn_outbox_pkey
+       1  autumn_inbox
