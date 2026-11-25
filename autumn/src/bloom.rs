@@ -171,11 +171,11 @@ impl BloomFilter {
     pub fn insert_hash(&mut self, hash: u64) -> bool {
         let mut new = false;
         for (index, mask) in positions(self.bits(), self.hashes, hash) {
-            if let Some(word) = self.words.get_mut(index) {
-                if *word & mask == 0 {
-                    new = true;
-                    *word |= mask;
-                }
+            if let Some(word) = self.words.get_mut(index)
+                && *word & mask == 0
+            {
+                new = true;
+                *word |= mask;
             }
         }
         new
@@ -621,6 +621,8 @@ mod tests {
     }
 
     #[test]
+    // Collecting spawns every worker before joining any, so they run at once.
+    #[allow(clippy::needless_collect)]
     fn seen_filter_is_shared_across_threads() {
         let seen = Arc::new(SeenFilter::new(10_000, 0.001));
         let workers: Vec<_> = (0..4_u64)
