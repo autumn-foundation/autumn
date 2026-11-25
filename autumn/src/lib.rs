@@ -402,6 +402,7 @@ pub(crate) mod counter_cache;
 /// Maintained derived read models: `#[derivation]` (#1769).
 #[cfg(feature = "db")]
 pub mod derivation;
+pub mod bloom;
 pub mod distinct;
 pub mod quantiles;
 pub mod reservoir;

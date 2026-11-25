@@ -298,7 +298,7 @@ fn tau(mut x: f64) -> f64 {
 /// the same in every process. Integers are written little-endian, so it is
 /// the same on every machine too.
 #[derive(Debug, Clone, Copy)]
-struct StableHasher(u64);
+pub(crate) struct StableHasher(u64);
 
 impl Default for StableHasher {
     fn default() -> Self {
