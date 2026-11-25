@@ -8,8 +8,8 @@
 //! number of keys you expect and the false-positive rate you can live with:
 //! a million keys at 1 % fit in about 1.2 MB, whatever the keys are.
 //!
-//! It is a Bloom filter (Burton Bloom, 1970). Each key sets `k` bits picked
-//! by its hash (Kirsch and Mitzenmacher's double hashing, 2006). A key is
+//! It is a Bloom filter (Burton Bloom, 1970). Each key sets `k` bits, each
+//! drawn independently from a generator seeded by the key's hash. A key is
 //! "maybe present" when all of its bits are set.
 //!
 //! - **No false negatives.** A key that was inserted is always reported
@@ -285,16 +285,14 @@ impl BloomFilter {
             return None;
         }
         let chunks = rest.chunks_exact(8);
-        if !chunks.remainder().is_empty() {
+        let max_words = usize::try_from(Self::MAX_BITS / 64).unwrap_or(usize::MAX);
+        // Checked before decoding, so an oversized payload allocates nothing.
+        if !chunks.remainder().is_empty() || chunks.len() == 0 || chunks.len() > max_words {
             return None;
         }
         let words: Vec<u64> = chunks
             .map(|chunk| chunk.try_into().ok().map(u64::from_le_bytes))
             .collect::<Option<_>>()?;
-        let max_words = usize::try_from(Self::MAX_BITS / 64).unwrap_or(usize::MAX);
-        if words.is_empty() || words.len() > max_words {
-            return None;
-        }
         Some(Self { hashes, words })
     }
 
@@ -312,18 +310,19 @@ impl BloomFilter {
     }
 }
 
-/// The `(word, mask)` of each of the `hashes` bits a key sets, by enhanced
-/// double hashing: `g_i = h1 + i * h2 + i(i-1)/2`, each reduced to
-/// `0..bits` by a multiply-shift, which needs no division.
+/// The `(word, mask)` of each of the `hashes` bits a key sets. Each position
+/// is its own draw from a `SplitMix64` stream seeded by the key's hash, reduced
+/// to `0..bits` by a multiply-shift, which needs no division. Positions from
+/// double hashing (`h1 + i * h2`) are cheaper but correlated, and at low
+/// target rates they let whole keys collide far more often than the
+/// independent-bit rate [`BloomFilter::false_positive_rate`] reports.
 fn positions(bits: u64, hashes: u32, hash: u64) -> impl Iterator<Item = (usize, u64)> {
-    let mut g = hash;
-    let mut step = mix(hash) | 1;
+    let mut state = hash;
     (0..hashes).map(move |_| {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         // Truncation keeps the high 64 bits, which are below `bits`.
         #[allow(clippy::cast_possible_truncation)]
-        let bit = (u128::from(g).wrapping_mul(u128::from(bits))).wrapping_shr(64) as u64;
-        g = g.wrapping_add(step);
-        step = step.wrapping_add(1);
+        let bit = (u128::from(mix(state)).wrapping_mul(u128::from(bits))).wrapping_shr(64) as u64;
         (
             usize::try_from(bit.wrapping_shr(6)).unwrap_or(usize::MAX),
             1_u64.wrapping_shl(u32::try_from(bit & 63).unwrap_or(0)),
@@ -331,8 +330,7 @@ fn positions(bits: u64, hashes: u32, hash: u64) -> impl Iterator<Item = (usize, 
     })
 }
 
-/// The `SplitMix64` finalizer: a second, independent-looking hash from the
-/// first.
+/// The `SplitMix64` finalizer.
 const fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -507,6 +505,21 @@ mod tests {
     }
 
     #[test]
+    fn low_targets_hold_their_false_positive_rate() {
+        // At low rates the bit positions must stay independent: positions
+        // in arithmetic progression collide whole-key and miss the target
+        // by orders of magnitude.
+        let mut filter = BloomFilter::new(1_000, 1e-7);
+        for key in 0..1_000_u64 {
+            filter.insert(&key);
+        }
+        let probes = 1_000_000..11_000_000_u64;
+        let hits = probes.filter(|key| filter.contains(key)).count();
+        // 10M probes at 1e-7 expect 1 hit.
+        assert!(hits <= 5, "{hits} false positives in 10M probes at 1e-7");
+    }
+
+    #[test]
     fn false_positive_rate_climbs_past_capacity() {
         let mut filter = BloomFilter::new(1_000, 0.01);
         for key in 0..1_000_u64 {
@@ -601,6 +614,8 @@ mod tests {
         assert_eq!(BloomFilter::from_bytes(&[3, 0, 0, 0]), None);
     }
 
+    const PINNED_BITS_OF_42: [u64; 7] = [254, 264, 357, 398, 401, 839, 842];
+
     #[test]
     fn keys_hash_the_same_in_every_process() {
         let mut by_key = BloomFilter::new(100, 0.01);
@@ -617,7 +632,7 @@ mod tests {
                 word & (1 << (bit % 64)) != 0
             })
             .collect();
-        assert_eq!(set, [48, 56, 245, 434, 623, 630, 819]);
+        assert_eq!(set, PINNED_BITS_OF_42);
     }
 
     #[test]
