@@ -118,11 +118,31 @@ impl BloomFilter {
     /// item count to at least 1, and the size to [`MAX_BITS`](Self::MAX_BITS).
     /// The same arguments always give the same shape.
     #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn new(expected_items: usize, false_positive_rate: f64) -> Self {
-        let _ = (expected_items, false_positive_rate);
+        let items = expected_items.max(1) as f64;
+        let rate = if false_positive_rate.is_nan() {
+            0.01
+        } else {
+            false_positive_rate.clamp(1e-9, 0.5)
+        };
+        let ln2 = std::f64::consts::LN_2;
+        // m = -n ln p / ln(2)^2, rounded up to whole 64-bit words.
+        let ideal_bits = (-items * rate.ln() / (ln2 * ln2)).ceil();
+        let max_words = (Self::MAX_BITS / 64) as f64;
+        // Finite and clamped to 1..=2^25, so the casts are exact.
+        let words = (ideal_bits / 64.0).ceil().clamp(1.0, max_words) as usize;
+        // k = m/n ln 2 = -log2(p) at the ideal size.
+        let hashes = (-rate.log2())
+            .round()
+            .clamp(1.0, f64::from(Self::MAX_HASHES)) as u32;
         Self {
-            hashes: 1,
-            words: vec![0; 1],
+            hashes,
+            words: vec![0; words],
         }
     }
 
@@ -149,8 +169,16 @@ impl BloomFilter {
     /// Records a key by a 64-bit hash you computed, for example with a keyed
     /// hash over untrusted input. Returns as [`insert`](Self::insert) does.
     pub fn insert_hash(&mut self, hash: u64) -> bool {
-        let _ = hash;
-        false
+        let mut new = false;
+        for (index, mask) in positions(self.bits(), self.hashes, hash) {
+            if let Some(word) = self.words.get_mut(index) {
+                if *word & mask == 0 {
+                    new = true;
+                    *word |= mask;
+                }
+            }
+        }
+        new
     }
 
     /// `true` when `key` was probably inserted; `false` when it surely was
@@ -164,8 +192,8 @@ impl BloomFilter {
     /// [`insert_hash`](Self::insert_hash).
     #[must_use]
     pub fn contains_hash(&self, hash: u64) -> bool {
-        let _ = hash;
-        false
+        positions(self.bits(), self.hashes, hash)
+            .all(|(index, mask)| self.words.get(index).is_some_and(|word| word & mask != 0))
     }
 
     /// `true` when nothing was inserted.
@@ -177,15 +205,34 @@ impl BloomFilter {
     /// About how many distinct keys were inserted, read from how many bits
     /// are set. `u64::MAX` once every bit is set.
     #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     pub fn estimated_len(&self) -> u64 {
-        0
+        let set = self.set_bits();
+        if set == 0 {
+            return 0;
+        }
+        let bits = self.bits();
+        if set >= bits {
+            return u64::MAX;
+        }
+        let m = bits as f64;
+        // n = -(m / k) ln(1 - X / m): finite and non-negative below a full
+        // filter, and a float-to-int cast saturates.
+        let estimate = -(m / f64::from(self.hashes)) * (1.0 - set as f64 / m).ln();
+        estimate.round() as u64
     }
 
     /// The chance, at the filter's current fill, that a key never inserted
     /// is reported present.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn false_positive_rate(&self) -> f64 {
-        0.0
+        let fill = self.set_bits() as f64 / self.bits() as f64;
+        fill.powi(i32::try_from(self.hashes).unwrap_or(i32::MAX))
     }
 
     /// Folds `other` in, so this filter answers for the union of both.
@@ -195,7 +242,17 @@ impl BloomFilter {
     /// [`ShapeMismatch`] when the bit counts or hash counts differ. Nothing
     /// changes.
     pub fn merge(&mut self, other: &Self) -> Result<(), ShapeMismatch> {
-        let _ = other;
+        if self.hashes != other.hashes || self.words.len() != other.words.len() {
+            return Err(ShapeMismatch {
+                expected_bits: self.bits(),
+                expected_hashes: self.hashes,
+                found_bits: other.bits(),
+                found_hashes: other.hashes,
+            });
+        }
+        for (mine, theirs) in self.words.iter_mut().zip(&other.words) {
+            *mine |= *theirs;
+        }
         Ok(())
     }
 
@@ -208,15 +265,43 @@ impl BloomFilter {
     /// little-endian.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        Vec::new()
+        let mut bytes = Vec::with_capacity(self.words.len().saturating_mul(8).saturating_add(1));
+        bytes.push(u8::try_from(self.hashes).unwrap_or(u8::MAX));
+        for word in &self.words {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes
     }
 
     /// A filter from [`to_bytes`](Self::to_bytes) output. `None` when the
-    /// bytes are not a filter.
+    /// bytes are not a filter: a hash count of 0 or over
+    /// [`MAX_HASHES`](Self::MAX_HASHES), no words, a partial word, or more
+    /// than [`MAX_BITS`](Self::MAX_BITS).
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let _ = bytes;
-        None
+        let (&hashes, rest) = bytes.split_first()?;
+        let hashes = u32::from(hashes);
+        if !(1..=Self::MAX_HASHES).contains(&hashes) {
+            return None;
+        }
+        let chunks = rest.chunks_exact(8);
+        if !chunks.remainder().is_empty() {
+            return None;
+        }
+        let words: Vec<u64> = chunks
+            .map(|chunk| chunk.try_into().ok().map(u64::from_le_bytes))
+            .collect::<Option<_>>()?;
+        let max_words = usize::try_from(Self::MAX_BITS / 64).unwrap_or(usize::MAX);
+        if words.is_empty() || words.len() > max_words {
+            return None;
+        }
+        Some(Self { hashes, words })
+    }
+
+    fn set_bits(&self) -> u64 {
+        self.words.iter().fold(0_u64, |total, word| {
+            total.saturating_add(u64::from(word.count_ones()))
+        })
     }
 
     fn empty_like(&self) -> Self {
@@ -225,6 +310,33 @@ impl BloomFilter {
             words: vec![0; self.words.len()],
         }
     }
+}
+
+/// The `(word, mask)` of each of the `hashes` bits a key sets, by enhanced
+/// double hashing: `g_i = h1 + i * h2 + i(i-1)/2`, each reduced to
+/// `0..bits` by a multiply-shift, which needs no division.
+fn positions(bits: u64, hashes: u32, hash: u64) -> impl Iterator<Item = (usize, u64)> {
+    let mut g = hash;
+    let mut step = mix(hash) | 1;
+    (0..hashes).map(move |_| {
+        // Truncation keeps the high 64 bits, which are below `bits`.
+        #[allow(clippy::cast_possible_truncation)]
+        let bit = (u128::from(g).wrapping_mul(u128::from(bits))).wrapping_shr(64) as u64;
+        g = g.wrapping_add(step);
+        step = step.wrapping_add(1);
+        (
+            usize::try_from(bit.wrapping_shr(6)).unwrap_or(usize::MAX),
+            1_u64.wrapping_shl(u32::try_from(bit & 63).unwrap_or(0)),
+        )
+    })
+}
+
+/// The `SplitMix64` finalizer: a second, independent-looking hash from the
+/// first.
+const fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 fn stable_hash<T: Hash + ?Sized>(key: &T) -> u64 {
@@ -498,8 +610,14 @@ mod tests {
         assert_eq!(by_key, by_hash);
         assert!(by_hash.contains_hash(stable_hash(&42_u64)));
         // Pinned: a change here makes filters from older builds unmergeable.
-        assert_eq!(by_key.to_bytes(), BloomFilter::from_bytes(&by_key.to_bytes()).unwrap().to_bytes());
-        assert!(!by_key.is_empty());
+        assert_eq!((by_key.bits(), by_key.hashes()), (960, 7));
+        let set: Vec<u64> = (0..by_key.bits())
+            .filter(|&bit| {
+                let word = by_key.words[usize::try_from(bit / 64).unwrap()];
+                word & (1 << (bit % 64)) != 0
+            })
+            .collect();
+        assert_eq!(set, [48, 56, 245, 434, 623, 630, 819]);
     }
 
     #[test]
@@ -517,7 +635,10 @@ mod tests {
             .collect();
         let first_sightings: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
         // Every key is distinct; at most a false positive or two read as repeats.
-        assert!(first_sightings >= 3_990, "{first_sightings} first sightings");
+        assert!(
+            first_sightings >= 3_990,
+            "{first_sightings} first sightings"
+        );
         assert!((0..4_000_u64).all(|key| seen.contains(&key)));
         assert!(seen.false_positive_rate() < 0.001);
     }
