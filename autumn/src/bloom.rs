@@ -284,15 +284,16 @@ impl BloomFilter {
         if !(1..=Self::MAX_HASHES).contains(&hashes) {
             return None;
         }
-        let chunks = rest.chunks_exact(8);
+        let (chunks, remainder) = rest.as_chunks::<8>();
         let max_words = usize::try_from(Self::MAX_BITS / 64).unwrap_or(usize::MAX);
         // Checked before decoding, so an oversized payload allocates nothing.
-        if !chunks.remainder().is_empty() || chunks.len() == 0 || chunks.len() > max_words {
+        if !remainder.is_empty() || chunks.is_empty() || chunks.len() > max_words {
             return None;
         }
         let words: Vec<u64> = chunks
-            .map(|chunk| chunk.try_into().ok().map(u64::from_le_bytes))
-            .collect::<Option<_>>()?;
+            .iter()
+            .map(|&chunk| u64::from_le_bytes(chunk))
+            .collect();
         Some(Self { hashes, words })
     }
 
