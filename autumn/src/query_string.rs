@@ -680,6 +680,65 @@ fn build_tree<'a>(
     root
 }
 
+/// The `key=value` pairs of a query string, percent-decoded like
+/// `application/x-www-form-urlencoded`: `&` separates pairs (empty ones are
+/// skipped), the first `=` splits key from value, `+` is a space, `%XX` is a
+/// byte, and invalid UTF-8 becomes U+FFFD.
+fn pairs(query: &str) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (decode(key), decode(value))
+        })
+}
+
+/// Decode one form-urlencoded component. Text with no `+` or `%` is returned
+/// borrowed; everything else is rewritten in one pass.
+fn decode(input: &str) -> Cow<'_, str> {
+    let bytes = input.as_bytes();
+    let Some(first) = bytes.iter().position(|&b| b == b'+' || b == b'%') else {
+        return Cow::Borrowed(input);
+    };
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(bytes.get(..first).unwrap_or_default());
+    let mut rest = bytes.get(first..).unwrap_or_default();
+    while let Some((&byte, tail)) = rest.split_first() {
+        rest = tail;
+        match byte {
+            b'+' => out.push(b' '),
+            b'%' => {
+                let decoded = match rest {
+                    [hi, lo, ..] => hex(*hi).zip(hex(*lo)).map(|(h, l)| (h << 4) | l),
+                    _ => None,
+                };
+                match decoded {
+                    Some(decoded) => {
+                        out.push(decoded);
+                        rest = rest.get(2..).unwrap_or_default();
+                    }
+                    None => out.push(b'%'),
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Cow::Owned(
+        String::from_utf8(out)
+            .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned()),
+    )
+}
+
+const fn hex(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit.wrapping_sub(b'0')),
+        b'a'..=b'f' => Some(digit.wrapping_sub(b'a').wrapping_add(10)),
+        b'A'..=b'F' => Some(digit.wrapping_sub(b'A').wrapping_add(10)),
+        _ => None,
+    }
+}
+
 /// Decode a raw (still percent-encoded) query string into `T`.
 ///
 /// The string is the part **after** `?`, exactly as
@@ -692,7 +751,7 @@ fn build_tree<'a>(
 /// both a scalar and a container), when nesting exceeds [`MAX_DEPTH`], or when
 /// a value cannot be coerced into the target field's type.
 pub fn from_query_str<T: DeserializeOwned>(query: &str) -> Result<T, QueryError> {
-    let root = build_tree(url::form_urlencoded::parse(query.as_bytes()));
+    let root = build_tree(pairs(query));
     T::deserialize(NodeDeserializer {
         node: &Node::Map(root),
     })
@@ -1411,6 +1470,53 @@ impl<'de> VariantAccess<'de> for NodeContent<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The decoder agrees with `form_urlencoded` on every input, including
+    /// malformed escapes, invalid UTF-8, stray separators and `+`.
+    #[test]
+    fn pairs_match_form_urlencoded() {
+        let cases = [
+            "",
+            "&",
+            "&&a=1&&",
+            "a",
+            "a=",
+            "=b",
+            "=",
+            "a=b=c",
+            "a+b=c+d",
+            "%",
+            "%4",
+            "%41",
+            "%4g",
+            "%g4",
+            "a%=b%",
+            "%zz%41%",
+            "%E2%82%AC",
+            "%E2%82",
+            "%FF%FE",
+            "k=%C3%28",
+            "q=autumn%20web&x=%2B%2b+",
+            "a[b]=%5B",
+            "%25%32%35",
+            "a=1&b=%F0%9F%98%80",
+            "caf\u{e9}=\u{e9}+%e9",
+            "%00=%00",
+            "a==b",
+            "+%2B+",
+            "%%41",
+            "%4%41",
+        ];
+        for case in cases {
+            let want: Vec<(String, String)> = url::form_urlencoded::parse(case.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            let got: Vec<(String, String)> = pairs(case)
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            assert_eq!(got, want, "input {case:?}");
+        }
+    }
     use super::*;
     use serde::Deserialize;
 
