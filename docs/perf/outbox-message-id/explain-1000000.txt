@@ -1,0 +1,196 @@
+=== v4 ids (after CHECKPOINT)
+BEGIN
+                                                                                                                                                              QUERY PLAN                                                                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_outbox (actual rows=0 loops=1)
+   Buffers: shared hit=113 read=2 dirtied=6
+   WAL: records=6 fpi=5 bytes=24521
+   ->  Result (actual rows=1 loops=1)
+         Output: nextval('autumn_outbox_seq_seq'::regclass), '23900a87-5c00-4d30-97c5-ad55c4c5f82b'::text, '23900a87-5c00-4d30-97c5-ad55c4c5f82b'::text, 'autumn.event'::text, '{"type":"autumn.event"}'::text, '1764000999999'::bigint, '1764000999999'::bigint, 0, NULL::text, NULL::text, NULL::bigint, NULL::bigint, NULL::bigint
+         Buffers: shared hit=13 dirtied=1
+         WAL: records=1 bytes=99
+ Query Identifier: 3973737861449707711
+ Planning:
+   Buffers: shared hit=7
+ Planning Time: 0.055 ms
+ Execution Time: 0.322 ms
+(12 rows)
+
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_inbox (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=50 dirtied=3
+   WAL: records=4 fpi=3 bytes=17480
+   ->  Result (actual rows=1 loops=1)
+         Output: 'listeners'::text, '23900a87-5c00-4d30-97c5-ad55c4c5f82b'::text, '1764000999999'::bigint
+ Query Identifier: -2576391175607623286
+ Planning Time: 0.012 ms
+ Execution Time: 0.174 ms
+(11 rows)
+
+ROLLBACK
+BEGIN
+                                                                                                                                                              QUERY PLAN                                                                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_outbox (actual rows=0 loops=1)
+   Buffers: shared hit=113 read=2 dirtied=2
+   WAL: records=5 fpi=2 bytes=6375
+   ->  Result (actual rows=1 loops=1)
+         Output: nextval('autumn_outbox_seq_seq'::regclass), 'e3951090-94e2-4833-8522-72971d17ea05'::text, 'e3951090-94e2-4833-8522-72971d17ea05'::text, 'autumn.event'::text, '{"type":"autumn.event"}'::text, '1764000999999'::bigint, '1764000999999'::bigint, 0, NULL::text, NULL::text, NULL::bigint, NULL::bigint, NULL::bigint
+         Buffers: shared hit=13
+ Query Identifier: 3973737861449707711
+ Planning:
+   Buffers: shared hit=7
+ Planning Time: 0.048 ms
+ Execution Time: 0.319 ms
+(11 rows)
+
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_inbox (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=50 dirtied=1
+   WAL: records=4 fpi=1 bytes=4696
+   ->  Result (actual rows=1 loops=1)
+         Output: 'listeners'::text, 'e3951090-94e2-4833-8522-72971d17ea05'::text, '1764000999999'::bigint
+ Query Identifier: -2576391175607623286
+ Planning Time: 0.010 ms
+ Execution Time: 0.201 ms
+(11 rows)
+
+ROLLBACK
+BEGIN
+                                                                                                                                                              QUERY PLAN                                                                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_outbox (actual rows=0 loops=1)
+   Buffers: shared hit=113 read=2 dirtied=2
+   WAL: records=5 fpi=2 bytes=6059
+   ->  Result (actual rows=1 loops=1)
+         Output: nextval('autumn_outbox_seq_seq'::regclass), '2ef76347-d01b-4696-9eb3-b154e2d06b2d'::text, '2ef76347-d01b-4696-9eb3-b154e2d06b2d'::text, 'autumn.event'::text, '{"type":"autumn.event"}'::text, '1764000999999'::bigint, '1764000999999'::bigint, 0, NULL::text, NULL::text, NULL::bigint, NULL::bigint, NULL::bigint
+         Buffers: shared hit=13
+ Query Identifier: 3973737861449707711
+ Planning:
+   Buffers: shared hit=7
+ Planning Time: 0.048 ms
+ Execution Time: 0.287 ms
+(11 rows)
+
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_inbox (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=50 dirtied=1
+   WAL: records=4 fpi=1 bytes=5236
+   ->  Result (actual rows=1 loops=1)
+         Output: 'listeners'::text, '2ef76347-d01b-4696-9eb3-b154e2d06b2d'::text, '1764000999999'::bigint
+ Query Identifier: -2576391175607623286
+ Planning Time: 0.009 ms
+ Execution Time: 0.120 ms
+(11 rows)
+
+ROLLBACK
+=== v7 ids (after CHECKPOINT)
+BEGIN
+                                                                                                                                                              QUERY PLAN                                                                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_outbox (actual rows=0 loops=1)
+   Buffers: shared hit=115 dirtied=6
+   WAL: records=6 fpi=5 bytes=25477
+   ->  Result (actual rows=1 loops=1)
+         Output: nextval('autumn_outbox_seq_seq'::regclass), '01a213be-5795-7c45-9e0b-beb42c1d94e1'::text, '01a213be-5795-7c45-9e0b-beb42c1d94e1'::text, 'autumn.event'::text, '{"type":"autumn.event"}'::text, '1764000999999'::bigint, '1764000999999'::bigint, 0, NULL::text, NULL::text, NULL::bigint, NULL::bigint, NULL::bigint
+         Buffers: shared hit=13 dirtied=1
+         WAL: records=1 bytes=99
+ Query Identifier: 3973737861449707711
+ Planning:
+   Buffers: shared hit=7
+ Planning Time: 0.049 ms
+ Execution Time: 0.277 ms
+(12 rows)
+
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_inbox (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=50 dirtied=3
+   WAL: records=4 fpi=3 bytes=17192
+   ->  Result (actual rows=1 loops=1)
+         Output: 'listeners'::text, '01a213be-5795-7c45-9e0b-beb42c1d94e1'::text, '1764000999999'::bigint
+ Query Identifier: -2576391175607623286
+ Planning Time: 0.010 ms
+ Execution Time: 0.130 ms
+(11 rows)
+
+ROLLBACK
+BEGIN
+                                                                                                                                                              QUERY PLAN                                                                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_outbox (actual rows=0 loops=1)
+   Buffers: shared hit=115 dirtied=1
+   WAL: records=5 fpi=1 bytes=5082
+   ->  Result (actual rows=1 loops=1)
+         Output: nextval('autumn_outbox_seq_seq'::regclass), '01a213be-57a4-7124-ab96-98bcd63bd82b'::text, '01a213be-57a4-7124-ab96-98bcd63bd82b'::text, 'autumn.event'::text, '{"type":"autumn.event"}'::text, '1764000999999'::bigint, '1764000999999'::bigint, 0, NULL::text, NULL::text, NULL::bigint, NULL::bigint, NULL::bigint
+         Buffers: shared hit=13
+ Query Identifier: 3973737861449707711
+ Planning:
+   Buffers: shared hit=7
+ Planning Time: 0.049 ms
+ Execution Time: 0.255 ms
+(11 rows)
+
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_inbox (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=50
+   WAL: records=4 bytes=327
+   ->  Result (actual rows=1 loops=1)
+         Output: 'listeners'::text, '01a213be-57a4-7124-ab96-98bcd63bd82b'::text, '1764000999999'::bigint
+ Query Identifier: -2576391175607623286
+ Planning Time: 0.011 ms
+ Execution Time: 0.125 ms
+(11 rows)
+
+ROLLBACK
+BEGIN
+                                                                                                                                                              QUERY PLAN                                                                                                                                                              
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_outbox (actual rows=0 loops=1)
+   Buffers: shared hit=115 dirtied=1
+   WAL: records=5 fpi=1 bytes=7934
+   ->  Result (actual rows=1 loops=1)
+         Output: nextval('autumn_outbox_seq_seq'::regclass), '01a213be-57b2-77ea-a8d9-e44ec43b058d'::text, '01a213be-57b2-77ea-a8d9-e44ec43b058d'::text, 'autumn.event'::text, '{"type":"autumn.event"}'::text, '1764000999999'::bigint, '1764000999999'::bigint, 0, NULL::text, NULL::text, NULL::bigint, NULL::bigint, NULL::bigint
+         Buffers: shared hit=13
+ Query Identifier: 3973737861449707711
+ Planning:
+   Buffers: shared hit=7
+ Planning Time: 0.045 ms
+ Execution Time: 0.252 ms
+(11 rows)
+
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_inbox (actual rows=0 loops=1)
+   Conflict Resolution: NOTHING
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=50
+   WAL: records=4 bytes=327
+   ->  Result (actual rows=1 loops=1)
+         Output: 'listeners'::text, '01a213be-57b2-77ea-a8d9-e44ec43b058d'::text, '1764000999999'::bigint
+ Query Identifier: -2576391175607623286
+ Planning Time: 0.011 ms
+ Execution Time: 0.131 ms
+(11 rows)
+
+ROLLBACK
