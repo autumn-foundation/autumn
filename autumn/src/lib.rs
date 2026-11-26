@@ -399,6 +399,7 @@ pub mod sharding;
 #[cfg(feature = "db")]
 pub(crate) mod counter_cache;
 
+pub mod bloom;
 /// Maintained derived read models: `#[derivation]` (#1769).
 #[cfg(feature = "db")]
 pub mod derivation;

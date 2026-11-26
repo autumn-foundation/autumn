@@ -2967,6 +2967,24 @@ let window = slow.take();                 // fresh window, old Reservoir back
 fleet.merge(&window)?;                    // CapacityMismatch if capacities differ
 ```
 
+### Seen-before checks on a stream — `bloom` (unreleased)
+
+To answer "have I seen this key before?" (webhook delivery ids, first-time
+logins, crawled URLs) without keeping every key, use
+`autumn_web::bloom::SeenSet` (no feature, std only). It is a Bloom filter:
+never a false "new", and a false "seen" at the rate you size it for (about
+1.2 bytes a key at 1 %). `insert` returns whether the key was new.
+`false_positive_rate()` reports the live rate as the filter fills; `take()`
+rotates it. Filters of the same shape `merge` into the union:
+
+```rust
+let deliveries = Arc::new(SeenSet::new(1_000_000, 0.001)); // ~1.8 MB
+if deliveries.insert(&event_id) { process(event) }          // surely new: skip the DB lookup
+else if !store.processed(&event_id)? { process(event) }     // a retry, or the 0.1 % false "seen"
+let window = deliveries.take();                             // fresh window, old filter back
+fleet.merge(&BloomFilter::from_bytes(&peer_bytes).unwrap())?; // ShapeMismatch if sized differently
+```
+
 ### Runtime log levels (0.6.0)
 
 `PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
