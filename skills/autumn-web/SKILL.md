@@ -2967,6 +2967,23 @@ let window = slow.take();                 // fresh window, old Reservoir back
 fleet.merge(&window)?;                    // CapacityMismatch if capacities differ
 ```
 
+### Have we seen this before? — `bloom` (unreleased)
+
+To skip webhook redeliveries, replayed events or digests already sent without
+keeping every key, use `autumn_web::bloom::SeenFilter` (no feature, std only).
+It is a Bloom filter sized from the keys you expect and the false-positive rate
+you accept (a million keys at 1 % is about 1.2 MB). There are no false
+negatives; `insert` returns `true` the first time and `false` on a probable
+repeat. `false_positive_rate` reads the rate at the current fill, so rotate with
+`take` before it drifts. Filters of the same shape `merge` into the union:
+
+```rust
+let seen = Arc::new(SeenFilter::new(1_000_000, 0.001));
+if seen.insert(&delivery_id) { handle(event).await?; } // first sighting
+if seen.false_positive_rate() > 0.002 { archive(seen.take()); } // rotate
+fleet.merge(&BloomFilter::from_bytes(&peer_bytes).unwrap())?; // ShapeMismatch if sized differently
+```
+
 ### Runtime log levels (0.6.0)
 
 `PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
