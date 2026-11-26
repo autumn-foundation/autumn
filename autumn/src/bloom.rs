@@ -523,7 +523,7 @@ mod tests {
             );
             let predicted = filter.false_positive_rate();
             assert!(
-                (measured - predicted).abs() < predicted * 0.35 + 1e-4,
+                (measured - predicted).abs() < predicted.mul_add(0.35, 1e-4),
                 "predicted {predicted}, measured {measured}"
             );
         }
