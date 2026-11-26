@@ -276,19 +276,16 @@ impl BloomFilter {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let (hashes, words) = bytes.split_first_chunk::<4>()?;
         let hashes = u32::from_le_bytes(*hashes);
-        let max_len = usize::try_from(Self::MAX_BITS / 8).unwrap_or(usize::MAX);
+        let max_len = usize::try_from(Self::MAX_BITS / WORD_BITS).unwrap_or(usize::MAX);
+        let (words, partial) = words.as_chunks::<8>();
         if !(1..=Self::MAX_HASHES).contains(&hashes)
             || words.is_empty()
             || words.len() > max_len
-            || !words.len().is_multiple_of(8)
+            || !partial.is_empty()
         {
             return None;
         }
-        let words = words
-            .chunks_exact(8)
-            .map(|word| <[u8; 8]>::try_from(word).map(u64::from_le_bytes))
-            .collect::<Result<_, _>>()
-            .ok()?;
+        let words = words.iter().map(|word| u64::from_le_bytes(*word)).collect();
         Some(Self { words, hashes })
     }
 }
