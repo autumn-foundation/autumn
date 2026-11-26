@@ -1,8 +1,8 @@
 //! Bounded-memory membership: "have I seen this before?" in fixed memory.
 //!
-//! "Has this webhook delivery id been processed?", "is this the first time
-//! this device logged in?", "was this password reset token already spent?",
-//! "has this crawler fetched this URL today?" An exact answer keeps every key
+//! "Is this the first time this device logged in?", "has the crawler
+//! fetched this URL today?", "has this cache key been asked for before, so
+//! it is worth warming?" An exact answer keeps every key
 //! it has seen, and that set grows with the traffic. [`BloomFilter`] answers
 //! in a fixed number of bits, whatever the traffic: about 1.2 bytes a key
 //! for a 1 % false-positive rate, 1.8 bytes for 0.1 %.
@@ -19,6 +19,12 @@
 //!   "welcome back") and a false "new" would be wrong.
 //! - [`insert`](BloomFilter::insert) says whether the key was new, so
 //!   check-and-mark is one call.
+//! - "New" means new *to this filter*. After [`SeenSet::take`], a restart,
+//!   or on a replica that has not merged its peers, a key seen before reads
+//!   as new again. Where a duplicate does harm (charging a card, processing
+//!   a webhook), the filter cannot replace the exact check: either confirm
+//!   every key against the durable store, or fill the filter from that store
+//!   and keep it covering the store's whole deduplication window.
 //! - [`BloomFilter::new`] sizes the filter for an expected number of keys
 //!   and a target false-positive rate. Past that many keys it keeps working;
 //!   the rate just climbs, and [`false_positive_rate`](BloomFilter::false_positive_rate)
@@ -45,12 +51,12 @@
 //! ```rust
 //! use autumn_web::bloom::SeenSet;
 //!
-//! let deliveries = SeenSet::new(10_000, 0.001);
-//! assert!(deliveries.insert("evt_1"));  // surely new: no exact lookup needed
-//! assert!(deliveries.insert("evt_2"));
-//! assert!(!deliveries.insert("evt_1")); // a retry, or a false positive:
-//!                                       // confirm against the exact store
-//! assert!(deliveries.contains("evt_2"));
+//! let crawled = SeenSet::new(10_000, 0.001);
+//! assert!(crawled.insert("/docs"));  // new: fetch it
+//! assert!(crawled.insert("/blog"));
+//! assert!(!crawled.insert("/docs")); // seen (or, 0.1 % of the time, a
+//!                                    // false positive): skip it
+//! assert!(crawled.contains("/blog"));
 //! ```
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
@@ -293,14 +299,18 @@ impl BloomFilter {
     /// Enhanced double hashing: the first probe is `hash`, the stride is a
     /// second hash mixed from it, and the stride grows by `i` each step so
     /// two keys that share a first probe and a stride still part ways. Each
-    /// probe is mapped onto the bits by its high half (Lemire's
-    /// multiply-shift), which needs no division.
+    /// probe is mixed again, then mapped onto the bits by its high half
+    /// (Lemire's multiply-shift), which needs no division. The mapping is
+    /// linear, so without that last mix the probes of one key land in an
+    /// arithmetic progression across the bits, and two keys with a similar
+    /// start and stride share most of their bits: a small filter probed many
+    /// times then misses its rate by orders of magnitude.
     fn probes(&self, hash: u64) -> impl Iterator<Item = (usize, u64)> + use<> {
         let bits = u128::from(self.bits());
         let mut probe = hash;
         let mut stride = mix(hash) | 1;
         (0..u64::from(self.hashes)).map(move |i| {
-            let position = (u128::from(probe).wrapping_mul(bits)).wrapping_shr(64);
+            let position = (u128::from(mix(probe)).wrapping_mul(bits)).wrapping_shr(64);
             probe = probe.wrapping_add(stride);
             stride = stride.wrapping_add(i);
             let position = u64::try_from(position).unwrap_or(0);
@@ -523,6 +533,21 @@ mod tests {
     }
 
     #[test]
+    fn small_strict_filters_keep_their_rate() {
+        // Few bits and many probes: probes that are not decorrelated before
+        // they are mapped onto the bits overlap from key to key, and the
+        // measured rate lands orders of magnitude above the predicted one.
+        let mut filter = BloomFilter::new(10, 1e-9);
+        for i in 0..10_u64 {
+            filter.insert(&i);
+        }
+        let hits = (1_000_000..2_000_000_u64)
+            .filter(|i| filter.contains(i))
+            .count();
+        assert!(hits <= 2, "{hits} false positives in a million");
+    }
+
+    #[test]
     fn false_positive_rate_climbs_past_capacity() {
         let mut filter = BloomFilter::new(1_000, 0.01);
         for i in 0..1_000_u64 {
@@ -643,8 +668,8 @@ mod tests {
         filter.insert("autumn");
         assert_eq!(
             filter.to_bytes(),
-            [2, 0, 0, 0, 0, 0, 64, 4, 0, 0, 0, 0],
-            "bits 22 and 26 of one word, after a 2-hash header"
+            [2, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 2],
+            "bits 3 and 57 of one word, after a 2-hash header"
         );
     }
 

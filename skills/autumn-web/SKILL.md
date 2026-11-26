@@ -2969,8 +2969,8 @@ fleet.merge(&window)?;                    // CapacityMismatch if capacities diff
 
 ### Seen-before checks on a stream — `bloom` (unreleased)
 
-To answer "have I seen this key before?" (webhook delivery ids, first-time
-logins, crawled URLs) without keeping every key, use
+To answer "have I seen this key before?" (first-time logins, crawled URLs,
+cache-warm skips) without keeping every key, use
 `autumn_web::bloom::SeenSet` (no feature, std only). It is a Bloom filter:
 never a false "new", and a false "seen" at the rate you size it for (about
 1.2 bytes a key at 1 %). `insert` returns whether the key was new.
@@ -2978,12 +2978,16 @@ never a false "new", and a false "seen" at the rate you size it for (about
 rotates it. Filters of the same shape `merge` into the union:
 
 ```rust
-let deliveries = Arc::new(SeenSet::new(1_000_000, 0.001)); // ~1.8 MB
-if deliveries.insert(&event_id) { process(event) }          // surely new: skip the DB lookup
-else if !store.processed(&event_id)? { process(event) }     // a retry, or the 0.1 % false "seen"
-let window = deliveries.take();                             // fresh window, old filter back
+let devices = Arc::new(SeenSet::new(1_000_000, 0.001));  // ~1.8 MB
+if devices.insert(&(user_id, device_id)) { send_new_device_email() } // 0.1 % miss one
+let window = devices.take();                              // fresh window, old filter back
 fleet.merge(&BloomFilter::from_bytes(&peer_bytes).unwrap())?; // ShapeMismatch if sized differently
 ```
+
+"New" is relative to what the filter holds: after `take()`, a restart, or on
+a replica that has not merged its peers, an old key reads as new. Use it where
+an occasional repeat is harmless. Where a duplicate does harm (webhook
+processing, payments), keep the exact store check on every key.
 
 ### Runtime log levels (0.6.0)
 
