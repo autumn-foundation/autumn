@@ -493,8 +493,7 @@ mod docker_webhook_store {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn pg_sql_webhook_store_ensure_schema_adds_delivered_index_to_existing_tables() {
-        use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
-        use scoped_futures::ScopedFutureExt as _;
+        use diesel_async::RunQueryDsl as _;
 
         let pool = autumn_web::test::TestDb::shared().await.pool();
         let store = SqlOutboundWebhookStore::new(pool.clone());
@@ -531,24 +530,22 @@ mod docker_webhook_store {
 
         // The plan of the purge's DELETE can use the index: its predicate
         // implies the index's.
-        let plan = conn
-            .transaction::<_, diesel::result::Error, _>(|conn| {
-                async move {
-                    diesel::sql_query("SET LOCAL enable_seqscan = off")
-                        .execute(conn)
-                        .await?;
-                    diesel::sql_query(
-                        "EXPLAIN (COSTS OFF) DELETE FROM autumn_webhook_deliveries \
-                         WHERE logged_at < 1 AND NOT is_dlq \
-                         AND response_status BETWEEN 200 AND 299",
-                    )
-                    .load::<PlanLine>(conn)
-                    .await
-                }
-                .scope_boxed()
-            })
+        diesel::sql_query("SET enable_seqscan = off")
+            .execute(&mut *conn)
             .await
             .unwrap();
+        let plan = diesel::sql_query(
+            "EXPLAIN (COSTS OFF) DELETE FROM autumn_webhook_deliveries \
+             WHERE logged_at < 1 AND NOT is_dlq \
+             AND response_status BETWEEN 200 AND 299",
+        )
+        .load::<PlanLine>(&mut *conn)
+        .await;
+        diesel::sql_query("RESET enable_seqscan")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let plan = plan.unwrap();
         assert!(
             plan.iter().any(|step| step
                 .line
