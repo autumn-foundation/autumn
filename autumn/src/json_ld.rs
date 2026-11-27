@@ -1,6 +1,6 @@
 //! Schema.org structured data as JSON-LD.
 //!
-//! [`JsonLd`] builds one schema.org node and renders it as a
+//! [`JsonLd`](crate::json_ld::JsonLd) builds one schema.org node and renders it as a
 //! `<script type="application/ld+json">` block. Search engines and AI agents
 //! read that block to learn what a page is about: a recipe, a product, an
 //! event.
@@ -23,14 +23,14 @@
 //! # Escaping
 //!
 //! A JSON string can hold `</script>`, and the HTML parser ends the script
-//! element there, whatever the JSON means. [`JsonLd::to_json`] writes every
+//! element there, whatever the JSON means. [`JsonLd::to_json`](crate::json_ld::JsonLd::to_json) writes every
 //! `<`, `>` and `&` as a `\u00XX` escape, and U+2028 and U+2029 as `\u2028`
 //! and `\u2029`. The escapes appear only inside JSON strings, so a JSON parser
 //! reads back the same value. The output has no `<` at all, so no value can
 //! close the element or open an HTML comment. `verification/json_ld_escape.rs`
 //! proves this for the escaper.
 //!
-//! [`JsonLd::to_json_unescaped`] is the plain JSON, for an API response or a
+//! [`JsonLd::to_json_unescaped`](crate::json_ld::JsonLd::to_json_unescaped) is the plain JSON, for an API response or a
 //! file. Do not put it in a page.
 //!
 //! With [`SeoMeta::json_ld`](crate::seo::SeoMeta::json_ld) the block renders
