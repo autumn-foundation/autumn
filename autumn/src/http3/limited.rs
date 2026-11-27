@@ -47,14 +47,14 @@ struct VarInt {
 impl VarInt {
     /// Add one byte. `Some(value)` when the integer is complete.
     const fn push(&mut self, byte: u8) -> Option<u64> {
-        if !self.started {
+        if self.started {
+            self.value = (self.value << 8) | byte as u64;
+            self.left -= 1;
+        } else {
             self.started = true;
             // The two high bits give the length: 1, 2, 4 or 8 bytes.
             self.left = (1u8 << (byte >> 6)) - 1;
             self.value = (byte & 0x3f) as u64;
-        } else {
-            self.value = (self.value << 8) | byte as u64;
-            self.left -= 1;
         }
         if self.left == 0 {
             let value = self.value;

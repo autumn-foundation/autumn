@@ -550,7 +550,7 @@ async fn serve_request<S, B>(
 {
     let (request, stream) =
         match tokio::time::timeout(head_timeout, resolver.resolve_request()).await {
-            Ok(Ok(resolved)) => resolved,
+            Ok(Ok(head)) => head,
             Ok(Err(e)) => {
                 tracing::debug!(peer = %info.peer, error = %e, "HTTP/3 request head rejected");
                 return;
@@ -594,7 +594,7 @@ async fn serve_request<S, B>(
                 return;
             }
         };
-        let sent = match frame.into_data() {
+        let written = match frame.into_data() {
             Ok(data) if data.is_empty() => Ok(()),
             Ok(data) => send.send_data(data).await,
             Err(frame) => match frame.into_trailers() {
@@ -602,7 +602,7 @@ async fn serve_request<S, B>(
                 Err(_) => Ok(()),
             },
         };
-        if sent.is_err() {
+        if written.is_err() {
             return;
         }
     }
