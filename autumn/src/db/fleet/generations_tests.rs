@@ -91,37 +91,84 @@ fn host_on(
     retention: Duration,
     destination: Arc<dyn ReplicaDestination>,
 ) -> Host {
-    let fleet = DatabaseFleet::with_engine(
-        &config(&dir.join(volume), restore_missing, retention),
-        engine,
-    )
-    .unwrap();
+    let replication = replication(dir, control_db, restore_missing, retention, destination)
+        .with_entropy(crate::entropy::SeededEntropy::shared(volume_seed(volume)));
+    install(dir, volume, engine, restore_missing, retention, replication)
+}
+
+/// The replication of a host, with control database `control_db`.
+fn replication(
+    dir: &Path,
+    control_db: &str,
+    restore_missing: bool,
+    retention: Duration,
+    destination: Arc<dyn ReplicaDestination>,
+) -> FleetReplication {
     let clock: Arc<dyn crate::time::ClockSource> = Arc::new(crate::time::SystemClock);
     let tombstones = Arc::new(FleetTombstones::new(
         control(dir, control_db),
         Arc::clone(&clock),
     ));
-    let replication = Arc::new(
-        FleetReplication::new(
-            destination,
-            ReplicationSettings {
-                database_path: std::path::PathBuf::new(),
-                root: BASE.to_owned(),
-                sync_interval: Duration::from_secs(1),
-                snapshot_interval: HOUR,
-                max_wal_bytes: 4 * 1024 * 1024,
-                retention: HOUR,
-                verify_interval: None,
-            },
-            Duration::from_secs(30),
-            restore_missing,
-            clock,
-        )
-        .with_tombstones(tombstones)
-        .with_retention_after_delete(retention),
-    );
+    FleetReplication::new(
+        destination,
+        ReplicationSettings {
+            database_path: std::path::PathBuf::new(),
+            root: BASE.to_owned(),
+            sync_interval: Duration::from_secs(1),
+            snapshot_interval: HOUR,
+            max_wal_bytes: 4 * 1024 * 1024,
+            retention: HOUR,
+            verify_interval: None,
+        },
+        Duration::from_secs(30),
+        restore_missing,
+        clock,
+    )
+    .with_tombstones(tombstones)
+    .with_retention_after_delete(retention)
+}
+
+/// A fixed seed for each volume: the first ship of each open is the same on
+/// each run, and two hosts do not draw the same generation ids.
+fn volume_seed(volume: &str) -> u64 {
+    volume.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// A fleet on volume `volume` with `replication` installed.
+fn install(
+    dir: &Path,
+    volume: &str,
+    engine: TextEngine,
+    restore_missing: bool,
+    retention: Duration,
+    replication: FleetReplication,
+) -> Host {
+    let fleet = DatabaseFleet::with_engine(
+        &config(&dir.join(volume), restore_missing, retention),
+        engine,
+    )
+    .unwrap();
+    let replication = Arc::new(replication);
     assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
     Host { fleet, replication }
+}
+
+/// A host that ships every `every`, with the seeded entropy `seed`.
+fn seeded_host(dir: &Path, every: Duration, seed: u64) -> Host {
+    let destination: Arc<dyn ReplicaDestination> =
+        Arc::new(FileDestination::new(dir.join("replicas")).unwrap());
+    let replication = replication(dir, "control.db", false, Duration::ZERO, destination)
+        .with_entropy(crate::entropy::SeededEntropy::shared(seed));
+    install(
+        dir,
+        "vol-a",
+        generations_engine(every),
+        false,
+        Duration::ZERO,
+        replication,
+    )
 }
 
 const fn generations_engine(every: Duration) -> TextEngine {
@@ -290,6 +337,147 @@ async fn the_worker_ships_every_interval() {
     }
     assert!(!complete(&a, &key).is_empty(), "the interval shipped");
     a.fleet.close_all().await;
+}
+
+/// The ship interval of the phase tests.
+const PHASE_EVERY: Duration = Duration::from_secs(30);
+
+/// The number of databases the phase tests open together.
+const PHASE_COUNT: usize = 8;
+
+/// Run `body` on a new current-thread runtime with paused time.
+fn paused<F: std::future::Future>(body: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap()
+        .block_on(body)
+}
+
+/// The snapshots of the database at `path`, as times after `since`.
+fn ships_of(host: &Host, path: &Path, since: tokio::time::Instant) -> Vec<Duration> {
+    host.fleet
+        .engine()
+        .snapshot_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(shipped, _)| shipped == path)
+        .map(|(_, at)| at.duration_since(since))
+        .collect()
+}
+
+/// Open `PHASE_COUNT` databases in one instant on a paused runtime, with the
+/// seeded entropy `seed`. Return the first two ships of each database, as
+/// times after the open, in open order.
+fn first_ships(seed: u64) -> Vec<[Duration; 2]> {
+    paused(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = seeded_host(tmp.path(), PHASE_EVERY, seed);
+        let keys: Vec<FleetDbKey> = (0..PHASE_COUNT)
+            .map(|i| host.fleet.key_for(&format!("tenant-{i}")).unwrap())
+            .collect();
+        let opened = tokio::time::Instant::now();
+        for key in &keys {
+            write(&host, key, "plan").await;
+        }
+        assert_eq!(
+            tokio::time::Instant::now(),
+            opened,
+            "the opens take no time"
+        );
+        // Paused time goes to each ship tick in turn.
+        tokio::time::sleep(2 * PHASE_EVERY + Duration::from_secs(1)).await;
+        let ships = keys
+            .iter()
+            .map(|key| {
+                let ships = ships_of(&host, &host.fleet.path_of(key), opened);
+                assert!(ships.len() >= 2, "each database ships twice: {ships:?}");
+                [ships[0], ships[1]]
+            })
+            .collect();
+        host.fleet.close_all().await;
+        ships
+    })
+}
+
+#[test]
+fn sim_databases_opened_together_ship_at_spread_out_times() {
+    let ships = first_ships(7);
+    let firsts: Vec<Duration> = ships.iter().map(|[first, _]| *first).collect();
+    for [first, second] in &ships {
+        assert!(
+            *first <= PHASE_EVERY,
+            "the first ship is at most `every` after the open: {ships:?}"
+        );
+        assert!(
+            second.abs_diff(*first + PHASE_EVERY) <= Duration::from_millis(1),
+            "the next ship is `every` after the first: {ships:?}"
+        );
+    }
+    let mut distinct = firsts.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        PHASE_COUNT,
+        "no two databases ship in the same instant: {firsts:?}"
+    );
+    let spread = distinct[PHASE_COUNT - 1].saturating_sub(distinct[0]);
+    assert!(
+        spread >= PHASE_EVERY / 2,
+        "the ships spread over the interval: {firsts:?}"
+    );
+}
+
+#[test]
+fn sim_a_seeded_entropy_replays_the_same_phases() {
+    let ships = first_ships(7);
+    assert_eq!(first_ships(7), ships, "the same seed gives the same phases");
+    assert_ne!(first_ships(8), ships, "another seed gives other phases");
+    // Each open draws one value. The timer rounds up to the next millisecond.
+    let entropy = crate::entropy::SeededEntropy::new(7);
+    for [first, _] in &ships {
+        let phase = super::generations::start_phase(
+            PHASE_EVERY,
+            crate::entropy::Entropy::next_u64(&entropy),
+        );
+        assert!(
+            first
+                .checked_sub(phase)
+                .is_some_and(|late| late <= Duration::from_millis(2)),
+            "the first ship is at the drawn phase: {first:?} for {phase:?}"
+        );
+    }
+}
+
+#[test]
+fn sim_a_reopen_draws_a_new_phase() {
+    paused(async {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = seeded_host(tmp.path(), PHASE_EVERY, 7);
+        let key = acme(&host.fleet);
+        let opened = tokio::time::Instant::now();
+        write(&host, &key, "plan").await;
+        // The close ships, and stops the timer of the first open.
+        host.fleet.close(&key).await;
+        write(&host, &key, "more").await;
+        tokio::time::sleep(PHASE_EVERY).await;
+        let ships = ships_of(&host, &host.fleet.path_of(&key), opened);
+        let old = super::generations::start_phase(
+            PHASE_EVERY,
+            crate::entropy::Entropy::next_u64(&crate::entropy::SeededEntropy::new(7)),
+        );
+        assert_eq!(ships.len(), 2, "the close, then one tick: {ships:?}");
+        assert_eq!(ships[0], Duration::ZERO, "the close ships at once");
+        assert!(ships[1] <= PHASE_EVERY, "the new phase is below `every`");
+        assert!(
+            ships[1].abs_diff(old) > Duration::from_millis(2),
+            "the reopen draws a new phase, not {old:?}: {ships:?}"
+        );
+        host.fleet.close_all().await;
+    });
 }
 
 #[tokio::test]

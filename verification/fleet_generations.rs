@@ -323,6 +323,73 @@ pub proof fn only_a_ship_or_a_retire_clears_the_record(retire: Retire, ship: Clo
             || ship == CloseShip::Shipped || ship == CloseShip::Fenced,
 {}
 
+// ---- The start phase of the ship timer ----
+//
+// Times here are nanoseconds. A draw is a `u64`, so it is below 2^64.
+
+/// `every` as `start_phase` uses it: at most `u64::MAX`.
+pub open spec fn clamped(every: nat) -> nat {
+    if every <= 18446744073709551615nat { every } else { 18446744073709551615nat }
+}
+
+/// `start_phase` in `generations.rs`: `(draw * every) >> 64`. It scales
+/// the draw into `[0, every)`.
+pub open spec fn phase(every: nat, draw: nat) -> nat {
+    (draw * clamped(every)) / 18446744073709551616nat
+}
+
+/// Ship `k` of a database opened at `open`. Ship 0 is the first.
+pub open spec fn ship_at(open: nat, every: nat, draw: nat, k: nat) -> nat {
+    open + phase(every, draw) + k * every
+}
+
+/// The phase is below `every`.
+pub proof fn the_phase_is_below_every(every: nat, draw: nat)
+    requires
+        every > 0,
+        draw < 18446744073709551616nat,
+    ensures
+        phase(every, draw) < every,
+{
+    let e = clamped(every);
+    assert(0 < e <= every);
+    assert(draw * e < 18446744073709551616nat * e) by (nonlinear_arith)
+        requires
+            e > 0,
+            draw < 18446744073709551616nat,
+    ;
+}
+
+/// A zero interval gives a zero phase.
+pub proof fn a_zero_interval_has_a_zero_phase(draw: nat)
+    ensures
+        phase(0, draw) == 0,
+{
+    assert(clamped(0) == 0);
+    assert(draw * 0 == 0) by (nonlinear_arith);
+}
+
+/// The first ship is less than `every` after the open: the RPO bound
+/// holds from the open.
+pub proof fn the_first_ship_is_within_every(open: nat, every: nat, draw: nat)
+    requires
+        every > 0,
+        draw < 18446744073709551616nat,
+    ensures
+        open <= ship_at(open, every, draw, 0),
+        ship_at(open, every, draw, 0) < open + every,
+{
+    the_phase_is_below_every(every, draw);
+}
+
+/// After the first ship, the ships are `every` apart.
+pub proof fn the_later_ships_are_every_apart(open: nat, every: nat, draw: nat, k: nat)
+    ensures
+        ship_at(open, every, draw, k + 1) == ship_at(open, every, draw, k) + every,
+{
+    assert((k + 1) * every == k * every + every) by (nonlinear_arith);
+}
+
 fn main() {}
 
 } // verus!

@@ -1119,7 +1119,7 @@ storage. Core does every write to the replica. The engine only gives files.
 | Mode | What core does | RPO |
 | --- | --- | --- |
 | `Continuous(_)` | Ships the changes as they commit. Only `SqliteEngine` (WAL shipping). `ContinuousShipper` is sealed. | `sync_interval` |
-| `Generations { every }` | Takes a `snapshot` every `every` and at close. Ships only the files whose SHA-256 is not in the previous generation. | `every` |
+| `Generations { every }` | Takes a `snapshot` every `every` and at close. The first `snapshot` is at a random time in the first `every` after the open. This spreads the ships of databases that open together. Ships only the files whose SHA-256 is not in the previous generation. | `every` |
 | `Rebuild` | Ships nothing. `restore_latest` calls `FleetEngine::rebuild`. | none |
 
 Install replication as for `SQLite`:

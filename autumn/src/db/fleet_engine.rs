@@ -56,6 +56,9 @@ pub enum ShipMode {
     /// Core calls [`FleetEngine::snapshot`] every `every` while the
     /// database is open, and once at close. It ships only the files whose
     /// content hash is not in the previous generation. The RPO is `every`.
+    ///
+    /// The first call is at a random time in the first `every` after the
+    /// open. This spreads the ships of databases that open at the same time.
     Generations {
         /// How often core ships a generation. Zero means one second.
         every: Duration,

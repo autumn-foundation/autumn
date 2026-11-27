@@ -3394,7 +3394,8 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `FleetFixture` in its CI. Engines go in their plugin, never in core.
 - Shipping another engine: return `ShipMode::Generations { every }` from
   `ship_mode` and call `fleet.install_replication(replication)` (needs
-  `sqlite`). Core snapshots every `every` and at close, puts only files with
+  `sqlite`). Core snapshots every `every` (the first at a random time in
+  the first `every`) and at close, puts only files with
   a new SHA-256, and restores the newest generation on a new volume. The
   engine never writes the replica: core checks the fence before each put
   (`FleetError::Fenced`, `421`). Make a snapshot of unchanged data the same
