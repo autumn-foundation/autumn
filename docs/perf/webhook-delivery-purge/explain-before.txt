@@ -1,0 +1,77 @@
+### 100000 logs
+== fixture: 100000 logs; workload: 138 deliveries, then one purge (cutoff 1760317200000)
+pgbench: setting random seed to 3742
+number of transactions actually processed: 138/138
+number of failed transactions: 0 (0.000%)
+ - number of failed transactions: 0 (0.000%)
+ - number of failed transactions: 0 (0.000%)
+                                                                                                                 QUERY PLAN                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_webhook_deliveries  (cost=0.00..14253.64 rows=0 width=0) (actual time=33.469..33.470 rows=0 loops=1)
+   Buffers: shared hit=12656 dirtied=21
+   ->  Seq Scan on public.autumn_webhook_deliveries  (cost=0.00..14253.64 rows=140 width=6) (actual time=33.049..33.257 rows=136 loops=1)
+         Output: ctid
+         Filter: ((NOT autumn_webhook_deliveries.is_dlq) AND (autumn_webhook_deliveries.logged_at < '1760317200000'::bigint) AND (autumn_webhook_deliveries.response_status >= 200) AND (autumn_webhook_deliveries.response_status <= 299))
+         Rows Removed by Filter: 100002
+         Buffers: shared hit=12499
+ Query Identifier: 2813086006118488349
+ Planning:
+   Buffers: shared hit=87
+ Planning Time: 0.287 ms
+ Execution Time: 33.539 ms
+(12 rows)
+
+### 1000000 logs
+== fixture: 1000000 logs; workload: 1388 deliveries, then one purge (cutoff 1760317200000)
+pgbench: setting random seed to 3742
+number of transactions actually processed: 1388/1388
+number of failed transactions: 0 (0.000%)
+ - number of failed transactions: 0 (0.000%)
+ - number of failed transactions: 0 (0.000%)
+                                                                                                                 QUERY PLAN                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_webhook_deliveries  (cost=0.00..142869.38 rows=0 width=0) (actual time=325.131..325.132 rows=0 loops=1)
+   Buffers: shared hit=32437 read=94412 dirtied=176
+   ->  Seq Scan on public.autumn_webhook_deliveries  (cost=0.00..142869.38 rows=1426 width=6) (actual time=322.551..323.918 rows=1347 loops=1)
+         Output: ctid
+         Filter: ((NOT autumn_webhook_deliveries.is_dlq) AND (autumn_webhook_deliveries.logged_at < '1760317200000'::bigint) AND (autumn_webhook_deliveries.response_status >= 200) AND (autumn_webhook_deliveries.response_status <= 299))
+         Rows Removed by Filter: 1000041
+         Buffers: shared hit=30914 read=94412
+ Query Identifier: -8304278110412088663
+ Planning:
+   Buffers: shared hit=87
+ Planning Time: 0.285 ms
+ JIT:
+   Functions: 3
+   Options: Inlining false, Optimization false, Expressions true, Deforming true
+   Timing: Generation 0.214 ms, Inlining 0.000 ms, Optimization 0.245 ms, Emission 3.373 ms, Total 3.832 ms
+ Execution Time: 337.866 ms
+(16 rows)
+
+### 3000000 logs
+== fixture: 3000000 logs; workload: 4166 deliveries, then one purge (cutoff 1760317200000)
+pgbench: setting random seed to 3742
+number of transactions actually processed: 4166/4166
+number of failed transactions: 0 (0.000%)
+ - number of failed transactions: 0 (0.000%)
+ - number of failed transactions: 0 (0.000%)
+                                                                                                                 QUERY PLAN                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_webhook_deliveries  (cost=0.00..429483.35 rows=0 width=0) (actual time=920.396..920.398 rows=0 loops=1)
+   Buffers: shared hit=36260 read=345161 dirtied=523
+   ->  Seq Scan on public.autumn_webhook_deliveries  (cost=0.00..429483.35 rows=4060 width=6) (actual time=912.712..916.607 rows=4067 loops=1)
+         Output: ctid
+         Filter: ((NOT autumn_webhook_deliveries.is_dlq) AND (autumn_webhook_deliveries.logged_at < '1760317200000'::bigint) AND (autumn_webhook_deliveries.response_status >= 200) AND (autumn_webhook_deliveries.response_status <= 299))
+         Rows Removed by Filter: 3000099
+         Buffers: shared hit=31670 read=345161
+ Query Identifier: 3112246196501982077
+ Planning:
+   Buffers: shared hit=87
+ Planning Time: 0.294 ms
+ JIT:
+   Functions: 3
+   Options: Inlining false, Optimization false, Expressions true, Deforming true
+   Timing: Generation 0.246 ms, Inlining 0.000 ms, Optimization 0.291 ms, Emission 3.725 ms, Total 4.262 ms
+ Execution Time: 934.583 ms
+(16 rows)
+
