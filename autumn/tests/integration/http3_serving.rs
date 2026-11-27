@@ -135,7 +135,7 @@ fn test_config() -> AutumnConfig {
 
 /// Serve `config` + the routes over h3, with the serve-boundary layers of
 /// `app.rs`: `MethodOverrideLayer` inside `TrustedProxiesLayer`.
-async fn serve_h3(
+fn serve_h3(
     config: AutumnConfig,
     settings: Http3Settings,
     client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
@@ -302,7 +302,7 @@ impl H3Client {
 
 #[tokio::test]
 async fn h3_serves_a_get_request() {
-    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let resp = client.get("/hello").await.expect("GET over h3");
     assert_eq!(resp.status, 200);
@@ -314,7 +314,7 @@ async fn h3_serves_a_get_request() {
 
 #[tokio::test]
 async fn h3_round_trips_a_large_request_body() {
-    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let payload: String = "autumn-".repeat(20_000);
     let req = axum::http::Request::post("https://localhost/echo")
@@ -333,7 +333,7 @@ async fn h3_round_trips_a_large_request_body() {
 
 #[tokio::test]
 async fn h3_method_override_reaches_the_put_handler() {
-    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     // The layer applies an override only to a same-origin form. It compares
     // `Origin` with the `Host` that the adapter adds from `:authority`.
@@ -371,7 +371,7 @@ async fn h3_ignores_forwarded_for_from_an_untrusted_peer() {
     config.security.trusted_proxies.trust_forwarded_headers = true;
     // The loopback peer is not in this range, so it is not a trusted proxy.
     config.security.trusted_proxies.ranges = vec!["10.0.0.0/8".to_owned()];
-    let server = serve_h3(config, Http3Settings::default(), None).await;
+    let server = serve_h3(config, Http3Settings::default(), None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let resp = client
         .get_with("/whoami", &[("x-forwarded-for", "203.0.113.7")])
@@ -390,7 +390,7 @@ async fn h3_honors_forwarded_for_from_a_trusted_peer() {
     let mut config = test_config();
     config.security.trusted_proxies.trust_forwarded_headers = true;
     config.security.trusted_proxies.ranges = vec!["127.0.0.0/8".to_owned()];
-    let server = serve_h3(config, Http3Settings::default(), None).await;
+    let server = serve_h3(config, Http3Settings::default(), None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let resp = client
         .get_with("/whoami", &[("x-forwarded-for", "203.0.113.7")])
@@ -405,7 +405,7 @@ async fn h3_honors_forwarded_for_from_a_trusted_peer() {
 
 #[tokio::test]
 async fn h3_request_carries_a_host_header_from_the_authority() {
-    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let resp = client.get("/host").await.expect("GET over h3");
     assert_eq!(resp.body, "localhost");
@@ -414,7 +414,7 @@ async fn h3_request_carries_a_host_header_from_the_authority() {
 
 #[tokio::test]
 async fn h3_serves_a_renewed_certificate_on_the_next_connection() {
-    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
     let first = connect(server.addr, None).await.expect("h3 connects");
     let original = first.verifier.last_leaf().expect("leaf recorded");
 
@@ -429,10 +429,10 @@ async fn h3_serves_a_renewed_certificate_on_the_next_connection() {
 
     let mut second = connect(server.addr, None).await.expect("h3 reconnects");
     assert_eq!(second.get("/hello").await.expect("GET").status, 200);
-    let served = second.verifier.last_leaf().expect("leaf recorded");
-    assert_ne!(served, original);
+    let leaf_now = second.verifier.last_leaf().expect("leaf recorded");
+    assert_ne!(leaf_now, original);
     assert_eq!(
-        served, renewed_leaf,
+        leaf_now, renewed_leaf,
         "the endpoint serves the renewed certificate"
     );
     server.shutdown().await;
@@ -440,7 +440,7 @@ async fn h3_serves_a_renewed_certificate_on_the_next_connection() {
 
 #[tokio::test]
 async fn h3_drains_an_in_flight_request_on_shutdown() {
-    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let shutdown = server.shutdown.clone();
     let entered = SLOW_ENTERED.notified();
@@ -459,7 +459,7 @@ async fn h3_drains_an_in_flight_request_on_shutdown() {
 
 #[tokio::test]
 async fn h3_refuses_new_requests_after_shutdown() {
-    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
     let mut before = connect(server.addr, None).await.expect("h3 connects");
     assert_eq!(before.get("/hello").await.expect("GET").status, 200);
     drop(before);
@@ -484,7 +484,7 @@ async fn h3_refuses_new_requests_after_shutdown() {
 async fn h3_caps_open_connections() {
     let mut settings = Http3Settings::default();
     settings.max_connections = Some(1);
-    let server = serve_h3(test_config(), settings, None).await;
+    let server = serve_h3(test_config(), settings, None);
     let mut first = connect(server.addr, None).await.expect("first connects");
     assert_eq!(first.get("/hello").await.expect("GET").status, 200);
     let second = async {
@@ -504,7 +504,7 @@ async fn h3_caps_open_connections() {
 async fn h3_closes_a_streaming_response_when_the_drain_grace_ends() {
     let mut settings = Http3Settings::default();
     settings.drain_grace = Duration::from_millis(300);
-    let server = serve_h3(test_config(), settings, None).await;
+    let server = serve_h3(test_config(), settings, None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let req = axum::http::Request::get("https://localhost/forever")
         .body(())
@@ -530,7 +530,7 @@ async fn h3_closes_a_streaming_response_when_the_drain_grace_ends() {
 
 #[tokio::test]
 async fn h3_rejects_a_request_with_a_connection_specific_header() {
-    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let resp = client
         .get_with("/hello", &[("te", "gzip")])
@@ -544,7 +544,7 @@ async fn h3_rejects_a_request_with_a_connection_specific_header() {
 
 #[tokio::test]
 async fn h3_removes_connection_headers_from_a_response() {
-    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let resp = client.get("/hop").await.expect("the response is valid h3");
     assert_eq!(resp.body, "hop");
@@ -559,7 +559,7 @@ async fn h3_removes_connection_headers_from_a_response() {
 
 #[tokio::test]
 async fn h3_serves_a_large_request_head_inside_the_limit() {
-    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let big = "a".repeat(30 * 1024);
     let resp = client
@@ -576,7 +576,7 @@ async fn h3_does_not_count_body_bytes_against_a_small_head_limit() {
     // the first DATA can arrive in one packet; only the HEADERS frame counts.
     let mut settings = Http3Settings::default();
     settings.max_field_section_size = Some(2048);
-    let server = serve_h3(test_config(), settings, None).await;
+    let server = serve_h3(test_config(), settings, None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let payload = "b".repeat(100_000);
     let req = axum::http::Request::post("https://localhost/echo")
@@ -596,7 +596,7 @@ async fn h3_does_not_count_body_bytes_against_a_small_head_limit() {
 async fn h3_closes_a_connection_after_the_keep_alive_timeout() {
     let mut settings = Http3Settings::default();
     settings.keep_alive_timeout = Some(Duration::from_millis(300));
-    let server = serve_h3(test_config(), settings, None).await;
+    let server = serve_h3(test_config(), settings, None);
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     assert_eq!(client.get("/hello").await.expect("GET").status, 200);
     tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -627,8 +627,7 @@ async fn h3_mtls_rejects_a_client_without_a_certificate() {
         test_config(),
         Http3Settings::default(),
         Some(required_verifier(&trust)),
-    )
-    .await;
+    );
     let result = async {
         let mut client = connect(server.addr, None).await?;
         client.get("/cert").await
@@ -648,8 +647,7 @@ async fn h3_mtls_exposes_the_verified_client_identity() {
         test_config(),
         Http3Settings::default(),
         Some(required_verifier(&trust)),
-    )
-    .await;
+    );
     let mut client = connect(server.addr, Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM)))
         .await
         .expect("h3 connects with a client certificate");
