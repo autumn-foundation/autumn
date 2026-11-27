@@ -1152,8 +1152,10 @@ It is the same code core uses for the `SQLite` fleet of `[database.fleet]`:
   boot.
 - A one-off task (`autumn task`) builds no `[replication]`. There the
   installer returns `NoReplication`.
-- Shutdown stays with the plugin. Close the fleet (`close_all`) in an
-  `on_shutdown` hook: the last generation ships at close.
+- Shutdown stays with the plugin. Start `fleet.spawn_maintenance(token)` at
+  boot. At shutdown, cancel the token and await the handle. It closes every
+  database, ships the last generations and stops the loop. A bare
+  `close_all` does not stop the loop.
 
 The mode decides what it starts. Replication needs the `sqlite` feature: it
 keeps the tombstones on the `SQLite` control database. `FleetStats` and the

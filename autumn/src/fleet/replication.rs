@@ -107,8 +107,10 @@ impl ReplicaSource {
 /// warning. A one-off task (`autumn task`) builds no
 /// `[replication]`, so there it returns [`ReplicationInstall::NoReplication`].
 ///
-/// Shutdown stays with the plugin: close the fleet (`close_all`) in an
-/// `on_shutdown` hook. The last generation ships at close.
+/// Shutdown stays with the plugin. Start `fleet.spawn_maintenance(token)`
+/// at boot. At shutdown, cancel the token and await the handle: it closes
+/// every database, ships the last generations and stops the loop. A bare
+/// `close_all` does not stop the loop.
 ///
 /// # Errors
 ///
