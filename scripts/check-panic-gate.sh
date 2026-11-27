@@ -129,6 +129,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/heavy_hitters.rs:default
   autumn/src/bloom.rs:default
   autumn/src/distinct.rs:default
+  autumn/src/minhash.rs:default
   autumn/src/quantiles.rs:default
   autumn/src/reservoir.rs:default
   autumn/src/middleware/short_circuit.rs:default
