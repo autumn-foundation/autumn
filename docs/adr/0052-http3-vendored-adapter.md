@@ -46,9 +46,11 @@ Option 3.
 - h3 runs as a task beside the TLS listener, inside the same server task, on
   the same shutdown token. It is not a new `BoundListener` variant.
 - Extended CONNECT, WebTransport and QUIC datagrams stay off.
-- `h3` 0.0.8 reads a whole HEADERS frame before it checks its size. A
-  transport wrapper (`http3/limited.rs`) limits the bytes that `h3` reads
-  before a request head is parsed, and on control streams.
+- `h3` 0.0.8 reads a whole frame (other than DATA) before it parses it. A
+  transport wrapper (`http3/limited.rs`) reads the frame headers on each
+  request stream, and refuses a frame other than DATA that declares more
+  than `max_header_bytes`. This covers the head and the trailers. A
+  control or QPACK stream has a total limit of 64 KiB.
 - The request head has a time limit. Idle connections close. A drain ends
   after the same grace that TCP connections get.
 

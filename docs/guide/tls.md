@@ -1428,7 +1428,8 @@ Each key has an `AUTUMN_SERVER__HTTP3__*` env var, for example
 - A request with a connection-specific header (`Connection`, `TE` other than
   `trailers`, and so on) gets `400`. HTTP/3 forbids these headers.
 - `[server.http]` limits apply:
-  - `max_header_bytes` limits the request head (default 64 KiB).
+  - `max_header_bytes` limits the request head and the trailers (default
+    64 KiB).
   - `header_read_timeout_ms` limits the time to receive the head (default
     30 seconds).
   - `keep_alive_timeout_ms` closes a connection with no request in flight.

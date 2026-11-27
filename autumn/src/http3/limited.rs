@@ -1,146 +1,180 @@
-//! The QUIC transport that `h3` reads from, with a byte limit on each stream.
+//! The QUIC transport that `h3` reads from, with byte limits.
 //!
-//! `h3` buffers a whole HEADERS frame before it checks
-//! `max_field_section_size`. A client can declare a very large frame and send
-//! data into it. This wrapper counts the bytes that `h3` reads:
+//! `h3` buffers a whole frame before it parses it, except DATA, which it
+//! streams. It checks `max_field_section_size` only after it has the whole
+//! HEADERS frame. A client can declare a very large frame and send data into
+//! it. This wrapper reads the frame headers as `h3` receives them:
 //!
-//! - On a request stream, until the server releases the stream (the request
-//!   head is parsed). Then the body is not limited here.
-//! - On a unidirectional stream (control, QPACK), for the life of the stream.
-//!   These streams carry a few small frames.
+//! - On a request stream, a frame that is not DATA (HEADERS, trailers, an
+//!   unknown type) may not declare more than the head limit. DATA frames
+//!   pass: the app's body limits apply to them.
+//! - On a unidirectional stream (control, QPACK), the limit applies to the
+//!   bytes of the whole stream. These streams carry a few small frames.
 //!
 //! When a stream goes over its limit, the wrapper stops the stream and gives
 //! `h3` an error. On the control stream, that closes the connection.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use h3::quic::{self, ConnectionErrorIncoming, StreamErrorIncoming, StreamId, WriteBuf};
 
 /// The byte limit on a unidirectional stream.
-pub(super) const UNI_STREAM_LIMIT: usize = 64 * 1024;
+pub(super) const UNI_STREAM_LIMIT: u64 = 64 * 1024;
+
+/// The HTTP/3 DATA frame type.
+const DATA_FRAME: u64 = 0x00;
 
 /// `H3_EXCESSIVE_LOAD`, sent in `STOP_SENDING` when a stream goes over its limit.
 const H3_EXCESSIVE_LOAD: u64 = 0x0107;
 
 /// A stream went over its byte limit.
 #[derive(Debug, thiserror::Error)]
-#[error("the HTTP/3 stream sent more than {limit} bytes before its request head ended")]
+#[error("the HTTP/3 stream sent a frame larger than the limit of {limit} bytes")]
 struct OverLimit {
-    limit: usize,
+    limit: u64,
 }
 
-/// The request streams of one connection whose head is not parsed yet.
-#[derive(Debug)]
-pub(super) struct HeadBudgets {
-    limit: usize,
-    open: Mutex<HashMap<StreamId, Arc<AtomicBool>>>,
+/// A QUIC variable-length integer, read one byte at a time.
+#[derive(Debug, Clone, Copy, Default)]
+struct VarInt {
+    value: u64,
+    /// Bytes still to read. `0` before the first byte.
+    left: u8,
+    started: bool,
 }
 
-impl HeadBudgets {
-    pub(super) fn new(limit: usize) -> Arc<Self> {
-        Arc::new(Self {
-            limit,
-            open: Mutex::new(HashMap::new()),
-        })
-    }
-
-    /// Remove the limit from `id`: its request head is parsed.
-    pub(super) fn release(&self, id: StreamId) {
-        if let Some(released) = self.lock().remove(&id) {
-            released.store(true, Ordering::Release);
+impl VarInt {
+    /// Add one byte. `Some(value)` when the integer is complete.
+    const fn push(&mut self, byte: u8) -> Option<u64> {
+        if !self.started {
+            self.started = true;
+            // The two high bits give the length: 1, 2, 4 or 8 bytes.
+            self.left = (1u8 << (byte >> 6)) - 1;
+            self.value = (byte & 0x3f) as u64;
+        } else {
+            self.value = (self.value << 8) | byte as u64;
+            self.left -= 1;
+        }
+        if self.left == 0 {
+            let value = self.value;
+            *self = Self {
+                value: 0,
+                left: 0,
+                started: false,
+            };
+            Some(value)
+        } else {
+            None
         }
     }
-
-    fn register(&self, id: StreamId) -> Arc<AtomicBool> {
-        let released = Arc::new(AtomicBool::new(false));
-        self.lock().insert(id, Arc::clone(&released));
-        released
-    }
-
-    fn forget(&self, id: StreamId) {
-        self.lock().remove(&id);
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<StreamId, Arc<AtomicBool>>> {
-        self.open
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    #[cfg(test)]
-    pub(super) fn open_count(&self) -> usize {
-        self.lock().len()
-    }
 }
 
-/// The byte count of one receive stream.
+/// Where the frame reader is in the request stream.
+#[derive(Debug, Clone, Copy)]
+enum FrameState {
+    Type(VarInt),
+    Length { frame_type: u64, length: VarInt },
+    Payload { left: u64 },
+}
+
+/// The byte limit of one receive stream.
 #[derive(Debug)]
-struct Gate {
-    read: usize,
-    limit: usize,
-    /// `None` on a unidirectional stream: its limit is never removed.
-    released: Option<Arc<AtomicBool>>,
-    /// Where to remove the entry of a request stream when it drops.
-    registry: Option<(Arc<HeadBudgets>, StreamId)>,
+enum Gate {
+    /// A request stream: each frame that is not DATA has a size limit.
+    Frames { limit: u64, state: FrameState },
+    /// A unidirectional stream: the whole stream has a size limit.
+    Total { limit: u64, read: u64 },
 }
 
 impl Gate {
+    const fn request(limit: u64) -> Self {
+        Self::Frames {
+            limit,
+            state: FrameState::Type(VarInt {
+                value: 0,
+                left: 0,
+                started: false,
+            }),
+        }
+    }
+
     const fn uni() -> Self {
-        Self {
-            read: 0,
+        Self::Total {
             limit: UNI_STREAM_LIMIT,
-            released: None,
-            registry: None,
-        }
-    }
-
-    fn request(budgets: &Arc<HeadBudgets>, id: StreamId) -> Self {
-        Self {
             read: 0,
-            limit: budgets.limit,
-            released: Some(budgets.register(id)),
-            registry: Some((Arc::clone(budgets), id)),
         }
     }
 
-    /// Count `len` bytes. `false` when the stream is over its limit.
-    fn admit(&mut self, len: usize) -> bool {
-        if self
-            .released
-            .as_ref()
-            .is_some_and(|released| released.load(Ordering::Acquire))
-        {
-            return true;
+    const fn limit(&self) -> u64 {
+        match self {
+            Self::Frames { limit, .. } | Self::Total { limit, .. } => *limit,
         }
-        self.read = self.read.saturating_add(len);
-        self.read <= self.limit
+    }
+
+    /// Read `bytes`. `false` when the stream is over its limit.
+    fn admit(&mut self, mut bytes: &[u8]) -> bool {
+        match self {
+            Self::Total { limit, read } => {
+                *read = read.saturating_add(bytes.len() as u64);
+                *read <= *limit
+            }
+            Self::Frames { limit, state } => {
+                while !bytes.is_empty() {
+                    match state {
+                        FrameState::Payload { left } => {
+                            let take = usize::try_from(*left)
+                                .map_or(bytes.len(), |left| left.min(bytes.len()));
+                            bytes = &bytes[take..];
+                            *left -= take as u64;
+                            if *left == 0 {
+                                *state = FrameState::Type(VarInt::default());
+                            }
+                        }
+                        FrameState::Type(varint) => {
+                            let byte = bytes[0];
+                            bytes = &bytes[1..];
+                            if let Some(frame_type) = varint.push(byte) {
+                                *state = FrameState::Length {
+                                    frame_type,
+                                    length: VarInt::default(),
+                                };
+                            }
+                        }
+                        FrameState::Length { frame_type, length } => {
+                            let byte = bytes[0];
+                            bytes = &bytes[1..];
+                            if let Some(length) = length.push(byte) {
+                                if *frame_type != DATA_FRAME && length > *limit {
+                                    return false;
+                                }
+                                *state = if length == 0 {
+                                    FrameState::Type(VarInt::default())
+                                } else {
+                                    FrameState::Payload { left: length }
+                                };
+                            }
+                        }
+                    }
+                }
+                true
+            }
+        }
     }
 }
 
-impl Drop for Gate {
-    fn drop(&mut self) {
-        if let Some((budgets, id)) = self.registry.take() {
-            budgets.forget(id);
-        }
-    }
-}
-
-fn poll_limited<S: quic::RecvStream>(
+fn poll_limited<S: quic::RecvStream<Buf = Bytes>>(
     inner: &mut S,
     gate: &mut Gate,
     cx: &mut Context<'_>,
-) -> Poll<Result<Option<S::Buf>, StreamErrorIncoming>> {
+) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
     let data = ready!(inner.poll_data(cx))?;
     if let Some(buf) = &data
-        && !gate.admit(buf.remaining())
+        && !gate.admit(buf.chunk())
     {
         inner.stop_sending(H3_EXCESSIVE_LOAD);
         return Poll::Ready(Err(StreamErrorIncoming::Unknown(Box::new(OverLimit {
-            limit: gate.limit,
+            limit: gate.limit(),
         }))));
     }
     Poll::Ready(Ok(data))
@@ -152,8 +186,8 @@ pub(super) struct LimitedRecv<S> {
     gate: Gate,
 }
 
-impl<S: quic::RecvStream> quic::RecvStream for LimitedRecv<S> {
-    type Buf = S::Buf;
+impl<S: quic::RecvStream<Buf = Bytes>> quic::RecvStream for LimitedRecv<S> {
+    type Buf = Bytes;
 
     fn poll_data(
         &mut self,
@@ -218,8 +252,6 @@ impl<B: Buf> quic::RecvStream for LimitedBidi<B> {
     }
 }
 
-use bytes::Bytes;
-
 impl<B: Buf> quic::BidiStream<B> for LimitedBidi<B> {
     type SendStream = h3_quinn::SendStream<B>;
     type RecvStream = LimitedRecv<h3_quinn::RecvStream>;
@@ -236,10 +268,22 @@ impl<B: Buf> quic::BidiStream<B> for LimitedBidi<B> {
     }
 }
 
-/// Opens server-side streams. The server opens only its unidirectional
-/// streams; a bidirectional one would carry no client data to limit.
+/// Opens server-side streams.
 pub(super) struct LimitedOpenStreams {
     inner: h3_quinn::OpenStreams,
+    limit: u64,
+}
+
+fn open_bidi<B: Buf, O: quic::OpenStreams<B, BidiStream = h3_quinn::BidiStream<B>>>(
+    opener: &mut O,
+    limit: u64,
+    cx: &mut Context<'_>,
+) -> Poll<Result<LimitedBidi<B>, StreamErrorIncoming>> {
+    let inner = ready!(opener.poll_open_bidi(cx))?;
+    Poll::Ready(Ok(LimitedBidi {
+        inner,
+        gate: Gate::request(limit),
+    }))
 }
 
 impl<B: Buf> quic::OpenStreams<B> for LimitedOpenStreams {
@@ -250,11 +294,7 @@ impl<B: Buf> quic::OpenStreams<B> for LimitedOpenStreams {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
-        let inner = ready!(quic::OpenStreams::<B>::poll_open_bidi(&mut self.inner, cx))?;
-        Poll::Ready(Ok(LimitedBidi {
-            inner,
-            gate: Gate::uni(),
-        }))
+        open_bidi(&mut self.inner, self.limit, cx)
     }
 
     fn poll_open_send(
@@ -272,14 +312,16 @@ impl<B: Buf> quic::OpenStreams<B> for LimitedOpenStreams {
 /// An `h3_quinn` connection whose receive streams have byte limits.
 pub(super) struct LimitedConnection {
     inner: h3_quinn::Connection,
-    budgets: Arc<HeadBudgets>,
+    limit: u64,
 }
 
 impl LimitedConnection {
-    pub(super) fn new(conn: quinn::Connection, budgets: Arc<HeadBudgets>) -> Self {
+    /// Wrap `conn`. `limit` is the largest frame, other than DATA, that a
+    /// request stream may declare.
+    pub(super) fn new(conn: quinn::Connection, limit: u64) -> Self {
         Self {
             inner: h3_quinn::Connection::new(conn),
-            budgets,
+            limit,
         }
     }
 }
@@ -292,11 +334,7 @@ impl<B: Buf> quic::OpenStreams<B> for LimitedConnection {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
-        let inner = ready!(quic::OpenStreams::<B>::poll_open_bidi(&mut self.inner, cx))?;
-        Poll::Ready(Ok(LimitedBidi {
-            inner,
-            gate: Gate::uni(),
-        }))
+        open_bidi(&mut self.inner, self.limit, cx)
     }
 
     fn poll_open_send(
@@ -331,16 +369,16 @@ impl<B: Buf> quic::Connection<B> for LimitedConnection {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
         let inner = ready!(quic::Connection::<B>::poll_accept_bidi(&mut self.inner, cx))?;
-        let id = quic::RecvStream::recv_id(&inner);
         Poll::Ready(Ok(LimitedBidi {
             inner,
-            gate: Gate::request(&self.budgets, id),
+            gate: Gate::request(self.limit),
         }))
     }
 
     fn opener(&self) -> Self::OpenStreams {
         LimitedOpenStreams {
             inner: quic::Connection::<B>::opener(&self.inner),
+            limit: self.limit,
         }
     }
 }
@@ -349,33 +387,128 @@ impl<B: Buf> quic::Connection<B> for LimitedConnection {
 mod tests {
     use super::*;
 
+    /// Encode `value` as a QUIC variable-length integer.
+    fn varint(value: u64) -> Vec<u8> {
+        match value {
+            0..=0x3f => vec![u8::try_from(value).unwrap()],
+            0x40..=0x3fff => (u16::try_from(value).unwrap() | 0x4000)
+                .to_be_bytes()
+                .to_vec(),
+            0x4000..=0x3fff_ffff => (u32::try_from(value).unwrap() | 0x8000_0000)
+                .to_be_bytes()
+                .to_vec(),
+            _ => (value | 0xc000_0000_0000_0000).to_be_bytes().to_vec(),
+        }
+    }
+
+    /// A frame header: type, then declared length.
+    fn header(frame_type: u64, length: u64) -> Vec<u8> {
+        let mut out = varint(frame_type);
+        out.extend(varint(length));
+        out
+    }
+
     #[test]
-    fn a_uni_gate_never_lifts_its_limit() {
+    fn varints_of_every_length_decode() {
+        for value in [
+            0,
+            37,
+            0x3f,
+            0x40,
+            15_293,
+            0x3fff,
+            0x4000,
+            494_878_333,
+            0x4000_0000,
+        ] {
+            let mut reader = VarInt::default();
+            let bytes = varint(value);
+            let (last, rest) = bytes.split_last().unwrap();
+            for byte in rest {
+                assert_eq!(reader.push(*byte), None);
+            }
+            assert_eq!(reader.push(*last), Some(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_head_inside_the_limit_passes() {
+        let mut gate = Gate::request(100);
+        let mut bytes = header(0x01, 100);
+        bytes.extend([0u8; 100]);
+        assert!(gate.admit(&bytes));
+    }
+
+    #[test]
+    fn a_head_that_declares_more_than_the_limit_is_refused() {
+        let mut gate = Gate::request(100);
+        assert!(!gate.admit(&header(0x01, 101)));
+    }
+
+    #[test]
+    fn a_head_and_its_body_in_one_chunk_count_only_the_head() {
+        let mut gate = Gate::request(16);
+        let mut bytes = header(0x01, 16);
+        bytes.extend([0u8; 16]);
+        bytes.extend(header(DATA_FRAME, 100_000));
+        bytes.extend(vec![0u8; 100_000]);
+        assert!(
+            gate.admit(&bytes),
+            "DATA bytes do not count against the head"
+        );
+    }
+
+    #[test]
+    fn oversized_trailers_after_a_body_are_refused() {
+        let mut gate = Gate::request(16);
+        let mut bytes = header(0x01, 8);
+        bytes.extend([0u8; 8]);
+        bytes.extend(header(DATA_FRAME, 1_000));
+        bytes.extend(vec![0u8; 1_000]);
+        assert!(gate.admit(&bytes));
+        assert!(
+            !gate.admit(&header(0x01, 1_000_000)),
+            "trailers are a HEADERS frame"
+        );
+    }
+
+    #[test]
+    fn an_oversized_unknown_frame_is_refused() {
+        let mut gate = Gate::request(16);
+        assert!(!gate.admit(&header(0x21, 17)));
+    }
+
+    #[test]
+    fn a_frame_header_split_across_chunks_is_read() {
+        let mut gate = Gate::request(100);
+        let bytes = header(0x01, 0x4000);
+        for byte in &bytes[..bytes.len() - 1] {
+            assert!(gate.admit(std::slice::from_ref(byte)));
+        }
+        assert!(
+            !gate.admit(&bytes[bytes.len() - 1..]),
+            "the length ends in the last chunk"
+        );
+    }
+
+    #[test]
+    fn a_large_data_frame_split_across_chunks_passes() {
+        let mut gate = Gate::request(16);
+        assert!(gate.admit(&header(DATA_FRAME, 300_000)));
+        for _ in 0..3 {
+            assert!(gate.admit(&vec![0u8; 100_000]));
+        }
+        assert!(
+            !gate.admit(&header(0x01, 17)),
+            "the next frame is read again"
+        );
+    }
+
+    #[test]
+    fn a_uni_stream_has_a_lifetime_limit() {
         let mut gate = Gate::uni();
-        assert!(gate.admit(UNI_STREAM_LIMIT));
-        assert!(!gate.admit(1), "one byte over the limit is refused");
-    }
-
-    #[test]
-    fn a_request_gate_lifts_its_limit_on_release() {
-        let budgets = HeadBudgets::new(10);
-        let id = StreamId::try_from(0_u64).expect("stream 0");
-        let mut gate = Gate::request(&budgets, id);
-        assert!(gate.admit(10));
-        assert!(!gate.admit(1), "the head may not pass the limit");
-
-        let mut gate = Gate::request(&budgets, id);
-        assert!(gate.admit(10));
-        budgets.release(id);
-        assert!(gate.admit(1_000_000), "the body is not limited here");
-    }
-
-    #[test]
-    fn a_dropped_request_gate_leaves_no_entry() {
-        let budgets = HeadBudgets::new(10);
-        let gate = Gate::request(&budgets, StreamId::try_from(4_u64).expect("stream 4"));
-        assert_eq!(budgets.open_count(), 1);
-        drop(gate);
-        assert_eq!(budgets.open_count(), 0);
+        let limit = usize::try_from(UNI_STREAM_LIMIT).unwrap();
+        assert!(gate.admit(&vec![0u8; limit]));
+        assert!(!gate.admit(&[0]), "one byte over the limit is refused");
     }
 }

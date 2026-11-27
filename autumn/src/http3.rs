@@ -17,7 +17,8 @@
 //! - A request without `Host` gets one from `:authority`.
 //! - A request with a connection-specific header gets `400`, and these
 //!   headers are removed from responses (RFC 9114, section 4.2).
-//! - Limits: request-head size and time, idle connections, open
+//! - Limits: the size of each frame other than DATA (head, trailers), the
+//!   time to receive the head, idle connections, open
 //!   connections, handshakes in progress (with a QUIC Retry under load).
 //! - Shutdown sends GOAWAY, lets in-flight requests finish within the grace
 //!   that TCP connections get, then closes.
@@ -47,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::Http3Config;
 use crate::http_server::HttpLimits;
 use crate::tls::TlsConnectInfo;
-use limited::{HeadBudgets, LimitedConnection, LimitedRecv};
+use limited::{LimitedConnection, LimitedRecv};
 
 /// After the last response of a drained connection, wait this long for the
 /// client to close. A server close drops stream data that is not sent yet.
@@ -414,7 +415,6 @@ async fn serve_connection<S, B>(
     let info = TlsConnectInfo::from_peer_chain(peer, chain.as_deref().map(Vec::as_slice));
 
     let max_head = settings.max_head_bytes();
-    let budgets = HeadBudgets::new(usize::try_from(max_head).unwrap_or(usize::MAX));
     let mut builder = h3::server::builder();
     // Off on purpose: extended CONNECT would let a browser try WebSockets over
     // h3, which the app does not serve.
@@ -424,16 +424,14 @@ async fn serve_connection<S, B>(
         .enable_webtransport(false)
         .enable_datagram(false);
     let quic = conn.clone();
-    let mut h3_conn: h3::server::Connection<LimitedConnection, Bytes> = match builder
-        .build(LimitedConnection::new(conn, Arc::clone(&budgets)))
-        .await
-    {
-        Ok(h3_conn) => h3_conn,
-        Err(e) => {
-            tracing::debug!(peer = %peer, error = %e, "HTTP/3 connection setup failed");
-            return;
-        }
-    };
+    let mut h3_conn: h3::server::Connection<LimitedConnection, Bytes> =
+        match builder.build(LimitedConnection::new(conn, max_head)).await {
+            Ok(h3_conn) => h3_conn,
+            Err(e) => {
+                tracing::debug!(peer = %peer, error = %e, "HTTP/3 connection setup failed");
+                return;
+            }
+        };
 
     let mut requests = JoinSet::new();
     let mut idle_deadline = settings.keep_alive_timeout.map(|t| Instant::now() + t);
@@ -478,7 +476,6 @@ async fn serve_connection<S, B>(
                     resolver,
                     service.clone(),
                     info.clone(),
-                    Arc::clone(&budgets),
                     settings.head_deadline(),
                 ));
             }
@@ -542,7 +539,6 @@ async fn serve_request<S, B>(
     resolver: h3::server::RequestResolver<LimitedConnection, Bytes>,
     service: S,
     info: TlsConnectInfo,
-    budgets: Arc<HeadBudgets>,
     head_timeout: Duration,
 ) where
     S: tower::Service<Request<axum::body::Body>, Response = Response<B>, Error = Infallible>
@@ -564,8 +560,6 @@ async fn serve_request<S, B>(
                 return;
             }
         };
-    // The head is parsed: the body is not limited by the head budget.
-    budgets.release(stream.id());
     let (mut send, recv) = stream.split();
     let (mut parts, ()) = request.into_parts();
     if has_connection_header(&parts.headers) {

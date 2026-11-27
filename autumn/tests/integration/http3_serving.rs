@@ -571,6 +571,28 @@ async fn h3_serves_a_large_request_head_inside_the_limit() {
 }
 
 #[tokio::test]
+async fn h3_does_not_count_body_bytes_against_a_small_head_limit() {
+    // A small head limit, and a body much larger than it. The HEADERS and
+    // the first DATA can arrive in one packet; only the HEADERS frame counts.
+    let mut settings = Http3Settings::default();
+    settings.max_field_section_size = Some(2048);
+    let server = serve_h3(test_config(), settings, None).await;
+    let mut client = connect(server.addr, None).await.expect("h3 connects");
+    let payload = "b".repeat(100_000);
+    let req = axum::http::Request::post("https://localhost/echo")
+        .header("content-type", "application/octet-stream")
+        .body(())
+        .unwrap();
+    let resp = client
+        .request(req, Some(Bytes::from(payload.clone())))
+        .await
+        .expect("POST over h3");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.body.len(), payload.len());
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn h3_closes_a_connection_after_the_keep_alive_timeout() {
     let mut settings = Http3Settings::default();
     settings.keep_alive_timeout = Some(Duration::from_millis(300));
