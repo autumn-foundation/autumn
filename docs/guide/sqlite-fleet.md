@@ -842,11 +842,23 @@ let load = fleet.lake()?.load(MySink::open(..)).await?;
   `has(key, generation)` for each member that the inclusion rule takes.
   When it is `true`, core calls `keep(key, generation)` and restores
   nothing. Then core restores each other member and calls `add(member)`.
-- `add` gets the `key`, the `generation` and the restored `file`. Core
-  checks that the identity row of the file names the key. Core removes
-  the file after `add`.
+- `add` gets the `key`, the `generation`, the `format` and the restored
+  `file`. Core removes the file after `add`.
+- The lake reads two replica formats. `LakeFormat::Wal` (WAL shipping):
+  `file` is a `SQLite` file, and core checks that its identity row names
+  the key. `LakeFormat::Generations` (`ShipMode::Generations`, for example
+  a DuckDB fleet): `file` is the engine's snapshot entry, with the name it
+  had on the volume. Core checks the hash of each file, and then calls
+  `check_identity(member)` on the sink before `add`.
+- Implement `check_identity` to read the identity of the engine. The
+  default refuses the member, so a sink that cannot read the engine fails
+  it with `LakeError::Ingest`. The `SQLite` lake cannot read a generations
+  replica: `materialize()` on such a fleet fails. With
+  `skip_failed_tenants()`, each tenant is a `Failed` skip, not
+  `Unreplicated`.
 - A `LakeGeneration` holds the generation id and the WAL position. So a
-  new commit in the same generation is a change.
+  new commit in the same generation is a change. For generations it holds
+  the manifest's generation id, and no WAL position.
 - `finish()` gives the lake. A sink that keeps its lake between loads
   drops, at `finish`, each member that it got from neither `add` nor
   `keep`. A deleted tenant is gone then. So is a tenant that failed in

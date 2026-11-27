@@ -15,7 +15,8 @@ verus! {
 pub struct Candidate {
     /// The listed name parses as a tenant id.
     pub valid_name: bool,
-    /// A complete generation exists (`restore::plan` gave a plan).
+    /// A complete generation exists in either format: a `snapshot.json` or
+    /// a `manifest.json`. See `unreplicated` in part 4.
     pub has_replica: bool,
     /// A tombstone row exists on the control database.
     pub row: bool,
@@ -347,6 +348,282 @@ pub proof fn kept_lake_matches_new(
         assert(held_valid(s[last], generations[last], held[last]));
         kept_member_matches_new(s[last], generations[last], held[last]);
     }
+}
+
+// ---- Part 4: the two replica formats ----
+//
+// A member's replica holds complete generations in two formats: WAL
+// shipping commits with `snapshot.json`, generation shipping with
+// `manifest.json`. `decide` reads every generation. Then
+// `FleetLake::plan_from` takes the newest generation of each format at or
+// before the target, and takes the newer of the two.
+
+/// One complete generation of a member.
+pub struct Gen {
+    /// The epoch of the writer. 0: no epoch.
+    pub epoch: int,
+    /// When the generation was made.
+    pub created: int,
+    /// A `manifest.json` generation. `false`: a `snapshot.json` one.
+    pub manifest: bool,
+}
+
+/// `a` is not older than `b`: by epoch, then by time.
+pub open spec fn not_older(a: Gen, b: Gen) -> bool {
+    a.epoch > b.epoch || (a.epoch == b.epoch && a.created >= b.created)
+}
+
+/// The newest generation of `s`. A tie gives either one.
+pub open spec fn newest(s: Seq<Gen>) -> Gen
+    decreases s.len(),
+{
+    if s.len() <= 1 {
+        s[0]
+    } else {
+        let rest = newest(s.drop_last());
+        if not_older(s.last(), rest) {
+            s.last()
+        } else {
+            rest
+        }
+    }
+}
+
+/// `newest(s)` is in `s` and is not older than any generation of `s`.
+pub proof fn newest_is_newest(s: Seq<Gen>)
+    requires
+        s.len() > 0,
+    ensures
+        s.contains(newest(s)),
+        forall|i: int| 0 <= i < s.len() ==> not_older(newest(s), #[trigger] s[i]),
+    decreases s.len(),
+{
+    if s.len() == 1 {
+        assert(s[0] == newest(s));
+    } else {
+        let rest = s.drop_last();
+        newest_is_newest(rest);
+        assert(newest(s) == if not_older(s.last(), newest(rest)) {
+            s.last()
+        } else {
+            newest(rest)
+        });
+        assert forall|i: int| 0 <= i < s.len() implies not_older(newest(s), #[trigger] s[i]) by {
+            if i < s.len() - 1 {
+                assert(s[i] == rest[i]);
+                assert(not_older(newest(rest), rest[i]));
+            }
+        }
+        if not_older(s.last(), newest(rest)) {
+            assert(s[s.len() - 1] == newest(s));
+        } else {
+            assert(newest(s) == newest(rest));
+            let j = choose|j: int| 0 <= j < rest.len() && rest[j] == newest(rest);
+            assert(s[j] == rest[j]);
+            assert(s[j] == newest(s));
+        }
+    }
+}
+
+/// The generations of `s` made at or before `t`, in order.
+pub open spec fn at(s: Seq<Gen>, t: int) -> Seq<Gen>
+    decreases s.len(),
+{
+    if s.len() == 0 {
+        s
+    } else if s.last().created <= t {
+        at(s.drop_last(), t).push(s.last())
+    } else {
+        at(s.drop_last(), t)
+    }
+}
+
+/// The target filter keeps the format of each generation.
+pub proof fn at_keeps_the_format(s: Seq<Gen>, t: int, manifest: bool)
+    requires
+        forall|i: int| 0 <= i < s.len() ==> (#[trigger] s[i]).manifest == manifest,
+    ensures
+        forall|j: int| 0 <= j < at(s, t).len() ==> (#[trigger] at(s, t)[j]).manifest == manifest,
+    decreases s.len(),
+{
+    if s.len() > 0 {
+        let rest = s.drop_last();
+        assert forall|i: int| 0 <= i < rest.len() implies (#[trigger] rest[i]).manifest
+            == manifest by {
+            assert(rest[i] == s[i]);
+        }
+        at_keeps_the_format(rest, t, manifest);
+        let kept = at(rest, t);
+        assert(s.last() == s[s.len() - 1]);
+        assert forall|j: int| 0 <= j < at(s, t).len() implies (#[trigger] at(s, t)[j]).manifest
+            == manifest by {
+            if s.last().created <= t {
+                assert(at(s, t) == kept.push(s.last()));
+                if j < kept.len() {
+                    assert(at(s, t)[j] == kept[j]);
+                } else {
+                    assert(at(s, t)[j] == s.last());
+                }
+            } else {
+                assert(at(s, t) == kept);
+            }
+        }
+    }
+}
+
+/// The generation the lake plans: the newer of the newest of each format.
+/// The manifest wins a tie.
+pub open spec fn pick(wal: Seq<Gen>, manifests: Seq<Gen>) -> Gen {
+    if wal.len() == 0 {
+        newest(manifests)
+    } else if manifests.len() == 0 {
+        newest(wal)
+    } else if not_older(newest(manifests), newest(wal)) {
+        newest(manifests)
+    } else {
+        newest(wal)
+    }
+}
+
+/// The pick is not older than any generation of either format. So a
+/// split by format gives the same order as one list.
+pub proof fn pick_is_newest_of_both(wal: Seq<Gen>, manifests: Seq<Gen>)
+    requires
+        wal.len() + manifests.len() > 0,
+    ensures
+        forall|i: int| 0 <= i < wal.len() ==> not_older(pick(wal, manifests), #[trigger] wal[i]),
+        forall|i: int|
+            0 <= i < manifests.len() ==> not_older(
+                pick(wal, manifests),
+                #[trigger] manifests[i],
+            ),
+        wal.contains(pick(wal, manifests)) || manifests.contains(pick(wal, manifests)),
+{
+    if wal.len() > 0 {
+        newest_is_newest(wal);
+    }
+    if manifests.len() > 0 {
+        newest_is_newest(manifests);
+    }
+}
+
+/// `decide` reports `Unreplicated` only when neither format has a
+/// complete generation. It reads every generation, not only those at or
+/// before the target.
+pub open spec fn unreplicated(wal: Seq<Gen>, manifests: Seq<Gen>) -> bool {
+    wal.len() == 0 && manifests.len() == 0
+}
+
+/// What the lake does with a member that the tombstone rule takes.
+pub enum Outcome {
+    /// No complete generation: `SkipReason::Unreplicated`.
+    Unreplicated,
+    /// Each generation is after the target: `SkipReason::AbsentAtTarget`.
+    AbsentAtTarget,
+    /// The sink cannot read the format: an error, or `Failed` when
+    /// skipped.
+    Failed,
+    /// Restored, checked and given to the sink.
+    Added,
+}
+
+/// `wal`, `manifests`: every complete generation of each format. `t`: the
+/// target. `sink_reads_manifests`: the sink checks the identity of a
+/// generations member (`LakeSink::check_identity`).
+pub open spec fn outcome(
+    wal: Seq<Gen>,
+    manifests: Seq<Gen>,
+    t: int,
+    sink_reads_manifests: bool,
+) -> Outcome {
+    if unreplicated(wal, manifests) {
+        Outcome::Unreplicated
+    } else if at(wal, t).len() == 0 && at(manifests, t).len() == 0 {
+        Outcome::AbsentAtTarget
+    } else if pick(at(wal, t), at(manifests, t)).manifest && !sink_reads_manifests {
+        Outcome::Failed
+    } else {
+        Outcome::Added
+    }
+}
+
+/// A manifest is a replica: the lake never reports such a member as
+/// `Unreplicated`, whatever the target and the sink.
+pub proof fn a_manifest_is_not_unreplicated(
+    wal: Seq<Gen>,
+    manifests: Seq<Gen>,
+    t: int,
+    sink_reads_manifests: bool,
+)
+    requires
+        manifests.len() > 0,
+    ensures
+        outcome(wal, manifests, t, sink_reads_manifests) != Outcome::Unreplicated,
+{
+}
+
+/// A target before every generation gives `AbsentAtTarget`, not
+/// `Unreplicated`.
+pub proof fn a_target_before_every_generation_is_absent(
+    wal: Seq<Gen>,
+    manifests: Seq<Gen>,
+    t: int,
+    sink_reads_manifests: bool,
+)
+    requires
+        wal.len() + manifests.len() > 0,
+        at(wal, t).len() == 0,
+        at(manifests, t).len() == 0,
+    ensures
+        outcome(wal, manifests, t, sink_reads_manifests) == Outcome::AbsentAtTarget,
+{
+}
+
+/// A generations fleet (manifests only) gives each member to a sink that
+/// reads manifests.
+pub proof fn a_generations_member_is_added(manifests: Seq<Gen>, t: int)
+    requires
+        at(manifests, t).len() > 0,
+    ensures
+        outcome(Seq::empty(), manifests, t, true) == Outcome::Added,
+{
+    let none: Seq<Gen> = Seq::empty();
+    assert(at(none, t) == none);
+}
+
+/// A sink that cannot read manifests fails a generations member. It does
+/// not report it as `Unreplicated`.
+pub proof fn an_unreadable_member_fails(manifests: Seq<Gen>, t: int)
+    requires
+        at(manifests, t).len() > 0,
+        forall|i: int| 0 <= i < manifests.len() ==> (#[trigger] manifests[i]).manifest,
+    ensures
+        outcome(Seq::empty(), manifests, t, false) == Outcome::Failed,
+{
+    let none: Seq<Gen> = Seq::empty();
+    assert(at(none, t) == none);
+    let kept = at(manifests, t);
+    at_keeps_the_format(manifests, t, true);
+    newest_is_newest(kept);
+    let j = choose|j: int| 0 <= j < kept.len() && kept[j] == newest(kept);
+    assert(kept[j].manifest);
+}
+
+/// A WAL replica is read as before: the sink need not read manifests.
+pub proof fn a_wal_member_is_added(wal: Seq<Gen>, t: int, sink_reads_manifests: bool)
+    requires
+        at(wal, t).len() > 0,
+        forall|i: int| 0 <= i < wal.len() ==> !(#[trigger] wal[i]).manifest,
+    ensures
+        outcome(wal, Seq::empty(), t, sink_reads_manifests) == Outcome::Added,
+{
+    let none: Seq<Gen> = Seq::empty();
+    assert(at(none, t) == none);
+    let kept = at(wal, t);
+    at_keeps_the_format(wal, t, false);
+    newest_is_newest(kept);
+    let j = choose|j: int| 0 <= j < kept.len() && kept[j] == newest(kept);
+    assert(!kept[j].manifest);
 }
 
 fn main() {}

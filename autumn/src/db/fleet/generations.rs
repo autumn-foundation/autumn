@@ -517,16 +517,26 @@ fn newest(
         .destination()
         .get(&manifest_key(&root, &chosen.id))
         .map_err(|e| e.to_string())?;
-    let manifest: Manifest =
-        serde_json::from_slice(&body).map_err(|e| format!("unreadable manifest: {e}"))?;
-    check_manifest(&manifest, &chosen.id)?;
+    let manifest = read_manifest(&body, &chosen.id)?;
     Ok(Some((chosen, manifest)))
+}
+
+/// Parse the manifest of generation `id` and check it.
+///
+/// # Errors
+///
+/// The manifest is not JSON, or [`check_manifest`] refuses it.
+pub fn read_manifest(body: &[u8], id: &str) -> Result<Manifest, String> {
+    let manifest: Manifest =
+        serde_json::from_slice(body).map_err(|e| format!("unreadable manifest: {e}"))?;
+    check_manifest(&manifest, id)?;
+    Ok(manifest)
 }
 
 /// Write the files of `manifest` at `target` (the first part of each path
 /// becomes the file name of `target`). Each file is checked against its
 /// hash and length. Blocking.
-fn download(
+pub fn download(
     destination: &dyn ReplicaDestination,
     root: &str,
     manifest: &Manifest,

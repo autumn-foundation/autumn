@@ -3370,12 +3370,16 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   pass request input as the SQL. Guide: "Query the lake".
 - Another lake format (ADR 0040 §6): implement `LakeSink` and call
   `fleet.lake()?.load(sink)`. Core runs the inclusion rule, restores, and
-  checks the identity row. The sink gets `add(LakeMember { key, generation,
-  file })` and gives its lake from `finish()`. To keep a lake between
-  loads, return `true` from `has(key, generation)`: core calls `keep` and
-  restores nothing. At `finish`, drop each member that got neither `add`
-  nor `keep`. `LakeGeneration` holds the WAL position, so compare all of
-  it. `TAKES_SLOTS = true` gets slot databases. Keep the catalog in files
+  checks the identity row of a WAL member. For a `Generations` fleet
+  (`member.format == LakeFormat::Generations`), implement
+  `check_identity(member)`: the default refuses the member. The sink gets
+  `add(LakeMember { key, generation, format, file })` and gives its lake
+  from `finish()`. To keep a lake between loads, return `true` from
+  `has(key, generation)`: core calls `keep` and restores nothing. At
+  `finish`, drop each member that got neither `add` nor `keep`.
+  `LakeGeneration` holds the WAL position, so compare all of it. For a
+  generations member the position is `None`, and the id names the
+  generation. `TAKES_SLOTS = true` gets slot databases. Keep the catalog in files
   under the sink's own prefix, never under `<base>/fleet/`. Guide: "Lake
   sinks".
 - The control database lives outside `root` (validation refuses it inside).

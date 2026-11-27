@@ -9,13 +9,21 @@
 //! decide  ─► a tombstone row or marker covers the generation: skip it
 //! has     ─► the sink holds this state: keep it, restore nothing
 //! restore ─► N workers restore N members into a private scratch directory
-//! check   ─► the identity row of each restored file names its key
+//! check   ─► the identity of each restored member names its key
 //! add     ─► in key order: the sink takes each restored member
 //! finish  ─► the sink gives its lake
 //! ```
 //!
+//! A generation has one of two formats ([`LakeFormat`]). WAL shipping
+//! commits a generation with `snapshot.json`. Core restores a `SQLite` file
+//! and reads its identity row. Generation shipping commits with
+//! `manifest.json`. Core downloads the files of the manifest and checks
+//! each hash. The sink reads the identity ([`LakeSink::check_identity`]).
+//! When a replica has generations of the two formats, core uses the newer
+//! one. It compares the epoch first, and then the time.
+//!
 //! Core runs the inclusion rule (list, decide). Then it asks the sink
-//! `has`, restores, and checks the identity row of each restored file. A
+//! `has`, restores, and checks the identity of each restored member. A
 //! [`LakeSink`] builds the lake (ADR 0040 §6). [`FleetLake::load`] runs any
 //! sink. [`FleetLake::materialize`] runs the `SQLite` sink: it copies each
 //! table with an `_autumn_tenant` column into one lake file, and
@@ -45,6 +53,7 @@ use crate::replication::destination::ReplicaDestination;
 use crate::replication::restore::{self, RestoreError, RestorePlan};
 use crate::replication::segment;
 
+use super::fleet::generations::{self, Manifest};
 use super::fleet_replication::replica_root;
 use super::fleet_tombstones::{FleetTombstones, MARKER_OBJECT, Marker, restore_allowed};
 
@@ -91,16 +100,37 @@ pub struct LakeGeneration {
 
 impl LakeGeneration {
     /// The state that `plan` restores.
-    fn of(plan: &RestorePlan) -> Self {
-        Self {
-            id: plan.generation.clone(),
-            segment: plan
-                .segments
-                .last()
-                .map(|segment| (segment.index, segment.seq)),
-            effective: plan.effective,
+    fn of(plan: &MemberPlan) -> Self {
+        match plan {
+            MemberPlan::Wal(plan) => Self {
+                id: plan.generation.clone(),
+                segment: plan
+                    .segments
+                    .last()
+                    .map(|segment| (segment.index, segment.seq)),
+                effective: plan.effective,
+            },
+            MemberPlan::Generations { manifest, .. } => Self {
+                id: manifest.generation.clone(),
+                segment: None,
+                effective: plan.started_at(),
+            },
         }
     }
+}
+
+/// How the replica of a member is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LakeFormat {
+    /// `SQLite` WAL shipping: a snapshot and WAL segments. Core restores a
+    /// checkpointed `SQLite` file and checks its identity row.
+    Wal,
+    /// Generation shipping (`ShipMode::Generations`): the files of one
+    /// manifest. Core restores the engine's snapshot entry, one file or one
+    /// directory. The sink checks its identity
+    /// ([`LakeSink::check_identity`]).
+    Generations,
 }
 
 /// One included member, given to [`LakeSink::add`].
@@ -111,8 +141,13 @@ pub struct LakeMember<'a> {
     pub key: &'a FleetDbKey,
     /// The replica state restored.
     pub generation: &'a LakeGeneration,
-    /// The restored `SQLite` file: checkpointed, with no sidecars. Its
-    /// identity row names `key`. Core removes the file after `add` returns.
+    /// The format of the replica.
+    pub format: LakeFormat,
+    /// The restored database. [`LakeFormat::Wal`]: a `SQLite` file,
+    /// checkpointed, with no sidecars. [`LakeFormat::Generations`]: the
+    /// snapshot entry of the engine, with the file name it had on the
+    /// volume. Its identity names `key`. Core removes it after `add`
+    /// returns.
     pub file: &'a Path,
 }
 
@@ -158,6 +193,27 @@ pub trait LakeSink: Send + 'static {
     ///
     /// [`LakeError::Ingest`] when the member fails.
     fn add(&mut self, member: LakeMember<'_>) -> Result<(), LakeError>;
+
+    /// Check that the restored `member` is the database of its key. Core
+    /// calls it before [`add`](Self::add) for each
+    /// [`LakeFormat::Generations`] member. Core checks a
+    /// [`LakeFormat::Wal`] member itself.
+    ///
+    /// The default refuses the member: only a sink for the engine can read
+    /// the identity in its files.
+    ///
+    /// # Errors
+    ///
+    /// [`LakeError::Misplaced`] when the member names another database.
+    /// [`LakeError::Ingest`] when the sink cannot read the member.
+    fn check_identity(&self, member: LakeMember<'_>) -> Result<(), LakeError> {
+        Err(LakeError::Ingest {
+            tenant: member_name(member.key),
+            detail: "the fleet ships generations, and this sink cannot read their identity. \
+                     Load it with a sink for the fleet's engine"
+                .to_owned(),
+        })
+    }
 
     /// Return `true` when the sink holds this state of the member. Core
     /// then calls [`keep`](Self::keep) and does not restore the member.
@@ -626,22 +682,25 @@ impl FleetLake {
 
         for (chunk_index, chunk) in planned.chunks(self.workers).enumerate() {
             let restored = self.restore_chunk(dir, chunk_index, chunk);
-            for ((key, _, generation), (output, result)) in chunk.iter().zip(restored) {
+            for ((key, plan, generation), (output, result)) in chunk.iter().zip(restored) {
                 let name = member_name(key);
+                let member = LakeMember {
+                    key,
+                    generation,
+                    format: plan.format(),
+                    file: &output.file,
+                };
                 let loaded = result
-                    .map_err(|error| LakeError::Restore {
+                    .map_err(|detail| LakeError::Restore {
                         tenant: name.clone(),
-                        detail: error.to_string(),
+                        detail,
                     })
-                    .and_then(|()| check_identity(key, &name, &output))
-                    .and_then(|()| {
-                        sink.add(LakeMember {
-                            key,
-                            generation,
-                            file: &output,
-                        })
-                    });
-                remove_database(&output);
+                    .and_then(|()| match member.format {
+                        LakeFormat::Wal => check_identity(key, &name, member.file),
+                        LakeFormat::Generations => sink.check_identity(member),
+                    })
+                    .and_then(|()| sink.add(member));
+                output.remove();
                 match loaded {
                     Ok(()) => members.push(LakeEntry {
                         key: key.clone(),
@@ -736,29 +795,86 @@ impl FleetLake {
             Decision::Skip(Skip::Unreplicated) => return skip(SkipReason::Unreplicated),
             Decision::Plan => {}
         }
-        let plan =
-            match restore::plan_from_listing(self.destination.as_ref(), root, keys, self.as_of) {
-                Ok(plan) => plan,
-                Err(RestoreError::NoReplica { .. }) => return skip(SkipReason::Unreplicated),
-                Err(RestoreError::TargetBeforeRetention { .. }) => {
-                    return skip(SkipReason::AbsentAtTarget);
+        // The newest generation of each format at or before the target.
+        let target_ms = self.as_of.map_or(i64::MAX, Timestamp::as_millisecond);
+        let manifest = generations::complete_generations(root, keys)
+            .into_iter()
+            .rev()
+            .find(|generation| generation.created_ms <= target_ms);
+        let wal = restore::complete_snapshots(root, keys)
+            .into_iter()
+            .rev()
+            .find(|(_, created_ms, _)| *created_ms <= target_ms);
+        let format = newer_format(
+            wal.map(|(epoch, created_ms, _)| (epoch, created_ms)),
+            manifest.as_ref().map(|g| (g.epoch, g.created_ms)),
+        );
+        let plan = match (format, manifest) {
+            // `decide` saw a generation, so each one is after the target.
+            (None, _) => return skip(SkipReason::AbsentAtTarget),
+            (Some(LakeFormat::Generations), Some(chosen)) => {
+                match self.plan_generations(key, root, &chosen)? {
+                    Ok(plan) => plan,
+                    Err(stale) => return Ok(Attempt::Stale(stale)),
                 }
-                // The head moved on after the listing.
-                Err(error @ RestoreError::TruncatedTail { .. }) => {
-                    return Ok(Attempt::Stale(error.to_string()));
+            }
+            // `newer_format` gives `Generations` only with a manifest.
+            (Some(LakeFormat::Wal | LakeFormat::Generations), _) => {
+                match restore::plan_from_listing(self.destination.as_ref(), root, keys, self.as_of)
+                {
+                    Ok(plan) => MemberPlan::Wal(plan),
+                    Err(RestoreError::NoReplica { .. }) => return skip(SkipReason::Unreplicated),
+                    Err(RestoreError::TargetBeforeRetention { .. }) => {
+                        return skip(SkipReason::AbsentAtTarget);
+                    }
+                    // The head moved on after the listing.
+                    Err(error @ RestoreError::TruncatedTail { .. }) => {
+                        return Ok(Attempt::Stale(error.to_string()));
+                    }
+                    Err(error) => {
+                        return Err(LakeError::Restore {
+                            tenant: member_name(key),
+                            detail: error.to_string(),
+                        });
+                    }
                 }
-                Err(error) => {
-                    return Err(LakeError::Restore {
-                        tenant: member_name(key),
-                        detail: error.to_string(),
-                    });
-                }
-            };
+            }
+        };
         // `as_of` can pick an older generation than the newest.
-        if !restore_allowed(row, marker, plan.generation_started_at) {
+        if !restore_allowed(row, marker, plan.started_at()) {
             return skip(SkipReason::Deleted);
         }
         Ok(Attempt::Done(Planned::Restore(Box::new(plan))))
+    }
+
+    /// Read and check the manifest of `chosen`. The inner `Err` tells why
+    /// the manifest is gone since the listing, for example after a prune.
+    fn plan_generations(
+        &self,
+        key: &FleetDbKey,
+        root: &str,
+        chosen: &generations::Complete,
+    ) -> Result<Result<MemberPlan, String>, LakeError> {
+        let id = chosen.id.as_str();
+        let failed = |detail: String| LakeError::Restore {
+            tenant: member_name(key),
+            detail,
+        };
+        let body = match self.destination.get(&generations::manifest_key(root, id)) {
+            Ok(body) => body,
+            Err(error) if error.is_not_found() => {
+                return Ok(Err(format!(
+                    "the manifest of generation {id} is gone since the listing"
+                )));
+            }
+            Err(error) => return Err(failed(error.to_string())),
+        };
+        let manifest = generations::read_manifest(&body, id).map_err(failed)?;
+        Ok(Ok(MemberPlan::Generations {
+            root: root.to_owned(),
+            manifest,
+            created: segment::timestamp_from_ms(chosen.created_ms),
+        }))
     }
 
     /// The member's marker, read only when the listing has one.
@@ -792,10 +908,9 @@ impl FleetLake {
         &self,
         dir: &Path,
         chunk_index: usize,
-        chunk: &[(FleetDbKey, RestorePlan, LakeGeneration)],
-    ) -> Vec<(PathBuf, Result<(), RestoreError>)> {
+        chunk: &[(FleetDbKey, MemberPlan, LakeGeneration)],
+    ) -> Vec<(Output, Result<(), String>)> {
         let destination = self.destination.as_ref();
-        let output = |index: usize| dir.join(format!("{chunk_index:08}-{index:04}.db"));
         std::thread::scope(|scope| {
             // Start every thread before the first join.
             #[allow(clippy::needless_collect, reason = "spawn all, then join")]
@@ -803,32 +918,29 @@ impl FleetLake {
                 .iter()
                 .enumerate()
                 .map(|(index, (_, plan, _))| {
-                    let path = output(index);
+                    let output = Output::of(plan, dir, &format!("{chunk_index:08}-{index:04}"));
                     let handle = std::thread::Builder::new()
                         .name("autumn-fleet-lake".to_owned())
                         .spawn_scoped(scope, {
-                            let path = path.clone();
-                            move || restore::apply(destination, plan, &path).map(|_| ())
+                            let file = output.file.clone();
+                            move || plan.restore(destination, &file)
                         });
-                    (path, plan, handle)
+                    (output, plan, handle)
                 })
                 .collect();
             handles
                 .into_iter()
-                .map(|(path, plan, handle)| {
+                .map(|(output, plan, handle)| {
                     // No thread: restore on this one.
                     let result = handle.map_or_else(
-                        |_| restore::apply(destination, plan, &path).map(|_| ()),
+                        |_| plan.restore(destination, &output.file),
                         |handle| {
-                            handle.join().unwrap_or_else(|_| {
-                                Err(RestoreError::Io {
-                                    op: "restore thread",
-                                    detail: "the restore thread panicked".to_owned(),
-                                })
-                            })
+                            handle
+                                .join()
+                                .unwrap_or_else(|_| Err("the restore thread panicked".to_owned()))
                         },
                     );
-                    (path, result)
+                    (output, result)
                 })
                 .collect()
         })
@@ -846,8 +958,102 @@ fn member_name(key: &FleetDbKey) -> String {
 
 /// What the lake does with one member.
 enum Planned {
-    Restore(Box<RestorePlan>),
+    Restore(Box<MemberPlan>),
     Skip(SkipReason),
+}
+
+/// The restore of one member, by the format of its replica.
+enum MemberPlan {
+    /// A WAL generation: the snapshot and its segments.
+    Wal(RestorePlan),
+    /// A generation of `ShipMode::Generations`: the files of `manifest`.
+    Generations {
+        /// The replica root of the member.
+        root: String,
+        /// The checked manifest.
+        manifest: Manifest,
+        /// When the generation was made, from its id.
+        created: Timestamp,
+    },
+}
+
+impl MemberPlan {
+    const fn format(&self) -> LakeFormat {
+        match self {
+            Self::Wal(_) => LakeFormat::Wal,
+            Self::Generations { .. } => LakeFormat::Generations,
+        }
+    }
+
+    /// When the generation was made. The tombstone rule reads it.
+    const fn started_at(&self) -> Timestamp {
+        match self {
+            Self::Wal(plan) => plan.generation_started_at,
+            Self::Generations { created, .. } => *created,
+        }
+    }
+
+    /// The entry name of the restored database: the name on the volume
+    /// for generations. A WAL restore makes one `SQLite` file.
+    fn entry_name(&self) -> Option<&str> {
+        match self {
+            Self::Wal(_) => None,
+            Self::Generations { manifest, .. } => manifest
+                .files
+                .first()
+                .and_then(|file| file.path.split('/').next()),
+        }
+    }
+
+    /// Restore the member at `file`. Blocking.
+    fn restore(&self, destination: &dyn ReplicaDestination, file: &Path) -> Result<(), String> {
+        match self {
+            Self::Wal(plan) => restore::apply(destination, plan, file)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Self::Generations { root, manifest, .. } => {
+                generations::download(destination, root, manifest, file).map(|_| ())
+            }
+        }
+    }
+}
+
+/// Where one member is restored.
+struct Output {
+    /// The restored database.
+    file: PathBuf,
+    /// The private directory of a generations member. `None`: a WAL file.
+    dir: Option<PathBuf>,
+}
+
+impl Output {
+    /// The output of `plan` in `dir`, named from `stem`.
+    fn of(plan: &MemberPlan, dir: &Path, stem: &str) -> Self {
+        plan.entry_name().map_or_else(
+            || Self {
+                file: dir.join(format!("{stem}.db")),
+                dir: None,
+            },
+            // A directory of its own keeps the name the engine gave.
+            |name| {
+                let own = dir.join(stem);
+                Self {
+                    file: own.join(name),
+                    dir: Some(own),
+                }
+            },
+        )
+    }
+
+    /// Remove the restored database and its files.
+    fn remove(&self) {
+        match &self.dir {
+            Some(dir) => {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            None => remove_database(&self.file),
+        }
+    }
 }
 
 /// One try of [`FleetLake::plan_member`].
@@ -946,14 +1152,32 @@ fn slot_key(name: &str) -> Option<FleetDbKey> {
     (format!("{slot:05}") == name).then_some(key)
 }
 
-/// When the newest complete generation under `root` was created.
+/// When the newest complete generation under `root` was created. A
+/// generation is complete with its `snapshot.json` (WAL shipping) or its
+/// `manifest.json` (generation shipping).
 fn newest_generation(root: &str, keys: &[String]) -> Option<Timestamp> {
     keys.iter()
-        .filter(|key| key.ends_with(segment::SNAPSHOT_META_OBJECT))
-        .filter_map(|key| segment::generation_of_key(root, key))
+        .filter_map(|key| {
+            let generation = segment::generation_of_key(root, key)?;
+            let complete = key.ends_with(segment::SNAPSHOT_META_OBJECT)
+                || *key == generations::manifest_key(root, &generation);
+            complete.then_some(generation)
+        })
         .filter_map(|generation| segment::parse_generation_id(&generation))
         .map(|info| segment::timestamp_from_ms(info.created_ms))
         .max()
+}
+
+/// The format of the newer of two generations, each as (epoch, created
+/// ms). When the two are equal, core uses the manifest. `None` when there
+/// is neither.
+fn newer_format(wal: Option<(u64, i64)>, manifest: Option<(u64, i64)>) -> Option<LakeFormat> {
+    match (wal, manifest) {
+        (None, None) => None,
+        (Some(_), None) => Some(LakeFormat::Wal),
+        (Some(wal), Some(manifest)) if wal > manifest => Some(LakeFormat::Wal),
+        (_, Some(_)) => Some(LakeFormat::Generations),
+    }
 }
 
 /// The inclusion decision before a restore. With the `restore_allowed`
@@ -1063,3 +1287,6 @@ fn remove_database(path: &Path) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod generations_tests;

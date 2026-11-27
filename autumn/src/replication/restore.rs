@@ -367,6 +367,27 @@ pub(crate) fn generation_epochs(
     epochs
 }
 
+/// The complete WAL generations in `keys` as (epoch, created ms, id),
+/// oldest first. A generation is complete when its snapshot metadata
+/// (written last) exists. Its epoch is in the same listing. No epoch means
+/// 0. The order is by epoch, then by time: a fenced old owner can ship a
+/// later generation, and core must never use it.
+pub(crate) fn complete_snapshots(root: &str, keys: &[String]) -> Vec<(u64, i64, String)> {
+    let epochs = generation_epochs(root, keys);
+    let mut complete: Vec<(u64, i64, String)> = keys
+        .iter()
+        .filter(|key| key.ends_with(segment::SNAPSHOT_META_OBJECT))
+        .filter_map(|key| segment::generation_of_key(root, key))
+        .filter_map(|generation| {
+            let info = segment::parse_generation_id(&generation)?;
+            let epoch = epochs.get(&generation).copied().unwrap_or(0);
+            Some((epoch, info.created_ms, generation))
+        })
+        .collect();
+    complete.sort();
+    complete
+}
+
 /// Decide what to restore, reading only the destination's key listing.
 ///
 /// `target` is the instant to restore to; `None` means "the latest replicated
@@ -406,26 +427,7 @@ pub(crate) fn plan_from_listing(
         .cloned()
         .collect();
 
-    // A generation counts only once its snapshot metadata (written last) exists.
-    // Its epoch (issue #3233) is in the same listing; none means 0.
-    let epochs = generation_epochs(root, &keys);
-    let mut complete: Vec<(u64, i64, String)> = Vec::new();
-    for key in &keys {
-        if !key.ends_with(segment::SNAPSHOT_META_OBJECT) {
-            continue;
-        }
-        let Some(generation) = segment::generation_of_key(root, key) else {
-            continue;
-        };
-        let Some(info) = segment::parse_generation_id(&generation) else {
-            continue;
-        };
-        let epoch = epochs.get(&generation).copied().unwrap_or(0);
-        complete.push((epoch, info.created_ms, generation));
-    }
-    // The newest epoch first, then the newest time: a fenced old owner can
-    // ship a later generation, and it must never win.
-    complete.sort();
+    let complete = complete_snapshots(root, &keys);
 
     let Some(oldest_ms) = complete.iter().map(|(_, ms, _)| *ms).min() else {
         return Err(RestoreError::NoReplica {

@@ -381,11 +381,37 @@ Step 4 changed this section in these ways:
 - A sink sets `TAKES_SLOTS = true` to get slot databases. The default is
   `false`.
 - Core checks the identity row of each restored file before `add`. So
-  each sink gets this check.
+  each sink gets this check. (The notes on generations replicas change
+  this.)
 - `FleetLake::load(sink)` runs any sink. `materialize()` runs the `SQLite`
   sink. `verification/fleet_lake.rs` proves that a load that skips held
   members gives the same rows as a load that restores all of them, when
   the sink holds the right rows for each state.
+
+##### Notes on generations replicas
+
+The first lake input read only WAL replicas. It skipped each member of a
+`Generations` fleet as `Unreplicated`, with no error. These rules replace
+that:
+
+- A `manifest.json` commits a generation, as `snapshot.json` does. Core
+  takes the newest generation of each format at or before `as_of`. Then
+  it takes the newer one, by epoch and then by time. A manifest wins a
+  tie.
+- Core restores a generations member as `fleet::generations` does at open:
+  it checks the manifest, downloads each file and checks its hash. The
+  entry keeps the file name that it had on the volume.
+- `LakeMember::format` gives the format (`LakeFormat::Wal` or
+  `LakeFormat::Generations`). Core checks the identity row of a WAL member.
+  It calls `LakeSink::check_identity` for a generations member. The
+  default refuses the member with `LakeError::Ingest`, so a sink that
+  cannot read the engine (the `SQLite` sink, for example) fails the member
+  with a reason. It does not skip it as `Unreplicated`.
+- `has` and `keep` get the manifest's generation id, no WAL position, and
+  the generation time.
+- A manifest of another layout version is a `LakeError::Restore`.
+- `verification/fleet_lake.rs` part 4 proves the format choice and that a
+  manifest is never `Unreplicated`.
 
 #### 7. Conformance kit
 
