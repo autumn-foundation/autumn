@@ -410,6 +410,8 @@ that:
 - `has` and `keep` get the manifest's generation id, no WAL position, and
   the generation time.
 - A manifest of another layout version is a `LakeError::Restore`.
+- A prune can remove a planned generation before its download. Core then
+  plans the member again from a new listing, once.
 - `verification/fleet_lake.rs` part 4 proves the format choice and that a
   manifest is never `Unreplicated`.
 

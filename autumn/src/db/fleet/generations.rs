@@ -272,11 +272,13 @@ pub fn file_key(root: &str, holder: &str, sha256: &str) -> String {
 }
 
 /// Refuse a manifest path that can leave the snapshot: empty, absolute, a
-/// `.`, `..` or empty part, or a backslash.
+/// `.`, `..` or empty part, a backslash, or a `:` (a Windows drive or
+/// stream).
 pub fn check_relative(path: &str) -> Result<(), String> {
     let bad = path.is_empty()
         || path.starts_with('/')
         || path.contains('\\')
+        || path.contains(':')
         || path.contains('\0')
         || path
             .split('/')
@@ -1660,6 +1662,8 @@ mod tests {
             "a\\b",
             "./a",
             "a/",
+            "C:x",
+            "a/b:stream",
         ] {
             assert!(check_relative(bad).is_err(), "{bad:?}");
         }

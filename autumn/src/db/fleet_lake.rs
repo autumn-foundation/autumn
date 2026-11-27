@@ -682,26 +682,44 @@ impl FleetLake {
 
         for (chunk_index, chunk) in planned.chunks(self.workers).enumerate() {
             let restored = self.restore_chunk(dir, chunk_index, chunk);
-            for ((key, plan, generation), (output, result)) in chunk.iter().zip(restored) {
-                let name = member_name(key);
-                let member = LakeMember {
-                    key,
-                    generation,
-                    format: plan.format(),
-                    file: &output.file,
-                };
-                let loaded = result
-                    .map_err(|detail| LakeError::Restore {
-                        tenant: name.clone(),
-                        detail,
-                    })
-                    .and_then(|()| match member.format {
-                        LakeFormat::Wal => check_identity(key, &name, member.file),
-                        LakeFormat::Generations => sink.check_identity(member),
-                    })
-                    .and_then(|()| sink.add(member));
-                output.remove();
-                match loaded {
+            for (index, ((key, plan, generation), (output, result))) in
+                chunk.iter().zip(restored).enumerate()
+            {
+                if result.is_err() && self.generation_gone(plan) {
+                    // A prune removed the generation after the plan. Plan
+                    // the member again, once.
+                    output.remove();
+                    let stem = format!("{chunk_index:08}-{index:04}-again");
+                    match self.replan(key, rows) {
+                        Ok(Planned::Restore(plan)) => {
+                            let generation = LakeGeneration::of(&plan);
+                            let (loaded, restored) = if sink.has(key, &generation) {
+                                (sink.keep(key, &generation), false)
+                            } else {
+                                let output = Output::of(&plan, dir, &stem);
+                                let result = plan.restore(self.destination.as_ref(), &output.file);
+                                let loaded =
+                                    give(&mut sink, key, &plan, &generation, &output, result);
+                                (loaded, true)
+                            };
+                            match loaded {
+                                Ok(()) => members.push(LakeEntry {
+                                    key: key.clone(),
+                                    generation,
+                                    restored,
+                                }),
+                                Err(error) => skipped.push(self.member_failed(key, error)?),
+                            }
+                        }
+                        Ok(Planned::Skip(reason)) => skipped.push(LakeSkip {
+                            name: member_name(key),
+                            reason,
+                        }),
+                        Err(error) => skipped.push(self.member_failed(key, error)?),
+                    }
+                    continue;
+                }
+                match give(&mut sink, key, plan, generation, &output, result) {
                     Ok(()) => members.push(LakeEntry {
                         key: key.clone(),
                         generation: generation.clone(),
@@ -759,16 +777,35 @@ impl FleetLake {
         if let Attempt::Done(planned) = self.plan_from(key, &root, keys, row)? {
             return Ok(planned);
         }
+        self.replan(key, rows)
+    }
+
+    /// Plan `key` from a new listing of its root.
+    fn replan(&self, key: &FleetDbKey, rows: &HashSet<String>) -> Result<Planned, LakeError> {
+        let root = replica_root(&self.base, key);
         let fresh = self
             .destination
             .list(&format!("{root}/"))
             .map_err(|error| LakeError::Destination(error.to_string()))?;
-        match self.plan_from(key, &root, &fresh, row)? {
+        match self.plan_from(key, &root, &fresh, rows.contains(&key.name()))? {
             Attempt::Done(planned) => Ok(planned),
             Attempt::Stale(detail) => Err(LakeError::Restore {
                 tenant: member_name(key),
                 detail,
             }),
+        }
+    }
+
+    /// Whether the generation of `plan` is gone: a prune removes the
+    /// manifest first. Always `false` for a WAL plan.
+    fn generation_gone(&self, plan: &MemberPlan) -> bool {
+        match plan {
+            MemberPlan::Wal(_) => false,
+            MemberPlan::Generations { root, manifest, .. } => matches!(
+                self.destination
+                    .get(&generations::manifest_key(root, &manifest.generation)),
+                Err(error) if error.is_not_found()
+            ),
         }
     }
 
@@ -809,10 +846,19 @@ impl FleetLake {
             wal.map(|(epoch, created_ms, _)| (epoch, created_ms)),
             manifest.as_ref().map(|g| (g.epoch, g.created_ms)),
         );
+        debug_assert!(
+            format != Some(LakeFormat::Generations) || manifest.is_some(),
+            "a generations format has a manifest"
+        );
         let plan = match (format, manifest) {
             // `decide` saw a generation, so each one is after the target.
             (None, _) => return skip(SkipReason::AbsentAtTarget),
             (Some(LakeFormat::Generations), Some(chosen)) => {
+                // The tombstone rule first: a deleted member costs no read.
+                let created = segment::timestamp_from_ms(chosen.created_ms);
+                if !restore_allowed(row, marker, created) {
+                    return skip(SkipReason::Deleted);
+                }
                 match self.plan_generations(key, root, &chosen)? {
                     Ok(plan) => plan,
                     Err(stale) => return Ok(Attempt::Stale(stale)),
@@ -945,6 +991,37 @@ impl FleetLake {
                 .collect()
         })
     }
+}
+
+/// Check the identity of a restored member and give it to `sink`. Then
+/// remove the restored files.
+fn give<S: LakeSink>(
+    sink: &mut S,
+    key: &FleetDbKey,
+    plan: &MemberPlan,
+    generation: &LakeGeneration,
+    output: &Output,
+    result: Result<(), String>,
+) -> Result<(), LakeError> {
+    let name = member_name(key);
+    let member = LakeMember {
+        key,
+        generation,
+        format: plan.format(),
+        file: &output.file,
+    };
+    let loaded = result
+        .map_err(|detail| LakeError::Restore {
+            tenant: name.clone(),
+            detail,
+        })
+        .and_then(|()| match member.format {
+            LakeFormat::Wal => check_identity(key, &name, member.file),
+            LakeFormat::Generations => sink.check_identity(member),
+        })
+        .and_then(|()| sink.add(member));
+    output.remove();
+    loaded
 }
 
 /// The name of a member in a [`LakeSkip`] and in errors: the tenant id, or

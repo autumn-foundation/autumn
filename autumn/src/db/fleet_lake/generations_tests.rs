@@ -841,3 +841,82 @@ async fn a_directory_entry_keeps_its_name_and_is_removed_after_add() {
     assert!(!sink.leftover, "core removes the member's directory");
     assert!(!sink.last_dir.unwrap().exists());
 }
+
+/// A frozen listing, and a prune of generation `gone` at its first file
+/// download.
+struct PruneOnDownload {
+    inner: Arc<dyn ReplicaDestination>,
+    listing: Vec<String>,
+    gone: String,
+    pruned: std::sync::atomic::AtomicBool,
+}
+
+impl ReplicaDestination for PruneOnDownload {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn put(&self, key: &str, body: &[u8]) -> Result<(), DestinationError> {
+        self.inner.put(key, body)
+    }
+    fn put_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
+        self.inner.put_file(key, path)
+    }
+    fn get(&self, key: &str) -> Result<Vec<u8>, DestinationError> {
+        self.inner.get(key)
+    }
+    fn get_to_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
+        let prefix = format!("/{}/", self.gone);
+        if key.contains(&prefix) && !self.pruned.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // The manifest goes first, as in a prune.
+            let mut doomed: Vec<String> = self
+                .inner
+                .list(&format!("{BASE}/fleet/"))?
+                .into_iter()
+                .filter(|k| k.contains(&prefix))
+                .collect();
+            doomed.sort_by_key(|k| !k.ends_with(generations::MANIFEST_OBJECT));
+            for k in doomed {
+                self.inner.delete(&k)?;
+            }
+        }
+        self.inner.get_to_file(key, path)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, DestinationError> {
+        if prefix.ends_with("/fleet/") {
+            Ok(self.listing.clone())
+        } else {
+            self.inner.list(prefix)
+        }
+    }
+    fn delete(&self, key: &str) -> Result<(), DestinationError> {
+        self.inner.delete(key)
+    }
+}
+
+#[tokio::test]
+async fn a_generation_pruned_during_the_load_is_planned_again() {
+    let host = host(Duration::ZERO);
+    host.ship("acme", &["a1"]).await;
+    let planned = host.ship("acme", &["a2"]).await;
+    let listing = host.destination.list(&format!("{BASE}/fleet/")).unwrap();
+    let newer = host.ship("acme", &["a3"]).await;
+    host.fleet.close_all().await;
+
+    let destination = Arc::new(PruneOnDownload {
+        inner: Arc::clone(&host.destination),
+        listing,
+        gone: planned.clone(),
+        pruned: std::sync::atomic::AtomicBool::new(false),
+    });
+    let load = FleetLake::new(destination, BASE)
+        .markers_only()
+        .with_scratch_dir(&host.scratch)
+        .load(TextSink::default())
+        .await
+        .unwrap();
+    assert!(load.skipped.is_empty(), "{:?}", load.skipped);
+    assert_eq!(load.lake.added.len(), 1);
+    assert_eq!(load.lake.added[0].generation.id, newer);
+    assert_eq!(load.lake.added[0].values, ["a1", "a2", "a3"]);
+    assert_eq!(load.members[0].generation.id, newer);
+}
