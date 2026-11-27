@@ -275,9 +275,16 @@ const DEFAULT_OPEN_WAIT: Duration = Duration::from_secs(5);
 const DRAIN_POLL: Duration = Duration::from_millis(20);
 
 /// The warning for a fleet with ownership and no replica.
+#[cfg(feature = "sqlite")]
 pub(crate) const UNREPLICATED_WARNING: &str = "fleet ownership is on, but nothing replicates \
-     this fleet: a standby that takes over opens empty databases. Turn on [replication], and \
-     connect the fleet with autumn_web::fleet::install_replication at boot";
+     this fleet: a standby that takes over opens empty databases. Connect the fleet to \
+     [replication] with autumn_web::fleet::install_replication at boot";
+
+/// The warning for a fleet with ownership and no replica.
+#[cfg(not(feature = "sqlite"))]
+pub(crate) const UNREPLICATED_WARNING: &str = "fleet ownership is on, but nothing replicates \
+     this fleet: a standby that takes over opens empty databases. Fleet replication needs the \
+     sqlite feature";
 
 /// How long a close waits for the workers of one database to stop. Workers
 /// of different databases stop together, so this also bounds a shutdown.

@@ -53,7 +53,7 @@ pub enum InstallReplicationError {
         /// The fleet root of the fleet that ships there.
         other: String,
     },
-    /// The OS did not start the replication thread.
+    /// The OS did not start the replication thread. Stop the boot.
     #[error("could not start the fleet replication thread: {0}")]
     Thread(#[source] std::io::Error),
 }
@@ -105,14 +105,19 @@ impl ReplicaSource {
 ///
 /// With `[replication]` off it installs nothing. When `config` turns on
 /// ownership, it then logs one warning: a standby that takes over opens
-/// empty databases.
+/// empty databases. A one-off task (`autumn task`) builds no
+/// `[replication]`, so there it returns [`ReplicationInstall::NoReplication`].
+///
+/// Shutdown stays with the plugin: close the fleet (`close_all`) in an
+/// `on_shutdown` hook. The last generation ships at close.
 ///
 /// # Errors
 ///
 /// [`InstallReplicationError::AlreadyReplicates`] for a second call on one
 /// fleet, [`InstallReplicationError::RootInUse`] when another fleet ships
 /// to the replica root, and [`InstallReplicationError::Thread`] when the
-/// loop thread does not start.
+/// loop thread does not start. After `Thread` the fleet keeps a replica
+/// with no loop: stop the boot.
 pub fn install_replication<E: FleetEngine>(
     state: &AppState,
     fleet: &DatabaseFleet<E>,
@@ -134,16 +139,16 @@ pub fn install_replication<E: FleetEngine>(
         .claimed
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(other) = claimed.as_ref()
-        && other != fleet.root()
-    {
+    if fleet.replication().is_some() {
+        return Err(InstallReplicationError::AlreadyReplicates);
+    }
+    // Replica keys hold only the tenant or the slot. A second fleet would
+    // write the same keys, also with the same root and another template.
+    if let Some(other) = claimed.as_ref() {
         return Err(InstallReplicationError::RootInUse {
             root: source.settings.root.clone(),
             other: other.display().to_string(),
         });
-    }
-    if fleet.replication().is_some() {
-        return Err(InstallReplicationError::AlreadyReplicates);
     }
     if config.restore_missing && config.ownership.is_none() {
         tracing::warn!(

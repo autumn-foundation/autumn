@@ -141,6 +141,36 @@ async fn a_second_fleet_on_one_replica_root_is_refused() {
 }
 
 #[tokio::test]
+async fn a_second_fleet_on_the_same_root_with_another_template_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = replicated_state(tmp.path()).await;
+    let root = tmp.path().join("fleet");
+    let primary_config = DatabaseFleetConfig {
+        path: Some("{tenant}/primary.db".to_owned()),
+        ..config(&root)
+    };
+    let primary = fleet(&primary_config, Some(HOUR));
+    assert_eq!(
+        install_replication(&state, &primary, &primary_config).unwrap(),
+        ReplicationInstall::Installed
+    );
+    let analytics_config = DatabaseFleetConfig {
+        path: Some("{tenant}/analytics.db".to_owned()),
+        ..config(&root)
+    };
+    let analytics = fleet(&analytics_config, Some(HOUR));
+
+    let error = install_replication(&state, &analytics, &analytics_config).unwrap_err();
+
+    assert!(
+        matches!(error, InstallReplicationError::RootInUse { .. }),
+        "{error}"
+    );
+    assert!(analytics.replication().is_none(), "nothing installed");
+    stop(&primary);
+}
+
+#[tokio::test]
 async fn with_replication_off_nothing_is_installed() {
     let tmp = tempfile::tempdir().unwrap();
     let config = config(&tmp.path().join("fleet"));

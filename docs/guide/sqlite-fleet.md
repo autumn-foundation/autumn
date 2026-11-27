@@ -1148,6 +1148,12 @@ It is the same code core uses for the `SQLite` fleet of `[database.fleet]`:
 - One replica root holds one fleet. A second fleet gets
   `InstallReplicationError::RootInUse`: two fleets with one tenant id would
   write the same keys.
+- `InstallReplicationError::Thread` leaves a replica with no loop. Stop the
+  boot.
+- A one-off task (`autumn task`) builds no `[replication]`. There the
+  installer returns `NoReplication`.
+- Shutdown stays with the plugin. Close the fleet (`close_all`) in an
+  `on_shutdown` hook: the last generation ships at close.
 
 The mode decides what it starts. Replication needs the `sqlite` feature: it
 keeps the tombstones on the `SQLite` control database. `FleetStats` and the
