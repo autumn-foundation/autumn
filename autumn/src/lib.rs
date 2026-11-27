@@ -203,6 +203,7 @@ pub mod heavy_hitters;
 pub mod hedge;
 #[cfg(feature = "db")]
 pub mod hooks;
+pub mod hot_keys;
 pub mod http_server;
 #[cfg(feature = "i18n")]
 pub mod i18n;
