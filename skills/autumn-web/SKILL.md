@@ -2984,6 +2984,23 @@ if seen.false_positive_rate() > 0.002 { archive(seen.take()); } // rotate
 fleet.merge(&BloomFilter::from_bytes(&peer_bytes).unwrap())?; // ShapeMismatch if sized differently
 ```
 
+### How alike are these two sets? — `minhash` (unreleased)
+
+To catch reworded spam, near-duplicate posts or overlapping traffic without
+keeping either set, use `autumn_web::minhash::MinHash` (no feature, std only).
+It estimates the Jaccard similarity `|A ∩ B| / |A ∪ B|` from a fixed number of
+slots (128 slots is 1 KiB, about ±0.09; `standard_error` is `1/sqrt(slots)`).
+`of_text(text, width, slots)` sketches word shingles, ignoring case and
+punctuation. Sketches with the same slot count `merge` into the exact sketch of
+the union, and `to_bytes`/`from_bytes` store one per row:
+
+```rust
+let incoming = MinHash::of_text(&post.body, 3, 128);
+for removed in removed_sketches.iter().filter_map(|b| MinHash::from_bytes(b)) {
+    if incoming.jaccard(&removed)? > 0.8 { return Err(flag_as_duplicate()); } // SlotMismatch if sized differently
+}
+```
+
 ### Runtime log levels (0.6.0)
 
 `PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,

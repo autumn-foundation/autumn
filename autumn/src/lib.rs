@@ -404,6 +404,7 @@ pub mod bloom;
 #[cfg(feature = "db")]
 pub mod derivation;
 pub mod distinct;
+pub mod minhash;
 pub mod quantiles;
 pub mod reservoir;
 

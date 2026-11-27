@@ -332,7 +332,7 @@ fn positions(bits: u64, hashes: u32, hash: u64) -> impl Iterator<Item = (usize, 
 }
 
 /// The `SplitMix64` finalizer.
-const fn mix(mut z: u64) -> u64 {
+pub(crate) const fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
