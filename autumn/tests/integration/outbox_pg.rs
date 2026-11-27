@@ -242,6 +242,34 @@ mod docker {
         outbox::ensure_schema(&single).await.unwrap();
     }
 
+    /// A pool of one has no connection to spare for the background build of
+    /// the delivered-logs index, so the webhook store's `ensure_schema` skips
+    /// it (and still succeeds).
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_sql_webhook_store_ensure_schema_skips_the_index_build_on_a_single_connection_pool()
+    {
+        use autumn_web::webhook_outbound::SqlOutboundWebhookStore;
+        use diesel_async::AsyncPgConnection;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+        let db = autumn_web::test::TestDb::shared().await;
+        SqlOutboundWebhookStore::new(db.pool())
+            .ensure_schema()
+            .await
+            .unwrap();
+        let single: PgPool = Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            db.url(),
+        ))
+        .max_size(1)
+        .build()
+        .unwrap();
+        SqlOutboundWebhookStore::new(single)
+            .ensure_schema()
+            .await
+            .unwrap();
+    }
+
     /// Sent rows that the purge has not deleted yet. Their `seq` is lower than
     /// the `seq` of each pending row.
     const SENT_ROWS: i64 = 50_000;
@@ -464,6 +492,19 @@ mod docker {
             valid,
             "ensure_schema builds the delivered-logs index in the background"
         );
+
+        // Once the index exists, the background task finds it and sends no DDL.
+        store.ensure_schema().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let rows = diesel::sql_query(
+            "SELECT i.indisvalid AS valid FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             WHERE c.relname = 'idx_autumn_webhook_deliveries_delivered'",
+        )
+        .load::<IndexValid>(&mut *conn)
+        .await
+        .unwrap();
+        assert!(rows.len() == 1 && rows[0].valid, "one valid index stays");
 
         // The plan of the purge's DELETE can use the index: its predicate
         // implies the index's.
