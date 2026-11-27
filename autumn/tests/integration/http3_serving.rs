@@ -335,16 +335,33 @@ async fn h3_round_trips_a_large_request_body() {
 async fn h3_method_override_reaches_the_put_handler() {
     let server = serve_h3(test_config(), Http3Settings::default(), None).await;
     let mut client = connect(server.addr, None).await.expect("h3 connects");
-    let req = axum::http::Request::post("https://localhost/item")
-        .header("content-type", "application/x-www-form-urlencoded")
-        .body(())
-        .unwrap();
+    // The layer applies an override only to a same-origin form. It compares
+    // `Origin` with the `Host` that the adapter adds from `:authority`.
+    let form = |origin: &str| {
+        axum::http::Request::post("https://localhost/item")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("origin", origin)
+            .body(())
+            .unwrap()
+    };
     let resp = client
-        .request(req, Some(Bytes::from_static(b"_method=PUT")))
+        .request(
+            form("https://localhost"),
+            Some(Bytes::from_static(b"_method=PUT")),
+        )
         .await
         .expect("POST over h3");
     assert_eq!(resp.status, 200, "{}", resp.body);
     assert_eq!(resp.body, "put", "the override must run before routing");
+
+    let resp = client
+        .request(
+            form("https://evil.example"),
+            Some(Bytes::from_static(b"_method=PUT")),
+        )
+        .await
+        .expect("POST over h3");
+    assert_eq!(resp.body, "post", "a cross-site form gets no override");
     server.shutdown().await;
 }
 
