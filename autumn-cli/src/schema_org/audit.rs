@@ -138,25 +138,24 @@ pub fn extract_blocks(html: &str) -> Vec<&str> {
     let lower = html.to_ascii_lowercase();
     let mut out = Vec::new();
     let mut at = 0;
-    while let Some(rel) = lower[at..].find("<script") {
-        let open = at + rel;
-        let after_name = open + "<script".len();
-        let Some(next) = lower[after_name..].chars().next() else {
-            break;
-        };
-        if !(next.is_ascii_whitespace() || next == '>' || next == '/') {
-            at = after_name;
+    while let Some(open) = next_tag(&lower, at, "<script") {
+        // An HTML comment is skipped whole: a `<script` inside it is text.
+        if lower[open..].starts_with("<!--") {
+            let Some(end) = lower[open + 4..].find("-->") else {
+                break;
+            };
+            at = open + 4 + end + 3;
             continue;
         }
+        let after_name = open + "<script".len();
         let Some(tag_end) = tag_end(&lower, after_name) else {
             break;
         };
         let attrs = &lower[after_name..tag_end];
         let body_start = tag_end + 1;
-        let Some(close_rel) = lower[body_start..].find("</script") else {
+        let Some(body_end) = next_name_boundary(&lower, body_start, "</script") else {
             break;
         };
-        let body_end = body_start + close_rel;
         if script_type(attrs).is_some_and(|t| {
             t.split(';')
                 .next()
@@ -167,6 +166,36 @@ pub fn extract_blocks(html: &str) -> Vec<&str> {
         at = body_end + "</script".len();
     }
     out
+}
+
+/// The next `<!--` or `marker` (a tag name, ended by a boundary) at or after
+/// `from`, whichever comes first.
+fn next_tag(lower: &str, from: usize, marker: &str) -> Option<usize> {
+    let tag = next_name_boundary(lower, from, marker);
+    let comment = lower[from..].find("<!--").map(|i| from + i);
+    match (tag, comment) {
+        (Some(t), Some(c)) => Some(t.min(c)),
+        (t, c) => t.or(c),
+    }
+}
+
+/// The next `marker` at or after `from` whose tag name ends there: the byte
+/// after it is whitespace, `>` or `/`, or the input ends. `</scripture>` is
+/// not `</script`.
+fn next_name_boundary(lower: &str, from: usize, marker: &str) -> Option<usize> {
+    let mut at = from;
+    while let Some(rel) = lower[at..].find(marker) {
+        let start = at + rel;
+        let after = start + marker.len();
+        match lower.as_bytes().get(after) {
+            None => return Some(start),
+            Some(b) if b.is_ascii_whitespace() || matches!(b, b'>' | b'/') => {
+                return Some(start);
+            }
+            Some(_) => at = after,
+        }
+    }
+    None
 }
 
 /// The index of the `>` that ends the tag whose attributes start at `from`.
@@ -1118,6 +1147,25 @@ mod tests {
             text.contains("error   unreadable: failed to fetch"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_script_inside_a_comment_is_skipped() {
+        let html = "<!-- <script> removed --> <script type=\"application/ld+json\">{bad json}</script>\
+                    <!-- <script type=\"application/ld+json\">{\"old\":1}</script> -->";
+        assert_eq!(extract_blocks(html), vec!["{bad json}"]);
+        let report = audit_html("page", html);
+        assert_eq!(report.findings[0].rule, "invalid-json");
+    }
+
+    #[test]
+    fn a_longer_tag_name_does_not_close_the_script() {
+        let json = r#"{"@context":"https://schema.org","@type":"Thing","name":"</scripture>"}"#;
+        let html = format!("<script type=\"application/ld+json\">{json}</script >");
+        assert_eq!(extract_blocks(&html), vec![json]);
+        assert!(audit_html("page", &html).findings.is_empty());
+        // `<scripts>` is not a script element either.
+        assert!(extract_blocks("<scripts type=\"application/ld+json\">{}</scripts>").is_empty());
     }
 
     #[test]
