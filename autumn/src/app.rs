@@ -19088,10 +19088,12 @@ mod tests {
 
     /// Issue #3542: each background subsystem reads its own field. Each gate
     /// is joined from two parts at run time, so it does not match this test.
+    /// The restore check gate is in the fleet replication installer.
     #[test]
     fn each_background_subsystem_reads_its_own_capability() {
         let source = include_str!("app.rs").replace("\r\n", "\n");
-        let gates: [(&str, [&str; 2], usize); 7] = [
+        let installer = include_str!("fleet/replication.rs").replace("\r\n", "\n");
+        let gates: [(&str, [&str; 2], usize); 6] = [
             (
                 "job workers",
                 ["capabilities.", "job_workers,\n        ) {"],
@@ -19127,11 +19129,6 @@ mod tests {
                 ["relay: state.capabilities().", "fleet_relay,"],
                 1,
             ),
-            (
-                "restore check",
-                ["if state.capabilities().", "restore_check {"],
-                1,
-            ),
         ];
         for (subsystem, [head, tail], expected) in gates {
             let gate = [head, tail].concat();
@@ -19141,6 +19138,12 @@ mod tests {
                 "the {subsystem} gate must read its own capability: `{gate}`"
             );
         }
+        let restore_check = ["if state.capabilities().", "restore_check {"].concat();
+        assert_eq!(
+            installer.matches(restore_check.as_str()).count(),
+            1,
+            "the restore check gate must read its own capability: `{restore_check}`"
+        );
     }
 
     // The boot records the name of each framework retention sweep, so the
