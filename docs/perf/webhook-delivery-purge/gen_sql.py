@@ -19,8 +19,13 @@ ROOT = HERE.parents[2]
 SRC = pathlib.Path(os.environ.get(
     "SQL_STORE_RS", ROOT / "autumn/src/webhook_outbound/sql_store.rs")).read_text()
 out = pathlib.Path(sys.argv[1])
+out.mkdir(parents=True, exist_ok=True)
+# SQL_STORE_RS may be a pipe (`<(git show ...)`) that is read once and not
+# inherited by a child: hand the extractor a regular copy of the source.
+src_copy = out / "sql_store.rs"
+src_copy.write_text(SRC)
 subprocess.run([sys.executable, str(HERE.parent / "webhook-reactivate/extract_sql.py"), str(out)],
-               check=True)
+               check=True, env={**os.environ, "SQL_STORE_RS": str(src_copy)})
 
 m = re.search(r'pub async fn purge_deliveries_before.*?sql\(\s*"((?:[^"\\]|\\.)*)"', SRC, re.S)
 if not m:
