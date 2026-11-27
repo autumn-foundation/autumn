@@ -2193,6 +2193,22 @@ In-process HTTPS termination on the same host:port (off by default).
   probes its own loopback listener over TLS instead of failing forever. See
   `docs/guide/tls.md`.
 
+### `[server.http3]` (feature `http3`)
+
+HTTP/3 over QUIC (UDP) beside the `[server.tls]` listener (off by default).
+
+- `enabled` (default `false`). Needs `[server.tls]`; `validate()` rejects it
+  without.
+- `port` (default: the TCP port), `max_idle_timeout_secs` (default `30`),
+  `max_concurrent_bidi_streams` (default `100`), `alt_svc_max_age` (default
+  `86400`). Env: `AUTUMN_SERVER__HTTP3__*`.
+- QUIC shares the TLS certificate resolver and the mTLS verifier. TLS 1.3
+  only, no 0-RTT, no extended CONNECT (WebSockets stay on h1/h2).
+- TCP responses get `Alt-Svc: h3=":<port>"; ma=<alt_svc_max_age>`, unless the
+  app sets `Alt-Svc`.
+- `autumn_web::http3::{Http3Listener, Http3Settings, AltSvcLayer}` are the
+  public parts. See `docs/guide/tls.md`.
+
 ### `[server.tls.client_auth]` (feature `tls`, 0.8.0, #1640)
 
 Mutual TLS: verify the *caller's* certificate, not just prove the server's.

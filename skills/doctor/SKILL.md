@@ -202,6 +202,18 @@ configuration:
 
 See issue #1852.
 
+## HTTP/3 check
+
+`autumn doctor` has an `http3` check for `[server.http3]`:
+
+- **Pass** — HTTP/3 is off, or it is on with `[server.tls]`. The detail names
+  the UDP port. Make sure that this port is open end to end.
+- **Warn** — HTTP/3 is on and Linux `net.core.rmem_max` is below 7500000 bytes.
+- **Fail** — HTTP/3 is on without `[server.tls]`. The app does not start.
+
+The check reads the config only. It cannot see whether the app was built with
+the `http3` feature. Without the feature, the app does not start.
+
 ## mTLS client-auth check (0.8.0, issue #1640)
 
 `autumn doctor` adds a `tls_client_auth` check that grades the

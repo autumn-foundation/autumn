@@ -1412,8 +1412,8 @@ Each key has an `AUTUMN_SERVER__HTTP3__*` env var, for example
 
 ### How it works
 
-- The app binds a UDP endpoint on the TCP listener's address. A bind failure
-  stops the boot.
+- The app binds a UDP endpoint on the TCP listener's IP address. The UDP port
+  is `port`, or the TCP port. A bind failure stops the boot.
 - QUIC uses the TLS listener's certificate resolver. A renewal (file reload
   or ACME) applies to the next h3 connection. The endpoint does not restart.
 - `[server.tls.client_auth]` applies to QUIC too. UDP is not a way around mTLS.
@@ -1425,10 +1425,21 @@ Each key has an `AUTUMN_SERVER__HTTP3__*` env var, for example
   has the peer address, so `X-Forwarded-For` from an untrusted peer has no
   effect.
 - A request without `Host` gets one from `:authority`.
-- `[server.http]` `max_header_bytes` and `max_connections` apply. QUIC
-  connections count against their own limit of the same size.
-- On shutdown the endpoint stops accepting, sends GOAWAY, and lets in-flight
-  requests finish within `shutdown_timeout_secs`.
+- A request with a connection-specific header (`Connection`, `TE` other than
+  `trailers`, and so on) gets `400`. HTTP/3 forbids these headers.
+- `[server.http]` limits apply:
+  - `max_header_bytes` limits the request head (default 64 KiB).
+  - `header_read_timeout_ms` limits the time to receive the head (default
+    30 seconds).
+  - `keep_alive_timeout_ms` closes a connection with no request in flight.
+  - `max_connections` limits QUIC connections. QUIC connections have a
+    separate limit. Its value is `max_connections`.
+- Under handshake load, the server sends a QUIC Retry to an unvalidated
+  client. The Retry makes the client prove its address before the server
+  signs a handshake.
+- On shutdown the endpoint stops accepting and sends GOAWAY. In-flight
+  requests get 5 seconds to finish, the same grace as a TCP connection. Then
+  the connection closes.
 
 ### What stays off
 
@@ -1440,9 +1451,10 @@ Each key has an `AUTUMN_SERVER__HTTP3__*` env var, for example
 
 ### Operator checklist
 
-1. **Open UDP on the port end to end.** Open it in the host firewall, the
-   cloud security group and every NAT between. When UDP is blocked, browsers
-   stay on TCP and nothing fails, so this is easy to miss.
+1. **Open UDP 443 (or `port`) end to end.** Open it in the host firewall, in
+   the cloud security group, and in each NAT device between the client and
+   the app. When UDP is blocked, browsers use TCP. No error occurs. Thus, you
+   can easily miss this problem.
 2. **On Linux, raise the UDP receive buffer.** quinn asks for a large buffer.
    The default `net.core.rmem_max` caps it. quinn then logs a warning and drops
    packets under load:
@@ -1454,6 +1466,8 @@ Each key has an `AUTUMN_SERVER__HTTP3__*` env var, for example
    Add the same keys to `/etc/sysctl.d/` so that they stay after a reboot.
 3. **Run `autumn doctor`.** The `http3` check fails when `[server.http3]` is
    on without `[server.tls]`, and warns when `net.core.rmem_max` is too small.
+   It reads the config only. A binary without the `http3` feature does not
+   start when `[server.http3]` is on.
 
 For many replicas behind a load balancer, terminate TLS (and h3) at the load
 balancer. That stays the recommended setup.

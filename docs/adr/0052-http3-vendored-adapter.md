@@ -25,10 +25,10 @@ the app directly on the internet wants HTTP/3 without a proxy.
 ## Options
 
 1. Use `axum-h3` as it is. Rejected: blocker 2 is a security hole.
-2. Fork `axum-h3` and wait for upstream. Rejected: a 0.0.x crate with one
-   maintainer would gate a security-relevant path.
-3. Vendor the adapter (about 250 lines) into `autumn/src/http3.rs`, on `h3`
-   and `h3-quinn` directly, without `h3-util`.
+2. Send the fixes upstream and wait for a release. Rejected: a 0.0.x crate
+   with one maintainer would gate a security-relevant path.
+3. Vendor the adapter into `autumn/src/http3.rs`, on `h3` and `h3-quinn`
+   directly, without `h3-util`.
 
 ## Decision
 
@@ -46,6 +46,11 @@ Option 3.
 - h3 runs as a task beside the TLS listener, inside the same server task, on
   the same shutdown token. It is not a new `BoundListener` variant.
 - Extended CONNECT, WebTransport and QUIC datagrams stay off.
+- `h3` 0.0.8 reads a whole HEADERS frame before it checks its size. A
+  transport wrapper (`http3/limited.rs`) limits the bytes that `h3` reads
+  before a request head is parsed, and on control streams.
+- The request head has a time limit. Idle connections close. A drain ends
+  after the same grace that TCP connections get.
 
 ## Consequences
 

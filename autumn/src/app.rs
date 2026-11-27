@@ -19422,21 +19422,6 @@ mod tests {
         assert_eq!(task_names(&kept), task_names(&mixed_tasks()));
     }
 
-    /// The replication loop's final flush must be *triggered* after the drain.
-    ///
-    /// Cancelling the token only *wakes* the replication thread; the tick that
-    /// ships the last committed frames runs immediately after it. So waiting
-    /// for the thread is not enough on its own — if the token fires at phase 5,
-    /// with `server_shutdown`, that final tick happens while requests are still
-    /// draining, and a request that commits during the drain is never
-    /// replicated even though the wait below succeeds and logs that replication
-    /// flushed. The token must therefore be independent of `server_shutdown`
-    /// and cancelled only once the drain has finished.
-    ///
-    /// The wait must also not be a blocking join: a blocked join cannot be
-    /// cancelled, so a stuck upload would hold the process open past the
-    /// shutdown budget that is supposed to bound it.
-    ///
     /// h3 must serve the serve-boundary service (`TrustedProxiesLayer` around
     /// `MethodOverrideLayer`), not the bare router. Without it, `_method=PUT`
     /// breaks and forwarded headers are not resolved over h3. `Alt-Svc` must go
@@ -19471,6 +19456,21 @@ mod tests {
         assert!(joined < drained, "the drain includes h3 requests");
     }
 
+    /// The replication loop's final flush must be *triggered* after the drain.
+    ///
+    /// Cancelling the token only *wakes* the replication thread; the tick that
+    /// ships the last committed frames runs immediately after it. So waiting
+    /// for the thread is not enough on its own — if the token fires at phase 5,
+    /// with `server_shutdown`, that final tick happens while requests are still
+    /// draining, and a request that commits during the drain is never
+    /// replicated even though the wait below succeeds and logs that replication
+    /// flushed. The token must therefore be independent of `server_shutdown`
+    /// and cancelled only once the drain has finished.
+    ///
+    /// The wait must also not be a blocking join: a blocked join cannot be
+    /// cancelled, so a stuck upload would hold the process open past the
+    /// shutdown budget that is supposed to bound it.
+    ///
     /// Source-order test in the house style, because the ordering is a property
     /// of this function and nothing smaller: an app-level boot test would need a
     /// `SQLite` runtime pool, which only exists in the `sqlite` lane.

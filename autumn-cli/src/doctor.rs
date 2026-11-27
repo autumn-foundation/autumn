@@ -1051,7 +1051,7 @@ pub fn check_http3_impl(data: &Http3DoctorData) -> CheckResult {
         return CheckResult {
             name: "http3",
             status: CheckStatus::Pass,
-            detail: Some("[server.http3] is off; serving HTTP/1.1 and HTTP/2 only".into()),
+            detail: Some("[server.http3] is off".into()),
             hint: None,
         };
     }
@@ -1072,8 +1072,8 @@ pub fn check_http3_impl(data: &Http3DoctorData) -> CheckResult {
                  {HTTP3_RMEM_MAX_RECOMMENDED}"
             )),
             hint: Some(
-                "Run `sysctl -w net.core.rmem_max=7500000` and add it to /etc/sysctl.conf, \
-                 or quinn drops UDP packets under load",
+                "Run `sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000` and add \
+                 both keys to /etc/sysctl.d/. Else quinn drops UDP packets under load",
             ),
         };
     }
@@ -1104,7 +1104,8 @@ fn http3_doctor_data_from(
         Some("false" | "0") => Some(false),
         _ => None,
     };
-    let env_port = |key: &str| env.var(key).ok().and_then(|v| v.trim().parse::<u16>().ok());
+    // As the runtime parses them: no trim, and an invalid value keeps the TOML.
+    let env_port = |key: &str| env.var(key).ok().and_then(|v| v.parse::<u16>().ok());
     let toml_port = |table: Option<&toml::Table>, key: &str| {
         table
             .and_then(|t| t.get(key))
@@ -1119,9 +1120,13 @@ fn http3_doctor_data_from(
     let tcp_port = env_port("AUTUMN_SERVER__PORT")
         .or_else(|| toml_port(server, "port"))
         .unwrap_or(3000);
-    let udp_port = env_port("AUTUMN_SERVER__HTTP3__PORT")
-        .or_else(|| toml_port(h3, "port"))
-        .unwrap_or(tcp_port);
+    // An empty `AUTUMN_SERVER__HTTP3__PORT` clears the TOML port.
+    let h3_port = match env.var("AUTUMN_SERVER__HTTP3__PORT").ok().as_deref() {
+        Some("") => None,
+        Some(value) => value.parse::<u16>().ok().or_else(|| toml_port(h3, "port")),
+        None => toml_port(h3, "port"),
+    };
+    let udp_port = h3_port.unwrap_or(tcp_port);
     let tls_configured =
         server.is_some_and(|s| s.contains_key("tls")) || any_tls_env_var_set_in(env);
     Http3DoctorData {
@@ -14544,6 +14549,25 @@ pub struct Vault {
         let data = http3_doctor_data_from(&table, &env, None);
         assert!(!data.enabled, "the env override wins");
         assert_eq!(data.udp_port, 9443);
+    }
+
+    #[test]
+    fn http3_data_parses_the_port_env_as_the_runtime_does() {
+        let table: toml::Table =
+            toml::from_str("[server]\nport = 8443\n[server.http3]\nenabled = true\nport = 9443\n")
+                .unwrap();
+        let empty = autumn_web::config::MockEnv::new().with("AUTUMN_SERVER__HTTP3__PORT", "");
+        assert_eq!(
+            http3_doctor_data_from(&table, &empty, None).udp_port,
+            8443,
+            "an empty value clears the TOML port"
+        );
+        let padded = autumn_web::config::MockEnv::new().with("AUTUMN_SERVER__HTTP3__PORT", " 7443");
+        assert_eq!(
+            http3_doctor_data_from(&table, &padded, None).udp_port,
+            9443,
+            "an invalid value keeps the TOML port"
+        );
     }
 
     #[test]

@@ -51,7 +51,7 @@ async fn post_item() -> &'static str {
 
 #[get("/whoami")]
 async fn whoami(ClientAddr(addr): ClientAddr) -> String {
-    addr.ip().to_string()
+    addr.to_string()
 }
 
 #[get("/host")]
@@ -63,10 +63,41 @@ async fn host(headers: axum::http::HeaderMap) -> String {
         .to_owned()
 }
 
+/// Set when `/slow` starts, so the drain test cancels only once the request
+/// is in flight.
+static SLOW_ENTERED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
 #[get("/slow")]
 async fn slow() -> &'static str {
+    SLOW_ENTERED.notify_one();
     tokio::time::sleep(Duration::from_millis(600)).await;
     "drained"
+}
+
+#[get("/version")]
+async fn version(req: axum::extract::Request) -> String {
+    format!("{:?}", req.version())
+}
+
+/// A response body that never ends: one chunk every 100 ms.
+#[get("/forever")]
+async fn forever() -> axum::body::Body {
+    let ticks = futures::stream::unfold((), |()| async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Some((
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(b"tick\n")),
+            (),
+        ))
+    });
+    axum::body::Body::from_stream(ticks)
+}
+
+#[get("/hop")]
+async fn hop() -> impl axum::response::IntoResponse {
+    (
+        [("connection", "x-hop"), ("x-hop", "1"), ("x-kept", "1")],
+        "hop",
+    )
 }
 
 #[get("/cert")]
@@ -130,7 +161,7 @@ async fn serve_h3(
     let router = TestApp::new()
         .config(config)
         .routes(routes![
-            hello, echo, put_item, post_item, whoami, host, slow, cert
+            hello, echo, put_item, post_item, whoami, host, slow, cert, version, forever, hop
         ])
         .build()
         .into_router();
@@ -168,7 +199,6 @@ struct H3Client {
 
 struct H3Response {
     status: u16,
-    version: axum::http::Version,
     headers: axum::http::HeaderMap,
     body: String,
 }
@@ -242,7 +272,6 @@ impl H3Client {
             }
             Ok(H3Response {
                 status: resp.status().as_u16(),
-                version: resp.version(),
                 headers: resp.headers().clone(),
                 body: String::from_utf8_lossy(&body).into_owned(),
             })
@@ -277,8 +306,9 @@ async fn h3_serves_a_get_request() {
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let resp = client.get("/hello").await.expect("GET over h3");
     assert_eq!(resp.status, 200);
-    assert_eq!(resp.version, axum::http::Version::HTTP_3);
     assert_eq!(resp.body, "hello over h3");
+    let resp = client.get("/version").await.expect("GET over h3");
+    assert_eq!(resp.body, "HTTP/3.0", "the handler sees an HTTP/3 request");
     server.shutdown().await;
 }
 
@@ -396,8 +426,11 @@ async fn h3_drains_an_in_flight_request_on_shutdown() {
     let server = serve_h3(test_config(), Http3Settings::default(), None).await;
     let mut client = connect(server.addr, None).await.expect("h3 connects");
     let shutdown = server.shutdown.clone();
+    let entered = SLOW_ENTERED.notified();
     let request = tokio::spawn(async move { client.get("/slow").await });
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::timeout(DEADLINE, entered)
+        .await
+        .expect("the request reaches the handler");
     shutdown.cancel();
     let resp = request
         .await
@@ -410,6 +443,9 @@ async fn h3_drains_an_in_flight_request_on_shutdown() {
 #[tokio::test]
 async fn h3_refuses_new_requests_after_shutdown() {
     let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let mut before = connect(server.addr, None).await.expect("h3 connects");
+    assert_eq!(before.get("/hello").await.expect("GET").status, 200);
+    drop(before);
     server.shutdown.cancel();
     tokio::time::timeout(DEADLINE, server.handle)
         .await
@@ -444,6 +480,92 @@ async fn h3_caps_open_connections() {
         "a second connection over the cap must not be served"
     );
     drop(first);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn h3_closes_a_streaming_response_when_the_drain_grace_ends() {
+    let mut settings = Http3Settings::default();
+    settings.drain_grace = Duration::from_millis(300);
+    let server = serve_h3(test_config(), settings, None).await;
+    let mut client = connect(server.addr, None).await.expect("h3 connects");
+    let req = axum::http::Request::get("https://localhost/forever")
+        .body(())
+        .unwrap();
+    let mut stream = client.send.send_request(req).await.expect("request opens");
+    stream.finish().await.expect("request ends");
+    let resp = stream.recv_response().await.expect("response head");
+    assert_eq!(resp.status(), 200);
+    assert!(stream.recv_data().await.expect("first chunk").is_some());
+
+    let started = std::time::Instant::now();
+    server.shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(10), server.handle)
+        .await
+        .expect("an endless response must not hold the drain open")
+        .expect("no panic")
+        .expect("Ok");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the drain ended near its grace, not at a client timeout"
+    );
+}
+
+#[tokio::test]
+async fn h3_rejects_a_request_with_a_connection_specific_header() {
+    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let mut client = connect(server.addr, None).await.expect("h3 connects");
+    let resp = client
+        .get_with("/hello", &[("te", "gzip")])
+        .await
+        .expect("the server answers");
+    assert_eq!(resp.status, 400, "RFC 9114 makes this request malformed");
+    let resp = client.get("/hello").await.expect("the connection stays up");
+    assert_eq!(resp.status, 200);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn h3_removes_connection_headers_from_a_response() {
+    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let mut client = connect(server.addr, None).await.expect("h3 connects");
+    let resp = client.get("/hop").await.expect("the response is valid h3");
+    assert_eq!(resp.body, "hop");
+    assert!(resp.headers.get("connection").is_none());
+    assert!(
+        resp.headers.get("x-hop").is_none(),
+        "a header that Connection names goes too"
+    );
+    assert_eq!(resp.headers.get("x-kept").unwrap(), "1");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn h3_serves_a_large_request_head_inside_the_limit() {
+    let server = serve_h3(test_config(), Http3Settings::default(), None).await;
+    let mut client = connect(server.addr, None).await.expect("h3 connects");
+    let big = "a".repeat(30 * 1024);
+    let resp = client
+        .get_with("/hello", &[("x-big", big.as_str())])
+        .await
+        .expect("a 30 KiB head is inside the 64 KiB default");
+    assert_eq!(resp.status, 200);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn h3_closes_a_connection_after_the_keep_alive_timeout() {
+    let mut settings = Http3Settings::default();
+    settings.keep_alive_timeout = Some(Duration::from_millis(300));
+    let server = serve_h3(test_config(), settings, None).await;
+    let mut client = connect(server.addr, None).await.expect("h3 connects");
+    assert_eq!(client.get("/hello").await.expect("GET").status, 200);
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let after = tokio::time::timeout(Duration::from_secs(5), client.get("/hello")).await;
+    assert!(
+        !matches!(after, Ok(Ok(_))),
+        "an idle connection past keep_alive_timeout is closed"
+    );
     server.shutdown().await;
 }
 
