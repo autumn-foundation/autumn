@@ -47,6 +47,8 @@ fn control(
 ) -> diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection> {
     crate::db::create_pool(&crate::config::DatabaseConfig {
         url: Some(format!("sqlite://{}", dir.join(name).display())),
+        // A loaded CI runner can take more than 5 s to open a connection.
+        connect_timeout_secs: 60,
         ..Default::default()
     })
     .unwrap()
