@@ -240,6 +240,7 @@ writes.
 
 | Rule | Severity | Meaning |
 |---|---|---|
+| `unreadable` | error | The page could not be fetched, or the file is not UTF-8. |
 | `invalid-json` | error | The block is not JSON. |
 | `missing-context` | error | A top-level node has no schema.org `@context`. |
 | `missing-type` | error | A top-level node has no `@type`. |

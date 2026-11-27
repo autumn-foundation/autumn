@@ -94,6 +94,17 @@ fn audit_reads_a_directory_and_rejects_a_missing_path() {
     assert!(out.status.success(), "{}", stdout(&out));
     assert!(stdout(&out).contains("2 pages"), "{}", stdout(&out));
 
+    let bad = dir.path().join("latin1.html");
+    std::fs::write(&bad, [0x3c, 0x70, 0x3e, 0xe9]).expect("write");
+    let out = run(&["audit", &bad.display().to_string(), "--format", "json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("json report");
+    assert_eq!(report["failed"], true, "{report}");
+    assert_eq!(
+        report["pages"][0]["findings"][0]["rule"], "unreadable",
+        "{report}"
+    );
+
     let out = run(&["audit", "/no/such/dir"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no such file"));

@@ -5,6 +5,7 @@
 //!
 //! | Rule | Severity | What it means |
 //! |---|---|---|
+//! | `unreadable` | error | The page could not be fetched, or the file read as UTF-8. |
 //! | `invalid-json` | error | The block is not JSON. |
 //! | `missing-context` | error | A top-level node has no schema.org `@context`. |
 //! | `missing-type` | error | A top-level node has no `@type`. |
@@ -147,10 +148,9 @@ pub fn extract_blocks(html: &str) -> Vec<&str> {
             at = after_name;
             continue;
         }
-        let Some(tag_end_rel) = lower[after_name..].find('>') else {
+        let Some(tag_end) = tag_end(&lower, after_name) else {
             break;
         };
-        let tag_end = after_name + tag_end_rel;
         let attrs = &lower[after_name..tag_end];
         let body_start = tag_end + 1;
         let Some(close_rel) = lower[body_start..].find("</script") else {
@@ -167,6 +167,24 @@ pub fn extract_blocks(html: &str) -> Vec<&str> {
         at = body_end + "</script".len();
     }
     out
+}
+
+/// The index of the `>` that ends the tag whose attributes start at `from`.
+/// A `>` inside a quoted attribute value does not end the tag.
+fn tag_end(html: &str, from: usize) -> Option<usize> {
+    let mut quote: Option<u8> = None;
+    for (i, b) in html.bytes().enumerate().skip(from) {
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+        } else if matches!(b, b'"' | b'\'') {
+            quote = Some(b);
+        } else if b == b'>' {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// The `type` attribute value in a lowercased attribute string.
@@ -782,6 +800,24 @@ pub fn render_json(reports: &[PageReport], strict: bool) -> String {
     )
 }
 
+/// The report for a target that could not be read: one `unreadable` error,
+/// so the report, text or JSON, fails like the exit code does.
+#[must_use]
+pub fn unreadable_report(source: &str, error: String) -> PageReport {
+    PageReport {
+        source: source.to_owned(),
+        blocks: 0,
+        types: Vec::new(),
+        findings: vec![Finding {
+            rule: "unreadable",
+            severity: Severity::Error,
+            block: 0,
+            path: String::new(),
+            message: error,
+        }],
+    }
+}
+
 /// Run `autumn schema-org audit`. Exits 1 when the audit fails or a target
 /// cannot be read.
 pub fn run(targets: &[String], strict: bool, format: super::Format) {
@@ -796,22 +832,18 @@ pub fn run(targets: &[String], strict: bool, format: super::Format) {
             std::process::exit(1);
         }
     };
-    let mut reports = Vec::new();
-    let mut unreadable = false;
-    for target in &targets {
-        match load(target) {
-            Ok(html) => reports.push(audit_html(&target.label(), &html)),
-            Err(e) => {
-                eprintln!("error: {e}");
-                unreadable = true;
-            }
-        }
-    }
+    let reports: Vec<PageReport> = targets
+        .iter()
+        .map(|target| match load(target) {
+            Ok(html) => audit_html(&target.label(), &html),
+            Err(e) => unreadable_report(&target.label(), e),
+        })
+        .collect();
     match format {
         super::Format::Text => print!("{}", render_text(&reports, strict)),
         super::Format::Json => print!("{}", render_json(&reports, strict)),
     }
-    if unreadable || failed(&reports, strict) {
+    if failed(&reports, strict) {
         std::process::exit(1);
     }
 }
@@ -1058,6 +1090,34 @@ mod tests {
                     <script type=application/ld+json>{\"c\":3}</script>\
                     <script src=\"x.js\" type=\"module\"></script>";
         assert_eq!(extract_blocks(html), vec!["{\"a\":1}", "{\"c\":3}"]);
+    }
+
+    #[test]
+    fn a_gt_inside_a_quoted_attribute_does_not_end_the_tag() {
+        let html = "<script data-note=\"a > b\" type=\"application/ld+json\">{\"a\":1}</script>\
+                    <script data-x='>' type=application/ld+json>{\"b\":2}</script>";
+        assert_eq!(extract_blocks(html), vec!["{\"a\":1}", "{\"b\":2}"]);
+    }
+
+    #[test]
+    fn an_unreadable_target_fails_the_json_report() {
+        let reports = vec![
+            audit_html("a.html", &page(GOOD_RECIPE)),
+            unreadable_report(
+                "https://down.test/",
+                "failed to fetch https://down.test/".to_owned(),
+            ),
+        ];
+        assert!(failed(&reports, false));
+        let json: Value = serde_json::from_str(&render_json(&reports, false)).expect("json");
+        assert_eq!(json["failed"], true);
+        assert_eq!(json["errors"], 1);
+        assert_eq!(json["pages"][1]["findings"][0]["rule"], "unreadable");
+        let text = render_text(&reports, false);
+        assert!(
+            text.contains("error   unreadable: failed to fetch"),
+            "{text}"
+        );
     }
 
     #[test]
