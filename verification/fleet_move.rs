@@ -14,7 +14,8 @@ verus! {
 //
 // A delivery writes the row into the destination. It has a time from the
 // clock and the epoch of the destination. The row is in the destination
-// when one delivery is in it. The source keeps a mark: the time and the
+// when one delivery is in it: a flag for each of the file and the replica
+// says so. The source keeps a mark: the time and the
 // epoch of its last delivery.
 //
 // The model is for loss, for one move of one row. Versions and tombstones,
@@ -46,6 +47,9 @@ pub struct State {
     /// the destination.
     pub dst_local: Set<int>,
     pub dst_replica: Set<int>,
+    /// The row is in the local file and in the replica of the destination.
+    pub dst_local_holds: bool,
+    pub dst_replica_holds: bool,
     /// The epoch of the destination now.
     pub epoch: nat,
     /// When the destination file started.
@@ -56,21 +60,13 @@ pub struct State {
     pub now: int,
 }
 
-pub open spec fn dst_has_local(s: State) -> bool {
-    exists|t: int| #[trigger] s.dst_local.contains(t)
-}
-
-pub open spec fn dst_has_replica(s: State) -> bool {
-    exists|t: int| #[trigger] s.dst_replica.contains(t)
-}
-
 /// The row survives every choice of rewinds: for each database, the local
 /// file or the replica, one of the two holds the row.
 pub open spec fn safe(s: State) -> bool {
-    &&& (s.src_local || dst_has_local(s))
-    &&& (s.src_local || dst_has_replica(s))
-    &&& (s.src_replica || dst_has_local(s))
-    &&& (s.src_replica || dst_has_replica(s))
+    &&& (s.src_local || s.dst_local_holds)
+    &&& (s.src_local || s.dst_replica_holds)
+    &&& (s.src_replica || s.dst_local_holds)
+    &&& (s.src_replica || s.dst_replica_holds)
 }
 
 /// A mark of the current epoch and file names a delivery in the local file:
@@ -96,7 +92,9 @@ pub open spec fn bound_ok(s: State) -> bool {
 pub open spec fn inv(s: State) -> bool {
     &&& safe(s)
     &&& s.since < s.now
-    &&& s.dst_replica.subset_of(s.dst_local)
+    &&& (s.dst_replica_holds ==> s.dst_local_holds)
+    &&& forall|t: int| #[trigger] s.dst_local.contains(t) ==> s.dst_local_holds
+    &&& forall|t: int| #[trigger] s.dst_replica.contains(t) ==> s.dst_replica_holds
     &&& mark_ok(s, s.mark_local)
     &&& mark_ok(s, s.mark_replica)
     &&& bound_ok(s)
@@ -111,6 +109,8 @@ pub open spec fn initial() -> State {
         mark_replica: None,
         dst_local: Set::empty(),
         dst_replica: Set::empty(),
+        dst_local_holds: false,
+        dst_replica_holds: false,
         epoch: 1,
         since: -1,
         bound: None,
@@ -124,6 +124,7 @@ pub open spec fn initial() -> State {
 pub open spec fn deliver(s: State) -> State {
     State {
         dst_local: s.dst_local.insert(s.now),
+        dst_local_holds: true,
         mark_local: Some(Mark { at: s.now, epoch: s.epoch }),
         now: s.now + 1,
         ..s
@@ -135,7 +136,7 @@ pub open spec fn ship_src(s: State) -> State {
 }
 
 pub open spec fn ship_dst(s: State) -> State {
-    State { dst_replica: s.dst_local, ..s }
+    State { dst_replica: s.dst_local, dst_replica_holds: s.dst_local_holds, ..s }
 }
 
 /// The destination proves a bound `b`. See `tick_dst_keeps_inv`.
@@ -149,6 +150,7 @@ pub open spec fn tick_dst(s: State, b: int) -> State {
 pub open spec fn rewind_dst(s: State, new_epoch: bool) -> State {
     State {
         dst_local: s.dst_replica,
+        dst_local_holds: s.dst_replica_holds,
         epoch: if new_epoch { s.epoch + 1 } else { s.epoch },
         since: s.now,
         now: s.now + 1,
@@ -212,7 +214,6 @@ pub proof fn deliver_keeps_inv(s: State)
 {
     let n = deliver(s);
     assert(n.dst_local.contains(s.now));
-    assert(s.dst_replica.subset_of(n.dst_local));
     match s.bound {
         Some(b) => {
             assert forall|t: int|
@@ -279,11 +280,8 @@ pub proof fn delete_src_keeps_inv(s: State)
                 assert(s.since < m.at);
                 assert(s.dst_local.contains(m.at));
                 assert(s.dst_replica.contains(m.at));
-                let n = delete_src(s);
-                assert(n.dst_local.contains(m.at));
-                assert(n.dst_replica.contains(m.at));
-                assert(dst_has_local(n));
-                assert(dst_has_replica(n));
+                assert(s.dst_replica_holds);
+                assert(s.dst_local_holds);
             },
             None => {},
         },
@@ -324,8 +322,7 @@ pub proof fn a_delete_on_acknowledgement_is_unsafe()
 {
     let s = delete_src(deliver(initial()));
     assert(!s.src_local);
-    assert(s.dst_replica == Set::<int>::empty());
-    assert(!dst_has_replica(s));
+    assert(!s.dst_replica_holds);
 }
 
 /// A bound of the new epoch covers the time of a delivery that the rewind
@@ -349,7 +346,7 @@ pub proof fn a_time_only_check_is_unsafe()
     tick_dst_keeps_inv(r, 0);
     let s = delete_src(after_a_rewind());
     assert(!s.src_local);
-    assert(!dst_has_local(s));
+    assert(!s.dst_local_holds);
 }
 
 /// A rewind that keeps the epoch: a new volume under the same owner, or a
@@ -374,7 +371,7 @@ pub proof fn an_epoch_only_check_is_unsafe()
     tick_dst_keeps_inv(r, 0);
     let s = delete_src(after_a_same_epoch_rewind());
     assert(!s.src_local);
-    assert(!dst_has_local(s));
+    assert(!s.dst_local_holds);
 }
 
 fn main() {}
