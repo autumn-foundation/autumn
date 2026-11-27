@@ -8,18 +8,20 @@ verus! {
 // and `DatabaseFleet::warn_if_unreplicated` in `autumn/src/db/fleet.rs`.
 // The `[replication]` runtime core builds at boot is the source. A fleet
 // root is a number. The model leaves out the I/O: the replication thread
-// and the health indicator. The unit tests check those parts.
+// and the health indicator. The unit tests check those parts. The model has
+// one ownership flag. The runtime reads it from the config at the install,
+// and from the installed ownership at an open.
 //
 // The proofs show:
 //
 // - A fleet logs the unreplicated warning at most once, over any sequence
 //   of installs and opens.
-// - The warning is logged only for a fleet with ownership, no replica and
-//   an engine that is not in `Rebuild` mode.
+// - The fleet logs the warning only for ownership, no replica and an engine
+//   that is not in `Rebuild` mode.
 // - With a source, an install connects the fleet or refuses. It never
 //   leaves a fleet with ownership and no replica in silence.
-// - A source holds at most one fleet. A second fleet is refused, and the
-//   state does not change.
+// - A source holds at most one fleet. The source refuses a second fleet,
+//   and the state does not change.
 
 /// One fleet.
 pub struct Fleet {
@@ -70,10 +72,10 @@ pub open spec fn install(source: Option<Source>, f: Fleet) -> (Outcome, Option<S
     match source {
         None => (Outcome::NoReplication, None, warn(f)),
         Some(s) => {
-            if s.claimed.is_some() && s.claimed != Some(f.root) {
-                (Outcome::RootInUse, Some(s), f)
-            } else if f.replicated {
+            if f.replicated {
                 (Outcome::AlreadyReplicates, Some(s), f)
+            } else if s.claimed.is_some() {
+                (Outcome::RootInUse, Some(s), f)
             } else {
                 (
                     Outcome::Installed,
@@ -191,10 +193,11 @@ proof fn a_source_never_installs_in_silence(s: Source, f: Fleet)
 {
 }
 
-/// A source holds one fleet. A second fleet is refused, with no change.
+/// A source holds one fleet. The source refuses a second fleet, also one
+/// with the same root, and nothing changes.
 proof fn one_fleet_per_source(s: Source, a: Fleet, b: Fleet)
     requires
-        a.root != b.root,
+        !b.replicated,
         install(Some(s), a).0 == Outcome::Installed,
     ensures
         ({

@@ -514,6 +514,7 @@ async fn without_the_installer_a_takeover_opens_empty_databases_and_warns() {
     let b = boot_host(tmp.path(), "host-b", &store, false).await;
 
     assert_eq!(rows(&b).await, [0; 3], "the standby has no replica");
+    assert!(b.fleet.unreplicated_warned());
     assert_eq!(
         warnings.matching(crate::db::fleet::UNREPLICATED_WARNING),
         2,

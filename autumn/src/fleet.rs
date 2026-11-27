@@ -4,6 +4,9 @@
 //! the same for a job or a task, with no request. Both return a
 //! [`FleetLease`]: the engine handle, held open until the lease drops.
 //!
+//! With the `sqlite` feature, `install_replication` connects the fleet of a
+//! plugin to `[replication]` at boot.
+//!
 //! Core has no generic extractor. Each engine plugin writes its own, with its
 //! own name and error mapping:
 //!

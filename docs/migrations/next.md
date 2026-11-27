@@ -125,9 +125,13 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
 - **Stable surface changed:** {the API, what changed, and the replacement — or
   "none". Every entry here is a `**Breaking:**` change in the changelog and
   needs its own section under *Breaking changes* above.}
-- **Experimental surface changed:** {the API and what changed — or "none".
-  Experimental surface may change in any release, so this is a courtesy, not a
-  promise. Plugins that declared it with `uses_experimental` are the audience.}
+- **Experimental surface changed:** `fleet` adds
+  `install_replication(&state, &fleet, &config)`, `ReplicationInstall` and
+  `InstallReplicationError` (with the `sqlite` feature). An engine plugin
+  calls it in `on_startup`, after `DatabaseFleet::with_engine`. Then its
+  fleet gets the replica of `[replication]`, as `[database.fleet]` does.
+  Replace a hand-built `FleetReplication` with it. Without it, a fleet with
+  ownership logs a warning at its first open.
 - **New stable surface:** {additive APIs plugin authors can now rely on — or
   "none". These are not breaking; they are why a plugin author reads this
   section for the good news too.}

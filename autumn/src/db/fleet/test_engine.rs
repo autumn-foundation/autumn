@@ -227,7 +227,7 @@ impl FleetEngine for TextEngine {
 }
 
 /// The `WARN` events of this thread while the value lives. Use it in a
-/// current-thread test: other threads are not captured.
+/// current-thread test. It does not capture other threads.
 pub struct Warnings {
     messages: Arc<std::sync::Mutex<Vec<String>>>,
     _guard: tracing::subscriber::DefaultGuard,
@@ -246,6 +246,9 @@ impl Warnings {
         let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
         let layer = WarnLayer(Arc::clone(&messages));
         let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        // The interest of a callsite is cached for the process. A test on
+        // another thread with no subscriber can cache it as "never".
+        tracing::callsite::rebuild_interest_cache();
         Self {
             messages,
             _guard: guard,

@@ -277,14 +277,14 @@ const DRAIN_POLL: Duration = Duration::from_millis(20);
 /// The warning for a fleet with ownership and no replica.
 #[cfg(feature = "sqlite")]
 pub(crate) const UNREPLICATED_WARNING: &str = "fleet ownership is on, but nothing replicates \
-     this fleet: a standby that takes over opens empty databases. Connect the fleet to \
+     this fleet: a standby that becomes the owner opens empty databases. Connect the fleet to \
      [replication] with autumn_web::fleet::install_replication at boot";
 
 /// The warning for a fleet with ownership and no replica.
 #[cfg(not(feature = "sqlite"))]
 pub(crate) const UNREPLICATED_WARNING: &str = "fleet ownership is on, but nothing replicates \
-     this fleet: a standby that takes over opens empty databases. Fleet replication needs the \
-     sqlite feature";
+     this fleet: a standby that becomes the owner opens empty databases. Fleet replication needs \
+     the sqlite feature";
 
 /// How long a close waits for the workers of one database to stop. Workers
 /// of different databases stop together, so this also bounds a shutdown.
@@ -1302,9 +1302,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             .push(hooks);
     }
 
-    /// Logs [`UNREPLICATED_WARNING`] once for this fleet. Only when
-    /// `ownership` is on, nothing replicates the fleet, and the engine is not
-    /// in `Rebuild` mode. Returns `true` when this call logged it.
+    /// Logs [`UNREPLICATED_WARNING`] once for this fleet. It logs only when
+    /// `ownership` is on, no replica is installed, and the engine is not in
+    /// `Rebuild` mode. Returns `true` when this call logged it.
     pub(crate) fn warn_if_unreplicated(&self, ownership: bool) -> bool {
         if !ownership
             || self.inner.unreplicated_warned.load(Ordering::Acquire)
@@ -1320,6 +1320,12 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             "{UNREPLICATED_WARNING}"
         );
         true
+    }
+
+    /// Whether the fleet logged [`UNREPLICATED_WARNING`].
+    #[cfg(test)]
+    pub(crate) fn unreplicated_warned(&self) -> bool {
+        self.inner.unreplicated_warned.load(Ordering::Acquire)
     }
 
     fn hooks(&self) -> Vec<Arc<dyn FleetLifecycle<E>>> {
@@ -2091,8 +2097,8 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let path = self.path_of(&key);
         let name = key.name();
         check_contained(self.root(), &path)?;
-        // Core cannot see the fleet of a plugin at boot: warn at the first
-        // open instead, when the plugin installed no replica.
+        // Core cannot see the fleet of a plugin at boot. Thus the first open
+        // logs the warning when the plugin installed no replica.
         self.warn_if_unreplicated(self.inner.ownership.get().is_some());
         let mut existed = self.inner.engine.exists(&path);
         if !existed && restore {

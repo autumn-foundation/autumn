@@ -2062,7 +2062,9 @@ impl AppBuilder {
     ///
     /// Every role runs every startup hook. Do not start a loop here. Use
     /// [`background_task`](Self::background_task). The framework starts a
-    /// background task only on the roles that run its capability.
+    /// background task only on the roles that run its capability. One
+    /// exception: an engine plugin calls `fleet::install_replication` here,
+    /// and it starts the loop of the fleet replica.
     #[must_use]
     pub fn on_startup<F, Fut>(mut self, hook: F) -> Self
     where
@@ -5023,8 +5025,9 @@ impl AppBuilder {
                         tracing::warn!("{e}");
                     }
                     // Each fleet (ADR 0019 §5) ships its databases next to the
-                    // control database, through the same destination. Before the
-                    // startup hooks: an engine plugin installs from there.
+                    // control database, through the same destination. Core puts
+                    // the source in the state before the startup hooks run. An
+                    // engine plugin hook installs from it.
                     #[cfg(feature = "sqlite")]
                     crate::fleet::ReplicaSource::from_runtime(
                         &runtime,

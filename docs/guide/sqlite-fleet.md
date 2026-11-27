@@ -1087,7 +1087,7 @@ errors.
   Give it to `FleetOwnership::new`, then call `DatabaseFleet::start_ownership`
   and `DatabaseFleet::spawn_ownership` before the first request.
 - **Replication.** Call `autumn_web::fleet::install_replication` before the
-  first request too. Without it, a standby that takes over opens empty
+  first request too. Without it, a standby that becomes the owner opens empty
   databases. See [Shipping a plugin engine](#shipping-a-plugin-engine).
 
 ### Sidecar engines
@@ -1146,8 +1146,8 @@ It is the same code core uses for the `SQLite` fleet of `[database.fleet]`:
 - With `[replication]` off it installs nothing and returns
   `ReplicationInstall::NoReplication`.
 - One replica root holds one fleet. A second fleet gets
-  `InstallReplicationError::RootInUse`: two fleets with one tenant id would
-  write the same keys.
+  `InstallReplicationError::RootInUse`. Two fleets with one tenant id write
+  the same keys.
 - `InstallReplicationError::Thread` leaves a replica with no loop. Stop the
   boot.
 - A one-off task (`autumn task`) builds no `[replication]`. There the
@@ -1162,7 +1162,7 @@ keeps the tombstones on the `SQLite` control database. `FleetStats` and the
 `FleetReplication` and call `fleet.install_replication` instead.
 
 A fleet with ownership and no replica logs one warning: a standby that
-takes over opens empty databases. The installer logs it at boot. A fleet
+becomes the owner opens empty databases. The installer logs it at boot. A fleet
 whose plugin never calls the installer logs it at its first open. A
 `Rebuild` engine has no replica, and logs no warning.
 

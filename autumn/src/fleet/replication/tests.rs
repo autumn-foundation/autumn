@@ -1,6 +1,7 @@
 //! Tests of the boot-time installer, on the test file engine.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::{InstallReplicationError, ReplicationInstall, install_replication, replicated_state};
@@ -8,7 +9,8 @@ use crate::AppState;
 use crate::config::{DatabaseFleetConfig, FleetOwnershipConfig};
 use crate::db::fleet::test_engine::{TextEngine, Warnings};
 use crate::db::fleet::{DatabaseFleet, UNREPLICATED_WARNING};
-use crate::db::fleet_replication::FLEET_REPLICATION_INDICATOR;
+use crate::db::fleet_ownership::{FleetOwnership, MemoryOwnership, OwnerId, SlotRange};
+use crate::db::fleet_replication::{FLEET_REPLICATION_INDICATOR, FleetReplication};
 use crate::fleet_layout::FleetMode;
 
 const HOUR: Duration = Duration::from_hours(1);
@@ -137,6 +139,10 @@ async fn a_second_fleet_on_one_replica_root_is_refused() {
         "{error}"
     );
     assert!(second.replication().is_none(), "nothing installed");
+    assert!(
+        first.replication().is_some(),
+        "the first fleet keeps its replica"
+    );
     stop(&first);
 }
 
@@ -194,6 +200,7 @@ async fn ownership_and_no_replica_logs_one_warning_at_boot() {
         let _ = install_replication(&state, &fleet, &config).unwrap();
     }
 
+    assert!(fleet.unreplicated_warned());
     assert_eq!(warnings.matching(UNREPLICATED_WARNING), 1, "{warnings:?}");
 }
 
@@ -210,6 +217,8 @@ async fn no_ownership_or_a_rebuild_engine_logs_no_warning() {
     let _ = install_replication(&state, &plain, &plain_config).unwrap();
     let _ = install_replication(&state, &rebuild, &rebuild_config).unwrap();
 
+    assert!(!plain.unreplicated_warned());
+    assert!(!rebuild.unreplicated_warned());
     assert_eq!(warnings.matching(UNREPLICATED_WARNING), 0, "{warnings:?}");
 }
 
@@ -222,7 +231,63 @@ async fn an_installed_replica_logs_no_warning() {
 
     let warnings = Warnings::capture();
     let _ = install_replication(&state, &fleet, &config).unwrap();
+    let ownership = Arc::new(
+        FleetOwnership::new(
+            Arc::new(MemoryOwnership::new(Arc::new(crate::time::SystemClock))),
+            OwnerId::new("host-a").unwrap(),
+            vec![SlotRange::ALL],
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    fleet.start_ownership(ownership).await.unwrap();
+    let key = fleet.key_for("acme").unwrap();
+    drop(fleet.open(&key).await.unwrap());
 
+    assert!(!fleet.unreplicated_warned());
     assert_eq!(warnings.matching(UNREPLICATED_WARNING), 0, "{warnings:?}");
+    fleet.close_all().await;
     stop(&fleet);
+}
+
+#[tokio::test]
+async fn a_fleet_replicated_by_hand_is_refused_and_leaves_the_source_free() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = replicated_state(tmp.path()).await;
+    let by_hand_config = config(&tmp.path().join("by-hand"));
+    let by_hand = fleet(&by_hand_config, Some(HOUR));
+    let replicas: Arc<dyn crate::replication::ReplicaDestination> = Arc::new(
+        crate::replication::FileDestination::new(tmp.path().join("own-replicas")).unwrap(),
+    );
+    let own = Arc::new(FleetReplication::new(
+        replicas,
+        crate::replication::ReplicationSettings {
+            database_path: std::path::PathBuf::new(),
+            root: "app/own".to_owned(),
+            sync_interval: Duration::from_secs(1),
+            snapshot_interval: HOUR,
+            max_wal_bytes: 4 * 1024 * 1024,
+            retention: HOUR,
+            verify_interval: None,
+        },
+        Duration::from_secs(30),
+        false,
+        Arc::new(crate::time::SystemClock),
+    ));
+    assert!(by_hand.install_replication(own).is_ok());
+
+    let error = install_replication(&state, &by_hand, &by_hand_config).unwrap_err();
+
+    assert!(
+        matches!(error, InstallReplicationError::AlreadyReplicates),
+        "{error}"
+    );
+    let next_config = config(&tmp.path().join("next"));
+    let next = fleet(&next_config, Some(HOUR));
+    assert_eq!(
+        install_replication(&state, &next, &next_config).unwrap(),
+        ReplicationInstall::Installed,
+        "the source is still free"
+    );
+    stop(&next);
 }

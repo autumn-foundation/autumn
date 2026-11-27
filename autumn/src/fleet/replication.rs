@@ -1,16 +1,7 @@
 //! The boot-time replication of a fleet, for every engine.
 //!
 //! Core builds the `[replication]` destination at boot, before the startup
-//! hooks run. [`install_replication`] connects one fleet to it: the
-//! `SQLite` fleet of `[database.fleet]`, or the fleet of an engine plugin.
-//! An engine plugin calls it from its `on_startup` hook, after
-//! `DatabaseFleet::with_engine` and before the first open:
-//!
-//! ```rust,ignore
-//! let fleet = DatabaseFleet::with_engine(&config, DuckDbEngine::new())?;
-//! autumn_web::fleet::install_replication(&state, &fleet, &config)?;
-//! state.insert_extension(fleet);
-//! ```
+//! hooks run. [`install_replication`] connects one fleet to it.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -26,7 +17,6 @@ use crate::replication::{ReplicaDestination, ReplicationSettings};
 /// What [`install_replication`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-#[must_use]
 pub enum ReplicationInstall {
     /// The fleet ships to the `[replication]` destination.
     Installed,
@@ -42,24 +32,23 @@ pub enum InstallReplicationError {
     #[error("the fleet already replicates")]
     AlreadyReplicates,
     /// Another fleet ships to this replica root. Two fleets with one tenant
-    /// id would write the same keys.
+    /// id write the same keys.
     #[error(
-        "another fleet ({other}) already ships to the replica root {root:?}; one replica root \
-         holds one fleet"
+        "another fleet ({claimed_by}) already ships to the replica root {root:?}; one replica \
+         root holds one fleet"
     )]
     RootInUse {
         /// The replica key root.
         root: String,
         /// The fleet root of the fleet that ships there.
-        other: String,
+        claimed_by: String,
     },
     /// The OS did not start the replication thread. Stop the boot.
-    #[error("could not start the fleet replication thread: {0}")]
+    #[error("could not start the fleet replication thread")]
     Thread(#[source] std::io::Error),
 }
 
-/// What `[replication]` built at boot, for the fleets of the app. Core puts
-/// it in the app state.
+/// Holds what `[replication]` built at boot. Core puts it in the app state.
 pub struct ReplicaSource {
     destination: Arc<dyn ReplicaDestination>,
     settings: ReplicationSettings,
@@ -93,6 +82,15 @@ impl ReplicaSource {
 
 /// Connects `fleet` to the `[replication]` destination of the app.
 ///
+/// An engine plugin calls it from its `on_startup` hook, after
+/// `DatabaseFleet::with_engine` and before the first open:
+///
+/// ```rust,ignore
+/// let fleet = DatabaseFleet::with_engine(&config, DuckDbEngine::new())?;
+/// autumn_web::fleet::install_replication(&state, &fleet, &config)?;
+/// state.insert_extension(fleet);
+/// ```
+///
 /// It builds the [`FleetReplication`] from `[replication]` and from
 /// `config` (`restore_missing`, `replica_retention_after_delete`,
 /// `restore_check_sample`, `replication_workers`). It keeps the tombstones
@@ -104,8 +102,9 @@ impl ReplicaSource {
 /// was built from.
 ///
 /// With `[replication]` off it installs nothing. When `config` turns on
-/// ownership, it then logs one warning: a standby that takes over opens
-/// empty databases. A one-off task (`autumn task`) builds no
+/// ownership, it then logs one warning: a standby that becomes the owner
+/// opens empty databases. When `restore_missing` is on, it also logs a
+/// warning. A one-off task (`autumn task`) builds no
 /// `[replication]`, so there it returns [`ReplicationInstall::NoReplication`].
 ///
 /// Shutdown stays with the plugin: close the fleet (`close_all`) in an
@@ -134,7 +133,8 @@ pub fn install_replication<E: FleetEngine>(
         fleet.warn_if_unreplicated(config.ownership.is_some());
         return Ok(ReplicationInstall::NoReplication);
     };
-    // Held to the end: two installs at once cannot both claim the source.
+    // Keep the lock to the end. Then two installs at the same time cannot
+    // both claim the source.
     let mut claimed = source
         .claimed
         .lock()
@@ -147,7 +147,7 @@ pub fn install_replication<E: FleetEngine>(
     if let Some(other) = claimed.as_ref() {
         return Err(InstallReplicationError::RootInUse {
             root: source.settings.root.clone(),
-            other: other.display().to_string(),
+            claimed_by: other.display().to_string(),
         });
     }
     if config.restore_missing && config.ownership.is_none() {
@@ -183,7 +183,7 @@ pub fn install_replication<E: FleetEngine>(
     Ok(ReplicationInstall::Installed)
 }
 
-/// The replication of one fleet, from the source and the fleet section.
+/// Builds the replication of one fleet from the source and the section.
 fn build(
     state: &AppState,
     source: &ReplicaSource,
