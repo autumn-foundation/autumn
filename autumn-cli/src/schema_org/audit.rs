@@ -324,7 +324,7 @@ fn audit_node(object: &Map<String, Value>, path: &str, ctx: &mut Ctx<'_>, top: b
     let names = type_names(object);
     if names.is_empty() {
         // A reference to a node elsewhere (`{"@id": …}`) needs no type.
-        if object.keys().all(|k| k == "@id" || k == "@context") {
+        if object.contains_key("@id") && object.keys().all(|k| k == "@id" || k == "@context") {
             return;
         }
         if top {
@@ -1024,6 +1024,27 @@ mod tests {
             ),
         );
         assert!(report.findings.is_empty(), "{:?}", rules(&report));
+    }
+
+    #[test]
+    fn a_node_with_neither_type_nor_id_is_reported() {
+        let report = audit_html("page", &page(r#"{"@context":"https://schema.org"}"#));
+        assert_eq!(
+            rules(&report),
+            vec![("missing-type", Severity::Error, "$".to_owned())]
+        );
+        let report = audit_html(
+            "page",
+            &page(r#"{"@context":"https://schema.org","@type":"CreativeWork","author":{}}"#),
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == "missing-type" && f.path == "$.author"),
+            "{:?}",
+            rules(&report)
+        );
     }
 
     #[test]
