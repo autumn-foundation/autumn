@@ -223,6 +223,8 @@ fn the_guide_says_a_delete_on_acknowledgement_loses_a_row() {
             "`Covered`",
             "`Pending`",
             "`Stale`",
+            "unix nanoseconds",
+            "do not round it",
         ],
     );
 }

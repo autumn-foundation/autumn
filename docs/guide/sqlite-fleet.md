@@ -1079,7 +1079,7 @@ CREATE TABLE birds (
   version       INTEGER NOT NULL,
   data          BLOB,
   moved_to      TEXT,     -- the destination of a moved copy
-  arrived_at    INTEGER,  -- Unix milliseconds, from the destination
+  arrived_at    INTEGER,  -- Unix nanoseconds, from the destination
   arrived_epoch INTEGER,  -- FencingToken::as_i64(), NULL without ownership
   gone          INTEGER NOT NULL DEFAULT 0  -- 1: a tombstone
 );
@@ -1124,6 +1124,9 @@ Notes:
   changes nothing.
 - `coverage` assumes a clock that does not step back. Keep the host clock in
   sync without steps.
+- Keep the arrival time at full precision (nanoseconds). Do not round it. A
+  time rounded down can be `Covered` before the arrival ships. A time
+  rounded up can miss `Stale` for an arrival to an earlier file.
 - A tombstone stops a late delivery of an older version. Drop it only when
   no such delivery can come. For example, keep it for longer than the
   longest move.

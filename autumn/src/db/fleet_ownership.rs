@@ -3549,7 +3549,7 @@ mod tests {
                  version INTEGER NOT NULL, \
                  moved INTEGER NOT NULL DEFAULT 0, \
                  gone INTEGER NOT NULL DEFAULT 0, \
-                 arrived_ms INTEGER, \
+                 arrived_ns INTEGER, \
                  arrived_epoch INTEGER)";
 
             #[derive(diesel::QueryableByName, Debug, Clone)]
@@ -3563,14 +3563,15 @@ mod tests {
                 #[diesel(sql_type = BigInt)]
                 gone: i64,
                 #[diesel(sql_type = Nullable<BigInt>)]
-                arrived_ms: Option<i64>,
+                arrived_ns: Option<i64>,
                 #[diesel(sql_type = Nullable<BigInt>)]
                 arrived_epoch: Option<i64>,
             }
 
             impl Bird {
                 fn arrival(&self) -> Option<Arrival> {
-                    let at = crate::time::Timestamp::from_millisecond(self.arrived_ms?).ok()?;
+                    let ns = i128::from(self.arrived_ns?);
+                    let at = crate::time::Timestamp::from_nanosecond(ns).ok()?;
                     let epoch = match self.arrived_epoch {
                         Some(epoch) => Some(FencingToken::try_from(epoch).ok()?),
                         None => None,
@@ -3591,7 +3592,7 @@ mod tests {
                 let mut conn = db.pool().get().await.unwrap();
                 diesel_async::RunQueryDsl::load::<Bird>(
                     diesel::sql_query(
-                        "SELECT id, version, moved, gone, arrived_ms, arrived_epoch \
+                        "SELECT id, version, moved, gone, arrived_ns, arrived_epoch \
                          FROM birds ORDER BY id",
                     ),
                     &mut *conn,
@@ -3698,9 +3699,10 @@ mod tests {
                 exec(
                     src,
                     &format!(
-                        "UPDATE birds SET moved = 1, arrived_ms = {}, arrived_epoch = {epoch} \
+                        "UPDATE birds SET moved = 1, arrived_ns = {}, arrived_epoch = {epoch} \
                          WHERE id = '{id}' AND version = {version} AND gone = 0",
-                        arrival.at.as_millisecond()
+                        // Full precision: a rounded time can look covered.
+                        i64::try_from(arrival.at.as_nanosecond()).unwrap()
                     ),
                 )
                 .await

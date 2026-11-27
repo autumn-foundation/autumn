@@ -4644,6 +4644,39 @@ mod tests {
         assert!(!plain.covers(through, Some(token(1))));
     }
 
+    /// The bound has nanosecond precision. An arrival time kept in
+    /// milliseconds is wrong both ways: rounded down, an arrival that is not
+    /// shipped looks `Covered`; rounded up, an arrival to an earlier file
+    /// misses `Stale`.
+    #[test]
+    fn a_rounded_arrival_time_can_give_the_wrong_answer() {
+        let micros = jiff::SignedDuration::from_micros;
+        let ms = Timestamp::from_second(1_700_000_000).unwrap();
+        let round_down = |t: Timestamp| Timestamp::from_millisecond(t.as_millisecond()).unwrap();
+        let round_up = |t: Timestamp| round_down(t) + jiff::SignedDuration::from_millis(1);
+
+        let bound = ReplicaBound::new(ms - micros(5_000), ms + micros(500), Some(token(1)));
+        let not_shipped = ms + micros(900);
+        assert_eq!(
+            bound.coverage(not_shipped, Some(token(1))),
+            Coverage::Pending
+        );
+        assert_eq!(
+            bound.coverage(round_down(not_shipped), Some(token(1))),
+            Coverage::Covered,
+            "rounded down, it looks shipped"
+        );
+
+        let file = ReplicaBound::new(ms + micros(500), ms + micros(5_000), Some(token(1)));
+        let earlier_file = ms + micros(400);
+        assert_eq!(file.coverage(earlier_file, Some(token(1))), Coverage::Stale);
+        assert_eq!(
+            file.coverage(round_up(earlier_file), Some(token(1))),
+            Coverage::Covered,
+            "rounded up, it looks like this file"
+        );
+    }
+
     #[tokio::test]
     async fn replica_bound_gives_the_bound_with_no_epoch_without_ownership() {
         let tmp = tempfile::tempdir().unwrap();
