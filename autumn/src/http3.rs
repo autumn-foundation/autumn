@@ -1,10 +1,13 @@
 //! HTTP/3 over QUIC, beside the `[server.tls]` listener.
 //!
-//! [`Http3Listener`] binds a UDP `quinn` endpoint and serves a
-//! [`tower::Service`] over `h3`. The app serves the same service as the TCP
-//! listener, so `TrustedProxiesLayer` and `MethodOverrideLayer` apply over h3
-//! too. [`AltSvcLayer`] adds the `Alt-Svc` header to TCP responses, so
-//! browsers know to try h3.
+//! (`lib.rs` puts an outer doc comment on `pub mod http3`. It merges with this
+//! block, so the links below are fully qualified.)
+//!
+//! [`Http3Listener`](crate::http3::Http3Listener) binds a UDP `quinn` endpoint
+//! and serves a [`tower::Service`] over `h3`. The app serves the same service
+//! as the TCP listener, so `TrustedProxiesLayer` and `MethodOverrideLayer`
+//! apply over h3 too. [`AltSvcLayer`](crate::http3::AltSvcLayer) adds the
+//! `Alt-Svc` header to TCP responses, so browsers know to try h3.
 //!
 //! Adapted from `axum-h3` 0.0.6 (MIT license; its notice is at the end of
 //! this file). Changes:
