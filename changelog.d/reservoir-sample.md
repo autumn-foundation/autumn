@@ -6,5 +6,6 @@
   same `k / n` chance of being kept, and `offer` says whether it was, so you
   can capture something expensive only for the sampled ones. Reservoirs of one
   capacity `merge` into a uniform sample of both streams, weighted by what
-  each side saw, so per-pod samples add up to a fair fleet sample.
-  `with_seed` replays a stream to the same sample. No feature, no dependency.
+  each side saw, so per-pod samples add up to a fair fleet sample. `with_seed`
+  replays a stream to the same sample. Behind the opt-in `sketches` feature;
+  no new dependency.

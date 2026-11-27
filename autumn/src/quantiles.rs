@@ -44,6 +44,8 @@
 //! let p99 = latency.quantile_duration(0.99).unwrap();
 //! assert!(p99 >= Duration::from_millis(980) && p99 <= Duration::from_millis(1_000));
 //! ```
+//!
+//! Needs the opt-in `sketches` feature.
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate".

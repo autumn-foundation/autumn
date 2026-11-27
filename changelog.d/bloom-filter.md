@@ -9,4 +9,4 @@
   the rate at the current fill so you can rotate before it drifts, and
   `estimated_len` reads back about how many keys went in. Filters of one shape
   `merge` into the union, and `to_bytes`/`from_bytes` ship them between
-  processes. No feature, no dependency.
+  processes. Behind the opt-in `sketches` feature; no new dependency.

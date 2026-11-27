@@ -7,5 +7,5 @@
   of one accuracy `merge` exactly, so per-pod sketches add up to the fleet's
   percentiles. Past `max_buckets` the lowest buckets fold first; a quantile
   ranked in the folded bucket loses its guarantee, and `is_collapsed()` says
-  when that has happened. `observe_duration` / `quantile_duration` read and write
-  `Duration`s. No feature, no dependency.
+  when that has happened. `observe_duration` / `quantile_duration` read and
+  write `Duration`s. Behind the opt-in `sketches` feature; no new dependency.
