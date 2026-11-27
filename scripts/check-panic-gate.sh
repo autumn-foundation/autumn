@@ -126,12 +126,12 @@ REQUEST_PATH_MODULES=(
   autumn/src/middleware/criticality.rs:default
   autumn/src/admission.rs:default
   autumn/src/bulkhead.rs:default
-  autumn/src/heavy_hitters.rs:default
-  autumn/src/bloom.rs:default
-  autumn/src/distinct.rs:default
-  autumn/src/minhash.rs:default
-  autumn/src/quantiles.rs:default
-  autumn/src/reservoir.rs:default
+  autumn/src/heavy_hitters.rs:sketches
+  autumn/src/bloom.rs:sketches
+  autumn/src/distinct.rs:sketches
+  autumn/src/minhash.rs:sketches
+  autumn/src/quantiles.rs:sketches
+  autumn/src/reservoir.rs:sketches
   autumn/src/middleware/short_circuit.rs:default
   autumn/src/capsule/capture.rs:reporting
   autumn/src/capsule/wire.rs:db

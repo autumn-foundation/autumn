@@ -51,6 +51,8 @@
 //! assert!(!deliveries.insert("evt_1")); // a redelivery: skip it
 //! assert!(deliveries.contains("evt_2"));
 //! ```
+//!
+//! Needs the opt-in `sketches` feature.
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate".

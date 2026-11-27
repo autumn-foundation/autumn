@@ -39,6 +39,8 @@
 //! assert_eq!(top[0].key, "acme");
 //! assert_eq!(top[0].count, 3);
 //! ```
+//!
+//! Needs the opt-in `sketches` feature.
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate".

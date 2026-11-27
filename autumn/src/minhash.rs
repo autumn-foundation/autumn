@@ -45,6 +45,8 @@
 //! assert!(removed.jaccard(&incoming).unwrap() > 0.8); // the same spam
 //! assert!(removed.jaccard(&unrelated).unwrap() < 0.2);
 //! ```
+//!
+//! Needs the opt-in `sketches` feature.
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate".

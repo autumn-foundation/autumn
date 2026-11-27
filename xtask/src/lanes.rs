@@ -52,11 +52,12 @@ pub const CLIPPY_WORKSPACE: &str = "cargo clippy -j 2 --workspace --all-targets 
 ///   on purpose; without the feature its allow and any read next to it are
 ///   never linted. `acme` also brings in the whole ACME tree.
 /// - `sla` (#1826): the SLA engine carries both gates.
+/// - `sketches`: the six stream-sketch modules carry the panic gate.
 /// - `markdown`, `i18n`, `presence`: gated modules of their own.
 ///
 /// `--all-features` is not usable: `managed-pg-bundled` downloads Postgres in
 /// its build script.
-pub const CLIPPY_GATED: &str = r#"cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,i18n,presence,sla" --all-targets -- -D warnings"#;
+pub const CLIPPY_GATED: &str = r#"cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,i18n,presence,sla,sketches" --all-targets -- -D warnings"#;
 
 /// Clippy over autumn-web's plugin sandbox (#1609).
 ///

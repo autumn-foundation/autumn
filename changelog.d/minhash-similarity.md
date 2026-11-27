@@ -6,4 +6,5 @@
   sketches a text by its word shingles, so "is this post a reworded copy of
   one we removed?" is one comparison. Sketches with the same slot count
   `merge` into the exact sketch of the union, and `to_bytes`/`from_bytes`
-  store one per row or ship it between processes. No feature, no dependency.
+  store one per row or ship it between processes. Behind the opt-in `sketches`
+  feature; no new dependency.

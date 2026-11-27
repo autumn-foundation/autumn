@@ -199,6 +199,7 @@ pub mod feed;
 pub mod format;
 pub mod health;
 pub(crate) mod health_cache;
+#[cfg(feature = "sketches")]
 pub mod heavy_hitters;
 pub mod hedge;
 #[cfg(feature = "db")]
@@ -399,13 +400,18 @@ pub mod sharding;
 #[cfg(feature = "db")]
 pub(crate) mod counter_cache;
 
+#[cfg(feature = "sketches")]
 pub mod bloom;
 /// Maintained derived read models: `#[derivation]` (#1769).
 #[cfg(feature = "db")]
 pub mod derivation;
+#[cfg(feature = "sketches")]
 pub mod distinct;
+#[cfg(feature = "sketches")]
 pub mod minhash;
+#[cfg(feature = "sketches")]
 pub mod quantiles;
+#[cfg(feature = "sketches")]
 pub mod reservoir;
 
 #[cfg(feature = "db")]

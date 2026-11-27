@@ -66,6 +66,11 @@ presence = ["ws"]
 # The hub half additionally needs `presence`; the CRDT, the marker and the
 # offline-sync resolver compile without it.
 collab = []
+# Fixed-memory stream sketches: `bloom`, `distinct` (HyperLogLog),
+# `heavy_hitters`, `minhash`, `quantiles` (DDSketch) and `reservoir`. Opt-in:
+# no framework code uses them, so an app that does not ask for them does not
+# compile them. Zero new dependencies.
+sketches = []
 # Calendar-aware SLA obligations (issue #1826). Adds `autumn_web::sla` and
 # `#[obligation]`. Zero new dependencies.
 sla = []
@@ -702,6 +707,9 @@ features = [
   # SLA obligations (#1826). Zero new dependencies. Without it, the `sla`
   # module and `#[obligation]` are missing from the published docs.
   "sla",
+  # Stream sketches. Zero new dependencies. Without it, the six sketch
+  # modules are missing from the published docs.
+  "sketches",
   # The compile gates (#2795). Default-on, but named here so the published
   # docs keep every module if docs.rs ever turns default features off.
   "ledger", "experiments", "feature-flags", "idempotency", "custom-domains",
