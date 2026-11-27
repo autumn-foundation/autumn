@@ -61,6 +61,7 @@ mod schema_dev_url;
 mod schema_migrate;
 #[cfg(feature = "sqlite")]
 mod schema_migrate_sqlite;
+mod schema_org_cli;
 mod schema_pull;
 #[cfg(feature = "sqlite")]
 mod schema_pull_sqlite;

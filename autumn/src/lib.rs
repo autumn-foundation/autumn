@@ -699,6 +699,9 @@ pub mod gdpr;
 pub mod graph;
 pub mod job;
 pub mod job_tracking;
+/// Schema.org structured data: [`json_ld::JsonLd`] nodes rendered as
+/// escaped `<script type="application/ld+json">` blocks.
+pub mod json_ld;
 /// Safe, method-aware link helpers: [`links::link_to`] anchors and
 /// [`links::button_to`] CSRF-protected action buttons.
 pub mod links;

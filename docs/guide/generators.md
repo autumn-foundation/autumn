@@ -1988,6 +1988,24 @@ autumn generate scaffold Bookmark url:String title:String tag:String alive:bool 
 | `src/schema.rs`                       | Diesel `table!` blocks                                                                     |
 | `tests/<name>.rs`                     | Standard `cargo test` integration test                                                     |
 
+### Schema.org JSON-LD (`--schema-org`)
+
+`--schema-org <Type>` makes the resource a schema.org type. The show page then
+renders a `<script type="application/ld+json">` block from the columns named
+after the type's properties: `date_published` is `datePublished`, and
+`offers_price` is `offers.price`. With no fields given, the type's required
+and recommended properties become the fields:
+
+```bash
+autumn generate scaffold Recipe --schema-org Recipe
+autumn generate scaffold Mug name:String cost:money sku:String \
+  --schema-org Product --schema-org-map cost=offers.price
+```
+
+`autumn schema-org show <Type>` lists a type's properties and the fields it
+seeds. Not supported with `--api`. See
+[Schema.org structured data](schema-org.md).
+
 ### Shipped example
 
 The [`examples/bookmarks`](../../examples/bookmarks) app is regenerated from
