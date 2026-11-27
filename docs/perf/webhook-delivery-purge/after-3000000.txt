@@ -1,0 +1,80 @@
+== fixture: 3000000 logs; workload: 4166 deliveries, then one purge (cutoff 1760317200000)
+pgbench: setting random seed to 3742
+number of transactions actually processed: 4166/4166
+number of failed transactions: 0 (0.000%)
+ - number of failed transactions: 0 (0.000%)
+ - number of failed transactions: 0 (0.000%)
+DELETE 4067
+== workload totals (pg_stat_statements, this database)
+ calls | buffers | temp_blks_written | wal_bytes | lsn_wal_bytes | lsn_wal_bytes_purge 
+-------+---------+-------------------+-----------+---------------+---------------------
+ 38155 |  203364 |                 0 |  12077019 |      12511040 |             4316656
+
+CREATE VIEW
+== top 10 by buffers
+                               statement                                | calls | buffers | pct_buffers | pct_calls |  hit  | read |  rows  | temp_blks_written | wal_bytes | wal_fpi 
+------------------------------------------------------------------------+-------+---------+-------------+-----------+-------+------+--------+-------------------+-----------+---------
+ INSERT INTO autumn_webhook_deliveries (id, subscription_id, topic, pay |  8494 |   91276 |        44.9 |      22.3 | 91228 |   48 |   8494 |                 0 |   7675848 |      56
+ SELECT id, subscription_id, topic, payload, request_headers, response_ | 12741 |   46989 |        23.1 |      33.4 | 46987 |    2 |   8575 |                 0 |     46391 |       0
+ SELECT id, target_url, event_topics, secret, status, consecutive_failu |  4328 |   21640 |        10.6 |      11.3 | 21640 |    0 |   4328 |                 0 |      4680 |       0
+ SELECT id, target_url, event_topics, secret, status, consecutive_failu |  4166 |   20833 |        10.2 |      10.9 | 20828 |    5 | 824261 |                 0 |         0 |       0
+ UPDATE autumn_webhook_subscriptions SET consecutive_failures = $2, sta |  8332 |   16854 |         8.3 |      21.8 | 16853 |    1 |     85 |                 0 |     32319 |       4
+ DELETE FROM autumn_webhook_deliveries WHERE logged_at < $1 AND NOT is_ |     1 |    5197 |         2.6 |       0.0 |  5197 |    0 |   4067 |                 0 |   4295386 |     523
+ UPDATE autumn_webhook_subscriptions SET consecutive_failures = consecu |    81 |     575 |         0.3 |       0.2 |   575 |    0 |     81 |                 0 |     22395 |       2
+
+== top 10 by calls
+                               statement                                | calls | pct_calls | buffers 
+------------------------------------------------------------------------+-------+-----------+---------
+ SELECT id, subscription_id, topic, payload, request_headers, response_ | 12741 |      33.4 |   46989
+ INSERT INTO autumn_webhook_deliveries (id, subscription_id, topic, pay |  8494 |      22.3 |   91276
+ UPDATE autumn_webhook_subscriptions SET consecutive_failures = $2, sta |  8332 |      21.8 |   16854
+ SELECT id, target_url, event_topics, secret, status, consecutive_failu |  4328 |      11.3 |   21640
+ SELECT id, target_url, event_topics, secret, status, consecutive_failu |  4166 |      10.9 |   20833
+ UPDATE autumn_webhook_subscriptions SET consecutive_failures = consecu |    81 |       0.2 |     575
+ SELECT statement, calls, buffers, round($1 * buffers / sum(buffers) OV |     1 |       0.0 |       4
+ DELETE FROM autumn_webhook_deliveries WHERE logged_at < $1 AND NOT is_ |     1 |       0.0 |    5197
+
+== top 10 by WAL bytes
+                               statement                                | calls | wal_bytes | pct_wal | wal_fpi 
+------------------------------------------------------------------------+-------+-----------+---------+---------
+ INSERT INTO autumn_webhook_deliveries (id, subscription_id, topic, pay |  8494 |   7675848 |    63.6 |      56
+ DELETE FROM autumn_webhook_deliveries WHERE logged_at < $1 AND NOT is_ |     1 |   4295386 |    35.6 |     523
+ SELECT id, subscription_id, topic, payload, request_headers, response_ | 12741 |     46391 |     0.4 |       0
+ UPDATE autumn_webhook_subscriptions SET consecutive_failures = $2, sta |  8332 |     32319 |     0.3 |       4
+ UPDATE autumn_webhook_subscriptions SET consecutive_failures = consecu |    81 |     22395 |     0.2 |       2
+ SELECT id, target_url, event_topics, secret, status, consecutive_failu |  4328 |      4680 |     0.0 |       0
+ SELECT id, target_url, event_topics, secret, status, consecutive_failu |  4166 |         0 |     0.0 |       0
+ SELECT statement, calls, round($1 * calls / sum(calls) OVER (), $2) AS |     1 |         0 |     0.0 |       0
+ SELECT statement, calls, buffers, round($1 * buffers / sum(buffers) OV |     1 |         0 |     0.0 |       0
+
+== statements with temp blocks
+ statement | temp_blks_read | temp_blks_written 
+-----------+----------------+-------------------
+
+== pg_stat_user_tables
+           relname            | seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_ins | n_tup_upd | n_tup_hot_upd | n_tup_del | n_live_tup | n_dead_tup 
+------------------------------+----------+--------------+----------+---------------+-----------+-----------+---------------+-----------+------------+------------
+ autumn_webhook_subscriptions |     8575 |      1715000 |     8332 |          8332 |         0 |       166 |           162 |         0 |          0 |         12
+ autumn_webhook_deliveries    |        0 |            0 |    21236 |         16970 |      4166 |      4328 |             0 |      4067 |         99 |       8395
+
+== pg_statio_user_tables
+           relname            | heap_blks | idx_blks | toast_blks 
+------------------------------+-----------+----------+------------
+ autumn_webhook_deliveries    |     41940 |   101528 |          0
+ autumn_webhook_subscriptions |     51559 |     8341 |          0
+
+== pg_stat_user_indexes
+              indexrelname               | idx_scan | idx_tup_read |  size   | pages 
+-----------------------------------------+----------+--------------+---------+-------
+ autumn_webhook_deliveries_pkey          |    21235 |        13065 | 141 MB  | 18059
+ autumn_webhook_subscriptions_pkey       |     8332 |         8336 | 16 kB   |     2
+ idx_autumn_webhook_deliveries_delivered |        1 |         4067 | 113 MB  | 14425
+ idx_autumn_webhook_deliveries_dlq       |        0 |            0 | 1200 kB |   150
+
+== relation sizes
+  heap   | heap_pages |  total  
+---------+------------+---------
+ 2944 MB |     376831 | 3200 MB
+
+== end state (rows left, md5 of the md5 of every row in id order)
+3000099|db3ae32df179eb1b1d56bd29f284d0ca

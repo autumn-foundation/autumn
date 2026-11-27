@@ -474,4 +474,89 @@ mod docker_webhook_store {
                 .any(|log| log.id == "pg-log-49")
         );
     }
+
+    #[derive(diesel::QueryableByName)]
+    struct IndexValid {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        valid: bool,
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct PlanLine {
+        #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+        line: String,
+    }
+
+    /// Tables made before `idx_autumn_webhook_deliveries_delivered` existed
+    /// get the index from `ensure_schema`, built in the background (it must
+    /// not delay boot), and the purge's predicate matches the index's.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_sql_webhook_store_ensure_schema_adds_delivered_index_to_existing_tables() {
+        use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
+        use scoped_futures::ScopedFutureExt as _;
+
+        let pool = autumn_web::test::TestDb::shared().await.pool();
+        let store = SqlOutboundWebhookStore::new(pool.clone());
+        store.ensure_schema().await.unwrap();
+        let mut conn = pool.get().await.unwrap();
+        diesel::sql_query("DROP INDEX IF EXISTS idx_autumn_webhook_deliveries_delivered")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        store.ensure_schema().await.unwrap();
+
+        // A concurrent build is in the catalog with `indisvalid = false` first.
+        let mut valid = false;
+        for _ in 0..100 {
+            let rows = diesel::sql_query(
+                "SELECT i.indisvalid AS valid FROM pg_index i \
+                 JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE c.relname = 'idx_autumn_webhook_deliveries_delivered'",
+            )
+            .load::<IndexValid>(&mut *conn)
+            .await
+            .unwrap();
+            if rows.len() == 1 && rows[0].valid {
+                valid = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            valid,
+            "ensure_schema builds the delivered-logs index in the background"
+        );
+
+        // The plan of the purge's DELETE can use the index: its predicate
+        // implies the index's.
+        let plan = conn
+            .transaction::<_, diesel::result::Error, _>(|conn| {
+                async move {
+                    diesel::sql_query("SET LOCAL enable_seqscan = off")
+                        .execute(conn)
+                        .await?;
+                    diesel::sql_query(
+                        "EXPLAIN (COSTS OFF) DELETE FROM autumn_webhook_deliveries \
+                         WHERE logged_at < 1 AND NOT is_dlq \
+                         AND response_status BETWEEN 200 AND 299",
+                    )
+                    .load::<PlanLine>(conn)
+                    .await
+                }
+                .scope_boxed()
+            })
+            .await
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step
+                .line
+                .contains("idx_autumn_webhook_deliveries_delivered")),
+            "the purge must be able to read idx_autumn_webhook_deliveries_delivered: {:?}",
+            plan.iter()
+                .map(|step| step.line.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
 }

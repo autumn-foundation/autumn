@@ -1,0 +1,14 @@
+without the index:   ->  Seq Scan on autumn_webhook_deliveries
+with the index:      ->  Bitmap Heap Scan on autumn_webhook_deliveries
+        ->  Bitmap Index Scan on idx_autumn_webhook_deliveries_delivered
+deleted 12 bbd9a6bc124eb6d85afecdb129398f80 e_200_f_-5,e_200_f_0,e_200_f_998,e_200_f_999,e_204_f_-5,e_204_f_0,e_204_f_998,e_204_f_999,e_299_f_-5,e_299_f_0,e_299_f_998,e_299_f_999
+deleted 12 bbd9a6bc124eb6d85afecdb129398f80 e_200_f_-5,e_200_f_0,e_200_f_998,e_200_f_999,e_204_f_-5,e_204_f_0,e_204_f_998,e_204_f_999,e_299_f_-5,e_299_f_0,e_299_f_998,e_299_f_999
+PASS: identical deleted sets
+
+== workload end state, base vs index (run.sh: rows left, md5 of the md5 of every row in id order)
+100000 base:  100002|65eece20637b47b7dda4e24947e7245c
+100000 index: 100002|65eece20637b47b7dda4e24947e7245c
+1000000 base:  1000041|8293cffd397498abf98063b0e5c43799
+1000000 index: 1000041|8293cffd397498abf98063b0e5c43799
+3000000 base:  3000099|db3ae32df179eb1b1d56bd29f284d0ca
+3000000 index: 3000099|db3ae32df179eb1b1d56bd29f284d0ca

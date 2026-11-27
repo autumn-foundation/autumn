@@ -39,6 +39,6 @@ psql -X -v ON_ERROR_STOP=1 -v cutoff="$CUTOFF" -f "$WORK/purge.sql"
 psql -X -q -c 'SELECT pg_stat_force_next_flush()' >/dev/null
 psql -X -v lsn0="$LSN0" -v lsn1="$LSN1" -f "$HERE/report.sql"
 # Result identity: every log the purge left, in id order.
-echo "== end state (rows left, md5 of every row in id order)"
-psql -X -At -c "SELECT count(*), md5(string_agg(t::text, E'\\n' ORDER BY id)) \
+echo "== end state (rows left, md5 of the md5 of every row in id order)"
+psql -X -At -c "SELECT count(*), md5(string_agg(md5(t::text), '' ORDER BY id)) \
     FROM autumn_webhook_deliveries t"

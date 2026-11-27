@@ -68,6 +68,8 @@ To use another pool, build the store yourself: `OutboundWebhookPlugin::new(Arc::
 
 The tables are `autumn_webhook_subscriptions` and `autumn_webhook_deliveries`. The `secret` column holds each signing secret. Limit read access to it. Nothing deletes delivery logs for you: call `purge_deliveries_before(cutoff)` on a schedule. It deletes only delivered (2xx) logs: pending and retrying deliveries, DLQ logs, and logs of deliveries skipped for a disabled or failed subscription stay.
 
+The purge reads `idx_autumn_webhook_deliveries_delivered`, a partial index on `logged_at` of the delivered logs. `ensure_schema` creates it with new tables. For tables made before it existed, `ensure_schema` builds it in the background with `CREATE INDEX CONCURRENTLY`, which blocks no writes. If the app role cannot create indexes, run that statement before the deploy. Until the index exists, every purge reads the whole delivery log.
+
 ---
 
 ## 3. Stripe-Style Payload Signing

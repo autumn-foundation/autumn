@@ -1,0 +1,16 @@
+== CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_autumn_webhook_deliveries_delivered ON autumn_webhook_deliveries (logged_at) WHERE NOT is_dlq AND response_status BETWEEN 200 AND 299
+3000099 rows, heap 2944 MB
+build: 2475 ms (wall clock, for scale only)
+lock samples on autumn_webhook_deliveries (distinct):
+     10 lock ShareUpdateExclusiveLock granted=true by CREATE INDEX CONCURRENTLY IF N
+      6 wait -/- CREATE INDEX CONCURRENTLY IF N
+      3 wait IO/WALSync INSERT INTO autumn_webhook_del
+      2 wait LWLock/WALWrite CREATE INDEX CONCURRENTLY IF N
+      2 wait IO/DataFileRead CREATE INDEX CONCURRENTLY IF N
+      2 lock RowExclusiveLock granted=true by INSERT INTO autumn_webhook_del
+      1 wait IO/WALWrite INSERT INTO autumn_webhook_del
+valid=true size 63 MB
+writer rows inserted during the build: 200
+== rollback: DROP INDEX CONCURRENTLY
+drop: 71 ms
+index present after rollback: false
