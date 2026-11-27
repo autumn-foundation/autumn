@@ -254,6 +254,33 @@ It proves these properties:
 The property test `a_restore_holds_every_write_at_or_before_the_bound` in
 `autumn/tests/integration/sqlite_replicated_through.rs` checks the runtime.
 
+## Move rows between fleet databases
+
+`fleet_move.rs` models one move of one row between two fleet databases, as
+"Move rows between fleet databases" in `docs/guide/sqlite-fleet.md` gives it.
+It takes the claim of the replica bound as proved above. Verify it with:
+
+```sh
+verus verification/fleet_move.rs
+```
+
+It proves these properties:
+
+- The row is in the local file or the replica of each database. This holds
+  at the start and after every step: a delivery, a ship, a bound, a rewind of
+  either database (also a rewind that keeps the epoch), and a delete under
+  the rule.
+- The rule deletes the source copy only when the bound covers the arrival
+  under the same epoch, and the arrival is newer than the file.
+- After a rewind of the destination, the old mark allows no delete. A new
+  delivery that ships ends the move.
+- A delete on acknowledgement, a check of the time alone, and a check of the
+  time and the epoch can lose the row.
+
+The model is for loss only. Versions and tombstones, which stop duplicates,
+are not in it. The tests in `mod moves` of `autumn/src/db/fleet_ownership.rs`
+check the runtime.
+
 ## Billing plan gate
 
 `billing_gate.rs` models the plan gate selection in

@@ -398,8 +398,8 @@ pub struct FleetReplication {
 
 /// The bound of one database, for [`FleetReplication::replicated_through`].
 enum Bound {
-    /// Every commit at or before it is in the replica.
-    At(Timestamp),
+    /// Every commit at or before the instant is in the replica.
+    At(ReplicaBound),
     /// Replicated here, but no bound is proved now.
     Unknown,
     /// A newer owner fenced the replica.
@@ -415,9 +415,15 @@ pub(crate) enum ClosedBound {
     Live {
         status: Arc<ReplicationStatus>,
         epoch: u64,
+        /// When this process started to replicate the file.
+        since: Timestamp,
     },
     /// Its replica caught up, or its last generation shipped.
-    At { at: Option<Timestamp>, epoch: u64 },
+    At {
+        at: Option<Timestamp>,
+        epoch: u64,
+        since: Timestamp,
+    },
     /// Its last generation ships from this slot, also in a retry after the
     /// close: read the slot.
     Slot(Arc<GenerationSlot>),
@@ -444,6 +450,113 @@ const WAIT_POLL: Duration = Duration::from_millis(250);
 /// A deadline past any real wait, for a timeout too large to add.
 fn far_future() -> tokio::time::Instant {
     tokio::time::Instant::now() + Duration::from_hours(24 * 365 * 30)
+}
+
+/// A replica bound, its epoch, and the start of its file. See
+/// [`FleetReplication::replica_bound`].
+///
+/// The bound speaks only for the file that this process replicates now. A
+/// rewind (a takeover, a fail-back, a restore, a new volume, or a restart
+/// after a power loss) gives a new file. A commit to an earlier file can then
+/// be missing, even when its time is at or before the bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaBound {
+    since: Timestamp,
+    through: Timestamp,
+    epoch: Option<crate::lock::FencingToken>,
+}
+
+/// What a [`ReplicaBound`] says about one commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Coverage {
+    /// The commit is in the replica.
+    Covered,
+    /// The commit is in this file, but not in the replica yet. Ask again
+    /// later.
+    Pending,
+    /// The commit is of another epoch, or not newer than this file. It can
+    /// be lost. Write it again.
+    Stale,
+}
+
+impl ReplicaBound {
+    /// A bound at `through`, for the file that this process started to
+    /// replicate at `since`, under `epoch` (`None`: no ownership).
+    #[must_use]
+    pub(crate) const fn new(
+        since: Timestamp,
+        through: Timestamp,
+        epoch: Option<crate::lock::FencingToken>,
+    ) -> Self {
+        Self {
+            since,
+            through,
+            epoch,
+        }
+    }
+
+    /// When this process started to replicate the file. A commit read after
+    /// this instant went to this file. A commit read at or before it can be
+    /// of an earlier file.
+    #[must_use]
+    pub const fn since(&self) -> Timestamp {
+        self.since
+    }
+
+    /// Every commit to the file at or before this instant is in the replica.
+    #[must_use]
+    pub const fn through(&self) -> Timestamp {
+        self.through
+    }
+
+    /// The epoch of the bound. `None` without ownership.
+    #[must_use]
+    pub const fn epoch(&self) -> Option<crate::lock::FencingToken> {
+        self.epoch
+    }
+
+    /// What the bound says about a commit at `committed_at` under `epoch`.
+    ///
+    /// Read `committed_at` from the app clock after the commit returns. Give
+    /// the epoch of the database that took the commit
+    /// ([`FleetDatabase::epoch`]). The answer assumes a clock that does not
+    /// step back.
+    #[must_use]
+    pub fn coverage(
+        &self,
+        committed_at: Timestamp,
+        epoch: Option<crate::lock::FencingToken>,
+    ) -> Coverage {
+        if self.epoch != epoch || committed_at <= self.since {
+            Coverage::Stale
+        } else if committed_at <= self.through {
+            Coverage::Covered
+        } else {
+            Coverage::Pending
+        }
+    }
+
+    /// Whether the replica holds a commit at `committed_at` under `epoch`:
+    /// [`coverage`](Self::coverage) is [`Coverage::Covered`].
+    #[must_use]
+    pub fn covers(
+        &self,
+        committed_at: Timestamp,
+        epoch: Option<crate::lock::FencingToken>,
+    ) -> bool {
+        self.coverage(committed_at, epoch) == Coverage::Covered
+    }
+
+    /// The bound of a replicator with the epoch `epoch` (`0`: no ownership).
+    /// An epoch above `i64::MAX` is not a token. It gives `None`, and each
+    /// commit with a real epoch is then `Stale`.
+    fn at(since: Timestamp, through: Timestamp, epoch: u64) -> Self {
+        let epoch = i64::try_from(epoch)
+            .ok()
+            .and_then(|epoch| crate::lock::FencingToken::try_from(epoch).ok());
+        Self::new(since, through, epoch)
+    }
 }
 
 /// Why [`FleetReplication::wait_replicated`] gave up.
@@ -1571,8 +1684,18 @@ impl FleetReplication {
     /// again, a delete or a restore in this process.
     #[must_use]
     pub fn replicated_through(&self, key: &FleetDbKey) -> Option<Timestamp> {
+        self.replica_bound(key).map(|bound| bound.through())
+    }
+
+    /// The bound of [`replicated_through`](Self::replicated_through), with
+    /// its epoch and the start of its file. `None` in the same cases.
+    ///
+    /// Use it to delete the source copy of a moved row only when the replica
+    /// holds the arrival. See [`ReplicaBound::coverage`].
+    #[must_use]
+    pub fn replica_bound(&self, key: &FleetDbKey) -> Option<ReplicaBound> {
         match self.bound(key) {
-            Bound::At(at) => Some(at),
+            Bound::At(bound) => Some(bound),
             Bound::Unknown | Bound::Fenced | Bound::NotReplicating => None,
         }
     }
@@ -1606,8 +1729,8 @@ impl FleetReplication {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let through = match self.bound(key) {
-                Bound::At(at) if at >= committed_at => return Ok(()),
-                Bound::At(at) => Some(at),
+                Bound::At(bound) if bound.through() >= committed_at => return Ok(()),
+                Bound::At(bound) => Some(bound.through()),
                 Bound::Unknown => None,
                 Bound::Fenced => return Err(ReplicatedWaitError::Fenced { name: key.name() }),
                 Bound::NotReplicating => {
@@ -1691,13 +1814,22 @@ impl FleetReplication {
         hook.is_none_or(|hook| epoch != 0 && hook(key) == Some(epoch))
     }
 
-    /// `at` under `epoch`, or `Unknown` when:
+    /// `at` under `epoch`, for the file replicated since `since`, or
+    /// `Unknown` when:
     /// - this host does not serve the key at that epoch now: a new owner may
     ///   restore before an old ship lands;
     /// - `at` is not below the clock now: the clock stepped back.
-    fn bound_at(&self, key: &FleetDbKey, at: Option<Timestamp>, epoch: u64) -> Bound {
+    fn bound_at(
+        &self,
+        key: &FleetDbKey,
+        at: Option<Timestamp>,
+        epoch: u64,
+        since: Timestamp,
+    ) -> Bound {
         match at {
-            Some(at) if at < self.clock.now() && self.serves(key, epoch) => Bound::At(at),
+            Some(at) if at < self.clock.now() && self.serves(key, epoch) => {
+                Bound::At(ReplicaBound::at(since, at, epoch))
+            }
             _ => Bound::Unknown,
         }
     }
@@ -1711,7 +1843,7 @@ impl FleetReplication {
         if fenced {
             Bound::Fenced
         } else {
-            self.bound_at(key, at, slot.epoch())
+            self.bound_at(key, at, slot.epoch(), slot.track().registered_at)
         }
     }
 
@@ -1728,7 +1860,12 @@ impl FleetReplication {
                 return Bound::Unknown;
             }
             let epoch = replica.epoch.load(Ordering::Acquire);
-            return self.bound_at(key, replica.status.replicated_through(), epoch);
+            return self.bound_at(
+                key,
+                replica.status.replicated_through(),
+                epoch,
+                replica.registered_at,
+            );
         }
         if let Some(slot) = self.current_generation_slot(key) {
             return self.slot_bound(key, &slot);
@@ -1740,10 +1877,12 @@ impl FleetReplication {
             .get(key)
             .map(|(bound, _)| bound.clone());
         match closed {
-            Some(ClosedBound::Live { status, epoch }) => {
-                self.bound_at(key, status.replicated_through(), epoch)
-            }
-            Some(ClosedBound::At { at, epoch }) => self.bound_at(key, at, epoch),
+            Some(ClosedBound::Live {
+                status,
+                epoch,
+                since,
+            }) => self.bound_at(key, status.replicated_through(), epoch, since),
+            Some(ClosedBound::At { at, epoch, since }) => self.bound_at(key, at, epoch, since),
             Some(ClosedBound::Slot(slot)) => self.slot_bound(key, &slot),
             Some(ClosedBound::Fenced) => Bound::Fenced,
             None => Bound::NotReplicating,
@@ -2149,6 +2288,7 @@ impl FleetLifecycle for FleetReplication {
                 ClosedBound::Live {
                     status: Arc::clone(&replica.status),
                     epoch: replica.epoch.load(Ordering::Acquire),
+                    since: replica.registered_at,
                 },
             );
         }
@@ -2232,6 +2372,7 @@ fn closed_at(replica: &ActiveReplica) -> ClosedBound {
     ClosedBound::At {
         at: replica.status.replicated_through(),
         epoch: replica.epoch.load(Ordering::Acquire),
+        since: replica.registered_at,
     }
 }
 
@@ -2368,15 +2509,9 @@ mod tests {
         )
     }
 
-    fn replicated_fleet_on(
-        root: &Path,
-        replicas: &Path,
-        restore_missing: bool,
-        mmap_size: u64,
-        clock: Arc<dyn ClockSource>,
-        tune: impl FnOnce(FleetReplication) -> FleetReplication,
-    ) -> (DatabaseFleet, Arc<FleetReplication>) {
-        let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
+    /// A tenant fleet config for a test.
+    fn fleet_config(root: &Path, restore_missing: bool, mmap_size: u64) -> DatabaseFleetConfig {
+        DatabaseFleetConfig {
             mode: FleetMode::Tenant,
             root: root.display().to_string(),
             path: None,
@@ -2394,11 +2529,22 @@ mod tests {
             max_open_policy: crate::config::FleetMaxOpenPolicy::Soft,
             mmap_size,
             cache_size_kib: 0,
-        })
-        // A loaded CI runner can take more than 5 s to open a connection.
-        .connect_timeout_secs(60)
-        .build()
-        .unwrap();
+        }
+    }
+
+    fn replicated_fleet_on(
+        root: &Path,
+        replicas: &Path,
+        restore_missing: bool,
+        mmap_size: u64,
+        clock: Arc<dyn ClockSource>,
+        tune: impl FnOnce(FleetReplication) -> FleetReplication,
+    ) -> (DatabaseFleet, Arc<FleetReplication>) {
+        let fleet = DatabaseFleet::builder(fleet_config(root, restore_missing, mmap_size))
+            // A loaded CI runner can take more than 5 s to open a connection.
+            .connect_timeout_secs(60)
+            .build()
+            .unwrap();
         let destination: Arc<dyn ReplicaDestination> =
             Arc::new(FileDestination::new(replicas).unwrap());
         let replication = Arc::new(tune(FleetReplication::new(
@@ -4455,6 +4601,180 @@ mod tests {
         ));
         drop(db);
         fleet.close_all().await;
+    }
+
+    // ── replica_bound ───────────────────────────────────────────────────────
+
+    fn token(n: i64) -> crate::lock::FencingToken {
+        crate::lock::FencingToken::try_from(n).unwrap()
+    }
+
+    #[test]
+    fn a_replica_bound_covers_only_a_commit_of_its_file_and_epoch() {
+        let secs = jiff::SignedDuration::from_secs;
+        let through = Timestamp::from_second(1_700_000_000).unwrap();
+        let since = through - secs(10);
+        let bound = ReplicaBound::new(since, through, Some(token(2)));
+        assert_eq!(bound.since(), since);
+        assert_eq!(bound.through(), through);
+        assert_eq!(bound.epoch(), Some(token(2)));
+
+        let at = |t: Timestamp, e| bound.coverage(t, e);
+        assert_eq!(
+            at(through, Some(token(2))),
+            Coverage::Covered,
+            "at the bound"
+        );
+        assert_eq!(at(since + secs(1), Some(token(2))), Coverage::Covered);
+        // At the start: the commit can be of the earlier file.
+        assert_eq!(at(since, Some(token(2))), Coverage::Stale, "at the start");
+        assert_eq!(at(through + secs(1), Some(token(2))), Coverage::Pending);
+        // An older file: a rewind can have removed the commit.
+        assert_eq!(at(since - secs(1), Some(token(2))), Coverage::Stale);
+        // Another epoch: a restore can have replaced the file since.
+        assert_eq!(at(through, Some(token(1))), Coverage::Stale, "older epoch");
+        assert_eq!(at(through, Some(token(3))), Coverage::Stale, "newer epoch");
+        assert_eq!(at(through, None), Coverage::Stale, "no epoch");
+        assert!(bound.covers(through, Some(token(2))));
+        assert!(!bound.covers(through + secs(1), Some(token(2))));
+        assert!(!bound.covers(since - secs(1), Some(token(2))));
+
+        let plain = ReplicaBound::new(since, through, None);
+        assert!(plain.covers(through, None));
+        assert!(!plain.covers(through, Some(token(1))));
+    }
+
+    #[tokio::test]
+    async fn replica_bound_gives_the_bound_with_no_epoch_without_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        assert_eq!(replication.replica_bound(&key), None, "no tick yet");
+
+        // A commit read at the instant of the open can be of an earlier file.
+        clock.advance(1);
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        let committed_at = clock.now();
+        clock.advance(1);
+        tick(&replication).await;
+        let through = replication.replicated_through(&key).expect("caught up");
+        let bound = replication.replica_bound(&key).expect("caught up");
+        assert_eq!(bound.through(), through);
+        assert_eq!(bound.epoch(), None);
+        assert!(bound.since() < committed_at, "opened before the commit");
+        assert_eq!(fleet.replica_bound(&key), Some(bound));
+        assert!(bound.covers(committed_at, db.epoch()));
+
+        let other = fleet.key_for("other").unwrap();
+        assert_eq!(fleet.replica_bound(&other), None, "not open here");
+        drop(db);
+        fleet.close_all().await;
+    }
+
+    /// A new volume restores the file from the replica, under the same
+    /// epoch. The new bound covers the time of a commit that the old file
+    /// did not ship, but the commit is not in the new file.
+    #[tokio::test]
+    async fn a_bound_of_a_new_file_does_not_cover_a_commit_to_the_old_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = SetClock::new();
+        let replicas = tmp.path().join("replicas");
+        let on_clock = || Arc::clone(&clock) as Arc<dyn ClockSource>;
+        let (old, old_replication) = replicated_fleet_on(
+            &tmp.path().join("old"),
+            &replicas,
+            false,
+            0,
+            on_clock(),
+            |r| r,
+        );
+        let key = old.key_for("acme").unwrap();
+        let db = old.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        clock.advance(1);
+        tick(&old_replication).await;
+        // Acknowledged. The old volume is lost before a pass ships it.
+        exec(&db, "INSERT INTO notes VALUES ('arrival')").await;
+        let committed_at = clock.now();
+        clock.advance(1);
+
+        let (new, new_replication) = replicated_fleet_on(
+            &tmp.path().join("new"),
+            &replicas,
+            true,
+            0,
+            on_clock(),
+            |r| r,
+        );
+        let restored = new.open(&key).await.unwrap();
+        assert_eq!(count(&restored).await, 0, "the replica has no arrival");
+        clock.advance(1);
+        tick(&new_replication).await;
+        let bound = new.replica_bound(&key).expect("caught up");
+        assert!(bound.through() >= committed_at, "the time alone is wrong");
+        assert_eq!(bound.epoch(), db.epoch(), "the same epoch");
+        assert!(bound.since() > committed_at);
+        assert_eq!(bound.coverage(committed_at, db.epoch()), Coverage::Stale);
+
+        // A commit to the new file is covered once it ships.
+        exec(&restored, "INSERT INTO notes VALUES ('arrival')").await;
+        let again = clock.now();
+        assert_eq!(
+            new.replica_bound(&key)
+                .map(|bound| bound.coverage(again, restored.epoch())),
+            Some(Coverage::Pending)
+        );
+        clock.advance(1);
+        tick(&new_replication).await;
+        let bound = new.replica_bound(&key).expect("caught up");
+        assert_eq!(bound.coverage(again, restored.epoch()), Coverage::Covered);
+        drop((db, restored));
+        new.close_all().await;
+    }
+
+    /// A closed database keeps its bound, its epoch and its start. A reopen
+    /// starts a new file: an earlier arrival is then `Stale`, and a second
+    /// delivery is needed.
+    #[tokio::test]
+    async fn a_closed_bound_keeps_its_start_and_a_reopen_starts_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = SetClock::new();
+        let (fleet, replication) = clocked_fleet(tmp.path(), &clock);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        clock.advance(1);
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        let committed_at = clock.now();
+        let epoch = db.epoch();
+        clock.advance(1);
+        drop(db);
+        fleet.close(&key).await;
+
+        let closed = fleet.replica_bound(&key).expect("closed, caught up");
+        assert!(closed.since() < committed_at);
+        assert_eq!(closed.epoch(), epoch);
+        assert_eq!(closed.coverage(committed_at, epoch), Coverage::Covered);
+
+        let db = fleet.open(&key).await.unwrap();
+        clock.advance(1);
+        tick(&replication).await;
+        let reopened = fleet.replica_bound(&key).expect("caught up");
+        assert!(reopened.since() > closed.since());
+        assert_eq!(reopened.coverage(committed_at, epoch), Coverage::Stale);
+        drop(db);
+        fleet.close_all().await;
+    }
+
+    #[test]
+    fn a_fleet_with_no_replication_has_no_replica_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = DatabaseFleet::builder(fleet_config(tmp.path(), false, 0))
+            .build()
+            .unwrap();
+        let key = fleet.key_for("acme").unwrap();
+        assert_eq!(fleet.replica_bound(&key), None);
     }
 
     #[tokio::test]

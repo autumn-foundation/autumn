@@ -672,7 +672,9 @@ A fleet app can ask if one write is offsite.
 database at or before it is in the replica. `fleet.wait_replicated` waits
 for it. Wait for it before you write the second half of a write that spans
 two databases. Then a takeover cannot lose one half. See
-[Know when a write is in the replica](sqlite-fleet.md#know-when-a-write-is-in-the-replica).
+[Know when a write is in the replica](sqlite-fleet.md#know-when-a-write-is-in-the-replica),
+and for a row that moves,
+[Move rows between fleet databases](sqlite-fleet.md#move-rows-between-fleet-databases).
 
 **What you actually pay for.** Steady-state upload is the size of your WAL
 writes, not the size of your database. The `-wal` file cannot grow forever, so

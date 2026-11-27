@@ -3321,6 +3321,19 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   (not a loss: keep the source row, retry). Do not use `worst_lag_seconds`
   or `last_success_at` for this. Guide: "Know when a write is in the
   replica" in `docs/guide/sqlite-fleet.md`.
+- Move a row between fleet databases (unreleased): never delete the source
+  copy on the destination's acknowledgement. A takeover can rewind the
+  destination. Write the row with a version one higher (never replace a
+  newer one or its tombstone), mark the source copy moved (with `dst`) and
+  keep it, and record the arrival's time and `db.epoch()` from the
+  destination. Delete the source copy (keep a tombstone) only when
+  `fleet.replica_bound(&dst).map(|b| b.coverage(arrived_at, arrived_epoch))`
+  is `Some(Covered)`, asked on the process that replicates `dst`. `Pending`: ask
+  later. `Stale` (another epoch, or not newer than the file, `bound.since()`):
+  deliver again. A time-only or epoch-only check is not safe: a restore, a
+  new volume or a restart can keep the epoch. Mark moved again each copy
+  that came back. Versioned upserts, deletes bounded by version. Guide:
+  "Move rows between fleet databases" in `docs/guide/sqlite-fleet.md`.
 - Delete with replication (issue #3235): `delete` also purges the replica.
   It writes a tombstone row (`_autumn_fleet_tombstones`) on the control
   database first; no row, no delete (`503`). A failed purge keeps the row,

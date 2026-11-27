@@ -166,6 +166,7 @@ async fn signup(shards: Shards, Path(tenant): Path<String>) -> AutumnResult<Stat
 | `fleet.restore(&key, at)` | rebuild from the replica (needs replication); `409` when another process still has it open |
 | `fleet.replicated_through(&key)` | the instant up to which every commit is in the replica. See [Know when a write is in the replica](#know-when-a-write-is-in-the-replica) |
 | `fleet.wait_replicated(&key, at, timeout)` | wait until every commit at or before `at` is in the replica |
+| `fleet.replica_bound(&key)` | the same instant, with its epoch and the start of its file. See [Move rows between fleet databases](#move-rows-between-fleet-databases) |
 | `fleet.restore_from_file(&key, &src, opts)` | replace (or create) the database with a local backup; no replication needed. See [Restore a backup in place](#restore-a-backup-in-place) |
 | `fleet.stats()` | counters (also on `/actuator/health` as `db:fleet`) |
 
@@ -631,16 +632,24 @@ uses this clock. Compare the commit time with the instant.
 Use it for a write that spans two databases. For example, a row moves from
 `src` to `dst`: upsert it into `dst`, then delete it from `src`. If the
 delete ships and the upsert does not, a takeover loses the row. So delete
-only after the upsert is in the replica:
+only after the replica holds the upsert:
 
 ```rust,ignore
 upsert(&dst_db, &row).await?;
-let committed_at = state.clock().now();
+let (committed_at, epoch) = (state.clock().now(), dst_db.epoch());
 fleet
     .wait_replicated(&dst, committed_at, Duration::from_secs(5))
     .await?;
-delete(&src_db, row.id).await?;
+if fleet
+    .replica_bound(&dst)
+    .is_some_and(|bound| bound.covers(committed_at, epoch))
+{
+    drop_moved(&src_db, row.id, row.version).await?;
+}
 ```
+
+For all the rules of a move, see
+[Move rows between fleet databases](#move-rows-between-fleet-databases).
 
 `replicated_through` is `None` when:
 
@@ -947,7 +956,7 @@ one store: the release of one fleet ends the lease of the other.
    A takeover can lose one half of a write that spans two databases. To
    prevent this, write the second half only after the first half is in the
    replica. Make the second half safe to repeat. See
-   [Know when a write is in the replica](#know-when-a-write-is-in-the-replica).
+   [Move rows between fleet databases](#move-rows-between-fleet-databases).
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew
    fails. It claims the range again only when the new owner lets it go, at a
@@ -1009,6 +1018,128 @@ selects that generation.
 Do not restore the control database to an earlier time while ownership is
 on. If its epoch counter goes back, the next claim after a fence still goes
 above the epoch that the replicator found.
+
+## Move rows between fleet databases
+
+A move takes a row out of one fleet database and puts it into another. For
+example, an agent goes to the next cell. The move writes to two databases.
+Each database has its own replica, and a takeover can rewind one database
+and not the other. The rules apply to every engine that has a replica bound:
+SQLite, and the engine of a plugin in `generations` mode. An engine in
+`rebuild` mode, and a sidecar, have no bound of their own.
+
+### Delete on acknowledgement loses rows
+
+A simple rule is "delete on acknowledgement": delete the source copy when
+the destination acknowledges the write. This rule loses rows:
+
+- The destination acknowledges the write when it is on its own volume.
+- The source deletes its copy, and ships the delete.
+- The destination stops before its next pass ships the write.
+- A new owner takes over from the replica. This rewinds the destination to
+  before the arrival. The source copy is gone, so the row is lost.
+
+A check of the time alone does not prevent a loss. After a rewind, a new
+bound can cover the time of an arrival that the rewind removed.
+
+### The rules
+
+1. Write the row into the destination with a version one higher than the
+   source copy. Never replace a newer version, or a tombstone of one.
+2. Mark the source copy moved, with its destination. Keep it. The
+   destination reads the app clock after the commit, and its epoch
+   (`db.epoch()`). It sends the two values back, and the source records them.
+3. Delete the source copy only when the bound of the destination covers the
+   arrival under the same epoch: `bound.coverage(arrived_at, arrived_epoch)`
+   on `fleet.replica_bound(&dst)` is `Covered`. Keep a tombstone: the id and
+   the version.
+4. When a database gets a new owner, a new epoch or a new file, check what
+   it holds. Deliver again each moved copy whose coverage is `Stale`. Mark
+   moved again each source copy that came back while its destination holds
+   a newer version.
+5. Make every write safe to repeat: a versioned upsert, and a mark and a
+   delete bounded by version.
+
+`coverage` gives one of three answers:
+
+| Answer | The arrival | Do |
+| --- | --- | --- |
+| `Covered` | is in the replica | delete the source copy (rule 3) |
+| `Pending` | is in the file, not in the replica yet | ask again later |
+| `Stale` | is of another epoch, or not newer than the file (`bound.since()`): a rewind can have removed it | deliver again (rule 4) |
+
+`replica_bound` is `None` when no bound is proved yet. Ask again later. If
+it stays `None`, deliver again: the delivery opens the database.
+
+The table and the writes, in SQLite:
+
+```sql
+CREATE TABLE birds (
+  id            TEXT PRIMARY KEY,
+  version       INTEGER NOT NULL,
+  data          BLOB,
+  moved_to      TEXT,     -- the destination of a moved copy
+  arrived_at    INTEGER,  -- Unix milliseconds, from the destination
+  arrived_epoch INTEGER,  -- FencingToken::as_i64(), NULL without ownership
+  gone          INTEGER NOT NULL DEFAULT 0  -- 1: a tombstone
+);
+
+-- Rule 1, on the destination. A newer version, or its tombstone, stays.
+INSERT INTO birds (id, version, data) VALUES (:id, :new_version, :data)
+  ON CONFLICT (id) DO UPDATE
+  SET version = excluded.version, data = excluded.data, moved_to = NULL,
+      arrived_at = NULL, arrived_epoch = NULL, gone = 0
+  WHERE excluded.version > birds.version;
+
+-- Rule 2, on the source.
+UPDATE birds SET moved_to = :dst, arrived_at = :at, arrived_epoch = :epoch
+  WHERE id = :id AND version = :version AND gone = 0;
+
+-- Rule 3, on the source, when the answer is `Covered`.
+UPDATE birds SET gone = 1, data = NULL
+  WHERE id = :id AND version = :version AND moved_to IS NOT NULL;
+```
+
+The bound is local to the process that replicates the destination. Ask that
+process. On another host, ask the owner of the slot of `dst`. A host that
+does not own the slot answers `421`.
+
+```rust,ignore
+// On the destination host, after the commit of rule 1.
+let arrival = (state.clock().now(), dst_db.epoch());
+
+// On the destination host, when the source asks about an arrival.
+let answer = fleet
+    .replica_bound(&dst)
+    .map(|bound| bound.coverage(arrived_at, arrived_epoch));
+```
+
+Notes:
+
+- `wait_replicated` can return `Ok` for an arrival that a rewind removed.
+  Read `coverage` after the wait.
+- A database gets a new file each time it opens, and after a restore, a
+  fail-back or a takeover. Run rule 4 for its copies then. An open after
+  an idle close also makes the earlier arrivals `Stale`. The second delivery
+  changes nothing.
+- `coverage` assumes a clock that does not step back. Keep the host clock in
+  sync without steps.
+- A tombstone stops a late delivery of an older version. Drop it only when
+  no such delivery can come. For example, keep it for longer than the
+  longest move.
+- To find each copy that came back with no search, write the mark before
+  the delivery. Deliver only when the bound of the source covers the mark.
+  A copy then comes back marked, not live.
+- Without [slot ownership](#failover-slot-ownership) there is no epoch, and
+  nothing fences the old owner. Turn on ownership for a fleet that moves
+  rows.
+- The source keeps a moved copy until the move ends. Do not show it as a
+  live row.
+
+`verification/fleet_move.rs` models one move of one row. It proves that a
+delete under rule 3 does not lose the row through a rewind of either
+database, also a rewind that keeps the epoch. It also shows that a delete on
+acknowledgement, and a check of the time alone, can lose the row.
 
 ## Memory-mapped reads
 
