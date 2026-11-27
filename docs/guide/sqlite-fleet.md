@@ -1119,7 +1119,7 @@ storage. Core does every write to the replica. The engine only gives files.
 | Mode | What core does | RPO |
 | --- | --- | --- |
 | `Continuous(_)` | Ships the changes as they commit. Only `SqliteEngine` (WAL shipping). `ContinuousShipper` is sealed. | `sync_interval` |
-| `Generations { every }` | Takes a `snapshot` every `every` and at close. Ships only the files whose SHA-256 is not in the previous generation. | `every` |
+| `Generations { every }` | Takes a `snapshot` every `every` and at close. Ships only the files whose SHA-256 is not in the previous generation. | `every`. See [What a generation costs](#what-a-generation-costs). |
 | `Rebuild` | Ships nothing. `restore_latest` calls `FleetEngine::rebuild`. | none |
 
 Install replication as for `SQLite`:
@@ -1176,6 +1176,29 @@ A generation of `Generations` mode is these objects:
 
 `plugin_conformance::fleet` checks the engine side. `fleet-fenced-ship`
 and `fleet-unchanged-files` need a fixture that installs replication.
+
+### What a generation costs
+
+Core ships each changed file whole. It does not ship a diff. An engine
+that keeps one file, such as DuckDB, ships the whole database after each
+change.
+
+- **Write volume.** Replica writes a day ≈
+  `changed files × file size × 86,400 / every`, with `every` in seconds.
+  A changed file is a file with one or more writes in the interval.
+- **Small tables.** A small table still costs a whole file. A DuckDB file
+  is about 1 MB at least, also for 1,500 rows.
+- **RPO.** The write volume sets the RPO that a fleet can pay for.
+  Calculate `every` from the write volume, not from the default.
+- **Storage.** Prune keeps the files of the two newest generations, so
+  storage stays bounded. The cost is write traffic, not storage.
+- **Measure.** `ship_now` returns a `ShipReport`. `ShipReport::bytes` is
+  the bytes that the ship wrote.
+
+Example: 64 files of about 3.3 MB, each with a write in each interval,
+and `every` = 30 seconds. The fleet writes about 600 GB a day (about
+420 MB a minute). With `every` = 300 seconds, the same fleet writes about
+60 GB a day, and the RPO is 5 minutes.
 
 ## Limits
 

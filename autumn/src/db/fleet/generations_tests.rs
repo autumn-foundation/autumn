@@ -420,6 +420,45 @@ async fn a_prune_keeps_two_generations() {
     b.fleet.close_all().await;
 }
 
+/// A change of one line ships the whole file again, not a diff.
+#[tokio::test]
+async fn a_one_line_change_ships_the_whole_file_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let key = acme(&a.fleet);
+    write(&a, &key, &"x".repeat(4096)).await;
+    a.fleet.ship_now(&key).await.unwrap();
+    write(&a, &key, "y").await;
+    let report = a.fleet.ship_now(&key).await.unwrap();
+    let len = std::fs::metadata(a.fleet.path_of(&key)).unwrap().len();
+    assert!(len > 4096);
+    assert_eq!((report.shipped, report.reused), (1, 0));
+    assert_eq!(report.bytes, len, "the ship holds the whole file");
+    a.fleet.close_all().await;
+}
+
+/// Many changes keep the stored files bounded: prune keeps the files of the
+/// two newest generations.
+#[tokio::test]
+async fn many_changes_keep_the_stored_files_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let key = acme(&a.fleet);
+    let mut shipped = 0_u64;
+    for n in 0..8 {
+        write(&a, &key, &format!("value {n}")).await;
+        shipped += a.fleet.ship_now(&key).await.unwrap().bytes;
+    }
+    let files: Vec<String> = objects(&a, &key)
+        .into_iter()
+        .filter(|object| object.contains("/files/"))
+        .collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    let len = std::fs::metadata(a.fleet.path_of(&key)).unwrap().len();
+    assert!(shipped > 2 * len, "the traffic is each whole file");
+    a.fleet.close_all().await;
+}
+
 #[tokio::test]
 async fn a_host_that_gets_its_range_back_serves_the_newer_owners_data() {
     let tmp = tempfile::tempdir().unwrap();
