@@ -417,69 +417,6 @@ mod docker {
              it must not read the {SENT_ROWS} sent rows"
         );
     }
-}
-
-#[cfg(feature = "test-support")]
-mod docker_webhook_store {
-    use std::collections::HashMap;
-
-    use autumn_web::webhook_outbound::{
-        OutboundWebhookHandler as _, SqlOutboundWebhookStore, WebhookDeliveryLog,
-        WebhookSubscription, WebhookSubscriptionStatus,
-    };
-
-    #[tokio::test]
-    #[ignore = "requires Docker (testcontainers)"]
-    async fn pg_sql_webhook_store_round_trips_and_fails_after_50() {
-        let pool = autumn_web::test::TestDb::shared().await.pool();
-        let store = SqlOutboundWebhookStore::new(pool);
-        store.ensure_schema().await.unwrap();
-        let sub = WebhookSubscription {
-            id: "pg-sub-1".to_owned(),
-            target_url: "https://receiver.example/hooks".to_owned(),
-            event_topics: vec!["pg.paid".to_owned()],
-            secret: "whsec_test_secret_with_32_bytes_ok!!".to_owned(),
-            status: WebhookSubscriptionStatus::Active,
-            consecutive_failures: 0,
-        };
-        store.create_subscription(sub.clone()).await.unwrap();
-        assert_eq!(store.get_subscriptions("pg.paid").await.unwrap(), vec![sub]);
-
-        for n in 0..50 {
-            let log = WebhookDeliveryLog {
-                id: format!("pg-log-{n}"),
-                subscription_id: "pg-sub-1".to_owned(),
-                topic: "pg.paid".to_owned(),
-                payload: "{}".to_owned(),
-                request_headers: HashMap::new(),
-                response_status: Some(500),
-                response_body: None,
-                elapsed_ms: 1,
-                attempt: 1,
-                max_attempts: 5,
-                is_dlq: n == 49,
-                last_error: Some("500".to_owned()),
-                timestamp: autumn_web::time::ambient_now(),
-            };
-            store.log_delivery(log).await.unwrap();
-        }
-        let failed = store.get_subscription("pg-sub-1").await.unwrap().unwrap();
-        assert_eq!(failed.status, WebhookSubscriptionStatus::Failed);
-        assert!(
-            store
-                .get_dlq_logs()
-                .await
-                .unwrap()
-                .iter()
-                .any(|log| log.id == "pg-log-49")
-        );
-    }
-
-    #[derive(diesel::QueryableByName)]
-    struct IndexValid {
-        #[diesel(sql_type = diesel::sql_types::Bool)]
-        valid: bool,
-    }
 
     #[derive(diesel::QueryableByName)]
     struct PlanLine {
@@ -496,7 +433,7 @@ mod docker_webhook_store {
         use diesel_async::RunQueryDsl as _;
 
         let pool = autumn_web::test::TestDb::shared().await.pool();
-        let store = SqlOutboundWebhookStore::new(pool.clone());
+        let store = autumn_web::webhook_outbound::SqlOutboundWebhookStore::new(pool.clone());
         store.ensure_schema().await.unwrap();
         let mut conn = pool.get().await.unwrap();
         diesel::sql_query("DROP INDEX IF EXISTS idx_autumn_webhook_deliveries_delivered")
@@ -554,6 +491,63 @@ mod docker_webhook_store {
             plan.iter()
                 .map(|step| step.line.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(feature = "test-support")]
+mod docker_webhook_store {
+    use std::collections::HashMap;
+
+    use autumn_web::webhook_outbound::{
+        OutboundWebhookHandler as _, SqlOutboundWebhookStore, WebhookDeliveryLog,
+        WebhookSubscription, WebhookSubscriptionStatus,
+    };
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_sql_webhook_store_round_trips_and_fails_after_50() {
+        let pool = autumn_web::test::TestDb::shared().await.pool();
+        let store = SqlOutboundWebhookStore::new(pool);
+        store.ensure_schema().await.unwrap();
+        let sub = WebhookSubscription {
+            id: "pg-sub-1".to_owned(),
+            target_url: "https://receiver.example/hooks".to_owned(),
+            event_topics: vec!["pg.paid".to_owned()],
+            secret: "whsec_test_secret_with_32_bytes_ok!!".to_owned(),
+            status: WebhookSubscriptionStatus::Active,
+            consecutive_failures: 0,
+        };
+        store.create_subscription(sub.clone()).await.unwrap();
+        assert_eq!(store.get_subscriptions("pg.paid").await.unwrap(), vec![sub]);
+
+        for n in 0..50 {
+            let log = WebhookDeliveryLog {
+                id: format!("pg-log-{n}"),
+                subscription_id: "pg-sub-1".to_owned(),
+                topic: "pg.paid".to_owned(),
+                payload: "{}".to_owned(),
+                request_headers: HashMap::new(),
+                response_status: Some(500),
+                response_body: None,
+                elapsed_ms: 1,
+                attempt: 1,
+                max_attempts: 5,
+                is_dlq: n == 49,
+                last_error: Some("500".to_owned()),
+                timestamp: autumn_web::time::ambient_now(),
+            };
+            store.log_delivery(log).await.unwrap();
+        }
+        let failed = store.get_subscription("pg-sub-1").await.unwrap().unwrap();
+        assert_eq!(failed.status, WebhookSubscriptionStatus::Failed);
+        assert!(
+            store
+                .get_dlq_logs()
+                .await
+                .unwrap()
+                .iter()
+                .any(|log| log.id == "pg-log-49")
         );
     }
 }
