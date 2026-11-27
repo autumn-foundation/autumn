@@ -451,6 +451,22 @@ fn parse_explicit<'c>(
                 (r.property, Some((nested, sub.property)))
             }
         };
+        // Two pairs on one property would write it twice, and the second
+        // value would replace the first. A direct pair and a nested pair on
+        // the same property conflict too.
+        let (property, sub) = target;
+        if let Some((other, _)) = out.iter().find(|(_, (p, s)): &(&&str, &Target)| {
+            p.name == property.name
+                && match (s, sub) {
+                    (Some((_, a)), Some((_, b))) => a.name == b.name,
+                    _ => true,
+                }
+        }) {
+            return Err(GenerateError::Config(format!(
+                "`--schema-org-map {pair}`: column `{other}` is already mapped to \
+                 `{path}`. Map each property once."
+            )));
+        }
         out.insert(col.name.as_str(), target);
     }
     Ok(out)
@@ -902,6 +918,35 @@ mod tests {
         assert!(err("cost=nmae").contains("Did you mean `name`"));
         assert!(err("cost=offers").contains("one column cannot hold"));
         assert!(err("cost=sku.x").contains("not a node"));
+        let cols = columns(&["name:String", "label:String", "cost:money", "price:money"]);
+        let conflict = |pairs: &[&str]| {
+            let pairs: Vec<String> = pairs.iter().map(|p| (*p).to_owned()).collect();
+            bind(ty("Product"), &cols, &pairs)
+                .expect_err("conflict")
+                .to_string()
+        };
+        let msg = conflict(&["name=name", "label=name"]);
+        assert!(
+            msg.contains("column `name` is already mapped to `name`"),
+            "{msg}"
+        );
+        let msg = conflict(&["cost=offers.price", "price=offers.price"]);
+        assert!(msg.contains("already mapped"), "{msg}");
+        let msg = conflict(&["cost=offers.price", "price=offers"]);
+        assert!(
+            msg.contains("already mapped") || msg.contains("one column cannot hold"),
+            "{msg}"
+        );
+        // Two different properties of one nested node do not conflict.
+        bind(
+            ty("Product"),
+            &columns(&["cost:money", "currency:String"]),
+            &[
+                "cost=offers.price".to_owned(),
+                "currency=offers.priceCurrency".to_owned(),
+            ],
+        )
+        .expect("distinct nested properties");
     }
 
     #[test]
