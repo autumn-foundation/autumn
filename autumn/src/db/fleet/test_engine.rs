@@ -225,3 +225,72 @@ impl FleetEngine for TextEngine {
         std::fs::write(path, format!("{}\n0\nrebuilt\n", key.name())).map_err(io("rebuild"))
     }
 }
+
+/// The `WARN` events of this thread while the value lives. Use it in a
+/// current-thread test: other threads are not captured.
+pub struct Warnings {
+    messages: Arc<std::sync::Mutex<Vec<String>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl std::fmt::Debug for Warnings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.messages().iter()).finish()
+    }
+}
+
+impl Warnings {
+    /// Starts the capture.
+    pub fn capture() -> Self {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = WarnLayer(Arc::clone(&messages));
+        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        Self {
+            messages,
+            _guard: guard,
+        }
+    }
+
+    /// The messages captured so far.
+    pub fn messages(&self) -> Vec<String> {
+        self.messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many messages hold `needle`.
+    pub fn matching(&self, needle: &str) -> usize {
+        self.messages()
+            .iter()
+            .filter(|message| message.contains(needle))
+            .count()
+    }
+}
+
+struct WarnLayer(Arc<std::sync::Mutex<Vec<String>>>);
+
+struct MessageField<'a>(&'a mut String);
+
+impl tracing::field::Visit for MessageField<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            *self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut message = String::new();
+        event.record(&mut MessageField(&mut message));
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(message);
+    }
+}

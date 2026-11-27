@@ -257,5 +257,15 @@ const fn control_store(_: &AppState) -> Option<Arc<dyn SlotOwnershipStore>> {
     None
 }
 
+#[cfg(feature = "sqlite")]
+mod replication;
+
+#[cfg(feature = "sqlite")]
+pub(crate) use replication::ReplicaSource;
+#[cfg(all(test, feature = "sqlite"))]
+pub(crate) use replication::replicated_state;
+#[cfg(feature = "sqlite")]
+pub use replication::{InstallReplicationError, ReplicationInstall, install_replication};
+
 #[cfg(test)]
 mod tests;

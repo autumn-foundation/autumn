@@ -334,6 +334,15 @@ Step 3 changed this section in these ways:
   lapsed lease with no newer epoch keeps it. `DatabaseFleet::release_ownership` counts
   it as unshipped, so the ranges lapse. `verification/fleet_generations.rs`
   models the record and `may_release`.
+- Core installed replication at boot only for the fleet of
+  `[database.fleet]`. A fleet from `DatabaseFleet::with_engine` had a
+  replica only when its plugin built one. Now core keeps what
+  `[replication]` built in the app state, and
+  `autumn_web::fleet::install_replication` connects any fleet to it. Core
+  calls it for the `SQLite` fleet too. One replica root holds one fleet.
+  A fleet with ownership and no replica logs one warning, at boot or at its
+  first open. `verification/fleet_replication_install.rs` models the
+  installer and the warning.
 
 #### 6. `LakeSink`
 

@@ -5022,15 +5022,16 @@ impl AppBuilder {
                     ) {
                         tracing::warn!("{e}");
                     }
-                    // A SQLite fleet (ADR 0019 §5) ships each of its databases
-                    // next to the control database, through the same destination.
+                    // Each fleet (ADR 0019 §5) ships its databases next to the
+                    // control database, through the same destination. Before the
+                    // startup hooks: an engine plugin installs from there.
                     #[cfg(feature = "sqlite")]
-                    if let Err(e) =
-                        start_fleet_replication(&state, &config, &runtime, fleet_lag_alert_after)
-                    {
-                        tracing::error!("SQLite fleet replication could not start: {e}");
-                        std::process::exit(1);
-                    }
+                    crate::fleet::ReplicaSource::from_runtime(
+                        &runtime,
+                        fleet_lag_alert_after,
+                        std::time::Duration::from_secs(config.server.shutdown_timeout_secs),
+                    )
+                    .install(&state);
                     replication_worker = Some(runtime.replicator);
                 }
                 Ok(Err(crate::replication::SetupError::Disabled)) => {}
@@ -5048,6 +5049,15 @@ impl AppBuilder {
                     std::process::exit(1);
                 }
             }
+        }
+        // With `[replication]` off this installs nothing, and warns for a
+        // fleet with ownership.
+        #[cfg(feature = "sqlite")]
+        if let Err(e) = start_fleet_replication(&state, &config) {
+            tracing::error!("SQLite fleet replication could not start: {e}");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
         }
 
         // Registered before the router is built so `/actuator/health` includes it.
@@ -13392,31 +13402,21 @@ async fn setup_database(
             if config.database.fleet.is_some() {
                 fleet_control_target_identified(custom_pool_provider, topology.migration_url())?;
             }
-            crate::db::fleet::build_for_app(config, topology.migration_url(), &migrations)?
-            .map_or(shards, |fleet| {
-                tracing::info!(
-                    mode = %fleet.mode(),
-                    root = %fleet.root().display(),
-                    max_open = fleet.max_open(),
-                    "SQLite database fleet ready"
-                );
-                if config
-                    .database
-                    .fleet
-                    .as_ref()
-                    .is_some_and(|f| f.restore_missing)
-                    && !config.replication.as_ref().is_some_and(|r| r.enabled)
-                {
-                    tracing::warn!(
-                        "database.fleet.restore_missing is set but [replication] is off; there is \
-                         no replica to restore a missing database from"
+            crate::db::fleet::build_for_app(config, topology.migration_url(), &migrations)?.map_or(
+                shards,
+                |fleet| {
+                    tracing::info!(
+                        mode = %fleet.mode(),
+                        root = %fleet.root().display(),
+                        max_open = fleet.max_open(),
+                        "SQLite database fleet ready"
                     );
-                }
-                Some(crate::sharding::ShardSet::from_fleet(
-                    fleet,
-                    topology.primary().clone(),
-                ))
-            })
+                    Some(crate::sharding::ShardSet::from_fleet(
+                        fleet,
+                        topology.primary().clone(),
+                    ))
+                },
+            )
         }
         _ => shards,
     };
@@ -13933,98 +13933,21 @@ async fn start_fleet_runtime(
     })
 }
 
-/// Replicate every database of the app's fleet next to the control database
-/// (ADR 0019 §5): installs the lifecycle hooks, registers the
-/// `replication:fleet` indicator and starts the loop thread. A no-op without a
-/// fleet.
+/// Replicate every database of the app's `SQLite` fleet next to the control
+/// database (ADR 0019 §5), with the installer an engine plugin calls. A
+/// no-op without a fleet.
 #[cfg(feature = "sqlite")]
 fn start_fleet_replication(
     state: &AppState,
     config: &AutumnConfig,
-    runtime: &crate::replication::ReplicationRuntime,
-    lag_alert_after: std::time::Duration,
-) -> Result<(), String> {
-    let Some(fleet) = state.shards().and_then(crate::sharding::ShardSet::fleet) else {
+) -> Result<(), crate::fleet::InstallReplicationError> {
+    let (Some(fleet), Some(fleet_config)) = (
+        state.shards().and_then(crate::sharding::ShardSet::fleet),
+        config.database.fleet.as_ref(),
+    ) else {
         return Ok(());
     };
-    let restore_missing = config
-        .database
-        .fleet
-        .as_ref()
-        .is_some_and(|f| f.restore_missing);
-    if restore_missing
-        && config
-            .database
-            .fleet
-            .as_ref()
-            .is_some_and(|f| f.ownership.is_none())
-    {
-        tracing::warn!(
-            "database.fleet.restore_missing is on without [database.fleet.ownership]: nothing \
-             fences the previous owner, so two hosts can write one database and diverge"
-        );
-    }
-    let fleet_config = config.database.fleet.as_ref();
-    let mut replication = crate::db::fleet_replication::FleetReplication::new(
-        Arc::clone(runtime.replicator.destination()),
-        runtime.settings.clone(),
-        lag_alert_after,
-        restore_missing,
-        state.clock_arc(),
-    )
-    // The server path sets a tighter cutoff from the budget left.
-    .with_final_flush(std::time::Duration::from_secs(
-        config.server.shutdown_timeout_secs,
-    ))
-    // Issue #3235: a deleted database's replica goes with it.
-    .with_retention_after_delete(fleet_config.map_or(std::time::Duration::ZERO, |f| {
-        f.replica_retention_after_delete
-    }))
-    // The check downloads whole databases, so it needs its own capability.
-    .with_restore_check(
-        runtime.settings.verify_interval,
-        if state.capabilities().restore_check {
-            fleet_config.map_or(0, |f| f.restore_check_sample)
-        } else {
-            0
-        },
-    )
-    .with_entropy(state.entropy_arc())
-    .with_ship_workers(
-        fleet_config.map_or(crate::db::fleet_replication::DEFAULT_SHIP_WORKERS, |f| {
-            f.replication_workers
-        }),
-    );
-    if let Some(control) = state.pool() {
-        replication = replication.with_tombstones(Arc::new(
-            crate::db::fleet_tombstones::FleetTombstones::new(control.clone(), state.clock_arc()),
-        ));
-    } else {
-        tracing::warn!(
-            "SQLite fleet replication has no control database: a failed purge of a deleted \
-             database's replica is not retried"
-        );
-    }
-    let replication = Arc::new(replication);
-    fleet
-        .install_replication(Arc::clone(&replication))
-        .map_err(|_| "the fleet already replicates".to_owned())?;
-    if let Err(e) = state.health_indicator_registry.register(
-        crate::db::fleet_replication::FLEET_REPLICATION_INDICATOR,
-        crate::actuator::IndicatorGroup::HealthOnly,
-        replication.indicator(),
-    ) {
-        tracing::warn!("{e}");
-    }
-    replication
-        .spawn_loop()
-        .map_err(|e| format!("could not start the fleet replication thread: {e}"))?;
-    tracing::info!(
-        prefix = %format!("{}/fleet/", runtime.settings.root),
-        restore_missing,
-        "SQLite fleet replication is enabled"
-    );
-    Ok(())
+    crate::fleet::install_replication(state, fleet, fleet_config).map(|_| ())
 }
 
 /// Runs the durable commit-hook worker of each open fleet database, and stops
@@ -16509,23 +16432,54 @@ mod fleet_boot_tests {
         .await
         .unwrap()
         .expect("a file destination builds");
-        let lag = std::time::Duration::from_secs(30);
+        crate::fleet::ReplicaSource::from_runtime(
+            &runtime,
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(5),
+        )
+        .install(&state);
 
-        start_fleet_replication(&state, &config, &runtime, lag).unwrap();
+        start_fleet_replication(&state, &config).unwrap();
         assert!(fleet.replicating());
         assert!(
             state
                 .health_indicator_registry()
                 .contains(crate::db::fleet_replication::FLEET_REPLICATION_INDICATOR)
         );
-        let again = start_fleet_replication(&state, &config, &runtime, lag).unwrap_err();
-        assert!(again.contains("already replicates"), "{again}");
+        let again = start_fleet_replication(&state, &config).unwrap_err();
+        assert!(again.to_string().contains("already replicates"), "{again}");
         if let Some(replication) = fleet.replication() {
             replication.stop();
         }
 
-        start_fleet_replication(&AppState::for_test(), &config, &runtime, lag)
+        start_fleet_replication(&AppState::for_test(), &config)
             .expect("no fleet, nothing to replicate");
+    }
+
+    /// `[database.fleet.ownership]` with `[replication]` off: the boot logs one
+    /// warning, and installs nothing.
+    #[tokio::test]
+    async fn fleet_ownership_without_replication_warns_once_at_boot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut config, fleet, state) = booted(tmp.path());
+        if let Some(fleet_config) = config.database.fleet.as_mut() {
+            fleet_config.ownership = Some(crate::config::FleetOwnershipConfig {
+                owner: "host-a".to_owned(),
+                slots: Vec::new(),
+                lease_secs: 30,
+            });
+        }
+        let warnings = crate::db::fleet::test_engine::Warnings::capture();
+
+        start_fleet_replication(&state, &config).unwrap();
+        start_fleet_replication(&state, &config).unwrap();
+
+        assert!(!fleet.replicating());
+        assert_eq!(
+            warnings.matching(crate::db::fleet::UNREPLICATED_WARNING),
+            1,
+            "{warnings:?}"
+        );
     }
 
     /// `AUTUMN_MIGRATE=1` on a fleet app migrates every database on disk and

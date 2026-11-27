@@ -651,3 +651,19 @@ It proves these rules:
 The model does not include the token check, the host parse or capsule replay.
 The tests in `autumn/tests/integration/tenancy_header_trust.rs` cover the
 runtime.
+
+## Fleet replication installer
+
+`fleet_replication_install.rs` models `install_replication` in
+`autumn/src/fleet/replication.rs` and `DatabaseFleet::warn_if_unreplicated`
+in `autumn/src/db/fleet.rs`. Verify it with:
+
+```sh
+verus verification/fleet_replication_install.rs
+```
+
+It proves four rules. A fleet logs the unreplicated warning at most once.
+Only ownership, no replica and an engine not in `Rebuild` mode cause it.
+With `[replication]` on, an install connects the fleet or refuses. One
+replica root holds one fleet. The tests in `autumn/src/fleet/replication/`
+check the runtime.

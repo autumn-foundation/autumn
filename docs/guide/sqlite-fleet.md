@@ -564,7 +564,8 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
   opening it. A host with an empty volume takes over a tenant or a slot range
   by serving it. Turn on [slot ownership](#failover-slot-ownership) with it:
   without ownership, nothing stops the previous owner, and the two copies
-  diverge. Boot logs a warning for `restore_missing` without ownership.
+  diverge. Boot logs a warning for `restore_missing` without ownership, and
+  for ownership without `[replication]`.
   The restored database holds what the previous owner shipped, and no more.
   A write it committed after its last sync is not in the replica, even if the
   request already returned success. So a takeover after a crash loses the
@@ -1085,6 +1086,9 @@ errors.
   of `fleet_ownership_store`, else the SQL store of the control database.
   Give it to `FleetOwnership::new`, then call `DatabaseFleet::start_ownership`
   and `DatabaseFleet::spawn_ownership` before the first request.
+- **Replication.** Call `autumn_web::fleet::install_replication` before the
+  first request too. Without it, a standby that takes over opens empty
+  databases. See [Shipping a plugin engine](#shipping-a-plugin-engine).
 
 ### Sidecar engines
 
@@ -1122,11 +1126,39 @@ storage. Core does every write to the replica. The engine only gives files.
 | `Generations { every }` | Takes a `snapshot` every `every` and at close. Ships only the files whose SHA-256 is not in the previous generation. | `every` |
 | `Rebuild` | Ships nothing. `restore_latest` calls `FleetEngine::rebuild`. | none |
 
-Install replication as for `SQLite`:
-`fleet.install_replication(Arc::new(FleetReplication::new(..)))`. The mode
-decides what it starts. Replication needs the `sqlite` feature: it keeps
-the tombstones on the `SQLite` control database. `FleetStats` and the `replication:fleet` health
-indicator report `ship_mode` and the RPO (`rpo_secs`, `rpo_seconds`).
+Connect the fleet to `[replication]` at boot with
+`autumn_web::fleet::install_replication`. Call it from the plugin's
+`on_startup` hook, after `DatabaseFleet::with_engine` and before the first
+open. Give it the section the fleet was built from:
+
+```rust,ignore
+let fleet = DatabaseFleet::with_engine(&config, DuckDbEngine::new())?;
+autumn_web::fleet::install_replication(&state, &fleet, &config)?;
+state.insert_extension(fleet);
+```
+
+It is the same code core uses for the `SQLite` fleet of `[database.fleet]`:
+
+- It reads `restore_missing`, `replica_retention_after_delete`,
+  `restore_check_sample` and `replication_workers` from the section.
+- It keeps the tombstones on the control database.
+- It registers the `replication:fleet` health indicator and starts the loop.
+- With `[replication]` off it installs nothing and returns
+  `ReplicationInstall::NoReplication`.
+- One replica root holds one fleet. A second fleet gets
+  `InstallReplicationError::RootInUse`: two fleets with one tenant id would
+  write the same keys.
+
+The mode decides what it starts. Replication needs the `sqlite` feature: it
+keeps the tombstones on the `SQLite` control database. `FleetStats` and the
+`replication:fleet` health indicator report `ship_mode` and the RPO
+(`rpo_secs`, `rpo_seconds`). For a replica of your own, build a
+`FleetReplication` and call `fleet.install_replication` instead.
+
+A fleet with ownership and no replica logs one warning: a standby that
+takes over opens empty databases. The installer logs it at boot. A fleet
+whose plugin never calls the installer logs it at its first open. A
+`Rebuild` engine has no replica, and logs no warning.
 
 A generation of `Generations` mode is these objects:
 

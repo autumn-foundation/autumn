@@ -23,8 +23,9 @@
 //! | `fleet-epoch-stamp` | `epoch_stamp` reports another epoch than the open stamped. Skipped when the engine reports none. |
 //!
 //! Each check uses its own fleet root under the scratch directory. The ship
-//! checks need a fixture that installs replication
-//! (`DatabaseFleet::install_replication`, with the `sqlite` feature).
+//! checks need a fixture that installs replication, with the `sqlite`
+//! feature: `autumn_web::fleet::install_replication` as at boot, or
+//! `DatabaseFleet::install_replication` for a replica of the fixture's own.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
