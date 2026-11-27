@@ -131,137 +131,79 @@ pub fn audit_html(source: &str, html: &str) -> PageReport {
 }
 
 /// The text of each `<script type="application/ld+json">` element of `html`,
-/// in order. The match on the tag and the type ignores ASCII case, and the
-/// type may carry parameters (`application/ld+json; charset=utf-8`).
+/// in order, trimmed. The type may carry parameters
+/// (`application/ld+json; charset=utf-8`) and matches in any ASCII case.
+///
+/// The page goes through the WHATWG HTML tokenizer, with the same raw-text
+/// switches the tree builder makes: `<script>` text is script data, and
+/// `<textarea>`/`<title>` (RCDATA) and `<style>`, `<xmp>`, `<iframe>`,
+/// `<noembed>`, `<noframes>` (raw text) hold no tags. So a `<script>` inside a
+/// comment, an attribute value or a `<textarea>` is text, and only a real
+/// `</script>` end tag ends a block.
 #[must_use]
-pub fn extract_blocks(html: &str) -> Vec<&str> {
-    let lower = html.to_ascii_lowercase();
-    let mut out = Vec::new();
-    let mut at = 0;
-    while let Some(open) = next_tag(&lower, at, "<script") {
-        // An HTML comment is skipped whole: a `<script` inside it is text.
-        if lower[open..].starts_with("<!--") {
-            let Some(end) = lower[open + 4..].find("-->") else {
-                break;
-            };
-            at = open + 4 + end + 3;
-            continue;
-        }
-        let after_name = open + "<script".len();
-        let Some(tag_end) = tag_end(&lower, after_name) else {
-            break;
-        };
-        let attrs = &lower[after_name..tag_end];
-        let body_start = tag_end + 1;
-        let Some(body_end) = next_name_boundary(&lower, body_start, "</script") else {
-            break;
-        };
-        if script_type(attrs).is_some_and(|t| {
-            t.split(';')
-                .next()
-                .is_some_and(|m| m.trim() == "application/ld+json")
-        }) {
-            out.push(html[body_start..body_end].trim());
-        }
-        at = body_end + "</script".len();
-    }
-    out
+pub fn extract_blocks(html: &str) -> Vec<String> {
+    use html5ever::tokenizer::{BufferQueue, Tokenizer, TokenizerOpts};
+    let queue = BufferQueue::default();
+    queue.push_back(html5ever::tendril::StrTendril::from_slice(html));
+    let tokenizer = Tokenizer::new(JsonLdSink::default(), TokenizerOpts::default());
+    let _ = tokenizer.feed(&queue);
+    tokenizer.end();
+    tokenizer.sink.blocks.take()
 }
 
-/// The next `<!--` or `marker` (a tag name, ended by a boundary) at or after
-/// `from`, whichever comes first.
-fn next_tag(lower: &str, from: usize, marker: &str) -> Option<usize> {
-    let tag = next_name_boundary(lower, from, marker);
-    let comment = lower[from..].find("<!--").map(|i| from + i);
-    match (tag, comment) {
-        (Some(t), Some(c)) => Some(t.min(c)),
-        (t, c) => t.or(c),
-    }
+/// Collects the text of JSON-LD script elements as the tokenizer emits it.
+#[derive(Default)]
+struct JsonLdSink {
+    /// The finished blocks.
+    blocks: std::cell::RefCell<Vec<String>>,
+    /// The text of the JSON-LD script being read, if any.
+    current: std::cell::RefCell<Option<String>>,
 }
 
-/// The next `marker` at or after `from` whose tag name ends there: the byte
-/// after it is whitespace, `>` or `/`, or the input ends. `</scripture>` is
-/// not `</script`.
-fn next_name_boundary(lower: &str, from: usize, marker: &str) -> Option<usize> {
-    let mut at = from;
-    while let Some(rel) = lower[at..].find(marker) {
-        let start = at + rel;
-        let after = start + marker.len();
-        match lower.as_bytes().get(after) {
-            None => return Some(start),
-            Some(b) if b.is_ascii_whitespace() || matches!(b, b'>' | b'/') => {
-                return Some(start);
-            }
-            Some(_) => at = after,
-        }
-    }
-    None
-}
+impl html5ever::tokenizer::TokenSink for JsonLdSink {
+    type Handle = ();
 
-/// The index of the `>` that ends the tag whose attributes start at `from`.
-/// A `>` inside a quoted attribute value does not end the tag.
-fn tag_end(html: &str, from: usize) -> Option<usize> {
-    let mut quote: Option<u8> = None;
-    for (i, b) in html.bytes().enumerate().skip(from) {
-        if let Some(q) = quote {
-            if b == q {
-                quote = None;
-            }
-        } else if matches!(b, b'"' | b'\'') {
-            quote = Some(b);
-        } else if b == b'>' {
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// The `type` attribute value in a lowercased attribute string.
-fn script_type(attrs: &str) -> Option<&str> {
-    let bytes = attrs.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
-            i += 1;
-        }
-        let name_start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'=' | b'/')
-        {
-            i += 1;
-        }
-        let name = &attrs[name_start..i];
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == b'=' {
-            i += 1;
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            let value = if i < bytes.len() && matches!(bytes[i], b'"' | b'\'') {
-                let quote = bytes[i];
-                let start = i + 1;
-                let end = attrs[start..]
-                    .bytes()
-                    .position(|b| b == quote)
-                    .map_or(attrs.len(), |p| start + p);
-                i = (end + 1).min(attrs.len());
-                &attrs[start..end]
-            } else {
-                let start = i;
-                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-                    i += 1;
+    fn process_token(
+        &self,
+        token: html5ever::tokenizer::Token,
+        _line_number: u64,
+    ) -> html5ever::tokenizer::TokenSinkResult<()> {
+        use html5ever::tokenizer::states::RawKind;
+        use html5ever::tokenizer::{TagKind, Token, TokenSinkResult};
+        match token {
+            Token::TagToken(tag) if tag.kind == TagKind::StartTag => match &*tag.name {
+                "script" => {
+                    let json_ld = tag.attrs.iter().any(|a| {
+                        &*a.name.local == "type"
+                            && a.value.split(';').next().is_some_and(|m| {
+                                m.trim().eq_ignore_ascii_case("application/ld+json")
+                            })
+                    });
+                    *self.current.borrow_mut() = json_ld.then(String::new);
+                    TokenSinkResult::RawData(RawKind::ScriptData)
                 }
-                &attrs[start..i]
-            };
-            if name == "type" {
-                return Some(value.trim());
+                "textarea" | "title" => TokenSinkResult::RawData(RawKind::Rcdata),
+                "style" | "xmp" | "iframe" | "noembed" | "noframes" => {
+                    TokenSinkResult::RawData(RawKind::Rawtext)
+                }
+                "plaintext" => TokenSinkResult::Plaintext,
+                _ => TokenSinkResult::Continue,
+            },
+            Token::TagToken(tag) if tag.kind == TagKind::EndTag && &*tag.name == "script" => {
+                if let Some(text) = self.current.borrow_mut().take() {
+                    self.blocks.borrow_mut().push(text.trim().to_owned());
+                }
+                TokenSinkResult::Continue
             }
-        } else if name.is_empty() {
-            i += 1;
+            Token::CharacterTokens(text) => {
+                if let Some(current) = self.current.borrow_mut().as_mut() {
+                    current.push_str(&text);
+                }
+                TokenSinkResult::Continue
+            }
+            _ => TokenSinkResult::Continue,
         }
     }
-    None
 }
 
 struct Ctx<'a> {
@@ -1166,6 +1108,23 @@ mod tests {
         assert!(audit_html("page", &html).findings.is_empty());
         // `<scripts>` is not a script element either.
         assert!(extract_blocks("<scripts type=\"application/ld+json\">{}</scripts>").is_empty());
+    }
+
+    #[test]
+    fn a_script_inside_rcdata_rawtext_or_an_attribute_is_text() {
+        let html = "<textarea><script></textarea>\
+                    <title><script></title>\
+                    <style>p::after{content:\"<script>\"}</style>\
+                    <a title=\"<script>\">x</a>\
+                    <script type=\"application/ld+json\">{bad json}</script>";
+        assert_eq!(extract_blocks(html), vec!["{bad json}"]);
+        assert_eq!(audit_html("page", html).findings[0].rule, "invalid-json");
+    }
+
+    #[test]
+    fn a_json_ld_type_attribute_in_another_tag_is_not_a_block() {
+        let html = "<div type=\"application/ld+json\">{}</div><textarea><script type=\"application/ld+json\">{}</script></textarea>";
+        assert!(extract_blocks(html).is_empty());
     }
 
     #[test]

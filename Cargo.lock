@@ -688,6 +688,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "hmac 0.13.0",
+ "html5ever",
  "include_dir",
  "indicatif",
  "jiff 1.0.0",
