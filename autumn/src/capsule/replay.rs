@@ -1373,6 +1373,21 @@ fn describe_outcome(outcome: &CapsuleOutcome) -> String {
 mod tests {
     use super::*;
 
+    // Capture writes `format!("{:?}", version)`. Replay must read every version back,
+    // HTTP/3 included.
+    #[test]
+    fn every_captured_http_version_replays_as_itself() {
+        for version in [
+            Version::HTTP_09,
+            Version::HTTP_10,
+            Version::HTTP_11,
+            Version::HTTP_2,
+            Version::HTTP_3,
+        ] {
+            assert_eq!(parse_version(&format!("{version:?}")), version);
+        }
+    }
+
     fn status(code: u16) -> CapsuleOutcome {
         CapsuleOutcome::Status {
             code,

@@ -203,6 +203,10 @@ pub mod heavy_hitters;
 pub mod hedge;
 #[cfg(feature = "db")]
 pub mod hooks;
+/// [`http3`] — serve HTTP/3 over QUIC beside the `[server.tls]` listener.
+/// Gated behind the off-by-default `http3` feature.
+#[cfg(feature = "http3")]
+pub mod http3;
 pub mod http_server;
 #[cfg(feature = "i18n")]
 pub mod i18n;

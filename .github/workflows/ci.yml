@@ -1419,6 +1419,7 @@ jobs:
             system-tests,
             redis-tls,
             tls,
+            http3,
             acme,
             sla,
             repl,
@@ -1701,6 +1702,24 @@ jobs:
           cargo test -p autumn-web --features "tls,ws,test-support" \
             --test integration_tests custom_domains:: | tee "${RUNNER_TEMP}/custom-domains.log"
           assert_ran "${RUNNER_TEMP}/custom-domains.log" "custom_domains"
+      - name: Run HTTP/3 tests
+        if: matrix.lane == 'http3'
+        # `http3` is not a default feature, so no other lane compiles the
+        # QUIC listener or its suite. The suite talks to the real listener
+        # with an in-process h3-quinn client: no Docker, no `curl --http3`.
+        # `assert_ran` fails the step when a filter matches no test.
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features "http3,test-support" --lib -- http3:: tls::tests::quic \
+            | tee "${RUNNER_TEMP}/http3-lib.log"
+          assert_ran "${RUNNER_TEMP}/http3-lib.log" "autumn-web http3 unit tests"
+          cargo test -p autumn-web --features "http3,test-support" \
+            --test integration_tests http3_serving:: | tee "${RUNNER_TEMP}/http3-serving.log"
+          assert_ran "${RUNNER_TEMP}/http3-serving.log" "http3_serving"
       - name: Run ACME-gated tests (certificate provisioning + renewal)
         if: matrix.lane == 'acme'
         # `acme` is not a default feature either, so the `test` job's workspace

@@ -5430,6 +5430,18 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
+        // `[server.http3]` needs the `http3` feature, or UDP would stay closed and
+        // `Alt-Svc` unsent with no sign of why.
+        #[cfg(not(feature = "http3"))]
+        if config.server.http3.enabled {
+            tracing::error!(
+                "[server.http3] enabled = true but this binary was built without the `http3` \
+                 feature; rebuild with `--features http3`, or set enabled = false"
+            );
+            exit_stop_managed_pg();
+            std::process::exit(1);
+        }
+
         // Fail before binding if `[server.tls]` is set but the build lacks `tls`
         // (it would serve plain HTTP on a port expected to be HTTPS), or if TLS is
         // combined with a Unix socket (TLS terminates on `host:port`).
@@ -5487,6 +5499,12 @@ impl AppBuilder {
 
         #[cfg(feature = "acme")]
         let mut acme_bind_state: Option<AcmeBindState> = None;
+
+        // The TLS parts and TCP address an HTTP/3 listener binds from.
+        #[cfg(feature = "http3")]
+        let mut http3_tls_parts: Option<crate::tls::ServerTlsParts> = None;
+        #[cfg(feature = "http3")]
+        let mut http3_tcp_addr: Option<std::net::SocketAddr> = None;
 
         // The resolved address as the readiness protocol spells it
         // (`<transport> <address>`); the supervisor writes it to its address
@@ -5584,6 +5602,10 @@ impl AppBuilder {
             }
             let configured_addr = format!("{}:{}", config.server.host, config.server.port);
             let listener = bind_or_adopt_tcp_listener(&configured_addr).await;
+            #[cfg(feature = "http3")]
+            {
+                http3_tcp_addr = listener.local_addr().ok();
+            }
             // Report the actual address: an inherited socket (#1674) keeps its
             // port, and `server.port = 0` resolves to an ephemeral one.
             let addr = listener
@@ -5612,8 +5634,14 @@ impl AppBuilder {
                         )
                         .await
                         {
-                            Ok((tls_listener, bind_state)) => {
+                            Ok((tls_listener, bind_state, parts)) => {
                                 acme_bind_state = Some(bind_state);
+                                #[cfg(feature = "http3")]
+                                {
+                                    http3_tls_parts = Some(parts);
+                                }
+                                #[cfg(not(feature = "http3"))]
+                                let _ = parts;
                                 (
                                     BoundListener::Tls(tls_listener),
                                     format!("https://{addr} (ACME)"),
@@ -5629,9 +5657,15 @@ impl AppBuilder {
                         }
                     } else {
                         match build_tls_listener(listener, tls_cfg, server_shutdown.child_token()) {
-                            Ok((tls_listener, reload, client_reload)) => {
+                            Ok((tls_listener, reload, client_reload, parts)) => {
                                 tls_reload_state = Some(reload);
                                 client_trust_reload = client_reload;
+                                #[cfg(feature = "http3")]
+                                {
+                                    http3_tls_parts = Some(parts);
+                                }
+                                #[cfg(not(feature = "http3"))]
+                                let _ = parts;
                                 (
                                     BoundListener::Tls(tls_listener),
                                     format!("https://{addr}"),
@@ -5648,9 +5682,15 @@ impl AppBuilder {
                     }
                     #[cfg(not(feature = "acme"))]
                     match build_tls_listener(listener, tls_cfg, server_shutdown.child_token()) {
-                        Ok((tls_listener, reload, client_reload)) => {
+                        Ok((tls_listener, reload, client_reload, parts)) => {
                             tls_reload_state = Some(reload);
                             client_trust_reload = client_reload;
+                            #[cfg(feature = "http3")]
+                            {
+                                http3_tls_parts = Some(parts);
+                            }
+                            #[cfg(not(feature = "http3"))]
+                            let _ = parts;
                             (
                                 BoundListener::Tls(tls_listener),
                                 format!("https://{addr}"),
@@ -5672,6 +5712,22 @@ impl AppBuilder {
             {
                 (BoundListener::Tcp(listener), addr, None)
             }
+        };
+
+        // HTTP/3 binds now, beside the TLS listener, so a UDP problem fails the boot.
+        #[cfg(feature = "http3")]
+        let http3_bound = match (http3_tls_parts.take(), http3_tcp_addr) {
+            (Some(parts), Some(tcp_addr)) if config.server.http3.enabled => {
+                match bind_http3_listener(&config, tcp_addr, &parts) {
+                    Ok(bound) => Some(bound),
+                    Err(e) => {
+                        tracing::error!("Failed to start [server.http3]: {e}");
+                        exit_stop_managed_pg();
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ => None,
         };
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
@@ -6157,6 +6213,18 @@ impl AppBuilder {
                 let handoff = http_limits
                     .max_connections
                     .and_then(|max| listener.limit_connections(max));
+                // h3 serves the same service, with the same serve-boundary layers.
+                // TCP responses advertise it with `Alt-Svc`.
+                #[cfg(feature = "http3")]
+                let (http3_task, alt_svc) = match http3_bound {
+                    Some((h3_listener, alt_svc)) => (
+                        Some(h3_listener.serve(service.clone(), server_shutdown_wait.clone())),
+                        Some(alt_svc),
+                    ),
+                    None => (None, None),
+                };
+                #[cfg(feature = "http3")]
+                let service = tower::Layer::layer(&tower::util::option_layer(alt_svc), service);
                 // The route-level mTLS requirement is not applied here but inside
                 // the router, so the MCP dispatch clone traverses it too. Only the
                 // identity plumbing belongs here: `ConnectInfo<TlsConnectInfo>`
@@ -6168,7 +6236,9 @@ impl AppBuilder {
                         crate::tls::TlsConnectInfo,
                     >(service);
                 Box::pin(async move {
-                    crate::http_server::serve_with_handoff(
+                    #[cfg(feature = "http3")]
+                    let http3_task = http3_task.map(tokio::spawn);
+                    let tcp_result = crate::http_server::serve_with_handoff(
                         crate::accept_drain::StopAcceptingOnShutdown::new(
                             listener,
                             server_shutdown_wait.clone(),
@@ -6178,7 +6248,17 @@ impl AppBuilder {
                         handoff,
                         crate::accept_drain::drain_signal(server_shutdown_wait),
                     )
-                    .await
+                    .await;
+                    // The drain waits for h3 requests too.
+                    #[cfg(feature = "http3")]
+                    if let Some(task) = http3_task {
+                        match task.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => tracing::error!(error = %e, "HTTP/3 listener failed"),
+                            Err(e) => tracing::error!(error = %e, "HTTP/3 listener task failed"),
+                        }
+                    }
+                    tcp_result
                 })
             }
         };
@@ -11371,6 +11451,7 @@ fn build_tls_listener(
         crate::tls::TlsListener,
         crate::tls::CertReloader,
         Option<crate::tls::client_auth::ClientTrustReloader>,
+        crate::tls::ServerTlsParts,
     ),
     crate::tls::TlsError,
 > {
@@ -11398,15 +11479,47 @@ fn build_tls_listener(
         std::time::Duration::from_secs(cfg.reload_interval_secs.max(1)),
     )?;
     let (client_verifier, client_reload) = build_client_auth(cfg, &provider)?;
-    let server_config = crate::tls::build_server_config_with_client_auth(
-        std::sync::Arc::clone(&provider),
-        std::sync::Arc::clone(&resolver) as std::sync::Arc<dyn rustls::server::ResolvesServerCert>,
+    // One set of parts, so an HTTP/3 listener serves the same certificate.
+    let parts = crate::tls::ServerTlsParts {
+        provider,
+        resolver: resolver as std::sync::Arc<dyn rustls::server::ResolvesServerCert>,
         client_verifier,
-    )?;
+    };
+    let server_config = parts.tcp_config()?;
     // A zero handshake timeout would drop every connection; clamp to one second.
     let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
-    Ok((listener, reload, client_reload))
+    Ok((listener, reload, client_reload, parts))
+}
+
+/// Bind the `[server.http3]` UDP listener next to the TLS listener on
+/// `tcp_addr`, and build the `Alt-Svc` layer for its port.
+#[cfg(feature = "http3")]
+fn bind_http3_listener(
+    config: &AutumnConfig,
+    tcp_addr: std::net::SocketAddr,
+    parts: &crate::tls::ServerTlsParts,
+) -> Result<(crate::http3::Http3Listener, crate::http3::AltSvcLayer), String> {
+    let h3 = &config.server.http3;
+    let udp_addr = std::net::SocketAddr::new(tcp_addr.ip(), h3.effective_port(tcp_addr.port()));
+    let handshake = config
+        .server
+        .tls
+        .as_ref()
+        .map_or(10, |tls| tls.handshake_timeout_secs);
+    let settings = crate::http3::Http3Settings::from_config(
+        h3,
+        &crate::http_server::HttpLimits::from(&config.server.http),
+    )
+    .with_handshake_timeout(std::time::Duration::from_secs(handshake));
+    let tls = parts.quic_config().map_err(|e| e.to_string())?;
+    let listener =
+        crate::http3::Http3Listener::bind(udp_addr, tls, settings).map_err(|e| e.to_string())?;
+    let bound = listener.local_addr().map_err(|e| e.to_string())?;
+    let alt_svc =
+        crate::http3::AltSvcLayer::for_port(h3, bound.port()).map_err(|e| e.to_string())?;
+    tracing::info!(udp = %bound, "HTTP/3 listening");
+    Ok((listener, alt_svc))
 }
 
 /// The mTLS wiring `build_client_auth` hands back: the verifier the listener
@@ -11510,7 +11623,14 @@ async fn build_acme_tls_listener(
     https_port: u16,
     status: Option<crate::acme::renewal::AcmeStatus>,
     shutdown: tokio_util::sync::CancellationToken,
-) -> Result<(crate::tls::TlsListener, AcmeBindState), String> {
+) -> Result<
+    (
+        crate::tls::TlsListener,
+        AcmeBindState,
+        crate::tls::ServerTlsParts,
+    ),
+    String,
+> {
     use crate::acme::store::{AcmeStore, CertId, FsAcmeStore};
 
     let provider = crate::tls::crypto_provider();
@@ -11632,12 +11752,13 @@ async fn build_acme_tls_listener(
     // request a client certificate: it would fail open.
     let (client_verifier, client_reload) =
         build_client_auth(tls_cfg, &provider).map_err(|e| e.to_string())?;
-    let server_config = crate::tls::build_server_config_with_client_auth(
-        std::sync::Arc::clone(&provider),
-        cert_resolver,
+    // One set of parts, so an HTTP/3 listener serves the same certificate.
+    let parts = crate::tls::ServerTlsParts {
+        provider: std::sync::Arc::clone(&provider),
+        resolver: cert_resolver,
         client_verifier,
-    )
-    .map_err(|e| e.to_string())?;
+    };
+    let server_config = parts.tcp_config().map_err(|e| e.to_string())?;
     let handshake_timeout = std::time::Duration::from_secs(tls_cfg.handshake_timeout_secs.max(1));
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
 
@@ -11675,6 +11796,7 @@ async fn build_acme_tls_listener(
             custom_domains,
             client_trust_reload: client_reload,
         },
+        parts,
     ))
 }
 
@@ -19315,6 +19437,40 @@ mod tests {
     /// cancelled, so a stuck upload would hold the process open past the
     /// shutdown budget that is supposed to bound it.
     ///
+    /// h3 must serve the serve-boundary service (`TrustedProxiesLayer` around
+    /// `MethodOverrideLayer`), not the bare router. Without it, `_method=PUT`
+    /// breaks and forwarded headers are not resolved over h3. `Alt-Svc` must go
+    /// on the TCP service only, after the h3 clone.
+    #[test]
+    fn http3_serves_the_serve_boundary_service_and_tcp_advertises_it() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let server_source = &source[server_start..build_mode_start];
+        let boundary = server_source
+            .find("&crate::security::TrustedProxiesLayer::from_config(&config.security.trusted_proxies),")
+            .expect("the serve boundary wraps the router in TrustedProxiesLayer");
+        let h3_serve = server_source
+            .find("h3_listener.serve(service.clone(), server_shutdown_wait.clone())")
+            .expect("h3 serves a clone of the serve-boundary service");
+        let alt_svc = server_source
+            .find("tower::Layer::layer(&tower::util::option_layer(alt_svc), service)")
+            .expect("the TCP service gets the Alt-Svc layer");
+        assert!(boundary < h3_serve, "h3 must clone the layered service");
+        assert!(h3_serve < alt_svc, "Alt-Svc goes on TCP after the h3 clone");
+        let joined = server_source
+            .find("if let Some(task) = http3_task {")
+            .expect("the server task waits for the h3 task");
+        let drained = server_source
+            .find("let server_result = server_task.await")
+            .expect("the drain awaits the server task");
+        assert!(joined < drained, "the drain includes h3 requests");
+    }
+
     /// Source-order test in the house style, because the ordering is a property
     /// of this function and nothing smaller: an app-level boot test would need a
     /// `SQLite` runtime pool, which only exists in the `sqlite` lane.

@@ -1019,6 +1019,139 @@ pub fn check_tls_impl(data: &TlsDoctorData) -> CheckResult {
     }
 }
 
+/// The Linux `net.core.rmem_max` (bytes) that HTTP/3 needs.
+///
+/// quinn asks for a large UDP receive buffer. The Linux default (about
+/// 208 KiB) caps it, so quinn logs a warning and drops packets under load.
+pub const HTTP3_RMEM_MAX_RECOMMENDED: u64 = 7_500_000;
+
+/// The resolved `[server.http3]` state for [`check_http3_impl`]. Built
+/// offline from the merged config, the env, and `/proc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Http3DoctorData {
+    /// `[server.http3] enabled`.
+    pub enabled: bool,
+    /// `[server.tls]` (or a `AUTUMN_SERVER__TLS__*` env var) is set.
+    pub tls_configured: bool,
+    /// The UDP port h3 binds.
+    pub udp_port: u16,
+    /// `net.core.rmem_max`. `None` when it cannot be read (not Linux).
+    pub rmem_max: Option<u64>,
+}
+
+/// Grade `[server.http3]` (pure, injectable for tests).
+///
+/// - Off → **Pass**.
+/// - On without `[server.tls]` → **Fail** (the app refuses to boot).
+/// - On with a small Linux `net.core.rmem_max` → **Warn**.
+/// - Otherwise → **Pass**, with a reminder to open the UDP port.
+#[must_use]
+pub fn check_http3_impl(data: &Http3DoctorData) -> CheckResult {
+    if !data.enabled {
+        return CheckResult {
+            name: "http3",
+            status: CheckStatus::Pass,
+            detail: Some("[server.http3] is off; serving HTTP/1.1 and HTTP/2 only".into()),
+            hint: None,
+        };
+    }
+    if !data.tls_configured {
+        return CheckResult {
+            name: "http3",
+            status: CheckStatus::Fail,
+            detail: Some("[server.http3] enabled = true needs [server.tls]".into()),
+            hint: Some("Configure [server.tls], or set [server.http3] enabled = false"),
+        };
+    }
+    if let Some(rmem_max) = data.rmem_max.filter(|v| *v < HTTP3_RMEM_MAX_RECOMMENDED) {
+        return CheckResult {
+            name: "http3",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "net.core.rmem_max is {rmem_max} bytes; HTTP/3 needs at least \
+                 {HTTP3_RMEM_MAX_RECOMMENDED}"
+            )),
+            hint: Some(
+                "Run `sysctl -w net.core.rmem_max=7500000` and add it to /etc/sysctl.conf, \
+                 or quinn drops UDP packets under load",
+            ),
+        };
+    }
+    CheckResult {
+        name: "http3",
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "HTTP/3 on UDP {}; make sure this UDP port is open end to end",
+            data.udp_port
+        )),
+        hint: None,
+    }
+}
+
+/// Pure core of [`resolve_http3_doctor_data`]. The env wins over the TOML,
+/// as at runtime.
+fn http3_doctor_data_from(
+    merged: &toml::Table,
+    env: &dyn autumn_web::config::Env,
+    rmem_max: Option<u64>,
+) -> Http3DoctorData {
+    let server = merged.get("server").and_then(toml::Value::as_table);
+    let h3 = server
+        .and_then(|s| s.get("http3"))
+        .and_then(toml::Value::as_table);
+    let env_bool = |key: &str| match env.var(key).ok().as_deref() {
+        Some("true" | "1") => Some(true),
+        Some("false" | "0") => Some(false),
+        _ => None,
+    };
+    let env_port = |key: &str| env.var(key).ok().and_then(|v| v.trim().parse::<u16>().ok());
+    let toml_port = |table: Option<&toml::Table>, key: &str| {
+        table
+            .and_then(|t| t.get(key))
+            .and_then(toml::Value::as_integer)
+            .and_then(|v| u16::try_from(v).ok())
+    };
+    let enabled = env_bool("AUTUMN_SERVER__HTTP3__ENABLED").unwrap_or_else(|| {
+        h3.and_then(|t| t.get("enabled"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    });
+    let tcp_port = env_port("AUTUMN_SERVER__PORT")
+        .or_else(|| toml_port(server, "port"))
+        .unwrap_or(3000);
+    let udp_port = env_port("AUTUMN_SERVER__HTTP3__PORT")
+        .or_else(|| toml_port(h3, "port"))
+        .unwrap_or(tcp_port);
+    let tls_configured =
+        server.is_some_and(|s| s.contains_key("tls")) || any_tls_env_var_set_in(env);
+    Http3DoctorData {
+        enabled,
+        tls_configured,
+        udp_port,
+        rmem_max,
+    }
+}
+
+/// Resolve `[server.http3]` from the active profile's merged config, the
+/// `.env` overlay, and `/proc/sys/net/core/rmem_max`.
+fn resolve_http3_doctor_data() -> Http3DoctorData {
+    let (canonical, selected, _) = resolve_active_profiles();
+    let merged = get_merged_toml_table_runtime_with(
+        &canonical,
+        &selected,
+        resolve_config_path_manifest_aware,
+    );
+    let env: Box<dyn autumn_web::config::Env> =
+        match autumn_web::dotenv::os_env_with_dotenv_for_profile(&canonical) {
+            Ok(e) => Box::new(e),
+            Err(_) => Box::new(autumn_web::config::OsEnv),
+        };
+    let rmem_max = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    http3_doctor_data_from(&merged, env.as_ref(), rmem_max)
+}
+
 /// Days before a client CA's `notAfter` at which doctor starts warning.
 ///
 /// Same window as the server certificate's: a CA rotation is slower to arrange
@@ -10397,6 +10530,10 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(move || check_tls_impl(&tls_data)));
     }
 
+    // HTTP/3: the TLS dependency, the UDP reminder, the Linux receive buffer.
+    let http3_data = resolve_http3_doctor_data();
+    tasks.push(Box::new(move || check_http3_impl(&http3_data)));
+
     // 8a-ter. Mutual TLS (#1640): grade the client-CA bundle and CRL offline, from the merged
     // table. Runs in both static and ACME modes: client auth is independent of how the
     // server's own certificate is provisioned.
@@ -14344,6 +14481,76 @@ pub struct Vault {
             resolve_client_auth_doctor_data(Some(&tls)),
             ClientAuthDoctorData::ModeOff
         ));
+    }
+
+    // ── check_http3_impl ─────────────────────────────────────────────────────
+
+    fn http3_data(enabled: bool, tls: bool, rmem_max: Option<u64>) -> Http3DoctorData {
+        Http3DoctorData {
+            enabled,
+            tls_configured: tls,
+            udp_port: 443,
+            rmem_max,
+        }
+    }
+
+    #[test]
+    fn http3_pass_when_off() {
+        let r = check_http3_impl(&http3_data(false, false, None));
+        assert_eq!(r.name, "http3");
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn http3_fail_without_tls() {
+        let r = check_http3_impl(&http3_data(true, false, Some(HTTP3_RMEM_MAX_RECOMMENDED)));
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.unwrap().contains("[server.tls]"));
+    }
+
+    #[test]
+    fn http3_warn_on_a_small_receive_buffer() {
+        let r = check_http3_impl(&http3_data(true, true, Some(212_992)));
+        assert!(matches!(r.status, CheckStatus::Warn));
+        assert!(r.hint.unwrap().contains("net.core.rmem_max"));
+    }
+
+    #[test]
+    fn http3_pass_names_the_udp_port() {
+        for rmem in [Some(HTTP3_RMEM_MAX_RECOMMENDED), None] {
+            let r = check_http3_impl(&http3_data(true, true, rmem));
+            assert!(matches!(r.status, CheckStatus::Pass), "{r:?}");
+            assert!(r.detail.unwrap().contains("UDP 443"));
+        }
+    }
+
+    #[test]
+    fn http3_data_reads_toml_and_env() {
+        let table: toml::Table = toml::from_str(
+            "[server]\nport = 8443\n[server.tls]\ncert_path = \"c\"\nkey_path = \"k\"\n\
+             [server.http3]\nenabled = true\n",
+        )
+        .unwrap();
+        let env = autumn_web::config::MockEnv::new();
+        let data = http3_doctor_data_from(&table, &env, Some(1));
+        assert!(data.enabled);
+        assert!(data.tls_configured);
+        assert_eq!(data.udp_port, 8443);
+        assert_eq!(data.rmem_max, Some(1));
+
+        let env = autumn_web::config::MockEnv::new()
+            .with("AUTUMN_SERVER__HTTP3__ENABLED", "false")
+            .with("AUTUMN_SERVER__HTTP3__PORT", "9443");
+        let data = http3_doctor_data_from(&table, &env, None);
+        assert!(!data.enabled, "the env override wins");
+        assert_eq!(data.udp_port, 9443);
+    }
+
+    #[test]
+    fn http3_data_sees_tls_set_by_env_only() {
+        let table: toml::Table = toml::from_str("[server.http3]\nenabled = true\n").unwrap();
+        let env = autumn_web::config::MockEnv::new().with("AUTUMN_SERVER__TLS__CERT_PATH", "c.pem");
+        assert!(http3_doctor_data_from(&table, &env, None).tls_configured);
     }
 
     // ── check_tls_impl (issue #1603) ─────────────────────────────────────────
