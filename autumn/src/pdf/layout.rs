@@ -1782,6 +1782,12 @@ const fn builtin_font(bold: bool, italic: bool) -> BuiltinFont {
 struct Writer {
     pages: Vec<PdfPage>,
     ops: Vec<Op>,
+    /// Font and size last emitted on the current page. Font and fill color are
+    /// graphics state, which survives `ET`, so a repeat on the same page is
+    /// redundant. Cleared when a page is flushed: a new content stream starts
+    /// from the defaults.
+    page_font: Option<(BuiltinFont, f32)>,
+    page_fill_set: bool,
     /// Distance in points from the top margin down to the current baseline.
     y_from_top: f32,
     content_width: f32,
@@ -1792,6 +1798,8 @@ impl Writer {
         Self {
             pages: Vec::new(),
             ops: Vec::new(),
+            page_font: None,
+            page_fill_set: false,
             y_from_top: 0.0,
             content_width: (-2.0f32).mul_add(MARGIN_PT, PAGE_WIDTH_PT),
         }
@@ -1817,17 +1825,26 @@ impl Writer {
             ops,
         ));
         self.y_from_top = 0.0;
+        self.page_font = None;
+        self.page_fill_set = false;
     }
 
     /// Draw one word at an explicit x offset (from the left margin) on the
     /// current line.
     fn draw_word(&mut self, x_from_left: f32, text: &str, bold: bool, italic: bool, size: f32) {
         self.ops.push(Op::StartTextSection);
-        self.ops.push(Op::SetFont {
-            font: PdfFontHandle::Builtin(builtin_font(bold, italic)),
-            size: Pt(size),
-        });
-        self.ops.push(Op::SetFillColor { col: BLACK });
+        let font = (builtin_font(bold, italic), size);
+        if self.page_font != Some(font) {
+            self.ops.push(Op::SetFont {
+                font: PdfFontHandle::Builtin(font.0),
+                size: Pt(size),
+            });
+            self.page_font = Some(font);
+        }
+        if !self.page_fill_set {
+            self.ops.push(Op::SetFillColor { col: BLACK });
+            self.page_fill_set = true;
+        }
         self.ops.push(Op::SetTextCursor {
             pos: Point {
                 x: Pt(MARGIN_PT + x_from_left),
