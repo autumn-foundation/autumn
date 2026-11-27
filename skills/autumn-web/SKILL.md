@@ -3398,10 +3398,11 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   a new SHA-256, and restores the newest generation on a new volume. The
   engine never writes the replica: core checks the fence before each put
   (`FleetError::Fenced`, `421`). Make a snapshot of unchanged data the same
-  bytes, and return the stamp from `epoch_stamp`. Each changed file ships
-  whole: replica writes a day ≈ `changed files × file size × 86,400 / every`
-  (`every` in seconds). Pick `every` from that write volume, not from the
-  default. `ShipMode::Rebuild` ships
+  bytes, and return the stamp from `epoch_stamp`. Core ships each changed
+  file whole. Bytes written to the replica a day ≈
+  `changed files × file size × 86,400 / every`, with `every` in seconds.
+  Calculate `every` from that write volume, not from the default.
+  `ShipMode::Rebuild` ships
   nothing: `restore_latest` calls `FleetEngine::rebuild`. Operators:
   `fleet.ship_now(&key)`, `fleet.restore_latest(&key)`. `FleetStats` has
   `ship_mode` and `rpo_secs`. A close-time generation that did not ship

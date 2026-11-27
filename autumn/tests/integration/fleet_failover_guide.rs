@@ -6,44 +6,16 @@
 
 use autumn_web::config::{FleetOwnershipConfig, ReplicationConfig};
 
+use super::guide_text;
+
 const GUIDE: &str = include_str!("../../../docs/guide/sqlite-fleet.md");
 
-/// The level of a markdown heading line, or `None` for another line.
-fn heading_level(line: &str) -> Option<usize> {
-    let hashes = line.chars().take_while(|c| *c == '#').count();
-    (hashes > 0 && line[hashes..].starts_with(' ')).then_some(hashes)
-}
-
-/// The text under `heading`, up to the next heading of the same or a higher
-/// level. A `#` line in a code fence is not a heading.
 fn section(heading: &str) -> String {
-    let level = heading_level(heading).expect("a markdown heading");
-    let mut lines = GUIDE.lines().skip_while(|line| *line != heading);
-    assert!(
-        lines.next().is_some(),
-        "the guide has no `{heading}` section"
-    );
-    let mut in_fence = false;
-    let mut text = Vec::new();
-    for line in lines {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-        } else if !in_fence && heading_level(line).is_some_and(|l| l <= level) {
-            break;
-        }
-        text.push(line);
-    }
-    text.join("\n")
+    guide_text::section(GUIDE, heading)
 }
 
 fn assert_says(section_text: &str, heading: &str, terms: &[&str]) {
-    let lower = section_text.to_lowercase();
-    for term in terms {
-        assert!(
-            lower.contains(&term.to_lowercase()),
-            "`{heading}` must say `{term}`"
-        );
-    }
+    guide_text::assert_says(heading, section_text, terms);
 }
 
 fn default_lease_secs() -> u64 {

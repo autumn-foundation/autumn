@@ -2,43 +2,12 @@
 //! facts: slot keys, held connections and the open-file budget. The behaviour
 //! behind each claim has a test in `db`, `db::fleet`, `config` and `sharding`.
 
+use super::guide_text;
+
 const GUIDE: &str = include_str!("../../../docs/guide/sqlite-fleet.md");
 
-/// The text under `heading`, up to the next heading of the same or a higher
-/// level. A `#` line in a code fence is not a heading.
-fn section(heading: &str) -> String {
-    let level = heading_level(heading).expect("a markdown heading");
-    let mut lines = GUIDE.lines().skip_while(|line| *line != heading);
-    assert!(
-        lines.next().is_some(),
-        "the guide has no `{heading}` section"
-    );
-    let mut in_fence = false;
-    let mut text = Vec::new();
-    for line in lines {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-        } else if !in_fence && heading_level(line).is_some_and(|l| l <= level) {
-            break;
-        }
-        text.push(line);
-    }
-    text.join("\n")
-}
-
-fn heading_level(line: &str) -> Option<usize> {
-    let hashes = line.chars().take_while(|c| *c == '#').count();
-    (hashes > 0 && line[hashes..].starts_with(' ')).then_some(hashes)
-}
-
 fn assert_says(heading: &str, terms: &[&str]) {
-    let text = section(heading).to_lowercase();
-    for term in terms {
-        assert!(
-            text.contains(&term.to_lowercase()),
-            "`{heading}` must say `{term}`"
-        );
-    }
+    guide_text::assert_says(heading, &guide_text::section(GUIDE, heading), terms);
 }
 
 /// Slot mode takes any routing key. An app that moves from tenant

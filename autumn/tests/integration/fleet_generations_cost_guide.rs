@@ -4,37 +4,18 @@
 //! formula and the facts that follow from it. The behaviour behind each
 //! claim has a test in `db::fleet::generations_tests`.
 
+use super::guide_text::{assert_says, section};
+
 const GUIDE: &str = include_str!("../../../docs/guide/sqlite-fleet.md");
 const ENGINE: &str = include_str!("../../src/db/fleet_engine.rs");
 
 /// The formula, as each doc writes it.
 const FORMULA: &str = "changed files × file size × 86,400 / every";
 
-fn heading_level(line: &str) -> Option<usize> {
-    let hashes = line.chars().take_while(|c| *c == '#').count();
-    (hashes > 0 && line[hashes..].starts_with(' ')).then_some(hashes)
-}
+const COST: &str = "### What a generation costs";
 
-/// The text under `heading`, up to the next heading of the same or a higher
-/// level. A `#` line in a code fence is not a heading.
-fn section(heading: &str) -> String {
-    let level = heading_level(heading).expect("a markdown heading");
-    let mut lines = GUIDE.lines().skip_while(|line| *line != heading);
-    assert!(
-        lines.next().is_some(),
-        "the guide has no `{heading}` section"
-    );
-    let mut in_fence = false;
-    let mut text = Vec::new();
-    for line in lines {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-        } else if !in_fence && heading_level(line).is_some_and(|l| l <= level) {
-            break;
-        }
-        text.push(line);
-    }
-    text.join("\n")
+fn cost() -> String {
+    section(GUIDE, COST)
 }
 
 /// The doc comment on the `Generations` variant, as one line of text.
@@ -48,6 +29,7 @@ fn generations_rustdoc() -> String {
         .iter()
         .rev()
         .map(|line| line.trim())
+        .skip_while(|line| line.starts_with("#["))
         .take_while(|line| line.starts_with("///"))
         .map(|line| line.trim_start_matches("///").trim())
         .collect();
@@ -55,29 +37,29 @@ fn generations_rustdoc() -> String {
     doc.join(" ")
 }
 
-/// Panics with the missing term when `text` does not say each of `terms`.
-/// Line breaks count as spaces.
-fn assert_says(name: &str, text: &str, terms: &[&str]) {
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let text = text.to_lowercase();
-    for term in terms {
-        assert!(
-            text.contains(&term.to_lowercase()),
-            "{name} must say `{term}`"
-        );
-    }
+/// Bytes written to the replica in `secs` seconds, by the formula.
+const fn replica_bytes(files: u64, file_bytes: u64, every_secs: u64, secs: u64) -> u64 {
+    files * file_bytes * secs / every_secs
 }
 
-const COST: &str = "### What a generation costs";
+/// `bytes` to the nearest `step`, in units of `unit`.
+const fn about(bytes: u64, step: u64, unit: u64) -> u64 {
+    (bytes + step / 2) / step * step / unit
+}
+
+const DAY: u64 = 86_400;
+const GB: u64 = 1_000_000_000;
+const MB: u64 = 1_000_000;
 
 #[test]
 fn the_guide_gives_the_write_formula_and_its_units() {
     assert_says(
         COST,
-        &section(COST),
+        &cost(),
         &[
             FORMULA,
             "`every` in seconds",
+            "zero counts as 1",
             "ships each changed file whole",
         ],
     );
@@ -87,7 +69,7 @@ fn the_guide_gives_the_write_formula_and_its_units() {
 fn the_guide_says_a_small_table_costs_a_whole_file() {
     assert_says(
         COST,
-        &section(COST),
+        &cost(),
         &["a small table", "whole file", "about 1 MB"],
     );
 }
@@ -96,7 +78,7 @@ fn the_guide_says_a_small_table_costs_a_whole_file() {
 fn the_guide_says_write_volume_sets_the_rpo() {
     assert_says(
         COST,
-        &section(COST),
+        &cost(),
         &["write volume sets the RPO", "not from the default"],
     );
 }
@@ -105,9 +87,9 @@ fn the_guide_says_write_volume_sets_the_rpo() {
 fn the_guide_says_prune_bounds_storage_not_traffic() {
     assert_says(
         COST,
-        &section(COST),
+        &cost(),
         &[
-            "two newest generations",
+            "two newest complete generations",
             "storage stays bounded",
             "write traffic",
         ],
@@ -116,38 +98,44 @@ fn the_guide_says_prune_bounds_storage_not_traffic() {
 
 #[test]
 fn the_guide_names_the_measure_of_one_ship() {
-    assert_says(COST, &section(COST), &["`ShipReport::bytes`", "`ship_now`"]);
-}
-
-/// The example of the guide follows from the formula.
-#[test]
-fn the_guide_example_agrees_with_the_formula() {
-    let files: u64 = 64;
-    let file_bytes: u64 = 3_300_000;
-    let every_secs: u64 = 30;
-    let per_day = files * file_bytes * 86_400 / every_secs;
-    let gb = per_day / 1_000_000_000;
-    let mb_a_minute = files * file_bytes * 60 / every_secs / 1_000_000;
-    assert_eq!((gb, mb_a_minute), (608, 422));
     assert_says(
         COST,
-        &section(COST),
+        &cost(),
         &[
-            "64 files of about 3.3 MB",
-            "`every` = 30",
-            "about 600 GB a day",
-            "about 420 MB a minute",
+            "`ShipReport::bytes`",
+            "`ship_now`",
+            "manifest and epoch markers",
         ],
     );
 }
 
-/// The section sits in the engine-plugin part of the guide, and the
-/// shipping table points to it.
+/// The numbers of the example in the guide follow from the formula.
 #[test]
-fn the_shipping_section_points_to_the_cost() {
+fn the_guide_example_agrees_with_the_formula() {
+    let (files, file_bytes) = (64, 3_300_000);
+    let fast = replica_bytes(files, file_bytes, 30, DAY);
+    let fast_minute = replica_bytes(files, file_bytes, 30, 60);
+    let slow = replica_bytes(files, file_bytes, 300, DAY);
+    assert_says(
+        COST,
+        &cost(),
+        &[
+            "64 files of about 3.3 MB",
+            "`every` = 30 seconds",
+            &format!("about {} GB a day", about(fast, 100 * GB, GB)),
+            &format!("about {} MB a minute", about(fast_minute, 10 * MB, MB)),
+            "`every` = 300 seconds",
+            &format!("about {} GB a day", about(slow, 10 * GB, GB)),
+            "the RPO is 5 minutes",
+        ],
+    );
+}
+
+#[test]
+fn the_shipping_table_links_to_the_cost() {
     assert_says(
         "### Shipping a plugin engine",
-        &section("### Shipping a plugin engine"),
+        &section(GUIDE, "### Shipping a plugin engine"),
         &["[What a generation costs](#what-a-generation-costs)"],
     );
 }
@@ -162,6 +150,7 @@ fn the_rustdoc_next_to_every_gives_the_cost() {
             FORMULA,
             "`every` in seconds",
             "write volume sets the RPO",
+            "not from the default",
             "two newest generations",
         ],
     );

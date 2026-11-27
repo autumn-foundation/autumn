@@ -1179,26 +1179,29 @@ and `fleet-unchanged-files` need a fixture that installs replication.
 
 ### What a generation costs
 
-Core ships each changed file whole. It does not ship a diff. An engine
-that keeps one file, such as DuckDB, ships the whole database after each
-change.
+Core ships each changed file whole. It does not ship a diff. For an
+engine with one file, such as DuckDB, core ships the whole database in
+each generation that has a change.
 
-- **Write volume.** Replica writes a day ≈
-  `changed files × file size × 86,400 / every`, with `every` in seconds.
-  A changed file is a file with one or more writes in the interval.
-- **Small tables.** A small table still costs a whole file. A DuckDB file
-  is about 1 MB at least, also for 1,500 rows.
-- **RPO.** The write volume sets the RPO that a fleet can pay for.
-  Calculate `every` from the write volume, not from the default.
-- **Storage.** Prune keeps the files of the two newest generations, so
-  storage stays bounded. The cost is write traffic, not storage.
+- **Write volume.** Bytes written to the replica a day ≈
+  `changed files × file size × 86,400 / every`, with `every` in seconds
+  (zero counts as 1). A changed file is a file with one or more writes in
+  the interval.
+- **Small tables.** Core ships a whole file also for a small table. A
+  DuckDB file with only 1,500 rows is still about 1 MB.
+- **RPO.** The write volume sets the RPO. Calculate `every` from the write
+  volume, not from the default.
+- **Storage.** Prune keeps the two newest complete generations, and each
+  older generation that holds a file they name. Thus storage stays
+  bounded. The cost is write traffic, not storage.
 - **Measure.** `ship_now` returns a `ShipReport`. `ShipReport::bytes` is
-  the bytes that the ship wrote.
+  the number of file bytes that the ship wrote. Each generation also puts
+  a manifest and epoch markers, and prune deletes old objects.
 
-Example: 64 files of about 3.3 MB, each with a write in each interval,
-and `every` = 30 seconds. The fleet writes about 600 GB a day (about
-420 MB a minute). With `every` = 300 seconds, the same fleet writes about
-60 GB a day, and the RPO is 5 minutes.
+Example: a fleet has 64 files of about 3.3 MB, and `every` = 30 seconds.
+Each file has a write in each interval. The fleet writes about 600 GB a
+day (about 420 MB a minute). With `every` = 300 seconds, the same fleet
+writes about 60 GB a day, and the RPO is 5 minutes.
 
 ## Limits
 

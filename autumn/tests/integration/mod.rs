@@ -194,6 +194,7 @@ mod framework_retention;
 mod framework_retention_pg;
 mod graceful_shutdown_contract;
 mod graph_crate_version;
+mod guide_text;
 mod health_indicator_integration;
 mod hooks_lifecycle;
 #[cfg(feature = "htmx")]
