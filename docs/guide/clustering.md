@@ -410,7 +410,11 @@ charged, because the frame carried a valid MAC.
    resets the sequence watermark.
 7. **Payload parse** — only now is `payload` deserialized. An unknown message
    type or malformed body is dropped (`reason="payload"`).
-8. **Merge** — the message is applied, and receipt is recorded against the
+8. **Sender identity** (iroh transport only) — the record that the sender
+   gives for itself must name the endpoint id of the connection. A Leave must
+   come from the id that this node has for the sender. Otherwise the frame is
+   dropped (`reason="sender"`).
+9. **Merge** — the message is applied, and receipt is recorded against the
    sender for the liveness overlay.
 
 ### Messages

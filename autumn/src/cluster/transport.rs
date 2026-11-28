@@ -267,7 +267,44 @@ pub trait PeerTransport: Send + Sync + 'static {
     fn retain_peers(&self, live: &BTreeSet<String>) {
         let _ = live;
     }
+
+    /// The address this node puts in its own record: what peers dial.
+    ///
+    /// The default is `configured` when it is set, else
+    /// [`local_addr`](Self::local_addr). The iroh transport gives
+    /// `<endpoint-id>@<ip:port>`.
+    fn advertise_addr(&self, configured: Option<&str>) -> String {
+        configured
+            .map(str::trim)
+            .filter(|addr| !addr.is_empty())
+            .map_or_else(|| self.local_addr().to_string(), ToOwned::to_owned)
+    }
+
+    /// The push targets after the transport's own rules.
+    ///
+    /// The default keeps `targets` as they are. The iroh transport keeps one
+    /// target per endpoint id and removes this node's id.
+    fn dial_targets(&self, targets: BTreeSet<String>) -> BTreeSet<String> {
+        targets
+    }
+
+    /// Whether a frame from `from` may speak for a sender whose own record
+    /// gives `advertised` as its address.
+    ///
+    /// Called after the MAC verifies. The default is `true`: a TCP source
+    /// address proves nothing. The iroh transport knows the peer's endpoint
+    /// id from the handshake, and refuses a sender whose record names
+    /// another id.
+    fn verify_sender(&self, from: &str, advertised: Option<&str>) -> bool {
+        let _ = (from, advertised);
+        true
+    }
 }
+
+#[cfg(feature = "iroh")]
+mod iroh_transport;
+#[cfg(feature = "iroh")]
+pub use iroh_transport::IrohPeerTransport;
 
 /// The background I/O context, captured when [`PeerTransport::start`] runs.
 ///

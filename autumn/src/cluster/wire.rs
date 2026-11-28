@@ -148,6 +148,9 @@ pub enum RejectReason {
     Replay,
     /// Step 7: the (authenticated) payload is not a known message.
     Payload,
+    /// Step 8: the transport knows the peer's identity, and the sender's own
+    /// record names another one.
+    Sender,
 }
 
 impl RejectReason {
@@ -163,6 +166,7 @@ impl RejectReason {
             Self::SelfOrigin => "self_origin",
             Self::Replay => "replay",
             Self::Payload => "payload",
+            Self::Sender => "sender",
         }
     }
 
@@ -193,7 +197,10 @@ impl RejectReason {
     /// keeps a real peer's connection safe from a frame a newer version of it
     /// was entitled to send.
     pub const fn authenticated(self) -> bool {
-        matches!(self, Self::SelfOrigin | Self::Replay | Self::Payload)
+        matches!(
+            self,
+            Self::SelfOrigin | Self::Replay | Self::Payload | Self::Sender
+        )
     }
 }
 
@@ -1019,6 +1026,7 @@ mod tests {
             RejectReason::SelfOrigin,
             RejectReason::Replay,
             RejectReason::Payload,
+            RejectReason::Sender,
         ] {
             assert!(
                 reason.authenticated(),

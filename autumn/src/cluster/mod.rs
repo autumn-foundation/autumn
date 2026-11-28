@@ -148,7 +148,7 @@ pub struct ClusterMemberInfo {
 /// my port with the wrong secret" into an alert, so every series is published
 /// from boot — a `rate()` over a label that only appears once the attack starts
 /// is a `rate()` nobody wrote an alert for.
-pub(crate) const REJECT_REASONS: [wire::RejectReason; 9] = [
+pub(crate) const REJECT_REASONS: [wire::RejectReason; 10] = [
     wire::RejectReason::Oversize,
     wire::RejectReason::Malformed,
     wire::RejectReason::Version,
@@ -158,6 +158,7 @@ pub(crate) const REJECT_REASONS: [wire::RejectReason; 9] = [
     wire::RejectReason::SelfOrigin,
     wire::RejectReason::Replay,
     wire::RejectReason::Payload,
+    wire::RejectReason::Sender,
 ];
 
 /// Counters that make cluster behaviour observable from `/actuator/metrics`
@@ -689,12 +690,10 @@ pub fn install_from_config(
     // A peer silent past its suspicion timeout is already out of the view, so closing its idle
     // socket costs nothing, and a socket that never completes a frame cannot be held for free.
     // The floor keeps a fast cluster from recycling connections.
-    let transport = transport::TcpPeerTransport::bind(&config.bind_addr)?
-        .with_inbound_idle_timeout(
-            suspicion_timeout
-                .saturating_mul(INBOUND_IDLE_SUSPICION_MULTIPLE)
-                .max(transport::DEFAULT_INBOUND_IDLE_TIMEOUT),
-        );
+    let idle_timeout = suspicion_timeout
+        .saturating_mul(INBOUND_IDLE_SUSPICION_MULTIPLE)
+        .max(transport::DEFAULT_INBOUND_IDLE_TIMEOUT);
+    let transport = peer_transport(state, config, idle_timeout)?;
 
     let runtime = node::ClusterRuntimeConfig {
         cluster_name: config.cluster_name.clone(),
@@ -713,7 +712,7 @@ pub fn install_from_config(
         state.entropy_arc(),
         state.clock_arc(),
         node_shutdown.clone(),
-        Arc::new(transport),
+        transport,
     )?;
 
     // Fails only if the preflight race above was lost. A hard error, not a warning: otherwise the
@@ -777,6 +776,43 @@ pub(crate) fn jittered(base: Duration, entropy: &dyn crate::entropy::Entropy) ->
 }
 
 /// Build the boot error used when the cluster listener cannot be bound.
+/// The transport that `[cluster] transport` selects.
+///
+/// `"iroh"` uses the [`IrohNode`](crate::iroh::IrohNode) that boot put on
+/// `state`.
+fn peer_transport(
+    state: &AppState,
+    config: &ClusterConfig,
+    idle_timeout: Duration,
+) -> AutumnResult<Arc<dyn transport::PeerTransport>> {
+    match config.transport {
+        crate::config::ClusterTransport::Tcp => Ok(Arc::new(
+            transport::TcpPeerTransport::bind(&config.bind_addr)?
+                .with_inbound_idle_timeout(idle_timeout),
+        )),
+        #[cfg(feature = "iroh")]
+        crate::config::ClusterTransport::Iroh => {
+            let node = state.extension::<crate::iroh::IrohNode>().ok_or_else(|| {
+                AutumnError::internal_server_error_msg(
+                    "cluster.transport = \"iroh\" needs the [iroh] endpoint: set \
+                     [iroh] enabled = true",
+                )
+            })?;
+            Ok(Arc::new(
+                transport::IrohPeerTransport::new((*node).clone(), None)
+                    .with_inbound_idle_timeout(idle_timeout),
+            ))
+        }
+        #[cfg(not(feature = "iroh"))]
+        crate::config::ClusterTransport::Iroh => {
+            let _ = (state, idle_timeout);
+            Err(AutumnError::internal_server_error_msg(
+                "cluster.transport = \"iroh\" needs the `iroh` feature",
+            ))
+        }
+    }
+}
+
 pub(crate) fn bind_error(addr: &str, err: &std::io::Error) -> AutumnError {
     AutumnError::internal_server_error_msg(format!(
         "cluster: failed to bind the cluster listener on {addr}: {err}"
