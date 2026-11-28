@@ -808,6 +808,96 @@ async fn a_misplaced_replica_fails_the_load() {
     );
 }
 
+/// Records the format of each member. Its identity check fails the test.
+struct Formats(Vec<LakeFormat>);
+
+impl LakeSink for Formats {
+    type Lake = Vec<LakeFormat>;
+
+    fn check_identity(&self, _member: LakeMember<'_>) -> Result<(), LakeError> {
+        panic!("core checks a WAL member itself");
+    }
+
+    fn add(&mut self, member: LakeMember<'_>) -> Result<(), LakeError> {
+        self.0.push(member.format);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<LakeFormat>, LakeError> {
+        Ok(self.0)
+    }
+}
+
+#[tokio::test]
+async fn a_wal_member_has_the_wal_format_and_core_checks_it() {
+    let host = host(Duration::ZERO);
+    ship(&host, "acme", &[NOTES]).await;
+    let load = lake(&host).load(Formats(Vec::new())).await.unwrap();
+    assert_eq!(load.lake, [LakeFormat::Wal]);
+}
+
+/// Accepts a generations member and records each format.
+struct AnyFormat(Vec<LakeFormat>);
+
+impl LakeSink for AnyFormat {
+    type Lake = Vec<LakeFormat>;
+
+    fn check_identity(&self, _member: LakeMember<'_>) -> Result<(), LakeError> {
+        Ok(())
+    }
+
+    fn add(&mut self, member: LakeMember<'_>) -> Result<(), LakeError> {
+        self.0.push(member.format);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<LakeFormat>, LakeError> {
+        Ok(self.0)
+    }
+}
+
+#[tokio::test]
+async fn with_both_formats_the_newer_generation_wins() {
+    use super::generations_tests::put_generation;
+
+    let host = host(Duration::ZERO);
+    let key = ship(&host, "acme", &[NOTES]).await;
+    let root = replica_root(BASE, &key);
+    let listed = host.destination.list(&format!("{root}/")).unwrap();
+    let (_, wal_ms, _) = restore::complete_snapshots(&root, &listed)
+        .pop()
+        .expect("a WAL generation");
+    // A manifest after the WAL generation.
+    put_generation(
+        host.destination.as_ref(),
+        &root,
+        wal_ms + 10,
+        None,
+        &[("acme.db", b"engine bytes")],
+    );
+    let formats =
+        |lake: FleetLake| async move { lake.load(AnyFormat(Vec::new())).await.unwrap().lake };
+    assert_eq!(formats(lake(&host)).await, [LakeFormat::Generations]);
+    // A target between them takes the WAL generation.
+    let between = segment::timestamp_from_ms(wal_ms + 5);
+    assert_eq!(formats(lake(&host).as_of(between)).await, [LakeFormat::Wal]);
+    // A higher epoch wins over a later time.
+    let other = ship(&host, "globex", &[NOTES]).await;
+    let other_root = replica_root(BASE, &other);
+    put_generation(
+        host.destination.as_ref(),
+        &other_root,
+        1,
+        Some(1),
+        &[("globex.db", b"engine bytes")],
+    );
+    let load = lake(&host).load(AnyFormat(Vec::new())).await.unwrap();
+    assert_eq!(
+        load.lake,
+        [LakeFormat::Generations, LakeFormat::Generations]
+    );
+}
+
 // ── Point in time ───────────────────────────────────────────────────────────
 
 #[tokio::test]

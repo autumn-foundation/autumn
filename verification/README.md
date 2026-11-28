@@ -548,6 +548,13 @@ It proves these properties:
   fails. The model assumes that core asks `has` only for an included
   member, and that the sink drops each member it did not get. Then a
   deleted member adds no rows.
+- A replica has two formats: `snapshot.json` (WAL) and `manifest.json`
+  (generations). The lake takes the newest generation of each format. The
+  newer of the two is not older than any generation of either format.
+- A member with a manifest is never `Unreplicated`. A target before every
+  generation gives `AbsentAtTarget`. A sink that cannot read manifests
+  fails a generations member. A sink that can gets it. A WAL member is read
+  as before.
 
 It does not model the restore, the schema union or the query. Tests cover
 them.

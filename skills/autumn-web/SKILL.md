@@ -3370,12 +3370,16 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   pass request input as the SQL. Guide: "Query the lake".
 - Another lake format (ADR 0040 §6): implement `LakeSink` and call
   `fleet.lake()?.load(sink)`. Core runs the inclusion rule, restores, and
-  checks the identity row. The sink gets `add(LakeMember { key, generation,
-  file })` and gives its lake from `finish()`. To keep a lake between
-  loads, return `true` from `has(key, generation)`: core calls `keep` and
-  restores nothing. At `finish`, drop each member that got neither `add`
-  nor `keep`. `LakeGeneration` holds the WAL position, so compare all of
-  it. `TAKES_SLOTS = true` gets slot databases. Keep the catalog in files
+  checks the identity row of a WAL member. For a `Generations` fleet
+  (`member.format == LakeFormat::Generations`), implement
+  `check_identity(member)`: the default refuses the member. The sink gets
+  `add(LakeMember { key, generation, format, file })` and gives its lake
+  from `finish()`. To keep a lake between loads, return `true` from
+  `has(key, generation)`: core calls `keep` and restores nothing. At
+  `finish`, drop each member that got neither `add` nor `keep`.
+  `LakeGeneration` holds the WAL position, so compare all of it. For a
+  generations member the position is `None`, and the id names the
+  generation. `TAKES_SLOTS = true` gets slot databases. Keep the catalog in files
   under the sink's own prefix, never under `<base>/fleet/`. Guide: "Lake
   sinks".
 - The control database lives outside `root` (validation refuses it inside).
@@ -3399,7 +3403,11 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   a new SHA-256, and restores the newest generation on a new volume. The
   engine never writes the replica: core checks the fence before each put
   (`FleetError::Fenced`, `421`). Make a snapshot of unchanged data the same
-  bytes, and return the stamp from `epoch_stamp`. `ShipMode::Rebuild` ships
+  bytes, and return the stamp from `epoch_stamp`. Core ships each changed
+  file whole. Bytes written to the replica a day ≈
+  `changed files × file size × 86,400 / every`, with `every` in seconds.
+  Calculate `every` from that write volume, not from the default.
+  `ShipMode::Rebuild` ships
   nothing: `restore_latest` calls `FleetEngine::rebuild`. Operators:
   `fleet.ship_now(&key)`, `fleet.restore_latest(&key)`. `FleetStats` has
   `ship_mode` and `rpo_secs`. A close-time generation that did not ship

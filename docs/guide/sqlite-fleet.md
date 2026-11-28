@@ -842,11 +842,23 @@ let load = fleet.lake()?.load(MySink::open(..)).await?;
   `has(key, generation)` for each member that the inclusion rule takes.
   When it is `true`, core calls `keep(key, generation)` and restores
   nothing. Then core restores each other member and calls `add(member)`.
-- `add` gets the `key`, the `generation` and the restored `file`. Core
-  checks that the identity row of the file names the key. Core removes
-  the file after `add`.
+- `add` gets the `key`, the `generation`, the `format` and the restored
+  `file`. Core removes the file after `add`.
+- The lake reads two replica formats. `LakeFormat::Wal` (WAL shipping):
+  `file` is a `SQLite` file, and core checks that its identity row names
+  the key. `LakeFormat::Generations` (`ShipMode::Generations`, for example
+  a DuckDB fleet): `file` is the engine's snapshot entry, with the name it
+  had on the volume. Core checks the hash of each file, and then calls
+  `check_identity(member)` on the sink before `add`.
+- Implement `check_identity` to read the identity of the engine. The
+  default refuses the member, so a sink that cannot read the engine fails
+  it with `LakeError::Ingest`. The `SQLite` lake cannot read a generations
+  replica: `materialize()` on such a fleet fails. With
+  `skip_failed_tenants()`, each tenant is a `Failed` skip, not
+  `Unreplicated`.
 - A `LakeGeneration` holds the generation id and the WAL position. So a
-  new commit in the same generation is a change.
+  new commit in the same generation is a change. For generations it holds
+  the manifest's generation id, and no WAL position.
 - `finish()` gives the lake. A sink that keeps its lake between loads
   drops, at `finish`, each member that it got from neither `add` nor
   `keep`. A deleted tenant is gone then. So is a tenant that failed in
@@ -1119,7 +1131,7 @@ storage. Core does every write to the replica. The engine only gives files.
 | Mode | What core does | RPO |
 | --- | --- | --- |
 | `Continuous(_)` | Ships the changes as they commit. Only `SqliteEngine` (WAL shipping). `ContinuousShipper` is sealed. | `sync_interval` |
-| `Generations { every }` | Takes a `snapshot` every `every` and at close. The first `snapshot` is at a random time in the first `every` after the open. This spreads the ships of databases that open together. Ships only the files whose SHA-256 is not in the previous generation. | `every` |
+| `Generations { every }` | Takes a `snapshot` every `every` and at close. The first `snapshot` is at a random time in the first `every` after the open. This spreads the ships of databases that open together. Ships only the files whose SHA-256 is not in the previous generation. | `every`. See [What a generation costs](#what-a-generation-costs). |
 | `Rebuild` | Ships nothing. `restore_latest` calls `FleetEngine::rebuild`. | none |
 
 Install replication as for `SQLite`:
@@ -1176,6 +1188,32 @@ A generation of `Generations` mode is these objects:
 
 `plugin_conformance::fleet` checks the engine side. `fleet-fenced-ship`
 and `fleet-unchanged-files` need a fixture that installs replication.
+
+### What a generation costs
+
+Core ships each changed file whole. It does not ship a diff. For an
+engine with one file, such as DuckDB, core ships the whole database in
+each generation that has a change.
+
+- **Write volume.** Bytes written to the replica a day ≈
+  `changed files × file size × 86,400 / every`, with `every` in seconds
+  (zero counts as 1). A changed file is a file with one or more writes in
+  the interval.
+- **Small tables.** Core ships a whole file also for a small table. A
+  DuckDB file with only 1,500 rows is still about 1 MB.
+- **RPO.** The write volume sets the RPO. Calculate `every` from the write
+  volume, not from the default.
+- **Storage.** Prune keeps the two newest complete generations, and each
+  older generation that holds a file they name. Thus storage stays
+  bounded. The cost is write traffic, not storage.
+- **Measure.** `ship_now` returns a `ShipReport`. `ShipReport::bytes` is
+  the number of file bytes that the ship wrote. Each generation also puts
+  a manifest and epoch markers, and prune deletes old objects.
+
+Example: a fleet has 64 files of about 3.3 MB, and `every` = 30 seconds.
+Each file has a write in each interval. The fleet writes about 600 GB a
+day (about 420 MB a minute). With `every` = 300 seconds, the same fleet
+writes about 60 GB a day, and the RPO is 5 minutes.
 
 ## Limits
 
