@@ -74,6 +74,7 @@ mod rust_source;
 mod sbom;
 mod scaling_driver;
 mod schema;
+mod schema_org;
 mod search;
 mod seed;
 mod serve;
@@ -775,6 +776,46 @@ pub enum AeoSubcommands {
         /// profile).
         #[arg(long)]
         profile: Option<String>,
+    },
+}
+
+/// Subcommands for `autumn schema-org`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum SchemaOrgSubcommands {
+    /// List the schema.org types the CLI knows. `*` marks a Google rich
+    /// result.
+    List {
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = schema_org::Format::Text)]
+        format: schema_org::Format,
+    },
+    /// Show a type's properties, what Google requires and recommends, and
+    /// the scaffold columns it seeds.
+    Show {
+        /// The type, e.g. `Recipe` (case-insensitive).
+        #[arg(value_name = "TYPE")]
+        name: String,
+        /// Also list every inherited property.
+        #[arg(long)]
+        all: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = schema_org::Format::Text)]
+        format: schema_org::Format,
+    },
+    /// Audit the JSON-LD of pages: http(s) URLs, HTML files, or directories
+    /// of HTML files (such as the `dist/` of `autumn build`). Exits 1 on an
+    /// error, or on a warning with `--strict`.
+    Audit {
+        /// URLs, HTML files or directories.
+        #[arg(value_name = "URL|FILE|DIR", required = true)]
+        targets: Vec<String>,
+        /// Fail on warnings too: unknown properties, wrong values, and
+        /// properties Google recommends.
+        #[arg(long)]
+        strict: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = schema_org::Format::Text)]
+        format: schema_org::Format,
     },
 }
 
@@ -2622,6 +2663,23 @@ enum Commands {
     #[allow(clippy::doc_markdown)]
     #[command(subcommand, verbatim_doc_comment)]
     Aeo(AeoSubcommands),
+
+    /// Schema.org structured data: browse types and audit JSON-LD.
+    ///
+    /// `autumn schema-org list` prints the types the CLI knows. `show <Type>`
+    /// prints a type's properties, what Google asks for, and the columns
+    /// `autumn generate scaffold --schema-org <Type>` makes. `audit` reads the
+    /// JSON-LD blocks of pages and reports what is wrong or missing.
+    ///
+    /// # Examples
+    ///
+    ///   autumn schema-org list
+    ///   autumn schema-org show Recipe
+    ///   autumn schema-org audit http://localhost:3000/recipes/1
+    ///   autumn schema-org audit dist/ --strict
+    #[allow(clippy::doc_markdown)]
+    #[command(name = "schema-org", subcommand, verbatim_doc_comment)]
+    SchemaOrg(SchemaOrgSubcommands),
 
     /// Cache-coherence tooling — prove no write can leave a cached read stale.
     ///
@@ -5584,6 +5642,20 @@ enum GenerateCommands {
         /// `multipart` feature. Insert-only: every row becomes a NEW record.
         #[arg(long)]
         import: bool,
+        /// Make the resource a schema.org type, e.g. `--schema-org Recipe`.
+        /// The show view renders a `<script type="application/ld+json">`
+        /// block of that type from the columns named after its properties
+        /// (`date_published` is `datePublished`; `offers_price` is
+        /// `offers.price`). With no fields given, the type's required and
+        /// recommended properties become the fields. See `autumn schema-org
+        /// show <Type>`. Not supported with `--api`.
+        #[arg(long, value_name = "TYPE")]
+        schema_org: Option<String>,
+        /// Bind a column to a schema.org property the names do not match,
+        /// e.g. `--schema-org-map cost=offers.price`. Repeatable. Needs
+        /// `--schema-org`.
+        #[arg(long, value_name = "COLUMN=PROPERTY")]
+        schema_org_map: Vec<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -6189,6 +6261,17 @@ fn run_command(command: Commands) {
             ttl,
             profile,
         }) => aeo::dns(base_url, mcp_path.as_deref(), ttl, profile.as_deref()),
+        Commands::SchemaOrg(sub) => match sub {
+            SchemaOrgSubcommands::List { format } => schema_org::run_list(format),
+            SchemaOrgSubcommands::Show { name, all, format } => {
+                schema_org::run_show(&name, all, format);
+            }
+            SchemaOrgSubcommands::Audit {
+                targets,
+                strict,
+                format,
+            } => schema_org::audit::run(&targets, strict, format),
+        },
         Commands::Agents(AgentsSubcommands::Manifest(args)) => {
             let features = routes::CargoFeatures {
                 features: args.features,
@@ -7760,6 +7843,8 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             searchable,
             i18n,
             import,
+            schema_org,
+            schema_org_map,
             dry_run,
             force,
         } => {
@@ -7798,7 +7883,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                     ))
                 },
             );
-            let (fields, options) = match generate::config::merge_config_with_cli(
+            let (fields, mut options) = match generate::config::merge_config_with_cli(
                 config_entry,
                 &fields,
                 &index,
@@ -7826,6 +7911,13 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                     std::process::exit(1);
                 }
             };
+            // `--schema-org` and `--schema-org-map` from the CLI win over the TOML entry.
+            if schema_org.is_some() {
+                options.schema_org = schema_org;
+            }
+            if !schema_org_map.is_empty() {
+                options.schema_org_map = schema_org_map;
+            }
             let timestamp = generate::timestamp_now();
             // The shared-layout preflight is generate-only: on destroy it would fail
             // cleanup when `pub fn layout` is missing or renamed (#1834).
@@ -13354,6 +13446,72 @@ mod tests {
             panic!("expected config unset");
         };
         assert_eq!(actor.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn parse_schema_org_commands() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "schema-org",
+            "audit",
+            "dist/",
+            "http://x.test/",
+            "--strict",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        let Commands::SchemaOrg(SchemaOrgSubcommands::Audit {
+            targets,
+            strict,
+            format,
+        }) = cli.command
+        else {
+            panic!("expected schema-org audit");
+        };
+        assert_eq!(
+            targets,
+            vec!["dist/".to_owned(), "http://x.test/".to_owned()]
+        );
+        assert!(strict);
+        assert_eq!(format, schema_org::Format::Json);
+        assert!(Cli::try_parse_from(["autumn", "schema-org", "audit"]).is_err());
+        let cli = Cli::try_parse_from(["autumn", "schema-org", "show", "Recipe", "--all"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::SchemaOrg(SchemaOrgSubcommands::Show { all: true, .. })
+        ));
+    }
+
+    #[test]
+    fn parse_scaffold_schema_org_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Mug",
+            "cost:money",
+            "--schema-org",
+            "Product",
+            "--schema-org-map",
+            "cost=offers.price",
+            "--schema-org-map",
+            "label=name",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold {
+            schema_org,
+            schema_org_map,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected generate scaffold");
+        };
+        assert_eq!(schema_org.as_deref(), Some("Product"));
+        assert_eq!(
+            schema_org_map,
+            vec!["cost=offers.price".to_owned(), "label=name".to_owned()]
+        );
     }
 
     #[test]

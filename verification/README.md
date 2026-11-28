@@ -404,6 +404,21 @@ prove that the joined id is unique. These tests check that:
 and `an_escaped_part_never_meets_its_underscored_twin` check the runtime
 against the same rules.
 
+## JSON-LD script escaping
+
+`json_ld_escape.rs` models `escape_script_json` in `autumn/src/json_ld.rs`,
+which writes schema.org JSON-LD into a `<script>` element. Verify it with:
+
+```sh
+verus verification/json_ld_escape.rs
+```
+
+It proves that the output has no `<`, `>` or `&` byte for any input, so
+`</script` and `<!--` cannot occur in it, and that every other byte passes
+through. The proptest `escaped_output_has_no_markup_bytes_and_round_trips`
+checks the runtime on any string, and that the escaped JSON parses back to the
+same value.
+
 ## Kani proofs
 
 Kani checks the shipped functions, not a model of them. The harnesses are in

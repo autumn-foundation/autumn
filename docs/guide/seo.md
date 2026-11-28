@@ -604,6 +604,9 @@ fn post_page_declares_its_canonical_url() {
    that URL out of `robots.txt`.
 6. Register a `SitemapSource` for the pages the framework cannot derive.
 7. Read `/robots.txt` and `/sitemap.xml` before you deploy.
+8. For a page that is a recipe, a product, an event or another
+   [schema.org](schema-org.md) type, add a `JsonLd` block, and check it with
+   `autumn schema-org audit <URL>`.
 
 ---
 
@@ -621,6 +624,8 @@ fn post_page_declares_its_canonical_url() {
 
 ## Related guides
 
+- [Schema.org structured data](schema-org.md) — JSON-LD blocks, which
+  `SeoMeta::json_ld` renders with the meta tags.
 - [Internationalization](i18n.md) — locale-prefixed routing and the locale
   switcher that the `hreflang` links pair with.
 - [Atom and RSS Feeds](feeds.md) — the other document a content site publishes

@@ -411,6 +411,7 @@ pub struct SeoMeta {
     twitter_image: Option<String>,
     robots_directive: Option<String>,
     hreflang_alternates: Vec<(String, String)>,
+    json_ld: Vec<crate::json_ld::JsonLd>,
 }
 
 impl SeoMeta {
@@ -527,6 +528,15 @@ impl SeoMeta {
         self
     }
 
+    /// Add a schema.org [`JsonLd`](crate::json_ld::JsonLd) block. It renders
+    /// after the meta tags as an escaped `<script type="application/ld+json">`
+    /// element. Call it again to add another block.
+    #[must_use]
+    pub fn json_ld(mut self, node: crate::json_ld::JsonLd) -> Self {
+        self.json_ld.push(node);
+        self
+    }
+
     /// Render all configured meta tags as Maud [`Markup`].
     ///
     /// Emits only the tags that have been configured. Empty builders produce
@@ -588,6 +598,9 @@ impl SeoMeta {
             }
             @for (lang, href) in &self.hreflang_alternates {
                 link rel="alternate" hreflang=(lang) href=(href);
+            }
+            @for node in &self.json_ld {
+                (node.render())
             }
         }
     }
@@ -1278,6 +1291,31 @@ pub async fn write_seo_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn seo_meta_renders_json_ld_blocks_after_meta_tags() {
+        use crate::json_ld::JsonLd;
+        let html = SeoMeta::new()
+            .title("Pancakes")
+            .json_ld(JsonLd::new("Recipe").set("name", "Pan</script>cakes"))
+            .json_ld(JsonLd::new("BreadcrumbList"))
+            .render()
+            .into_string();
+        let title_at = html.find("<title>").expect("title");
+        let script_at = html.find("application/ld+json").expect("json-ld");
+        assert!(title_at < script_at, "{html}");
+        assert_eq!(html.matches("application/ld+json").count(), 2, "{html}");
+        assert_eq!(html.matches("</script>").count(), 2, "{html}");
+        assert!(html.contains(r"Pan\u003c/script\u003ecakes"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn seo_meta_without_json_ld_renders_no_script() {
+        let html = SeoMeta::new().title("x").render().into_string();
+        assert!(!html.contains("<script"), "{html}");
+    }
 
     #[test]
     fn sitemap_entry_builder() {

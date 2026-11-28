@@ -108,6 +108,15 @@ pub struct ScaffoldOptions {
     /// `false` (the default) keeps the scaffold's output byte-for-byte
     /// unchanged.
     pub import: bool,
+    /// The schema.org type the resource is — `--schema-org Recipe`. The show
+    /// view renders a JSON-LD block of that type, built from the columns that
+    /// match its properties (see [`super::schema_org::bind`]). With no fields
+    /// given, the type's required and recommended properties become the
+    /// fields. `None` (the default) keeps the output unchanged.
+    pub schema_org: Option<String>,
+    /// `--schema-org-map column=property` pairs that bind a column the names
+    /// do not match. `offers.price` names a property of a nested node.
+    pub schema_org_map: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,6 +445,43 @@ fn plan_scaffold_with_options_impl(
                 .to_owned(),
         ));
     }
+    // `--schema-org <Type>`: resolve the type first, and seed the fields from
+    // it when none were given, so the model, migration and views all see the same columns.
+    let schema_type = options
+        .schema_org
+        .as_deref()
+        .map(super::schema_org::resolve_type)
+        .transpose()?;
+    if schema_type.is_none() && !options.schema_org_map.is_empty() {
+        return Err(GenerateError::Config(
+            "`--schema-org-map` needs `--schema-org <Type>`: it binds columns to that type's \
+             properties."
+                .to_owned(),
+        ));
+    }
+    if let Some(t) = schema_type.filter(|_| options.api && !for_revert) {
+        return Err(GenerateError::Config(format!(
+            "`--schema-org {}` adds JSON-LD to the HTML show view, and `--api` renders no \
+             views. Drop one of them.",
+            t.name
+        )));
+    }
+    let seeded_tokens;
+    let field_tokens: &[String] = match schema_type {
+        Some(t) if field_tokens.is_empty() => {
+            seeded_tokens = super::schema_org::seed_field_tokens(t);
+            if seeded_tokens.is_empty() {
+                return Err(GenerateError::Config(format!(
+                    "`--schema-org {}` with no fields: Google lists no required or recommended \
+                     properties for `{}`, so there is nothing to seed. Give the fields; columns \
+                     named after its properties (`autumn schema-org show {}`) are bound.",
+                    t.name, t.name, t.name
+                )));
+            }
+            &seeded_tokens
+        }
+        _ => field_tokens,
+    };
     let mut fields = parse_fields(field_tokens)?;
     super::model::apply_unique_flags(&mut fields, &options.model.uniques)?;
     // A `{translatable}` column holds a per-locale container, but the CRUD form binds one
@@ -616,6 +662,8 @@ fn plan_scaffold_with_options_impl(
         counter_cache: options.counter_cache,
         i18n: options.i18n,
         import: options.import,
+        schema_org: options.schema_org.clone(),
+        schema_org_map: options.schema_org_map.clone(),
     };
     let mut plan = if for_revert {
         super::model::plan_model_with_options_for_revert(
@@ -994,6 +1042,24 @@ fn plan_scaffold_with_options_impl(
         // returns the literal; with it on, a `t!(locale, "key")` lookup whose key and English
         // text are recorded for the bundle back-fill below.
         let labels = scaffold_i18n::ViewLabels::new(options_with_key.i18n);
+        // The show view's JSON-LD (`--schema-org`). The type is bound against every column,
+        // `created_at` included, since the JSON-LD reads the stored row, not the form.
+        let json_ld_fn = match schema_type {
+            Some(t) => {
+                let columns = super::schema_org::Column::from_fields(&fields);
+                let bindings = super::schema_org::bind(t, &columns, &options.schema_org_map)?;
+                if !for_revert && !bindings.iter().any(|b| b.column != "created_at") {
+                    return Err(GenerateError::Config(format!(
+                        "`--schema-org {}`: no column matches a `{}` property, so the JSON-LD \
+                         would be empty. Name columns after its properties (`autumn schema-org \
+                         show {}`), or bind them with `--schema-org-map column=property`.",
+                        t.name, t.name, t.name
+                    )));
+                }
+                super::schema_org::render_json_ld_fn(t, &bindings, &pascal_name, &snake_name)
+            }
+            None => None,
+        };
         let fresh_own_routes = render_routes_file(
             project_root,
             &pascal_name,
@@ -1015,6 +1081,7 @@ fn plan_scaffold_with_options_impl(
             options_with_key.import,
             &labels,
             backend,
+            json_ld_fn.as_deref(),
         );
         let own_routes = super::nested::reapply_children(&previous_own_routes, &fresh_own_routes)
             .map_err(|refused| {
@@ -3073,6 +3140,9 @@ fn render_routes_file(
     // Selects the form field Rust types, which differ for `Uuid`/`Decimal` on
     // SQLite (issue #1924).
     backend: DatabaseBackend,
+    // `--schema-org`: the `json_ld` function the show view renders, or `None`. `None` keeps
+    // the routes file byte-for-byte unchanged.
+    json_ld_fn: Option<&str>,
 ) -> String {
     let id_rust = id_type.rust_type();
     // Issue #1349: with `--i18n`, view handlers take `Locale` so `t!` has a `locale`. It goes
@@ -6690,6 +6760,14 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
                 n.parent_plural, n.fk, n.parent_pascal
             )
         });
+        // `--schema-org`: the JSON-LD block, after the property list. `show_view` borrows the
+        // row; the plain `show` owns it.
+        let (show_view_json_ld, show_json_ld) = if json_ld_fn.is_some() {
+            ("        (json_ld(row))\n", "        (json_ld(&row))\n")
+        } else {
+            ("", "")
+        };
+        let json_ld_section = json_ld_fn.unwrap_or("");
         let show_section = if has_state_machine {
             // `show_view` only uses the DB to resolve reference display labels (#1146);
             // otherwise name it `_db` (no `mut`) to keep the generated crate warning-free.
@@ -6734,7 +6812,7 @@ async fn show_view(
     Ok({layout_fn}({show_view_title}, {cp_show}flash, html! {{
         h1 {{ {show_view_heading} }}
         (autumn_web::widgets::property_list(&props))
-{show_transition_controls}        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
+{show_view_json_ld}{show_transition_controls}        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
         " "
         (autumn_web::a11y::Link::new(paths::edit(row.id), {edit_link_text})){show_parent_backlink}
     }}))
@@ -6951,7 +7029,7 @@ pub async fn show({locale_param_inline}{id_param_decl}, mut db: {db_ty}, flash: 
     Ok({layout_fn}({show_title}, {cp_show}{flash_arg}, html! {{
         h1 {{ {show_heading} }}
         (autumn_web::widgets::property_list(&props))
-        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
+{show_json_ld}        (autumn_web::a11y::Link::new(paths::index(), {back_to_list}))
         " "
         (autumn_web::a11y::Link::new(paths::edit({route_key_display_expr}), {edit_link_text})){show_parent_backlink}
     }}))
@@ -6985,7 +7063,7 @@ fn submit_token_input(submit_token: Option<&SubmitToken>, field: Option<&SubmitF
     }}
 }}
 {bulk_ids_parser}{attachment_read_back_helpers}{private_layout}
-{index_handler}{bulk_delete_fn}{export_csv_fn}{csv_import_fn}{trash_section}{reorder_section}{show_section}
+{index_handler}{bulk_delete_fn}{export_csv_fn}{csv_import_fn}{trash_section}{reorder_section}{show_section}{json_ld_section}
 /// `GET /{plural}/new` — render the new-{snake_name} form.
 #[secured]
 #[get("/{plural}/new", name = "new")]
@@ -14462,6 +14540,178 @@ async fn main() {
             routes.contains("use crate::schema::categories;"),
             "own table needs no extra schema import: {routes}"
         );
+    }
+
+    fn schema_org_options(ty: &str, map: &[&str]) -> ScaffoldOptions {
+        ScaffoldOptions {
+            schema_org: Some(ty.to_owned()),
+            schema_org_map: map.iter().map(|s| (*s).to_owned()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn file_text(plan: &Plan, suffix: &str) -> String {
+        plan.actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Create { path, contents } | Action::Modify { path, contents }
+                    if path.to_string_lossy().replace('\\', "/").ends_with(suffix) =>
+                {
+                    Some(contents.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no planned file ending {suffix}"))
+    }
+
+    #[test]
+    fn schema_org_scaffold_with_no_fields_seeds_them_from_the_type() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Recipe",
+            &[],
+            "20261127000000",
+            &schema_org_options("recipe", &[]),
+        )
+        .unwrap();
+        let model = file_text(&plan, "src/models/recipe.rs");
+        assert!(model.contains("pub name: String,"), "{model}");
+        assert!(
+            model.contains("pub recipe_ingredient: Option<String>,"),
+            "{model}"
+        );
+        let routes = file_text(&plan, "src/routes/recipes.rs");
+        assert!(
+            routes.contains("fn json_ld(row: &Recipe) -> autumn_web::json_ld::JsonLd {"),
+            "{routes}"
+        );
+        assert!(routes.contains("JsonLd::new(\"Recipe\")"), "{routes}");
+        assert!(routes.contains(".set(\"image\", &row.image)"), "{routes}");
+        assert!(
+            routes.contains(".set_opt(\"recipeIngredient\", row.recipe_ingredient.as_deref().map(json_ld_lines))"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("fn json_ld_lines(text: &str) -> Vec<&str>"),
+            "{routes}"
+        );
+        // The show view renders the block after the property list.
+        let list_at = routes
+            .find("(autumn_web::widgets::property_list(&props))\n        (json_ld(&row))")
+            .expect("splice");
+        assert!(
+            list_at > routes.find("pub async fn show(").expect("show"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn schema_org_scaffold_binds_the_given_fields() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Mug",
+            &[
+                "name:String".into(),
+                "cost:money".into(),
+                "sku:String".into(),
+                "notes:Text".into(),
+            ],
+            "20261127000000",
+            &schema_org_options("Product", &["cost=offers.price"]),
+        )
+        .unwrap();
+        let routes = file_text(&plan, "src/routes/mugs.rs");
+        assert!(
+            routes.contains(
+                "let offers = JsonLd::node(\"Offer\")\n        .set(\"price\", row.cost);"
+            ),
+            "{routes}"
+        );
+        assert!(
+            routes.contains(".set_opt(\"offers\", Some(offers).filter(JsonLd::has_properties))"),
+            "{routes}"
+        );
+        assert!(routes.contains(".set(\"sku\", &row.sku)"), "{routes}");
+        let json_ld_fn = &routes[routes.find("fn json_ld(").expect("fn")..];
+        let json_ld_fn = &json_ld_fn[..json_ld_fn.find("\n}\n").expect("fn end")];
+        assert!(!json_ld_fn.contains("row.notes"), "{json_ld_fn}");
+        assert!(!routes.contains("json_ld_lines"), "{routes}");
+    }
+
+    #[test]
+    fn schema_org_reaches_the_state_machine_show_view() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Event",
+            &[
+                "name:String".into(),
+                "start_date:Timestamp".into(),
+                "status:String:states(draft->live)".into(),
+            ],
+            "20261127000000",
+            &schema_org_options("Event", &[]),
+        )
+        .unwrap();
+        let routes = file_text(&plan, "src/routes/events.rs");
+        assert!(routes.contains("async fn show_view("), "{routes}");
+        assert!(
+            routes.contains("(autumn_web::widgets::property_list(&props))\n        (json_ld(row))"),
+            "{routes}"
+        );
+    }
+
+    #[test]
+    fn without_schema_org_the_routes_have_no_json_ld() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let routes = file_text(&plan, "src/routes/posts.rs");
+        assert!(!routes.contains("json_ld"), "{routes}");
+    }
+
+    #[test]
+    fn schema_org_refusals_name_the_problem() {
+        let tmp = project_with_main(default_main());
+        let err = |fields: &[&str], opts: ScaffoldOptions| {
+            let fields: Vec<String> = fields.iter().map(|s| (*s).to_owned()).collect();
+            plan_scaffold_with_options(tmp.path(), "Thing", &fields, "20261127000000", &opts)
+                .map(|_| ())
+                .expect_err("refused")
+                .to_string()
+        };
+        let msg = err(
+            &["name:String"],
+            ScaffoldOptions {
+                api: true,
+                ..schema_org_options("Thing", &[])
+            },
+        );
+        assert!(msg.contains("`--api` renders no views"), "{msg}");
+        let msg = err(
+            &["name:String"],
+            ScaffoldOptions {
+                schema_org_map: vec!["name=name".into()],
+                ..Default::default()
+            },
+        );
+        assert!(msg.contains("needs `--schema-org <Type>`"), "{msg}");
+        let msg = err(&["colour:String"], schema_org_options("Thing", &[]));
+        assert!(
+            msg.contains("no column matches a `Thing` property"),
+            "{msg}"
+        );
+        let msg = err(&[], schema_org_options("Thing", &[]));
+        assert!(msg.contains("nothing to seed"), "{msg}");
+        let msg = err(&["name:String"], schema_org_options("Thingy", &[]));
+        assert!(msg.contains("Did you mean `Thing`"), "{msg}");
     }
 
     #[test]

@@ -537,6 +537,24 @@ omit the URL from the source instead. `sitemap_xml` truncates past 50,000 URLs.
 `autumn build` writes both files into `dist/`. Guide: `docs/guide/seo.md`; runnable
 example: `examples/reddit-clone` (`src/seo.rs`, `autumn.toml`).
 
+**Schema.org JSON-LD (unreleased):** build structured data with
+`autumn_web::json_ld::JsonLd` instead of writing a `<script>` by hand.
+`JsonLd::new("Recipe")` is a top-level node (with `@context`),
+`JsonLd::node("Person")` a nested one; `.set(name, value)` takes any
+`Serialize` (jiff dates write ISO 8601, `null` removes the property),
+`.set_opt` skips `None`, `JsonLd::graph([...])` shares one `@context`.
+`(node)` in `html!` (or `.render()`) writes the `<script
+type="application/ld+json">` element with `<`, `>`, `&` escaped, so a user
+value cannot close the script; `to_json_unescaped()` is the opt-out for non-HTML
+output. `SeoMeta::new().json_ld(node)` renders it after the meta tags. For a
+resource, `autumn generate scaffold Recipe --schema-org Recipe` (no fields →
+the type's Google-required and recommended properties become the fields) writes
+a `json_ld(row)` fn the show view renders; columns bind by name
+(`date_published` → `datePublished`, `offers_price` → `offers.price`),
+`--schema-org-map cost=offers.price` binds the rest. `autumn schema-org show
+<Type>` lists properties; `autumn schema-org audit <URL|FILE|DIR> [--strict]`
+checks pages (exit 1 on errors). Guide: `docs/guide/schema-org.md`.
+
 **Agent readiness (AEO, on by default):** `[aeo]` in `autumn.toml`. No code:
 `Accept: text/markdown` on an HTML page returns Markdown (`Vary: Accept`); the
 homepage sends agent `Link` headers; the router fallback serves `/robots.txt`

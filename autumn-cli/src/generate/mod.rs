@@ -36,6 +36,7 @@ pub mod pwa;
 pub mod scaffold;
 mod scaffold_i18n;
 pub mod schema_edit;
+pub mod schema_org;
 mod spelling;
 mod sweep;
 pub mod system_test;

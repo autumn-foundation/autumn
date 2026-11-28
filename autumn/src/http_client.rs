@@ -8340,15 +8340,20 @@ mod tests {
 
         #[tokio::test]
         async fn the_throttle_applies_under_a_deadline() {
-            let (url, _hits) = counting(Some(503), &[]).await;
+            let (url, hits) = counting(Some(503), &[]).await;
             let throttle = Arc::new(crate::admission::AdaptiveThrottle::new(
                 2.0,
                 Duration::from_secs(120),
             ));
-            let client = Client {
+            // The lowest draw: the throttle rejects every attempt whose reject
+            // probability is above 0. With OS entropy the count depended on
+            // the draws, and on whether the host's circuit breaker opened
+            // first and took the calls before the throttle saw them.
+            let mut client = Client {
                 throttle: Some(Arc::clone(&throttle)),
                 ..Client::new()
             };
+            client.entropy = Arc::new(FixedDraw(0));
             let mut throttled = 0;
             for _ in 0..100 {
                 let result =
@@ -8357,10 +8362,14 @@ mod tests {
                     throttled += 1;
                 }
             }
-            assert!(
-                throttled > 20,
-                "the deadline path must use the throttle: {throttled}"
+            // The first call has nothing to go on and reaches the host; its
+            // 503 makes every later attempt's probability above 0.
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "only the first call is sent"
             );
+            assert_eq!(throttled, 99, "the deadline path must use the throttle");
         }
 
         #[tokio::test]

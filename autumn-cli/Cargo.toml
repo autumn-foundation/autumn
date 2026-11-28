@@ -113,6 +113,9 @@ ctrlc = "3.5.2"
 getrandom = "0.4"
 hex = "0.4"
 hmac = "0.13"
+# `autumn schema-org audit` finds `<script type="application/ld+json">` with the
+# WHATWG tokenizer. `autumn-web` already builds it (through `css-inline`).
+html5ever = "0.40"
 include_dir = "0.7"
 indicatif = "0.18"
 notify = "8"

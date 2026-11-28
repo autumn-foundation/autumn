@@ -95,6 +95,13 @@ pub struct ScaffoldConfigEntry {
     /// `--import`.
     #[serde(default)]
     pub import: bool,
+    /// The schema.org type of the resource — the TOML equivalent of
+    /// `--schema-org Recipe`.
+    #[serde(default)]
+    pub schema_org: Option<String>,
+    /// `column=property` pairs — the TOML equivalent of `--schema-org-map`.
+    #[serde(default)]
+    pub schema_org_map: Vec<String>,
 }
 
 /// Project-level generator defaults, read from `[generate]` in the config file.
@@ -367,6 +374,8 @@ pub fn merge_config_with_cli(
             counter_cache,
             i18n,
             import,
+            schema_org: config.schema_org,
+            schema_org_map: config.schema_org_map,
         },
     ))
 }
@@ -659,7 +668,34 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             searchable: vec![],
             i18n: false,
             import: false,
+            schema_org: None,
+            schema_org_map: vec![],
         }
+    }
+
+    #[test]
+    fn merge_carries_the_schema_org_keys() {
+        let entry = ScaffoldConfigEntry {
+            schema_org: Some("Product".into()),
+            schema_org_map: vec!["url=offers.price".into()],
+            ..bookmark_entry()
+        };
+        let (_, options) = merge(entry);
+        assert_eq!(options.schema_org.as_deref(), Some("Product"));
+        assert_eq!(options.schema_org_map, vec!["url=offers.price".to_owned()]);
+    }
+
+    #[test]
+    fn schema_org_keys_parse_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            &tmp,
+            "[scaffold.Recipe]\nfields = [\"name:String\"]\nschema_org = \"Recipe\"\n\
+             schema_org_map = [\"name=headline\"]\n",
+        );
+        let entry = read_explicit_scaffold_config(&path, "Recipe", false).unwrap();
+        assert_eq!(entry.schema_org.as_deref(), Some("Recipe"));
+        assert_eq!(entry.schema_org_map, vec!["name=headline".to_owned()]);
     }
 
     fn merge(entry: ScaffoldConfigEntry) -> (Vec<String>, ScaffoldOptions) {
