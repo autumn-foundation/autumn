@@ -144,7 +144,7 @@ directories = "6.0.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31.2", features = ["fs", "signal", "socket", "user"] }
+nix = { version = "0.32.0", features = ["fs", "signal", "socket", "user"] }
 
 # Windows daemon lifecycle (#1639). The workspace forbids `unsafe`, so both of
 # these are chosen for having a safe surface: `sysinfo` supplies the process
