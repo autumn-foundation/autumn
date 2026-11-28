@@ -58,8 +58,9 @@ skew, a GC pause, a slow boot) does not run it again.
 - A row stays for the task's period plus `lease_ttl_secs`. The period of a
   fixed-delay task is its delay: each replica starts its timer at its own
   boot. The period of a cron task is the time to its next occurrence: a late
-  occurrence still runs until then. Then the next claim deletes the row. Set
-  `lease_ttl_secs` longer than the spread between the replicas' clocks.
+  occurrence still runs until then. Then a claim of the same tick deletes
+  the row, and so does the next tick any replica wins. Set `lease_ttl_secs`
+  longer than the spread between the replicas' clocks.
 - The claim and the prune use the database clock (`now()`), not the replica
   clocks.
 - The coordinator keeps no session state and holds no connection while a tick

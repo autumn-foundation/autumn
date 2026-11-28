@@ -1,0 +1,23 @@
+-- One replica's claim attempt, as PostgresTickSchedulerCoordinator::try_acquire_for_period
+-- issues it: the claim; on a loss, the prune of this key and, if it removed a
+-- row, the claim again; on a win, the table-wide prune. The task is drawn so
+-- that each replica tries each tick once: weight 1/period. The helper SELECT
+-- computes the tick key and advisory key the Rust code computes
+-- (fixed_delay_tick_key, advisory_lock_key). The Rust code reads the prune's
+-- row count; pgbench reads it through the RETURNING run.sh appends.
+\set u random(1, 670)
+\set task CASE WHEN :u <= 600 THEN 1 + (:u - 1) / 60 WHEN :u <= 660 THEN 11 + (:u - 601) / 6 ELSE 21 + (:u - 661) END
+\set period CASE WHEN :task <= 10 THEN 1 WHEN :task <= 20 THEN 10 ELSE 60 END
+SELECT ('autumn' || chr(58) || 'scheduler') AS prefix, k.task_name, k.tick_key, 'replica-' || :client_id::int AS owner, 300 + :period::int AS hold, ('x' || left(encode(sha256(convert_to(('autumn' || chr(58) || 'scheduler'), 'UTF8') || '\x00'::bytea || convert_to(k.task_name, 'UTF8') || '\x00'::bytea || convert_to(k.tick_key, 'UTF8')), 'hex'), 16))::bit(64)::bigint AS akey FROM (SELECT 'task-' || :task::int AS task_name, 'task-' || :task::int || ':' || floor(extract(epoch FROM clock_timestamp()) / :period::int)::bigint AS tick_key) k \gset
+\set generation 0
+@@CLAIM@@ \aset
+\if :generation = 0
+\set pruned 0
+@@PRUNE_KEY@@ RETURNING 1 AS pruned \aset
+\if :pruned = 1
+@@CLAIM@@ \aset
+\endif
+\endif
+\if :generation > 0
+@@PRUNE@@;
+\endif

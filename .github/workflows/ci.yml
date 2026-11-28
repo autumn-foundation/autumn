@@ -2888,9 +2888,11 @@ jobs:
           # data-capsule round trip (`data_capsule_pg`, the only test of
           # `gdpr/portability/pg.rs` import) joins them: the `Test (Docker)`
           # sweep runs it without coverage, so the patch gate saw none of that
-          # file. A filter that matches nothing exits 0, so check the count.
+          # file. The Postgres tick coordinator of `scheduler.rs`
+          # (`scheduled_coordination_pg`) runs only there too. A filter that
+          # matches nothing exits 0, so check the count.
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
-            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: ledger_postgres:: data_capsule_pg:: \
+            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: ledger_postgres:: data_capsule_pg:: scheduled_coordination_pg:: \
             | tee "$RUNNER_TEMP/isolation-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/isolation-cov.log"
           # Issue #2555: the Postgres `TestDb::reset_table` runs only in this

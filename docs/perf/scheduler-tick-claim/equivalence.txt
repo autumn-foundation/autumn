@@ -1,0 +1,16 @@
+free key                                                   same      won, generation above every earlier one;autumn:scheduler/digest:100 replica-b;autumn:scheduler/digest:101 replica-a;
+                                                                     expired rows left: base 0, new 0
+key holds a live row                                       same      lost;autumn:scheduler/digest:100 replica-b;
+                                                                     expired rows left: base 0, new 4
+key holds an expired row (late replica)                    same      won, generation above every earlier one;autumn:scheduler/digest:100 replica-b;autumn:scheduler/digest:99 replica-a;
+                                                                     expired rows left: base 0, new 0
+constant key, expired row (ACME mutex)                     same      won, generation above every earlier one;autumn:scheduler/acme replica-a;autumn:scheduler/digest:100 replica-b;
+                                                                     expired rows left: base 0, new 0
+free key, advisory key held (pre-#3052 replica)            same      lost;autumn:scheduler/digest:100 replica-b;
+                                                                     expired rows left: base 0, new 4
+expired row, advisory key held                             same      lost;autumn:scheduler/digest:100 replica-b;
+                                                                     expired rows left: base 0, new 3
+another prefix, key live here, expired there               same      won, generation above every earlier one;autumn:scheduler/digest:100 replica-b;other:scheduler/digest:100 replica-a;
+                                                                     expired rows left: base 0, new 0
+same key in another prefix                                 same      won, generation above every earlier one;autumn:scheduler/digest:100 replica-b;other:scheduler/digest:101 replica-a;
+                                                                     expired rows left: base 0, new 0

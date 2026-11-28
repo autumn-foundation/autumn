@@ -13,7 +13,7 @@ notes = ""
 
 [[site]]
 file = "autumn/src/scheduler.rs"
-function = "autumn_web::scheduler::PostgresTickSchedulerCoordinator::try_acquire_for_period"
+function = "autumn_web::scheduler::PostgresTickSchedulerCoordinator::claim"
 
 [plan]
 status = "ok"

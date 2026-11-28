@@ -1,0 +1,77 @@
+work=/tmp/tmp.8ECq1chMVo
+ live_rows 
+-----------
+      3380
+(1 row)
+
+ n_live_tup | n_dead_tup 
+------------+------------
+       3380 |          0
+(1 row)
+
+number of transactions actually processed: 19941
+number of failed transactions: 0 (0.000%)
+latency average = 1.606 ms
+latency stddev = 10.682 ms
+rate limit schedule lag: avg 0.480 (max 427.042) ms
+tps = 66.473768 (without initial connection time)
+replicas=6 seconds=300 rate=67.0/s
+wal_lsn_delta_bytes=2440136
+CREATE VIEW
+-- statements on the tick table, by buffers
+                                           query                                            | calls | rows | buffers |  hit   | read | dirtied | temp_w | wal_records | wal_fpi | wal_bytes | pct_buf | pct_calls | pct_wal | buf_per_call 
+--------------------------------------------------------------------------------------------+-------+------+---------+--------+------+---------+--------+-------------+---------+-----------+---------+-----------+---------+--------------
+ DELETE FROM autumn_scheduler_ticks WHERE expires_at < now()                                | 19941 | 3380 |  186547 | 186547 |    0 |      27 |      0 |        3849 |      45 |    570266 |    65.8 |      50.0 |    28.2 |         9.35
+ INSERT INTO autumn_scheduler_ticks (key_prefix, task_name, tick_key, owner, expires_at) SE | 19941 | 3365 |   96826 |  96826 |    0 |      71 |      0 |       14141 |      19 |   1451554 |    34.2 |      50.0 |    71.8 |         4.86
+
+-- totals
+ calls | buffers | wal_bytes | wal_fpi | temp_w 
+-------+---------+-----------+---------+--------
+ 39882 |  283373 |   2021820 |      64 |      0
+
+-- top 10 statements in the database by calls (harness helper included)
+                                 query                                  | calls | buffers 
+------------------------------------------------------------------------+-------+---------
+ SELECT ($6 || chr($7) || $8) AS prefix, k.task_name, k.tick_key, $9 || | 19941 |       0
+ INSERT INTO autumn_scheduler_ticks (key_prefix, task_name, tick_key, o | 19941 |   96826
+ DELETE FROM autumn_scheduler_ticks WHERE expires_at < now()            | 19941 |  186547
+ SELECT coalesce(wait_event_type, $1) || $2 || coalesce(wait_event, $3) |  5942 |       0
+ SELECT (n_dead_tup > $1 + $2 * n_live_tup)::int || $3 || (n_mod_since_ |     4 |      56
+ ANALYZE autumn_scheduler_ticks                                         |     2 |     938
+ SELECT pg_current_wal_lsn()                                            |     2 |       0
+ VACUUM (ANALYZE) autumn_scheduler_ticks                                |     2 |    1817
+ SELECT sum(calls) AS calls, sum(buffers) AS buffers, sum(wal_bytes) AS |     1 |       1
+ SELECT pg_stat_statements_reset()                                      |     1 |       0
+
+-- table
+        relname         | seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_ins | n_tup_del | n_tup_hot_upd | n_live_tup | n_dead_tup 
+------------------------+----------+--------------+----------+---------------+-----------+-----------+---------------+------------+------------
+ autumn_scheduler_ticks |        0 |            0 |    39860 |         20237 |      3365 |      3380 |             0 |       3339 |       1370
+
+        relname         | heap_blks | idx_blks 
+------------------------+-----------+----------
+ autumn_scheduler_ticks |    151280 |   113828
+
+-- indexes
+             indexrelname              | idx_scan | idx_tup_read | idx_tup_fetch | bytes  
+---------------------------------------+----------+--------------+---------------+--------
+ autumn_scheduler_ticks_pkey           |    19888 |        16523 |         16523 | 729088
+ idx_autumn_scheduler_ticks_expires_at |    19972 |      1715849 |          2884 | 122880
+
+-- end state
+ live_rows | expired_left 
+-----------+--------------
+      3365 |            0
+
+-- autovacuum emulator (naptime=60s)
+t=60 vacuum analyze
+t=120 analyze
+t=180 vacuum analyze
+t=240 analyze
+-- wait-event samples (backend x sample) during the run
+    144 IO:WALSync
+     73 LWLock:WALWrite
+     39 CPU:-
+      9 Client:ClientRead
+      4 Lock:tuple
+      4 Lock:transactionid
