@@ -1,0 +1,11 @@
+$ cargo test -p autumn-web --test integration_tests cache_response_tenant_scope
+running 1 test
+test integration::cache_response_tenant_scope::response_cache_never_serves_one_tenant_to_another ... FAILED
+
+---- integration::cache_response_tenant_scope::response_cache_never_serves_one_tenant_to_another stdout ----
+panicked at autumn/tests/integration/cache_response_tenant_scope.rs:93:5:
+assertion `left == right` failed: subdomain tenancy: tenant B was served tenant A's cached response
+  left: "catalog-of-tenant-a-sentinel"
+ right: "catalog-of-tenant-b-sentinel"
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2963 filtered out

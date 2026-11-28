@@ -38,6 +38,8 @@ mod cache_coherence;
 #[cfg(all(feature = "db", feature = "cache-moka", feature = "test-support"))]
 mod cache_invalidation_after_commit;
 #[cfg(feature = "cache-moka")]
+mod cache_response_tenant_scope;
+#[cfg(feature = "cache-moka")]
 mod cache_stampede;
 #[cfg(feature = "cache-moka")]
 mod cached_impl_scope;
