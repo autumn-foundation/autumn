@@ -205,13 +205,14 @@ impl<S: quic::RecvStream<Buf = Bytes>> quic::RecvStream for LimitedRecv<S> {
     }
 }
 
-/// A request stream whose receive side has a byte limit.
-pub(super) struct LimitedBidi<B: Buf> {
-    inner: h3_quinn::BidiStream<B>,
+/// A request stream whose receive side has a byte limit. Generic over the
+/// inner stream so that tests can drive it with a fake.
+pub(super) struct LimitedBidi<S> {
+    inner: S,
     gate: Gate,
 }
 
-impl<B: Buf> quic::SendStream<B> for LimitedBidi<B> {
+impl<B: Buf, S: quic::SendStream<B>> quic::SendStream<B> for LimitedBidi<S> {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
         self.inner.poll_ready(cx)
     }
@@ -233,7 +234,7 @@ impl<B: Buf> quic::SendStream<B> for LimitedBidi<B> {
     }
 }
 
-impl<B: Buf> quic::RecvStream for LimitedBidi<B> {
+impl<S: quic::RecvStream<Buf = Bytes>> quic::RecvStream for LimitedBidi<S> {
     type Buf = Bytes;
 
     fn poll_data(
@@ -252,9 +253,14 @@ impl<B: Buf> quic::RecvStream for LimitedBidi<B> {
     }
 }
 
-impl<B: Buf> quic::BidiStream<B> for LimitedBidi<B> {
-    type SendStream = h3_quinn::SendStream<B>;
-    type RecvStream = LimitedRecv<h3_quinn::RecvStream>;
+impl<B, S> quic::BidiStream<B> for LimitedBidi<S>
+where
+    B: Buf,
+    S: quic::BidiStream<B> + quic::RecvStream<Buf = Bytes>,
+    S::RecvStream: quic::RecvStream<Buf = Bytes>,
+{
+    type SendStream = S::SendStream;
+    type RecvStream = LimitedRecv<S::RecvStream>;
 
     fn split(self) -> (Self::SendStream, Self::RecvStream) {
         let (send, recv) = self.inner.split();
@@ -278,7 +284,7 @@ fn open_bidi<B: Buf, O: quic::OpenStreams<B, BidiStream = h3_quinn::BidiStream<B
     opener: &mut O,
     limit: u64,
     cx: &mut Context<'_>,
-) -> Poll<Result<LimitedBidi<B>, StreamErrorIncoming>> {
+) -> Poll<Result<LimitedBidi<h3_quinn::BidiStream<B>>, StreamErrorIncoming>> {
     let inner = ready!(opener.poll_open_bidi(cx))?;
     Poll::Ready(Ok(LimitedBidi {
         inner,
@@ -287,7 +293,7 @@ fn open_bidi<B: Buf, O: quic::OpenStreams<B, BidiStream = h3_quinn::BidiStream<B
 }
 
 impl<B: Buf> quic::OpenStreams<B> for LimitedOpenStreams {
-    type BidiStream = LimitedBidi<B>;
+    type BidiStream = LimitedBidi<h3_quinn::BidiStream<B>>;
     type SendStream = h3_quinn::SendStream<B>;
 
     fn poll_open_bidi(
@@ -327,7 +333,7 @@ impl LimitedConnection {
 }
 
 impl<B: Buf> quic::OpenStreams<B> for LimitedConnection {
-    type BidiStream = LimitedBidi<B>;
+    type BidiStream = LimitedBidi<h3_quinn::BidiStream<B>>;
     type SendStream = h3_quinn::SendStream<B>;
 
     fn poll_open_bidi(
@@ -574,6 +580,140 @@ mod tests {
         let mut recv = limited(Vec::new(), 16);
         quic::RecvStream::stop_sending(&mut recv, 0x0100);
         assert_eq!(recv.inner.stopped, Some(0x0100));
+    }
+
+    /// A request stream that records what the wrapper passes through.
+    struct FakeBidi {
+        recv: FakeRecv,
+        ready: bool,
+        sent: usize,
+        finished: bool,
+        reset: Option<u64>,
+    }
+
+    impl quic::SendStream<Bytes> for FakeBidi {
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+            self.ready = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn send_data<T: Into<WriteBuf<Bytes>>>(
+            &mut self,
+            _data: T,
+        ) -> Result<(), StreamErrorIncoming> {
+            self.sent += 1;
+            Ok(())
+        }
+
+        fn poll_finish(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+            self.finished = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn reset(&mut self, reset_code: u64) {
+            self.reset = Some(reset_code);
+        }
+
+        fn send_id(&self) -> StreamId {
+            StreamId::try_from(8_u64).expect("stream 8")
+        }
+    }
+
+    impl quic::RecvStream for FakeBidi {
+        type Buf = Bytes;
+
+        fn poll_data(
+            &mut self,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+            self.recv.poll_data(cx)
+        }
+
+        fn stop_sending(&mut self, error_code: u64) {
+            self.recv.stop_sending(error_code);
+        }
+
+        fn recv_id(&self) -> StreamId {
+            self.recv.recv_id()
+        }
+    }
+
+    impl quic::BidiStream<Bytes> for FakeBidi {
+        type SendStream = Self;
+        type RecvStream = FakeRecv;
+
+        fn split(self) -> (Self::SendStream, Self::RecvStream) {
+            let recv = FakeRecv {
+                chunks: self.recv.chunks.clone(),
+                stopped: None,
+            };
+            (
+                Self {
+                    recv: FakeRecv {
+                        chunks: std::collections::VecDeque::new(),
+                        stopped: None,
+                    },
+                    ..self
+                },
+                recv,
+            )
+        }
+    }
+
+    fn fake_bidi(chunks: Vec<Vec<u8>>, limit: u64) -> LimitedBidi<FakeBidi> {
+        LimitedBidi {
+            inner: FakeBidi {
+                recv: FakeRecv {
+                    chunks: chunks.into_iter().map(Bytes::from).collect(),
+                    stopped: None,
+                },
+                ready: false,
+                sent: 0,
+                finished: false,
+                reset: None,
+            },
+            gate: Gate::request(limit),
+        }
+    }
+
+    #[test]
+    fn a_request_stream_passes_its_send_side_through() {
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut bidi = fake_bidi(Vec::new(), 16);
+        assert!(quic::SendStream::<Bytes>::poll_ready(&mut bidi, &mut cx).is_ready());
+        quic::SendStream::<Bytes>::send_data(&mut bidi, Bytes::from_static(b"x"))
+            .expect("data passes");
+        assert!(quic::SendStream::<Bytes>::poll_finish(&mut bidi, &mut cx).is_ready());
+        quic::SendStream::<Bytes>::reset(&mut bidi, 0x0101);
+        assert_eq!(quic::SendStream::<Bytes>::send_id(&bidi).into_inner(), 8);
+        assert!(bidi.inner.ready && bidi.inner.finished);
+        assert_eq!(bidi.inner.sent, 1);
+        assert_eq!(bidi.inner.reset, Some(0x0101));
+    }
+
+    #[test]
+    fn a_request_stream_limits_its_receive_side_before_and_after_split() {
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut head = header(0x01, 4);
+        head.extend([0u8; 4]);
+        let mut bidi = fake_bidi(vec![head, header(0x01, 17)], 16);
+        assert!(matches!(
+            quic::RecvStream::poll_data(&mut bidi, &mut cx),
+            Poll::Ready(Ok(Some(_)))
+        ));
+        assert_eq!(quic::RecvStream::recv_id(&bidi).into_inner(), 4);
+        quic::RecvStream::stop_sending(&mut bidi, 0x0102);
+        assert_eq!(bidi.inner.recv.stopped, Some(0x0102));
+
+        // The split receive side keeps the frame reader, so the next frame,
+        // which declares too much, is refused there.
+        let (_send, mut recv) = quic::BidiStream::<Bytes>::split(bidi);
+        assert!(matches!(
+            quic::RecvStream::poll_data(&mut recv, &mut cx),
+            Poll::Ready(Err(_))
+        ));
     }
 
     #[test]

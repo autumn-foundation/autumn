@@ -114,6 +114,16 @@ async fn trailers(req: axum::extract::Request) -> axum::response::Response {
     )))
 }
 
+/// A body that fails after its first chunk.
+#[get("/broken")]
+async fn broken() -> axum::body::Body {
+    let chunks = futures::stream::iter(vec![
+        Ok(Bytes::from_static(b"start")),
+        Err(std::io::Error::other("the body failed")),
+    ]);
+    axum::body::Body::from_stream(chunks)
+}
+
 #[get("/hop")]
 async fn hop() -> impl axum::response::IntoResponse {
     (
@@ -184,7 +194,7 @@ fn serve_h3(
         .config(config)
         .routes(routes![
             hello, echo, put_item, post_item, whoami, host, slow, cert, version, forever, hop,
-            trailers
+            trailers, broken
         ])
         .build()
         .into_router();
@@ -757,6 +767,37 @@ async fn h3_round_trips_request_and_response_trailers() {
         assert_eq!(trailers.get("x-echo").unwrap(), "abc");
     };
     tokio::time::timeout(DEADLINE, fut).await.expect("in time");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn h3_stops_the_stream_when_a_response_body_fails() {
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
+    let mut client = connect(server.addr, None).await.expect("h3 connects");
+    let req = axum::http::Request::get("https://localhost/broken")
+        .body(())
+        .unwrap();
+    let outcome = tokio::time::timeout(DEADLINE, async {
+        let mut stream = client.send.send_request(req).await.expect("request opens");
+        stream.finish().await.expect("request ends");
+        let resp = stream.recv_response().await.expect("response head");
+        assert_eq!(resp.status(), 200);
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    })
+    .await
+    .expect("in time");
+    assert!(
+        outcome.is_err(),
+        "a failed body must not end like a complete one"
+    );
+    let mut fresh = connect(server.addr, None).await.expect("h3 connects again");
+    assert_eq!(fresh.get("/hello").await.expect("GET").status, 200);
     server.shutdown().await;
 }
 
