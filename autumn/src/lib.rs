@@ -212,6 +212,10 @@ pub mod http_server;
 pub mod i18n;
 #[cfg_attr(not(feature = "idempotency"), path = "idempotency_off.rs")]
 pub mod idempotency;
+/// [`iroh`] — an endpoint that peers dial by public key, through NAT.
+/// Gated behind the off-by-default `iroh` feature.
+#[cfg(feature = "iroh")]
+pub mod iroh;
 pub mod range;
 #[cfg(feature = "db")]
 pub mod search;

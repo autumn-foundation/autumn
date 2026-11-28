@@ -98,6 +98,7 @@ AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS=2500
 | `node_id` | string | none | Stable node identity. Defaults to a per-boot random id. |
 | `push_interval_ms` | u64 | `500` | Base period of the state push, carrying ±20% per-node jitter. |
 | `suspicion_timeout_ms` | u64 | `2500` | Silence after which a peer is locally down and leaves the view. |
+| `transport` | `"tcp"` or `"iroh"` | `"tcp"` | How nodes reach each other. See [the iroh transport](#the-iroh-transport). |
 
 ### Validation
 
@@ -109,6 +110,10 @@ warning:
 - `suspicion_timeout_ms` must be at least `3 × push_interval_ms`. Below that
   ratio a single delayed push evicts a healthy peer and the view flaps.
 - `push_interval_ms` must be at least `10`.
+- With `transport = "iroh"`: each seed is `<endpoint-id>` or
+  `<endpoint-id>@<ip:port>`, `bind_addr` is not checked, `advertise_addr` must
+  be a dialable `ip:port` (not a wildcard, not port `0`), and `[iroh] enabled`
+  must be `true`. The next item is for `transport = "tcp"`.
 - `bind_addr`, `advertise_addr`, and every entry of `seed_peers` must parse as
   a `SocketAddr` (`host:port`, IP literal — hostnames are not resolved). Only
   `bind_addr` may carry port `0`: there it means "any free port" and the node
@@ -120,6 +125,9 @@ warning:
 - An unknown key under `[cluster]` is a config error, like every other section.
 
 ### Choosing addresses
+
+This section is for `transport = "tcp"`. The iroh transport sends replies on
+the connection that a peer opened; see [the iroh transport](#the-iroh-transport).
 
 `bind_addr` is a local bind; `advertise_addr` is what other nodes dial. They
 differ whenever the bind is a wildcard or the node sits behind NAT:
@@ -145,6 +153,31 @@ differ whenever the bind is a wildcard or the node sits behind NAT:
   contact; after that each node learns peers (and their advertised addresses)
   from the pushed state. Seeding one direction is enough — node B pointed at
   node A produces a two-member view on both.
+
+### The iroh transport
+
+With the `iroh` feature, `transport = "iroh"` runs the cluster on the
+[`[iroh]` endpoint](iroh.md). Nodes dial each other by endpoint id.
+
+- `seed_peers` are `<endpoint-id>` or `<endpoint-id>@<ip:port>`.
+- `bind_addr` is not used. The endpoint binds `[iroh] bind_addr`.
+- A node advertises `<endpoint-id>@<ip:port>`. `advertise_addr`, when set, is
+  the direct `ip:port` (for example, a port forward). Set it when `[iroh]
+  bind_addr` is a wildcard: else the node picks one interface address, and it
+  may be one that peers cannot route to.
+- One QUIC connection carries frames in both directions. When a peer dials
+  this node, this node also writes to the peer on that connection. So a node
+  behind NAT that can dial out gets every push back: no one-way cluster.
+- Each frame goes on its own QUIC stream. The envelope, the MAC, the queues
+  and the farewell are the same as on TCP. QUIC also encrypts the frames.
+- The handshake proves the peer's endpoint id. A frame whose sender's own
+  record names another id is dropped (`reason="sender"`).
+- `[iroh] allowed_peers`, when set, limits which ids may connect.
+
+The shared secret is still the root of trust. A holder of the secret can
+gossip false records about other nodes. A node that sees a false record about
+itself refutes it at a higher incarnation. Keep the secret to the nodes you
+run, and set `allowed_peers`.
 
 ## Using the counter
 
@@ -410,7 +443,13 @@ charged, because the frame carried a valid MAC.
    resets the sequence watermark.
 7. **Payload parse** — only now is `payload` deserialized. An unknown message
    type or malformed body is dropped (`reason="payload"`).
-8. **Merge** — the message is applied, and receipt is recorded against the
+8. **Sender identity** (iroh transport only) — the record that the sender
+   gives for itself must name the endpoint id of the connection. A Leave must
+   come from the id that this node has for the sender. A push without the
+   sender's own record, and a Leave from a sender this node never met, are
+   dropped too (`reason="sender"`). The check runs before the replay
+   watermark moves, so a dropped frame cannot silence the real sender.
+9. **Merge** — the message is applied, and receipt is recorded against the
    sender for the liveness overlay.
 
 ### Messages

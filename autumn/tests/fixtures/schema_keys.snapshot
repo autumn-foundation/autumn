@@ -156,6 +156,7 @@ cluster.push_interval_ms
 cluster.secret
 cluster.seed_peers
 cluster.suspicion_timeout_ms
+cluster.transport
 compression
 compression.enabled
 cors
@@ -319,6 +320,16 @@ idempotency.redis
 idempotency.redis.key_prefix
 idempotency.redis.url
 idempotency.ttl_secs
+iroh
+iroh.address_lookup
+iroh.allow_http_relay
+iroh.allow_readable_secret_key
+iroh.allowed_peers
+iroh.bind_addr
+iroh.enabled
+iroh.relay
+iroh.relay_urls
+iroh.secret_key_path
 jobs
 jobs.backend
 jobs.default_timeout_ms

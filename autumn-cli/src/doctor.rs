@@ -1157,6 +1157,253 @@ fn resolve_http3_doctor_data() -> Http3DoctorData {
     http3_doctor_data_from(&merged, env.as_ref(), rmem_max)
 }
 
+/// The state of the `[iroh]` secret key file, read offline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IrohKeyFile {
+    /// No file yet. The app creates it on first boot.
+    Missing,
+    /// The file holds a key, and only its owner can read it.
+    Ok,
+    /// Group or others can read the file. The permission bits.
+    Exposed(u32),
+    /// The file does not hold 32 bytes or 64 hex characters.
+    NotAKey,
+    /// The file exists, but doctor cannot read it.
+    Unreadable,
+}
+
+/// The resolved `[iroh]` state for [`check_iroh_impl`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrohDoctorData {
+    /// `[iroh] enabled`.
+    pub enabled: bool,
+    /// `[iroh] relay`.
+    pub relay: String,
+    /// `[iroh] address_lookup`.
+    pub address_lookup: String,
+    /// The secret key file.
+    pub key_file: IrohKeyFile,
+    /// `[cluster] enabled = true` with `transport = "iroh"`.
+    pub cluster_uses_iroh: bool,
+    /// `[iroh] allow_readable_secret_key`.
+    pub allow_readable_secret_key: bool,
+}
+
+/// Grade `[iroh]` (pure, injectable for tests).
+///
+/// - A cluster on iroh with `[iroh]` off → **Fail** (boot refuses it).
+/// - Off → **Pass**.
+/// - A key file that others can read, or that holds no key → **Fail** (boot
+///   refuses it).
+/// - A key file that doctor cannot read → **Warn**.
+/// - Otherwise → **Pass**, with the relay and lookup modes.
+#[must_use]
+pub fn check_iroh_impl(data: &IrohDoctorData) -> CheckResult {
+    let result = |status, detail: String, hint| CheckResult {
+        name: "iroh",
+        status,
+        detail: Some(detail),
+        hint,
+    };
+    if !data.enabled {
+        if data.cluster_uses_iroh {
+            return result(
+                CheckStatus::Fail,
+                "[cluster] transport = \"iroh\" needs [iroh] enabled = true".into(),
+                Some("Set [iroh] enabled = true, or set [cluster] transport = \"tcp\""),
+            );
+        }
+        return result(CheckStatus::Pass, "[iroh] is off".into(), None);
+    }
+    match data.key_file {
+        IrohKeyFile::Exposed(mode) if data.allow_readable_secret_key => {
+            return result(
+                CheckStatus::Warn,
+                format!(
+                    "the [iroh] secret key file has mode {mode:o}; allow_readable_secret_key \
+                     lets it through"
+                ),
+                Some("Mount the key with mode 0600 and remove allow_readable_secret_key"),
+            );
+        }
+        IrohKeyFile::Exposed(mode) => {
+            return result(
+                CheckStatus::Fail,
+                format!("the [iroh] secret key file has mode {mode:o}; others can access it"),
+                Some(
+                    "Run `chmod 600` on [iroh] secret_key_path; the key is the node's identity. \
+                     For a secret volume, set [iroh] allow_readable_secret_key = true",
+                ),
+            );
+        }
+        IrohKeyFile::NotAKey => {
+            return result(
+                CheckStatus::Fail,
+                "the [iroh] secret key file does not hold 32 bytes or 64 hex characters".into(),
+                Some("Remove the file to make a new identity, or restore the right file"),
+            );
+        }
+        IrohKeyFile::Unreadable => {
+            return result(
+                CheckStatus::Warn,
+                "doctor cannot read the [iroh] secret key file".into(),
+                Some("Run doctor as the user that runs the app"),
+            );
+        }
+        IrohKeyFile::Missing | IrohKeyFile::Ok => {}
+    }
+    let key = if data.key_file == IrohKeyFile::Missing {
+        "key file is created on first boot"
+    } else {
+        "key file is owner-only"
+    };
+    let reach = if data.relay == "disabled" {
+        "; with no relay, peers need a direct address"
+    } else {
+        ""
+    };
+    result(
+        CheckStatus::Pass,
+        format!(
+            "iroh on, relay = {}, address_lookup = {}; {key}{reach}",
+            data.relay, data.address_lookup
+        ),
+        None,
+    )
+}
+
+/// Read the key file at `path` the way the app does.
+fn iroh_key_file_state(path: &std::path::Path) -> IrohKeyFile {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return IrohKeyFile::Missing,
+        Err(_) => return IrohKeyFile::Unreadable,
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                return IrohKeyFile::Exposed(mode);
+            }
+        }
+    }
+    let hex_key = std::str::from_utf8(&bytes)
+        .ok()
+        .map(str::trim)
+        .is_some_and(|text| text.len() == 64 && text.bytes().all(|b| b.is_ascii_hexdigit()));
+    if bytes.len() == 32 || hex_key {
+        IrohKeyFile::Ok
+    } else {
+        IrohKeyFile::NotAKey
+    }
+}
+
+/// Pure core of [`resolve_iroh_doctor_data`]. The env wins over the TOML.
+fn iroh_doctor_data_from(
+    merged: &toml::Table,
+    env: &dyn autumn_web::config::Env,
+    project_dir: &std::path::Path,
+) -> IrohDoctorData {
+    let iroh = merged.get("iroh").and_then(toml::Value::as_table);
+    let cluster = merged.get("cluster").and_then(toml::Value::as_table);
+    let env_bool = |key: &str| match env.var(key).ok().as_deref() {
+        Some("true" | "1") => Some(true),
+        Some("false" | "0") => Some(false),
+        _ => None,
+    };
+    let toml_str = |table: Option<&toml::Table>, key: &str| {
+        table
+            .and_then(|t| t.get(key))
+            .and_then(toml::Value::as_str)
+            .map(ToOwned::to_owned)
+    };
+    let string = |env_key: &str, table, key: &str, default: &str| {
+        env.var(env_key)
+            .ok()
+            .or_else(|| toml_str(table, key))
+            .unwrap_or_else(|| default.to_owned())
+    };
+    // As the runtime parses an enum: an env value that is not in `allowed` is
+    // ignored, and the TOML value stays. The first entry is the default.
+    let choice = |env_key: &str, table, key: &str, allowed: &[&str]| {
+        env.var(env_key)
+            .ok()
+            .filter(|value| allowed.contains(&value.as_str()))
+            .or_else(|| toml_str(table, key))
+            .unwrap_or_else(|| allowed.first().copied().unwrap_or_default().to_owned())
+    };
+    let toml_bool = |table: Option<&toml::Table>, key: &str| {
+        table
+            .and_then(|t| t.get(key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let enabled = env_bool("AUTUMN_IROH__ENABLED").unwrap_or_else(|| toml_bool(iroh, "enabled"));
+    let key_path = std::path::PathBuf::from(string(
+        "AUTUMN_IROH__SECRET_KEY_PATH",
+        iroh,
+        "secret_key_path",
+        ".autumn/iroh/secret.key",
+    ));
+    let key_path = if key_path.is_absolute() {
+        key_path
+    } else {
+        project_dir.join(key_path)
+    };
+    let cluster_enabled =
+        env_bool("AUTUMN_CLUSTER__ENABLED").unwrap_or_else(|| toml_bool(cluster, "enabled"));
+    let transport = choice(
+        "AUTUMN_CLUSTER__TRANSPORT",
+        cluster,
+        "transport",
+        &["tcp", "iroh"],
+    );
+    let allow_readable_secret_key = env_bool("AUTUMN_IROH__ALLOW_READABLE_SECRET_KEY")
+        .unwrap_or_else(|| toml_bool(iroh, "allow_readable_secret_key"));
+    IrohDoctorData {
+        enabled,
+        relay: choice(
+            "AUTUMN_IROH__RELAY",
+            iroh,
+            "relay",
+            &["disabled", "n0", "custom"],
+        ),
+        address_lookup: choice(
+            "AUTUMN_IROH__ADDRESS_LOOKUP",
+            iroh,
+            "address_lookup",
+            &["static", "n0-dns"],
+        ),
+        allow_readable_secret_key,
+        key_file: if enabled {
+            iroh_key_file_state(&key_path)
+        } else {
+            IrohKeyFile::Missing
+        },
+        cluster_uses_iroh: cluster_enabled && transport == "iroh",
+    }
+}
+
+/// Resolve `[iroh]` from the active profile's merged config and the `.env`
+/// overlay.
+fn resolve_iroh_doctor_data() -> IrohDoctorData {
+    let (canonical, selected, _) = resolve_active_profiles();
+    let merged = get_merged_toml_table_runtime_with(
+        &canonical,
+        &selected,
+        resolve_config_path_manifest_aware,
+    );
+    let env: Box<dyn autumn_web::config::Env> =
+        match autumn_web::dotenv::os_env_with_dotenv_for_profile(&canonical) {
+            Ok(e) => Box::new(e),
+            Err(_) => Box::new(autumn_web::config::OsEnv),
+        };
+    let project_dir = std::env::current_dir().unwrap_or_default();
+    iroh_doctor_data_from(&merged, env.as_ref(), &project_dir)
+}
+
 /// Days before a client CA's `notAfter` at which doctor starts warning.
 ///
 /// Same window as the server certificate's: a CA rotation is slower to arrange
@@ -10539,6 +10786,10 @@ pub fn run(opts: DoctorOptions) {
     let http3_data = resolve_http3_doctor_data();
     tasks.push(Box::new(move || check_http3_impl(&http3_data)));
 
+    // iroh: the key file, the relay and lookup modes, the cluster transport.
+    let iroh_data = resolve_iroh_doctor_data();
+    tasks.push(Box::new(move || check_iroh_impl(&iroh_data)));
+
     // 8a-ter. Mutual TLS (#1640): grade the client-CA bundle and CRL offline, from the merged
     // table. Runs in both static and ACME modes: client auth is independent of how the
     // server's own certificate is provisioned.
@@ -14486,6 +14737,123 @@ pub struct Vault {
             resolve_client_auth_doctor_data(Some(&tls)),
             ClientAuthDoctorData::ModeOff
         ));
+    }
+
+    // ── check_iroh_impl ──────────────────────────────────────────────────────
+
+    fn iroh_data(enabled: bool, key_file: IrohKeyFile, cluster: bool) -> IrohDoctorData {
+        IrohDoctorData {
+            enabled,
+            relay: "disabled".into(),
+            address_lookup: "static".into(),
+            key_file,
+            cluster_uses_iroh: cluster,
+            allow_readable_secret_key: false,
+        }
+    }
+
+    #[test]
+    fn iroh_pass_when_off() {
+        let r = check_iroh_impl(&iroh_data(false, IrohKeyFile::Missing, false));
+        assert_eq!(r.name, "iroh");
+        assert!(matches!(r.status, CheckStatus::Pass));
+    }
+
+    #[test]
+    fn iroh_fail_when_the_cluster_needs_it_and_it_is_off() {
+        let r = check_iroh_impl(&iroh_data(false, IrohKeyFile::Missing, true));
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.unwrap().contains("transport = \"iroh\""));
+    }
+
+    #[test]
+    fn iroh_fail_on_a_key_file_that_others_can_read_or_that_holds_no_key() {
+        let r = check_iroh_impl(&iroh_data(true, IrohKeyFile::Exposed(0o644), false));
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.hint.unwrap().contains("chmod 600"));
+        let r = check_iroh_impl(&iroh_data(true, IrohKeyFile::NotAKey, false));
+        assert!(matches!(r.status, CheckStatus::Fail));
+        let r = check_iroh_impl(&iroh_data(true, IrohKeyFile::Unreadable, false));
+        assert!(matches!(r.status, CheckStatus::Warn));
+        let mut opted_in = iroh_data(true, IrohKeyFile::Exposed(0o644), false);
+        opted_in.allow_readable_secret_key = true;
+        let r = check_iroh_impl(&opted_in);
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "the opt-in warns: {r:?}"
+        );
+    }
+
+    #[test]
+    fn iroh_pass_names_the_modes_and_the_need_for_a_direct_address() {
+        let r = check_iroh_impl(&iroh_data(true, IrohKeyFile::Ok, true));
+        assert!(matches!(r.status, CheckStatus::Pass));
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("relay = disabled"), "{detail}");
+        assert!(detail.contains("direct address"), "{detail}");
+        let mut relayed = iroh_data(true, IrohKeyFile::Missing, false);
+        relayed.relay = "n0".into();
+        let detail = check_iroh_impl(&relayed).detail.unwrap();
+        assert!(detail.contains("created on first boot"), "{detail}");
+        assert!(!detail.contains("direct address"), "{detail}");
+    }
+
+    #[test]
+    fn iroh_data_reads_toml_env_and_the_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let table: toml::Table = toml::from_str(
+            "[iroh]\nenabled = true\nsecret_key_path = \"keys/iroh.key\"\nrelay = \"n0\"\n\
+             [cluster]\nenabled = true\ntransport = \"iroh\"\n",
+        )
+        .unwrap();
+        let env = autumn_web::config::MockEnv::new();
+        let data = iroh_doctor_data_from(&table, &env, dir.path());
+        assert!(data.enabled);
+        assert_eq!(data.relay, "n0");
+        assert_eq!(data.address_lookup, "static");
+        assert_eq!(data.key_file, IrohKeyFile::Missing);
+        assert!(data.cluster_uses_iroh);
+
+        std::fs::create_dir_all(dir.path().join("keys")).unwrap();
+        let key = dir.path().join("keys/iroh.key");
+        std::fs::write(&key, format!("{}\n", "ab".repeat(32))).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                iroh_doctor_data_from(&table, &env, dir.path()).key_file,
+                IrohKeyFile::Ok
+            );
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o640)).unwrap();
+            assert_eq!(
+                iroh_doctor_data_from(&table, &env, dir.path()).key_file,
+                IrohKeyFile::Exposed(0o640)
+            );
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::write(&key, b"short").unwrap();
+        assert_eq!(
+            iroh_doctor_data_from(&table, &env, dir.path()).key_file,
+            IrohKeyFile::NotAKey
+        );
+
+        let bogus = autumn_web::config::MockEnv::new()
+            .with("AUTUMN_IROH__RELAY", "bogus")
+            .with("AUTUMN_CLUSTER__TRANSPORT", "Iroh");
+        let data = iroh_doctor_data_from(&table, &bogus, dir.path());
+        assert_eq!(
+            data.relay, "n0",
+            "an invalid env value keeps the TOML value"
+        );
+        assert!(data.cluster_uses_iroh);
+
+        let env = autumn_web::config::MockEnv::new()
+            .with("AUTUMN_IROH__ENABLED", "false")
+            .with("AUTUMN_CLUSTER__TRANSPORT", "tcp");
+        let data = iroh_doctor_data_from(&table, &env, dir.path());
+        assert!(!data.enabled, "the env override wins");
+        assert!(!data.cluster_uses_iroh);
     }
 
     // ── check_http3_impl ─────────────────────────────────────────────────────

@@ -1138,7 +1138,8 @@ fn rejection_counters_are_per_reason_and_fold_framing_into_oversize() {
     );
     assert_eq!(
         metrics.rejected_total(),
-        13,
+        // One per reason, one more `mac`, three folded framing rejections.
+        u64::try_from(REJECT_REASONS.len()).unwrap_or(u64::MAX) + 1 + 3,
         "the unlabelled aggregate must be the sum over every reason INCLUDING \
          the folded framing rejections"
     );

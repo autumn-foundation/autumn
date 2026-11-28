@@ -56,7 +56,7 @@ pub const CLIPPY_WORKSPACE: &str = "cargo clippy -j 2 --workspace --all-targets 
 ///
 /// `--all-features` is not usable: `managed-pg-bundled` downloads Postgres in
 /// its build script.
-pub const CLIPPY_GATED: &str = r#"cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,http3,i18n,presence,sla" --all-targets -- -D warnings"#;
+pub const CLIPPY_GATED: &str = r#"cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,http3,iroh,i18n,presence,sla" --all-targets -- -D warnings"#;
 
 /// Clippy over autumn-web's plugin sandbox (#1609).
 ///

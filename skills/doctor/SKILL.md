@@ -214,6 +214,20 @@ See issue #1852.
 The check reads the config only. It cannot see whether the app was built with
 the `http3` feature. Without the feature, the app does not start.
 
+## iroh check
+
+`autumn doctor` has an `iroh` check for `[iroh]`:
+
+- **Pass** — iroh is off, or it is on with an owner-only key file (or none
+  yet: the app creates it). The detail names the relay and lookup modes, and
+  says when peers need a direct address.
+- **Warn** — doctor cannot read the key file, or group or others can access
+  it and `allow_readable_secret_key = true` lets it through.
+- **Fail** — group or others can access the key file, the file holds no key,
+  or `[cluster] enabled = true` with `transport = "iroh"` and `[iroh]` off.
+
+See `docs/guide/iroh.md`.
+
 ## mTLS client-auth check (0.8.0, issue #1640)
 
 `autumn doctor` adds a `tls_client_auth` check that grades the

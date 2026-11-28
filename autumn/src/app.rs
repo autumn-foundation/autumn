@@ -5769,6 +5769,30 @@ impl AppBuilder {
         // The token is not a child of `server_shutdown`: requests still drain after
         // that fires and may increment a cluster counter, which would be lost if
         // the push loop had already left. It is cancelled after the drain instead.
+        // The iroh endpoint (#3818). It closes after the cluster departs: the
+        // farewell travels on it.
+        #[cfg(feature = "iroh")]
+        let iroh_shutdown = tokio_util::sync::CancellationToken::new();
+        #[cfg(feature = "iroh")]
+        let iroh_bound = crate::iroh::start_from_config(&state, &config.iroh, &iroh_shutdown).await;
+        #[cfg(feature = "iroh")]
+        let iroh_node = match iroh_bound {
+            Ok(node) => node,
+            Err(error) => {
+                tracing::error!(error = %error, "iroh endpoint failed to start");
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop_async().await;
+                std::process::exit(1);
+            }
+        };
+        #[cfg(not(feature = "iroh"))]
+        if let Err(error) = crate::config::IrohConfig::check_feature(config.iroh.enabled, false) {
+            tracing::error!(error = %error, "iroh endpoint failed to start");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+
         #[cfg(feature = "cluster")]
         let cluster_shutdown = tokio_util::sync::CancellationToken::new();
         #[cfg(feature = "cluster")]
@@ -6681,6 +6705,12 @@ impl AppBuilder {
             if !departure_wait.is_zero() {
                 tokio::time::sleep(departure_wait).await;
             }
+        }
+
+        #[cfg(feature = "iroh")]
+        if let Some(node) = iroh_node {
+            iroh_shutdown.cancel();
+            let _ = tokio::time::timeout(crate::iroh::CLOSE_BUDGET, node.close()).await;
         }
 
         // Phase 7: `on_shutdown` hooks get what remains of the budget. They run

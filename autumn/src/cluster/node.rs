@@ -183,14 +183,9 @@ impl ClusterNode {
         })?;
 
         let local_addr = transport.local_addr();
-        let advertise_addr = config
-            .advertise_addr
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            // Fall back to the bound address, so port 0 publishes the resolved
-            // ephemeral port rather than a port nobody can dial.
-            .map_or_else(|| local_addr.to_string(), ToOwned::to_owned);
+        // Without a configured address, the transport gives the bound one, so
+        // port 0 publishes the resolved ephemeral port.
+        let advertise_addr = transport.advertise_addr(config.advertise_addr.as_deref());
 
         // A restart with a static node id must come back at a strictly higher
         // incarnation than peers remember; see `seed_incarnation`.
@@ -456,12 +451,12 @@ fn publish_self(state: &mut ClusterState, inner: &ClusterInner, incarnation: Inc
 
 /// Every address worth pushing to, for this node's configuration and document.
 fn push_targets(state: &ClusterState, inner: &ClusterInner) -> BTreeSet<String> {
-    target_addresses(
+    inner.transport.dial_targets(target_addresses(
         state,
         &inner.node_id,
         &inner.seed_peers,
         &[inner.advertise_addr.as_str(), &inner.local_addr.to_string()],
-    )
+    ))
 }
 
 /// The configured seeds plus every member this node has learned that is still
@@ -748,7 +743,24 @@ async fn receive_loop(
             verifier.forget(&pruned);
         }
 
-        match verifier.accept(&frame) {
+        // The sender's own record names its address: in its push, or in this
+        // node's document for a Leave. A transport that knows the peer's
+        // identity refuses a sender that names another one.
+        let sender_ok = |envelope: &Envelope, message: &ClusterMessage| {
+            let advertised = match message {
+                ClusterMessage::StatePush { state: theirs } => theirs
+                    .members
+                    .get(&envelope.sender)
+                    .map(|record| record.addr.clone()),
+                ClusterMessage::Leave => inner
+                    .lock_state()
+                    .members
+                    .get(&envelope.sender)
+                    .map(|record| record.addr.clone()),
+            };
+            inner.transport.verify_sender(&from, advertised.as_deref())
+        };
+        match verifier.accept_checked(&frame, sender_ok) {
             Ok((envelope, message)) => apply(&inner, &envelope, &from, &message),
             Err(reason) => {
                 // Counted per reason: a climbing `mac` count (wrong secret) is a

@@ -2114,6 +2114,37 @@ suspicion_timeout_ms = 2500       # ≥ 3× push_interval_ms enforced
 Env form `AUTUMN_CLUSTER__<KEY>`; addresses are IP literals (no hostname
 resolution).
 
+`transport = "iroh"` (feature `iroh`, #3818) runs the cluster on the `[iroh]`
+endpoint instead of TCP: seeds are `<endpoint-id>` or
+`<endpoint-id>@<ip:port>`, `bind_addr` is not used, `advertise_addr` is the
+direct `ip:port` peers dial. One QUIC connection carries frames both ways, so
+a node behind NAT still converges. A frame whose sender's own record names
+another endpoint id is dropped (`reason="sender"`). Needs `[iroh] enabled =
+true`.
+
+### `[iroh]` (feature `iroh`, #3818)
+
+One iroh QUIC endpoint per process, dialed by its ed25519 public key (the
+endpoint id). Off by default.
+
+```toml
+[iroh]
+enabled = true
+secret_key_path = ".autumn/iroh/secret.key"  # created 0600; the node's identity
+bind_addr = "0.0.0.0:7947"                   # UDP; port 0 = any free port
+relay = "disabled"                           # "disabled" | "n0" | "custom" (+ relay_urls)
+address_lookup = "static"                    # "static" | "n0-dns"
+allowed_peers = []                           # endpoint ids that may connect
+```
+
+- Defaults talk to no third party. NAT traversal needs a relay.
+- A key file that group or others can access is refused, unless
+  `allow_readable_secret_key = true`. `http://` relay URLs need
+  `allow_http_relay = true`.
+- `autumn_web::iroh::IrohNode` is on `AppState` when enabled:
+  `register(alpn)` (applies `allowed_peers`), `connect(peer, alpn)`, `id()`,
+  `dial_addr()`. Env: `AUTUMN_IROH__<KEY>`. See `docs/guide/iroh.md`.
+
 ### `[failure_capture]` — failure capsules (0.7.0, #1598)
 
 Opt-in deterministic replay capsules: every caught handler panic or 5xx writes
