@@ -576,6 +576,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("iroh.key");
         std::fs::write(&path, b"short").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let err = load_or_create_secret_key(&path).expect_err("not a key");
         assert!(err.to_string().contains("32 bytes"), "{err}");
     }
