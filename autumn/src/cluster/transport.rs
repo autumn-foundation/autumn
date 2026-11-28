@@ -289,12 +289,12 @@ pub trait PeerTransport: Send + Sync + 'static {
     }
 
     /// Whether a frame from `from` may speak for a sender whose own record
-    /// gives `advertised` as its address.
+    /// gives `advertised` as its address. `None` when there is no record.
     ///
-    /// Called after the MAC verifies. The default is `true`: a TCP source
-    /// address proves nothing. The iroh transport knows the peer's endpoint
-    /// id from the handshake, and refuses a sender whose record names
-    /// another id.
+    /// Called after the MAC verifies and before the replay watermark moves.
+    /// The default is `true`: a TCP source address proves nothing. The iroh
+    /// transport knows the peer's endpoint id from the handshake. It refuses
+    /// a sender whose record names another id, or that has no record.
     fn verify_sender(&self, from: &str, advertised: Option<&str>) -> bool {
         let _ = (from, advertised);
         true

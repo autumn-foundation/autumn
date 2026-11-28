@@ -157,6 +157,8 @@ REQUEST_PATH_MODULES=(
   autumn/src/cluster/wire.rs:default
   autumn/src/cluster/transport.rs:default
   autumn/src/cluster/node.rs:default
+  # The iroh endpoint's accept loop: any peer on the network reaches it.
+  autumn/src/iroh.rs:iroh
   autumn/src/shadow/diff.rs:default
   autumn/src/shadow/sample.rs:default
   autumn/src/shadow/transport.rs:default

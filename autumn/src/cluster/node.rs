@@ -59,7 +59,7 @@ use tokio_util::sync::CancellationToken;
 use super::counter::CELL_SEPARATOR;
 use super::membership::{ClusterState, LivenessOverlay, MemberRecord};
 use super::transport::{IncomingFrames, PeerTransport};
-use super::wire::{ClusterMessage, Envelope, FrameVerifier, RejectReason};
+use super::wire::{ClusterMessage, Envelope, FrameVerifier};
 use super::{ClusterHandle, ClusterInner, ClusterMetrics, Incarnation, jittered, wire};
 use crate::config::MIN_CLUSTER_SECRET_LEN;
 use crate::entropy::Entropy;
@@ -743,7 +743,24 @@ async fn receive_loop(
             verifier.forget(&pruned);
         }
 
-        match verifier.accept(&frame) {
+        // The sender's own record names its address: in its push, or in this
+        // node's document for a Leave. A transport that knows the peer's
+        // identity refuses a sender that names another one.
+        let sender_ok = |envelope: &Envelope, message: &ClusterMessage| {
+            let advertised = match message {
+                ClusterMessage::StatePush { state: theirs } => theirs
+                    .members
+                    .get(&envelope.sender)
+                    .map(|record| record.addr.clone()),
+                ClusterMessage::Leave => inner
+                    .lock_state()
+                    .members
+                    .get(&envelope.sender)
+                    .map(|record| record.addr.clone()),
+            };
+            inner.transport.verify_sender(&from, advertised.as_deref())
+        };
+        match verifier.accept_checked(&frame, sender_ok) {
             Ok((envelope, message)) => apply(&inner, &envelope, &from, &message),
             Err(reason) => {
                 // Counted per reason: a climbing `mac` count (wrong secret) is a
@@ -778,23 +795,6 @@ fn apply(
     let now = inner.clock.monotonic();
     let refuted = {
         let mut state = inner.lock_state();
-        // The sender's own record names its address. A transport that knows
-        // the peer's identity refuses a frame whose sender names another one.
-        let advertised = match message {
-            ClusterMessage::StatePush { state: theirs } => theirs.members.get(&envelope.sender),
-            ClusterMessage::Leave => state.members.get(&envelope.sender),
-        }
-        .map(|record| record.addr.as_str());
-        if !inner.transport.verify_sender(peer_addr, advertised) {
-            drop(state);
-            inner.metrics.record_rejection(RejectReason::Sender);
-            tracing::warn!(
-                peer = %peer_addr,
-                sender = %envelope.sender,
-                "cluster: the frame's sender names another peer identity; dropping it"
-            );
-            return;
-        }
         let outcome = match message {
             ClusterMessage::StatePush { state: theirs } => {
                 let before = state.clone();

@@ -11,7 +11,9 @@
 //! The default config talks to no third party: no relay and no address
 //! lookup. Peers dial `<endpoint-id>@<ip:port>`. See `[iroh]` in the
 //! configuration guide.
-// autumn-panic-gate: connection-path module — production code must be panic-free.
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
+// #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
 #![cfg_attr(
     not(test),
     deny(
@@ -23,6 +25,7 @@
         clippy::unimplemented,
         clippy::indexing_slicing,
         clippy::string_slice,
+        clippy::arithmetic_side_effects,
     )
 )]
 
@@ -79,10 +82,10 @@ pub enum IrohError {
         /// The key file.
         path: PathBuf,
     },
-    /// Users other than the owner can read the secret key file.
+    /// Group or others can access the secret key file.
     #[error(
-        "iroh: secret key file {} has mode {mode:o}; it must be readable by its owner only \
-         (chmod 0600)",
+        "iroh: secret key file {} has mode {mode:o}; only its owner may access it (chmod \
+         0600), or set [iroh] allow_readable_secret_key = true",
         path.display()
     )]
     KeyMode {
@@ -121,6 +124,7 @@ pub enum IrohError {
 }
 
 /// Format a peer address: `<id>`, or `<id>@<ip:port>`.
+#[must_use]
 pub fn format_peer_addr(id: &str, direct: Option<SocketAddr>) -> String {
     direct.map_or_else(|| id.to_owned(), |addr| format!("{id}@{addr}"))
 }
@@ -155,21 +159,53 @@ pub fn peer_endpoint_addr(peer: &str) -> Result<EndpointAddr, IrohError> {
 /// Returns an [`IrohError`] when the file cannot be read or written, does not
 /// hold a key, or is readable by others.
 pub fn load_or_create_secret_key(path: &Path) -> Result<SecretKey, IrohError> {
+    load_or_create_secret_key_with(path, false)
+}
+
+/// [`load_or_create_secret_key`], with the `[iroh] allow_readable_secret_key`
+/// opt-in. When `allow_readable` is true, a file that group or others can
+/// access is used, and a warning is logged.
+///
+/// # Errors
+///
+/// As [`load_or_create_secret_key`].
+pub fn load_or_create_secret_key_with(
+    path: &Path,
+    allow_readable: bool,
+) -> Result<SecretKey, IrohError> {
     let io = |source| IrohError::KeyIo {
         path: path.to_owned(),
         source,
     };
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            check_key_mode(path)?;
+    match std::fs::File::open(path) {
+        Ok(mut file) => {
+            // The mode and the bytes come from one open file, so a swap of
+            // the path between the two reads cannot mix two files.
+            match check_key_mode(path, &file.metadata().map_err(io)?) {
+                Err(IrohError::KeyMode { mode, .. }) if allow_readable => tracing::warn!(
+                    path = %path.display(),
+                    mode = %format_args!("{mode:o}"),
+                    "iroh: the secret key file is not owner-only; \
+                     allow_readable_secret_key = true lets it through"
+                ),
+                checked => checked?,
+            }
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes).map_err(io)?;
             decode_secret_key(&bytes).ok_or_else(|| IrohError::KeyLength {
                 path: path.to_owned(),
             })
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let key = SecretKey::generate();
-            write_new_key(path, &key).map_err(io)?;
-            Ok(key)
+            match write_new_key(path, &key) {
+                Ok(()) => Ok(key),
+                // Another process created the key first: use that one.
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    load_or_create_secret_key_with(path, allow_readable)
+                }
+                Err(err) => Err(io(err)),
+            }
         }
         Err(err) => Err(io(err)),
     }
@@ -186,17 +222,15 @@ fn decode_secret_key(bytes: &[u8]) -> Option<SecretKey> {
 }
 
 #[cfg(unix)]
-fn check_key_mode(path: &Path) -> Result<(), IrohError> {
+fn check_key_mode(path: &Path, metadata: &std::fs::Metadata) -> Result<(), IrohError> {
     use std::os::unix::fs::PermissionsExt as _;
-    let mode = std::fs::metadata(path)
-        .map_err(|source| IrohError::KeyIo {
-            path: path.to_owned(),
-            source,
-        })?
-        .permissions()
-        .mode()
-        & 0o777;
-    if mode & 0o077 == 0 {
+    let mode = metadata.permissions().mode() & 0o777;
+    #[allow(
+        clippy::verbose_bit_mask,
+        reason = "0o077 reads as the group and other bits"
+    )]
+    let owner_only = mode & 0o077 == 0;
+    if owner_only {
         Ok(())
     } else {
         Err(IrohError::KeyMode {
@@ -208,7 +242,7 @@ fn check_key_mode(path: &Path) -> Result<(), IrohError> {
 
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps, reason = "same signature as the Unix check")]
-const fn check_key_mode(_path: &Path) -> Result<(), IrohError> {
+const fn check_key_mode(_path: &Path, _metadata: &std::fs::Metadata) -> Result<(), IrohError> {
     Ok(())
 }
 
@@ -221,15 +255,25 @@ fn write_new_key(path: &Path, key: &SecretKey) -> std::io::Result<()> {
         std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
         dir.create(parent)?;
     }
+    // Write a temporary file, then link it to `path`. A crash never leaves a
+    // part key at `path`, and the link fails when `path` exists, so two
+    // processes that start at once never share or replace a key.
+    let mut temp_name = path.as_os_str().to_owned();
+    temp_name.push(format!(".tmp-{}", key.public()));
+    let temp = PathBuf::from(temp_name);
     let mut options = std::fs::OpenOptions::new();
-    // `create_new`: two processes that start at once never share a key.
     options.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(path)?;
-    file.write_all(hex::encode(key.to_bytes()).as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all()
+    let written = (|| {
+        let mut file = options.open(&temp)?;
+        file.write_all(hex::encode(key.to_bytes()).as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::hard_link(&temp, path)
+    })();
+    let _ = std::fs::remove_file(&temp);
+    written
 }
 
 /// The queue and the allow-list of one ALPN.
@@ -271,7 +315,10 @@ impl IrohNode {
     ///
     /// Returns an [`IrohError`] when the key, a setting or the bind fails.
     pub async fn bind(config: &IrohConfig) -> Result<Self, IrohError> {
-        let secret = load_or_create_secret_key(&config.secret_key_path)?;
+        let secret = load_or_create_secret_key_with(
+            &config.secret_key_path,
+            config.allow_readable_secret_key,
+        )?;
         let bind_addr: SocketAddr = config
             .bind_addr
             .parse()
@@ -305,6 +352,9 @@ impl IrohNode {
             .bind()
             .await
             .map_err(|err| bind_failed(err.to_string()))?;
+        if bind_addr.ip().is_unspecified() {
+            wait_for_interface_addrs(&endpoint).await;
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 endpoint,
@@ -315,16 +365,19 @@ impl IrohNode {
     }
 
     /// This endpoint's id: its public key.
+    #[must_use]
     pub fn id(&self) -> EndpointId {
         self.inner.endpoint.id()
     }
 
     /// The underlying endpoint.
+    #[must_use]
     pub fn endpoint(&self) -> &Endpoint {
         &self.inner.endpoint
     }
 
     /// The `[iroh] allowed_peers` ids.
+    #[must_use]
     pub fn allowed_peers(&self) -> &BTreeSet<EndpointId> {
         &self.inner.allowed_peers
     }
@@ -334,6 +387,7 @@ impl IrohNode {
     /// The bound socket when it names an IP. When the bind is on the
     /// unspecified address, the first interface address iroh found. `None`
     /// when there is none.
+    #[must_use]
     pub fn direct_addr(&self) -> Option<SocketAddr> {
         let bound = self.inner.endpoint.bound_sockets();
         if let Some(addr) = bound.iter().find(|addr| !addr.ip().is_unspecified()) {
@@ -349,22 +403,31 @@ impl IrohNode {
     }
 
     /// This endpoint's peer address: `<id>@<direct address>`, or `<id>`.
+    #[must_use]
     pub fn dial_addr(&self) -> String {
         format_peer_addr(&self.id().to_string(), self.direct_addr())
     }
 
-    /// Accept connections for `alpn` from any peer.
+    /// Accept connections for `alpn`.
     ///
-    /// Returns the queue of connections. A second call for the same ALPN
-    /// replaces the first.
+    /// When `[iroh] allowed_peers` is set, only those peers get through.
+    /// Else any peer does. Returns the queue of connections. A second call
+    /// for the same ALPN replaces the first.
+    ///
+    /// The endpoint can accept 0-RTT data. A handler that must not act on
+    /// replayable data refuses streams where `RecvStream::is_0rtt` is true.
+    #[must_use]
     pub fn register(&self, alpn: &[u8]) -> mpsc::Receiver<Connection> {
-        self.add_handler(alpn, None)
+        let allow = (!self.inner.allowed_peers.is_empty())
+            .then(|| Arc::new(self.inner.allowed_peers.clone()));
+        self.add_handler(alpn, allow)
     }
 
     /// Accept connections for `alpn` only from the peers in `allow`.
     ///
     /// The handshake completes, then a peer not in `allow` is closed before
     /// the handler sees it.
+    #[must_use]
     pub fn register_with_allow_list(
         &self,
         alpn: &[u8],
@@ -415,6 +478,36 @@ impl IrohNode {
             })
     }
 
+    /// Connect to the peer with endpoint id `id` on `alpn`, trying each
+    /// address in `direct`. iroh uses the addresses it already knows too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IrohError`] when `id` is not an endpoint id or the
+    /// connection fails.
+    pub async fn connect_direct(
+        &self,
+        id: &str,
+        direct: impl IntoIterator<Item = SocketAddr>,
+        alpn: &[u8],
+    ) -> Result<Connection, IrohError> {
+        let key = PublicKey::from_str(id).map_err(|err| IrohError::Peer {
+            peer: id.to_owned(),
+            reason: err.to_string(),
+        })?;
+        let addr = direct
+            .into_iter()
+            .fold(EndpointAddr::new(key), EndpointAddr::with_ip_addr);
+        self.inner
+            .endpoint
+            .connect(addr, alpn)
+            .await
+            .map_err(|err| IrohError::Connect {
+                peer: id.to_owned(),
+                reason: err.to_string(),
+            })
+    }
+
     /// Accept connections and give each to the handler of its ALPN, until
     /// `shutdown` fires or the endpoint closes.
     pub async fn run(self, shutdown: CancellationToken) {
@@ -425,6 +518,16 @@ impl IrohNode {
                 () = shutdown.cancelled() => return,
             };
             let Some(incoming) = incoming else { return };
+            // Under load, ask the client to prove its address first. A spoofed
+            // source cannot answer, so it never holds a handshake slot.
+            if pending.available_permits() < MAX_PENDING_HANDSHAKES.div_euclid(2)
+                && !incoming.remote_addr_validated()
+            {
+                if let Err(err) = incoming.retry() {
+                    err.into_incoming().refuse();
+                }
+                continue;
+            }
             let Ok(permit) = Arc::clone(&pending).try_acquire_owned() else {
                 tracing::debug!("iroh: too many handshakes in progress; refusing a connection");
                 incoming.refuse();
@@ -519,6 +622,21 @@ pub async fn start_from_config(
     Ok(Some(node))
 }
 
+/// Time limit to find the interface addresses after a wildcard bind.
+const INTERFACE_ADDRS_BUDGET: Duration = Duration::from_secs(1);
+
+/// Wait until iroh knows an interface address, or for
+/// [`INTERFACE_ADDRS_BUDGET`]. A wildcard bind finds them after `bind`
+/// returns, and the dial address that boot logs needs one.
+async fn wait_for_interface_addrs(endpoint: &Endpoint) {
+    let found = async {
+        while endpoint.addr().ip_addrs().next().is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let _ = tokio::time::timeout(INTERFACE_ADDRS_BUDGET, found).await;
+}
+
 fn relay_mode(config: &IrohConfig) -> Result<RelayMode, IrohError> {
     Ok(match config.relay {
         IrohRelayMode::Disabled => RelayMode::Disabled,
@@ -595,6 +713,17 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let err = load_or_create_secret_key(&path).expect_err("group and others can read it");
         assert!(err.to_string().contains("0600"), "{err}");
+        assert!(
+            err.to_string().contains("allow_readable_secret_key"),
+            "{err}"
+        );
+        let key = load_or_create_secret_key_with(&path, true).expect("the opt-in lets it through");
+        assert_eq!(
+            key.public(),
+            load_or_create_secret_key_with(&path, true)
+                .unwrap()
+                .public()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -670,7 +799,7 @@ mod tests {
             Ok::<_, IrohError>(())
         })
         .await;
-        assert!(matches!(refused, Ok(_)), "the stranger's connection ends");
+        assert!(refused.is_ok(), "the stranger's connection ends");
         assert!(
             tokio::time::timeout(Duration::from_millis(300), accepted.recv())
                 .await
@@ -693,9 +822,80 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_configured_allow_list_applies_to_every_registered_alpn() {
+        let dir = tempfile::tempdir().unwrap();
+        let friend = IrohNode::bind(&config(dir.path(), "friend.key"))
+            .await
+            .unwrap();
+        let stranger = IrohNode::bind(&config(dir.path(), "stranger.key"))
+            .await
+            .unwrap();
+        let server = IrohNode::bind(&crate::config::IrohConfig {
+            allowed_peers: vec![friend.id().to_string()],
+            ..config(dir.path(), "server.key")
+        })
+        .await
+        .unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut accepted = server.register(ALPN);
+        tokio::spawn(server.clone().run(shutdown.clone()));
+
+        if let Ok(conn) = stranger.connect(&server.dial_addr(), ALPN).await {
+            let _ = tokio::time::timeout(DEADLINE, conn.closed()).await;
+        }
+        let _conn = friend.connect(&server.dial_addr(), ALPN).await.unwrap();
+        let first = tokio::time::timeout(DEADLINE, accepted.recv())
+            .await
+            .expect("in time")
+            .expect("a connection");
+        assert_eq!(
+            first.remote_id(),
+            friend.id(),
+            "only the friend gets through"
+        );
+        shutdown.cancel();
+        for node in [server, friend, stranger] {
+            node.close().await;
+        }
+    }
+
+    #[test]
+    fn a_new_key_file_is_written_whole_and_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iroh.key");
+        let key = load_or_create_secret_key(&path).unwrap();
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("iroh.key")],
+            "no temporary file stays"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text.trim(),
+            hex::encode(key.to_bytes()),
+            "the file holds the key as hex"
+        );
+        assert_eq!(
+            write_new_key(&path, &SecretKey::generate())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "a second writer never replaces the key"
+        );
+        assert_eq!(
+            load_or_create_secret_key(&path).unwrap().public(),
+            key.public()
+        );
+    }
+
     #[test]
     fn a_dial_addr_names_the_id_and_a_bound_socket() {
-        let id = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6";
+        let id = "af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d";
         let addr: SocketAddr = "127.0.0.1:7947".parse().unwrap();
         assert_eq!(
             format_peer_addr(id, Some(addr)),

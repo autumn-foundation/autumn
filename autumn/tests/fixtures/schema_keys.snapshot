@@ -322,6 +322,8 @@ idempotency.redis.url
 idempotency.ttl_secs
 iroh
 iroh.address_lookup
+iroh.allow_http_relay
+iroh.allow_readable_secret_key
 iroh.allowed_peers
 iroh.bind_addr
 iroh.enabled

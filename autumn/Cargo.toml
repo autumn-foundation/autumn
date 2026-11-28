@@ -715,6 +715,7 @@ features = [
   "tls",
   # HTTP/3 over QUIC. Pure Rust (quinn, h3, rustls/ring).
   "http3",
+  "iroh",
   # SLA obligations (#1826). Zero new dependencies. Without it, the `sla`
   # module and `#[obligation]` are missing from the published docs.
   "sla",

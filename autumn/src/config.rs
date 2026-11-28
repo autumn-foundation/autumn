@@ -266,6 +266,8 @@
 //! | `AUTUMN_IROH__RELAY_URLS` | `iroh.relay_urls` | comma-separated URLs |
 //! | `AUTUMN_IROH__ADDRESS_LOOKUP` | `iroh.address_lookup` | `static` or `n0-dns` |
 //! | `AUTUMN_IROH__ALLOWED_PEERS` | `iroh.allowed_peers` | comma-separated endpoint ids |
+//! | `AUTUMN_IROH__ALLOW_READABLE_SECRET_KEY` | `iroh.allow_readable_secret_key` | `bool` |
+//! | `AUTUMN_IROH__ALLOW_HTTP_RELAY` | `iroh.allow_http_relay` | `bool` |
 //! | `AUTUMN_SHADOW__ENABLED` | `shadow.enabled` | `bool` |
 //! | `AUTUMN_SHADOW__TARGET` | `shadow.target` | `String` |
 //! | `AUTUMN_SHADOW__SAMPLE_RATE` | `shadow.sample_rate` | `f64` |
@@ -3443,7 +3445,9 @@ impl ClusterConfig {
     ///   peer.
     /// - `bind_addr`, `advertise_addr` and every `seed_peers` entry must parse
     ///   as a [`std::net::SocketAddr`] (IP literal — hostnames are not
-    ///   resolved).
+    ///   resolved). With `transport = "iroh"`, each seed is `<endpoint-id>` or
+    ///   `<endpoint-id>@<ip:port>`, `bind_addr` is not checked, and
+    ///   `advertise_addr` is a dialable `ip:port`.
     /// - `cluster_name`, and `node_id` when set, must be non-empty, at most 64
     ///   bytes, and free of the `#` counter cell-key separator.
     ///
@@ -3620,6 +3624,17 @@ pub struct IrohConfig {
     /// Endpoint ids that may connect. Empty means no list.
     #[serde(default)]
     pub allowed_peers: Vec<String>,
+
+    /// Boot with a secret key file that group or others can access, and log
+    /// a warning. Off by default: such a file is refused. For a secret volume
+    /// that cannot set mode `0600`.
+    #[serde(default)]
+    pub allow_readable_secret_key: bool,
+
+    /// Accept `http://` relay URLs, for a local or test relay. Off by
+    /// default: a relay URL must be `https://`.
+    #[serde(default)]
+    pub allow_http_relay: bool,
 }
 
 fn default_iroh_secret_key_path() -> std::path::PathBuf {
@@ -3640,6 +3655,8 @@ impl Default for IrohConfig {
             relay_urls: Vec::new(),
             address_lookup: IrohAddressLookup::default(),
             allowed_peers: Vec::new(),
+            allow_readable_secret_key: false,
+            allow_http_relay: false,
         }
     }
 }
@@ -3722,6 +3739,12 @@ pub fn parse_iroh_peer(value: &str) -> Result<(&str, Option<std::net::SocketAddr
             "{id:?} is not an endpoint id (64 lowercase hex characters)"
         ));
     }
+    // With the feature on, also check that the id is a real ed25519 key, so a
+    // mistyped seed fails at boot and not at the first dial.
+    #[cfg(feature = "iroh")]
+    if let Err(err) = id.parse::<::iroh::PublicKey>() {
+        return Err(format!("{id:?} is not an endpoint id: {err}"));
+    }
     let direct = direct
         .map(|direct| {
             direct.parse::<std::net::SocketAddr>().map_err(|err| {
@@ -3769,20 +3792,17 @@ impl IrohConfig {
                     self.bind_addr
                 ))
             })?;
-        match self.relay {
-            IrohRelayMode::Custom if self.relay_urls.is_empty() => {
-                return Err(ConfigError::Validation(
-                    "iroh.relay = \"custom\" needs at least one URL in iroh.relay_urls".to_owned(),
-                ));
-            }
-            IrohRelayMode::Custom => {}
-            IrohRelayMode::Disabled | IrohRelayMode::N0 if !self.relay_urls.is_empty() => {
-                return Err(ConfigError::Validation(
-                    "iroh.relay_urls is set, but it is used only with iroh.relay = \"custom\""
-                        .to_owned(),
-                ));
-            }
-            IrohRelayMode::Disabled | IrohRelayMode::N0 => {}
+        let custom = self.relay == IrohRelayMode::Custom;
+        if custom && self.relay_urls.is_empty() {
+            return Err(ConfigError::Validation(
+                "iroh.relay = \"custom\" needs at least one URL in iroh.relay_urls".to_owned(),
+            ));
+        }
+        if !custom && !self.relay_urls.is_empty() {
+            return Err(ConfigError::Validation(
+                "iroh.relay_urls is set, but it is used only with iroh.relay = \"custom\""
+                    .to_owned(),
+            ));
         }
         for (index, url) in self.relay_urls.iter().enumerate() {
             let parsed = url::Url::parse(url).map_err(|err| {
@@ -3790,18 +3810,25 @@ impl IrohConfig {
                     "iroh.relay_urls[{index}] is not a URL, got {url:?}: {err}"
                 ))
             })?;
-            if parsed.scheme() != "https" || parsed.host_str().is_none() {
+            let scheme_ok = match parsed.scheme() {
+                "https" => true,
+                "http" => self.allow_http_relay,
+                _ => false,
+            };
+            if !scheme_ok || parsed.host_str().is_none() {
                 return Err(ConfigError::Validation(format!(
                     "iroh.relay_urls[{index}] must start with https:// and name a host, got \
-                     {url:?}"
+                     {url:?} (for a local relay over http://, set iroh.allow_http_relay = true)"
                 )));
             }
         }
         for (index, peer) in self.allowed_peers.iter().enumerate() {
-            if !is_iroh_endpoint_id(peer) {
+            if let Err(reason) = parse_iroh_peer(peer).and_then(|(_, direct)| {
+                direct.map_or(Ok(()), |_| Err("an allowed peer has no address".to_owned()))
+            }) {
                 return Err(ConfigError::Validation(format!(
                     "iroh.allowed_peers[{index}] must be an endpoint id (64 lowercase hex \
-                     characters), got {peer:?}"
+                     characters), got {peer:?}: {reason}"
                 )));
             }
         }
@@ -8312,6 +8339,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_IROH__ALLOWED_PEERS",
             &mut self.iroh.allowed_peers,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_IROH__ALLOW_READABLE_SECRET_KEY",
+            &mut self.iroh.allow_readable_secret_key,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_IROH__ALLOW_HTTP_RELAY",
+            &mut self.iroh.allow_http_relay,
         );
     }
 
@@ -20782,9 +20819,9 @@ path = "/healthz"
 
     // ── [iroh] ────────────────────────────────────────────────────
 
-    /// A valid endpoint id: 64 lowercase hex characters.
-    const PEER_A: &str = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6";
-    const PEER_B: &str = "6d1c4b83c2b2b88e4d5d7e1f0f5a9a5f4c3b2a1908f7e6d5c4b3a29180706050";
+    /// Valid endpoint ids: ed25519 public keys as 64 lowercase hex characters.
+    const PEER_A: &str = "af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d";
+    const PEER_B: &str = "2df04125f0015afb47ce853aef8772094ff9498c14cb1b9e12973c2927da0fa6";
 
     #[test]
     fn iroh_is_off_and_private_by_default() {
@@ -20833,6 +20870,8 @@ path = "/healthz"
         let keys = AutumnConfig::get_schema_keys();
         let iroh = keys.get("iroh").expect("[iroh] in the schema");
         for key in [
+            "allow_readable_secret_key",
+            "allow_http_relay",
             "enabled",
             "secret_key_path",
             "bind_addr",
@@ -20878,6 +20917,29 @@ path = "/healthz"
     fn iroh_rejects_a_bind_addr_that_is_not_a_socket_addr() {
         let err = iroh_error("[iroh]\nenabled = true\nbind_addr = \"localhost:7947\"\n");
         assert!(err.contains("iroh.bind_addr"), "{err}");
+    }
+
+    #[test]
+    fn iroh_http_relay_urls_need_an_explicit_opt_in() {
+        let base = "[iroh]\nenabled = true\nrelay = \"custom\"\nrelay_urls = [\"http://127.0.0.1:3340\"]\n";
+        assert!(iroh_error(base).contains("allow_http_relay"));
+        let config: AutumnConfig =
+            toml::from_str(&format!("{base}allow_http_relay = true\n")).expect("parses");
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    #[cfg(feature = "iroh")]
+    #[test]
+    fn iroh_rejects_an_id_that_is_hex_but_not_a_key() {
+        // 64 hex characters, but not a point on the curve: iroh refuses it.
+        let bad = "ff".repeat(32);
+        if bad.parse::<::iroh::PublicKey>().is_ok() {
+            return;
+        }
+        let err = iroh_error(&format!(
+            "[iroh]\nenabled = true\nallowed_peers = [\"{bad}\"]\n"
+        ));
+        assert!(err.contains("iroh.allowed_peers[0]"), "{err}");
     }
 
     #[test]

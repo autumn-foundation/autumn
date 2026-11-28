@@ -25,7 +25,7 @@ enabled = true
 At boot the app logs its endpoint id and a dial address:
 
 ```text
-INFO iroh endpoint bound endpoint_id=ae58ff88… dial_addr=ae58ff88…@10.0.0.4:51820
+INFO iroh endpoint bound endpoint_id=af06a3e3… dial_addr=af06a3e3…@10.0.0.4:51820
 ```
 
 The endpoint id is public. Give it to the peers that dial this node.
@@ -41,6 +41,8 @@ The endpoint id is public. Give it to the peers that dial this node.
 | `relay_urls` | `[]` | The relays for `relay = "custom"`. Each starts with `https://`. |
 | `address_lookup` | `"static"` | `"static"` (from config and from connections) or `"n0-dns"`. |
 | `allowed_peers` | `[]` | Endpoint ids that may connect. Empty means no list. |
+| `allow_readable_secret_key` | `false` | Boot with a key file that group or others can access, and warn. |
+| `allow_http_relay` | `false` | Accept `http://` relay URLs, for a local or test relay. |
 
 Each key has an `AUTUMN_IROH__<KEY>` env override. `relay_urls` and
 `allowed_peers` take comma-separated values.
@@ -49,8 +51,12 @@ Each key has an `AUTUMN_IROH__<KEY>` env override. `relay_urls` and
 
 The app creates the key file on first boot, with mode `0600`, in a directory
 with mode `0700`. The file holds 64 hex characters. A file with 32 raw bytes
-is read too. On Unix, the app refuses to boot when group or others can read
-the file. The app never logs the key.
+is read too. On Unix, the app refuses to boot when group or others can
+access the file. The app never logs the key.
+
+A secret volume (for example, a Kubernetes Secret) can mount files with mode
+`0644`. Set `defaultMode: 0600` on the volume. If you cannot, set
+`allow_readable_secret_key = true`: the app then boots and logs a warning.
 
 Keep the file across restarts: a new key is a new endpoint id. In a container,
 put the file on a volume, or mount it from a secret store.
@@ -59,8 +65,9 @@ put the file on a volume, or mount it from a secret store.
 
 A peer address is one of:
 
-- `<endpoint-id>`: dial by id. This needs an address from somewhere: a relay,
-  `address_lookup = "n0-dns"`, or a connection that the peer opened.
+- `<endpoint-id>`: dial by id. This needs an address from somewhere:
+  `address_lookup = "n0-dns"`, or a connection that the peer opened. A relay
+  is not a directory: it does not find a peer by its id.
 - `<endpoint-id>@<ip:port>`: dial by id at a direct address. The handshake
   still checks the id.
 
@@ -86,9 +93,14 @@ dial.
 
 ## Who may connect
 
-`allowed_peers` applies to every protocol on the endpoint. A peer not on the
-list completes the handshake, then the node closes the connection. No
-protocol handler sees it. When you set the list, add the cluster nodes too.
+`allowed_peers` applies to every protocol that registers on the endpoint. A
+peer not on the list completes the handshake, then the node closes the
+connection. No protocol handler sees it. When you set the list, add the
+cluster nodes too.
+
+The endpoint asks a client to prove its address (a QUIC retry) when many
+handshakes are in progress. A flood from spoofed addresses then holds no
+handshake slot.
 
 An unknown protocol (ALPN) fails the handshake.
 
@@ -103,13 +115,14 @@ bind_addr = "0.0.0.0:7947"
 enabled = true
 transport = "iroh"
 secret = "a-shared-secret-at-least-16-bytes"
-seed_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@10.0.0.4:7947"]
+seed_peers = ["af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d@10.0.0.4:7947"]
 ```
 
 See [Embedded Clustering](clustering.md#the-iroh-transport).
 
 ## Check it
 
-`autumn doctor` has an `iroh` check. It fails when the key file is readable by
-others or holds no key, and when `[cluster] transport = "iroh"` is set with
-`[iroh]` off. It shows the relay and lookup modes.
+`autumn doctor` has an `iroh` check. It fails when group or others can access
+the key file (it warns with `allow_readable_secret_key`), when the file holds
+no key, and when `[cluster] enabled = true` with `transport = "iroh"` is set
+and `[iroh]` is off. It shows the relay and lookup modes.

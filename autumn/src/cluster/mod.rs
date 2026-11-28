@@ -775,7 +775,6 @@ pub(crate) fn jittered(base: Duration, entropy: &dyn crate::entropy::Entropy) ->
     Duration::from_millis(millis.max(1))
 }
 
-/// Build the boot error used when the cluster listener cannot be bound.
 /// The transport that `[cluster] transport` selects.
 ///
 /// `"iroh"` uses the [`IrohNode`](crate::iroh::IrohNode) that boot put on
@@ -813,6 +812,7 @@ fn peer_transport(
     }
 }
 
+/// Build the boot error used when the cluster listener cannot be bound.
 pub(crate) fn bind_error(addr: &str, err: &std::io::Error) -> AutumnError {
     AutumnError::internal_server_error_msg(format!(
         "cluster: failed to bind the cluster listener on {addr}: {err}"

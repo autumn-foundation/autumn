@@ -388,7 +388,21 @@ impl FrameVerifier {
     /// watermark, payload parse. The payload is only parsed once the MAC has
     /// verified.
     pub fn accept(&mut self, frame: &[u8]) -> Result<(Envelope, ClusterMessage), RejectReason> {
-        match self.verify(frame) {
+        self.accept_checked(frame, |_, _| true)
+    }
+
+    /// [`Self::accept`], plus step 8: `sender_ok` must accept the frame's
+    /// sender before the watermark moves.
+    ///
+    /// A frame that `sender_ok` refuses is [`RejectReason::Sender`] and
+    /// leaves the watermark as it was, so a refused frame cannot silence the
+    /// real sender.
+    pub fn accept_checked(
+        &mut self,
+        frame: &[u8],
+        sender_ok: impl FnOnce(&Envelope, &ClusterMessage) -> bool,
+    ) -> Result<(Envelope, ClusterMessage), RejectReason> {
+        match self.verify(frame, sender_ok) {
             Ok(accepted) => Ok(accepted),
             Err(reason) => {
                 self.rejected = self.rejected.saturating_add(1);
@@ -399,7 +413,11 @@ impl FrameVerifier {
 
     /// The receive path proper. [`Self::accept`] owns the counter so that no
     /// early return here can forget to increment it.
-    fn verify(&mut self, frame: &[u8]) -> Result<(Envelope, ClusterMessage), RejectReason> {
+    fn verify(
+        &mut self,
+        frame: &[u8],
+        sender_ok: impl FnOnce(&Envelope, &ClusterMessage) -> bool,
+    ) -> Result<(Envelope, ClusterMessage), RejectReason> {
         // 1. Length prefix.
         let body = frame_body(frame)?;
 
@@ -452,6 +470,11 @@ impl FrameVerifier {
         // 7. Payload parse.
         let message: ClusterMessage =
             serde_json::from_str(&envelope.payload).map_err(|_| RejectReason::Payload)?;
+
+        // 8. Sender identity, before the watermark moves.
+        if !sender_ok(&envelope, &message) {
+            return Err(RejectReason::Sender);
+        }
 
         // A higher incarnation replaces the watermark, resetting its sequence.
         self.watermarks.insert(
@@ -756,6 +779,31 @@ mod tests {
             verifier.accept(&good).is_ok(),
             "…and the verifier must still accept the sender's next good frame"
         );
+    }
+
+    /// A sender that the transport refuses must leave the watermark as it
+    /// was. Else a holder of the secret could sign a frame as another node at
+    /// a huge incarnation, and the real node's frames would all be replays.
+    #[test]
+    fn a_refused_sender_does_not_move_the_watermark() {
+        let mut verifier = verifier();
+        let forged = frame_for(SECRET, CLUSTER, REMOTE, u64::MAX, u64::MAX, &state_push());
+        assert_eq!(
+            verifier.accept_checked(&forged, |_, _| false).err(),
+            Some(RejectReason::Sender)
+        );
+        assert_eq!(verifier.watermark(REMOTE), None);
+        assert_eq!(verifier.rejected_total(), 1, "a refused sender is counted");
+
+        let real = frame_for(SECRET, CLUSTER, REMOTE, 1, 1, &state_push());
+        let mut seen = None;
+        let accepted = verifier.accept_checked(&real, |envelope, _| {
+            seen = Some(envelope.sender.clone());
+            true
+        });
+        assert!(accepted.is_ok(), "the real sender still gets through");
+        assert_eq!(seen.as_deref(), Some(REMOTE), "the check sees the sender");
+        assert_eq!(verifier.watermark(REMOTE), Some((1, 1)));
     }
 
     /// Pruning a member must forget it **whole**: the replay watermark goes

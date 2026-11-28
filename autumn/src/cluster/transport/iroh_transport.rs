@@ -40,34 +40,55 @@ const MAX_STREAM_BYTES: usize = MAX_FRAME_BYTES.saturating_add(LENGTH_PREFIX_BYT
 /// The QUIC close code when this node closes a cluster connection.
 const CLOSED_BY_CLUSTER: u32 = 2;
 
-/// The live connections, keyed by the peer's endpoint id.
+/// One connection that the writers use, and the count of frames written
+/// on it.
+#[derive(Clone)]
+struct Tracked {
+    conn: Connection,
+    /// Frames this node wrote on `conn`. The reader of `conn` reads it, so a
+    /// connection that only carries this node's frames is not idle.
+    writes: Arc<AtomicU64>,
+}
+
+/// The connection that the writers use for each peer endpoint id.
 ///
 /// The writers look here before they dial, so a connection that a peer
-/// opened also carries this node's frames to that peer.
+/// opened also carries this node's frames to that peer. The newest
+/// connection wins: after a peer restarts, its new connection replaces the
+/// old one.
 #[derive(Default)]
 struct Connections {
-    by_peer: Mutex<HashMap<String, Connection>>,
+    by_peer: Mutex<HashMap<String, Tracked>>,
 }
 
 impl Connections {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Connection>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Tracked>> {
         self.by_peer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A connection to `peer` that is still open.
-    fn get(&self, peer: &str) -> Option<Connection> {
+    /// The connection to `peer`, when it is still open.
+    fn get(&self, peer: &str) -> Option<Tracked> {
         let mut by_peer = self.lock();
         if by_peer
             .get(peer)
-            .is_some_and(|conn| conn.close_reason().is_some())
+            .is_some_and(|tracked| tracked.conn.close_reason().is_some())
         {
             by_peer.remove(peer);
         }
         by_peer.get(peer).cloned()
     }
 
-    fn insert(&self, peer: &str, conn: Connection) {
-        self.lock().insert(peer.to_owned(), conn);
+    /// Make `conn` the connection for `peer`. Returns its write count.
+    fn insert(&self, peer: &str, conn: Connection) -> Arc<AtomicU64> {
+        let writes = Arc::new(AtomicU64::new(0));
+        self.lock().insert(
+            peer.to_owned(),
+            Tracked {
+                conn,
+                writes: Arc::clone(&writes),
+            },
+        );
+        writes
     }
 
     /// Forget `conn` when it is still the connection for `peer`.
@@ -75,12 +96,16 @@ impl Connections {
         let mut by_peer = self.lock();
         if by_peer
             .get(peer)
-            .is_some_and(|known| known.stable_id() == conn.stable_id())
+            .is_some_and(|known| known.conn.stable_id() == conn.stable_id())
         {
             by_peer.remove(peer);
         }
     }
 }
+
+/// The direct addresses known for each peer endpoint id: from the seeds
+/// and from the member records. A dial tries all of them.
+type Hints = Arc<Mutex<HashMap<String, BTreeSet<SocketAddr>>>>;
 
 /// One peer's unauthenticated-frame count, and the token that closes every
 /// connection from that peer.
@@ -189,6 +214,7 @@ pub struct IrohPeerTransport {
     io: Mutex<Option<TransportIo>>,
     readers: Mutex<Option<Readers>>,
     connections: Arc<Connections>,
+    hints: Hints,
     budget: Arc<Budget>,
     live_inbound: Arc<AtomicUsize>,
     framing_rejections: Arc<AtomicU64>,
@@ -212,12 +238,7 @@ impl IrohPeerTransport {
     /// `advertise` is the direct `ip:port` that peers dial; when `None`, the
     /// node advertises its own direct address.
     pub fn new(node: IrohNode, advertise: Option<SocketAddr>) -> Self {
-        let accepted = if node.allowed_peers().is_empty() {
-            node.register(CLUSTER_ALPN)
-        } else {
-            let allow = node.allowed_peers().clone();
-            node.register_with_allow_list(CLUSTER_ALPN, allow)
-        };
+        let accepted = node.register(CLUSTER_ALPN);
         let (inbound_tx, incoming) = mpsc::channel(PEER_QUEUE_CAPACITY);
         Self {
             own_id: node.id().to_string(),
@@ -230,6 +251,7 @@ impl IrohPeerTransport {
             io: Mutex::new(None),
             readers: Mutex::new(None),
             connections: Arc::new(Connections::default()),
+            hints: Hints::default(),
             budget: Arc::new(Budget::default()),
             live_inbound: Arc::new(AtomicUsize::new(0)),
             framing_rejections: Arc::new(AtomicU64::new(0)),
@@ -284,6 +306,7 @@ impl IrohPeerTransport {
             Writer {
                 to: to.to_owned(),
                 node: self.node.clone(),
+                hints: Arc::clone(&self.hints),
                 readers,
                 shutdown,
                 entropy,
@@ -345,35 +368,53 @@ impl PeerTransport for IrohPeerTransport {
         let direct = self
             .advertise
             .or_else(|| configured.map(str::trim).and_then(|addr| addr.parse().ok()));
-        crate::iroh::format_peer_addr(&self.own_id, direct.or_else(|| self.node.direct_addr()))
+        let wildcard = self
+            .node
+            .endpoint()
+            .bound_sockets()
+            .iter()
+            .all(|addr| addr.ip().is_unspecified());
+        let direct = direct.or_else(|| {
+            let found = self.node.direct_addr();
+            if wildcard {
+                // One of several interfaces, and it may not be the one peers
+                // can route to (a VPN or a container bridge).
+                tracing::warn!(
+                    advertised = ?found,
+                    "cluster: the iroh endpoint binds every interface, so the advertised \
+                     address is a guess; set cluster.advertise_addr"
+                );
+            }
+            found
+        });
+        crate::iroh::format_peer_addr(&self.own_id, direct)
     }
 
     fn dial_targets(&self, targets: BTreeSet<String>) -> BTreeSet<String> {
-        // One target per endpoint id, never this node. A target with a direct
-        // address wins over a bare id.
-        let mut by_id: BTreeMap<String, String> = BTreeMap::new();
+        // One target per endpoint id, never this node. Every direct address
+        // for the id becomes a dial hint, so a stale seed address cannot hide
+        // the address that the peer advertises now.
+        let mut hints: HashMap<String, BTreeSet<SocketAddr>> = HashMap::new();
         for target in targets {
-            let Some(id) = Self::peer_id(&target) else {
+            let Ok((id, direct)) = parse_iroh_peer(target.trim()) else {
                 tracing::debug!(peer = %target, "cluster: not an iroh peer address; skipping");
                 continue;
             };
             if id == self.own_id {
                 continue;
             }
-            let id = id.to_owned();
-            let has_direct = target.contains('@');
-            match by_id.get(&id) {
-                Some(kept) if kept.contains('@') || !has_direct => {}
-                _ => {
-                    by_id.insert(id, target.trim().to_owned());
-                }
-            }
+            let addrs = hints.entry(id.to_owned()).or_default();
+            addrs.extend(direct);
         }
-        by_id.into_values().collect()
+        let ids = hints.keys().cloned().collect();
+        *self.hints.lock().unwrap_or_else(PoisonError::into_inner) = hints;
+        ids
     }
 
     fn verify_sender(&self, from: &str, advertised: Option<&str>) -> bool {
-        advertised.is_none_or(|addr| Self::peer_id(addr) == Some(from))
+        // No record: a push that leaves out its sender's record, or a Leave
+        // from a sender this node never met. Neither names an identity.
+        advertised.is_some_and(|addr| Self::peer_id(addr) == Some(from))
     }
 
     fn start(&self, shutdown: &CancellationToken, entropy: &Arc<dyn Entropy>) {
@@ -467,24 +508,26 @@ async fn accept_loop(
             continue;
         };
         let peer = conn.remote_id().to_string();
-        readers.connections.insert(&peer, conn.clone());
-        tokio::spawn(read_frames(conn, peer, readers.clone(), Some(slot)));
+        let writes = readers.connections.insert(&peer, conn.clone());
+        tokio::spawn(read_frames(conn, peer, writes, readers.clone(), Some(slot)));
     }
 }
 
 /// Read one frame per uni stream off `conn`, and hand each up as from `peer`.
 ///
-/// Ends when the connection closes, when it is idle for the idle timeout,
-/// when a stream is larger than a frame, or when the peer spends its
-/// unauthenticated-frame budget.
+/// Ends when the connection closes, when no frame went either way for the
+/// idle timeout, when a stream is larger than a frame, or when the peer
+/// spends its unauthenticated-frame budget.
 async fn read_frames(
     conn: Connection,
     peer: String,
+    writes: Arc<AtomicU64>,
     readers: Readers,
     slot: Option<super::InboundSlot>,
 ) {
     let _slot = slot;
     let (close, _budget) = readers.budget.register(&peer);
+    let mut written = writes.load(Ordering::Relaxed);
     loop {
         let stream = tokio::select! {
             stream = tokio::time::timeout(readers.idle_timeout, conn.accept_uni()) => stream,
@@ -492,9 +535,18 @@ async fn read_frames(
             () = readers.shutdown.cancelled() => break,
         };
         let mut stream = match stream {
+            // 0-RTT data can be replayed. A cluster peer never sends it.
+            Ok(Ok(stream)) if stream.is_0rtt() => continue,
             Ok(Ok(stream)) => stream,
             Ok(Err(_)) => break,
             Err(_elapsed) => {
+                // Not idle while this node writes on it: a connection can carry
+                // frames one way only.
+                let now = writes.load(Ordering::Relaxed);
+                if now != written {
+                    written = now;
+                    continue;
+                }
                 tracing::debug!(peer = %peer, "cluster: iroh connection idle; closing it");
                 break;
             }
@@ -521,6 +573,12 @@ async fn read_frames(
             () = readers.shutdown.cancelled() => break,
         };
         if handed_up.is_err() {
+            // The receive loop is gone, but the writers may still send the
+            // farewell on this connection. Keep it open until they stop.
+            tokio::select! {
+                () = close.cancelled() => {}
+                () = readers.shutdown.cancelled() => {}
+            }
             break;
         }
     }
@@ -532,6 +590,7 @@ async fn read_frames(
 struct Writer {
     to: PeerAddr,
     node: IrohNode,
+    hints: Hints,
     readers: Readers,
     shutdown: CancellationToken,
     entropy: Arc<dyn Entropy>,
@@ -541,24 +600,33 @@ struct Writer {
 impl Writer {
     /// A connection to the peer: one that is open (in either direction), or a
     /// new one. A new connection also gets a reader.
-    async fn connection(&self, peer: &str) -> Option<Connection> {
-        if let Some(conn) = self.readers.connections.get(peer) {
-            return Some(conn);
+    async fn connection(&self, peer: &str) -> Option<Tracked> {
+        if let Some(tracked) = self.readers.connections.get(peer) {
+            return Some(tracked);
         }
+        let direct: Vec<SocketAddr> = self
+            .hints
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(peer)
+            .map(|addrs| addrs.iter().copied().collect())
+            .unwrap_or_default();
+        let dial = self.node.connect_direct(peer, direct, CLUSTER_ALPN);
         let dialled = tokio::select! {
-            result = tokio::time::timeout(DIAL_TIMEOUT, self.node.connect(&self.to, CLUSTER_ALPN)) => result,
+            result = tokio::time::timeout(DIAL_TIMEOUT, dial) => result,
             () = self.shutdown.cancelled() => return None,
         };
         match dialled {
             Ok(Ok(conn)) => {
-                self.readers.connections.insert(peer, conn.clone());
+                let writes = self.readers.connections.insert(peer, conn.clone());
                 tokio::spawn(read_frames(
                     conn.clone(),
                     peer.to_owned(),
+                    Arc::clone(&writes),
                     self.readers.clone(),
                     None,
                 ));
-                Some(conn)
+                Some(Tracked { conn, writes })
             }
             Ok(Err(err)) => {
                 tracing::debug!(peer = %self.to, error = %err, "cluster: iroh dial failed");
@@ -568,12 +636,17 @@ impl Writer {
         }
     }
 
-    /// Write `frame` on its own uni stream.
+    /// Write `frame` on its own uni stream, and wait until the peer has it.
+    ///
+    /// The wait keeps [`PeerTransport::pending_frames`] true: a frame in this
+    /// node's QUIC buffer is not delivered, and closing the endpoint drops it.
     async fn write(&self, conn: &Connection, frame: &[u8]) -> bool {
         let written = async {
             let mut stream = conn.open_uni().await.ok()?;
             stream.write_all(frame).await.ok()?;
-            stream.finish().ok()
+            stream.finish().ok()?;
+            // `None`: the peer has every byte. `Some`: it stopped the stream.
+            matches!(stream.stopped().await, Ok(None)).then_some(())
         };
         tokio::select! {
             result = tokio::time::timeout(WRITE_TIMEOUT, written) => matches!(result, Ok(Some(()))),
@@ -607,7 +680,7 @@ async fn iroh_writer(
         let Some(frame) = queued else { return };
         let _held = InFlightFrame::claim(&writer.in_flight);
 
-        let Some(conn) = writer.connection(&peer).await else {
+        let Some(tracked) = writer.connection(&peer).await else {
             if writer.shutdown.is_cancelled() {
                 return;
             }
@@ -619,8 +692,10 @@ async fn iroh_writer(
             continue;
         };
         backoff = RECONNECT_BACKOFF_MIN;
-        if !writer.write(&conn, &frame).await {
-            writer.readers.connections.forget(&peer, &conn);
+        if writer.write(&tracked.conn, &frame).await {
+            tracked.writes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            writer.readers.connections.forget(&peer, &tracked.conn);
         }
     }
 }
@@ -880,13 +955,75 @@ mod tests {
         x.close().await;
     }
 
+    fn iroh_cluster_config() -> crate::config::ClusterConfig {
+        crate::config::ClusterConfig {
+            enabled: true,
+            secret: Some(secrecy::SecretString::from(
+                String::from_utf8_lossy(SECRET).into_owned(),
+            )),
+            transport: crate::config::ClusterTransport::Iroh,
+            ..crate::config::ClusterConfig::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_installer_runs_the_cluster_on_the_boot_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+
+        let state = crate::state::AppState::for_test();
+        let err = crate::cluster::install_from_config(&state, &iroh_cluster_config(), &token)
+            .expect_err("no endpoint on the state");
+        assert!(err.to_string().contains("[iroh] enabled = true"), "{err}");
+
+        let state = crate::state::AppState::for_test();
+        let node = crate::iroh::start_from_config(
+            &state,
+            &crate::config::IrohConfig {
+                enabled: true,
+                secret_key_path: dir.path().join("boot.key"),
+                bind_addr: "127.0.0.1:0".to_owned(),
+                ..crate::config::IrohConfig::default()
+            },
+            &token,
+        )
+        .await
+        .expect("binds")
+        .expect("enabled");
+        crate::cluster::install_from_config(&state, &iroh_cluster_config(), &token)
+            .expect("installs on the boot endpoint");
+        let handle = state
+            .extension::<ClusterHandle>()
+            .expect("a cluster handle");
+        let own = handle.members().into_iter().next().expect("this node");
+        assert!(
+            own.addr.starts_with(&node.id().to_string()),
+            "the node advertises its endpoint id: {}",
+            own.addr
+        );
+        token.cancel();
+        node.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_from_config_binds_nothing_when_iroh_is_off() {
+        let state = crate::state::AppState::for_test();
+        let token = CancellationToken::new();
+        let node =
+            crate::iroh::start_from_config(&state, &crate::config::IrohConfig::default(), &token)
+                .await
+                .expect("no error");
+        assert!(node.is_none());
+        assert!(state.extension::<IrohNode>().is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dial_targets_keep_one_address_per_id_and_never_this_node() {
         let dir = tempfile::tempdir().unwrap();
         let node = iroh_node(dir.path(), "a").await;
         let own = node.id().to_string();
         let transport = IrohPeerTransport::new(node.clone(), None);
-        let peer = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6";
+        let peer = "af06a3e3291714e4f356c19c9b15cd1951ec6e6662aa77be07547f289383341d";
         let targets: BTreeSet<String> = [
             peer.to_owned(),
             format!("{peer}@10.0.0.2:7947"),
@@ -897,11 +1034,34 @@ mod tests {
         .into_iter()
         .collect();
         let kept: Vec<String> = transport.dial_targets(targets).into_iter().collect();
-        assert_eq!(kept, vec![format!("{peer}@10.0.0.2:7947")]);
+        assert_eq!(
+            kept,
+            vec![peer.to_owned()],
+            "one target per id, never this node"
+        );
+
+        // Every direct address of the id is a dial hint, so a stale seed
+        // address cannot hide the one the peer advertises now.
+        let fresh = [
+            format!("{peer}@10.0.0.1:7947"),
+            format!("{peer}@10.0.0.2:7947"),
+        ];
+        transport.dial_targets(fresh.into_iter().collect());
+        let hints = transport.hints.lock().unwrap().get(peer).cloned().unwrap();
+        assert_eq!(
+            hints.into_iter().collect::<Vec<_>>(),
+            vec![
+                "10.0.0.1:7947".parse::<SocketAddr>().unwrap(),
+                "10.0.0.2:7947".parse().unwrap()
+            ]
+        );
 
         assert!(transport.verify_sender(peer, Some(&format!("{peer}@10.0.0.2:7947"))));
         assert!(transport.verify_sender(peer, Some(peer)));
-        assert!(transport.verify_sender(peer, None), "no record to compare");
+        assert!(
+            !transport.verify_sender(peer, None),
+            "no record names an identity"
+        );
         assert!(!transport.verify_sender(peer, Some(&own)));
         assert!(!transport.verify_sender(peer, Some("10.0.0.9:7946")));
 

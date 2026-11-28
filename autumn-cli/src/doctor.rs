@@ -1185,6 +1185,8 @@ pub struct IrohDoctorData {
     pub key_file: IrohKeyFile,
     /// `[cluster] enabled = true` with `transport = "iroh"`.
     pub cluster_uses_iroh: bool,
+    /// `[iroh] allow_readable_secret_key`.
+    pub allow_readable_secret_key: bool,
 }
 
 /// Grade `[iroh]` (pure, injectable for tests).
@@ -1214,11 +1216,24 @@ pub fn check_iroh_impl(data: &IrohDoctorData) -> CheckResult {
         return result(CheckStatus::Pass, "[iroh] is off".into(), None);
     }
     match data.key_file {
+        IrohKeyFile::Exposed(mode) if data.allow_readable_secret_key => {
+            return result(
+                CheckStatus::Warn,
+                format!(
+                    "the [iroh] secret key file has mode {mode:o}; allow_readable_secret_key \
+                     lets it through"
+                ),
+                Some("Mount the key with mode 0600 and remove allow_readable_secret_key"),
+            );
+        }
         IrohKeyFile::Exposed(mode) => {
             return result(
                 CheckStatus::Fail,
-                format!("the [iroh] secret key file has mode {mode:o}; others can read it"),
-                Some("Run `chmod 600` on [iroh] secret_key_path; the key is the node's identity"),
+                format!("the [iroh] secret key file has mode {mode:o}; others can access it"),
+                Some(
+                    "Run `chmod 600` on [iroh] secret_key_path; the key is the node's identity. \
+                     For a secret volume, set [iroh] allow_readable_secret_key = true",
+                ),
             );
         }
         IrohKeyFile::NotAKey => {
@@ -1310,6 +1325,15 @@ fn iroh_doctor_data_from(
             .or_else(|| toml_str(table, key))
             .unwrap_or_else(|| default.to_owned())
     };
+    // As the runtime parses an enum: an env value that is not in `allowed` is
+    // ignored, and the TOML value stays. The first entry is the default.
+    let choice = |env_key: &str, table, key: &str, allowed: &[&str]| {
+        env.var(env_key)
+            .ok()
+            .filter(|value| allowed.contains(&value.as_str()))
+            .or_else(|| toml_str(table, key))
+            .unwrap_or_else(|| allowed.first().copied().unwrap_or_default().to_owned())
+    };
     let toml_bool = |table: Option<&toml::Table>, key: &str| {
         table
             .and_then(|t| t.get(key))
@@ -1330,16 +1354,29 @@ fn iroh_doctor_data_from(
     };
     let cluster_enabled =
         env_bool("AUTUMN_CLUSTER__ENABLED").unwrap_or_else(|| toml_bool(cluster, "enabled"));
-    let transport = string("AUTUMN_CLUSTER__TRANSPORT", cluster, "transport", "tcp");
+    let transport = choice(
+        "AUTUMN_CLUSTER__TRANSPORT",
+        cluster,
+        "transport",
+        &["tcp", "iroh"],
+    );
+    let allow_readable_secret_key = env_bool("AUTUMN_IROH__ALLOW_READABLE_SECRET_KEY")
+        .unwrap_or_else(|| toml_bool(iroh, "allow_readable_secret_key"));
     IrohDoctorData {
         enabled,
-        relay: string("AUTUMN_IROH__RELAY", iroh, "relay", "disabled"),
-        address_lookup: string(
+        relay: choice(
+            "AUTUMN_IROH__RELAY",
+            iroh,
+            "relay",
+            &["disabled", "n0", "custom"],
+        ),
+        address_lookup: choice(
             "AUTUMN_IROH__ADDRESS_LOOKUP",
             iroh,
             "address_lookup",
-            "static",
+            &["static", "n0-dns"],
         ),
+        allow_readable_secret_key,
         key_file: if enabled {
             iroh_key_file_state(&key_path)
         } else {
@@ -14711,6 +14748,7 @@ pub struct Vault {
             address_lookup: "static".into(),
             key_file,
             cluster_uses_iroh: cluster,
+            allow_readable_secret_key: false,
         }
     }
 
@@ -14737,6 +14775,13 @@ pub struct Vault {
         assert!(matches!(r.status, CheckStatus::Fail));
         let r = check_iroh_impl(&iroh_data(true, IrohKeyFile::Unreadable, false));
         assert!(matches!(r.status, CheckStatus::Warn));
+        let mut opted_in = iroh_data(true, IrohKeyFile::Exposed(0o644), false);
+        opted_in.allow_readable_secret_key = true;
+        let r = check_iroh_impl(&opted_in);
+        assert!(
+            matches!(r.status, CheckStatus::Warn),
+            "the opt-in warns: {r:?}"
+        );
     }
 
     #[test]
@@ -14792,6 +14837,16 @@ pub struct Vault {
             iroh_doctor_data_from(&table, &env, dir.path()).key_file,
             IrohKeyFile::NotAKey
         );
+
+        let bogus = autumn_web::config::MockEnv::new()
+            .with("AUTUMN_IROH__RELAY", "bogus")
+            .with("AUTUMN_CLUSTER__TRANSPORT", "Iroh");
+        let data = iroh_doctor_data_from(&table, &bogus, dir.path());
+        assert_eq!(
+            data.relay, "n0",
+            "an invalid env value keeps the TOML value"
+        );
+        assert!(data.cluster_uses_iroh);
 
         let env = autumn_web::config::MockEnv::new()
             .with("AUTUMN_IROH__ENABLED", "false")

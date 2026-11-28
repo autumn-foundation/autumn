@@ -30,13 +30,18 @@ key. The handshake proves the key. With a relay, iroh goes through NAT.
 Option 3.
 
 - `[iroh]` binds one endpoint. The secret key file is created `0600`. A file
-  that others can read is refused.
+  that group or others can access is refused, unless the app sets
+  `allow_readable_secret_key` (it then warns). An `http://` relay needs
+  `allow_http_relay`.
 - The relay is off and the address lookup is static by default. The
   endpoint then talks to no third party. `n0` relays, custom relays and n0 DNS
   are opt-ins.
 - Each protocol registers an ALPN. An unknown ALPN fails the handshake. A
   per-ALPN allow-list closes other peers after the handshake, before a
-  handler sees them. `[iroh] allowed_peers` is the list for every ALPN.
+  handler sees them. `[iroh] allowed_peers` is the list for every ALPN that
+  registers with `register`.
+- Under load, an unvalidated client gets a QUIC retry before it takes a
+  handshake slot.
 - `[cluster] transport = "iroh"` uses ALPN `autumn/cluster/1`. One QUIC uni
   stream carries one frame. The envelope, the MAC, the queues and the
   farewell lane do not change.
@@ -45,7 +50,8 @@ Option 3.
 - `PeerTransport` gets three hooks with defaults that keep TCP as it was:
   `advertise_addr`, `dial_targets` and `verify_sender`.
 - `verify_sender` refuses a frame whose sender's own record names another
-  endpoint id than the connection (`reason="sender"`). It does not stop a
+  endpoint id than the connection, or that has no such record
+  (`reason="sender"`). The check runs before the replay watermark moves. It does not stop a
   holder of the secret from gossiping false records about other nodes. The
   victim refutes those at a higher incarnation. Per-record signatures would
   stop it, and are out of scope.
@@ -55,7 +61,8 @@ Option 3.
 ## Consequences
 
 - The feature is additive and off by default (`iroh`).
-- ring stays the only crypto backend.
+- ring stays the only TLS backend. iroh adds ed25519 and other primitives
+  for its keys and relays.
 - A node with a static `node_id` keeps its id when its key changes. Its new
   record wins at a higher incarnation, as an address change does on TCP.
 - Serving the app over iroh and the `iroh://` client scheme build on
