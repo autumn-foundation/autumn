@@ -780,8 +780,12 @@ async fn h3_stops_the_stream_when_a_response_body_fails() {
     let outcome = tokio::time::timeout(DEADLINE, async {
         let mut stream = client.send.send_request(req).await.expect("request opens");
         stream.finish().await.expect("request ends");
-        let resp = stream.recv_response().await.expect("response head");
-        assert_eq!(resp.status(), 200);
+        // The reset can arrive before the head is read: an error at either
+        // step is the stopped stream.
+        match stream.recv_response().await {
+            Ok(resp) => assert_eq!(resp.status(), 200),
+            Err(e) => return Err(e.to_string()),
+        }
         loop {
             match stream.recv_data().await {
                 Ok(Some(_)) => {}
