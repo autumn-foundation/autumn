@@ -2601,7 +2601,7 @@ jobs:
       # Coverage is not bound by the crates.io baseline, so this list is a
       # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
       # `acme`, `managed-pg*`, `system-tests`, `test-support`, ...).
-      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,webmcp,markdown,constela,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
+      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,webmcp,markdown,constela,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,http3,plugin-sandbox"
       # `postgresql_embedded`'s build script downloads Postgres binaries via
       # the GitHub API; unauthenticated it hits the 60 req/hr rate limit and
       # fails the build with a 403. Authenticate with the job's token to get
