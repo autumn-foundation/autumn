@@ -3134,6 +3134,19 @@ jobs:
             retention:: search:: \
             | tee "$RUNNER_TEMP/cli-one-shot-env-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-one-shot-env-cov.log"
+          # PR #3813: same gap for `schema_org::` (the schema.org vocabulary,
+          # `autumn schema-org list`/`show`, the JSON-LD audit, and the
+          # scaffold's `--schema-org` binding) and for the clap parse tests of
+          # those commands. `schema::` above does not match it. The `cli_tests`
+          # leg runs the binary, so the command dispatch in `main.rs` is
+          # measured too. Check both counts.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- schema_org:: \
+            tests::parse_schema_org_commands tests::parse_scaffold_schema_org_flags \
+            | tee "$RUNNER_TEMP/cli-schema-org-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-schema-org-cov.log"
+          cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- schema_org_cli:: \
+            | tee "$RUNNER_TEMP/cli-schema-org-bin-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-schema-org-bin-cov.log"
           # Issue #2531 (independently, also #2753/PR #3358: three
           # near-identical Cargo-feature-injector functions were merged into
           # one shared `ensure_autumn_web_feature` here): same gap for
