@@ -23,9 +23,15 @@ params() {
 }
 prune="$(tr -d '\n' < "$work/prune.sql")"
 claim="$(params "$work/claim.sql")"
-python3 - "$here/claim.bench" "$work/claim.bench" "$prune" "$claim" <<'PY'
+# A source with the prune of one key claims first (claim-split.bench).
+template="$here/claim.bench"; prune_key=""
+if [ -f "$work/prune_key.sql" ]; then
+  template="$here/claim-split.bench"; prune_key="$(params "$work/prune_key.sql")"
+fi
+python3 - "$template" "$work/claim.bench" "$prune" "$claim" "$prune_key" <<'PY'
 import sys
-s = open(sys.argv[1]).read().replace("@@PRUNE@@", sys.argv[3]).replace("@@CLAIM@@", sys.argv[4])
+s = open(sys.argv[1]).read()
+s = s.replace("@@PRUNE_KEY@@", sys.argv[5]).replace("@@PRUNE@@", sys.argv[3]).replace("@@CLAIM@@", sys.argv[4])
 open(sys.argv[2], "w").write(s)
 PY
 

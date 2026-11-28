@@ -1,0 +1,78 @@
+work=/tmp/tmp.oKXTtI2fMS
+ live_rows 
+-----------
+      3380
+(1 row)
+
+ n_live_tup | n_dead_tup 
+------------+------------
+       3380 |          0
+(1 row)
+
+number of transactions actually processed: 6674
+number of failed transactions: 0 (0.000%)
+latency average = 1.933 ms
+latency stddev = 11.712 ms
+rate limit schedule lag: avg 0.575 (max 323.225) ms
+tps = 22.253499 (without initial connection time)
+replicas=2 seconds=300 rate=22.33/s
+wal_lsn_delta_bytes=2927512
+CREATE VIEW
+-- statements on the tick table, by buffers
+                                           query                                            | calls | rows | buffers |  hit  | read | dirtied | temp_w | wal_records | wal_fpi | wal_bytes | pct_buf | pct_calls | pct_wal | buf_per_call 
+--------------------------------------------------------------------------------------------+-------+------+---------+-------+------+---------+--------+-------------+---------+-----------+---------+-----------+---------+--------------
+ INSERT INTO autumn_scheduler_ticks (key_prefix, task_name, tick_key, owner, expires_at) SE |  6674 | 2870 |   41579 | 41579 |    0 |      51 |      0 |       11760 |      18 |   1208220 |    48.8 |      50.0 |    68.1 |         6.23
+ DELETE FROM autumn_scheduler_ticks WHERE expires_at < now()                                |  2870 | 3380 |   25994 | 25994 |    0 |      25 |      0 |        3655 |      44 |    555925 |    30.5 |      21.5 |    31.4 |         9.06
+ DELETE FROM autumn_scheduler_ticks WHERE key_prefix = $1::text AND task_name = $2::text AN |  3804 |    0 |   17677 | 17677 |    0 |       1 |      0 |         158 |       0 |      9050 |    20.7 |      28.5 |     0.5 |         4.65
+
+-- totals
+ calls | buffers | wal_bytes | wal_fpi | temp_w 
+-------+---------+-----------+---------+--------
+ 13348 |   85250 |   1773195 |      62 |      0
+
+-- top 10 statements in the database by calls (harness helper included)
+                                 query                                  | calls | buffers 
+------------------------------------------------------------------------+-------+---------
+ INSERT INTO autumn_scheduler_ticks (key_prefix, task_name, tick_key, o |  6674 |   41579
+ SELECT ($6 || chr($7) || $8) AS prefix, k.task_name, k.tick_key, $9 || |  6674 |       0
+ SELECT coalesce(wait_event_type, $1) || $2 || coalesce(wait_event, $3) |  5633 |       0
+ DELETE FROM autumn_scheduler_ticks WHERE key_prefix = $1::text AND tas |  3804 |   17677
+ DELETE FROM autumn_scheduler_ticks WHERE expires_at < now()            |  2870 |   25994
+ SELECT (n_dead_tup > $1 + $2 * n_live_tup)::int || $3 || (n_mod_since_ |     4 |      56
+ VACUUM (ANALYZE) autumn_scheduler_ticks                                |     3 |    2677
+ SELECT pg_current_wal_lsn()                                            |     2 |       0
+ SELECT pg_stat_statements_reset()                                      |     1 |       0
+ SELECT pg_stat_reset()                                                 |     1 |       0
+
+-- table
+        relname         | seq_scan | seq_tup_read | idx_scan | idx_tup_fetch | n_tup_ins | n_tup_del | n_tup_hot_upd | n_live_tup | n_dead_tup 
+------------------------+----------+--------------+----------+---------------+-----------+-----------+---------------+------------+------------
+ autumn_scheduler_ticks |        0 |            0 |    13373 |         14132 |      2870 |      3380 |             0 |       2845 |        700
+
+        relname         | heap_blks | idx_blks 
+------------------------+-----------+----------
+ autumn_scheduler_ticks |     37256 |    43131
+
+-- indexes
+             indexrelname              | idx_scan | idx_tup_read | idx_tup_fetch | bytes  
+---------------------------------------+----------+--------------+---------------+--------
+ autumn_scheduler_ticks_pkey           |     7817 |         4947 |          4946 | 622592
+ idx_autumn_scheduler_ticks_expires_at |     5556 |       198918 |          8486 | 106496
+
+-- end state
+ live_rows | expired_left 
+-----------+--------------
+      2870 |            0
+
+-- autovacuum emulator (naptime=60s)
+t=60 vacuum analyze
+t=120 analyze
+t=180 vacuum analyze
+t=240 vacuum analyze
+-- wait-event samples (backend x sample) during the run
+     57 IO:WALSync
+     16 CPU:-
+      8 LWLock:WALWrite
+      5 Client:ClientRead
+      1 IO:WALWrite
+      1 IO:DataFileImmediateSync

@@ -570,6 +570,86 @@ async fn create_tick_table(conn: &mut diesel_async::AsyncPgConnection) -> Autumn
     .map_err(setup_error)
 }
 
+/// Delete every expired tick row. The replica that claims a tick runs it.
+#[cfg(feature = "postgres")]
+const PG_TICK_PRUNE_SQL: &str = "DELETE FROM autumn_scheduler_ticks WHERE expires_at < now()";
+
+/// Delete one tick row if it has expired, so its key can be claimed again.
+#[cfg(feature = "postgres")]
+const PG_TICK_PRUNE_KEY_SQL: &str = "DELETE FROM autumn_scheduler_ticks \
+     WHERE key_prefix = $1 AND task_name = $2 AND tick_key = $3 AND expires_at < now()";
+
+/// Claim one tick. It also takes the advisory key that pre-#3052 releases
+/// hold for the whole tick, so it fails while an old replica runs the tick
+/// during a rolling upgrade. The lock is transaction-scoped and frees when
+/// the statement commits.
+#[cfg(feature = "postgres")]
+const PG_TICK_CLAIM_SQL: &str = "INSERT INTO autumn_scheduler_ticks \
+     (key_prefix, task_name, tick_key, owner, expires_at) \
+     SELECT $1, $2, $3, $4, now() + make_interval(secs => $5) \
+     WHERE pg_try_advisory_xact_lock($6) \
+     ON CONFLICT DO NOTHING \
+     RETURNING generation";
+
+#[cfg(feature = "postgres")]
+impl PostgresTickSchedulerCoordinator {
+    /// Insert the tick row. Returns its generation, or `None` when a row
+    /// already holds the key or the advisory key is taken.
+    async fn claim(
+        &self,
+        conn: &mut diesel_async::AsyncPgConnection,
+        task_name: &str,
+        tick_key: &str,
+        period: Duration,
+    ) -> AutumnResult<Option<i64>> {
+        use diesel_async::RunQueryDsl as _;
+
+        let claimed = diesel::sql_query(PG_TICK_CLAIM_SQL)
+            .bind::<diesel::sql_types::Text, _>(&self.key_prefix)
+            .bind::<diesel::sql_types::Text, _>(task_name)
+            .bind::<diesel::sql_types::Text, _>(tick_key)
+            .bind::<diesel::sql_types::Text, _>(&self.replica_id)
+            .bind::<diesel::sql_types::Double, _>(tick_hold(self.retention, period).as_secs_f64())
+            .bind::<diesel::sql_types::BigInt, _>(advisory_lock_key(
+                &self.key_prefix,
+                task_name,
+                tick_key,
+            ))
+            .load::<TickGenerationRow>(&mut *conn)
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "postgres scheduler tick claim failed: {error}"
+                ))
+            })?;
+        Ok(claimed.into_iter().next().map(|row| row.generation))
+    }
+
+    /// Delete the row of this key if it has expired. Returns `true` when a
+    /// row went.
+    async fn prune_key(
+        &self,
+        conn: &mut diesel_async::AsyncPgConnection,
+        task_name: &str,
+        tick_key: &str,
+    ) -> AutumnResult<bool> {
+        use diesel_async::RunQueryDsl as _;
+
+        let deleted = diesel::sql_query(PG_TICK_PRUNE_KEY_SQL)
+            .bind::<diesel::sql_types::Text, _>(&self.key_prefix)
+            .bind::<diesel::sql_types::Text, _>(task_name)
+            .bind::<diesel::sql_types::Text, _>(tick_key)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| {
+                AutumnError::internal_server_error_msg(format!(
+                    "postgres scheduler tick prune failed: {error}"
+                ))
+            })?;
+        Ok(deleted > 0)
+    }
+}
+
 #[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct TickGenerationRow {
@@ -620,48 +700,28 @@ impl SchedulerCoordinator for PostgresTickSchedulerCoordinator {
             })?;
             self.ensure_table(&mut conn).await?;
 
-            // Prune first. Each row carries its own expiry, set from the
+            // Claim first. Each row carries its own expiry, set from the
             // database clock, so a shorter retention in another app sharing
             // the table cannot free our ticks.
-            diesel::sql_query("DELETE FROM autumn_scheduler_ticks WHERE expires_at < now()")
-                .execute(&mut *conn)
-                .await
-                .map_err(|error| {
-                    AutumnError::internal_server_error_msg(format!(
-                        "postgres scheduler tick prune failed: {error}"
-                    ))
-                })?;
+            let mut claimed = self.claim(&mut conn, task_name, tick_key, period).await?;
+            if claimed.is_none() && self.prune_key(&mut conn, task_name, tick_key).await? {
+                // The row in the way had expired: the key is free again.
+                claimed = self.claim(&mut conn, task_name, tick_key, period).await?;
+            }
+            if claimed.is_some() {
+                // Only the replica that claims a tick prunes the table. Each
+                // tick then prunes it once, not once per replica that tries
+                // it. The claim stands even when the prune fails: the next
+                // won tick prunes again.
+                if let Err(error) = diesel::sql_query(PG_TICK_PRUNE_SQL)
+                    .execute(&mut *conn)
+                    .await
+                {
+                    tracing::warn!(error = %error, "postgres scheduler tick prune failed");
+                }
+            }
 
-            // The claim also takes the advisory key that pre-#3052 releases hold for the whole
-            // tick, so it fails while an old replica runs the tick during a rolling upgrade. The
-            // lock is transaction-scoped and frees when the statement commits.
-            let claimed = diesel::sql_query(
-                "INSERT INTO autumn_scheduler_ticks \
-                 (key_prefix, task_name, tick_key, owner, expires_at) \
-                 SELECT $1, $2, $3, $4, now() + make_interval(secs => $5) \
-                 WHERE pg_try_advisory_xact_lock($6) \
-                 ON CONFLICT DO NOTHING \
-                 RETURNING generation",
-            )
-            .bind::<diesel::sql_types::Text, _>(&self.key_prefix)
-            .bind::<diesel::sql_types::Text, _>(task_name)
-            .bind::<diesel::sql_types::Text, _>(tick_key)
-            .bind::<diesel::sql_types::Text, _>(&self.replica_id)
-            .bind::<diesel::sql_types::Double, _>(tick_hold(self.retention, period).as_secs_f64())
-            .bind::<diesel::sql_types::BigInt, _>(advisory_lock_key(
-                &self.key_prefix,
-                task_name,
-                tick_key,
-            ))
-            .load::<TickGenerationRow>(&mut *conn)
-            .await
-            .map_err(|error| {
-                AutumnError::internal_server_error_msg(format!(
-                    "postgres scheduler tick claim failed: {error}"
-                ))
-            })?;
-
-            Ok(claimed.into_iter().next().map(|row| {
+            Ok(claimed.map(|generation| {
                 SchedulerLease::postgres(
                     self.replica_id.clone(),
                     PostgresTickRow {
@@ -669,7 +729,7 @@ impl SchedulerCoordinator for PostgresTickSchedulerCoordinator {
                         key_prefix: self.key_prefix.clone(),
                         task_name: task_name.to_owned(),
                         tick_key: tick_key.to_owned(),
-                        generation: row.generation,
+                        generation,
                     },
                 )
             }))
