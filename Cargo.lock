@@ -8728,9 +8728,9 @@ dependencies = [
 
 [[package]]
 name = "smop"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31a4f827aa0c327fa4264ac6467031e43994defc2c9d6ef7ab68eb49513cad91"
+checksum = "c8f18170d370334e244543d101772cd932a5038bf397f2b71438fb7ea2b1eef2"
 dependencies = [
  "anyhow",
  "tempfile",
