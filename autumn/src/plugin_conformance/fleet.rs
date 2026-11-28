@@ -682,11 +682,8 @@ async fn unchanged_files<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcom
             .map_err(fail("the first ship failed"))?;
         // The ship timer can ship a write before `ship_now`. Then the
         // replica holds a generation, and `ship_now` has nothing new.
-        let shipped = match first.generation {
-            Some(_) => first.shipped > 0,
-            None => newest_generation(&replication, &key)?.is_some(),
-        };
-        if !shipped {
+        let empty = first.generation.is_some() && first.shipped == 0;
+        if empty || newest_generation(&replication, &key)?.is_none() {
             return Err(format!("the first ship shipped nothing: {first:?}"));
         }
         let before = replica_objects(&replication, &key)?;
