@@ -1290,6 +1290,38 @@ async fn a_shipped_generation_sets_replicated_through() {
 }
 
 #[tokio::test]
+async fn a_generation_bound_carries_the_epoch_of_its_database() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = host(tmp.path(), "vol-a", false);
+    let store = Arc::new(MemoryOwnership::new(Arc::new(crate::time::SystemClock)));
+    let _ownership = own(&a, &store, "a").await;
+    let key = acme(&a.fleet);
+    write(&a, &key, "plan").await;
+    let committed_at = wall_after_commit();
+    // The database is still open: this open does not start a new file.
+    let epoch = a.fleet.open(&key).await.unwrap().epoch();
+    assert!(epoch.is_some(), "opened under an epoch");
+    a.fleet.ship_now(&key).await.unwrap();
+
+    let bound = a.fleet.replica_bound(&key).expect("shipped");
+    assert_eq!(bound.epoch(), epoch);
+    assert_eq!(a.fleet.replicated_through(&key), Some(bound.through()));
+    assert!(bound.covers(committed_at, epoch));
+    a.fleet.close(&key).await;
+
+    // A reopen starts a new file. The earlier commit is then `Stale`.
+    write(&a, &key, "later").await;
+    a.fleet.ship_now(&key).await.unwrap();
+    let reopened = a.fleet.replica_bound(&key).expect("shipped");
+    assert!(reopened.since() > committed_at);
+    assert_eq!(
+        reopened.coverage(committed_at, epoch),
+        crate::db::fleet_replication::Coverage::Stale
+    );
+    a.fleet.close_all().await;
+}
+
+#[tokio::test]
 async fn a_fenced_generation_ship_drops_the_bound() {
     let tmp = tempfile::tempdir().unwrap();
     let a = host(tmp.path(), "vol-a", false);

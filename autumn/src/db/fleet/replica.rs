@@ -169,6 +169,19 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             .and_then(|replication| replication.replicated_through(key))
     }
 
+    /// The replica bound of `key`, with its epoch and the start of its file.
+    /// See
+    /// [`FleetReplication::replica_bound`](crate::db::fleet_replication::FleetReplication::replica_bound).
+    /// `None` with no replication.
+    #[must_use]
+    pub fn replica_bound(
+        &self,
+        key: &FleetDbKey,
+    ) -> Option<crate::db::fleet_replication::ReplicaBound> {
+        self.replication()
+            .and_then(|replication| replication.replica_bound(key))
+    }
+
     /// Wait until the replica of `key` holds every commit at or before
     /// `committed_at`. See
     /// [`FleetReplication::wait_replicated`](crate::db::fleet_replication::FleetReplication::wait_replicated).

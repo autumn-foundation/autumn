@@ -1,7 +1,8 @@
-//! The costs of a fleet failover, as `docs/guide/sqlite-fleet.md` states them.
+//! The costs of a fleet failover, and the rules to move a row between fleet
+//! databases, as `docs/guide/sqlite-fleet.md` states them.
 //!
-//! The guide must state each cost, and its numbers must agree with the
-//! config defaults. The behaviour behind each claim has a test in
+//! The guide must state each cost and each rule. Its numbers must agree with
+//! the config defaults. The behaviour behind each claim has a test in
 //! `db::fleet_ownership`.
 
 use autumn_web::config::{FleetOwnershipConfig, ReplicationConfig};
@@ -109,4 +110,111 @@ fn the_guide_says_a_stale_file_is_restored_without_restore_missing() {
     );
     let heading = "### The failover procedure";
     assert_says(&section(heading), heading, &["without `restore_missing`"]);
+}
+
+const MOVE: &str = "## Move rows between fleet databases";
+
+/// The numbered rules of `text`, in order: the text after `1. `, `2. `, ...
+/// A rule ends at a blank line. Code fences are not read.
+fn rules(text: &str) -> Vec<String> {
+    let mut rules: Vec<String> = Vec::new();
+    let mut open = false;
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            open = false;
+            continue;
+        }
+        if in_fence || line.trim().is_empty() {
+            open = false;
+            continue;
+        }
+        let numbered = line
+            .split_once(". ")
+            .filter(|(n, _)| n.parse::<usize>() == Ok(rules.len() + 1));
+        if let Some((_, rule)) = numbered {
+            rules.push(rule.to_owned());
+            open = true;
+        } else if let Some(last) = rules.last_mut().filter(|_| open && line.starts_with("   ")) {
+            last.push(' ');
+            last.push_str(line.trim());
+        } else {
+            open = false;
+        }
+    }
+    rules
+}
+
+/// The five rules of a move, in order.
+#[test]
+fn the_guide_gives_the_five_rules_of_a_move() {
+    let text = section(MOVE);
+    let rules = rules(&text);
+    assert_eq!(rules.len(), 5, "`{MOVE}` must give five rules: {rules:#?}");
+    let expect: [&[&str]; 5] = [
+        &[
+            "version one higher",
+            "never replace a newer version",
+            "tombstone",
+        ],
+        &["mark the source copy moved", "keep it"],
+        &[
+            "delete the source copy only when",
+            "coverage(",
+            "replica_bound",
+            "same epoch",
+        ],
+        &[
+            "new owner",
+            "new epoch",
+            "deliver again",
+            "mark moved again",
+        ],
+        &["safe to repeat", "versioned upsert", "bounded by version"],
+    ];
+    for (n, (rule, terms)) in rules.iter().zip(expect).enumerate() {
+        assert_says(rule, &format!("{MOVE}, rule {}", n + 1), terms);
+    }
+}
+
+/// The obvious rule loses data. The guide must say so, and why.
+#[test]
+fn the_guide_says_a_delete_on_acknowledgement_loses_a_row() {
+    assert_says(
+        &section(MOVE),
+        MOVE,
+        &[
+            "delete on acknowledgement",
+            "rewinds the destination",
+            "the row is lost",
+            "every engine that has a replica bound",
+            "`rebuild` mode",
+            "`fleet.replica_bound(&dst)`",
+            "process that replicates",
+            "`Covered`",
+            "`Pending`",
+            "`Stale`",
+            "unix nanoseconds",
+            "do not round it",
+        ],
+    );
+}
+
+/// A reader of the older sections must find the move rules.
+#[test]
+fn the_replica_and_failover_sections_point_to_the_move_rules() {
+    let link = "(#move-rows-between-fleet-databases)";
+    for heading in [
+        "### Know when a write is in the replica",
+        "### The failover procedure",
+    ] {
+        assert_says(&section(heading), heading, &[link]);
+    }
+    assert!(
+        GUIDE
+            .lines()
+            .any(|line| line.starts_with("| `fleet.replica_bound(&key)` |")),
+        "the API table must list `fleet.replica_bound(&key)`"
+    );
 }

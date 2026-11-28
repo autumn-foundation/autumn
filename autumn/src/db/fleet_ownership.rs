@@ -2802,6 +2802,14 @@ mod tests {
                 .unwrap();
         }
 
+        /// Two ticks, with a clock step between them. The second tick proves
+        /// that the replica holds every commit before the step.
+        async fn ship(host: &Host) {
+            tick(&host.replication).await;
+            host.clock.advance(Duration::from_millis(10));
+            tick(&host.replication).await;
+        }
+
         fn acme(fleet: &DatabaseFleet) -> FleetDbKey {
             fleet.key_for("acme").unwrap()
         }
@@ -3431,6 +3439,544 @@ mod tests {
             assert_eq!(db_c.epoch(), Some(token(3)));
             assert_eq!(bodies(&db_c).await, vec!["a1", "b1"]);
             c.fleet.close_all().await;
+        }
+
+        #[tokio::test]
+        async fn replica_bound_carries_the_epoch_of_the_database() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&a.fleet);
+            let db = a.fleet.open(&key).await.unwrap();
+            exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            ship(&a).await;
+            let bound = a.fleet.replica_bound(&key).expect("caught up");
+            assert_eq!(bound.epoch(), Some(token(1)));
+            assert_eq!(bound.epoch(), db.epoch());
+            assert_eq!(a.fleet.replicated_through(&key), Some(bound.through()));
+
+            // A host that does not serve the slot gives no bound.
+            assert!(a.ownership.lose(key.routing_slot(), token(9)));
+            assert_eq!(a.fleet.replica_bound(&key), None);
+            drop(db);
+            a.fleet.close_all().await;
+        }
+
+        /// A fail-back restores the file from the replica. The new bound
+        /// covers the time of a commit of the old epoch, but the commit is
+        /// not in the file. `wait_replicated` returns `Ok`. `coverage` says
+        /// `Stale`.
+        #[tokio::test]
+        async fn a_bound_after_a_fail_back_does_not_cover_a_commit_of_the_old_epoch() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&a.fleet);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            ship(&a).await;
+            // Acknowledged. A stops before the next pass ships it.
+            exec(&db_a, "INSERT INTO notes VALUES ('arrival')")
+                .await
+                .unwrap();
+            let committed_at = a.clock.now();
+            let epoch = db_a.epoch();
+            a.clock.advance(Duration::from_millis(10));
+            drop(db_a);
+
+            // B takes over from the replica, without the arrival.
+            clock.advance(TTL);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+            let db_b = b.fleet.open(&key).await.unwrap();
+            assert!(bodies(&db_b).await.is_empty());
+            exec(&db_b, "INSERT INTO notes VALUES ('b1')")
+                .await
+                .unwrap();
+            tick(&b.replication).await;
+            drop(db_b);
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            assert_eq!(a.fleet.fence_unowned(), 1);
+            a.fleet.close(&key).await;
+            b.fleet.close_all().await;
+            assert!(b.fleet.release_ownership().await);
+
+            // A gets the range back under a newer epoch. The replica
+            // replaces its file.
+            assert_eq!(a.ownership.refresh().await.claimed.len(), 1);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_a).await, vec!["b1"]);
+            ship(&a).await;
+
+            let bound = a.fleet.replica_bound(&key).expect("caught up again");
+            assert!(
+                bound.through() >= committed_at,
+                "the time alone says the arrival is in the replica"
+            );
+            assert_eq!(bound.epoch(), db_a.epoch());
+            assert_ne!(bound.epoch(), epoch);
+            a.fleet
+                .wait_replicated(&key, committed_at, Duration::ZERO)
+                .await
+                .expect("the wait checks the time only");
+            assert!(!bound.covers(committed_at, epoch));
+            assert_eq!(
+                bound.coverage(committed_at, epoch),
+                crate::db::fleet_replication::Coverage::Stale
+            );
+            drop(db_a);
+            a.fleet.close_all().await;
+        }
+
+        /// The moves of rows between two fleet databases on two hosts. The
+        /// helpers follow the rules of "Move rows between fleet databases"
+        /// in `docs/guide/sqlite-fleet.md`.
+        mod moves {
+            use super::*;
+            use crate::db::fleet_replication::Coverage;
+            use diesel::sql_types::{BigInt, Nullable};
+
+            const LOW: (u16, u16) = (0, 8191);
+            const HIGH: (u16, u16) = (8192, 16383);
+
+            /// `gone = 1` is a tombstone: it keeps the id and the version of
+            /// a row that moved on.
+            const BIRDS: &str = "CREATE TABLE birds (\
+                 id TEXT PRIMARY KEY, \
+                 version INTEGER NOT NULL, \
+                 moved INTEGER NOT NULL DEFAULT 0, \
+                 gone INTEGER NOT NULL DEFAULT 0, \
+                 arrived_ns INTEGER, \
+                 arrived_epoch INTEGER)";
+
+            #[derive(diesel::QueryableByName, Debug, Clone)]
+            struct Bird {
+                #[diesel(sql_type = Text)]
+                id: String,
+                #[diesel(sql_type = BigInt)]
+                version: i64,
+                #[diesel(sql_type = BigInt)]
+                moved: i64,
+                #[diesel(sql_type = BigInt)]
+                gone: i64,
+                #[diesel(sql_type = Nullable<BigInt>)]
+                arrived_ns: Option<i64>,
+                #[diesel(sql_type = Nullable<BigInt>)]
+                arrived_epoch: Option<i64>,
+            }
+
+            impl Bird {
+                fn arrival(&self) -> Option<Arrival> {
+                    let ns = i128::from(self.arrived_ns?);
+                    let at = crate::time::Timestamp::from_nanosecond(ns).ok()?;
+                    let epoch = match self.arrived_epoch {
+                        Some(epoch) => Some(FencingToken::try_from(epoch).ok()?),
+                        None => None,
+                    };
+                    Some(Arrival { at, epoch })
+                }
+            }
+
+            /// When the destination committed an arrival, and under which
+            /// epoch.
+            struct Arrival {
+                at: crate::time::Timestamp,
+                epoch: Option<FencingToken>,
+            }
+
+            /// Every row, tombstones too.
+            async fn birds(db: &FleetDatabase) -> Vec<Bird> {
+                let mut conn = db.pool().get().await.unwrap();
+                diesel_async::RunQueryDsl::load::<Bird>(
+                    diesel::sql_query(
+                        "SELECT id, version, moved, gone, arrived_ns, arrived_epoch \
+                         FROM birds ORDER BY id",
+                    ),
+                    &mut *conn,
+                )
+                .await
+                .unwrap()
+            }
+
+            /// The rows that are not tombstones.
+            async fn live(db: &FleetDatabase) -> Vec<Bird> {
+                birds(db)
+                    .await
+                    .into_iter()
+                    .filter(|bird| bird.gone == 0)
+                    .collect()
+            }
+
+            fn versions(birds: &[Bird]) -> Vec<(&str, i64)> {
+                birds
+                    .iter()
+                    .map(|bird| (bird.id.as_str(), bird.version))
+                    .collect()
+            }
+
+            /// The `n`th tenant key in `slots`.
+            fn key_in(fleet: &DatabaseFleet, slots: (u16, u16), n: usize) -> FleetDbKey {
+                (0..512)
+                    .map(|i| fleet.key_for(&format!("t{i}")).unwrap())
+                    .filter(|key| (slots.0..=slots.1).contains(&key.routing_slot()))
+                    .nth(n)
+                    .expect("a tenant in the range")
+            }
+
+            /// Open `key` on `host`, create the table, and ship it.
+            async fn create(host: &Host, key: &FleetDbKey) {
+                let db = host.fleet.open(key).await.unwrap();
+                exec(&db, BIRDS).await.unwrap();
+                ship(host).await;
+            }
+
+            /// A source host on the low slots, a destination host on the
+            /// high slots, and one key on each. The source holds `b1` at
+            /// version 1. Both replicas hold everything.
+            async fn two_hosts(
+                dir: &std::path::Path,
+                clock: &crate::time::TickingClock,
+            ) -> (Host, Host, FleetDbKey, FleetDbKey) {
+                let src = host(dir, "s", clock, vec![range(LOW.0, LOW.1)]).await;
+                let dst = host(dir, "d", clock, vec![range(HIGH.0, HIGH.1)]).await;
+                let src_key = key_in(&src.fleet, LOW, 0);
+                let dst_key = key_in(&dst.fleet, HIGH, 0);
+                let src_db = src.fleet.open(&src_key).await.unwrap();
+                exec(&src_db, BIRDS).await.unwrap();
+                exec(&src_db, "INSERT INTO birds (id, version) VALUES ('b1', 1)")
+                    .await
+                    .unwrap();
+                ship(&src).await;
+                create(&dst, &dst_key).await;
+                (src, dst, src_key, dst_key)
+            }
+
+            /// The leases end. `name` takes over `slots` from the replica.
+            async fn take_over(
+                dir: &std::path::Path,
+                clock: &crate::time::TickingClock,
+                name: &str,
+                slots: (u16, u16),
+            ) -> Host {
+                clock.advance(TTL);
+                host(dir, name, clock, vec![range(slots.0, slots.1)]).await
+            }
+
+            /// Rule 1: write the row with a version one higher. Never
+            /// replace a newer version, or a tombstone of one. Safe to
+            /// repeat.
+            async fn arrive(dst: &Host, key: &FleetDbKey, id: &str, version: i64) -> Arrival {
+                let db = dst.fleet.open(key).await.unwrap();
+                exec(
+                    &db,
+                    &format!(
+                        "INSERT INTO birds (id, version) VALUES ('{id}', {version}) \
+                         ON CONFLICT (id) DO UPDATE \
+                         SET version = excluded.version, moved = 0, gone = 0 \
+                         WHERE excluded.version > birds.version"
+                    ),
+                )
+                .await
+                .unwrap();
+                // The destination reads the clock after the commit. Time
+                // moves on.
+                let arrival = Arrival {
+                    at: dst.clock.now(),
+                    epoch: db.epoch(),
+                };
+                dst.clock.advance(Duration::from_millis(10));
+                arrival
+            }
+
+            /// Rule 2: mark the source copy moved. Keep it.
+            async fn mark_moved(src: &FleetDatabase, id: &str, version: i64, arrival: &Arrival) {
+                let epoch = arrival
+                    .epoch
+                    .map_or_else(|| "NULL".to_owned(), |epoch| epoch.get().to_string());
+                exec(
+                    src,
+                    &format!(
+                        "UPDATE birds SET moved = 1, arrived_ns = {}, arrived_epoch = {epoch} \
+                         WHERE id = '{id}' AND version = {version} AND gone = 0",
+                        // Full precision: a rounded time can look covered.
+                        i64::try_from(arrival.at.as_nanosecond()).unwrap()
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+
+            /// What the destination's bound says about the arrival of a
+            /// moved copy. `None`: no bound yet.
+            fn coverage(dst: &Host, key: &FleetDbKey, bird: &Bird) -> Option<Coverage> {
+                let bound = dst.fleet.replica_bound(key)?;
+                Some(
+                    bird.arrival()
+                        .map_or(Coverage::Stale, |a| bound.coverage(a.at, a.epoch)),
+                )
+            }
+
+            /// Rule 3: drop a moved copy only when the destination's bound
+            /// covers its arrival. Gives the number of dropped copies.
+            async fn settle(src: &FleetDatabase, dst: &Host, key: &FleetDbKey) -> usize {
+                let mut dropped = 0;
+                for bird in live(src).await.into_iter().filter(|bird| bird.moved == 1) {
+                    if coverage(dst, key, &bird) == Some(Coverage::Covered) {
+                        dropped += drop_moved(src, &bird.id, bird.version).await;
+                    }
+                }
+                dropped
+            }
+
+            /// Rule 5: turn the moved copy of one version, and no other,
+            /// into a tombstone.
+            async fn drop_moved(src: &FleetDatabase, id: &str, version: i64) -> usize {
+                exec(
+                    src,
+                    &format!(
+                        "UPDATE birds SET gone = 1 WHERE id = '{id}' AND version = {version} \
+                         AND moved = 1 AND gone = 0"
+                    ),
+                )
+                .await
+                .unwrap()
+            }
+
+            /// Rule 4: deliver again each moved copy whose arrival is stale,
+            /// and mark moved again each live copy that came back while the
+            /// destination holds a newer version.
+            async fn reconcile(src: &FleetDatabase, dst: &Host, key: &FleetDbKey) {
+                let held = birds(&dst.fleet.open(key).await.unwrap()).await;
+                for bird in live(src).await {
+                    let stale =
+                        bird.moved == 1 && coverage(dst, key, &bird) == Some(Coverage::Stale);
+                    let came_back = bird.moved == 0
+                        && held
+                            .iter()
+                            .any(|newer| newer.id == bird.id && newer.version > bird.version);
+                    if stale || came_back {
+                        let arrival = arrive(dst, key, &bird.id, bird.version + 1).await;
+                        mark_moved(src, &bird.id, bird.version, &arrival).await;
+                    }
+                }
+            }
+
+            #[tokio::test]
+            async fn deleting_the_source_on_acknowledgement_loses_a_row_in_a_takeover() {
+                let dir = tempfile::tempdir().unwrap();
+                let clock = clock_at(1_000_000);
+                let (s, d, src, dst) = two_hosts(dir.path(), &clock).await;
+                let src_db = s.fleet.open(&src).await.unwrap();
+
+                // The destination acknowledges the arrival. The source
+                // deletes its copy and ships the delete.
+                arrive(&d, &dst, "b1", 2).await;
+                exec(&src_db, "DELETE FROM birds WHERE id = 'b1'")
+                    .await
+                    .unwrap();
+                ship(&s).await;
+
+                // The destination stops before it ships the arrival.
+                let d2 = take_over(dir.path(), &clock, "d2", HIGH).await;
+                let dst_db = d2.fleet.open(&dst).await.unwrap();
+                assert!(birds(&dst_db).await.is_empty(), "the takeover rewound it");
+                assert!(birds(&src_db).await.is_empty());
+                // `b1` is in neither database: it is lost.
+                drop((src_db, dst_db));
+                s.fleet.close_all().await;
+                d.fleet.close_all().await;
+                d2.fleet.close_all().await;
+            }
+
+            #[tokio::test]
+            async fn the_move_rule_loses_no_row_when_the_destination_rewinds() {
+                let dir = tempfile::tempdir().unwrap();
+                let clock = clock_at(1_000_000);
+                let (s, d, src, dst) = two_hosts(dir.path(), &clock).await;
+                let src_db = s.fleet.open(&src).await.unwrap();
+
+                let arrival = arrive(&d, &dst, "b1", 2).await;
+                mark_moved(&src_db, "b1", 1, &arrival).await;
+                ship(&s).await;
+                assert_eq!(settle(&src_db, &d, &dst).await, 0, "not in the replica");
+
+                // The destination stops before it ships the arrival.
+                let d2 = take_over(dir.path(), &clock, "d2", HIGH).await;
+                let dst_db = d2.fleet.open(&dst).await.unwrap();
+                assert!(birds(&dst_db).await.is_empty(), "the takeover rewound it");
+                ship(&d2).await;
+                let moved = live(&src_db).await;
+                assert_eq!(coverage(&d2, &dst, &moved[0]), Some(Coverage::Stale));
+                assert_eq!(settle(&src_db, &d2, &dst).await, 0, "the source keeps it");
+
+                // The source delivers it again under the new epoch.
+                reconcile(&src_db, &d2, &dst).await;
+                assert_eq!(versions(&live(&dst_db).await), vec![("b1", 2)]);
+                assert_eq!(settle(&src_db, &d2, &dst).await, 0, "not shipped yet");
+                ship(&d2).await;
+                assert_eq!(settle(&src_db, &d2, &dst).await, 1);
+                assert!(live(&src_db).await.is_empty());
+
+                // The row survives the next takeover.
+                drop(dst_db);
+                d2.fleet.close_all().await;
+                assert!(d2.fleet.release_ownership().await);
+                let d3 = host(dir.path(), "d3", &clock, vec![range(HIGH.0, HIGH.1)]).await;
+                let dst_db = d3.fleet.open(&dst).await.unwrap();
+                assert_eq!(versions(&live(&dst_db).await), vec![("b1", 2)]);
+                drop((src_db, dst_db));
+                s.fleet.close_all().await;
+                d.fleet.close_all().await;
+                d3.fleet.close_all().await;
+            }
+
+            /// A new volume under the same owner restores the destination
+            /// and keeps the epoch. Only the start of the new file shows
+            /// that the arrival can be lost.
+            #[tokio::test]
+            async fn the_move_rule_loses_no_row_when_a_new_volume_keeps_the_epoch() {
+                let dir = tempfile::tempdir().unwrap();
+                let clock = clock_at(1_000_000);
+                let (s, d, src, dst) = two_hosts(dir.path(), &clock).await;
+                let src_db = s.fleet.open(&src).await.unwrap();
+                let arrival = arrive(&d, &dst, "b1", 2).await;
+                mark_moved(&src_db, "b1", 1, &arrival).await;
+
+                // The volume of `d` is lost before a pass ships the arrival.
+                // The same owner starts on an empty volume.
+                let d2 = host_on(
+                    dir.path(),
+                    "d-new",
+                    "d",
+                    &clock,
+                    vec![range(HIGH.0, HIGH.1)],
+                )
+                .await;
+                d2.clock.advance(Duration::from_secs(1));
+                let dst_db = d2.fleet.open(&dst).await.unwrap();
+                assert_eq!(dst_db.epoch(), arrival.epoch, "the same epoch");
+                assert!(birds(&dst_db).await.is_empty(), "the restore lost it");
+                ship(&d2).await;
+                let bound = d2.fleet.replica_bound(&dst).expect("caught up");
+                assert!(bound.through() >= arrival.at, "the time alone is wrong");
+                assert_eq!(settle(&src_db, &d2, &dst).await, 0, "the source keeps it");
+
+                reconcile(&src_db, &d2, &dst).await;
+                ship(&d2).await;
+                assert_eq!(settle(&src_db, &d2, &dst).await, 1);
+                assert_eq!(versions(&live(&dst_db).await), vec![("b1", 2)]);
+                drop((src_db, dst_db));
+                s.fleet.close_all().await;
+                d2.fleet.close_all().await;
+                d.fleet.close_all().await;
+            }
+
+            #[tokio::test]
+            async fn the_move_rule_marks_a_copy_that_comes_back_moved_again() {
+                let dir = tempfile::tempdir().unwrap();
+                let clock = clock_at(1_000_000);
+                let (s, d, src, dst) = two_hosts(dir.path(), &clock).await;
+                let src_db = s.fleet.open(&src).await.unwrap();
+
+                let arrival = arrive(&d, &dst, "b1", 2).await;
+                ship(&d).await;
+                mark_moved(&src_db, "b1", 1, &arrival).await;
+
+                // The source stops before it ships the mark. The copy comes
+                // back on the new owner: two live copies.
+                let s2 = take_over(dir.path(), &clock, "s2", LOW).await;
+                let src_db2 = s2.fleet.open(&src).await.unwrap();
+                let back = live(&src_db2).await;
+                assert_eq!(versions(&back), vec![("b1", 1)]);
+                assert_eq!(back[0].moved, 0, "the mark is lost");
+
+                reconcile(&src_db2, &d, &dst).await;
+                assert_eq!(live(&src_db2).await[0].moved, 1, "marked moved again");
+                let dst_db = d.fleet.open(&dst).await.unwrap();
+                assert_eq!(
+                    versions(&live(&dst_db).await),
+                    vec![("b1", 2)],
+                    "the second delivery changed nothing"
+                );
+                ship(&d).await;
+                assert_eq!(settle(&src_db2, &d, &dst).await, 1);
+                assert!(live(&src_db2).await.is_empty());
+                drop((src_db, src_db2, dst_db));
+                s.fleet.close_all().await;
+                s2.fleet.close_all().await;
+                d.fleet.close_all().await;
+            }
+
+            /// Rule 5: a late retry of the drop of an old version does not
+            /// drop the row that moved back and out again.
+            #[tokio::test]
+            async fn a_late_drop_bounded_by_version_keeps_a_row_that_moved_back() {
+                let dir = tempfile::tempdir().unwrap();
+                let clock = clock_at(1_000_000);
+                let (s, d, src, dst) = two_hosts(dir.path(), &clock).await;
+                let src_db = s.fleet.open(&src).await.unwrap();
+
+                let arrival = arrive(&d, &dst, "b1", 2).await;
+                mark_moved(&src_db, "b1", 1, &arrival).await;
+                // The row moves back as version 3, and out again as 4.
+                exec(
+                    &src_db,
+                    "INSERT INTO birds (id, version) VALUES ('b1', 3) \
+                     ON CONFLICT (id) DO UPDATE \
+                     SET version = excluded.version, moved = 0, gone = 0 \
+                     WHERE excluded.version > birds.version",
+                )
+                .await
+                .unwrap();
+                let arrival = arrive(&d, &dst, "b1", 4).await;
+                mark_moved(&src_db, "b1", 3, &arrival).await;
+
+                // A late retry of the first drop finds no row.
+                assert_eq!(drop_moved(&src_db, "b1", 1).await, 0);
+                assert_eq!(versions(&live(&src_db).await), vec![("b1", 3)]);
+                // The second move settles once its arrival is in the replica.
+                ship(&d).await;
+                assert_eq!(settle(&src_db, &d, &dst).await, 1);
+                drop(src_db);
+                s.fleet.close_all().await;
+                d.fleet.close_all().await;
+            }
+
+            /// A row moves from A to B, then from B to C. A late delivery
+            /// from A to B of the old version finds a tombstone, and does not
+            /// bring the row back.
+            #[tokio::test]
+            async fn a_late_delivery_of_an_old_version_does_not_bring_a_row_back() {
+                let dir = tempfile::tempdir().unwrap();
+                let clock = clock_at(1_000_000);
+                let (src_host, dst_host, a, b) = two_hosts(dir.path(), &clock).await;
+                let c = key_in(&dst_host.fleet, HIGH, 1);
+                create(&dst_host, &c).await;
+                let a_db = src_host.fleet.open(&a).await.unwrap();
+                let b_db = dst_host.fleet.open(&b).await.unwrap();
+                let c_db = dst_host.fleet.open(&c).await.unwrap();
+
+                let to_b = arrive(&dst_host, &b, "b1", 2).await;
+                mark_moved(&a_db, "b1", 1, &to_b).await;
+                let to_c = arrive(&dst_host, &c, "b1", 3).await;
+                mark_moved(&b_db, "b1", 2, &to_c).await;
+                ship(&dst_host).await;
+                assert_eq!(settle(&b_db, &dst_host, &c).await, 1);
+
+                // A's question timed out. It delivers version 2 again.
+                arrive(&dst_host, &b, "b1", 2).await;
+                assert!(live(&b_db).await.is_empty(), "the tombstone stays");
+                assert_eq!(versions(&live(&c_db).await), vec![("b1", 3)]);
+                ship(&dst_host).await;
+                assert_eq!(settle(&a_db, &dst_host, &b).await, 1);
+                assert!(live(&a_db).await.is_empty());
+                drop((a_db, b_db, c_db));
+                src_host.fleet.close_all().await;
+                dst_host.fleet.close_all().await;
+            }
         }
 
         /// Each write at or before the old owner's last bound is in the
