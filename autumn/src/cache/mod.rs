@@ -7,7 +7,7 @@
 //! - [`MokaCache`] — the default, lock-free, in-process cache powered by
 //!   [moka](https://docs.rs/moka) (behind the `cache-moka` feature)
 //! - [`CacheResponseLayer`] — a Tower middleware that caches HTTP GET
-//!   responses, usable via `#[intercept(CacheResponseLayer::new(...))]`
+//!   responses, mounted over a route group with `AppBuilder::scoped`
 //! - [`CacheableResult`] — helper trait used by `#[cached(result)]` to
 //!   only cache `Ok` values
 //!

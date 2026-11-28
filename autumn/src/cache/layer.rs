@@ -14,9 +14,13 @@
 //!     .ttl(std::time::Duration::from_secs(300))
 //!     .build();
 //!
-//! #[get("/users/{id}")]
-//! #[intercept(CacheResponseLayer::from_cache(store))]
+//! #[get("/{id}")]
 //! async fn get_user(Path(id): Path<i32>) -> Json<User> { ... }
+//!
+//! // `scoped` takes the layer as an ordinary expression. `#[intercept(..)]`
+//! // takes a bare path only: `#[intercept(CacheResponseLayer::from_cache(..))]`
+//! // is dropped and mounts no layer (`docs/guide/middleware.md`).
+//! app.scoped("/users", CacheResponseLayer::from_cache(store), routes![get_user])
 //! ```
 
 use std::convert::Infallible;
@@ -79,20 +83,48 @@ fn cached_response_into_response(cached: CachedResponse) -> Option<axum::respons
     builder.body(Body::from(cached.body)).ok()
 }
 
+/// The cache key for a response: the request URI, behind the resolved tenant
+/// when one is in scope.
+///
+/// With no tenant the key is `http:<uri>`, unchanged, so an app without
+/// tenancy keeps its warm entries. A tenant (including an empty one) goes
+/// behind a `tenant=` marker that no URI starts with, length-prefixed so a
+/// `:` in the tenant id cannot shift into the URI.
+fn response_key<'a>(tenant: Option<&'a str>, uri: &'a http::Uri) -> ResponseKey<'a> {
+    ResponseKey { tenant, uri }
+}
+
+struct ResponseKey<'a> {
+    tenant: Option<&'a str>,
+    uri: &'a http::Uri,
+}
+
+impl std::fmt::Display for ResponseKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.tenant {
+            None => write!(f, "http:{}", self.uri),
+            Some(tenant) => write!(f, "http:tenant={}:{tenant}:{}", tenant.len(), self.uri),
+        }
+    }
+}
+
 /// Tower layer that caches HTTP GET responses.
 ///
-/// Wrap around a handler via `#[intercept(CacheResponseLayer::from_cache(store))]`
-/// or construct manually and apply with `.layer()`.
+/// Mount it over a route group with `AppBuilder::scoped`, or apply it with
+/// `.layer()`. `#[intercept(..)]` takes a bare path, so a call such as
+/// `CacheResponseLayer::from_cache(store)` there mounts nothing.
 ///
 /// Caching rules:
 /// - Only `GET` requests are cached.
 /// - Only `200 OK` responses are cached.
-/// - The cache key is the request URI path + query string.
+/// - The cache key is the request URI path + query string, plus the tenant
+///   when the framework's tenancy middleware resolved one for the request.
 ///
 /// # Only wrap responses that are the same for every visitor
 ///
-/// That last rule is the whole contract: the key is the URI and *nothing
-/// else*. This layer does not read `Vary`, does not read `Cache-Control`,
+/// That last rule is the whole contract: the key is the URI (and the
+/// resolved tenant) and *nothing else*. This layer does not read `Vary`,
+/// does not read `Cache-Control`,
 /// and does not look at cookies — so whatever the first visitor's request
 /// produced for a URI is replayed verbatim to everyone else who asks for it
 /// until the entry expires. Wrapping a handler whose body depends on who is
@@ -177,12 +209,25 @@ where
             return Box::pin(self.inner.call(req));
         }
 
+        // The tenant the framework resolved for this request, if any. Under
+        // subdomain or header tenancy two tenants send the same URI, so a key
+        // without the tenant hands one tenant's stored page to the other.
+        let tenant = crate::tenancy::CURRENT_TENANT
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+
         // Format the key into a stack buffer to skip a heap allocation per request. An empty key
         // means the URI did not fit, and the code below falls back to an allocated String.
         let mut buf = [0u8; 512];
         let cache_key_str = {
             let mut cursor = &mut buf[..];
-            if std::io::Write::write_fmt(&mut cursor, format_args!("http:{}", req.uri())).is_ok() {
+            if std::io::Write::write_fmt(
+                &mut cursor,
+                format_args!("{}", response_key(tenant.as_deref(), req.uri())),
+            )
+            .is_ok()
+            {
                 let len = 512 - cursor.len();
                 std::str::from_utf8(&buf[..len]).unwrap_or_default()
             } else {
@@ -193,7 +238,10 @@ where
         let store = self.store.clone();
 
         let cache_hit = if cache_key_str.is_empty() {
-            super::get_cached::<CachedResponse>(store.as_ref(), &format!("http:{}", req.uri()))
+            super::get_cached::<CachedResponse>(
+                store.as_ref(),
+                &response_key(tenant.as_deref(), req.uri()).to_string(),
+            )
         } else {
             super::get_cached::<CachedResponse>(store.as_ref(), cache_key_str)
         };
@@ -206,7 +254,7 @@ where
 
         let mut inner = self.inner.clone();
         let cache_key = if cache_key_str.is_empty() {
-            format!("http:{}", req.uri())
+            response_key(tenant.as_deref(), req.uri()).to_string()
         } else {
             cache_key_str.to_owned()
         };
@@ -310,6 +358,33 @@ mod tests {
                     .expect("infallible response builder"))
             }
         })
+    }
+
+    #[test]
+    fn response_key_without_tenant_is_the_pre_tenancy_key() {
+        let uri: http::Uri = "/catalog?page=2".parse().unwrap();
+        assert_eq!(response_key(None, &uri).to_string(), "http:/catalog?page=2");
+    }
+
+    #[test]
+    fn response_key_separates_tenants_and_the_untenanted_slot() {
+        let uri: http::Uri = "/catalog".parse().unwrap();
+        let keys = [
+            response_key(None, &uri).to_string(),
+            response_key(Some(""), &uri).to_string(),
+            response_key(Some("a"), &uri).to_string(),
+            response_key(Some("b"), &uri).to_string(),
+        ];
+        for (i, left) in keys.iter().enumerate() {
+            for right in &keys[i + 1..] {
+                assert_ne!(left, right);
+            }
+        }
+        // A `:` in the tenant id stays inside the length-prefixed segment.
+        assert_ne!(
+            response_key(Some("a:1"), &uri).to_string(),
+            response_key(Some("a"), &uri).to_string()
+        );
     }
 
     #[tokio::test]
