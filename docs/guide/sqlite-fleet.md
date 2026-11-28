@@ -1131,7 +1131,7 @@ storage. Core does every write to the replica. The engine only gives files.
 | Mode | What core does | RPO |
 | --- | --- | --- |
 | `Continuous(_)` | Ships the changes as they commit. Only `SqliteEngine` (WAL shipping). `ContinuousShipper` is sealed. | `sync_interval` |
-| `Generations { every }` | Takes a `snapshot` every `every` and at close. Ships only the files whose SHA-256 is not in the previous generation. | `every` |
+| `Generations { every }` | Takes a `snapshot` every `every` and at close. Ships only the files whose SHA-256 is not in the previous generation. | `every`. See [What a generation costs](#what-a-generation-costs). |
 | `Rebuild` | Ships nothing. `restore_latest` calls `FleetEngine::rebuild`. | none |
 
 Install replication as for `SQLite`:
@@ -1188,6 +1188,32 @@ A generation of `Generations` mode is these objects:
 
 `plugin_conformance::fleet` checks the engine side. `fleet-fenced-ship`
 and `fleet-unchanged-files` need a fixture that installs replication.
+
+### What a generation costs
+
+Core ships each changed file whole. It does not ship a diff. For an
+engine with one file, such as DuckDB, core ships the whole database in
+each generation that has a change.
+
+- **Write volume.** Bytes written to the replica a day ≈
+  `changed files × file size × 86,400 / every`, with `every` in seconds
+  (zero counts as 1). A changed file is a file with one or more writes in
+  the interval.
+- **Small tables.** Core ships a whole file also for a small table. A
+  DuckDB file with only 1,500 rows is still about 1 MB.
+- **RPO.** The write volume sets the RPO. Calculate `every` from the write
+  volume, not from the default.
+- **Storage.** Prune keeps the two newest complete generations, and each
+  older generation that holds a file they name. Thus storage stays
+  bounded. The cost is write traffic, not storage.
+- **Measure.** `ship_now` returns a `ShipReport`. `ShipReport::bytes` is
+  the number of file bytes that the ship wrote. Each generation also puts
+  a manifest and epoch markers, and prune deletes old objects.
+
+Example: a fleet has 64 files of about 3.3 MB, and `every` = 30 seconds.
+Each file has a write in each interval. The fleet writes about 600 GB a
+day (about 420 MB a minute). With `every` = 300 seconds, the same fleet
+writes about 60 GB a day, and the RPO is 5 minutes.
 
 ## Limits
 

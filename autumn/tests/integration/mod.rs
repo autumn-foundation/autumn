@@ -174,6 +174,7 @@ mod fault_injection;
 mod feature_flags_integration;
 mod feed;
 mod fleet_failover_guide;
+mod fleet_generations_cost_guide;
 #[cfg(all(feature = "postgres", not(feature = "sqlite")))]
 mod fleet_ownership_pg;
 mod fleet_slot_guide;
@@ -193,6 +194,7 @@ mod framework_retention;
 mod framework_retention_pg;
 mod graceful_shutdown_contract;
 mod graph_crate_version;
+mod guide_text;
 mod health_indicator_integration;
 mod hooks_lifecycle;
 #[cfg(feature = "htmx")]

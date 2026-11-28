@@ -56,6 +56,13 @@ pub enum ShipMode {
     /// Core calls [`FleetEngine::snapshot`] every `every` while the
     /// database is open, and once at close. It ships only the files whose
     /// content hash is not in the previous generation. The RPO is `every`.
+    ///
+    /// Core ships each changed file whole, not a diff. Bytes written to the
+    /// replica a day ≈ `changed files × file size × 86,400 / every`, with
+    /// `every` in seconds. The write volume sets the RPO. Calculate `every`
+    /// from the write volume, not from the default. Prune keeps the two
+    /// newest generations and the files that they name. Thus storage stays
+    /// bounded. See "What a generation costs" in `docs/guide/sqlite-fleet.md`.
     Generations {
         /// How often core ships a generation. Zero means one second.
         every: Duration,
