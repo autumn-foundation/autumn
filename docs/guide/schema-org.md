@@ -252,6 +252,12 @@ writes.
 | `unknown-type` | notice | The type is not in the CLI's vocabulary, so it is not checked. A name close to a known type is a warning instead, with a "did you mean". |
 | `no-json-ld` | notice | The page has no JSON-LD block. |
 
+A JSON-LD value object, such as `{"@value": "Bonjour", "@language": "fr"}`,
+is checked as a literal. Its `@type`, when it is `Date`, `DateTime`, `URL` or
+another primitive, is the literal's datatype: the literal must fit it, and the
+property must take it. The values in a `{"@list": […]}` or `{"@set": […]}` are
+each checked as a value of the property.
+
 The audit fails, with exit code 1, on an error. With `--strict` it also fails
 on a warning. A notice never fails it. Nested nodes are checked too: an
 `Offer` with no `price` is an error. A review or rating nested in the item it

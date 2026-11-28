@@ -468,6 +468,20 @@ fn audit_value(property: &'static vocab::Property, value: &Value, path: &str, ct
                 audit_value(property, item, &format!("{path}[{i}]"), ctx);
             }
         }
+        // A value object is a literal, maybe with a language or a datatype.
+        Value::Object(object) if object.contains_key("@value") => {
+            audit_value_object(property, object, path, ctx);
+        }
+        // A list or set object wraps the values; each one is a value of the
+        // property.
+        Value::Object(object) if object.contains_key("@list") || object.contains_key("@set") => {
+            let key = if object.contains_key("@list") {
+                "@list"
+            } else {
+                "@set"
+            };
+            audit_value(property, &object[key], &format!("{path}[\"{key}\"]"), ctx);
+        }
         Value::Object(object) => {
             let names = type_names(object);
             let fits = names.is_empty()
@@ -516,9 +530,83 @@ fn describe(value: &Value) -> String {
     }
 }
 
+/// Check a JSON-LD value object (`{"@value": …}`). Its `@language` needs no
+/// check. Its `@type`, when it names a primitive (`Date`, `URL`), is the
+/// literal's datatype: the literal must fit it, and the property must take
+/// it. Another `@type` (an XSD IRI) leaves the property's own range to check.
+fn audit_value_object(
+    property: &'static vocab::Property,
+    object: &Map<String, Value>,
+    path: &str,
+    ctx: &mut Ctx<'_>,
+) {
+    let literal = &object["@value"];
+    let value_path = format!("{path}[\"@value\"]");
+    if is_empty(literal) {
+        ctx.push(
+            "empty-value",
+            Severity::Warning,
+            &value_path,
+            format!("`{}` is empty", property.name),
+        );
+        return;
+    }
+    if literal.is_object() || literal.is_array() {
+        ctx.push(
+            "wrong-value",
+            Severity::Warning,
+            &value_path,
+            "a value object's `@value` must be a string, a number or a boolean".to_owned(),
+        );
+        return;
+    }
+    let datatype = object
+        .get("@type")
+        .and_then(Value::as_str)
+        .map(vocab::strip_schema_prefix)
+        .filter(|t| vocab::is_primitive(t));
+    let (range, fits): (&[&str], bool) = match datatype {
+        Some(datatype) => {
+            if !property.range.contains(&datatype) {
+                ctx.push(
+                    "wrong-value",
+                    Severity::Warning,
+                    path,
+                    format!(
+                        "`{}` expects {}, not a `{datatype}` value",
+                        property.name,
+                        property.range.join(" or ")
+                    ),
+                );
+                return;
+            }
+            (&[], range_fits(&[datatype], literal))
+        }
+        None => (property.range, range_fits(property.range, literal)),
+    };
+    if !fits {
+        let expected = datatype.map_or_else(|| range.join(" or "), str::to_owned);
+        ctx.push(
+            "wrong-value",
+            Severity::Warning,
+            &value_path,
+            format!(
+                "`{}` expects {expected}, not {}",
+                property.name,
+                describe(literal)
+            ),
+        );
+    }
+}
+
 /// Whether a plain JSON value fits any entry of the property's range.
 fn scalar_fits(property: &vocab::Property, value: &Value) -> bool {
-    property.range.iter().any(|r| match (*r, value) {
+    range_fits(property.range, value)
+}
+
+/// Whether a plain JSON value fits any entry of `range`.
+fn range_fits(range: &[&str], value: &Value) -> bool {
+    range.iter().any(|r| match (*r, value) {
         ("Text" | "Duration" | "Energy" | "Mass", Value::String(_))
         | ("Number", Value::Number(_))
         | ("Boolean", Value::Bool(_)) => true,
@@ -1044,6 +1132,89 @@ mod tests {
                 .any(|f| f.rule == "missing-type" && f.path == "$.author"),
             "{:?}",
             rules(&report)
+        );
+    }
+
+    #[test]
+    fn a_value_object_is_a_literal() {
+        let report = audit_html(
+            "page",
+            &page(
+                r#"{"@context":"https://schema.org","@type":"Thing",
+                "name":{"@value":"Bonjour","@language":"fr"}}"#,
+            ),
+        );
+        assert!(report.findings.is_empty(), "{:?}", rules(&report));
+    }
+
+    #[test]
+    fn a_value_object_datatype_is_checked() {
+        let report = audit_html(
+            "page",
+            &page(
+                r#"{"@context":"https://schema.org","@type":"Event","name":"x",
+                "location":"Hall","startDate":{"@value":"not a date","@type":"Date"},
+                "endDate":{"@value":"2026-11-28","@type":"Date"},
+                "url":{"@value":true,"@type":"Boolean"},
+                "description":{"@value":""},
+                "maximumAttendeeCapacity":{"@value":"120","@type":"http://www.w3.org/2001/XMLSchema#integer"}}"#,
+            ),
+        );
+        let wrong: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == "wrong-value")
+            .map(|f| f.path.as_str())
+            .collect();
+        assert!(wrong.contains(&"$.startDate[\"@value\"]"), "{wrong:?}");
+        assert!(
+            !wrong.iter().any(|p| p.starts_with("$.endDate")),
+            "{wrong:?}"
+        );
+        // `url` takes a URL, not a boolean datatype.
+        assert!(wrong.contains(&"$.url"), "{wrong:?}");
+        // An XSD datatype leaves the property's range to check: "120" is an Integer.
+        assert!(
+            !wrong
+                .iter()
+                .any(|p| p.starts_with("$.maximumAttendeeCapacity")),
+            "{wrong:?}"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == "empty-value" && f.path == "$.description[\"@value\"]")
+        );
+        assert!(
+            report.findings.iter().all(|f| f.rule != "missing-type"),
+            "{:?}",
+            rules(&report)
+        );
+    }
+
+    #[test]
+    fn list_and_set_objects_check_each_item() {
+        let report = audit_html(
+            "page",
+            &page(
+                r#"{"@context":"https://schema.org","@type":"Thing",
+                "sameAs":{"@set":["https://a.test","not a url"]},
+                "alternateName":{"@list":["one",""]}}"#,
+            ),
+        );
+        let paths: Vec<(&str, &str)> = report
+            .findings
+            .iter()
+            .map(|f| (f.rule, f.path.as_str()))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("empty-value", "$.alternateName[\"@list\"][1]"),
+                ("wrong-value", "$.sameAs[\"@set\"][1]"),
+            ],
+            "{paths:?}"
         );
     }
 
