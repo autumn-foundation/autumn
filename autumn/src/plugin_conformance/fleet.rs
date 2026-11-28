@@ -551,6 +551,20 @@ fn replica_objects(
         .map_err(|e| format!("the replica cannot be listed: {e}"))
 }
 
+/// The id of the newest complete generation in the replica of `key`.
+#[cfg(feature = "sqlite")]
+fn newest_generation(
+    replication: &crate::db::fleet_replication::FleetReplication,
+    key: &FleetDbKey,
+) -> Result<Option<String>, String> {
+    let objects = replica_objects(replication, key)?;
+    Ok(
+        crate::db::fleet::generations::complete_generations(&replication.root_for(key), &objects)
+            .pop()
+            .map(|generation| generation.id),
+    )
+}
+
 #[cfg(not(feature = "sqlite"))]
 #[allow(clippy::unused_async, clippy::unnecessary_wraps)]
 async fn fenced_ship<F: FleetFixture>(_: &F, _: &Path) -> Outcome {
@@ -666,7 +680,10 @@ async fn unchanged_files<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcom
             .ship_now(&key)
             .await
             .map_err(fail("the first ship failed"))?;
-        if first.generation.is_none() || first.shipped == 0 {
+        // The ship timer can ship a write before `ship_now`. Then the
+        // replica holds a generation, and `ship_now` has nothing new.
+        let empty = first.generation.is_some() && first.shipped == 0;
+        if empty || newest_generation(&replication, &key)?.is_none() {
             return Err(format!("the first ship shipped nothing: {first:?}"));
         }
         let before = replica_objects(&replication, &key)?;
@@ -684,13 +701,14 @@ async fn unchanged_files<F: FleetFixture>(fixture: &F, scratch: &Path) -> Outcom
                  bytes"
             ));
         }
+        let held = newest_generation(&replication, &key)?;
         fixture.write(db.handle(), "second").await?;
-        let changed = fleet
+        fleet
             .ship_now(&key)
             .await
             .map_err(fail("the ship after a write failed"))?;
         drop(db);
-        if changed.generation.is_none() {
+        if newest_generation(&replication, &key)? == held {
             return Err("a ship after a write made no generation".to_owned());
         }
         Ok(Some(format!(

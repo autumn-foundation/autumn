@@ -1219,6 +1219,41 @@ fn prune(destination: &dyn ReplicaDestination, root: &str, last: &Manifest) -> R
     Ok(())
 }
 
+/// The time from the open to the first ship: `draw` scaled into
+/// `[0, every)`, as `(draw * every) >> 64`. A uniform draw gives an almost
+/// uniform phase. A zero `every` gives zero. `phase` in
+/// `verification/fleet_generations.rs` is the model.
+pub(super) fn start_phase(every: Duration, draw: u64) -> Duration {
+    let every_ns = u64::try_from(every.as_nanos()).unwrap_or(u64::MAX);
+    let phase_ns = (u128::from(draw) * u128::from(every_ns)) >> 64;
+    // The product is below 2^64 * every_ns, so the phase is below every_ns.
+    Duration::from_nanos(u64::try_from(phase_ns).unwrap_or(u64::MAX))
+}
+
+/// The ship timer of one database. It ticks at `start`, then each `every`.
+///
+/// A late first tick (a slow epoch marker) fires at once and keeps the
+/// ticks on `start + k * every`. Thus the phase stays. A late later tick (a
+/// slow ship) fires at once, and the next tick is `every` after it.
+pub(super) struct ShipTimer {
+    interval: tokio::time::Interval,
+}
+
+impl ShipTimer {
+    pub(super) fn new(start: tokio::time::Instant, every: Duration) -> Self {
+        let mut interval = tokio::time::interval_at(start, every);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Self { interval }
+    }
+
+    /// Wait for the next tick. Cancel safe.
+    pub(super) async fn tick(&mut self) {
+        self.interval.tick().await;
+        self.interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    }
+}
+
 /// The lifecycle hook of `ShipMode::Generations`: a ship worker for each
 /// open database, and the restore of a missing one.
 pub struct GenerationShipper<E: FleetEngine> {
@@ -1305,19 +1340,21 @@ impl<E: FleetEngine> FleetLifecycle<E> for GenerationShipper<E> {
         let stop = CancellationToken::new();
         let stopped = stop.clone();
         let runtime = tokio::runtime::Handle::try_current().map_err(|e| e.to_string())?;
+        // The first ship is at a random time in [0, every) after the open.
+        // This spreads the ships of databases that open at the same time.
+        let start =
+            tokio::time::Instant::now() + start_phase(every, replication.entropy().next_u64());
         let handle = runtime.spawn(async move {
             // The epoch marker first: an old owner that still ships is
             // fenced from now on, also before the first generation.
             if let Some(fleet) = fleet.upgrade().map(|inner| DatabaseFleet { inner }) {
                 fleet.mark_epoch(&replication, &target).await;
             }
-            let start = tokio::time::Instant::now() + every;
-            let mut tick = tokio::time::interval_at(start, every);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick = ShipTimer::new(start, every);
             loop {
                 tokio::select! {
                     () = stopped.cancelled() => break,
-                    _ = tick.tick() => {
+                    () = tick.tick() => {
                         let Some(fleet) = fleet.upgrade().map(|inner| DatabaseFleet { inner }) else {
                             return;
                         };
@@ -1506,6 +1543,79 @@ mod tests {
             epoch: None,
             files,
         }
+    }
+
+    #[test]
+    fn the_start_phase_is_below_every() {
+        let entropy = crate::entropy::SeededEntropy::new(11);
+        let draws: Vec<u64> = [0, 1, u64::MAX / 2, u64::MAX - 1, u64::MAX]
+            .into_iter()
+            .chain((0..1000).map(|_| crate::entropy::Entropy::next_u64(&entropy)))
+            .collect();
+        for every in [
+            Duration::from_nanos(1),
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_hours(1),
+            Duration::MAX,
+        ] {
+            for &draw in &draws {
+                let phase = start_phase(every, draw);
+                assert!(phase < every, "{phase:?} is not below {every:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_start_phase_scales_the_draw() {
+        let every = Duration::from_secs(30);
+        assert_eq!(start_phase(every, 0), Duration::ZERO);
+        assert_eq!(start_phase(every, 1 << 63), Duration::from_secs(15));
+        assert_eq!(start_phase(every, 3 << 62), Duration::from_millis(22_500));
+        assert_eq!(start_phase(Duration::ZERO, u64::MAX), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_first_tick_keeps_the_phase() {
+        let every = Duration::from_secs(30);
+        let open = tokio::time::Instant::now();
+        let mut timer = ShipTimer::new(open + Duration::from_secs(5), every);
+        // The epoch marker took 40 s: the first tick is late.
+        tokio::time::advance(Duration::from_secs(40)).await;
+        timer.tick().await;
+        assert_eq!(
+            open.elapsed(),
+            Duration::from_secs(40),
+            "a late tick fires at once"
+        );
+        timer.tick().await;
+        assert_eq!(
+            open.elapsed(),
+            Duration::from_secs(65),
+            "the next tick is on the grid of the phase"
+        );
+        // This ship took 40 s: the next tick is `every` after the late one.
+        tokio::time::advance(Duration::from_secs(40)).await;
+        timer.tick().await;
+        assert_eq!(open.elapsed(), Duration::from_secs(105));
+        timer.tick().await;
+        assert_eq!(open.elapsed(), Duration::from_secs(135));
+    }
+
+    #[test]
+    fn uniform_draws_fill_the_interval() {
+        let entropy = crate::entropy::SeededEntropy::new(5);
+        let every = Duration::from_secs(30);
+        let mut buckets = [0_u32; 10];
+        for _ in 0..1000 {
+            let phase = start_phase(every, crate::entropy::Entropy::next_u64(&entropy));
+            let bucket = phase.as_nanos() * 10 / every.as_nanos();
+            buckets[usize::try_from(bucket).unwrap()] += 1;
+        }
+        assert!(
+            buckets.iter().all(|&n| (60..=140).contains(&n)),
+            "a tenth of the interval holds about a tenth of the phases: {buckets:?}"
+        );
     }
 
     #[test]

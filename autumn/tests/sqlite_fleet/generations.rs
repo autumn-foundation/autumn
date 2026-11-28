@@ -251,7 +251,14 @@ async fn host(dir: &FsPath, volume: &str, owner: &str, clock: &TickingClock) -> 
         .with_tombstones(Arc::new(FleetTombstones::new(
             control_pool(dir),
             Arc::clone(&clock),
-        ))),
+        )))
+        // A fixed seed for each volume: the first ship of each open is the
+        // same on each run, and two hosts do not draw the same ids.
+        .with_entropy(autumn_web::entropy::SeededEntropy::shared(
+            volume.bytes().fold(1, |seed: u64, byte| {
+                seed.wrapping_mul(31).wrapping_add(u64::from(byte))
+            }),
+        )),
     );
     assert!(fleet.install_replication(replication).is_ok());
     let store = SqlSlotOwnership::new(control_pool(dir), Arc::clone(&clock));

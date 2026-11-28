@@ -184,6 +184,9 @@ It proves these properties:
   rules of `fleet_replica_tombstones.rs`: after a delete, a restore is
   refused. A purge at or after the newest generation removes every holder,
   and keeps a newer database of the same key.
+- The start phase of the ship timer is below `every`. So the first ship is
+  less than `every` after the open, and the later ships are `every` apart.
+  The model has no timer rounding. Tokio adds up to one millisecond.
 
 The unit tests in `generations.rs` and `db/fleet/generations_tests.rs`, the
 kit checks `fleet-fenced-ship` and `fleet-unchanged-files`, and the takeover

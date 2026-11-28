@@ -4,8 +4,8 @@
 //! epoch stamp, and each later line is one value.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::db::fleet::FleetError;
@@ -34,6 +34,8 @@ pub struct TextEngine {
     pub every: Option<Duration>,
     pub opens: AtomicU64,
     pub snapshots: AtomicU64,
+    /// The path and the Tokio time of each snapshot, in order.
+    pub snapshot_log: Mutex<Vec<(PathBuf, tokio::time::Instant)>>,
 }
 
 impl TextEngine {
@@ -47,6 +49,7 @@ impl TextEngine {
             every: None,
             opens: AtomicU64::new(0),
             snapshots: AtomicU64::new(0),
+            snapshot_log: Mutex::new(Vec::new()),
         }
     }
 
@@ -179,6 +182,10 @@ impl FleetEngine for TextEngine {
         let copy = dir.join(file);
         std::fs::copy(path, &copy).map_err(io("snapshot database"))?;
         let n = self.snapshots.fetch_add(1, Ordering::Relaxed);
+        self.snapshot_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((path.to_path_buf(), tokio::time::Instant::now()));
         if self.noisy_snapshot {
             let mut text = std::fs::read_to_string(&copy).map_err(io("snapshot database"))?;
             {

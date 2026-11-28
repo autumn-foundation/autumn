@@ -57,6 +57,9 @@ pub enum ShipMode {
     /// database is open, and once at close. It ships only the files whose
     /// content hash is not in the previous generation. The RPO is `every`.
     ///
+    /// The first call is at a random time in the first `every` after the
+    /// open. This spreads the ships of databases that open at the same time.
+    ///
     /// Core ships each changed file whole, not a diff. Bytes written to the
     /// replica a day ≈ `changed files × file size × 86,400 / every`, with
     /// `every` in seconds. The write volume sets the RPO. Calculate `every`

@@ -787,6 +787,8 @@ mod tests {
     fn control(dir: &std::path::Path) -> Pool<RuntimeConnection> {
         crate::db::create_pool(&crate::config::DatabaseConfig {
             url: Some(format!("sqlite://{}", dir.join("control.db").display())),
+            // A loaded CI runner can take more than 5 s to open a connection.
+            connect_timeout_secs: 60,
             ..Default::default()
         })
         .unwrap()

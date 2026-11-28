@@ -366,7 +366,8 @@ pub struct FleetReplication {
     retention_after_delete: Duration,
     /// How often the restore check runs, and how many databases it takes.
     restore_check: Option<(Duration, usize)>,
-    /// Picks the restore-check sample and names its scratch files.
+    /// Picks the restore-check sample and the ship timer phases, and names
+    /// the scratch files.
     entropy: Arc<dyn Entropy>,
     /// One purge at a time in this process: a re-create waits for the retry
     /// task, and the other way round.
@@ -725,7 +726,8 @@ impl FleetReplication {
         self
     }
 
-    /// The entropy that picks the restore-check sample. Default: the OS.
+    /// The entropy that picks the restore-check sample and the start phase
+    /// of each generation ship timer. Default: the OS.
     #[must_use]
     pub fn with_entropy(mut self, entropy: Arc<dyn Entropy>) -> Self {
         self.entropy = entropy;
