@@ -61,6 +61,11 @@
 //! | `AUTUMN_SERVER__HTTP__MAX_HEADER_BYTES` | `server.http.max_header_bytes` | `usize` |
 //! | `AUTUMN_SERVER__HTTP__HTTP2_MAX_CONCURRENT_STREAMS` | `server.http.http2_max_concurrent_streams` | `u32` |
 //! | `AUTUMN_SERVER__HTTP__MAX_CONNECTIONS` | `server.http.max_connections` | `usize` |
+//! | `AUTUMN_SERVER__HTTP3__ENABLED` | `server.http3.enabled` | `bool` |
+//! | `AUTUMN_SERVER__HTTP3__PORT` | `server.http3.port` | `u16` |
+//! | `AUTUMN_SERVER__HTTP3__MAX_IDLE_TIMEOUT_SECS` | `server.http3.max_idle_timeout_secs` | `u64` |
+//! | `AUTUMN_SERVER__HTTP3__MAX_CONCURRENT_BIDI_STREAMS` | `server.http3.max_concurrent_bidi_streams` | `u32` |
+//! | `AUTUMN_SERVER__HTTP3__ALT_SVC_MAX_AGE` | `server.http3.alt_svc_max_age` | `u64` |
 //! | `AUTUMN_REALTIME__MAX_CONNECTIONS` | `realtime.max_connections` | `usize` |
 //! | `AUTUMN_REALTIME__MAX_MESSAGE_BYTES` | `realtime.max_message_bytes` | `usize` |
 //! | `AUTUMN_REALTIME__PING_INTERVAL_MS` | `realtime.ping_interval_ms` | `u64` |
@@ -7475,6 +7480,7 @@ impl AutumnConfig {
         self.check_role("role")?;
         self.database.validate()?;
         self.server.http.validate()?;
+        self.server.http3.validate(self.server.tls.as_ref())?;
         self.realtime.validate()?;
         self.cors.validate()?;
         self.server.admission.validate()?;
@@ -8377,6 +8383,27 @@ impl AutumnConfig {
         );
     }
 
+    fn apply_server_http3_env_overrides_with_env(&mut self, env: &dyn Env) {
+        let h3 = &mut self.server.http3;
+        parse_env_bool(env, "AUTUMN_SERVER__HTTP3__ENABLED", &mut h3.enabled);
+        parse_env_option(env, "AUTUMN_SERVER__HTTP3__PORT", &mut h3.port);
+        parse_env(
+            env,
+            "AUTUMN_SERVER__HTTP3__MAX_IDLE_TIMEOUT_SECS",
+            &mut h3.max_idle_timeout_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__HTTP3__MAX_CONCURRENT_BIDI_STREAMS",
+            &mut h3.max_concurrent_bidi_streams,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__HTTP3__ALT_SVC_MAX_AGE",
+            &mut h3.alt_svc_max_age,
+        );
+    }
+
     fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
         self.apply_server_http_env_overrides_with_env(env);
@@ -8432,6 +8459,7 @@ impl AutumnConfig {
             &mut self.server.capacity_contract,
         );
         self.apply_admission_env_overrides_with_env(env);
+        self.apply_server_http3_env_overrides_with_env(env);
 
         // Materialize `[server.tls]` when any of its env keys is set, so an env-only deployment can
         // enable HTTPS. A half-set cert/key pair is caught by startup validation.
@@ -10270,6 +10298,13 @@ pub struct ServerConfig {
     #[serde(default)]
     pub tls: Option<TlsConfig>,
 
+    /// HTTP/3 over QUIC beside the `[server.tls]` listener. Off by default.
+    ///
+    /// Always parsed. The listener needs the `http3` feature.
+    /// See [`Http3Config`].
+    #[serde(default)]
+    pub http3: Http3Config,
+
     /// Admission control: static or adaptive limit, and criticality
     /// partitions (issue #3068). See [`AdmissionConfig`].
     ///
@@ -10489,6 +10524,109 @@ impl AdmissionConfig {
         let max = self.max_limit.unwrap_or(usize::MAX);
         crate::admission::LimitBounds::new(self.min_limit, max, self.initial_limit)
             .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// `[server.http3]`: serve HTTP/3 over QUIC (UDP) beside the TLS listener.
+///
+/// It needs `[server.tls]`: QUIC uses the same certificate. TCP responses then
+/// carry `Alt-Svc`, so browsers try h3 on the next request.
+///
+/// ```toml
+/// [server.http3]
+/// enabled = true
+/// port = 443                       # UDP port. Default: server.port
+/// max_idle_timeout_secs = 30
+/// max_concurrent_bidi_streams = 100
+/// alt_svc_max_age = 86400
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct Http3Config {
+    /// Serve HTTP/3. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The UDP port. `None` (the default) uses the bound TCP port.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Close a QUIC connection after this many idle seconds. Default: `30`.
+    #[serde(default = "default_http3_max_idle_timeout_secs")]
+    pub max_idle_timeout_secs: u64,
+    /// Requests in flight on one connection. Default: `100`.
+    #[serde(default = "default_http3_max_concurrent_bidi_streams")]
+    pub max_concurrent_bidi_streams: u32,
+    /// The `ma` (max age, seconds) of the `Alt-Svc` header. Default: `86400`.
+    #[serde(default = "default_http3_alt_svc_max_age")]
+    pub alt_svc_max_age: u64,
+}
+
+const fn default_http3_max_idle_timeout_secs() -> u64 {
+    30
+}
+
+const fn default_http3_max_concurrent_bidi_streams() -> u32 {
+    100
+}
+
+const fn default_http3_alt_svc_max_age() -> u64 {
+    86_400
+}
+
+impl Default for Http3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: None,
+            max_idle_timeout_secs: default_http3_max_idle_timeout_secs(),
+            max_concurrent_bidi_streams: default_http3_max_concurrent_bidi_streams(),
+            alt_svc_max_age: default_http3_alt_svc_max_age(),
+        }
+    }
+}
+
+impl Http3Config {
+    /// The UDP port: [`port`](Self::port), else `tcp_port`.
+    #[must_use]
+    pub fn effective_port(&self, tcp_port: u16) -> u16 {
+        self.port.unwrap_or(tcp_port)
+    }
+
+    /// The `Alt-Svc` header value that advertises h3 on `udp_port`.
+    #[must_use]
+    pub fn alt_svc_value(&self, udp_port: u16) -> String {
+        format!("h3=\":{udp_port}\"; ma={}", self.alt_svc_max_age)
+    }
+
+    /// Check the section. A disabled section is not checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when h3 is enabled without
+    /// `[server.tls]`, or a limit is `0`.
+    pub fn validate(&self, tls: Option<&TlsConfig>) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if tls.is_none() {
+            return Err(ConfigError::Validation(
+                "[server.http3] enabled = true needs [server.tls]: QUIC uses the TLS certificate. \
+                 Configure [server.tls], or set enabled = false"
+                    .to_owned(),
+            ));
+        }
+        if self.max_idle_timeout_secs == 0 {
+            return Err(ConfigError::Validation(
+                "[server.http3] max_idle_timeout_secs must be at least 1".to_owned(),
+            ));
+        }
+        if self.max_concurrent_bidi_streams == 0 {
+            return Err(ConfigError::Validation(
+                "[server.http3] max_concurrent_bidi_streams must be at least 1: with 0, no \
+                 request can open"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -14690,6 +14828,7 @@ impl Default for ServerConfig {
             max_concurrent_requests: None,
             capacity_contract: None,
             tls: None,
+            http3: Http3Config::default(),
             admission: AdmissionConfig::default(),
         }
     }
@@ -20287,6 +20426,130 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.server.tls.is_none());
+    }
+
+    // ── [server.http3] ────────────────────────────────────────────
+
+    #[test]
+    fn server_http3_is_off_by_default() {
+        let config = AutumnConfig::default();
+        let h3 = &config.server.http3;
+        assert!(!h3.enabled);
+        assert_eq!(h3.port, None);
+        assert_eq!(h3.max_idle_timeout_secs, 30);
+        assert_eq!(h3.max_concurrent_bidi_streams, 100);
+        assert_eq!(h3.alt_svc_max_age, 86_400);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn server_http3_parses_every_key_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.tls]
+            cert_path = "cert.pem"
+            key_path = "key.pem"
+
+            [server.http3]
+            enabled = true
+            port = 8443
+            max_idle_timeout_secs = 15
+            max_concurrent_bidi_streams = 32
+            alt_svc_max_age = 3600
+            "#,
+        )
+        .expect("[server.http3] should parse");
+        let h3 = &config.server.http3;
+        assert!(h3.enabled);
+        assert_eq!(h3.port, Some(8443));
+        assert_eq!(h3.max_idle_timeout_secs, 15);
+        assert_eq!(h3.max_concurrent_bidi_streams, 32);
+        assert_eq!(h3.alt_svc_max_age, 3600);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn server_http3_keys_are_in_the_strict_schema() {
+        let keys = AutumnConfig::get_schema_keys();
+        let h3 = keys
+            .get("server.http3")
+            .expect("[server.http3] in the schema");
+        for key in [
+            "enabled",
+            "port",
+            "max_idle_timeout_secs",
+            "max_concurrent_bidi_streams",
+            "alt_svc_max_age",
+        ] {
+            assert!(h3.contains(key), "missing server.http3.{key}");
+        }
+    }
+
+    #[test]
+    fn server_http3_enabled_without_tls_is_rejected() {
+        let config: AutumnConfig =
+            toml::from_str("[server.http3]\nenabled = true\n").expect("parses");
+        let err = config.validate().expect_err("h3 needs [server.tls]");
+        assert!(err.to_string().contains("[server.tls]"), "{err}");
+    }
+
+    #[test]
+    fn server_http3_disabled_without_tls_is_accepted() {
+        let config: AutumnConfig =
+            toml::from_str("[server.http3]\nenabled = false\nport = 1\n").expect("parses");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn server_http3_rejects_zero_limits() {
+        for (key, value) in [
+            ("max_idle_timeout_secs", 0),
+            ("max_concurrent_bidi_streams", 0),
+        ] {
+            let config: AutumnConfig = toml::from_str(&format!(
+                "[server.tls]\ncert_path = \"c\"\nkey_path = \"k\"\n\
+                 [server.http3]\nenabled = true\n{key} = {value}\n"
+            ))
+            .expect("parses");
+            let err = config.validate().expect_err("zero must be rejected");
+            assert!(err.to_string().contains(key), "{err}");
+        }
+    }
+
+    #[test]
+    fn server_http3_alt_svc_value_names_port_and_max_age() {
+        let h3 = Http3Config {
+            enabled: true,
+            alt_svc_max_age: 600,
+            ..Http3Config::default()
+        };
+        assert_eq!(h3.alt_svc_value(443), "h3=\":443\"; ma=600");
+    }
+
+    #[test]
+    fn server_http3_port_falls_back_to_the_tcp_port() {
+        let mut h3 = Http3Config::default();
+        assert_eq!(h3.effective_port(8443), 8443);
+        h3.port = Some(9443);
+        assert_eq!(h3.effective_port(8443), 9443);
+    }
+
+    #[test]
+    fn env_override_sets_server_http3() {
+        let env = MockEnv::new()
+            .with("AUTUMN_SERVER__HTTP3__ENABLED", "true")
+            .with("AUTUMN_SERVER__HTTP3__PORT", "8443")
+            .with("AUTUMN_SERVER__HTTP3__MAX_IDLE_TIMEOUT_SECS", "12")
+            .with("AUTUMN_SERVER__HTTP3__MAX_CONCURRENT_BIDI_STREAMS", "7")
+            .with("AUTUMN_SERVER__HTTP3__ALT_SVC_MAX_AGE", "60");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let h3 = &config.server.http3;
+        assert!(h3.enabled);
+        assert_eq!(h3.port, Some(8443));
+        assert_eq!(h3.max_idle_timeout_secs, 12);
+        assert_eq!(h3.max_concurrent_bidi_streams, 7);
+        assert_eq!(h3.alt_svc_max_age, 60);
     }
 
     // ── deploy (#1607) ────────────────────────────────────────────

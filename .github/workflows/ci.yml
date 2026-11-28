@@ -1419,6 +1419,7 @@ jobs:
             system-tests,
             redis-tls,
             tls,
+            http3,
             acme,
             sla,
             repl,
@@ -1701,6 +1702,24 @@ jobs:
           cargo test -p autumn-web --features "tls,ws,test-support" \
             --test integration_tests custom_domains:: | tee "${RUNNER_TEMP}/custom-domains.log"
           assert_ran "${RUNNER_TEMP}/custom-domains.log" "custom_domains"
+      - name: Run HTTP/3 tests
+        if: matrix.lane == 'http3'
+        # `http3` is not a default feature, so no other lane compiles the
+        # QUIC listener or its suite. The suite talks to the real listener
+        # with an in-process h3-quinn client: no Docker, no `curl --http3`.
+        # `assert_ran` fails the step when a filter matches no test.
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features "http3,test-support" --lib -- http3:: tls::tests::quic \
+            | tee "${RUNNER_TEMP}/http3-lib.log"
+          assert_ran "${RUNNER_TEMP}/http3-lib.log" "autumn-web http3 unit tests"
+          cargo test -p autumn-web --features "http3,test-support" \
+            --test integration_tests http3_serving:: | tee "${RUNNER_TEMP}/http3-serving.log"
+          assert_ran "${RUNNER_TEMP}/http3-serving.log" "http3_serving"
       - name: Run ACME-gated tests (certificate provisioning + renewal)
         if: matrix.lane == 'acme'
         # `acme` is not a default feature either, so the `test` job's workspace
@@ -2582,7 +2601,7 @@ jobs:
       # Coverage is not bound by the crates.io baseline, so this list is a
       # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
       # `acme`, `managed-pg*`, `system-tests`, `test-support`, ...).
-      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,webmcp,markdown,constela,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
+      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,webmcp,markdown,constela,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,http3,plugin-sandbox"
       # `postgresql_embedded`'s build script downloads Postgres binaries via
       # the GitHub API; unauthenticated it hits the 60 req/hr rate limit and
       # fails the build with a 403. Authenticate with the job's token to get
@@ -3299,7 +3318,7 @@ jobs:
         # step writes the tree to a file. Then a failed `cargo tree` fails the
         # step.
         env:
-          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,webmcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile,alerts,experiments,feature-flags,job-tracking,nested-form,slo,upgrade,wizard,widgets-search,widgets-social,widgets-workflow,widgets-charts,jwt,push,cluster,plugin-conformance,runtime-config,axum-ws
+          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,webmcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,http3,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile,alerts,experiments,feature-flags,job-tracking,nested-form,slo,upgrade,wizard,widgets-search,widgets-social,widgets-workflow,widgets-charts,jwt,push,cluster,plugin-conformance,runtime-config,axum-ws
         run: |
           cargo clippy -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" --lib -- -D warnings
           tree="${RUNNER_TEMP}/sqlite-only-tree.txt"

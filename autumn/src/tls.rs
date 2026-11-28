@@ -602,10 +602,99 @@ pub fn build_server_config_with_client_auth(
     resolver: Arc<dyn ResolvesServerCert>,
     client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 ) -> Result<Arc<rustls::ServerConfig>, TlsError> {
+    let mut config = build_config(
+        provider,
+        rustls::DEFAULT_VERSIONS,
+        resolver,
+        client_verifier,
+    )?;
+    // Without ALPN, rustls selects no protocol and clients never send the HTTP/2 preface, so
+    // the serve path's h2 support goes unused (#2321). `h2` first; ALPN-less and
+    // http/1.1-only clients are unaffected. Static TLS and ACME both build their config here.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+/// The rustls config for QUIC (HTTP/3).
+///
+/// TLS 1.3 only, ALPN `h3`, and no early data (0-RTT): early data can be
+/// replayed. The resolver and the client verifier are the ones the TCP
+/// listener uses, so a renewal or a CA rotation reaches both.
+///
+/// # Errors
+///
+/// Returns [`TlsError::BuildConfig`] if rustls rejects TLS 1.3 for the
+/// provider.
+pub fn build_quic_server_config(
+    provider: Arc<CryptoProvider>,
+    resolver: Arc<dyn ResolvesServerCert>,
+    client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<Arc<rustls::ServerConfig>, TlsError> {
+    let mut config = build_config(
+        provider,
+        &[&rustls::version::TLS13],
+        resolver,
+        client_verifier,
+    )?;
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    config.max_early_data_size = 0;
+    Ok(Arc::new(config))
+}
+
+/// The inputs both rustls configs share: one provider, one cert resolver,
+/// and the optional mTLS verifier.
+///
+/// Build the TCP config with [`tcp_config`](Self::tcp_config) and the QUIC
+/// config with [`quic_config`](Self::quic_config) from one value, so the two
+/// listeners cannot serve different certificates.
+#[derive(Clone, Debug)]
+pub struct ServerTlsParts {
+    /// The crypto provider (`ring`).
+    pub provider: Arc<CryptoProvider>,
+    /// The certificate resolver. Renewals store into it.
+    pub resolver: Arc<dyn ResolvesServerCert>,
+    /// The client-certificate verifier, when `[server.tls.client_auth]` is on.
+    pub client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+}
+
+impl ServerTlsParts {
+    /// The TCP listener's config. See [`build_server_config_with_client_auth`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsError::BuildConfig`] if rustls rejects the config.
+    pub fn tcp_config(&self) -> Result<Arc<rustls::ServerConfig>, TlsError> {
+        build_server_config_with_client_auth(
+            Arc::clone(&self.provider),
+            Arc::clone(&self.resolver),
+            self.client_verifier.clone(),
+        )
+    }
+
+    /// The QUIC listener's config. See [`build_quic_server_config`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsError::BuildConfig`] if rustls rejects the config.
+    pub fn quic_config(&self) -> Result<Arc<rustls::ServerConfig>, TlsError> {
+        build_quic_server_config(
+            Arc::clone(&self.provider),
+            Arc::clone(&self.resolver),
+            self.client_verifier.clone(),
+        )
+    }
+}
+
+fn build_config(
+    provider: Arc<CryptoProvider>,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    resolver: Arc<dyn ResolvesServerCert>,
+    client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<rustls::ServerConfig, TlsError> {
     let builder = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(versions)
         .map_err(|source| TlsError::BuildConfig { source })?;
-    let mut config = match client_verifier {
+    let config = match client_verifier {
         Some(verifier) => {
             let mut config = builder
                 .with_client_cert_verifier(verifier)
@@ -621,11 +710,7 @@ pub fn build_server_config_with_client_auth(
         }
         None => builder.with_no_client_auth().with_cert_resolver(resolver),
     };
-    // Without ALPN, rustls selects no protocol and clients never send the HTTP/2 preface, so
-    // the serve path's h2 support goes unused (#2321). `h2` first; ALPN-less and
-    // http/1.1-only clients are unaffected. Static TLS and ACME both build their config here.
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(Arc::new(config))
+    Ok(config)
 }
 
 /// Connection info for a request served over the mTLS-capable HTTPS listener
@@ -694,12 +779,18 @@ impl TlsConnectInfo {
         io: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
         peer: std::net::SocketAddr,
     ) -> Self {
+        Self::from_peer_chain(peer, io.get_ref().1.peer_certificates())
+    }
+
+    /// Connect info for `peer` from the chain a completed handshake verified.
+    /// The QUIC listener uses this too.
+    pub(crate) fn from_peer_chain(
+        peer: std::net::SocketAddr,
+        chain: Option<&[rustls_pki_types::CertificateDer<'_>]>,
+    ) -> Self {
         // rustls exposes the peer chain only after a successful handshake, so this parse turns
         // an already verified certificate into an identity; it does not decide trust.
-        let client = io
-            .get_ref()
-            .1
-            .peer_certificates()
+        let client = chain
             .and_then(<[rustls_pki_types::CertificateDer<'_>]>::first)
             .and_then(|leaf| match client_auth::ClientIdentity::from_der(leaf) {
                 Ok(identity) => Some(Arc::new(identity)),
@@ -1327,6 +1418,9 @@ mod tests {
     // Self-signed `CN=localhost`, valid until 2126. The key pair is a public test fixture.
     const CERT_PEM: &str = include_str!("../tests/fixtures/tls/localhost.cert.pem");
     const KEY_PEM: &str = include_str!("../tests/fixtures/tls/localhost.key.pem");
+    // A second `CN=localhost` pair, the stand-in for a renewal.
+    const RENEWED_CERT_PEM: &str = include_str!("../tests/fixtures/tls/localhost-renewed.cert.pem");
+    const RENEWED_KEY_PEM: &str = include_str!("../tests/fixtures/tls/localhost-renewed.key.pem");
     // A second, unrelated self-signed key (does not match `CERT_PEM`).
     const MISMATCHED_KEY_PEM: &str = include_str!("../tests/fixtures/tls/other.key.pem");
     // Self-signed `CN=localhost` that expired in 2021.
@@ -1765,6 +1859,185 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
             via_client_auth.alpn_protocols, expected,
             "the client-auth arm must advertise the same ALPN"
         );
+    }
+
+    fn fixture_parts(
+        client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+    ) -> (ServerTlsParts, Arc<ReloadableCertResolver>) {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+        let certified = load_certified_key(&cert, &key, &provider, now()).unwrap();
+        let resolver = Arc::new(ReloadableCertResolver::new(certified));
+        let parts = ServerTlsParts {
+            provider,
+            resolver: Arc::clone(&resolver) as Arc<dyn ResolvesServerCert>,
+            client_verifier,
+        };
+        (parts, resolver)
+    }
+
+    /// Drive an in-memory handshake between `server` and a client limited to
+    /// `versions`. Returns the negotiated ALPN, or the first error.
+    fn in_memory_handshake(
+        server: Arc<rustls::ServerConfig>,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        alpn: &[&[u8]],
+    ) -> Result<(Option<Vec<u8>>, Option<CertificateDer<'static>>), rustls::Error> {
+        #[derive(Debug)]
+        struct AcceptAny;
+        impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+            fn verify_server_cert(
+                &self,
+                _: &CertificateDer<'_>,
+                _: &[CertificateDer<'_>],
+                _: &rustls_pki_types::ServerName<'_>,
+                _: &[u8],
+                _: rustls_pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                crypto_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+        let mut client_config = rustls::ClientConfig::builder_with_provider(crypto_provider())
+            .with_protocol_versions(versions)
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAny))
+            .with_no_client_auth();
+        client_config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client_config),
+            rustls_pki_types::ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let mut server = rustls::ServerConnection::new(server).unwrap();
+        for _ in 0..16 {
+            let mut buf = Vec::new();
+            client.write_tls(&mut buf).unwrap();
+            server.read_tls(&mut buf.as_slice()).unwrap();
+            server.process_new_packets()?;
+            let mut buf = Vec::new();
+            server.write_tls(&mut buf).unwrap();
+            client.read_tls(&mut buf.as_slice()).unwrap();
+            client.process_new_packets()?;
+            if !client.is_handshaking() && !server.is_handshaking() {
+                let leaf = client
+                    .peer_certificates()
+                    .and_then(<[CertificateDer<'_>]>::first)
+                    .map(|c| c.clone().into_owned());
+                return Ok((server.alpn_protocol().map(<[u8]>::to_vec), leaf));
+            }
+        }
+        panic!("the in-memory handshake did not finish");
+    }
+
+    #[test]
+    fn quic_config_advertises_only_h3_and_refuses_early_data() {
+        let (parts, _) = fixture_parts(None);
+        let config = parts.quic_config().expect("QUIC config builds");
+        assert_eq!(config.alpn_protocols, vec![b"h3".to_vec()]);
+        assert_eq!(config.max_early_data_size, 0, "0-RTT stays off");
+    }
+
+    #[test]
+    fn quic_config_is_accepted_by_a_quic_server_connection() {
+        let (parts, _) = fixture_parts(None);
+        let config = parts.quic_config().expect("QUIC config builds");
+        // quinn unwraps this call per connection, so a bad config would panic there.
+        rustls::quic::ServerConnection::new(config, rustls::quic::Version::V1, Vec::new())
+            .expect("rustls accepts the config for QUIC");
+    }
+
+    #[test]
+    fn quic_config_refuses_a_tls12_client() {
+        let (parts, _) = fixture_parts(None);
+        let config = parts.quic_config().expect("QUIC config builds");
+        let tls12 = in_memory_handshake(config, &[&rustls::version::TLS12], &[b"h3"]);
+        assert!(tls12.is_err(), "QUIC is TLS 1.3 only: {tls12:?}");
+    }
+
+    #[test]
+    fn quic_config_negotiates_h3_over_tls13() {
+        let (parts, _) = fixture_parts(None);
+        let config = parts.quic_config().expect("QUIC config builds");
+        let (alpn, _) = in_memory_handshake(config, &[&rustls::version::TLS13], &[b"h3"])
+            .expect("TLS 1.3 handshake");
+        assert_eq!(alpn.as_deref(), Some(&b"h3"[..]));
+    }
+
+    #[test]
+    fn quic_and_tcp_configs_share_one_resolver() {
+        let (parts, resolver) = fixture_parts(None);
+        let tcp = parts.tcp_config().expect("TCP config builds");
+        let quic = parts.quic_config().expect("QUIC config builds");
+        assert_eq!(
+            tcp.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        // A renewal stores into the resolver; both configs must see it.
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", RENEWED_CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", RENEWED_KEY_PEM);
+        let renewed = load_certified_key(&cert, &key, &crypto_provider(), now()).unwrap();
+        resolver.store(Arc::clone(&renewed));
+        for (config, versions) in [
+            (tcp, &rustls::version::TLS12),
+            (quic, &rustls::version::TLS13),
+        ] {
+            let (_, leaf) = in_memory_handshake(config, &[versions], &[b"h3", b"h2"])
+                .expect("handshake after renewal");
+            assert_eq!(
+                leaf,
+                Some(renewed.cert[0].clone()),
+                "a renewal reaches every config"
+            );
+        }
+    }
+
+    #[test]
+    fn quic_config_keeps_the_client_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = write_temp(
+            dir.path(),
+            "ca.pem",
+            include_str!("../tests/fixtures/tls/client/ca.cert.pem"),
+        );
+        let verifier = client_auth::build_client_verifier(
+            client_auth::load_client_roots(&ca).expect("client roots load"),
+            vec![],
+            crate::config::ClientAuthMode::Required,
+            crypto_provider(),
+        )
+        .expect("client verifier builds");
+        let (parts, _) = fixture_parts(Some(verifier));
+        let config = parts.quic_config().expect("QUIC config builds");
+        // A client with no certificate must fail the handshake, as it does over TCP.
+        let result = in_memory_handshake(config, &[&rustls::version::TLS13], &[b"h3"]);
+        assert!(result.is_err(), "mTLS must hold over QUIC: {result:?}");
     }
 
     // Advertising `h2` is safe only while the serve loop's `auto::Builder` speaks HTTP/2, which

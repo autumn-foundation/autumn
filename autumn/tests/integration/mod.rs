@@ -460,6 +460,8 @@ mod repository_nul_field;
 // Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
 // cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
 // (after the fix) the batched `dependent_delete_all` replacement.
+#[cfg(feature = "http3")]
+mod http3_serving;
 #[cfg(feature = "tls")]
 mod mtls_support;
 #[cfg(feature = "db")]

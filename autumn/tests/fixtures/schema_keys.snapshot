@@ -577,6 +577,12 @@ server.http.http2_max_concurrent_streams
 server.http.keep_alive_timeout_ms
 server.http.max_connections
 server.http.max_header_bytes
+server.http3
+server.http3.alt_svc_max_age
+server.http3.enabled
+server.http3.max_concurrent_bidi_streams
+server.http3.max_idle_timeout_secs
+server.http3.port
 server.max_concurrent_requests
 server.port
 server.prestop_grace_secs

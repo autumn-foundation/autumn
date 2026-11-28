@@ -22,7 +22,7 @@ max_connections = 10_000             # open connections per listener
 | `keep_alive_timeout_ms` | Closes a connection that has no request in flight for this long. | unset or `0` |
 | `max_header_bytes` | HTTP/1 requests with a larger head get `431`. Also sets the HTTP/2 header list limit. Must be `8192` or more. | cannot be turned off; unset is about 400 KiB (HTTP/1) and 16 KiB (HTTP/2) |
 | `http2_max_concurrent_streams` | The stream limit the server sends in its HTTP/2 `SETTINGS`. Must be `1` or more. | cannot be turned off; unset is 200 |
-| `max_connections` | At the limit, the server does not accept new connections. The kernel queues new connections until one closes. A WebSocket or SSE stream counts until it closes. The count is per listener. On HTTPS, a connection counts from TCP accept, also during its TLS handshake. | unset or `0` |
+| `max_connections` | At the limit, the server does not accept new connections. The kernel queues new connections until one closes. A WebSocket or SSE stream counts until it closes. The count is per listener. On HTTPS, a connection counts from TCP accept, also during its TLS handshake. The HTTP/3 (QUIC) listener has a separate limit of the same value. | unset or `0` |
 
 The limits apply to the TCP, Unix socket and HTTPS listeners. They also apply
 to the ACME `:80` challenge listener. The timers also run during a graceful

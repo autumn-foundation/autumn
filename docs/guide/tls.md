@@ -1385,6 +1385,96 @@ Add `crl_path = "client-ca.crl.pem"`; the next poll picks it up, and
 
 ---
 
+## HTTP/3 over QUIC (`[server.http3]`)
+
+HTTP/3 runs over QUIC on UDP. It sets up a connection faster and has no
+head-of-line blocking on lossy networks. Use it only when the app is directly
+on the internet. Most load balancers, PaaS tiers and ingress controllers do not
+forward UDP. A CDN in front of the app already gives h3 to the browser.
+
+Build with the `http3` feature. It needs `[server.tls]` (static or ACME):
+
+```toml
+[server.tls]
+cert_path = "/etc/autumn/tls/fullchain.pem"
+key_path = "/etc/autumn/tls/privkey.pem"
+
+[server.http3]
+enabled = true
+# port = 443                       # UDP port. Default: the TCP port
+# max_idle_timeout_secs = 30       # close an idle connection
+# max_concurrent_bidi_streams = 100 # requests in flight per connection
+# alt_svc_max_age = 86400          # seconds a browser keeps the Alt-Svc hint
+```
+
+Each key has an `AUTUMN_SERVER__HTTP3__*` env var, for example
+`AUTUMN_SERVER__HTTP3__ENABLED=true`.
+
+### How it works
+
+- The app binds a UDP endpoint on the TCP listener's IP address. The UDP port
+  is `port`, or the TCP port. A bind failure stops the boot.
+- QUIC uses the TLS listener's certificate resolver. A renewal (file reload
+  or ACME) applies to the next h3 connection. The endpoint does not restart.
+- `[server.tls.client_auth]` applies to QUIC too. UDP is not a way around mTLS.
+- TCP responses get `Alt-Svc: h3=":<port>"; ma=<alt_svc_max_age>`. A browser
+  tries h3 after it sees this header. An `Alt-Svc` header that the app sets
+  stays as it is.
+- h3 requests go through the same middleware as TCP requests:
+  `TrustedProxiesLayer`, `MethodOverrideLayer` and the router. Each request
+  has the peer address, so `X-Forwarded-For` from an untrusted peer has no
+  effect.
+- A request without `Host` gets one from `:authority`.
+- A request with a connection-specific header (`Connection`, `TE` other than
+  `trailers`, and so on) gets `400`. HTTP/3 forbids these headers.
+- `[server.http]` limits apply:
+  - `max_header_bytes` limits the request head and the trailers (default
+    64 KiB).
+  - `header_read_timeout_ms` limits the time to receive the head (default
+    30 seconds).
+  - `keep_alive_timeout_ms` closes a connection with no request in flight.
+  - `max_connections` limits QUIC connections. QUIC connections have a
+    separate limit. Its value is `max_connections`.
+- Under handshake load, the server sends a QUIC Retry to an unvalidated
+  client. The Retry makes the client prove its address before the server
+  signs a handshake.
+- On shutdown the endpoint stops accepting and sends GOAWAY. In-flight
+  requests get `shutdown_timeout_secs` to finish, as over TCP. Then the
+  connection closes.
+
+### What stays off
+
+- **WebSockets over h3.** Extended CONNECT (RFC 9220) is not advertised, so
+  browsers open `wss://` over HTTP/2 or HTTP/1.1.
+- **0-RTT.** Early data can be replayed, so the server refuses it.
+- **QUIC datagrams** and **WebTransport**.
+- **DNS HTTPS records.** Browsers learn of h3 from `Alt-Svc` only.
+
+### Operator checklist
+
+1. **Open UDP 443 (or `port`) end to end.** Open it in the host firewall, in
+   the cloud security group, and in each NAT device between the client and
+   the app. When UDP is blocked, browsers use TCP. No error occurs. Thus, you
+   can easily miss this problem.
+2. **On Linux, raise the UDP receive buffer.** quinn asks for a large buffer.
+   The default `net.core.rmem_max` caps it. quinn then logs a warning and drops
+   packets under load:
+
+   ```bash
+   sudo sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000
+   ```
+
+   Add the same keys to `/etc/sysctl.d/` so that they stay after a reboot.
+3. **Run `autumn doctor`.** The `http3` check fails when `[server.http3]` is
+   on without `[server.tls]`, and warns when `net.core.rmem_max` is too small.
+   It reads the config only. A binary without the `http3` feature does not
+   start when `[server.http3]` is on.
+
+For many replicas behind a load balancer, terminate TLS (and h3) at the load
+balancer. That stays the recommended setup.
+
+---
+
 ## Terminating TLS at a reverse proxy
 
 If a reverse proxy or platform already fronts your app, terminate TLS there and
