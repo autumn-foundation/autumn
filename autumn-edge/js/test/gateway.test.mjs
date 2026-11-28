@@ -551,20 +551,24 @@ test("a stalled origin probe times out and does not stall the edge lane", async 
     return realFetch(input, init);
   };
   try {
+    // A request that waited on a probe would take the whole timeout. The
+    // timeout is long enough that a request that does not wait stays well
+    // under it on a loaded runner; 100 ms was not (macOS, x86-64).
+    const probeTimeoutMs = 1000;
     const gateway = createEdgeGateway({
       capsule: respond([served(200, [], "edge")]),
       origin: base,
       probeOrigin: true,
-      probeTimeoutMs: 100,
+      probeTimeoutMs,
     });
     const started = Date.now();
     const first = await gateway.fetch(new Request("https://edge.test/a"));
     assert.equal(await first.text(), "edge");
-    assert.ok(Date.now() - started < 2000, "bounded by the probe timeout");
+    assert.ok(Date.now() - started < probeTimeoutMs + 2000, "bounded by the probe timeout");
     // Inside the retry window the next request does not probe again.
     const again = Date.now();
     await gateway.fetch(new Request("https://edge.test/b"));
-    assert.ok(Date.now() - again < 100);
+    assert.ok(Date.now() - again < probeTimeoutMs, "the next request does not wait on a probe");
     assert.equal(probes, 1);
   } finally {
     globalThis.fetch = realFetch;
