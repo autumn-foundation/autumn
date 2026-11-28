@@ -19422,6 +19422,91 @@ mod tests {
         assert_eq!(task_names(&kept), task_names(&mixed_tasks()));
     }
 
+    #[cfg(feature = "http3")]
+    fn http3_test_parts() -> crate::tls::ServerTlsParts {
+        let provider = crate::tls::crypto_provider();
+        let key = crate::tls::certified_key_from_pem(
+            include_bytes!("../tests/fixtures/tls/localhost.cert.pem"),
+            include_bytes!("../tests/fixtures/tls/localhost.key.pem"),
+            &provider,
+        )
+        .expect("fixture pair loads");
+        crate::tls::ServerTlsParts {
+            provider,
+            resolver: std::sync::Arc::new(crate::tls::ReloadableCertResolver::new(key)),
+            client_verifier: None,
+        }
+    }
+
+    #[cfg(feature = "http3")]
+    fn http3_test_config(port: Option<u16>) -> AutumnConfig {
+        let mut config: AutumnConfig = toml::from_str(
+            "[server.tls]\ncert_path = \"c.pem\"\nkey_path = \"k.pem\"\n\
+             [server.http3]\nenabled = true\nalt_svc_max_age = 60\n",
+        )
+        .expect("config parses");
+        config.server.http3.port = port;
+        config
+    }
+
+    /// Without `[server.http3].port`, the UDP port is the TCP port, and
+    /// `Alt-Svc` names the port that was bound.
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_binds_the_tcp_port_and_advertises_it() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind TCP");
+        let tcp_addr = tcp.local_addr().expect("TCP addr");
+        let (listener, alt_svc) =
+            bind_http3_listener(&http3_test_config(None), tcp_addr, &http3_test_parts())
+                .expect("h3 binds beside TCP");
+        let udp = listener.local_addr().expect("UDP addr");
+        assert_eq!(udp.ip(), tcp_addr.ip());
+        assert_eq!(
+            udp.port(),
+            tcp_addr.port(),
+            "UDP shares the TCP port number"
+        );
+        let advertised = format!("{alt_svc:?}");
+        assert!(
+            advertised.contains(&format!("h3=\\\":{}\\\"; ma=60", udp.port())),
+            "{advertised}"
+        );
+    }
+
+    /// `[server.http3].port` replaces the TCP port, and `Alt-Svc` follows it.
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_binds_the_configured_port() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe a free UDP port");
+        let port = probe.local_addr().expect("probe addr").port();
+        drop(probe);
+        let tcp_addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (listener, alt_svc) = bind_http3_listener(
+            &http3_test_config(Some(port)),
+            tcp_addr,
+            &http3_test_parts(),
+        )
+        .expect("h3 binds the configured port");
+        assert_eq!(listener.local_addr().expect("UDP addr").port(), port);
+        assert!(format!("{alt_svc:?}").contains(&format!(":{port}")));
+    }
+
+    /// A UDP port that is taken fails the boot with a message that names it.
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_bind_failure_names_the_address() {
+        let taken = std::net::UdpSocket::bind("127.0.0.1:0").expect("hold a UDP port");
+        let port = taken.local_addr().expect("held addr").port();
+        let tcp_addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let err = bind_http3_listener(
+            &http3_test_config(Some(port)),
+            tcp_addr,
+            &http3_test_parts(),
+        )
+        .expect_err("the port is taken");
+        assert!(err.contains(&port.to_string()), "{err}");
+    }
+
     /// h3 must serve the serve-boundary service (`TrustedProxiesLayer` around
     /// `MethodOverrideLayer`), not the bare router. Without it, `_method=PUT`
     /// breaks and forwarded headers are not resolved over h3. `Alt-Svc` must go
