@@ -52,7 +52,7 @@ Option 3.
   than `max_header_bytes`. This covers the head and the trailers. A
   control or QPACK stream has a total limit of 64 KiB.
 - The request head has a time limit. Idle connections close. A drain ends
-  after the same grace that TCP connections get.
+  after `shutdown_timeout_secs`, the budget that TCP requests get.
 
 ## Consequences
 

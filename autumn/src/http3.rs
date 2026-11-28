@@ -23,8 +23,8 @@
 //! - Limits: the size of each frame other than DATA (head, trailers), the
 //!   time to receive the head, idle connections, open
 //!   connections, handshakes in progress (with a QUIC Retry under load).
-//! - Shutdown sends GOAWAY, lets in-flight requests finish within the grace
-//!   that TCP connections get, then closes.
+//! - Shutdown sends GOAWAY, lets in-flight requests finish within the drain
+//!   grace (the app sets `server.shutdown_timeout_secs`), then closes.
 //!
 //! Extended CONNECT, WebTransport, QUIC datagrams and 0-RTT stay off.
 //! WebSockets therefore stay on HTTP/1.1 and HTTP/2.
@@ -71,9 +71,9 @@ const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Request-head size limit when `[server.http]` sets none.
 const DEFAULT_MAX_HEAD_BYTES: u64 = 64 * 1024;
 
-/// Time a connection gets to finish its requests after shutdown starts. The
-/// same as for a TCP connection.
-const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(5);
+/// Time a connection gets to finish its requests after shutdown starts, when
+/// the caller sets none. The app sets `server.shutdown_timeout_secs`.
+const DEFAULT_DRAIN_GRACE: Duration = Duration::from_secs(30);
 
 /// Handshakes in progress above which an unvalidated client gets a Retry.
 /// A Retry proves the client owns its address before the server signs.
@@ -146,6 +146,14 @@ impl Http3Settings {
     #[must_use]
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout.max(Duration::from_secs(1));
+        self
+    }
+
+    /// Set the time that in-flight requests get after shutdown starts. `0`
+    /// becomes one second.
+    #[must_use]
+    pub fn with_drain_grace(mut self, grace: Duration) -> Self {
+        self.drain_grace = grace.max(Duration::from_secs(1));
         self
     }
 
@@ -251,6 +259,12 @@ impl Http3Listener {
         let endpoint = quinn::Endpoint::server(server, addr)
             .map_err(|source| Http3Error::Bind { addr, source })?;
         Ok(Self { endpoint, settings })
+    }
+
+    /// The settings this listener serves with.
+    #[must_use]
+    pub const fn settings(&self) -> &Http3Settings {
+        &self.settings
     }
 
     /// The bound UDP address.

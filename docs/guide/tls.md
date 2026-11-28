@@ -1439,8 +1439,8 @@ Each key has an `AUTUMN_SERVER__HTTP3__*` env var, for example
   client. The Retry makes the client prove its address before the server
   signs a handshake.
 - On shutdown the endpoint stops accepting and sends GOAWAY. In-flight
-  requests get 5 seconds to finish, the same grace as a TCP connection. Then
-  the connection closes.
+  requests get `shutdown_timeout_secs` to finish, as over TCP. Then the
+  connection closes.
 
 ### What stays off
 

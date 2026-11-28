@@ -11511,7 +11511,11 @@ fn bind_http3_listener(
         h3,
         &crate::http_server::HttpLimits::from(&config.server.http),
     )
-    .with_handshake_timeout(std::time::Duration::from_secs(handshake));
+    .with_handshake_timeout(std::time::Duration::from_secs(handshake))
+    // In-flight requests get the same budget as over TCP: the drain watchdog's.
+    .with_drain_grace(std::time::Duration::from_secs(
+        config.server.shutdown_timeout_secs,
+    ));
     let tls = parts.quic_config().map_err(|e| e.to_string())?;
     let listener =
         crate::http3::Http3Listener::bind(udp_addr, tls, settings).map_err(|e| e.to_string())?;
@@ -19470,6 +19474,26 @@ mod tests {
         assert!(
             advertised.contains(&format!("h3=\\\":{}\\\"; ma=60", udp.port())),
             "{advertised}"
+        );
+    }
+
+    /// h3 requests get `server.shutdown_timeout_secs` to finish on shutdown, as
+    /// TCP requests do.
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_drain_grace_is_the_shutdown_timeout() {
+        let mut config = http3_test_config(None);
+        config.server.shutdown_timeout_secs = 17;
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind TCP");
+        let (listener, _) = bind_http3_listener(
+            &config,
+            tcp.local_addr().expect("TCP addr"),
+            &http3_test_parts(),
+        )
+        .expect("h3 binds");
+        assert_eq!(
+            listener.settings().drain_grace,
+            std::time::Duration::from_secs(17)
         );
     }
 
