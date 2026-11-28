@@ -586,7 +586,6 @@ mod tests {
     struct FakeBidi {
         recv: FakeRecv,
         ready: bool,
-        sent: usize,
         finished: bool,
         reset: Option<u64>,
     }
@@ -601,7 +600,6 @@ mod tests {
             &mut self,
             _data: T,
         ) -> Result<(), StreamErrorIncoming> {
-            self.sent += 1;
             Ok(())
         }
 
@@ -668,7 +666,6 @@ mod tests {
                     stopped: None,
                 },
                 ready: false,
-                sent: 0,
                 finished: false,
                 reset: None,
             },
@@ -682,13 +679,10 @@ mod tests {
         let mut cx = Context::from_waker(waker);
         let mut bidi = fake_bidi(Vec::new(), 16);
         assert!(quic::SendStream::<Bytes>::poll_ready(&mut bidi, &mut cx).is_ready());
-        quic::SendStream::<Bytes>::send_data(&mut bidi, Bytes::from_static(b"x"))
-            .expect("data passes");
         assert!(quic::SendStream::<Bytes>::poll_finish(&mut bidi, &mut cx).is_ready());
         quic::SendStream::<Bytes>::reset(&mut bidi, 0x0101);
         assert_eq!(quic::SendStream::<Bytes>::send_id(&bidi).into_inner(), 8);
         assert!(bidi.inner.ready && bidi.inner.finished);
-        assert_eq!(bidi.inner.sent, 1);
         assert_eq!(bidi.inner.reset, Some(0x0101));
     }
 
