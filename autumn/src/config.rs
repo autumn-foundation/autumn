@@ -3603,8 +3603,8 @@ pub struct IrohConfig {
     #[serde(default = "default_iroh_bind_addr")]
     pub bind_addr: String,
 
-    /// The relay servers: `"disabled"` (the default), `"n0"` (the relays of
-    /// number 0), or `"custom"` with `relay_urls`.
+    /// The relay servers: `"disabled"` (the default), `"n0"` (n0's public
+    /// relays), or `"custom"` with `relay_urls`.
     #[serde(default)]
     pub relay: IrohRelayMode,
 
@@ -3613,7 +3613,7 @@ pub struct IrohConfig {
     pub relay_urls: Vec<String>,
 
     /// How peers find addresses: `"static"` (the default: from config) or
-    /// `"n0-dns"` (publish to and resolve from the DNS of number 0).
+    /// `"n0-dns"` (publish to and resolve from the DNS of n0).
     #[serde(default)]
     pub address_lookup: IrohAddressLookup,
 
@@ -3651,7 +3651,7 @@ pub enum IrohRelayMode {
     /// No relay. Peers need a direct address.
     #[default]
     Disabled,
-    /// The public relays of number 0 (`n0`).
+    /// The public relays of n0 (`n0`).
     N0,
     /// The relays in `relay_urls`.
     Custom,
@@ -3678,7 +3678,7 @@ pub enum IrohAddressLookup {
     #[default]
     #[serde(rename = "static")]
     Static,
-    /// Publish this endpoint's addresses to the DNS of number 0, and resolve
+    /// Publish this endpoint's addresses to the DNS of n0, and resolve
     /// peers from it.
     #[serde(rename = "n0-dns")]
     N0Dns,
@@ -20792,7 +20792,10 @@ path = "/healthz"
         assert!(!iroh.enabled);
         assert_eq!(iroh.relay, IrohRelayMode::Disabled);
         assert_eq!(iroh.address_lookup, IrohAddressLookup::Static);
-        assert_eq!(iroh.secret_key_path, std::path::PathBuf::from(".autumn/iroh/secret.key"));
+        assert_eq!(
+            iroh.secret_key_path,
+            std::path::PathBuf::from(".autumn/iroh/secret.key")
+        );
         assert_eq!(iroh.bind_addr, "0.0.0.0:0");
         assert!(iroh.relay_urls.is_empty());
         assert!(iroh.allowed_peers.is_empty());
@@ -20810,10 +20813,16 @@ path = "/healthz"
         .expect("[iroh] parses");
         let iroh = &config.iroh;
         assert!(iroh.enabled);
-        assert_eq!(iroh.secret_key_path, std::path::PathBuf::from("/var/lib/app/iroh.key"));
+        assert_eq!(
+            iroh.secret_key_path,
+            std::path::PathBuf::from("/var/lib/app/iroh.key")
+        );
         assert_eq!(iroh.bind_addr, "0.0.0.0:7947");
         assert_eq!(iroh.relay, IrohRelayMode::Custom);
-        assert_eq!(iroh.relay_urls, vec!["https://relay.example.com".to_owned()]);
+        assert_eq!(
+            iroh.relay_urls,
+            vec!["https://relay.example.com".to_owned()]
+        );
         assert_eq!(iroh.address_lookup, IrohAddressLookup::N0Dns);
         assert_eq!(iroh.allowed_peers, vec![PEER_A.to_owned()]);
         assert!(config.validate().is_ok());
@@ -20854,9 +20863,8 @@ path = "/healthz"
 
     #[test]
     fn iroh_relay_urls_without_custom_relay_are_rejected() {
-        let err = iroh_error(
-            "[iroh]\nenabled = true\nrelay_urls = [\"https://relay.example.com\"]\n",
-        );
+        let err =
+            iroh_error("[iroh]\nenabled = true\nrelay_urls = [\"https://relay.example.com\"]\n");
         assert!(err.contains("relay = \"custom\""), "{err}");
     }
 
@@ -20879,7 +20887,8 @@ path = "/healthz"
     }
 
     fn iroh_cluster(seeds: &str, advertise: Option<&str>) -> AutumnConfig {
-        let advertise = advertise.map_or_else(String::new, |a| format!("advertise_addr = \"{a}\"\n"));
+        let advertise =
+            advertise.map_or_else(String::new, |a| format!("advertise_addr = \"{a}\"\n"));
         toml::from_str(&format!(
             "[iroh]\nenabled = true\n\
              [cluster]\nenabled = true\ntransport = \"iroh\"\n\
@@ -20913,7 +20922,11 @@ path = "/healthz"
     #[test]
     fn cluster_iroh_advertise_addr_is_a_direct_ip_and_port() {
         let seed = format!("\"{PEER_A}\"");
-        assert!(iroh_cluster(&seed, Some("203.0.113.5:7947")).validate().is_ok());
+        assert!(
+            iroh_cluster(&seed, Some("203.0.113.5:7947"))
+                .validate()
+                .is_ok()
+        );
         for bad in ["node-a.internal:7947", "0.0.0.0:7947", "203.0.113.5:0"] {
             let err = iroh_cluster(&seed, Some(bad))
                 .validate()
@@ -20941,7 +20954,10 @@ path = "/healthz"
             .with("AUTUMN_IROH__SECRET_KEY_PATH", "/keys/iroh.key")
             .with("AUTUMN_IROH__BIND_ADDR", "0.0.0.0:7947")
             .with("AUTUMN_IROH__RELAY", "custom")
-            .with("AUTUMN_IROH__RELAY_URLS", "https://a.example,https://b.example")
+            .with(
+                "AUTUMN_IROH__RELAY_URLS",
+                "https://a.example,https://b.example",
+            )
             .with("AUTUMN_IROH__ADDRESS_LOOKUP", "n0-dns")
             .with("AUTUMN_IROH__ALLOWED_PEERS", PEER_A)
             .with("AUTUMN_CLUSTER__TRANSPORT", "iroh");
@@ -20949,7 +20965,10 @@ path = "/healthz"
         config.apply_env_overrides_with_env(&env);
         let iroh = &config.iroh;
         assert!(iroh.enabled);
-        assert_eq!(iroh.secret_key_path, std::path::PathBuf::from("/keys/iroh.key"));
+        assert_eq!(
+            iroh.secret_key_path,
+            std::path::PathBuf::from("/keys/iroh.key")
+        );
         assert_eq!(iroh.bind_addr, "0.0.0.0:7947");
         assert_eq!(iroh.relay, IrohRelayMode::Custom);
         assert_eq!(iroh.relay_urls.len(), 2);
@@ -20979,7 +20998,10 @@ path = "/healthz"
         );
         assert!(parse_iroh_peer("not-an-id").is_err());
         assert!(parse_iroh_peer(&format!("{PEER_A}@nowhere")).is_err());
-        assert!(parse_iroh_peer(&PEER_A.to_uppercase()).is_err(), "ids are lowercase");
+        assert!(
+            parse_iroh_peer(&PEER_A.to_uppercase()).is_err(),
+            "ids are lowercase"
+        );
     }
 
     // ── [server.http3] ────────────────────────────────────────────

@@ -272,9 +272,10 @@ impl IrohNode {
     /// Returns an [`IrohError`] when the key, a setting or the bind fails.
     pub async fn bind(config: &IrohConfig) -> Result<Self, IrohError> {
         let secret = load_or_create_secret_key(&config.secret_key_path)?;
-        let bind_addr: SocketAddr = config.bind_addr.parse().map_err(|err| {
-            IrohError::Config(format!("bind_addr {:?}: {err}", config.bind_addr))
-        })?;
+        let bind_addr: SocketAddr = config
+            .bind_addr
+            .parse()
+            .map_err(|err| IrohError::Config(format!("bind_addr {:?}: {err}", config.bind_addr)))?;
         let allowed_peers = config
             .allowed_peers
             .iter()
@@ -471,8 +472,9 @@ impl IrohNode {
             conn.close(VarInt::from_u32(REFUSED), b"not allowed");
             return;
         }
-        if let Err(mpsc::error::TrySendError::Full(conn) | mpsc::error::TrySendError::Closed(conn)) =
-            handler.queue.try_send(conn)
+        if let Err(
+            mpsc::error::TrySendError::Full(conn) | mpsc::error::TrySendError::Closed(conn),
+        ) = handler.queue.try_send(conn)
         {
             conn.close(VarInt::from_u32(REFUSED), b"busy");
         }
@@ -593,8 +595,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_nodes_connect_by_id_and_address_and_dispatch_by_alpn() {
         let dir = tempfile::tempdir().unwrap();
-        let server = IrohNode::bind(&config(dir.path(), "server.key")).await.unwrap();
-        let client = IrohNode::bind(&config(dir.path(), "client.key")).await.unwrap();
+        let server = IrohNode::bind(&config(dir.path(), "server.key"))
+            .await
+            .unwrap();
+        let client = IrohNode::bind(&config(dir.path(), "client.key"))
+            .await
+            .unwrap();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let mut accepted = server.register(ALPN);
         tokio::spawn(server.clone().run(shutdown.clone()));
@@ -617,8 +623,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unregistered_alpn_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let server = IrohNode::bind(&config(dir.path(), "server.key")).await.unwrap();
-        let client = IrohNode::bind(&config(dir.path(), "client.key")).await.unwrap();
+        let server = IrohNode::bind(&config(dir.path(), "server.key"))
+            .await
+            .unwrap();
+        let client = IrohNode::bind(&config(dir.path(), "client.key"))
+            .await
+            .unwrap();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let _accepted = server.register(ALPN);
         tokio::spawn(server.clone().run(shutdown.clone()));
@@ -636,9 +646,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_allow_list_turns_away_other_peers() {
         let dir = tempfile::tempdir().unwrap();
-        let friend = IrohNode::bind(&config(dir.path(), "friend.key")).await.unwrap();
-        let stranger = IrohNode::bind(&config(dir.path(), "stranger.key")).await.unwrap();
-        let server = IrohNode::bind(&config(dir.path(), "server.key")).await.unwrap();
+        let friend = IrohNode::bind(&config(dir.path(), "friend.key"))
+            .await
+            .unwrap();
+        let stranger = IrohNode::bind(&config(dir.path(), "stranger.key"))
+            .await
+            .unwrap();
+        let server = IrohNode::bind(&config(dir.path(), "server.key"))
+            .await
+            .unwrap();
         let shutdown = tokio_util::sync::CancellationToken::new();
         let mut accepted = server.register_with_allow_list(ALPN, [friend.id()]);
         tokio::spawn(server.clone().run(shutdown.clone()));
@@ -676,7 +692,10 @@ mod tests {
     fn a_dial_addr_names_the_id_and_a_bound_socket() {
         let id = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6";
         let addr: SocketAddr = "127.0.0.1:7947".parse().unwrap();
-        assert_eq!(format_peer_addr(id, Some(addr)), format!("{id}@127.0.0.1:7947"));
+        assert_eq!(
+            format_peer_addr(id, Some(addr)),
+            format!("{id}@127.0.0.1:7947")
+        );
         assert_eq!(format_peer_addr(id, None), id);
     }
 }

@@ -5774,8 +5774,7 @@ impl AppBuilder {
         #[cfg(feature = "iroh")]
         let iroh_shutdown = tokio_util::sync::CancellationToken::new();
         #[cfg(feature = "iroh")]
-        let iroh_bound =
-            crate::iroh::start_from_config(&state, &config.iroh, &iroh_shutdown).await;
+        let iroh_bound = crate::iroh::start_from_config(&state, &config.iroh, &iroh_shutdown).await;
         #[cfg(feature = "iroh")]
         let iroh_node = match iroh_bound {
             Ok(node) => node,

@@ -26,8 +26,8 @@ use tokio_util::sync::CancellationToken;
 use super::{
     DEFAULT_INBOUND_IDLE_TIMEOUT, DIAL_TIMEOUT, FAREWELL_LANE_CAPACITY, InFlightFrame,
     IncomingFrames, MAX_INBOUND_CONNECTIONS, MAX_UNAUTHENTICATED_FRAMES, PEER_QUEUE_CAPACITY,
-    PeerAddr, PeerLanes, PeerTransport, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN,
-    TransportIo, WRITE_TIMEOUT, claim_inbound_slot, retire_writers,
+    PeerAddr, PeerLanes, PeerTransport, RECONNECT_BACKOFF_MAX, RECONNECT_BACKOFF_MIN, TransportIo,
+    WRITE_TIMEOUT, claim_inbound_slot, retire_writers,
 };
 use crate::cluster::wire::{LENGTH_PREFIX_BYTES, MAX_FRAME_BYTES};
 use crate::config::parse_iroh_peer;
@@ -342,11 +342,9 @@ impl PeerTransport for IrohPeerTransport {
     }
 
     fn advertise_addr(&self, configured: Option<&str>) -> String {
-        let direct = self.advertise.or_else(|| {
-            configured
-                .map(str::trim)
-                .and_then(|addr| addr.parse().ok())
-        });
+        let direct = self
+            .advertise
+            .or_else(|| configured.map(str::trim).and_then(|addr| addr.parse().ok()));
         crate::iroh::format_peer_addr(&self.own_id, direct.or_else(|| self.node.direct_addr()))
     }
 
@@ -730,9 +728,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_nodes_converge_over_iroh() {
         let dir = tempfile::tempdir().unwrap();
-        let a = start(iroh_node(dir.path(), "a").await, "node-a", SECRET, vec![], None);
+        let a = start(
+            iroh_node(dir.path(), "a").await,
+            "node-a",
+            SECRET,
+            vec![],
+            None,
+        );
         let seed = a.node.dial_addr();
-        let b = start(iroh_node(dir.path(), "b").await, "node-b", SECRET, vec![seed], None);
+        let b = start(
+            iroh_node(dir.path(), "b").await,
+            "node-b",
+            SECRET,
+            vec![seed],
+            None,
+        );
 
         let both = ["node-a".to_owned(), "node-b".to_owned()];
         assert!(
@@ -761,7 +771,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_node_that_cannot_be_dialed_still_hears_back() {
         let dir = tempfile::tempdir().unwrap();
-        let a = start(iroh_node(dir.path(), "a").await, "node-a", SECRET, vec![], None);
+        let a = start(
+            iroh_node(dir.path(), "a").await,
+            "node-a",
+            SECRET,
+            vec![],
+            None,
+        );
         let seed = a.node.dial_addr();
         let b = start(
             iroh_node(dir.path(), "b").await,
@@ -792,7 +808,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_node_with_the_wrong_secret_never_joins() {
         let dir = tempfile::tempdir().unwrap();
-        let a = start(iroh_node(dir.path(), "a").await, "node-a", SECRET, vec![], None);
+        let a = start(
+            iroh_node(dir.path(), "a").await,
+            "node-a",
+            SECRET,
+            vec![],
+            None,
+        );
         let seed = a.node.dial_addr();
         let intruder = start(
             iroh_node(dir.path(), "x").await,
@@ -815,7 +837,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_frame_whose_sender_names_another_endpoint_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let a = start(iroh_node(dir.path(), "a").await, "node-a", SECRET, vec![], None);
+        let a = start(
+            iroh_node(dir.path(), "a").await,
+            "node-a",
+            SECRET,
+            vec![],
+            None,
+        );
         let b = iroh_node(dir.path(), "b").await;
         let x = iroh_node(dir.path(), "x").await;
 
@@ -878,7 +906,10 @@ mod tests {
         assert!(!transport.verify_sender(peer, Some("10.0.0.9:7946")));
 
         let advertised = transport.advertise_addr(None);
-        assert!(advertised.starts_with(&format!("{own}@127.0.0.1:")), "{advertised}");
+        assert!(
+            advertised.starts_with(&format!("{own}@127.0.0.1:")),
+            "{advertised}"
+        );
         assert_eq!(
             transport.advertise_addr(Some("203.0.113.5:7947")),
             format!("{own}@203.0.113.5:7947")

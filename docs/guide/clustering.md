@@ -98,6 +98,7 @@ AUTUMN_CLUSTER__SUSPICION_TIMEOUT_MS=2500
 | `node_id` | string | none | Stable node identity. Defaults to a per-boot random id. |
 | `push_interval_ms` | u64 | `500` | Base period of the state push, carrying ±20% per-node jitter. |
 | `suspicion_timeout_ms` | u64 | `2500` | Silence after which a peer is locally down and leaves the view. |
+| `transport` | `"tcp"` or `"iroh"` | `"tcp"` | How nodes reach each other. See [the iroh transport](#the-iroh-transport). |
 
 ### Validation
 
@@ -145,6 +146,29 @@ differ whenever the bind is a wildcard or the node sits behind NAT:
   contact; after that each node learns peers (and their advertised addresses)
   from the pushed state. Seeding one direction is enough — node B pointed at
   node A produces a two-member view on both.
+
+### The iroh transport
+
+With the `iroh` feature, `transport = "iroh"` runs the cluster on the
+[`[iroh]` endpoint](iroh.md). Nodes dial each other by endpoint id.
+
+- `seed_peers` are `<endpoint-id>` or `<endpoint-id>@<ip:port>`.
+- `bind_addr` is not used. The endpoint binds `[iroh] bind_addr`.
+- A node advertises `<endpoint-id>@<ip:port>`. `advertise_addr`, when set, is
+  the direct `ip:port` (for example, a port forward).
+- One QUIC connection carries frames in both directions. When a peer dials
+  this node, this node also writes to the peer on that connection. So a node
+  behind NAT that can dial out gets every push back: no one-way cluster.
+- Each frame goes on its own QUIC stream. The envelope, the MAC, the queues
+  and the farewell are the same as on TCP. QUIC also encrypts the frames.
+- The handshake proves the peer's endpoint id. A frame whose sender's own
+  record names another id is dropped (`reason="sender"`).
+- `[iroh] allowed_peers`, when set, limits which ids may connect.
+
+The shared secret is still the root of trust. A holder of the secret can
+gossip false records about other nodes. A node that sees a false record about
+itself refutes it at a higher incarnation. Keep the secret to the nodes you
+run, and set `allowed_peers`.
 
 ## Using the counter
 
