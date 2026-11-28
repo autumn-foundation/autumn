@@ -387,6 +387,7 @@ impl FrameVerifier {
     /// length cap, envelope parse, header checks, MAC, self-origin, replay
     /// watermark, payload parse. The payload is only parsed once the MAC has
     /// verified.
+    #[cfg(test)]
     pub fn accept(&mut self, frame: &[u8]) -> Result<(Envelope, ClusterMessage), RejectReason> {
         self.accept_checked(frame, |_, _| true)
     }
