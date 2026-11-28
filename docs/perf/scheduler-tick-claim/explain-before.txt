@@ -1,0 +1,65 @@
+rows=3364 expired=90
+n_live_tup=3342 n_dead_tup=1370
+== prune (table-wide)
+DELETE FROM autumn_scheduler_ticks WHERE expires_at < now()
+                                                                       QUERY PLAN                                                                       
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_scheduler_ticks  (cost=22.17..100.57 rows=0 width=0) (actual time=0.124..0.124 rows=0 loops=1)
+   Buffers: shared hit=113 dirtied=14
+   ->  Bitmap Heap Scan on public.autumn_scheduler_ticks  (cost=22.17..100.57 rows=760 width=6) (actual time=0.025..0.042 rows=91 loops=1)
+         Output: ctid
+         Recheck Cond: (autumn_scheduler_ticks.expires_at < now())
+         Heap Blocks: exact=13
+         Buffers: shared hit=17
+         ->  Bitmap Index Scan on idx_autumn_scheduler_ticks_expires_at  (cost=0.00..21.98 rows=760 width=0) (actual time=0.018..0.018 rows=91 loops=1)
+               Index Cond: (autumn_scheduler_ticks.expires_at < now())
+               Buffers: shared hit=4
+ Query Identifier: 1633351668469919288
+ Planning:
+   Buffers: shared hit=85
+ Planning Time: 0.250 ms
+ Execution Time: 0.200 ms
+(15 rows)
+
+== claim, losing (key holds a live row)
+INSERT INTO autumn_scheduler_ticks (key_prefix, task_name, tick_key, owner, expires_at) SELECT 'autumn:scheduler'::text, 'task-1'::text, 'task-1:1795887062'::text, 'replica-0'::text, now() + make_interval(secs => 301::float8) WHERE pg_try_advisory_xact_lock(42::int8) ON CONFLICT DO NOTHING RETURNING generation
+                                                                                                QUERY PLAN                                                                                                 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_scheduler_ticks  (cost=0.00..0.02 rows=1 width=152) (actual time=0.193..0.193 rows=0 loops=1)
+   Output: autumn_scheduler_ticks.generation
+   Conflict Resolution: NOTHING
+   Tuples Inserted: 0
+   Conflicting Tuples: 1
+   Buffers: shared hit=76 dirtied=1
+   ->  Result  (cost=0.00..0.02 rows=1 width=152) (actual time=0.062..0.062 rows=1 loops=1)
+         Output: 'autumn:scheduler'::text, 'task-1'::text, 'task-1:1795887062'::text, 'replica-0'::text, nextval('autumn_scheduler_ticks_generation_seq'::regclass), now(), (now() + '00:05:01'::interval)
+         One-Time Filter: pg_try_advisory_xact_lock('42'::bigint)
+         Buffers: shared hit=13 dirtied=1
+ Query Identifier: 1854994037219994430
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.082 ms
+ Execution Time: 0.217 ms
+(15 rows)
+
+== claim, winning (new key)
+INSERT INTO autumn_scheduler_ticks (key_prefix, task_name, tick_key, owner, expires_at) SELECT 'autumn:scheduler'::text, 'task-1'::text, 'task-1:explain'::text, 'replica-0'::text, now() + make_interval(secs => 301::float8) WHERE pg_try_advisory_xact_lock(42::int8) ON CONFLICT DO NOTHING RETURNING generation
+                                                                                               QUERY PLAN                                                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Insert on public.autumn_scheduler_ticks  (cost=0.00..0.02 rows=1 width=152) (actual time=0.212..0.213 rows=1 loops=1)
+   Output: autumn_scheduler_ticks.generation
+   Conflict Resolution: NOTHING
+   Tuples Inserted: 1
+   Conflicting Tuples: 0
+   Buffers: shared hit=85
+   ->  Result  (cost=0.00..0.02 rows=1 width=152) (actual time=0.069..0.069 rows=1 loops=1)
+         Output: 'autumn:scheduler'::text, 'task-1'::text, 'task-1:explain'::text, 'replica-0'::text, nextval('autumn_scheduler_ticks_generation_seq'::regclass), now(), (now() + '00:05:01'::interval)
+         One-Time Filter: pg_try_advisory_xact_lock('42'::bigint)
+         Buffers: shared hit=13
+ Query Identifier: 1854994037219994430
+ Planning:
+   Buffers: shared hit=3
+ Planning Time: 0.077 ms
+ Execution Time: 0.237 ms
+(15 rows)
+
