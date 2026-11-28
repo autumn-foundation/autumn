@@ -1,0 +1,17 @@
+$ cargo test -p autumn-web --test integration_tests cache_response_tenant_scope
+test integration::cache_response_tenant_scope::response_cache_never_serves_one_tenant_to_another ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2963 filtered out
+
+$ cargo test -p autumn-web --lib cache::
+test result: ok. 206 passed; 0 failed; 0 ignored; 0 measured; 8659 filtered out
+
+$ cargo test -p autumn-web --test integration_tests -- cache tenancy idempotency_middleware
+test result: ok. 160 passed; 0 failed; 31 ignored; 0 measured; 2773 filtered out
+
+$ cargo test -p autumn-web --test cache_global_integration
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ cargo clippy -p autumn-web --all-targets -- -D warnings
+no findings in autumn/src/cache/. (The local clippy 0.1.97 also reports
+`duration_suboptimal_units` and similar in files this change does not touch;
+the same count appears on trunk.)

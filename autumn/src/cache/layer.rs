@@ -90,7 +90,7 @@ fn cached_response_into_response(cached: CachedResponse) -> Option<axum::respons
 /// tenancy keeps its warm entries. A tenant (including an empty one) goes
 /// behind a `tenant=` marker that no URI starts with, length-prefixed so a
 /// `:` in the tenant id cannot shift into the URI.
-fn response_key<'a>(tenant: Option<&'a str>, uri: &'a http::Uri) -> ResponseKey<'a> {
+const fn response_key<'a>(tenant: Option<&'a str>, uri: &'a http::Uri) -> ResponseKey<'a> {
     ResponseKey { tenant, uri }
 }
 
