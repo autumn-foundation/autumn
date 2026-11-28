@@ -82,6 +82,11 @@ const RETRY_ABOVE_HANDSHAKES: usize = 64;
 /// Handshakes in progress above which new connections are refused.
 const MAX_HANDSHAKES: usize = 256;
 
+/// Request streams on one connection that may fail before their head is
+/// parsed. `h3` keeps the ID of each such stream until the connection
+/// closes, so the connection closes when there are more.
+const MAX_HEAD_FAILURES: usize = 32;
+
 /// Headers that HTTP/3 forbids (RFC 9114, section 4.2).
 const CONNECTION_HEADERS: [header::HeaderName; 5] = [
     header::CONNECTION,
@@ -361,7 +366,7 @@ impl Http3Listener {
 enum Next<R> {
     Drain,
     Request(R),
-    Reaped,
+    Reaped(Option<RequestOutcome>),
     /// The client closed, or the connection failed.
     Closed,
     /// No request for `keep_alive_timeout`.
@@ -437,6 +442,7 @@ async fn serve_connection<S, B>(
         };
 
     let mut requests = JoinSet::new();
+    let mut head_failures = 0usize;
     let mut idle_deadline = settings.keep_alive_timeout.map(|t| Instant::now() + t);
     let mut drain_deadline: Option<Instant> = None;
     let finished_cleanly = loop {
@@ -452,7 +458,9 @@ async fn serve_connection<S, B>(
             biased;
             () = shutdown.cancelled(), if drain_deadline.is_none() => Next::Drain,
             () = sleep_until(drain_deadline), if drain_deadline.is_some() => Next::GraceOver,
-            Some(_) = requests.join_next(), if !requests.is_empty() => Next::Reaped,
+            Some(joined) = requests.join_next(), if !requests.is_empty() => {
+                Next::Reaped(joined.ok())
+            }
             () = sleep_until(idle), if idle.is_some() => Next::Idle,
             accepted = h3_conn.accept() => match accepted {
                 Ok(Some(resolver)) => Next::Request(resolver),
@@ -482,7 +490,17 @@ async fn serve_connection<S, B>(
                     settings.head_deadline(),
                 ));
             }
-            Next::Reaped => {
+            Next::Reaped(outcome) => {
+                if outcome == Some(RequestOutcome::HeadFailed) {
+                    head_failures += 1;
+                    if head_failures > MAX_HEAD_FAILURES {
+                        tracing::debug!(
+                            peer = %peer,
+                            "HTTP/3 connection closed: too many request heads failed"
+                        );
+                        break false;
+                    }
+                }
                 if requests.is_empty() {
                     idle_deadline = settings.keep_alive_timeout.map(|t| Instant::now() + t);
                 }
@@ -538,12 +556,22 @@ fn strip_connection_headers(headers: &mut axum::http::HeaderMap) {
     }
 }
 
+/// How one request stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestOutcome {
+    /// The head was parsed. The stream got a response, or a reset.
+    Served,
+    /// The stream failed, or ran out of time, before its head was parsed.
+    HeadFailed,
+}
+
 async fn serve_request<S, B>(
     resolver: h3::server::RequestResolver<LimitedConnection, Bytes>,
     service: S,
     info: TlsConnectInfo,
     head_timeout: Duration,
-) where
+) -> RequestOutcome
+where
     S: tower::Service<Request<axum::body::Body>, Response = Response<B>, Error = Infallible>
         + Send
         + 'static,
@@ -556,11 +584,11 @@ async fn serve_request<S, B>(
             Ok(Ok(head)) => head,
             Ok(Err(e)) => {
                 tracing::debug!(peer = %info.peer, error = %e, "HTTP/3 request head rejected");
-                return;
+                return RequestOutcome::HeadFailed;
             }
             Err(_) => {
                 tracing::debug!(peer = %info.peer, "HTTP/3 request head timed out");
-                return;
+                return RequestOutcome::HeadFailed;
             }
         };
     let (mut send, recv) = stream.split();
@@ -571,7 +599,7 @@ async fn serve_request<S, B>(
         if send.send_response(rejected).await.is_ok() {
             let _ = send.finish().await;
         }
-        return;
+        return RequestOutcome::Served;
     }
     add_host_from_authority(&mut parts);
     parts.extensions.insert(axum::extract::ConnectInfo(info));
@@ -585,7 +613,7 @@ async fn serve_request<S, B>(
         .await
         .is_err()
     {
-        return;
+        return RequestOutcome::Served;
     }
     let mut body = axum::body::Body::new(body);
     while let Some(frame) = body.frame().await {
@@ -594,7 +622,7 @@ async fn serve_request<S, B>(
             Err(e) => {
                 tracing::debug!(error = %e, "HTTP/3 response body failed");
                 send.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
-                return;
+                return RequestOutcome::Served;
             }
         };
         let written = match frame.into_data() {
@@ -606,10 +634,11 @@ async fn serve_request<S, B>(
             },
         };
         if written.is_err() {
-            return;
+            return RequestOutcome::Served;
         }
     }
     let _ = send.finish().await;
+    RequestOutcome::Served
 }
 
 /// Give the request a `Host` header from `:authority` when it has none.

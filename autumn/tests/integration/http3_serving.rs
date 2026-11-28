@@ -608,6 +608,59 @@ async fn h3_closes_a_connection_after_the_keep_alive_timeout() {
     server.shutdown().await;
 }
 
+/// A bare QUIC connection with ALPN `h3`, for streams that an h3 client
+/// would never send.
+async fn connect_raw(addr: SocketAddr) -> (quinn::Endpoint, quinn::Connection) {
+    let mut tls = rustls::ClientConfig::builder_with_provider(autumn_web::tls::crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(RecordingVerifier::default()))
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+    let conn = endpoint
+        .connect(addr, "localhost")
+        .unwrap()
+        .await
+        .expect("QUIC connects");
+    (endpoint, conn)
+}
+
+/// Open `count` request streams that end before any HEADERS frame.
+async fn send_headless_streams(conn: &quinn::Connection, count: usize) {
+    for _ in 0..count {
+        let Ok((mut send, _recv)) = conn.open_bi().await else {
+            return;
+        };
+        let _ = send.finish();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn h3_closes_a_connection_with_many_failed_request_heads() {
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
+    let (_endpoint, conn) = connect_raw(server.addr).await;
+
+    // A few failed heads keep the connection.
+    send_headless_streams(&conn, 5).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        conn.close_reason().is_none(),
+        "a few failed heads are allowed"
+    );
+
+    // Many failed heads close it: h3 keeps the ID of each one.
+    send_headless_streams(&conn, 60).await;
+    tokio::time::timeout(DEADLINE, conn.closed())
+        .await
+        .expect("the server closes the connection");
+    server.shutdown().await;
+}
+
 fn required_verifier(trust: &TrustFixture) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
     let (verifier, _reloader) = autumn_web::tls::client_auth::ClientTrustReloader::load(
         trust.bundle.clone(),
