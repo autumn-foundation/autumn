@@ -19,6 +19,43 @@ struct TextFixture {
     generations: bool,
     /// Each snapshot differs, also with no write.
     noisy_snapshot: bool,
+    /// Ship in `Generations` mode through `fleet::install_replication`, as
+    /// an engine plugin does at boot.
+    installer: bool,
+    /// The replications the installer started.
+    #[cfg(feature = "sqlite")]
+    started: Started,
+}
+
+/// Stops each replication loop when the fixture goes.
+#[cfg(feature = "sqlite")]
+#[derive(Default)]
+struct Started(
+    std::sync::Mutex<Vec<std::sync::Arc<crate::db::fleet_replication::FleetReplication>>>,
+);
+
+#[cfg(feature = "sqlite")]
+impl Started {
+    fn push(&self, replication: &std::sync::Arc<crate::db::fleet_replication::FleetReplication>) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(std::sync::Arc::clone(replication));
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl Drop for Started {
+    fn drop(&mut self) {
+        for replication in self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+        {
+            replication.stop();
+        }
+    }
 }
 
 impl FleetFixture for TextFixture {
@@ -33,8 +70,7 @@ impl FleetFixture for TextFixture {
             skip_epoch: self.skip_epoch,
             keep_on_remove: self.keep_on_remove,
             noisy_snapshot: self.noisy_snapshot,
-            every: self
-                .generations
+            every: (self.generations || self.installer)
                 .then_some(std::time::Duration::from_hours(1)),
             ..TextEngine::new(self.bytes)
         };
@@ -46,6 +82,18 @@ impl FleetFixture for TextFixture {
         #[cfg(feature = "sqlite")]
         if self.generations {
             replicate(&fleet, &scratch)?;
+        }
+        #[cfg(feature = "sqlite")]
+        if self.installer {
+            let state = crate::fleet::replicated_state(&scratch).await;
+            let outcome = crate::fleet::install_replication(&state, &fleet, &config)
+                .map_err(|e| e.to_string())?;
+            if outcome != crate::fleet::ReplicationInstall::Installed {
+                return Err(format!("the installer did not install: {outcome:?}"));
+            }
+            if let Some(replication) = fleet.replication() {
+                self.started.push(replication);
+            }
         }
         let _ = scratch;
         Ok(fleet)
@@ -64,7 +112,7 @@ impl FleetFixture for TextFixture {
         fleet: &DatabaseFleet<TextEngine>,
         key: &crate::fleet_layout::FleetDbKey,
     ) -> Option<Result<(), crate::db::fleet::FleetError>> {
-        if self.generations {
+        if self.generations || self.installer {
             Some(fleet.restore_latest(key).await)
         } else {
             None
@@ -306,4 +354,171 @@ fn a_snapshot_entry_takes_the_target_name() {
         std::fs::read_to_string(target.join("000001.sst")).unwrap(),
         "sst"
     );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fixture_on_the_boot_installer_passes_every_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = TextFixture {
+        bytes: 100,
+        installer: true,
+        ..TextFixture::default()
+    };
+    let report = run_fleet_conformance("text", &fixture, tmp.path()).await;
+    for check in &report.checks {
+        assert_eq!(
+            check.status,
+            CheckStatus::Pass,
+            "{}: {}",
+            check.name,
+            check.message
+        );
+    }
+}
+
+/// The tenants and rows of the takeover tests.
+const TENANTS: [&str; 3] = ["acme", "globex", "initech"];
+const ROWS: usize = 1_000;
+
+/// One host of an engine fleet with ownership of every slot. Each host has
+/// its own volume. The hosts share the control database, the replica and
+/// the ownership store. `install`: the plugin calls the boot installer.
+struct PluginHost {
+    fleet: DatabaseFleet<TextEngine>,
+    #[cfg(feature = "sqlite")]
+    _started: Started,
+}
+
+async fn boot_host(
+    scratch: &std::path::Path,
+    volume: &str,
+    store: &std::sync::Arc<crate::db::fleet_ownership::MemoryOwnership>,
+    install: bool,
+) -> PluginHost {
+    use crate::db::fleet_ownership::{FleetOwnership, OwnerId, SlotRange};
+
+    let config = DatabaseFleetConfig {
+        restore_missing: true,
+        ownership: Some(crate::config::FleetOwnershipConfig {
+            owner: volume.to_owned(),
+            slots: Vec::new(),
+            lease_secs: 30,
+        }),
+        ..super::config(&scratch.join(volume))
+    };
+    let engine = TextEngine {
+        every: Some(std::time::Duration::from_hours(1)),
+        ..TextEngine::new(100)
+    };
+    let fleet = DatabaseFleet::with_engine(&config, engine).unwrap();
+    #[cfg(feature = "sqlite")]
+    let started = Started::default();
+    #[cfg(feature = "sqlite")]
+    if install {
+        // What the plugin does at boot. The app adds no code.
+        let state = crate::fleet::replicated_state(scratch).await;
+        let outcome = crate::fleet::install_replication(&state, &fleet, &config).unwrap();
+        assert_eq!(outcome, crate::fleet::ReplicationInstall::Installed);
+        started.push(fleet.replication().unwrap());
+    }
+    #[cfg(not(feature = "sqlite"))]
+    let _ = install;
+    let ownership = std::sync::Arc::new(
+        FleetOwnership::new(
+            std::sync::Arc::clone(store) as _,
+            OwnerId::new(volume).unwrap(),
+            vec![SlotRange::ALL],
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    fleet.start_ownership(ownership).await.unwrap();
+    PluginHost {
+        fleet,
+        #[cfg(feature = "sqlite")]
+        _started: started,
+    }
+}
+
+/// Host A writes `ROWS` rows into each tenant. With `ship`, the ship worker
+/// ran after the last write.
+async fn write_rows(host: &PluginHost, ship: bool) {
+    for tenant in TENANTS {
+        let key = host.fleet.key_for(tenant).unwrap();
+        let db = host.fleet.open(&key).await.unwrap();
+        for row in 0..ROWS {
+            TextEngine::write(db.handle(), &format!("{tenant}-{row}")).unwrap();
+        }
+        drop(db);
+        if ship {
+            host.fleet.ship_now(&key).await.unwrap();
+        }
+    }
+}
+
+/// The rows of each tenant on `host`.
+async fn rows(host: &PluginHost) -> Vec<usize> {
+    let mut counts = Vec::new();
+    for tenant in TENANTS {
+        let key = host.fleet.key_for(tenant).unwrap();
+        let db = host.fleet.open(&key).await.unwrap();
+        counts.push(TextEngine::read(db.handle()).unwrap().len());
+    }
+    counts
+}
+
+/// The ownership store of the takeover tests, on a clock the test moves.
+fn store() -> (
+    std::sync::Arc<crate::time::TickingClock>,
+    std::sync::Arc<crate::db::fleet_ownership::MemoryOwnership>,
+) {
+    let clock = std::sync::Arc::new(crate::time::TickingClock::starting_at(
+        crate::time::ClockSource::now(&crate::time::SystemClock),
+    ));
+    let store = std::sync::Arc::new(crate::db::fleet_ownership::MemoryOwnership::new(
+        std::sync::Arc::clone(&clock) as _,
+    ));
+    (clock, store)
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_standby_restores_every_tenant_on_takeover_with_no_app_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (clock, store) = store();
+    let a = boot_host(tmp.path(), "host-a", &store, true).await;
+    write_rows(&a, true).await;
+    // `kill -9`: host A stops with no close and no release. Its lease lapses.
+    drop(a);
+    clock.advance(std::time::Duration::from_secs(31));
+
+    let b = boot_host(tmp.path(), "host-b", &store, true).await;
+
+    assert_eq!(rows(&b).await, [ROWS; 3], "every row comes back");
+    b.fleet.close_all().await;
+}
+
+/// The failure the installer removes: a plugin that installs no replica.
+/// The standby opens empty databases, and each host logs one warning.
+#[tokio::test]
+async fn without_the_installer_a_takeover_opens_empty_databases_and_warns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (clock, store) = store();
+    let warnings = crate::db::fleet::test_engine::Warnings::capture();
+    let a = boot_host(tmp.path(), "host-a", &store, false).await;
+    write_rows(&a, false).await;
+    drop(a);
+    clock.advance(std::time::Duration::from_secs(31));
+
+    let b = boot_host(tmp.path(), "host-b", &store, false).await;
+
+    assert_eq!(rows(&b).await, [0; 3], "the standby has no replica");
+    assert!(b.fleet.unreplicated_warned());
+    assert_eq!(
+        warnings.matching(crate::db::fleet::UNREPLICATED_WARNING),
+        2,
+        "one per fleet: {warnings:?}"
+    );
+    b.fleet.close_all().await;
 }

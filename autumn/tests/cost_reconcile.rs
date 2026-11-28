@@ -249,9 +249,14 @@ async fn per_tenant_cost_reconciles_with_process_cpu() {
         "the tenant totals add up to the metered total"
     );
 
-    // acme does three times the work of globex.
+    // acme does three times the work of globex. Each request also has a
+    // fixed cost that does not change with the work. The noop route measured
+    // it. Remove it from both tenants before the compare.
+    let fixed = u64::try_from(noop_metered.as_micros()).unwrap_or(u64::MAX) / u64::from(2 * ROUNDS)
+        * u64::from(ROUNDS);
     #[allow(clippy::cast_precision_loss)]
-    let share = acme.cpu_micros as f64 / globex.cpu_micros as f64;
+    let share = acme.cpu_micros.saturating_sub(fixed) as f64
+        / globex.cpu_micros.saturating_sub(fixed).max(1) as f64;
     assert!(
         (2.5..=3.5).contains(&share),
         "acme/globex CPU share {share:.2}"

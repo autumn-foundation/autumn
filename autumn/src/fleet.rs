@@ -4,6 +4,9 @@
 //! the same for a job or a task, with no request. Both return a
 //! [`FleetLease`]: the engine handle, held open until the lease drops.
 //!
+//! With the `sqlite` feature, `install_replication` connects the fleet of a
+//! plugin to `[replication]` at boot.
+//!
 //! Core has no generic extractor. Each engine plugin writes its own, with its
 //! own name and error mapping:
 //!
@@ -256,6 +259,16 @@ fn control_store(state: &AppState) -> Option<Arc<dyn SlotOwnershipStore>> {
 const fn control_store(_: &AppState) -> Option<Arc<dyn SlotOwnershipStore>> {
     None
 }
+
+#[cfg(feature = "sqlite")]
+mod replication;
+
+#[cfg(feature = "sqlite")]
+pub(crate) use replication::ReplicaSource;
+#[cfg(all(test, feature = "sqlite"))]
+pub(crate) use replication::replicated_state;
+#[cfg(feature = "sqlite")]
+pub use replication::{InstallReplicationError, ReplicationInstall, install_replication};
 
 #[cfg(test)]
 mod tests;

@@ -284,12 +284,12 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
     PluginSurface {
         name: "db::fleet_engine",
         tier: SurfaceTier::Experimental,
-        note: "`FleetEngine`, `ShipMode` and `DatabaseFleet::with_engine`: one database engine of a fleet, and how core ships it (`ship_now`, `restore_latest`, `replication::FencedDestination`). Requires the `db` feature. `install_replication` and `ShipMode::Generations` need the `sqlite` feature. Experimental: the trait may change in any release while the fleet seams land (ADR 0040).",
+        note: "`FleetEngine`, `ShipMode` and `DatabaseFleet::with_engine`: one database engine of a fleet, and how core ships it (`ship_now`, `restore_latest`, `replication::FencedDestination`). Requires the `db` feature. `DatabaseFleet::install_replication` and `ShipMode::Generations` need the `sqlite` feature. Experimental: the trait may change in any release while the fleet seams land (ADR 0040).",
     },
     PluginSurface {
         name: "fleet",
         tier: SurfaceTier::Experimental,
-        note: "`resolve`, `resolve_key`, `FleetLease`, `fleet_of` and `ownership_store`: the request path an engine plugin's fleet extractor calls. Also `FleetDatabase::sidecar_replica` and `replication::ScopedDestination` for a sidecar engine (requires the `db` feature). Experimental while the fleet seams land (ADR 0040).",
+        note: "`resolve`, `resolve_key`, `FleetLease`, `fleet_of` and `ownership_store`: the request path an engine plugin's fleet extractor calls. `install_replication` (with the `sqlite` feature): connects the fleet to `[replication]` at boot. Also `FleetDatabase::sidecar_replica` and `replication::ScopedDestination` for a sidecar engine (requires the `db` feature). Experimental while the fleet seams land (ADR 0040).",
     },
     PluginSurface {
         name: "form::FieldRenderer",

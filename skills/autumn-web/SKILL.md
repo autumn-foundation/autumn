@@ -3371,6 +3371,15 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   hook ships through `db.sidecar_replica("duckdb")`, a `ScopedDestination`
   that refuses keys outside `<key prefix>/duckdb/` and writes after a close or
   a fence. Guide: "Writing a fleet extractor" in `docs/guide/sqlite-fleet.md`.
+- Replicate an engine plugin's fleet with
+  `autumn_web::fleet::install_replication(&state, &fleet, &config)` (needs
+  `sqlite`), not a hand-built `FleetReplication`. Call it in the plugin's
+  `on_startup`, after `DatabaseFleet::with_engine`, before the first open.
+  It gives the same parts as `[database.fleet]`: replica, tombstones,
+  `replication:fleet`, loop. `[replication]` off: `NoReplication`. A second
+  fleet on one replica root: `RootInUse`. Without it, a standby that becomes
+  the owner opens empty databases; a fleet with ownership and no replica logs one
+  warning. Guide: "Shipping a plugin engine".
 - Cross-tenant analytics (0.10.0, issue #3236): query the lake, not the volume.
   `fleet.lake()?.materialize().await?.query(sql)`
   (`autumn_web::db::fleet_lake`) restores each live tenant from its replica

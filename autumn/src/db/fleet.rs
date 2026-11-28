@@ -115,7 +115,6 @@ mod replica {
             false
         }
 
-        #[allow(dead_code)]
         pub(super) const fn replicates(&self) -> bool {
             false
         }
@@ -274,6 +273,18 @@ const DEFAULT_OPEN_WAIT: Duration = Duration::from_secs(5);
 
 /// How often a drain checks whether the last use of a database has ended.
 const DRAIN_POLL: Duration = Duration::from_millis(20);
+
+/// The warning for a fleet with ownership and no replica.
+#[cfg(feature = "sqlite")]
+pub(crate) const UNREPLICATED_WARNING: &str = "fleet ownership is on, but nothing replicates \
+     this fleet: a standby that becomes the owner opens empty databases. Connect the fleet to \
+     [replication] with autumn_web::fleet::install_replication at boot";
+
+/// The warning for a fleet with ownership and no replica.
+#[cfg(not(feature = "sqlite"))]
+pub(crate) const UNREPLICATED_WARNING: &str = "fleet ownership is on, but nothing replicates \
+     this fleet: a standby that becomes the owner opens empty databases. Fleet replication needs \
+     the sqlite feature";
 
 /// How long a close waits for the workers of one database to stop. Workers
 /// of different databases stop together, so this also bounds a shutdown.
@@ -1128,6 +1139,8 @@ struct Inner<E: FleetEngine> {
     ownership: std::sync::OnceLock<Arc<super::fleet_ownership::FleetOwnership>>,
     /// The shared volume lock held while ownership is installed.
     volume_lock: Mutex<Option<VolumeLock>>,
+    /// Set when the fleet logged [`UNREPLICATED_WARNING`].
+    unreplicated_warned: AtomicBool,
     state: Mutex<State<E>>,
     lifecycle: std::sync::RwLock<Vec<Arc<dyn FleetLifecycle<E>>>>,
     counters: Counters,
@@ -1214,6 +1227,7 @@ impl<E: FleetEngine> DatabaseFleet<E> {
                 replication: std::sync::OnceLock::new(),
                 ownership: std::sync::OnceLock::new(),
                 volume_lock: Mutex::new(None),
+                unreplicated_warned: AtomicBool::new(false),
                 state: Mutex::new(State::default()),
                 lifecycle: std::sync::RwLock::new(Vec::new()),
                 counters: Counters::default(),
@@ -1286,6 +1300,32 @@ impl<E: FleetEngine> DatabaseFleet<E> {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(hooks);
+    }
+
+    /// Logs [`UNREPLICATED_WARNING`] once for this fleet. It logs only when
+    /// `ownership` is on, no replica is installed, and the engine is not in
+    /// `Rebuild` mode. Returns `true` when this call logged it.
+    pub(crate) fn warn_if_unreplicated(&self, ownership: bool) -> bool {
+        if !ownership
+            || self.inner.unreplicated_warned.load(Ordering::Acquire)
+            || self.replicates()
+            || matches!(self.inner.engine.ship_mode(), ShipMode::Rebuild)
+            || self.inner.unreplicated_warned.swap(true, Ordering::AcqRel)
+        {
+            return false;
+        }
+        tracing::warn!(
+            root = %self.root().display(),
+            engine = std::any::type_name::<E>(),
+            "{UNREPLICATED_WARNING}"
+        );
+        true
+    }
+
+    /// Whether the fleet logged [`UNREPLICATED_WARNING`].
+    #[cfg(test)]
+    pub(crate) fn unreplicated_warned(&self) -> bool {
+        self.inner.unreplicated_warned.load(Ordering::Acquire)
     }
 
     fn hooks(&self) -> Vec<Arc<dyn FleetLifecycle<E>>> {
@@ -2057,6 +2097,9 @@ impl<E: FleetEngine> DatabaseFleet<E> {
         let path = self.path_of(&key);
         let name = key.name();
         check_contained(self.root(), &path)?;
+        // Core cannot see the fleet of a plugin at boot. Thus the first open
+        // logs the warning when the plugin installed no replica.
+        self.warn_if_unreplicated(self.inner.ownership.get().is_some());
         let mut existed = self.inner.engine.exists(&path);
         if !existed && restore {
             existed = self.restore_missing(&key, &path).await?;

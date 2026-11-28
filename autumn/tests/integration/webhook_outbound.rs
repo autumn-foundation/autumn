@@ -6,6 +6,11 @@ use autumn_web::webhook_outbound::{
 use std::sync::Arc;
 use std::time::Duration;
 
+/// How long a test waits for the delivery state. The wait ends as soon as
+/// the state holds. A slow CI runner needs more than 5 seconds for five
+/// attempts.
+const POLL_BUDGET: Duration = Duration::from_secs(30);
+
 /// Poll `condition` every 10 ms until it returns `true` or `timeout` elapses.
 ///
 /// Replaces fixed `tokio::time::sleep` calls that are fragile on slow CI
@@ -94,7 +99,7 @@ async fn test_webhook_outbound_lifecycle() {
     // 5. Wait for background delivery job to execute.
     //    response_status is set after the HTTP call; is_dlq covers permanent failure.
     //    Do NOT poll on logs.is_empty() — the log is created BEFORE the HTTP call.
-    poll_until(Duration::from_secs(5), || {
+    poll_until(POLL_BUDGET, || {
         let store = store.clone();
         async move {
             store
@@ -188,7 +193,7 @@ async fn test_webhook_outbound_retries_and_dlq() {
     // Wait for the first attempt and all subsequent retries (max_attempts = 5).
     //    All retries update the same log entry in place; is_dlq is set only
     //    after the final attempt exhausts max_attempts.
-    poll_until(Duration::from_secs(5), || {
+    poll_until(POLL_BUDGET, || {
         let store = store.clone();
         async move {
             store
@@ -277,7 +282,7 @@ async fn test_webhook_outbound_failure_caps_deactivation() {
         .unwrap();
 
     // Wait for attempts to fail and subscription to be marked Failed
-    poll_until(Duration::from_secs(5), || {
+    poll_until(POLL_BUDGET, || {
         let store = store.clone();
         async move {
             store
@@ -366,7 +371,7 @@ async fn test_webhook_outbound_actuator_endpoints() {
         .unwrap();
 
     // Wait for it to fail permanently (5 attempts)
-    poll_until(Duration::from_secs(5), || {
+    poll_until(POLL_BUDGET, || {
         let store = store.clone();
         async move {
             store
