@@ -3001,6 +3001,25 @@ for removed in removed_sketches.iter().filter_map(|b| MinHash::from_bytes(b)) {
 }
 ```
 
+### How often has this key been seen? — `frequency` (unreleased)
+
+To count failed logins per IP, hits per query or timeouts per endpoint for
+*every* key, not only the top ones (`heavy_hitters`), use
+`autumn_web::frequency::FrequencyCounter` (no feature, std only). It is a
+Count-Min sketch: `new(epsilon, delta)` sizes a fixed grid so an estimate is
+never below the truth and above it by at most `epsilon × total` with
+probability `1 - delta` (0.001 / 0.01 is about 106 KiB). `error_bound()` reads
+that overcount now. `take()` swaps in an empty sketch for fixed windows;
+sketches of the same shape `merge` exactly, and `to_bytes`/`from_bytes` ship
+them between replicas:
+
+```rust
+let failures = FrequencyCounter::new(0.001, 0.01);
+if failures.increment(&client_ip) > 20 { return Err(too_many_attempts()); }
+let last_hour = failures.take(); // on a timer: start a fresh window
+fleet.merge(&CountMinSketch::from_bytes(&peer_bytes).unwrap())?; // ShapeMismatch if sized differently
+```
+
 ### Runtime log levels (0.6.0)
 
 `PUT /actuator/loggers/{name}` now changes the **live** `tracing` subscriber,
