@@ -242,6 +242,34 @@ mod docker {
         outbox::ensure_schema(&single).await.unwrap();
     }
 
+    /// A pool of one has no connection to spare for the background build of
+    /// the delivered-logs index, so the webhook store's `ensure_schema` skips
+    /// it (and still succeeds).
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_sql_webhook_store_ensure_schema_skips_the_index_build_on_a_single_connection_pool()
+    {
+        use autumn_web::webhook_outbound::SqlOutboundWebhookStore;
+        use diesel_async::AsyncPgConnection;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+        let db = autumn_web::test::TestDb::shared().await;
+        SqlOutboundWebhookStore::new(db.pool())
+            .ensure_schema()
+            .await
+            .unwrap();
+        let single: PgPool = Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            db.url(),
+        ))
+        .max_size(1)
+        .build()
+        .unwrap();
+        SqlOutboundWebhookStore::new(single)
+            .ensure_schema()
+            .await
+            .unwrap();
+    }
+
     /// Sent rows that the purge has not deleted yet. Their `seq` is lower than
     /// the `seq` of each pending row.
     const SENT_ROWS: i64 = 50_000;
@@ -415,6 +443,95 @@ mod docker {
             reads < SENT_ROWS / 10,
             "the relay read {reads} rows of autumn_outbox; \
              it must not read the {SENT_ROWS} sent rows"
+        );
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct PlanLine {
+        #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+        line: String,
+    }
+
+    /// Tables made before `idx_autumn_webhook_deliveries_delivered` existed
+    /// get the index from `ensure_schema`, built in the background (it must
+    /// not delay boot), and the purge's predicate matches the index's.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_sql_webhook_store_ensure_schema_adds_delivered_index_to_existing_tables() {
+        use diesel_async::RunQueryDsl as _;
+
+        let pool = autumn_web::test::TestDb::shared().await.pool();
+        let store = autumn_web::webhook_outbound::SqlOutboundWebhookStore::new(pool.clone());
+        store.ensure_schema().await.unwrap();
+        let mut conn = pool.get().await.unwrap();
+        diesel::sql_query("DROP INDEX IF EXISTS idx_autumn_webhook_deliveries_delivered")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        store.ensure_schema().await.unwrap();
+
+        // A concurrent build is in the catalog with `indisvalid = false` first.
+        let mut valid = false;
+        for _ in 0..100 {
+            let rows = diesel::sql_query(
+                "SELECT i.indisvalid AS valid FROM pg_index i \
+                 JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE c.relname = 'idx_autumn_webhook_deliveries_delivered'",
+            )
+            .load::<IndexValid>(&mut *conn)
+            .await
+            .unwrap();
+            if rows.len() == 1 && rows[0].valid {
+                valid = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            valid,
+            "ensure_schema builds the delivered-logs index in the background"
+        );
+
+        // Once the index exists, the background task finds it and sends no DDL.
+        store.ensure_schema().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let rows = diesel::sql_query(
+            "SELECT i.indisvalid AS valid FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             WHERE c.relname = 'idx_autumn_webhook_deliveries_delivered'",
+        )
+        .load::<IndexValid>(&mut *conn)
+        .await
+        .unwrap();
+        assert!(rows.len() == 1 && rows[0].valid, "one valid index stays");
+
+        // The plan of the purge's DELETE can use the index: its predicate
+        // implies the index's.
+        diesel::sql_query("SET enable_seqscan = off")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let plan = diesel::sql_query(
+            "EXPLAIN (COSTS OFF) DELETE FROM autumn_webhook_deliveries \
+             WHERE logged_at < 1 AND NOT is_dlq \
+             AND response_status BETWEEN 200 AND 299",
+        )
+        .load::<PlanLine>(&mut *conn)
+        .await;
+        diesel::sql_query("RESET enable_seqscan")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let plan = plan.unwrap();
+        assert!(
+            plan.iter().any(|step| step
+                .line
+                .contains("idx_autumn_webhook_deliveries_delivered")),
+            "the purge must be able to read idx_autumn_webhook_deliveries_delivered: {:?}",
+            plan.iter()
+                .map(|step| step.line.as_str())
+                .collect::<Vec<_>>()
         );
     }
 }

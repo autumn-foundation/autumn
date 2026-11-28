@@ -59,10 +59,44 @@ CREATE TABLE IF NOT EXISTS autumn_webhook_deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_autumn_webhook_deliveries_dlq
     ON autumn_webhook_deliveries (logged_at)
-    WHERE is_dlq;";
+    WHERE is_dlq;
+CREATE INDEX IF NOT EXISTS idx_autumn_webhook_deliveries_delivered
+    ON autumn_webhook_deliveries (logged_at)
+    WHERE NOT is_dlq AND response_status BETWEEN 200 AND 299;";
 
 #[cfg(not(feature = "sqlite"))]
 const SCHEMA_LOCK_KEY: i64 = 0x0A17_0B0C_0001_3062;
+
+/// The index `purge_deliveries_before` reads, for tables made before it
+/// existed. Its predicate is the purge's, so it holds only delivered logs.
+#[cfg(not(feature = "sqlite"))]
+const DELIVERED_INDEX_SQL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_autumn_webhook_deliveries_delivered \
+     ON autumn_webhook_deliveries (logged_at) \
+     WHERE NOT is_dlq AND response_status BETWEEN 200 AND 299";
+
+/// Add the delivered-logs index to tables made before it existed (Postgres).
+///
+/// Without it the purge reads the whole delivery log to find the expired
+/// slice. The build is `CONCURRENTLY`, so it blocks no writes.
+/// [`SqlOutboundWebhookStore::ensure_schema`] runs it in a background task,
+/// because the build waits for older transactions on the table and must not
+/// delay boot. A role that cannot create indexes keeps working, only slower:
+/// the failure is a warning. After a failed build, drop the invalid
+/// `idx_autumn_webhook_deliveries_delivered` and restart.
+#[cfg(not(feature = "sqlite"))]
+async fn build_delivered_index(pool: &Pool<RuntimeConnection>) -> Result<(), String> {
+    let mut conn = pool.get().await.map_err(|error| error.to_string())?;
+    let present =
+        crate::outbox::tables_exist(&mut conn, &["idx_autumn_webhook_deliveries_delivered"])
+            .await
+            .map_err(|error| error.to_string())?;
+    if present {
+        return Ok(());
+    }
+    conn.batch_execute(DELIVERED_INDEX_SQL)
+        .await
+        .map_err(|error| error.to_string())
+}
 
 const UPSERT_SUBSCRIPTION_SQL: &str = "INSERT INTO autumn_webhook_subscriptions \
      (id, target_url, event_topics, secret, status, consecutive_failures) \
@@ -288,6 +322,24 @@ impl SqlOutboundWebhookStore {
                 // rights to create or own them.
                 let tables = ["autumn_webhook_subscriptions", "autumn_webhook_deliveries"];
                 if crate::outbox::tables_exist(&mut conn, &tables).await? {
+                    // Off the startup path: the build waits for every older
+                    // transaction on the table, however long that takes.
+                    // The build holds a pooled connection the whole time. A pool
+                    // of one has none to spare.
+                    if self.pool.status().max_size < 2 {
+                        tracing::warn!(
+                            "pool too small to build idx_autumn_webhook_deliveries_delivered in \
+                             the background; run `{DELIVERED_INDEX_SQL}` by hand to speed up \
+                             purge_deliveries_before"
+                        );
+                        return Ok(());
+                    }
+                    let pool = self.pool.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = build_delivered_index(&pool).await {
+                            tracing::warn!(%error, "could not build idx_autumn_webhook_deliveries_delivered; purge_deliveries_before reads the whole delivery log");
+                        }
+                    });
                     return Ok(());
                 }
                 format!("SELECT pg_advisory_xact_lock({SCHEMA_LOCK_KEY});\n{WEBHOOK_SCHEMA_SQL}")
