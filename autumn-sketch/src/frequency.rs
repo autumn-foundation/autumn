@@ -113,30 +113,38 @@ pub struct CountMinSketch {
 }
 
 impl CountMinSketch {
-    /// The most counters in one row: 2^20, for an `epsilon` near 2.6e-6.
+    /// The most counters in one row: 2^20.
     pub const MAX_WIDTH: usize = 1 << 20;
-    /// The most rows: 16, for a `delta` near 1e-7.
+    /// The most rows: 16.
     pub const MAX_DEPTH: usize = 16;
+    /// The smallest `epsilon` a row of [`MAX_WIDTH`](Self::MAX_WIDTH)
+    /// counters delivers: `e / 2^20`, about 2.6e-6.
+    #[allow(clippy::cast_precision_loss)]
+    pub const MIN_EPSILON: f64 = std::f64::consts::E / Self::MAX_WIDTH as f64;
+    /// The smallest `delta` [`MAX_DEPTH`](Self::MAX_DEPTH) rows deliver:
+    /// `e^-16`, about 1.1e-7.
+    pub const MIN_DELTA: f64 = 1.125_351_747_192_591_2e-7;
 
     /// An empty sketch whose estimates are within `epsilon × total` of the
     /// truth with probability `1 - delta`. `epsilon` is clamped to
-    /// `1e-6..=0.5` and `delta` to `1e-7..=0.5`; a NaN takes the default
-    /// (0.001 and 0.01). The grid is `ceil(e / epsilon)` wide and
-    /// `ceil(ln(1 / delta))` deep, within [`MAX_WIDTH`](Self::MAX_WIDTH) and
-    /// [`MAX_DEPTH`](Self::MAX_DEPTH). The same arguments always give the
-    /// same shape.
+    /// between [`MIN_EPSILON`](Self::MIN_EPSILON) and 0.5, and `delta` to
+    /// between [`MIN_DELTA`](Self::MIN_DELTA) and 0.5: the most the size caps can
+    /// deliver, so the guarantee holds for whatever the clamp leaves; a NaN
+    /// takes the default (0.001 and 0.01). The grid is `ceil(e / epsilon)`
+    /// wide and `ceil(ln(1 / delta))` deep. The same arguments always give
+    /// the same shape.
     #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn new(epsilon: f64, delta: f64) -> Self {
         let epsilon = if epsilon.is_nan() {
             0.001
         } else {
-            epsilon.clamp(1e-6, 0.5)
+            epsilon.clamp(Self::MIN_EPSILON, 0.5)
         };
         let delta = if delta.is_nan() {
             0.01
         } else {
-            delta.clamp(1e-7, 0.5)
+            delta.clamp(Self::MIN_DELTA, 0.5)
         };
         // Finite and clamped, so the casts are exact.
         let width = (std::f64::consts::E / epsilon)
@@ -442,6 +450,37 @@ mod tests {
         assert_eq!(loose.depth(), 1);
         let nan = CountMinSketch::new(f64::NAN, f64::NAN);
         assert_eq!(nan, CountMinSketch::new(0.001, 0.01));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn the_shape_delivers_the_accuracy_it_was_asked_for() {
+        // Down to the caps, the grid is never weaker than the clamped request.
+        for epsilon in [
+            1e-9,
+            1e-6,
+            2e-6,
+            CountMinSketch::MIN_EPSILON,
+            1e-4,
+            0.01,
+            0.5,
+        ] {
+            for delta in [1e-12, 1e-7, CountMinSketch::MIN_DELTA, 1e-4, 0.01, 0.5] {
+                let sketch = CountMinSketch::new(epsilon, delta);
+                let want_epsilon = epsilon.max(CountMinSketch::MIN_EPSILON);
+                let want_delta = delta.max(CountMinSketch::MIN_DELTA);
+                let got_epsilon = std::f64::consts::E / sketch.width() as f64;
+                let got_delta = (-(sketch.depth() as f64)).exp();
+                assert!(
+                    got_epsilon <= want_epsilon * (1.0 + 1e-12),
+                    "epsilon {epsilon}: grid gives {got_epsilon}"
+                );
+                assert!(
+                    got_delta <= want_delta * (1.0 + 1e-12),
+                    "delta {delta}: grid gives {got_delta}"
+                );
+            }
+        }
     }
 
     #[test]
