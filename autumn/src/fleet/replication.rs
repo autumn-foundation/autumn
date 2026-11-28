@@ -229,10 +229,17 @@ fn build(
 /// in `scratch/replicas` and a control database at `scratch/control.db`.
 #[cfg(test)]
 pub async fn replicated_state(scratch: &std::path::Path) -> AppState {
+    replicated_state_with(scratch, true).await
+}
+
+/// As [`replicated_state`]. Without `control`, the state has no control
+/// database pool.
+#[cfg(test)]
+pub async fn replicated_state_with(scratch: &std::path::Path, control: bool) -> AppState {
     let replicas = scratch.join("replicas");
     std::fs::create_dir_all(&replicas).expect("replica directory");
     let control_url = format!("sqlite://{}", scratch.join("control.db").display());
-    let control = crate::db::create_pool(&crate::config::DatabaseConfig {
+    let pool = crate::db::create_pool(&crate::config::DatabaseConfig {
         url: Some(control_url.clone()),
         ..Default::default()
     })
@@ -255,7 +262,11 @@ pub async fn replicated_state(scratch: &std::path::Path) -> AppState {
     .await
     .expect("the build thread")
     .expect("a file destination builds");
-    let state = AppState::for_test().with_pool(control);
+    let state = if control {
+        AppState::for_test().with_pool(pool)
+    } else {
+        AppState::for_test()
+    };
     ReplicaSource::from_runtime(&runtime, Duration::from_secs(30), Duration::from_secs(5))
         .install(&state);
     state

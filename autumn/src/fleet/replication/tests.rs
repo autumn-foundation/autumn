@@ -4,7 +4,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{InstallReplicationError, ReplicationInstall, install_replication, replicated_state};
+use super::{
+    InstallReplicationError, ReplicationInstall, install_replication, replicated_state,
+    replicated_state_with,
+};
 use crate::AppState;
 use crate::config::{DatabaseFleetConfig, FleetOwnershipConfig};
 use crate::db::fleet::test_engine::{TextEngine, Warnings};
@@ -290,4 +293,81 @@ async fn a_fleet_replicated_by_hand_is_refused_and_leaves_the_source_free() {
         "the source is still free"
     );
     stop(&next);
+}
+
+#[tokio::test]
+async fn restore_missing_with_replication_off_warns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = DatabaseFleetConfig {
+        restore_missing: true,
+        ..config(&tmp.path().join("fleet"))
+    };
+    let fleet = fleet(&config, Some(HOUR));
+
+    let warnings = Warnings::capture();
+    let outcome = install_replication(&AppState::for_test(), &fleet, &config).unwrap();
+
+    assert_eq!(outcome, ReplicationInstall::NoReplication);
+    assert_eq!(
+        warnings.matching("no replica to restore"),
+        1,
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_missing_without_ownership_warns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = replicated_state(tmp.path()).await;
+    let config = DatabaseFleetConfig {
+        restore_missing: true,
+        ..config(&tmp.path().join("fleet"))
+    };
+    let fleet = fleet(&config, Some(HOUR));
+
+    let warnings = Warnings::capture();
+    let outcome = install_replication(&state, &fleet, &config).unwrap();
+
+    assert_eq!(outcome, ReplicationInstall::Installed);
+    assert_eq!(warnings.matching("nothing fences"), 1, "{warnings:?}");
+    stop(&fleet);
+}
+
+#[tokio::test]
+async fn with_no_control_database_the_replica_has_no_tombstones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = replicated_state_with(tmp.path(), false).await;
+    let config = config(&tmp.path().join("fleet"));
+    let fleet = fleet(&config, Some(HOUR));
+
+    let warnings = Warnings::capture();
+    let outcome = install_replication(&state, &fleet, &config).unwrap();
+
+    assert_eq!(outcome, ReplicationInstall::Installed);
+    let replication = fleet.replication().expect("the fleet replicates");
+    assert!(replication.tombstones().is_none());
+    assert_eq!(warnings.matching("no control database"), 1, "{warnings:?}");
+    stop(&fleet);
+}
+
+#[test]
+fn the_errors_name_the_cause() {
+    let root_in_use = InstallReplicationError::RootInUse {
+        root: "app/dev".to_owned(),
+        claimed_by: "/var/fleet".to_owned(),
+    };
+    assert!(
+        root_in_use.to_string().contains("/var/fleet"),
+        "{root_in_use}"
+    );
+    assert!(root_in_use.to_string().contains("app/dev"), "{root_in_use}");
+    let thread = InstallReplicationError::Thread(std::io::Error::other("no threads"));
+    assert!(
+        std::error::Error::source(&thread).is_some(),
+        "the cause is the source"
+    );
+    assert!(
+        !thread.to_string().contains("no threads"),
+        "not twice: {thread}"
+    );
 }
