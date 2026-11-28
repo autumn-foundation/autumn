@@ -230,7 +230,8 @@ impl CountMinSketch {
     }
 
     /// The most an estimate overcounts, with probability `1 - delta`:
-    /// `ceil(e × total / width)`. It grows with the stream, so rotate the
+    /// `ceil(e × total / width)`, or `u64::MAX` once the total has
+    /// saturated. It grows with the stream, so rotate the
     /// sketch (see [`FrequencyCounter::take`]) when it passes what you can
     /// accept.
     #[must_use]
@@ -240,6 +241,10 @@ impl CountMinSketch {
         clippy::cast_sign_loss
     )]
     pub fn error_bound(&self) -> u64 {
+        // A saturated total no longer bounds the counters: claim nothing.
+        if self.total == u64::MAX {
+            return u64::MAX;
+        }
         // Saturating float-to-int cast: never wraps.
         (std::f64::consts::E * self.total as f64 / self.width as f64).ceil() as u64
     }
@@ -508,7 +513,7 @@ mod tests {
         sketch.add("a", u64::MAX);
         assert_eq!(sketch.add("a", 5), u64::MAX);
         assert_eq!(sketch.total(), u64::MAX);
-        assert!(sketch.error_bound() > u64::MAX / 3); // e × MAX / 6, no overflow
+        assert_eq!(sketch.error_bound(), u64::MAX);
     }
 
     #[test]
