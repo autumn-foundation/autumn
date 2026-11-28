@@ -234,6 +234,7 @@ CRATES = {
     'autumn_edge': 'autumn-edge/src',
     'autumn_search': 'autumn-search/src',
     'autumn_billing': 'autumn-billing/src',
+    'autumn_sketch': 'autumn-sketch/src',
     'autumn_storage_s3': 'autumn-storage-s3/src',
     'autumn_cache_redis': 'autumn-cache-redis/src',
     'autumn_admin_plugin': 'autumn-admin-plugin/src',

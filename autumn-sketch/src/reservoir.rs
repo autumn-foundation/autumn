@@ -31,7 +31,7 @@
 //! an `Arc` and offer to from every handler.
 //!
 //! ```rust
-//! use autumn_web::reservoir::Reservoir;
+//! use autumn_sketch::reservoir::Reservoir;
 //!
 //! let mut slow_requests = Reservoir::with_seed(3, 42);
 //! for path in ["/a", "/b", "/c", "/d", "/e", "/f"] {

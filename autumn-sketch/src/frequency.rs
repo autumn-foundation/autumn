@@ -46,7 +46,7 @@
 //! window ("this hour") is one call per tick.
 //!
 //! ```rust
-//! use autumn_web::frequency::FrequencyCounter;
+//! use autumn_sketch::frequency::FrequencyCounter;
 //!
 //! let failures = FrequencyCounter::new(0.001, 0.01);
 //! for ip in ["10.0.0.7", "10.0.0.7", "10.0.0.9", "10.0.0.7"] {

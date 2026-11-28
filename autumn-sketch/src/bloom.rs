@@ -43,7 +43,7 @@
 //! put in an `Arc` and record from every handler.
 //!
 //! ```rust
-//! use autumn_web::bloom::SeenFilter;
+//! use autumn_sketch::bloom::SeenFilter;
 //!
 //! let deliveries = SeenFilter::new(10_000, 0.001);
 //! assert!(deliveries.insert("evt_1")); // first time: process it

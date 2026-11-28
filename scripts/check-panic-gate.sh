@@ -126,13 +126,13 @@ REQUEST_PATH_MODULES=(
   autumn/src/middleware/criticality.rs:default
   autumn/src/admission.rs:default
   autumn/src/bulkhead.rs:default
-  autumn/src/heavy_hitters.rs:default
-  autumn/src/bloom.rs:default
-  autumn/src/distinct.rs:default
-  autumn/src/frequency.rs:default
-  autumn/src/minhash.rs:default
-  autumn/src/quantiles.rs:default
-  autumn/src/reservoir.rs:default
+  autumn-sketch/src/heavy_hitters.rs:default
+  autumn-sketch/src/bloom.rs:default
+  autumn-sketch/src/distinct.rs:default
+  autumn-sketch/src/frequency.rs:default
+  autumn-sketch/src/minhash.rs:default
+  autumn-sketch/src/quantiles.rs:default
+  autumn-sketch/src/reservoir.rs:default
   autumn/src/middleware/short_circuit.rs:default
   autumn/src/capsule/capture.rs:reporting
   autumn/src/capsule/wire.rs:db
@@ -233,7 +233,7 @@ GATE_FEATURE_EXEMPT=(${FEATURE_LINT_EXEMPT[@]+"${FEATURE_LINT_EXEMPT[@]}"})
 # path is a hole, so the sibling framework crates are swept too. `autumn-cli`
 # (an operator tool) and `autumn-macros` (compile-time proc-macro internals) are
 # deliberately EXEMPT and absent here.
-SCAN_DIRS="autumn/src,autumn-search/src,autumn-admin-plugin/src,autumn-media-plugin/src,autumn-storage-s3/src,autumn-cache-redis/src,autumn-billing/src"
+SCAN_DIRS="autumn/src,autumn-search/src,autumn-sketch/src,autumn-admin-plugin/src,autumn-media-plugin/src,autumn-storage-s3/src,autumn-cache-redis/src,autumn-billing/src"
 
 # Read-only inputs for the feature-reachability check.
 CI_WORKFLOW=".github/workflows/ci.yml"

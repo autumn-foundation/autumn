@@ -36,7 +36,7 @@
 //! [`insert_hash`](MinHash::insert_hash).
 //!
 //! ```rust
-//! use autumn_web::minhash::MinHash;
+//! use autumn_sketch::minhash::MinHash;
 //!
 //! let removed = MinHash::of_text("Buy cheap watches now at the best price in town", 2, 128);
 //! let incoming = MinHash::of_text("buy CHEAP watches now, at the best price in town!!", 2, 128);
