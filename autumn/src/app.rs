@@ -5716,19 +5716,12 @@ impl AppBuilder {
 
         // HTTP/3 binds now, beside the TLS listener, so a UDP problem fails the boot.
         #[cfg(feature = "http3")]
-        let http3_bound = match (http3_tls_parts.take(), http3_tcp_addr) {
-            (Some(parts), Some(tcp_addr)) if config.server.http3.enabled => {
-                match bind_http3_listener(&config, tcp_addr, &parts) {
-                    Ok(bound) => Some(bound),
-                    Err(e) => {
-                        tracing::error!("Failed to start [server.http3]: {e}");
-                        exit_stop_managed_pg();
-                        std::process::exit(1);
-                    }
-                }
-            }
-            _ => None,
-        };
+        let http3_bound = bind_http3_at_boot(&config, http3_tls_parts.take(), http3_tcp_addr)
+            .unwrap_or_else(|e| {
+                tracing::error!("Failed to start [server.http3]: {e}");
+                exit_stop_managed_pg();
+                std::process::exit(1);
+            });
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         if let Some(warning) = config.server.drain_window_warning() {
@@ -6251,13 +6244,7 @@ impl AppBuilder {
                     .await;
                     // The drain waits for h3 requests too.
                     #[cfg(feature = "http3")]
-                    if let Some(task) = http3_task {
-                        match task.await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => tracing::error!(error = %e, "HTTP/3 listener failed"),
-                            Err(e) => tracing::error!(error = %e, "HTTP/3 listener task failed"),
-                        }
-                    }
+                    await_http3_task(http3_task).await;
                     tcp_result
                 })
             }
@@ -11490,6 +11477,36 @@ fn build_tls_listener(
     let handshake_timeout = std::time::Duration::from_secs(cfg.handshake_timeout_secs.max(1));
     let listener = crate::tls::TlsListener::new(tcp, server_config, handshake_timeout, shutdown);
     Ok((listener, reload, client_reload, parts))
+}
+
+/// The boot step for `[server.http3]`: bind it when it is enabled and a TLS
+/// listener is bound on TCP. `Ok(None)` when h3 is off or there is no TLS
+/// listener (for example on a Unix socket).
+#[cfg(feature = "http3")]
+fn bind_http3_at_boot(
+    config: &AutumnConfig,
+    parts: Option<crate::tls::ServerTlsParts>,
+    tcp_addr: Option<std::net::SocketAddr>,
+) -> Result<Option<(crate::http3::Http3Listener, crate::http3::AltSvcLayer)>, String> {
+    match (parts, tcp_addr) {
+        (Some(parts), Some(tcp_addr)) if config.server.http3.enabled => {
+            bind_http3_listener(config, tcp_addr, &parts).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Wait for the h3 task when the TCP server ends, and log how it ended. The
+/// TCP result is the server's result: an h3 failure does not stop the drain.
+#[cfg(feature = "http3")]
+async fn await_http3_task(task: Option<tokio::task::JoinHandle<std::io::Result<()>>>) {
+    if let Some(task) = task {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(error = %e, "HTTP/3 listener failed"),
+            Err(e) => tracing::error!(error = %e, "HTTP/3 listener task failed"),
+        }
+    }
 }
 
 /// Bind the `[server.http3]` UDP listener next to the TLS listener on
@@ -19477,6 +19494,58 @@ mod tests {
         );
     }
 
+    /// h3 binds only when it is enabled and a TLS listener is bound on TCP.
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_binds_at_boot_only_when_enabled_with_tls() {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind TCP");
+        let addr = tcp.local_addr().expect("TCP addr");
+        let mut off = http3_test_config(None);
+        off.server.http3.enabled = false;
+        assert!(
+            bind_http3_at_boot(&off, Some(http3_test_parts()), Some(addr))
+                .expect("no error")
+                .is_none(),
+            "h3 off binds nothing"
+        );
+        let on = http3_test_config(None);
+        assert!(
+            bind_http3_at_boot(&on, None, Some(addr))
+                .expect("no error")
+                .is_none(),
+            "no TLS listener, no h3"
+        );
+        assert!(
+            bind_http3_at_boot(&on, Some(http3_test_parts()), None)
+                .expect("no error")
+                .is_none(),
+            "no TCP address, no h3"
+        );
+        assert!(
+            bind_http3_at_boot(&on, Some(http3_test_parts()), Some(addr))
+                .expect("binds")
+                .is_some()
+        );
+    }
+
+    /// The drain waits for the h3 task whatever way it ends, and never panics.
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn the_drain_waits_for_the_http3_task_however_it_ends() {
+        await_http3_task(None).await;
+        await_http3_task(Some(tokio::spawn(async { Ok(()) }))).await;
+        await_http3_task(Some(tokio::spawn(async {
+            Err(std::io::Error::other("listener failed"))
+        })))
+        .await;
+        let panicked = tokio::spawn(async {
+            panic!("listener task panicked");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        await_http3_task(Some(panicked)).await;
+    }
+
     /// h3 requests get `server.shutdown_timeout_secs` to finish on shutdown, as
     /// TCP requests do.
     #[cfg(feature = "http3")]
@@ -19557,7 +19626,7 @@ mod tests {
         assert!(boundary < h3_serve, "h3 must clone the layered service");
         assert!(h3_serve < alt_svc, "Alt-Svc goes on TCP after the h3 clone");
         let joined = server_source
-            .find("if let Some(task) = http3_task {")
+            .find("await_http3_task(http3_task).await;")
             .expect("the server task waits for the h3 task");
         let drained = server_source
             .find("let server_result = server_task.await")

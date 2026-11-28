@@ -92,6 +92,28 @@ async fn forever() -> axum::body::Body {
     axum::body::Body::from_stream(ticks)
 }
 
+/// Echoes the request trailer `x-checksum` as the response trailer `x-echo`.
+#[post("/trailers")]
+async fn trailers(req: axum::extract::Request) -> axum::response::Response {
+    let collected = http_body_util::BodyExt::collect(req.into_body())
+        .await
+        .expect("request body");
+    let echo = collected
+        .trailers()
+        .and_then(|t| t.get("x-checksum"))
+        .cloned()
+        .unwrap_or_else(|| axum::http::HeaderValue::from_static("none"));
+    let mut out = axum::http::HeaderMap::new();
+    out.insert("x-echo", echo);
+    let frames = futures::stream::iter(vec![
+        Ok::<_, std::convert::Infallible>(http_body::Frame::data(Bytes::from_static(b"body"))),
+        Ok(http_body::Frame::trailers(out)),
+    ]);
+    axum::response::Response::new(axum::body::Body::new(http_body_util::StreamBody::new(
+        frames,
+    )))
+}
+
 #[get("/hop")]
 async fn hop() -> impl axum::response::IntoResponse {
     (
@@ -161,7 +183,8 @@ fn serve_h3(
     let router = TestApp::new()
         .config(config)
         .routes(routes![
-            hello, echo, put_item, post_item, whoami, host, slow, cert, version, forever, hop
+            hello, echo, put_item, post_item, whoami, host, slow, cert, version, forever, hop,
+            trailers
         ])
         .build()
         .into_router();
@@ -611,21 +634,28 @@ async fn h3_closes_a_connection_after_the_keep_alive_timeout() {
 /// A bare QUIC connection with ALPN `h3`, for streams that an h3 client
 /// would never send.
 async fn connect_raw(addr: SocketAddr) -> (quinn::Endpoint, quinn::Connection) {
+    let (endpoint, conn) = connect_raw_alpn(addr, b"h3").await;
+    (endpoint, conn.expect("QUIC connects"))
+}
+
+async fn connect_raw_alpn(
+    addr: SocketAddr,
+    alpn: &[u8],
+) -> (
+    quinn::Endpoint,
+    Result<quinn::Connection, quinn::ConnectionError>,
+) {
     let mut tls = rustls::ClientConfig::builder_with_provider(autumn_web::tls::crypto_provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(RecordingVerifier::default()))
         .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h3".to_vec()];
+    tls.alpn_protocols = vec![alpn.to_vec()];
     let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
     let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
-    let conn = endpoint
-        .connect(addr, "localhost")
-        .unwrap()
-        .await
-        .expect("QUIC connects");
+    let conn = endpoint.connect(addr, "localhost").unwrap().await;
     (endpoint, conn)
 }
 
@@ -658,6 +688,75 @@ async fn h3_closes_a_connection_with_many_failed_request_heads() {
     tokio::time::timeout(DEADLINE, conn.closed())
         .await
         .expect("the server closes the connection");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn h3_stops_a_stream_that_declares_an_oversized_head() {
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
+    let (_endpoint, conn) = connect_raw(server.addr).await;
+    let (mut send, _recv) = conn.open_bi().await.expect("stream opens");
+    // A HEADERS frame (type 0x01) that declares 1 MB, over the 64 KiB default.
+    let mut frame = vec![0x01, 0x80, 0x0f, 0x42, 0x40];
+    frame.extend([0u8; 1024]);
+    send.write_all(&frame).await.expect("frame start is sent");
+    let stopped = tokio::time::timeout(DEADLINE, send.stopped())
+        .await
+        .expect("the server answers")
+        .expect("the stream is stopped, not lost");
+    assert_eq!(
+        stopped.map(quinn::VarInt::into_inner),
+        Some(0x0107),
+        "the server stops the stream with H3_EXCESSIVE_LOAD"
+    );
+    let mut client = connect(server.addr, None).await.expect("h3 still connects");
+    assert_eq!(client.get("/hello").await.expect("GET").status, 200);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn h3_refuses_a_client_without_the_h3_alpn() {
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
+    let (_endpoint, conn) = connect_raw_alpn(server.addr, b"h2").await;
+    assert!(conn.is_err(), "the handshake fails without a shared ALPN");
+    let mut client = connect(server.addr, None).await.expect("h3 still connects");
+    assert_eq!(client.get("/hello").await.expect("GET").status, 200);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn h3_round_trips_request_and_response_trailers() {
+    let server = serve_h3(test_config(), Http3Settings::default(), None);
+    let mut client = connect(server.addr, None).await.expect("h3 connects");
+    let req = axum::http::Request::post("https://localhost/trailers")
+        .body(())
+        .unwrap();
+    let fut = async {
+        let mut stream = client.send.send_request(req).await.expect("request opens");
+        stream
+            .send_data(Bytes::from_static(b"payload"))
+            .await
+            .expect("body");
+        let mut trailers = axum::http::HeaderMap::new();
+        trailers.insert("x-checksum", axum::http::HeaderValue::from_static("abc"));
+        stream.send_trailers(trailers).await.expect("trailers");
+        stream.finish().await.expect("request ends");
+        let resp = stream.recv_response().await.expect("response head");
+        assert_eq!(resp.status(), 200);
+        let mut body = Vec::new();
+        while let Some(mut chunk) = stream.recv_data().await.expect("body chunk") {
+            let n = chunk.remaining();
+            body.extend_from_slice(&chunk.copy_to_bytes(n));
+        }
+        assert_eq!(body, b"body");
+        let trailers = stream
+            .recv_trailers()
+            .await
+            .expect("trailers read")
+            .expect("response trailers");
+        assert_eq!(trailers.get("x-echo").unwrap(), "abc");
+    };
+    tokio::time::timeout(DEADLINE, fut).await.expect("in time");
     server.shutdown().await;
 }
 

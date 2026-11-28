@@ -504,6 +504,78 @@ mod tests {
         );
     }
 
+    /// A receive stream that hands out fixed chunks and records `STOP_SENDING`.
+    struct FakeRecv {
+        chunks: std::collections::VecDeque<Bytes>,
+        stopped: Option<u64>,
+    }
+
+    impl quic::RecvStream for FakeRecv {
+        type Buf = Bytes;
+
+        fn poll_data(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+            Poll::Ready(Ok(self.chunks.pop_front()))
+        }
+
+        fn stop_sending(&mut self, error_code: u64) {
+            self.stopped = Some(error_code);
+        }
+
+        fn recv_id(&self) -> StreamId {
+            StreamId::try_from(4_u64).expect("stream 4")
+        }
+    }
+
+    fn limited(chunks: Vec<Vec<u8>>, limit: u64) -> LimitedRecv<FakeRecv> {
+        LimitedRecv {
+            inner: FakeRecv {
+                chunks: chunks.into_iter().map(Bytes::from).collect(),
+                stopped: None,
+            },
+            gate: Gate::request(limit),
+        }
+    }
+
+    fn poll(recv: &mut LimitedRecv<FakeRecv>) -> Poll<Result<Option<Bytes>, StreamErrorIncoming>> {
+        let waker = std::task::Waker::noop();
+        quic::RecvStream::poll_data(recv, &mut Context::from_waker(waker))
+    }
+
+    #[test]
+    fn a_stream_inside_the_limit_reads_through() {
+        let mut head = header(0x01, 4);
+        head.extend([0u8; 4]);
+        let mut recv = limited(vec![head.clone(), header(DATA_FRAME, 9_000)], 16);
+        assert!(matches!(poll(&mut recv), Poll::Ready(Ok(Some(b))) if b == head));
+        assert!(matches!(poll(&mut recv), Poll::Ready(Ok(Some(_)))));
+        assert!(
+            matches!(poll(&mut recv), Poll::Ready(Ok(None))),
+            "end of stream"
+        );
+        assert_eq!(recv.inner.stopped, None);
+        assert_eq!(quic::RecvStream::recv_id(&recv).into_inner(), 4);
+    }
+
+    #[test]
+    fn a_stream_over_the_limit_is_stopped_with_excessive_load() {
+        let mut recv = limited(vec![header(0x01, 17)], 16);
+        let Poll::Ready(Err(StreamErrorIncoming::Unknown(error))) = poll(&mut recv) else {
+            panic!("an oversized frame must be refused");
+        };
+        assert!(error.to_string().contains("16 bytes"), "{error}");
+        assert_eq!(recv.inner.stopped, Some(H3_EXCESSIVE_LOAD));
+    }
+
+    #[test]
+    fn stop_sending_reaches_the_inner_stream() {
+        let mut recv = limited(Vec::new(), 16);
+        quic::RecvStream::stop_sending(&mut recv, 0x0100);
+        assert_eq!(recv.inner.stopped, Some(0x0100));
+    }
+
     #[test]
     fn a_uni_stream_has_a_lifetime_limit() {
         let mut gate = Gate::uni();
