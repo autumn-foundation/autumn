@@ -37,6 +37,7 @@ CRATES=(
   autumn-macros-model
   autumn-macros-repository
   autumn-schema-core
+  autumn-sketch
   autumn-edge
   autumn-web
   autumn-cli

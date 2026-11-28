@@ -29,7 +29,7 @@
 //! put in an `Arc` and record from every handler.
 //!
 //! ```rust
-//! use autumn_web::heavy_hitters::HeavyHitters;
+//! use autumn_sketch::heavy_hitters::HeavyHitters;
 //!
 //! let hot = HeavyHitters::new(64);
 //! for tenant in ["acme", "acme", "globex", "acme", "initech"] {

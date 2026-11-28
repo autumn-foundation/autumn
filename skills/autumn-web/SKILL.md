@@ -2901,10 +2901,19 @@ Published 0.5.0 behavior:
   process. Every `[log]` knob, the access log and the PII scrubber included,
   is documented on one page: `docs/guide/logging-pii.md`.
 
+### Stream sketches — the `autumn-sketch` crate (unreleased)
+
+The fixed-memory sketches below live in their own crate, not in
+`autumn-web`. Add `autumn-sketch = "0.11"` to the app's `[dependencies]`; it is
+std only, with no dependencies of its own. Each sketch has a shared form
+behind a mutex (put it in an `Arc` and record from every handler), and
+sketches of one shape merge, so per-replica sketches add up to the fleet's
+answer.
+
 ### Top keys of a stream — `heavy_hitters` (unreleased)
 
 To find the hottest tenant, route or client IP without a counter per key,
-use `autumn_web::heavy_hitters::HeavyHitters` (no feature, std only). It
+use `autumn_sketch::heavy_hitters::HeavyHitters` (the `autumn-sketch` crate). It
 holds `capacity` counters (Space-Saving): every key over `total / capacity`
 stays in the table, and each `Hitter` carries `count` (never below the truth)
 and `guaranteed()` (never above it). `frequent(share_ppm)` has no false
@@ -2919,7 +2928,7 @@ for hit in hot.frequent(50_000) { /* each is surely >= 5 % of traffic */ }
 ### Distinct counts of a stream — `distinct` (unreleased)
 
 To count unique visitors, client IPs or tenants without keeping every key,
-use `autumn_web::distinct::DistinctCounter` (no feature, std only). It is a
+use `autumn_sketch::distinct::DistinctCounter` (the `autumn-sketch` crate). It is a
 HyperLogLog of `2^precision` one-byte registers, accurate to
 `1.04 / sqrt(2^precision)`; duplicates change nothing. Sketches of the same
 precision `merge` into the union, so each replica counts its own and the
@@ -2935,7 +2944,7 @@ fleet_total.merge(&HyperLogLog::from_bytes(&peer_bytes).unwrap())?;
 ### Percentiles of a stream — `quantiles` (unreleased)
 
 To report p50/p99/p99.9 latency or payload size without keeping every sample,
-use `autumn_web::quantiles::Quantiles` (no feature, std only). It is a
+use `autumn_sketch::quantiles::Quantiles` (the `autumn-sketch` crate). It is a
 DDSketch: every quantile is within the relative accuracy you pass (`0.01` =
 1 %) of the true sample at its rank, and min/max are exact. Sketches of the
 same accuracy `merge` exactly, so each replica sketches its own traffic and
@@ -2954,7 +2963,7 @@ fleet.merge(&window)?;                        // IncompatibleSketch if accuracie
 
 To keep a few examples of a stream (requests to an endpoint, payloads that
 failed validation, slow traces) without keeping all of it, use
-`autumn_web::reservoir::Sampler` (no feature, std only). It holds `k` items,
+`autumn_sketch::reservoir::Sampler` (the `autumn-sketch` crate). It holds `k` items,
 and every item offered had the same `k / n` chance of being one of them.
 `offer` returns whether the item was kept. Reservoirs of the same capacity
 `merge` into a uniform sample of both streams, weighted by how many items each
@@ -2970,7 +2979,7 @@ fleet.merge(&window)?;                    // CapacityMismatch if capacities diff
 ### Have we seen this before? — `bloom` (unreleased)
 
 To skip webhook redeliveries, replayed events or digests already sent without
-keeping every key, use `autumn_web::bloom::SeenFilter` (no feature, std only).
+keeping every key, use `autumn_sketch::bloom::SeenFilter` (the `autumn-sketch` crate).
 It is a Bloom filter sized from the keys you expect and the false-positive rate
 you accept (a million keys at 1 % is about 1.2 MB). There are no false
 negatives; `insert` returns `true` the first time and `false` on a probable
@@ -2987,7 +2996,7 @@ fleet.merge(&BloomFilter::from_bytes(&peer_bytes).unwrap())?; // ShapeMismatch i
 ### How alike are these two sets? — `minhash` (unreleased)
 
 To catch reworded spam, near-duplicate posts or overlapping traffic without
-keeping either set, use `autumn_web::minhash::MinHash` (no feature, std only).
+keeping either set, use `autumn_sketch::minhash::MinHash` (the `autumn-sketch` crate).
 It estimates the Jaccard similarity `|A ∩ B| / |A ∪ B|` from a fixed number of
 slots (128 slots is 1 KiB, about ±0.09; `standard_error` is `1/sqrt(slots)`).
 `of_text(text, width, slots)` sketches word shingles, ignoring case and
@@ -2999,6 +3008,25 @@ let incoming = MinHash::of_text(&post.body, 3, 128);
 for removed in removed_sketches.iter().filter_map(|b| MinHash::from_bytes(b)) {
     if incoming.jaccard(&removed)? > 0.8 { return Err(flag_as_duplicate()); } // SlotMismatch if sized differently
 }
+```
+
+### How often has this key been seen? — `frequency` (unreleased)
+
+To count failed logins per IP, hits per query or timeouts per endpoint for
+*every* key, not only the top ones (`heavy_hitters`), use
+`autumn_sketch::frequency::FrequencyCounter` (the `autumn-sketch` crate). It is a
+Count-Min sketch: `new(epsilon, delta)` sizes a fixed grid so an estimate is
+never below the truth and above it by at most `epsilon × total` with
+probability `1 - delta` (0.001 / 0.01 is about 106 KiB). `error_bound()` reads
+that overcount now. `take()` swaps in an empty sketch for fixed windows;
+sketches of the same shape `merge` exactly, and `to_bytes`/`from_bytes` ship
+them between replicas:
+
+```rust
+let failures = FrequencyCounter::new(0.001, 0.01);
+if failures.increment(&client_ip) > 20 { return Err(too_many_attempts()); }
+let last_hour = failures.take(); // on a timer: start a fresh window
+fleet.merge(&CountMinSketch::from_bytes(&peer_bytes).unwrap())?; // ShapeMismatch if sized differently
 ```
 
 ### Runtime log levels (0.6.0)

@@ -34,7 +34,7 @@
 //! an `Arc` and record from every handler.
 //!
 //! ```rust
-//! use autumn_web::quantiles::Quantiles;
+//! use autumn_sketch::quantiles::Quantiles;
 //! use std::time::Duration;
 //!
 //! let latency = Quantiles::new(0.01);

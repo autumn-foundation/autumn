@@ -42,7 +42,7 @@
 //! to put in an `Arc` and record from every handler.
 //!
 //! ```rust
-//! use autumn_web::distinct::DistinctCounter;
+//! use autumn_sketch::distinct::DistinctCounter;
 //!
 //! let visitors = DistinctCounter::new(12);
 //! for visitor in ["ada", "grace", "ada", "linus", "grace"] {

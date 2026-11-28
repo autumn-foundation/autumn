@@ -19,6 +19,7 @@ SemVer contract.
 | `autumn-macros-model` | `autumn-macros-model/` | 2 | Depends on `autumn-macros-support`. `autumn-web` pins it **optionally**, so it must precede `autumn-web`. |
 | `autumn-macros-repository` | `autumn-macros-repository/` | 2 | Depends on `autumn-macros-support`. `autumn-web` pins it **optionally**, so it must precede `autumn-web`. |
 | `autumn-schema-core` | `autumn-schema-core/` | 3 | No Autumn runtime deps. `autumn-cli` pins it. |
+| `autumn-sketch` | `autumn-sketch/` | 3 | No dependencies at all. Nothing pins it; apps add it themselves. |
 | `autumn-edge` | `autumn-edge/` | 4 | Depends on `autumn-macros`. `autumn-web` pins it — **optionally**, but cargo still requires an optional dependency to resolve on crates.io, so it must precede `autumn-web`. |
 | `autumn-web` | `autumn/` | 5 | Depends on `autumn-macros`, the two macro shards and `autumn-edge`. |
 | `autumn-cli` | `autumn-cli/` | 6 | Depends on `autumn-schema-core`. Independent of `autumn-web` at crate level. |
@@ -541,6 +542,7 @@ Before pushing the release tag:
    cargo publish -p autumn-macros-model
    cargo publish -p autumn-macros-repository
    cargo publish -p autumn-schema-core
+   cargo publish -p autumn-sketch
    cargo publish -p autumn-edge
    cargo publish -p autumn-web
    cargo publish -p autumn-cli

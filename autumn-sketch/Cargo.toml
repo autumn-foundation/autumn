@@ -1,0 +1,17 @@
+[package]
+name = "autumn-sketch"
+description = "Fixed-memory stream sketches for Autumn apps: top keys, distinct counts, percentiles, samples, membership, similarity and per-key frequencies"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/autumn-foundation/autumn"
+readme = "README.md"
+keywords = ["sketch", "hyperloglog", "bloom-filter", "count-min", "streaming"]
+categories = ["algorithms", "data-structures"]
+
+[dependencies]
+
+[lints]
+workspace = true
